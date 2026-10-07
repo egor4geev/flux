@@ -1,18 +1,22 @@
 //! Вью редактора: связывает документ из ядра с окном, клавиатурой, мышью и IME.
 
 use std::ops::Range as Utf16Range;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use flux_core::movement::{self, Direction};
 use flux_core::text::line_start;
-use flux_core::{Document, EditKind, Range, Rope, Selection, Transaction, edit};
+use flux_core::{Document, EditKind, Range, Rope, Selection, TextChange, Transaction, edit};
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, FocusHandle, Focusable,
-    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, PromptLevel, Render,
-    ScrollWheelEvent, SharedString, UTF16Selection, Window, actions, div, point, prelude::*, px,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection, Window, actions, div,
+    point, prelude::*, px,
 };
 
 use crate::element::{EditorElement, LayoutCache};
-use crate::theme;
+use crate::highlighter::{self, Highlighter, ParseMode};
+use crate::theme::{self, Theme, UiColors};
 
 actions!(
     editor,
@@ -54,8 +58,6 @@ actions!(
         Cut,
         Paste,
         Save,
-        CloseWindow,
-        Quit,
     ]
 );
 
@@ -105,18 +107,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-x", Cut, context),
         KeyBinding::new("cmd-v", Paste, context),
         KeyBinding::new("cmd-s", Save, context),
-        KeyBinding::new("cmd-w", CloseWindow, context),
-        KeyBinding::new("cmd-q", Quit, context),
     ]);
 }
 
-/// Что сделать, когда пользователь разобрался с несохранёнными изменениями.
-#[derive(Clone, Copy)]
-pub enum AfterClose {
-    CloseWindow,
-    Quit,
-}
-
+/// Вид одного документа: свои скролл, выделение и состояние IME.
 pub struct Editor {
     pub(crate) document: Document,
     pub(crate) focus_handle: FocusHandle,
@@ -127,25 +121,49 @@ pub struct Editor {
     /// Текст, который сейчас набирается через IME (ещё не подтверждён).
     pub(crate) marked_range: Option<std::ops::Range<usize>>,
     pub(crate) layout: Option<LayoutCache>,
+    /// Подсветка синтаксиса документа и её фоновый разбор.
+    pub(crate) highlighter: Highlighter,
+    /// Фаза мигания: курсор сейчас нарисован.
+    pub(crate) cursor_visible: bool,
+    /// Таймер мигания; есть, только пока редактор в фокусе и окно активно.
+    blink_task: Option<Task<()>>,
     selecting: bool,
     status: Option<SharedString>,
-    /// Пользователь уже ответил на вопрос о несохранённых изменениях.
-    close_confirmed: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Editor {
-    pub fn new(document: Document, cx: &mut Context<Self>) -> Self {
-        Self {
+    pub fn new(document: Document, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        // Мигание включается и выключается вместе с фокусом и активностью окна.
+        let subscriptions = vec![
+            cx.on_focus(&focus_handle, window, Self::restart_blink),
+            cx.on_blur(&focus_handle, window, Self::restart_blink),
+            cx.observe_window_activation(window, Self::restart_blink),
+            // Новая тема — новое отображение capture на её области.
+            cx.observe_global::<Theme>(|this, cx| {
+                this.highlighter.refresh_map(Theme::get(cx));
+                cx.notify();
+            }),
+        ];
+        let highlighter = Highlighter::new(document.path(), document.text());
+        let mut editor = Self {
             document,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             scroll: point(0., 0.),
             autoscroll: true,
             marked_range: None,
             layout: None,
+            highlighter,
+            cursor_visible: true,
+            blink_task: None,
             selecting: false,
             status: None,
-            close_confirmed: false,
-        }
+            _subscriptions: subscriptions,
+        };
+        // Первый разбор — сразу в фон: заодно там скомпилируется запрос подсветки.
+        highlighter::parse(&mut editor, ParseMode::Background, cx);
+        editor
     }
 
     fn set_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
@@ -153,6 +171,7 @@ impl Editor {
         self.marked_range = None;
         self.status = None;
         self.autoscroll = true;
+        self.pause_blink(cx);
         cx.notify();
     }
 
@@ -164,10 +183,36 @@ impl Editor {
     }
 
     fn apply(&mut self, tx: Transaction, kind: EditKind, cx: &mut Context<Self>) {
-        self.document.apply(tx, kind);
+        if let Some(change) = self.document.apply(tx, kind) {
+            self.text_changed(&[change], cx);
+        }
         self.status = None;
         self.autoscroll = true;
+        self.pause_blink(cx);
         cx.notify();
+    }
+
+    /// Undo или Redo; `step` возвращает изменения текста или `None`, если шагать некуда.
+    fn history_step(
+        &mut self,
+        cx: &mut Context<Self>,
+        step: impl FnOnce(&mut Document) -> Option<Vec<TextChange>>,
+    ) {
+        if let Some(changes) = step(&mut self.document) {
+            self.text_changed(&changes, cx);
+            self.marked_range = None;
+            self.autoscroll = true;
+            self.pause_blink(cx);
+            cx.notify();
+        }
+    }
+
+    /// Текст изменился: подсветка сдвигает дерево и запускает разбор.
+    fn text_changed(&mut self, changes: &[TextChange], cx: &mut Context<Self>) {
+        for change in changes {
+            self.highlighter.edit(change);
+        }
+        highlighter::parse(self, ParseMode::AfterEdit, cx);
     }
 
     fn edit(
@@ -292,11 +337,13 @@ impl Editor {
 
     // --- Файл ---
 
-    fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+    /// Сохраняет документ; без пути — через «Сохранить как». Результат можно дождаться:
+    /// `true` — документ записан на диск.
+    pub fn save(&mut self, cx: &mut Context<Self>) -> Task<bool> {
         if self.document.path().is_some() {
-            self.save_now(cx);
+            Task::ready(self.save_now(cx))
         } else {
-            self.save_as(window, cx);
+            self.save_as(cx)
         }
     }
 
@@ -315,64 +362,72 @@ impl Editor {
         saved
     }
 
-    fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `false` — пользователь отменил выбор файла или запись не удалась.
+    fn save_as(&mut self, cx: &mut Context<Self>) -> Task<bool> {
         let directory = std::env::current_dir().unwrap_or_default();
         let path = cx.prompt_for_new_path(&directory, Some("untitled.txt"));
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(path))) = path.await {
-                this.update(cx, |this, cx| {
-                    this.document.set_path(path);
-                    this.save_now(cx);
-                })
-                .ok();
-            }
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = path.await else {
+                return false;
+            };
+            this.update(cx, |this, cx| this.save_to(path, cx))
+                .unwrap_or(false)
         })
-        .detach();
     }
 
-    /// `true` — можно закрывать сразу. Иначе спрашивает, сохранить ли изменения,
-    /// и по ответу сам выполняет `then`.
-    pub fn request_close(
-        &mut self,
-        then: AfterClose,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.close_confirmed || !self.document.is_modified() {
-            return true;
+    /// Привязывает документ к `path` и сохраняет. Со сменой расширения может
+    /// смениться язык — тогда подсветка заводится заново и разбирается в фоне.
+    pub(crate) fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
+        if self.highlighter.set_path(&path, self.document.text()) {
+            highlighter::parse(self, ParseMode::Background, cx);
         }
-        let message = format!("Save changes to {}?", self.document.display_name());
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &message,
-            Some("Your changes will be lost if you don't save them."),
-            &["Save", "Don't Save", "Cancel"],
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(answer) = answer.await else {
-                return;
-            };
-            this.update_in(cx, |this, window, cx| {
-                match answer {
-                    0 if this.document.path().is_none() => {
-                        this.save_as(window, cx);
-                        return;
-                    }
-                    0 if !this.save_now(cx) => return,
-                    0 | 1 => {}
-                    _ => return,
+        self.document.set_path(path);
+        self.save_now(cx)
+    }
+
+    /// Сообщение в статус-баре — до следующей правки или движения курсора.
+    pub fn show_status(&mut self, message: SharedString, cx: &mut Context<Self>) {
+        self.status = Some(message);
+        cx.notify();
+    }
+
+    // --- Мигание курсора ---
+
+    /// Вызывается при смене фокуса и активности окна: курсор сразу виден, а таймер
+    /// мигания есть, только пока редактор в фокусе и окно активно.
+    fn restart_blink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let blinking = self.focus_handle.is_focused(window) && window.is_window_active();
+        self.cursor_visible = true;
+        self.blink_task = theme::CURSOR_BLINK
+            .filter(|_| blinking)
+            .map(|period| Self::blink(period, cx));
+        cx.notify();
+    }
+
+    /// Правка или движение: курсор сразу виден, следующее мигание — через полный период.
+    /// Поэтому во время набора курсор не мигает.
+    fn pause_blink(&mut self, cx: &mut Context<Self>) {
+        self.cursor_visible = true;
+        if self.blink_task.is_some()
+            && let Some(period) = theme::CURSOR_BLINK
+        {
+            self.blink_task = Some(Self::blink(period, cx));
+        }
+    }
+
+    fn blink(period: Duration, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(period).await;
+                let toggled = this.update(cx, |this, cx| {
+                    this.cursor_visible = !this.cursor_visible;
+                    cx.notify();
+                });
+                if toggled.is_err() {
+                    break;
                 }
-                this.close_confirmed = true;
-                match then {
-                    AfterClose::CloseWindow => window.remove_window(),
-                    AfterClose::Quit => cx.quit(),
-                }
-            })
-            .ok();
+            }
         })
-        .detach();
-        false
     }
 
     // --- Мышь ---
@@ -441,7 +496,7 @@ impl Editor {
 
     // --- Отображение ---
 
-    fn status_bar(&self) -> impl IntoElement {
+    fn status_bar(&self, ui: UiColors) -> impl IntoElement {
         let text = self.document.text();
         let primary = self.document.selection().primary();
         let line = text.char_to_line(primary.head);
@@ -456,6 +511,8 @@ impl Editor {
         if cursors > 1 {
             right.push_str(&format!("  ·  {cursors} cursors"));
         }
+        right.push_str("  ·  ");
+        right.push_str(&self.highlighter.status());
         right.push_str(match self.document.line_ending() {
             "\r\n" => "  ·  CRLF",
             _ => "  ·  LF",
@@ -468,22 +525,22 @@ impl Editor {
             .px_3()
             .py_1()
             .text_size(px(12.))
-            .text_color(theme::dim())
-            .bg(theme::status_bar())
+            .text_color(ui.dim)
+            .bg(ui.status_bar)
             .border_t_1()
-            .border_color(theme::border())
+            .border_color(ui.border)
             .child(left)
             .child(right)
     }
 
     // --- UTF-16 ↔ символы: IME и macOS считают позиции в UTF-16 ---
 
-    fn to_utf16(&self, range: &std::ops::Range<usize>) -> Utf16Range<usize> {
+    fn utf16_range(&self, range: &std::ops::Range<usize>) -> Utf16Range<usize> {
         let text = self.document.text();
         text.char_to_utf16_cu(range.start)..text.char_to_utf16_cu(range.end)
     }
 
-    fn from_utf16(&self, range: &Utf16Range<usize>) -> std::ops::Range<usize> {
+    fn char_range(&self, range: &Utf16Range<usize>) -> std::ops::Range<usize> {
         let text = self.document.text();
         let len = text.len_utf16_cu();
         text.utf16_cu_to_char(range.start.min(len))..text.utf16_cu_to_char(range.end.min(len))
@@ -492,7 +549,7 @@ impl Editor {
     /// Диапазон, который заменяет IME: явно заданный, текущая композиция или выделение.
     fn input_range(&self, range_utf16: Option<Utf16Range<usize>>) -> Option<std::ops::Range<usize>> {
         range_utf16
-            .map(|r| self.from_utf16(&r))
+            .map(|r| self.char_range(&r))
             .or_else(|| self.marked_range.clone())
     }
 }
@@ -505,8 +562,8 @@ impl EntityInputHandler for Editor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.from_utf16(&range_utf16);
-        actual_range.replace(self.to_utf16(&range));
+        let range = self.char_range(&range_utf16);
+        actual_range.replace(self.utf16_range(&range));
         Some(self.document.text().slice(range).to_string())
     }
 
@@ -518,13 +575,13 @@ impl EntityInputHandler for Editor {
     ) -> Option<UTF16Selection> {
         let primary = self.document.selection().primary();
         Some(UTF16Selection {
-            range: self.to_utf16(&(primary.from()..primary.to())),
+            range: self.utf16_range(&(primary.from()..primary.to())),
             reversed: primary.head < primary.anchor,
         })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Utf16Range<usize>> {
-        self.marked_range.as_ref().map(|range| self.to_utf16(range))
+        self.marked_range.as_ref().map(|range| self.utf16_range(range))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -604,7 +661,7 @@ impl EntityInputHandler for Editor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let range = self.from_utf16(&range_utf16);
+        let range = self.char_range(&range_utf16);
         self.layout
             .as_ref()?
             .bounds_for_position(self.document.text(), range.start)
@@ -628,19 +685,17 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let modified = if self.document.is_modified() { "● " } else { "" };
-        window.set_window_title(&format!("{modified}{} — flux", self.document.display_name()));
-
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use Direction::{Backward, Forward};
+        let ui = Theme::ui(cx);
         div()
             .key_context("Editor")
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme::background())
-            .text_color(theme::foreground())
+            .bg(ui.background)
+            .text_color(ui.foreground)
             .font_family(theme::FONT_FAMILY)
             .text_size(px(theme::FONT_SIZE))
             // Движение
@@ -731,35 +786,13 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &Tab, _, cx| {
                 this.edit(EditKind::Insert, cx, |t, s| edit::insert_tab(t, s, theme::TAB_WIDTH))
             }))
-            .on_action(cx.listener(|this, _: &Undo, _, cx| {
-                if this.document.undo() {
-                    this.marked_range = None;
-                    this.autoscroll = true;
-                    cx.notify();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &Redo, _, cx| {
-                if this.document.redo() {
-                    this.marked_range = None;
-                    this.autoscroll = true;
-                    cx.notify();
-                }
-            }))
+            .on_action(cx.listener(|this, _: &Undo, _, cx| this.history_step(cx, Document::undo)))
+            .on_action(cx.listener(|this, _: &Redo, _, cx| this.history_step(cx, Document::redo)))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
-            // Файл и окно
-            .on_action(cx.listener(Self::save))
-            .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
-                if this.request_close(AfterClose::CloseWindow, window, cx) {
-                    window.remove_window();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &Quit, window, cx| {
-                if this.request_close(AfterClose::Quit, window, cx) {
-                    cx.quit();
-                }
-            }))
+            // Файл
+            .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx).detach()))
             .child(
                 div()
                     .flex_1()
@@ -772,7 +805,7 @@ impl Render for Editor {
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
                     .child(EditorElement::new(cx.entity())),
             )
-            .child(self.status_bar())
+            .child(self.status_bar(ui))
     }
 }
 

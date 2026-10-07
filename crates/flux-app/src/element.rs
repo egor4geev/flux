@@ -1,16 +1,17 @@
 //! Отрисовка редактора. Каждый кадр рисует только видимые строки:
 //! стоимость кадра не зависит от размера файла.
 
-use flux_core::text::{line_end, line_len, line_start};
 use flux_core::Rope;
+use flux_core::text::{line_len, line_start};
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, GlobalElementId,
     InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point, ShapedLine, Style,
     TextRun, Window, fill, font, point, px, relative, size,
 };
 
+use crate::display::{display_line, text_runs};
 use crate::editor::Editor;
-use crate::theme;
+use crate::theme::{self, Theme};
 
 /// Раскладка видимой части с прошлого кадра: по ней мышь и IME
 /// переводят пиксели в позиции текста и обратно.
@@ -92,27 +93,6 @@ impl LayoutCache {
     }
 }
 
-/// Строка для отрисовки: без перевода строки, табы развёрнуты в пробелы.
-fn display_line(text: &Rope, line: usize) -> (String, Vec<usize>) {
-    let slice = text.slice(line_start(text, line)..line_end(text, line));
-    let mut display = String::with_capacity(slice.len_bytes());
-    let mut char_to_byte = Vec::with_capacity(slice.len_chars() + 1);
-    let mut column = 0;
-    for c in slice.chars() {
-        char_to_byte.push(display.len());
-        if c == '\t' {
-            let spaces = theme::TAB_WIDTH - column % theme::TAB_WIDTH;
-            display.extend(std::iter::repeat_n(' ', spaces));
-            column += spaces;
-        } else {
-            display.push(c);
-            column += 1;
-        }
-    }
-    char_to_byte.push(display.len());
-    (display, char_to_byte)
-}
-
 pub struct EditorElement {
     editor: Entity<Editor>,
 }
@@ -174,6 +154,8 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> PrepaintState {
+        let theme = Theme::get(cx);
+        let ui = theme.ui;
         let editor = self.editor.read(cx);
         let text = editor.document.text().clone();
         let selection = editor.document.selection().clone();
@@ -226,15 +208,17 @@ impl Element for EditorElement {
             strikethrough: None,
         };
 
+        // Подсветка видимых строк: символьные колонки → байты отображаемой строки.
+        let highlights = editor
+            .highlighter
+            .highlight_lines(&text, first_line..last_line);
+        let base = run(0, ui.foreground);
         let mut lines = Vec::with_capacity(last_line - first_line);
         let mut max_width = px(0.);
-        for line in first_line..last_line {
+        for (i, line) in (first_line..last_line).enumerate() {
             let (display, char_to_byte) = display_line(&text, line);
-            let runs = if display.is_empty() {
-                vec![]
-            } else {
-                vec![run(display.len(), theme::foreground())]
-            };
+            let spans = highlights.get(i).map_or(&[][..], Vec::as_slice);
+            let runs = text_runs(spans, &char_to_byte, &base, |h| theme.syntax_style(h));
             let shaped = text_system.shape_line(display.into(), font_size, &runs, None);
             max_width = max_width.max(shaped.width);
             lines.push(LineLayout {
@@ -273,7 +257,7 @@ impl Element for EditorElement {
                     point(bounds.left(), layout.line_top(head_line)),
                     size(bounds.size.width, line_height),
                 ),
-                theme::current_line(),
+                ui.current_line,
             )
         });
 
@@ -304,7 +288,7 @@ impl Element for EditorElement {
                         point(layout.origin.x + x0, top),
                         point(layout.origin.x + x1, top + line_height),
                     ),
-                    theme::selection(),
+                    ui.selection,
                 ));
             }
         }
@@ -319,7 +303,7 @@ impl Element for EditorElement {
                     point(start.left(), start.bottom() - px(2.)),
                     point(end.left(), end.bottom() - px(1.)),
                 ),
-                theme::foreground(),
+                ui.foreground,
             ));
         }
 
@@ -334,7 +318,7 @@ impl Element for EditorElement {
                         point(layout.origin.x + x - px(1.), layout.line_top(line)),
                         size(px(2.), line_height),
                     ),
-                    theme::cursor(),
+                    ui.cursor,
                 ))
             })
             .collect();
@@ -343,9 +327,9 @@ impl Element for EditorElement {
             .map(|line| {
                 let number = (line + 1).to_string();
                 let color = if line == head_line {
-                    theme::foreground()
+                    ui.foreground
                 } else {
-                    theme::dim()
+                    ui.dim
                 };
                 let runs = [run(number.len(), color)];
                 let shaped = text_system.shape_line(number.into(), font_size, &runs, None);
@@ -378,7 +362,10 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus_handle = self.editor.read(cx).focus_handle.clone();
+        let editor = self.editor.read(cx);
+        let focus_handle = editor.focus_handle.clone();
+        // Курсоры — только в фокусе и в «видимой» фазе мигания.
+        let show_cursors = editor.cursor_visible && focus_handle.is_focused(window);
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.editor.clone()),
@@ -406,7 +393,7 @@ impl Element for EditorElement {
                 let origin = point(layout.origin.x, layout.line_top(layout.first_line + i));
                 line.shaped.paint(origin, line_height, window, cx).ok();
             }
-            if focus_handle.is_focused(window) {
+            if show_cursors {
                 for cursor in state.cursors.drain(..) {
                     window.paint_quad(cursor);
                 }

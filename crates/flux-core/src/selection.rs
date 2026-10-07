@@ -114,6 +114,11 @@ impl Selection {
         &self.ranges
     }
 
+    /// Число выделений (курсоров).
+    #[allow(
+        clippy::len_without_is_empty,
+        reason = "выделение никогда не пусто: is_empty всегда был бы false"
+    )]
     pub fn len(&self) -> usize {
         self.ranges.len()
     }

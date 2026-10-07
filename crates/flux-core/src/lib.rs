@@ -10,7 +10,7 @@ pub mod selection;
 pub mod text;
 pub mod transaction;
 
-pub use document::{Document, EditKind};
+pub use document::{Document, EditKind, TextChange};
 pub use ropey::{Rope, RopeSlice};
 pub use selection::{Range, Selection};
 pub use transaction::{Assoc, ChangeSet, Transaction};

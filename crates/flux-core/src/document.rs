@@ -10,7 +10,7 @@ use ropey::Rope;
 use crate::history::{History, Revision};
 use crate::selection::Selection;
 use crate::text::detect_line_ending;
-use crate::transaction::Transaction;
+use crate::transaction::{ChangeSet, Transaction};
 
 /// Правки одного вида, сделанные быстро и подряд, отменяются вместе.
 const COALESCE_WINDOW: Duration = Duration::from_secs(1);
@@ -22,6 +22,16 @@ pub enum EditKind {
     Delete,
     /// Никогда не склеивается: вставка из буфера, перевод строки и т.п.
     Other,
+}
+
+/// Изменение текста документа — для тех, кто следит за текстом со стороны
+/// (подсветка синтаксиса, в будущем LSP): `changes`, применённый к `old_text`,
+/// даёт текст после изменения.
+#[derive(Debug, Clone)]
+pub struct TextChange {
+    /// Текст до изменения (клон rope — O(1)).
+    pub old_text: Rope,
+    pub changes: ChangeSet,
 }
 
 #[derive(Debug)]
@@ -113,19 +123,24 @@ impl Document {
         });
     }
 
-    /// Применяет правку и записывает её в историю.
-    pub fn apply(&mut self, transaction: Transaction, kind: EditKind) {
+    /// Применяет правку и записывает её в историю. `None` — текст не изменился
+    /// (правка двигала только выделение).
+    pub fn apply(&mut self, transaction: Transaction, kind: EditKind) -> Option<TextChange> {
         let selection_before = self.selection.clone();
         let Transaction { changes, selection } = transaction;
         let selection_after = selection.unwrap_or_else(|| selection_before.map(&changes));
 
         if changes.is_empty() {
             self.selection = selection_after;
-            return;
+            return None;
         }
 
         let inversion = Transaction::new(changes.invert(&self.text))
             .with_selection(selection_before.clone());
+        let change = TextChange {
+            old_text: self.text.clone(),
+            changes: changes.clone(),
+        };
         changes.apply(&mut self.text);
         self.selection = selection_after.clone();
 
@@ -148,32 +163,39 @@ impl Document {
             at: now,
             selection_after,
         });
+        Some(change)
     }
 
-    pub fn undo(&mut self) -> bool {
-        let Some(txs) = self.history.undo() else {
-            return false;
-        };
-        self.replay(txs);
-        true
+    /// Отменяет последнюю группу правок. Изменения текста — по одному на ревизию,
+    /// в порядке применения. `None` — отменять нечего.
+    pub fn undo(&mut self) -> Option<Vec<TextChange>> {
+        let txs = self.history.undo()?;
+        Some(self.replay(txs))
     }
 
-    pub fn redo(&mut self) -> bool {
-        let Some(txs) = self.history.redo() else {
-            return false;
-        };
-        self.replay(txs);
-        true
+    /// Повторяет отменённую группу правок; `None` — повторять нечего.
+    pub fn redo(&mut self) -> Option<Vec<TextChange>> {
+        let txs = self.history.redo()?;
+        Some(self.replay(txs))
     }
 
-    fn replay(&mut self, txs: Vec<Transaction>) {
+    fn replay(&mut self, txs: Vec<Transaction>) -> Vec<TextChange> {
+        let mut changes = Vec::with_capacity(txs.len());
         for tx in txs {
-            tx.changes.apply(&mut self.text);
+            if !tx.changes.is_empty() {
+                let old_text = self.text.clone();
+                tx.changes.apply(&mut self.text);
+                changes.push(TextChange {
+                    old_text,
+                    changes: tx.changes,
+                });
+            }
             if let Some(selection) = tx.selection {
                 self.selection = selection;
             }
         }
         self.last_edit = None;
+        changes
     }
 
     /// Сохраняет атомарно: пишет во временный файл рядом и переименовывает.
@@ -215,6 +237,7 @@ impl Document {
 mod tests {
     use super::*;
     use crate::edit;
+    use crate::selection::Range;
 
     fn type_str(doc: &mut Document, s: &str) {
         for c in s.chars() {
@@ -223,15 +246,63 @@ mod tests {
         }
     }
 
+    /// `changes` по очереди от `old_text` первого шага дают текст `after`,
+    /// а `old_text` каждого шага — текст перед этим шагом.
+    fn check_changes(before: &Rope, changes: &[TextChange], after: &Rope) {
+        let mut text = before.clone();
+        for change in changes {
+            assert_eq!(change.old_text, text);
+            change.changes.apply(&mut text);
+        }
+        assert_eq!(&text, after);
+    }
+
+    #[test]
+    fn text_changes_describe_edit_undo_and_redo() {
+        let mut doc = Document::from_text("один\nдва");
+        let before = doc.text().clone();
+        let cursors = Selection::new(vec![Range::point(0), Range::point(5)], 0);
+        let change = doc.apply(
+            edit::insert_text(doc.text(), &cursors, "- "),
+            EditKind::Other,
+        );
+        check_changes(&before, &[change.unwrap()], doc.text());
+        assert_eq!(doc.text(), "- один\n- два");
+
+        // Правка одного выделения текст не меняет.
+        let only_selection = Transaction::new(ChangeSet::identity(doc.text().len_chars()))
+            .with_selection(Selection::point(0));
+        assert!(doc.apply(only_selection, EditKind::Other).is_none());
+
+        // Группа undo из нескольких ревизий: подряд набранные символы.
+        type_str(&mut doc, "abc");
+        let typed = doc.text().clone();
+        let changes = doc.undo().unwrap();
+        assert_eq!(changes.len(), 3);
+        check_changes(&typed, &changes, doc.text());
+        assert_eq!(doc.text(), "- один\n- два");
+
+        let undone = doc.text().clone();
+        let changes = doc.redo().unwrap();
+        assert_eq!(changes.len(), 3);
+        check_changes(&undone, &changes, doc.text());
+        assert_eq!(doc.text(), &typed);
+        assert!(doc.redo().is_none());
+
+        while doc.undo().is_some() {}
+        assert_eq!(doc.text(), "один\nдва");
+        assert!(doc.undo().is_none());
+    }
+
     #[test]
     fn undo_groups_typing() {
         let mut doc = Document::from_text("");
         type_str(&mut doc, "hello");
         assert_eq!(doc.text(), "hello");
-        assert!(doc.undo());
+        assert!(doc.undo().is_some());
         assert_eq!(doc.text(), "");
         assert_eq!(doc.selection().primary().head, 0);
-        assert!(doc.redo());
+        assert!(doc.redo().is_some());
         assert_eq!(doc.text(), "hello");
         assert_eq!(doc.selection().primary().head, 5);
     }
@@ -255,7 +326,7 @@ mod tests {
         type_str(&mut doc, "a");
         doc.undo();
         type_str(&mut doc, "b");
-        assert!(!doc.redo());
+        assert!(doc.redo().is_none());
         assert_eq!(doc.text(), "b");
     }
 

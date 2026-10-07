@@ -1,29 +1,34 @@
+mod display;
 mod editor;
 mod element;
+mod highlighter;
+#[cfg(feature = "scenario")]
+mod scenario;
 mod theme;
+mod workspace;
 
-use std::path::PathBuf;
+use std::path::{PathBuf, absolute};
 
-use flux_core::Document;
 use gpui::{
-    App, AppContext, Application, Bounds, Focusable, TitlebarOptions, WindowBounds, WindowOptions,
-    px, size,
+    App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };
 
-use editor::{AfterClose, Editor};
+use theme::Theme;
+use workspace::Workspace;
 
 fn main() {
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
-    let document = match &path {
-        Some(path) => Document::open(path).unwrap_or_else(|err| {
-            eprintln!("flux: cannot open {}: {err}", path.display());
-            std::process::exit(1);
-        }),
-        None => Document::from_text(""),
-    };
+    // `flux [пути...]`. Пути абсолютные: по ним сравниваются вкладки и различаются
+    // одноимённые файлы из разных каталогов.
+    let paths: Vec<PathBuf> = std::env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .map(|path| absolute(&path).unwrap_or(path))
+        .collect();
 
     Application::new().run(move |cx: &mut App| {
+        cx.set_global(Theme::github_dark());
         editor::bind_keys(cx);
+        workspace::init(cx);
 
         let bounds = Bounds::centered(None, size(px(1100.), px(750.)), cx);
         let options = WindowOptions {
@@ -34,20 +39,13 @@ fn main() {
             }),
             ..Default::default()
         };
-        cx.open_window(options, |window, cx| {
-            let editor = cx.new(|cx| Editor::new(document, cx));
-            window.focus(&editor.focus_handle(cx));
-
-            // Красная кнопка окна тоже спрашивает про несохранённые изменения.
-            let guarded = editor.clone();
-            window.on_window_should_close(cx, move |window, cx| {
-                guarded.update(cx, |editor, cx| {
-                    editor.request_close(AfterClose::CloseWindow, window, cx)
-                })
-            });
-            editor
-        })
-        .expect("failed to open window");
+        let _window = cx
+            .open_window(options, |window, cx| {
+                cx.new(|cx| Workspace::new(paths, window, cx))
+            })
+            .expect("failed to open window");
+        #[cfg(feature = "scenario")]
+        scenario::run(_window.into(), cx);
 
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {

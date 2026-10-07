@@ -8,7 +8,13 @@ license.workspace = true
 name = "flux"
 path = "src/main.rs"
 
+[features]
+# Сценарии проверки UI для агентов: нажатия и автоответы диалогов из переменных
+# окружения (`src/scenario.rs`, обвязка — `scripts/ui-scenario.sh`).
+scenario = []
+
 [dependencies]
 anyhow = "1.0.104"
 flux-core.workspace = true
+flux-syntax.workspace = true
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
