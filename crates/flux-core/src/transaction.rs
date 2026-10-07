@@ -188,6 +188,46 @@ impl ChangeSet {
         }
         new + pos.saturating_sub(old)
     }
+
+    /// То же, что [`map_pos`](Self::map_pos) для каждой позиции, но за один проход по
+    /// изменению: O(операций + позиций). Позиции должны идти по неубыванию, а равные — сначала
+    /// с `Assoc::Before` (так идут концы и начала соседних диапазонов: конец — `Before`,
+    /// следующее начало — `After`).
+    pub fn map_sorted(&self, positions: impl IntoIterator<Item = (usize, Assoc)>) -> Vec<usize> {
+        let mut mapped = Vec::new();
+        let (mut i, mut old, mut new) = (0, 0, 0);
+        'positions: for (pos, assoc) in positions {
+            while let Some(op) = self.ops.get(i) {
+                match op {
+                    Operation::Retain(n) => {
+                        if pos < old + n {
+                            mapped.push(new + (pos - old));
+                            continue 'positions;
+                        }
+                        old += n;
+                        new += n;
+                    }
+                    Operation::Delete(n) => {
+                        if pos < old + n {
+                            mapped.push(new);
+                            continue 'positions;
+                        }
+                        old += n;
+                    }
+                    Operation::Insert(s) => {
+                        if pos == old && assoc == Assoc::Before {
+                            mapped.push(new);
+                            continue 'positions;
+                        }
+                        new += s.chars().count();
+                    }
+                }
+                i += 1;
+            }
+            mapped.push(new + pos.saturating_sub(old));
+        }
+        mapped
+    }
 }
 
 /// Изменение текста вместе с выделением, которое должно получиться после него.
@@ -292,6 +332,49 @@ mod tests {
         let cs = ChangeSet::from_changes(10, vec![(2, 6, Some("ab".into()))]);
         assert_eq!(cs.map_pos(6, Assoc::After), 4);
         assert_eq!(cs.map_pos(2, Assoc::Before), 2);
+    }
+
+    #[test]
+    fn map_sorted_agrees_with_map_pos() {
+        // Детерминированный «случайный» набор правок и позиций.
+        let mut seed = 0x2545_f491_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..200 {
+            let len = 1 + next(40);
+            let mut changes = Vec::new();
+            let mut at = 0;
+            while at < len && changes.len() < 6 {
+                let from = at + next(len - at + 1);
+                let to = (from + next(4)).min(len);
+                let text = (next(3) > 0).then(|| "x".repeat(next(4)));
+                changes.push((from, to, text));
+                at = to + 1;
+            }
+            let cs = ChangeSet::from_changes(len, changes);
+            // Диапазоны по возрастанию: начало — After, конец — Before.
+            let mut positions = Vec::new();
+            let mut pos = 0;
+            while pos < len {
+                let start = pos + next(3);
+                let end = (start + 1 + next(5)).min(len + 1);
+                if start >= end || end > len {
+                    break;
+                }
+                positions.push((start, Assoc::After));
+                positions.push((end, Assoc::Before));
+                pos = end;
+            }
+            let expected: Vec<usize> = positions
+                .iter()
+                .map(|&(pos, assoc)| cs.map_pos(pos, assoc))
+                .collect();
+            assert_eq!(cs.map_sorted(positions.iter().copied()), expected, "{cs:?}");
+        }
     }
 
     #[test]

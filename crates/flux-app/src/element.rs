@@ -5,12 +5,12 @@ use flux_core::Rope;
 use flux_core::text::{line_len, line_start};
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point, ShapedLine, Style,
+    Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point, ShapedLine, Style,
     TextRun, Window, fill, font, point, px, relative, size,
 };
 
 use crate::display::{display_line, text_runs};
-use crate::editor::Editor;
+use crate::editor::{Autoscroll, Editor};
 use crate::theme::{self, Theme};
 
 /// Раскладка видимой части с прошлого кадра: по ней мышь и IME
@@ -107,7 +107,8 @@ pub struct PrepaintState {
     layout: Option<LayoutCache>,
     gutter: Vec<(ShapedLine, Point<Pixels>)>,
     current_line: Option<PaintQuad>,
-    /// Выделения и подчёркивание IME — рисуются под текстом, в пределах области текста.
+    /// Найденное поиском, выделения и подчёркивание IME — рисуются под текстом, в пределах
+    /// области текста.
     highlights: Vec<PaintQuad>,
     cursors: Vec<PaintQuad>,
 }
@@ -184,15 +185,23 @@ impl Element for EditorElement {
         let primary = selection.primary();
         let head_line = text.char_to_line(primary.head);
 
-        // Вертикальный автоскролл: держим курсор в окне с запасом в несколько строк.
-        if autoscroll {
-            let margin = (theme::SCROLL_MARGIN_LINES as f32 * lh).min((height - lh) / 2.).max(0.);
-            let top = head_line as f32 * lh;
-            if top - margin < scroll.y {
-                scroll.y = top - margin;
-            } else if top + lh + margin > scroll.y + height {
-                scroll.y = top + lh + margin - height;
+        // Вертикальный автоскролл: держим курсор в окне с запасом в несколько строк, а при
+        // переходе к найденному — ставим невидимую строку в середину.
+        let top = head_line as f32 * lh;
+        match autoscroll {
+            Some(Autoscroll::Fit) => {
+                let margin =
+                    (theme::SCROLL_MARGIN_LINES as f32 * lh).min((height - lh) / 2.).max(0.);
+                if top - margin < scroll.y {
+                    scroll.y = top - margin;
+                } else if top + lh + margin > scroll.y + height {
+                    scroll.y = top + lh + margin - height;
+                }
             }
+            Some(Autoscroll::Center) if top < scroll.y || top + lh > scroll.y + height => {
+                scroll.y = top - (height - lh) / 2.;
+            }
+            Some(Autoscroll::Center) | None => {}
         }
         scroll.y = scroll.y.clamp(0., (total_lines - 1) as f32 * lh);
 
@@ -229,7 +238,9 @@ impl Element for EditorElement {
 
         // Горизонтальный автоскролл — после раскладки строки, когда известен x курсора.
         let visible_width = f32::from(text_bounds.size.width) - theme::TEXT_PADDING * 2.;
-        if autoscroll && let Some(layout) = lines.get(head_line.wrapping_sub(first_line)) {
+        if autoscroll.is_some()
+            && let Some(layout) = lines.get(head_line.wrapping_sub(first_line))
+        {
             let x = f32::from(layout.x_for_column(primary.head - line_start(&text, head_line)));
             let margin = f32::from(em) * 4.;
             if x < scroll.x {
@@ -263,8 +274,9 @@ impl Element for EditorElement {
 
         let mut highlights = Vec::new();
         let newline_width = em * 0.5;
-        for range in selection.iter().filter(|r| !r.is_empty()) {
-            let (from, to) = (range.from(), range.to());
+        // Квады диапазона `from..to` по видимым строкам; перевод строки внутри диапазона —
+        // «хвост» за концом строки.
+        let mut range_quads = |from: usize, to: usize, color: Hsla| {
             let from_line = text.char_to_line(from);
             let to_line = text.char_to_line(to);
             for line in from_line.max(first_line)..=to_line.min(last_line.saturating_sub(1)) {
@@ -288,9 +300,34 @@ impl Element for EditorElement {
                         point(layout.origin.x + x0, top),
                         point(layout.origin.x + x1, top + line_height),
                     ),
-                    ui.selection,
+                    color,
                 ));
             }
+        };
+
+        // Найденное поиском — только пересекающее видимые строки. Текущее вхождение — поверх
+        // выделения (обычно оно и выделено): иначе синий выделения смешивается с его цветом.
+        let search = &editor.search;
+        let visible_start = line_start(&text, first_line);
+        let visible_end = if last_line < total_lines {
+            line_start(&text, last_line)
+        } else {
+            text.len_chars()
+        };
+        let first_match = search.matches.partition_point(|m| m.end <= visible_start);
+        for (i, m) in search.matches.iter().enumerate().skip(first_match) {
+            if m.start >= visible_end {
+                break;
+            }
+            if search.active != Some(i) {
+                range_quads(m.start, m.end, ui.search_match);
+            }
+        }
+        for range in selection.iter().filter(|r| !r.is_empty()) {
+            range_quads(range.from(), range.to(), ui.selection);
+        }
+        if let Some(m) = search.active.and_then(|i| search.matches.get(i)) {
+            range_quads(m.start, m.end, ui.search_match_active);
         }
         if let Some(marked) = marked_range
             && let (Some(start), Some(end)) = (
@@ -340,7 +377,7 @@ impl Element for EditorElement {
 
         self.editor.update(cx, |editor, _| {
             editor.scroll = scroll;
-            editor.autoscroll = false;
+            editor.autoscroll = None;
         });
 
         PrepaintState {

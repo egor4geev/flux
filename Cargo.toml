@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 flux-core = { path = "crates/flux-core" }
 flux-syntax = { path = "crates/flux-syntax" }
+flux-search = { path = "crates/flux-search" }
 tree-sitter = "0.27.0"
 tree-sitter-bash = "0.25.1"
 tree-sitter-go = "0.25.0"
@@ -45,4 +46,27 @@ opt-level = 3
 [profile.dev.package.tree-sitter-typescript]
 opt-level = 3
 [profile.dev.package.tree-sitter-yaml]
+opt-level = 3
+
+# Поиск (flux-search): движок регулярных выражений, поиск подстрок и нечёткий поиск.
+# В отладочной сборке без оптимизаций они в 10–15 раз медленнее: поиск в файле на
+# 50 тыс. строк — 10 мс вместо 1, сопоставление 36 тыс. путей — 20–30 мс на букву.
+# regex-automata, aho-corasick и memchr нужны и gpui — один раз пересоберутся зависимые.
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+[profile.dev.package.memchr]
+opt-level = 3
+[profile.dev.package.grep-searcher]
+opt-level = 3
+[profile.dev.package.grep-regex]
+opt-level = 3
+[profile.dev.package.grep-matcher]
+opt-level = 3
+[profile.dev.package.nucleo]
+opt-level = 3
+[profile.dev.package.nucleo-matcher]
 opt-level = 3

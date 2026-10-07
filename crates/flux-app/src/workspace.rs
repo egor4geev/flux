@@ -6,20 +6,25 @@ use std::path::{Path, PathBuf};
 
 use flux_core::Document;
 use gpui::{
-    Action, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    Global, Hsla, KeyBinding, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions,
-    PromptLevel, Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
-    WindowHandle, actions, div, prelude::*, px,
+    Action, AnyView, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, DismissEvent, Entity,
+    FocusHandle, Focusable, Global, Hsla, KeyBinding, ManagedView, MouseButton, MouseDownEvent,
+    MouseUpEvent, PathPromptOptions, PromptLevel, Render, ScrollHandle, SharedString, Subscription,
+    Task, WeakEntity, Window, WindowHandle, actions, div, prelude::*, px,
 };
 
 use crate::editor::Editor;
+use crate::find_bar::{self, FindBar};
+use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
 use crate::theme::{self, Theme, UiColors};
+use crate::{command_palette, file_finder, go_to_line};
 
 /// Высота полосы вкладок — примерно как у статус-бара.
 const TAB_BAR_HEIGHT: f32 = 28.;
 const TAB_TEXT_SIZE: f32 = 12.;
 /// Длинные имена файлов и каталогов на вкладке сокращаются посередине.
 const TAB_LABEL_MAX_CHARS: usize = 32;
+/// Отступ всплывающего окна (палитра, поиск файла) от верха окна.
+const MODAL_TOP: f32 = TAB_BAR_HEIGHT + 24.;
 
 actions!(
     workspace,
@@ -67,8 +72,20 @@ fn bind_keys(cx: &mut App) {
     );
 }
 
-/// Корневой вид окна: вкладки (по редактору на документ) и активная из них.
+/// Место в файле для перехода: строка с нуля и колонки в символах, выделяется `start..end`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub path: PathBuf,
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Корневой вид окна: вкладки (по редактору на документ) и активная из них, панели поиска,
+/// всплывающие окна.
 pub struct Workspace {
+    /// Корень проекта: по нему ищут файлы (cmd-p) и текст (cmd-shift-f).
+    root: Option<PathBuf>,
     tabs: Vec<Tab>,
     active: usize,
     /// Фокус пустого окна: без него не сработали бы cmd-o, cmd-n, cmd-w и cmd-q.
@@ -83,12 +100,29 @@ pub struct Workspace {
     /// Последние выставленные заголовок окна и признак «есть несохранённое».
     title: String,
     edited: bool,
+    /// Всплывающее окно поверх вкладок: палитра команд, поиск файла.
+    modal: Option<Modal>,
+    /// Строка поиска в документе (между вкладками и текстом).
+    find_bar: Entity<FindBar>,
+    /// Панель поиска по проекту (под текстом).
+    project_search: Entity<ProjectSearch>,
+    _subscriptions: Vec<Subscription>,
 }
 
 struct Tab {
     editor: Entity<Editor>,
     /// Полоса вкладок и заголовок окна перерисовываются при изменениях в редакторе.
     _observer: Subscription,
+}
+
+/// Всплывающее окно. Закрывается само (`DismissEvent`: Esc, выбор), щелчком мимо него,
+/// повторным вызовом того же окна или когда фокус ушёл из него (например, cmd-n открыл
+/// вкладку); фокус возвращается туда, где был до открытия.
+struct Modal {
+    view: AnyView,
+    focus_handle: FocusHandle,
+    previous_focus: Option<FocusHandle>,
+    _subscriptions: [Subscription; 2],
 }
 
 /// Откуда пришли пути — от этого зависит, куда сообщать об ошибках.
@@ -105,8 +139,16 @@ struct OpenError {
 }
 
 impl Workspace {
-    /// Окно с файлами из командной строки (читаются в фоне).
-    pub fn new(paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Окно проекта `root` с файлами из командной строки (читаются в фоне). `untitled` —
+    /// без файлов начать с безымянного документа (`flux` без аргументов); `flux .` открывает
+    /// пустое окно проекта.
+    pub fn new(
+        root: Option<PathBuf>,
+        paths: Vec<PathBuf>,
+        untitled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let this = cx.weak_entity();
         // Красная кнопка окна — то же, что cmd-shift-w.
         window.on_window_should_close(cx, move |window, cx| {
@@ -115,7 +157,25 @@ impl Workspace {
         });
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
+        let find_bar = cx.new(|cx| FindBar::new(window, cx));
+        let project_search = cx.new(|cx| ProjectSearch::new(root.clone(), window, cx));
+        // Панели открываются и закрываются сами (Esc, ×) — тогда меняется и раскладка окна.
+        let subscriptions = vec![
+            cx.observe(&find_bar, |_, _, cx| cx.notify()),
+            cx.observe(&project_search, |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                &project_search,
+                window,
+                |this, _, event, window, cx| match event {
+                    ProjectSearchEvent::Open { location, focus } => {
+                        this.open_location(location.clone(), *focus, window, cx)
+                    }
+                    ProjectSearchEvent::FocusEditor => this.focus_active(window, cx),
+                },
+            ),
+        ];
         let mut workspace = Self {
+            root,
             tabs: Vec::new(),
             active: 0,
             focus_handle,
@@ -125,16 +185,36 @@ impl Workspace {
             notice: None,
             title: String::new(),
             edited: false,
+            modal: None,
+            find_bar,
+            project_search,
+            _subscriptions: subscriptions,
         };
-        workspace.open_paths(paths, Source::CommandLine, window, cx);
+        if untitled || !paths.is_empty() {
+            workspace.open_paths(paths, Source::CommandLine, window, cx);
+        }
         workspace
+    }
+
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// Новый корень проекта (cmd-o с каталогом).
+    fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let root = fs::canonicalize(&root).unwrap_or(root);
+        self.project_search
+            .update(cx, |search, cx| search.set_root(Some(root.clone()), cx));
+        self.show_message(format!("Project: {}", tilde(&root)).into(), cx);
+        self.root = Some(root);
+        cx.notify();
     }
 
     fn editors(&self) -> Vec<Entity<Editor>> {
         self.tabs.iter().map(|tab| tab.editor.clone()).collect()
     }
 
-    fn active_editor(&self) -> Option<Entity<Editor>> {
+    pub(crate) fn active_editor(&self) -> Option<Entity<Editor>> {
         self.tabs.get(self.active).map(|tab| tab.editor.clone())
     }
 
@@ -149,10 +229,22 @@ impl Workspace {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
-        window.focus(&tab.editor.focus_handle(cx));
+        let editor = tab.editor.clone();
+        window.focus(&editor.focus_handle(cx));
         self.active = index;
         self.tab_scroll.scroll_to_item(index);
+        self.find_bar.update(cx, |bar, cx| {
+            bar.set_active_editor(Some(editor), window, cx)
+        });
         cx.notify();
+    }
+
+    /// Фокус — в активный редактор, а без вкладок — на само окно.
+    fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.active_editor() {
+            Some(editor) => window.focus(&editor.focus_handle(cx)),
+            None => window.focus(&self.focus_handle),
+        }
     }
 
     /// gpui прокручивает полосу к вкладке, только если полоса уже была нарисована; в её
@@ -218,6 +310,8 @@ impl Workspace {
         if self.tabs.is_empty() {
             self.active = 0;
             window.focus(&self.focus_handle);
+            self.find_bar
+                .update(cx, |bar, cx| bar.set_active_editor(None, window, cx));
             return cx.notify();
         }
         let active = if index < self.active {
@@ -230,10 +324,11 @@ impl Workspace {
 
     // --- Открытие ---
 
+    /// cmd-o: файлы открываются во вкладках, выбранный каталог становится корнем проекта.
     fn open(&mut self, _: &Open, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
-            directories: false,
+            directories: true,
             multiple: true,
             prompt: None,
         });
@@ -242,11 +337,72 @@ impl Workspace {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                this.open_paths(paths, Source::Dialog, window, cx)
+                let (dirs, files): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| p.is_dir());
+                if let Some(dir) = dirs.into_iter().last() {
+                    this.set_root(dir, cx);
+                }
+                this.open_paths(files, Source::Dialog, window, cx)
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Открывает файлы (как из cmd-o): уже открытые только активируются.
+    pub fn open_files(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_paths(paths, Source::Dialog, window, cx);
+    }
+
+    /// Открывает файл (или активирует его вкладку) и выделяет место в нём. `focus == false` —
+    /// фокус остаётся там, где был (например, в панели результатов поиска).
+    pub fn open_location(
+        &mut self,
+        location: Location,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_focus = window.focused(cx);
+        if self.activate_path(&location.path, window, cx) {
+            return self.reveal(&location, previous_focus.filter(|_| !focus), window, cx);
+        }
+        self.loading += 1;
+        let path = location.path.clone();
+        let read = cx
+            .background_executor()
+            .spawn(async move { read_document(path) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = read.await;
+            this.update_in(cx, |this, window, cx| {
+                this.loading -= 1;
+                this.finish_open(vec![result], Source::Dialog, window, cx);
+                if this.activate_path(&location.path, window, cx) {
+                    this.reveal(&location, previous_focus.filter(|_| !focus), window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Выделяет место в активном редакторе; `keep_focus` — куда вернуть фокус.
+    fn reveal(
+        &mut self,
+        location: &Location,
+        keep_focus: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.active_editor() {
+            editor.update(cx, |editor, cx| {
+                let start = editor.position(location.line, location.start);
+                let end = editor.position(location.line, location.end);
+                editor.select_range(start..end, cx);
+            });
+        }
+        if let Some(focus) = keep_focus {
+            window.focus(&focus);
+        }
     }
 
     /// Открывает файлы во вкладках по порядку. Уже открытые только активируются,
@@ -353,7 +509,7 @@ impl Workspace {
     }
 
     /// Сообщение пользователю: в статус-баре активного редактора, а в пустом окне — под подсказкой.
-    fn show_message(&mut self, message: SharedString, cx: &mut Context<Self>) {
+    pub(crate) fn show_message(&mut self, message: SharedString, cx: &mut Context<Self>) {
         match self.active_editor() {
             Some(editor) => editor.update(cx, |editor, cx| editor.show_status(message, cx)),
             None => {
@@ -441,17 +597,105 @@ impl Workspace {
         })
     }
 
+    /// cmd-f / cmd-alt-f: строка поиска для активной вкладки.
+    fn deploy_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.active_editor();
+        self.find_bar
+            .update(cx, |bar, cx| bar.deploy(replace, editor, window, cx));
+    }
+
+    // --- Всплывающие окна ---
+
+    /// Открывает всплывающее окно `V`; если оно уже открыто — закрывает. Другое открытое
+    /// окно заменяется. `build` вызывается до переноса фокуса: в нём `window.focused` — тот,
+    /// кто был в фокусе (палитре команд это нужно, чтобы собрать доступные ему действия).
+    pub fn toggle_modal<V: ManagedView>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+    ) {
+        if let Some(modal) = &self.modal
+            && modal.view.clone().downcast::<V>().is_ok()
+        {
+            return self.dismiss_modal(window, cx);
+        }
+        let previous_focus = match self.modal.take() {
+            Some(modal) => modal.previous_focus,
+            None => window.focused(cx),
+        };
+        let view = cx.new(|cx| build(window, cx));
+        let focus_handle = view.focus_handle(cx);
+        let subscriptions = [
+            cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
+                this.dismiss_modal(window, cx)
+            }),
+            cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
+                this.dismiss_modal(window, cx)
+            }),
+        ];
+        window.focus(&focus_handle);
+        self.modal = Some(Modal {
+            view: view.into(),
+            focus_handle,
+            previous_focus,
+            _subscriptions: subscriptions,
+        });
+        cx.notify();
+    }
+
+    /// Закрывает всплывающее окно. Фокус возвращается на прежнее место, только если он был
+    /// в окне: при щелчке мимо фокус уже ушёл туда, куда щёлкнули.
+    pub fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(modal) = self.modal.take() else {
+            return;
+        };
+        if modal.focus_handle.contains_focused(window, cx) || window.focused(cx).is_none() {
+            match (modal.previous_focus, self.active_editor()) {
+                (Some(previous), _) => window.focus(&previous),
+                (None, Some(editor)) => window.focus(&editor.focus_handle(cx)),
+                (None, None) => window.focus(&self.focus_handle),
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_modal(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+        let modal = self.modal.as_ref()?;
+        Some(
+            div()
+                .absolute()
+                .top(px(MODAL_TOP))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .on_mouse_down_out(
+                            cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)),
+                        )
+                        .child(modal.view.clone()),
+                ),
+        )
+    }
+
     // --- Отображение ---
 
-    /// Заголовок окна «● имя — flux» по активной вкладке и точка на красной кнопке, если есть
-    /// несохранённое. Платформу дёргаем, только когда что-то поменялось.
+    /// Заголовок окна «● имя — проект» по активной вкладке (без проекта — «— flux») и точка
+    /// на красной кнопке, если есть несохранённое. Платформу дёргаем, только когда что-то
+    /// поменялось.
     fn update_title(&mut self, window: &mut Window, cx: &App) {
-        let title = self.active_editor().map_or_else(
+        let project = self.root.as_deref().and_then(Path::file_name).map_or_else(
             || "flux".to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let title = self.active_editor().map_or_else(
+            || project.clone(),
             |editor| {
                 let document = &editor.read(cx).document;
                 let modified = if document.is_modified() { "● " } else { "" };
-                format!("{modified}{} — flux", document.display_name())
+                format!("{modified}{} — {project}", document.display_name())
             },
         );
         if title != self.title {
@@ -569,7 +813,15 @@ impl Workspace {
             .gap_2()
             .text_color(ui.dim)
             // Пока читаются файлы из командной строки, подсказку не показываем.
-            .when(self.loading == 0, |empty| empty.child("⌘O open · ⌘N new"))
+            .when(self.loading == 0, |empty| {
+                empty
+                    .child("⌘P find file · ⌘⇧F search · ⌘O open · ⌘N new")
+                    .children(
+                        self.root
+                            .as_deref()
+                            .map(|root| div().text_size(px(TAB_TEXT_SIZE)).child(tilde(root))),
+                    )
+            })
             .children(
                 self.notice
                     .clone()
@@ -584,6 +836,7 @@ impl Render for Workspace {
         let ui = Theme::ui(cx);
         let root = div()
             .key_context("Workspace")
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -604,15 +857,59 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &LastTab, window, cx| {
                 this.activate(this.tabs.len().saturating_sub(1), window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &command_palette::Toggle, window, cx| {
+                    command_palette::toggle(this, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &file_finder::Toggle, window, cx| {
+                file_finder::toggle(this, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &go_to_line::Toggle, window, cx| {
+                go_to_line::toggle(this, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &find_bar::Deploy, window, cx| {
+                this.deploy_find(false, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &find_bar::DeployReplace, window, cx| {
+                    this.deploy_find(true, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &find_bar::FindNext, window, cx| {
+                this.find_bar
+                    .update(cx, |bar, cx| bar.select_next(false, window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &find_bar::FindPrevious, window, cx| {
+                this.find_bar
+                    .update(cx, |bar, cx| bar.select_next(true, window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &project_search::Toggle, window, cx| {
+                let seed = this
+                    .active_editor()
+                    .and_then(|editor| editor.read(cx).search_seed());
+                this.project_search
+                    .update(cx, |search, cx| search.toggle(seed, window, cx))
             }));
-        match self.active_editor() {
+        // Сверху вниз: вкладки, строка поиска, текст, панель поиска по проекту, статус-бар.
+        let active = self.active_editor();
+        let root = match &active {
             Some(editor) => {
                 self.retry_tab_scroll(window, cx);
                 root.child(self.render_tab_bar(cx))
-                    .child(div().flex_1().min_h_0().child(editor))
+                    .when(self.find_bar.read(cx).is_open(), |root| {
+                        root.child(self.find_bar.clone())
+                    })
+                    .child(div().flex_1().min_h_0().child(editor.clone()))
             }
             None => root.child(self.render_empty(ui)),
-        }
+        };
+        root.when(self.project_search.read(cx).is_open(), |root| {
+            root.child(self.project_search.clone())
+        })
+        .children(active.map(|editor| editor.read(cx).render_status_bar(ui)))
+        .children(self.render_modal(cx))
     }
 }
 
@@ -721,10 +1018,11 @@ fn is_modified(editor: &Entity<Editor>, cx: &App) -> bool {
     editor.read(cx).document.is_modified()
 }
 
-/// Читает файл (в фоновом потоке). Каталоги пропускаем: проектов пока нет.
+/// Читает файл (в фоновом потоке). Каталог как файл не открывается: он может быть только
+/// корнем проекта.
 fn read_document(path: PathBuf) -> Result<Document, OpenError> {
     if path.is_dir() {
-        let reason = "is a directory, skipped (projects are not supported yet)".into();
+        let reason = "is a directory".into();
         return Err(OpenError { path, reason });
     }
     Document::open(&path).map_err(|err| OpenError {
@@ -745,6 +1043,19 @@ fn canonical(path: &Path) -> PathBuf {
     ) {
         (Some(dir), Some(name)) => dir.join(name),
         _ => path.to_path_buf(),
+    }
+}
+
+/// Путь для показа: домашний каталог — как `~`.
+pub(crate) fn tilde(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -906,6 +1217,14 @@ mod tests {
         assert_eq!(shorten("main.rs", 9), "main.rs");
         assert_eq!(shorten("abcdefghij.md", 9), "abcd…j.md");
         assert_eq!(shorten("абвгдеёжзий", 5), "аб…ий");
+    }
+
+    #[test]
+    fn home_is_shown_as_tilde() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(tilde(&home), "~");
+        assert_eq!(tilde(&home.join("dev/flux")), "~/dev/flux");
+        assert_eq!(tilde(Path::new("/opt/x")), "/opt/x");
     }
 
     #[test]

@@ -34,6 +34,22 @@ pub struct UiColors {
     /// Полоска сверху активной вкладки.
     pub tab_accent: Hsla,
     pub error: Hsla,
+    /// Фон панелей и всплывающих окон: строка поиска, поиск по проекту, палитра.
+    pub panel: Hsla,
+    pub input_background: Hsla,
+    pub input_border: Hsla,
+    /// Рамка поля ввода в фокусе.
+    pub focus_border: Hsla,
+    /// Строка списка под мышью и выбранная строка (палитра, поиск файла, результаты поиска).
+    pub list_hover: Hsla,
+    pub list_selected: Hsla,
+    /// Совпавшие символы в списках: нечёткий поиск, результаты поиска по проекту.
+    pub match_text: Hsla,
+    /// Фон найденных вхождений в тексте и текущего из них.
+    pub search_match: Hsla,
+    pub search_match_active: Hsla,
+    /// Фон включённого переключателя (Aa, ab, .*).
+    pub toggle_active: Hsla,
 }
 
 /// Как рисовать область подсветки.
@@ -147,6 +163,17 @@ impl Theme {
                 tab_bar: rgb(0x010409).into(),
                 tab_accent: rgb(0xf78166).into(),
                 error: rgb(0xf85149).into(),
+                panel: rgb(0x161b22).into(),
+                input_background: rgb(0x0d1117).into(),
+                input_border: rgb(0x30363d).into(),
+                focus_border: rgb(0x1f6feb).into(),
+                list_hover: rgba(0xb1bac41f).into(),
+                list_selected: rgba(0x388bfd40).into(),
+                match_text: rgb(0x58a6ff).into(),
+                // Как `editor.findMatch*` в теме GitHub Dark для VS Code.
+                search_match: rgba(0xf2cc6040).into(),
+                search_match_active: rgb(0x9e6a03).into(),
+                toggle_active: rgba(0x388bfd66).into(),
             },
             syntax: syntax
                 .into_iter()

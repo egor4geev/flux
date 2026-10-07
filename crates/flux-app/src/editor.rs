@@ -5,13 +5,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use flux_core::movement::{self, Direction};
-use flux_core::text::line_start;
-use flux_core::{Document, EditKind, Range, Rope, Selection, TextChange, Transaction, edit};
+use flux_core::text::{CharClass, char_class, line_len, line_start};
+use flux_core::{
+    Assoc, ChangeSet, Document, EditKind, Range, Rope, Selection, TextChange, Transaction, edit,
+};
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, FocusHandle, Focusable,
-    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection, Window, actions, div,
-    point, prelude::*, px,
+    App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, EventEmitter,
+    FocusHandle, Focusable, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
+    Point, Render, ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection, Window,
+    actions, div, point, prelude::*, px,
 };
 
 use crate::element::{EditorElement, LayoutCache};
@@ -110,6 +112,54 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
+/// События редактора — для тех, кто следит за ним со стороны (строка поиска).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorEvent {
+    /// Текст документа изменился: правка, вставка, IME, undo, redo.
+    Edited,
+}
+
+/// Как прокрутить к главному курсору при следующей отрисовке.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Autoscroll {
+    /// Держать курсор в окне с запасом в несколько строк — обычное движение и правка.
+    Fit,
+    /// Если строка курсора не видна — поставить её в середину окна: переход к найденному,
+    /// к строке, к результату поиска по проекту.
+    Center,
+}
+
+/// Вхождения, найденные строкой поиска: по возрастанию, без пересечений; `active` — текущее
+/// (рисуется ярче). Владеет ими редактор: он рисует их и сдвигает своими правками, пока не
+/// придут свежие результаты поиска.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchHighlights {
+    pub matches: Vec<std::ops::Range<usize>>,
+    pub active: Option<usize>,
+}
+
+impl SearchHighlights {
+    /// Сдвигает вхождения правкой; схлопнувшиеся до пустых убираются.
+    fn map(&mut self, changes: &ChangeSet) {
+        let positions = self
+            .matches
+            .iter()
+            .flat_map(|m| [(m.start, Assoc::After), (m.end, Assoc::Before)]);
+        let mapped = changes.map_sorted(positions);
+        let active = self.active.take();
+        let mut matches = Vec::with_capacity(self.matches.len());
+        for (i, &[start, end]) in mapped.as_chunks::<2>().0.iter().enumerate() {
+            if start < end {
+                if active == Some(i) {
+                    self.active = Some(matches.len());
+                }
+                matches.push(start..end);
+            }
+        }
+        self.matches = matches;
+    }
+}
+
 /// Вид одного документа: свои скролл, выделение и состояние IME.
 pub struct Editor {
     pub(crate) document: Document,
@@ -117,7 +167,7 @@ pub struct Editor {
     /// Смещение видимой области в пикселях.
     pub(crate) scroll: Point<f32>,
     /// Прокрутить к курсору при следующей отрисовке.
-    pub(crate) autoscroll: bool,
+    pub(crate) autoscroll: Option<Autoscroll>,
     /// Текст, который сейчас набирается через IME (ещё не подтверждён).
     pub(crate) marked_range: Option<std::ops::Range<usize>>,
     pub(crate) layout: Option<LayoutCache>,
@@ -129,8 +179,12 @@ pub struct Editor {
     blink_task: Option<Task<()>>,
     selecting: bool,
     status: Option<SharedString>,
+    /// Подсветка найденного строкой поиска.
+    pub(crate) search: SearchHighlights,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<EditorEvent> for Editor {}
 
 impl Editor {
     pub fn new(document: Document, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -151,7 +205,7 @@ impl Editor {
             document,
             focus_handle,
             scroll: point(0., 0.),
-            autoscroll: true,
+            autoscroll: Some(Autoscroll::Fit),
             marked_range: None,
             layout: None,
             highlighter,
@@ -159,6 +213,7 @@ impl Editor {
             blink_task: None,
             selecting: false,
             status: None,
+            search: SearchHighlights::default(),
             _subscriptions: subscriptions,
         };
         // Первый разбор — сразу в фон: заодно там скомпилируется запрос подсветки.
@@ -170,7 +225,7 @@ impl Editor {
         self.document.set_selection(selection);
         self.marked_range = None;
         self.status = None;
-        self.autoscroll = true;
+        self.autoscroll = Some(Autoscroll::Fit);
         self.pause_blink(cx);
         cx.notify();
     }
@@ -187,7 +242,7 @@ impl Editor {
             self.text_changed(&[change], cx);
         }
         self.status = None;
-        self.autoscroll = true;
+        self.autoscroll = Some(Autoscroll::Fit);
         self.pause_blink(cx);
         cx.notify();
     }
@@ -201,18 +256,23 @@ impl Editor {
         if let Some(changes) = step(&mut self.document) {
             self.text_changed(&changes, cx);
             self.marked_range = None;
-            self.autoscroll = true;
+            self.autoscroll = Some(Autoscroll::Fit);
             self.pause_blink(cx);
             cx.notify();
         }
     }
 
-    /// Текст изменился: подсветка сдвигает дерево и запускает разбор.
+    /// Текст изменился: подсветка сдвигает дерево и запускает разбор, найденное сдвигается
+    /// до прихода свежих результатов; подписчики узнают о правке.
     fn text_changed(&mut self, changes: &[TextChange], cx: &mut Context<Self>) {
         for change in changes {
             self.highlighter.edit(change);
+            if !self.search.matches.is_empty() {
+                self.search.map(&change.changes);
+            }
         }
         highlighter::parse(self, ParseMode::AfterEdit, cx);
+        cx.emit(EditorEvent::Edited);
     }
 
     fn edit(
@@ -270,6 +330,102 @@ impl Editor {
             Selection::point(primary.head)
         };
         self.set_selection(selection, cx);
+    }
+
+    // --- Поиск и переходы: их вызывают строка поиска, поиск по проекту, переход к строке ---
+
+    /// Подсвечивает найденные вхождения (по возрастанию, без пересечений).
+    pub fn set_search_highlights(
+        &mut self,
+        matches: Vec<std::ops::Range<usize>>,
+        active: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.search = SearchHighlights { matches, active };
+        cx.notify();
+    }
+
+    pub fn clear_search_highlights(&mut self, cx: &mut Context<Self>) {
+        if self.search != SearchHighlights::default() {
+            self.search = SearchHighlights::default();
+            cx.notify();
+        }
+    }
+
+    pub fn search_highlights(&self) -> &SearchHighlights {
+        &self.search
+    }
+
+    pub fn set_active_match(&mut self, active: Option<usize>, cx: &mut Context<Self>) {
+        if self.search.active != active {
+            self.search.active = active;
+            cx.notify();
+        }
+    }
+
+    /// Позиция по строке (с нуля) и колонке в символах; за краем — конец строки или документа.
+    pub fn position(&self, line: usize, column: usize) -> usize {
+        let text = self.document.text();
+        let line = line.min(text.len_lines() - 1);
+        line_start(text, line) + column.min(line_len(text, line))
+    }
+
+    /// Выделяет диапазон (курсор — в конце) и прокручивает к нему: если он не виден — к середине окна.
+    pub fn select_range(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        self.select_ranges(vec![range], 0, cx);
+    }
+
+    /// Несколько выделений разом (например, все найденные вхождения); к `primary` — прокрутка.
+    pub fn select_ranges(
+        &mut self,
+        ranges: Vec<std::ops::Range<usize>>,
+        primary: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if ranges.is_empty() {
+            return;
+        }
+        let ranges = ranges.into_iter().map(|r| Range::new(r.start, r.end)).collect();
+        self.set_selection(Selection::new(ranges, primary), cx);
+        self.autoscroll = Some(Autoscroll::Center);
+    }
+
+    /// Что искать по Cmd+F: главное выделение, если оно в одну строку, а без выделения — слово
+    /// под курсором.
+    pub fn search_seed(&self) -> Option<String> {
+        let text = self.document.text();
+        let primary = self.document.selection().primary();
+        let range = if primary.is_empty() {
+            let word = movement::word_range_at(text, primary.head);
+            let is_word = word.from() < text.len_chars()
+                && char_class(text.char(word.from())) == CharClass::Word;
+            if !is_word {
+                return None;
+            }
+            word
+        } else {
+            primary
+        };
+        let seed = text.slice(range.from()..range.to()).to_string();
+        let single_line = !seed.contains(['\n', '\r']);
+        (single_line && !seed.trim().is_empty()).then_some(seed)
+    }
+
+    /// Заменяет диапазоны текстами одной правкой — один шаг undo. Диапазоны — по возрастанию,
+    /// без пересечений.
+    pub fn replace_ranges(
+        &mut self,
+        edits: Vec<(std::ops::Range<usize>, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        if edits.is_empty() {
+            return;
+        }
+        let changes = edits
+            .into_iter()
+            .map(|(range, text)| (range.start, range.end, Some(text)));
+        let tx = Transaction::change(self.document.text(), changes);
+        self.apply(tx, EditKind::Other, cx);
     }
 
     // --- Буфер обмена ---
@@ -490,13 +646,14 @@ impl Editor {
         let delta = event.delta.pixel_delta(px(theme::LINE_HEIGHT));
         self.scroll.x -= f32::from(delta.x);
         self.scroll.y -= f32::from(delta.y);
-        self.autoscroll = false;
+        self.autoscroll = None;
         cx.notify();
     }
 
     // --- Отображение ---
 
-    fn status_bar(&self, ui: UiColors) -> impl IntoElement {
+    /// Статус-бар окна для этого редактора: рисует его Workspace внизу окна, под панелями.
+    pub(crate) fn render_status_bar(&self, ui: UiColors) -> impl IntoElement + use<> {
         let text = self.document.text();
         let primary = self.document.selection().primary();
         let line = text.char_to_line(primary.head);
@@ -805,7 +962,65 @@ impl Render for Editor {
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
                     .child(EditorElement::new(cx.entity())),
             )
-            .child(self.status_bar(ui))
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn highlights(matches: &[(usize, usize)], active: Option<usize>) -> SearchHighlights {
+        SearchHighlights {
+            matches: matches.iter().map(|&(start, end)| start..end).collect(),
+            active,
+        }
+    }
+
+    /// Правка документа длины `len`: `(from, to, вставка)`.
+    fn mapped(
+        search: &SearchHighlights,
+        len: usize,
+        changes: Vec<(usize, usize, Option<&str>)>,
+    ) -> SearchHighlights {
+        let changes = changes
+            .into_iter()
+            .map(|(from, to, text)| (from, to, text.map(str::to_string)));
+        let mut search = search.clone();
+        search.map(&ChangeSet::from_changes(len, changes));
+        search
+    }
+
+    #[test]
+    fn matches_shift_with_edits_before_them() {
+        // «ab foo cd foo»: вхождения foo — 3..6 и 10..13.
+        let search = highlights(&[(3, 6), (10, 13)], Some(1));
+        let got = mapped(&search, 13, vec![(0, 0, Some("xx"))]);
+        assert_eq!(got, highlights(&[(5, 8), (12, 15)], Some(1)));
+    }
+
+    #[test]
+    fn text_typed_at_match_edges_is_not_highlighted() {
+        let search = highlights(&[(3, 6)], Some(0));
+        let got = mapped(&search, 13, vec![(3, 3, Some("<")), (6, 6, Some(">"))]);
+        assert_eq!(got, highlights(&[(4, 7)], Some(0)));
+    }
+
+    #[test]
+    fn deleted_matches_disappear_and_active_follows_its_match() {
+        let search = highlights(&[(3, 6), (10, 13)], Some(1));
+        // Удалили первое вхождение целиком: текущее — теперь первое по счёту.
+        let got = mapped(&search, 13, vec![(2, 7, None)]);
+        assert_eq!(got, highlights(&[(5, 8)], Some(0)));
+        // Удалили текущее: текущего нет.
+        let got = mapped(&search, 13, vec![(9, 13, None)]);
+        assert_eq!(got, highlights(&[(3, 6)], None));
+    }
+
+    #[test]
+    fn edits_inside_a_match_resize_it() {
+        let search = highlights(&[(3, 6)], None);
+        let got = mapped(&search, 13, vec![(4, 5, Some("ooo"))]);
+        assert_eq!(got, highlights(&[(3, 8)], None));
+    }
+}
