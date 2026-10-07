@@ -1,0 +1,9 @@
+[package]
+name = "flux-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ropey = "1.6.1"
+unicode-segmentation = "1.13.3"
