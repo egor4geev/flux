@@ -1,10 +1,6 @@
 //! The start screen.
 
 pub(super) const STRINGS: &[(&str, &str)] = &[
-    (
-        "A fast, minimal code editor",
-        "Быстрый минималистичный редактор кода",
-    ),
     ("Toggle Project Tree", "Показать или скрыть дерево"),
     ("Start", "Начало"),
     ("Recent Projects", "Недавние проекты"),

@@ -1,3 +1,4 @@
+mod app_menu;
 mod command_palette;
 mod completion;
 mod context_menu;
@@ -76,6 +77,7 @@ fn main() {
             project_search::init(cx);
             settings::init(cx);
             settings_view::init(cx);
+            app_menu::init(cx);
             lsp::init(cx);
             diagnostics::init(cx);
             completion::init(cx);

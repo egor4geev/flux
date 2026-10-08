@@ -4,6 +4,7 @@ mod commands;
 mod common;
 mod completion;
 mod lsp;
+mod menu;
 mod navigation;
 mod pickers;
 mod search;
@@ -24,6 +25,7 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     lsp::STRINGS,
     navigation::STRINGS,
     settings::STRINGS,
+    menu::STRINGS,
     completion::STRINGS,
 ];
 

@@ -1,5 +1,6 @@
-//! The start screen, shown in a window with no open documents: the logo, the current project, quick
-//! actions with their shortcuts, and recent projects.
+//! The start screen, shown in a window with no open documents: the current project, quick actions
+//! with their shortcuts, and recent projects. The logo, version, and license live in Settings →
+//! About ([`crate::settings_view`]).
 //!
 //! Actions are dispatched to the window (`window.dispatch_action`), the same ones the keys trigger;
 //! a recent project is opened with the [`OpenProject`] action. The screen has no state: everything
@@ -9,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    Action, AnyElement, BoxShadow, Context, Div, FontWeight, Hsla, SharedString, Window, div, img,
+    Action, AnyElement, BoxShadow, Context, Div, FontWeight, Hsla, SharedString, Window, div,
     linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 
 use crate::i18n::tr;
-use crate::icons::{self, IconName, icon};
+use crate::icons::{IconName, icon};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_LG, RADIUS_MD};
 use crate::workspace::{self, OpenProject, Workspace, tilde};
@@ -30,8 +31,7 @@ const COLUMN_WIDTH: f32 = 300.;
 const RECENT_SHOWN: usize = 6;
 const ACTION_ROW_HEIGHT: f32 = 36.;
 const RECENT_ROW_HEIGHT: f32 = 44.;
-/// The logo tile and the action icon tiles.
-const LOGO_SIZE: f32 = 76.;
+/// The action icon tiles.
 const TILE_SIZE: f32 = 26.;
 /// Longer paths are shortened in the middle ("~/…/flux-dev/flux"): the gpui ellipsis does not work
 /// in rows with flexible width, and the end of a path matters more than its beginning.
@@ -164,7 +164,6 @@ pub fn render(screen: StartScreen, window: &mut Window, cx: &mut Context<Workspa
         .flex()
         .flex_col()
         .gap_7()
-        .child(hero(ui))
         .children(screen.notice.map(|notice| notice_banner(notice, ui)))
         .child(match screen.root {
             Some(root) => project_card(root, screen.branch, ui).into_any_element(),
@@ -180,8 +179,8 @@ pub fn render(screen: StartScreen, window: &mut Window, cx: &mut Context<Workspa
                 .child(column(tr("Start"), action_rows, ui))
                 .child(column(tr("Recent Projects"), recent, ui)),
         );
-    // The content is centered; if it does not fit in height, it scrolls (the `my_auto` margins
-    // shrink to zero).
+    // The content sits a little above the middle, where the eye expects it; if it does not fit in
+    // height, it scrolls (the spacers shrink to zero).
     div()
         .id("start-screen")
         .size_full()
@@ -192,8 +191,17 @@ pub fn render(screen: StartScreen, window: &mut Window, cx: &mut Context<Workspa
         .px_10()
         .py_10()
         .font_family(theme::UI_FONT)
-        .child(content.my_auto())
+        .child(spacer(2.))
+        .child(content)
+        .child(spacer(3.))
         .into_any_element()
+}
+
+/// Free space above and below the content, shared in proportion to `grow`.
+fn spacer(grow: f32) -> Div {
+    let mut spacer = div().flex_basis(px(0.));
+    spacer.style().flex_grow = Some(grow);
+    spacer
 }
 
 /// Shortcuts are taken from the previous frame's tree, so they are not there yet in the window's
@@ -204,79 +212,6 @@ fn request_frame_for_shortcuts(shortcuts: &[Option<SharedString>], window: &mut 
     if shortcuts.iter().all(Option::is_none) && !REQUESTED.swap(true, Ordering::Relaxed) {
         window.request_animation_frame();
     }
-}
-
-/// The logo on an accent gradient, the name, and the version.
-fn hero(ui: UiColors) -> Div {
-    // A tile like the app icon: dark glass, a highlight, a colored logo, and a soft glow.
-    let logo = div()
-        .relative()
-        .flex_none()
-        .size(px(LOGO_SIZE))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(LOGO_SIZE * 0.25))
-        .bg(linear_gradient(
-            180.,
-            linear_color_stop(ui.elevated, 0.),
-            linear_color_stop(UiColors::tint(ui.island, 1.), 1.),
-        ))
-        .border_1()
-        .border_color(ui.elevated_border)
-        .shadow(vec![
-            BoxShadow {
-                color: UiColors::tint(ui.accent, 0.30),
-                offset: point(px(0.), px(10.)),
-                blur_radius: px(32.),
-                spread_radius: px(-6.),
-            },
-            BoxShadow {
-                color: UiColors::tint(ui.shadow, 0.3),
-                offset: point(px(0.), px(2.)),
-                blur_radius: px(6.),
-                spread_radius: px(0.),
-            },
-        ])
-        .child(ui::sheen(ui, LOGO_SIZE * 0.25))
-        .child(img(icons::LOGO).size(px(LOGO_SIZE * 0.68)));
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap_4()
-        .child(logo)
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_size(px(theme::TEXT_DISPLAY))
-                                .font_weight(FontWeight::BOLD)
-                                .line_height(px(theme::TEXT_DISPLAY + 6.))
-                                .text_color(ui.foreground)
-                                .child("Flux"),
-                        )
-                        .child(ui::badge(
-                            concat!("v", env!("CARGO_PKG_VERSION")),
-                            ui.accent_text,
-                        )),
-                )
-                .child(
-                    div()
-                        .text_size(px(theme::TEXT_MD))
-                        .text_color(ui.text_muted)
-                        .child(tr("A fast, minimal code editor")),
-                ),
-        )
 }
 
 /// Card background: slightly lighter than the island.

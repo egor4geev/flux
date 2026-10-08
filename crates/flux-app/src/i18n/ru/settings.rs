@@ -1,4 +1,4 @@
-//! Settings: the window, the Language Servers section.
+//! Settings: the window, the Language Servers and About sections.
 
 pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Settings", "Настройки"),
@@ -32,4 +32,14 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Automatic installation is off: install it in Settings",
         "Автоустановка выключена: поставьте сервер в Настройках",
     ),
+    // About.
+    ("About", "О программе"),
+    (
+        "A fast, minimal code editor",
+        "Быстрый минималистичный редактор кода",
+    ),
+    ("Version", "Версия"),
+    ("License", "Лицензия"),
+    ("Developer", "Разработчик"),
+    ("Source code", "Исходный код"),
 ];

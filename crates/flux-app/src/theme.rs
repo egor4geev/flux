@@ -36,7 +36,7 @@ pub const TEXT_XS: f32 = 11.;
 pub const TEXT_SM: f32 = 12.;
 pub const TEXT_MD: f32 = 13.;
 pub const TEXT_LG: f32 = 15.;
-pub const TEXT_DISPLAY: f32 = 34.;
+pub const TEXT_XL: f32 = 20.;
 
 static CODE_FONT: OnceLock<&'static str> = OnceLock::new();
 
