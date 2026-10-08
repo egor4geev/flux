@@ -18,7 +18,7 @@ use crate::command_palette::keystroke_label;
 use crate::theme::{self, Theme};
 use crate::ui::{self, RADIUS_LG, RADIUS_SM};
 
-const MENU_MIN_WIDTH: f32 = 240.;
+pub const MENU_MIN_WIDTH: f32 = 240.;
 const ITEM_HEIGHT: f32 = 28.;
 /// Inset of the items from the menu edge; item corner radius = menu corner radius − inset.
 const MENU_PADDING: f32 = 5.;
@@ -45,6 +45,8 @@ enum Item {
 }
 
 pub struct ContextMenu {
+    /// A title above the items (the menu of version control operations).
+    title: Option<SharedString>,
     items: Vec<Item>,
     /// The item selected with the arrow keys; the mouse highlights its own item on its own.
     selected: Option<usize>,
@@ -61,11 +63,18 @@ impl ContextMenu {
     /// [`Self::separator`].
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
+            title: None,
             items: Vec::new(),
             selected: None,
             focus_handle: cx.focus_handle(),
             previous_focus: window.focused(cx),
         }
+    }
+
+    /// A title above the items.
+    pub fn title(mut self, title: impl Into<SharedString>) -> Self {
+        self.title = Some(title.into());
+        self
     }
 
     pub fn entry(self, label: impl Into<SharedString>, action: impl Action) -> Self {
@@ -257,6 +266,13 @@ impl Render for ContextMenu {
             .on_action(cx.listener(|_, _: &Cancel, _, cx| cx.emit(DismissEvent)))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
             .child(ui::sheen(ui, RADIUS_LG))
+            .children(self.title.clone().map(|title| {
+                div()
+                    .px_2p5()
+                    .pt_1()
+                    .pb_1p5()
+                    .child(ui::section_label(title, ui))
+            }))
             .children(items)
     }
 }

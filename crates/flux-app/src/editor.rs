@@ -199,6 +199,20 @@ pub struct Editor {
     pub(crate) diagnostics: crate::diagnostics::Diagnostics,
     pub(crate) completion: Option<crate::completion::CompletionMenu>,
     pub(crate) hover: crate::hover::HoverState,
+    /// Read-only: the HEAD side of a diff — selectable and copyable, not editable.
+    pub(crate) read_only: bool,
+    /// A commit message field: no gutter and no current line; the placeholder shows while it is
+    /// empty. `None` — a regular editor.
+    pub(crate) message: Option<SharedString>,
+    /// Git: the HEAD version of the document and the changed blocks against it (gutter markers).
+    pub(crate) git: crate::git_gutter::GitState,
+    /// What a host view draws over this editor for one frame (the diff viewer: changed blocks and
+    /// words): the host sets it before every render, the element takes it. An editor shown in its
+    /// own tab gets none.
+    pub(crate) frame_decorations: Option<std::rc::Rc<crate::diff_view::Decorations>>,
+    /// When the file was last written as far as this editor knows (opened, saved, reloaded): a
+    /// newer time on disk means someone else changed it.
+    pub(crate) disk_mtime: Option<std::time::SystemTime>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -231,6 +245,18 @@ impl Editor {
             }),
         ];
         Self::build(document, focus_handle, false, subscriptions, cx)
+    }
+
+    /// A commit message field: plain text in the code font, no gutter; `placeholder` shows while it
+    /// is empty.
+    pub fn message(
+        placeholder: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut editor = Self::new(Document::from_text(""), window, cx);
+        editor.message = Some(placeholder.into());
+        editor
     }
 
     /// A read-only preview: a document with highlighting, but no focus, cursor, or edits.
@@ -271,8 +297,14 @@ impl Editor {
             diagnostics: Default::default(),
             completion: None,
             hover: Default::default(),
+            read_only: false,
+            message: None,
+            git: Default::default(),
+            frame_decorations: None,
+            disk_mtime: None,
             _subscriptions: subscriptions,
         };
+        editor.disk_mtime = editor.document.path().and_then(file_mtime);
         // The first parse goes straight to the background, where the highlight query also gets
         // compiled.
         highlighter::parse(&mut editor, ParseMode::Background, cx);
@@ -308,6 +340,9 @@ impl Editor {
     }
 
     pub(crate) fn apply(&mut self, tx: Transaction, kind: EditKind, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if let Some(change) = self.document.apply(tx, kind) {
             self.text_changed(&[change], cx);
         }
@@ -323,6 +358,9 @@ impl Editor {
         cx: &mut Context<Self>,
         step: impl FnOnce(&mut Document) -> Option<Vec<TextChange>>,
     ) {
+        if self.read_only {
+            return;
+        }
         if let Some(changes) = step(&mut self.document) {
             self.text_changed(&changes, cx);
             self.marked_range = None;
@@ -345,6 +383,7 @@ impl Editor {
         crate::lsp::text_changed(self, changes);
         crate::completion::text_changed(self, changes);
         crate::hover::text_changed(self);
+        crate::git_gutter::text_changed(self, changes, cx);
         highlighter::parse(self, ParseMode::AfterEdit, cx);
         cx.emit(EditorEvent::Edited);
     }
@@ -583,6 +622,9 @@ impl Editor {
     /// Saves the document; without a path, goes through "Save As". The result can be awaited:
     /// `true` means the document was written to disk.
     pub fn save(&mut self, cx: &mut Context<Self>) -> Task<bool> {
+        if self.read_only || self.message.is_some() {
+            return Task::ready(false);
+        }
         if self.document.path().is_some() {
             Task::ready(self.save_now(cx))
         } else {
@@ -593,6 +635,7 @@ impl Editor {
     fn save_now(&mut self, cx: &mut Context<Self>) -> bool {
         let saved = match self.document.save() {
             Ok(()) => {
+                self.disk_mtime = self.document.path().and_then(file_mtime);
                 crate::lsp::saved(self);
                 self.status = Some(tr("Saved").into());
                 true
@@ -634,7 +677,40 @@ impl Editor {
         }
         self.document.set_path(path);
         crate::lsp::path_changed(self, cx);
+        crate::git_gutter::path_changed(self, cx);
         cx.notify();
+    }
+
+    /// Highlights the text as the language of `path` without binding the document to it: the HEAD
+    /// side of a diff looks like the file but is never saved.
+    pub fn set_highlight_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        if self.highlighter.set_path(path, self.document.text()) {
+            highlighter::parse(self, ParseMode::Background, cx);
+        }
+        cx.notify();
+    }
+
+    /// The file changed on disk: the text takes its content as one edit (⌘Z brings the old text
+    /// back) and the document counts as saved. `false` — the text was already the same.
+    pub fn reload(&mut self, content: &str, cx: &mut Context<Self>) -> bool {
+        if self.read_only {
+            return false;
+        }
+        self.disk_mtime = self.document.path().and_then(file_mtime);
+        let new = Rope::from_str(content);
+        let Some((range, text)) = crate::rename::difference(self.document.text(), &new) else {
+            return false;
+        };
+        // Neither the cursor nor the view jumps to the change: both stay where they were.
+        let selection = self.document.selection().clone();
+        let scroll = self.scroll;
+        self.replace_ranges(vec![(range, text)], cx);
+        self.document.set_selection(selection);
+        self.document.mark_saved();
+        self.scroll = scroll;
+        self.autoscroll = None;
+        cx.notify();
+        true
     }
 
     /// A status bar message, until the next edit or cursor movement.
@@ -696,7 +772,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        if crate::navigation::cmd_click(self, event, window, cx) {
+        if crate::navigation::cmd_click(self, event, window, cx)
+            || crate::git_gutter::mouse_down(self, event, window, cx)
+        {
             return;
         }
         let Some(pos) = self.position_for_mouse(event.position) else {
@@ -802,6 +880,11 @@ impl Editor {
     }
 }
 
+/// When a file was last modified; `None` if it can't be read.
+pub(crate) fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 impl EntityInputHandler for Editor {
     fn text_for_range(
         &mut self,
@@ -850,6 +933,9 @@ impl EntityInputHandler for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let kind = if new_text.contains('\n') {
             EditKind::Other
         } else {
@@ -879,6 +965,9 @@ impl EntityInputHandler for Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let primary = self.document.selection().primary();
         let range = self
             .input_range(range_utf16)
@@ -949,6 +1038,7 @@ impl Render for Editor {
         key_context.add("Editor");
         crate::completion::extend_key_context(self, &mut key_context);
         crate::hover::extend_key_context(self, window, &mut key_context);
+        crate::git_gutter::extend_key_context(self, &mut key_context);
         let root = div().key_context(key_context);
         // The preview doesn't take focus: otherwise a click on it would pull input away from the
         // search field.
@@ -1077,6 +1167,7 @@ impl Render for Editor {
             .map(|root| crate::diagnostics::actions(root, cx))
             .map(|root| crate::completion::actions(root, self, cx))
             .map(|root| crate::hover::actions(root, self, cx))
+            .map(|root| crate::git_gutter::actions(root, self, cx))
             .child(
                 div()
                     .flex_1()
@@ -1096,6 +1187,7 @@ impl Render for Editor {
             )
             .children(crate::completion::render(self, window, cx))
             .children(crate::hover::render(self, window, cx))
+            .children(crate::git_gutter::render(self, window, cx))
     }
 }
 

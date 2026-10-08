@@ -112,6 +112,12 @@ impl Document {
         self.history.state_id() != self.saved_state
     }
 
+    /// The text now matches the file: after it was reloaded from disk (the file changed outside).
+    pub fn mark_saved(&mut self) {
+        self.saved_state = self.history.state_id();
+        self.last_edit = None;
+    }
+
     pub fn set_selection(&mut self, selection: Selection) {
         let len = self.text.len_chars();
         self.selection = selection.transform(|range| {

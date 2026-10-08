@@ -3,6 +3,10 @@
 mod commands;
 mod common;
 mod completion;
+mod commit;
+mod diff;
+mod git;
+mod git_gutter;
 mod lsp;
 mod menu;
 mod navigation;
@@ -33,6 +37,10 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     terminal::STRINGS,
     terminal_search::STRINGS,
     terminal_panel::STRINGS,
+    git::STRINGS,
+    git_gutter::STRINGS,
+    diff::STRINGS,
+    commit::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов".

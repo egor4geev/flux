@@ -41,10 +41,6 @@ use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 use crate::workspace::tilde;
 
-/// Default panel width and the limits within which it can be dragged with the mouse.
-pub const DEFAULT_WIDTH: f32 = 260.;
-const MIN_WIDTH: f32 = 180.;
-const MAX_WIDTH: f32 = 600.;
 const ROW_HEIGHT: f32 = 26.;
 /// Title bar: the project label and icon buttons.
 const HEADER_HEIGHT: f32 = 40.;
@@ -175,6 +171,8 @@ pub enum FileTreeEvent {
     Removed { paths: Vec<PathBuf> },
     /// A message for the user (an operation error), shown in the status bar.
     Message(SharedString),
+    /// Files changed on disk (`None`: events were lost, anything may have): open documents follow.
+    DiskChanged(Option<Vec<PathBuf>>),
 }
 
 /// In-place name editing: a new file or directory, or a rename.
@@ -239,7 +237,8 @@ pub struct FileTreePanel {
     reveal_target: Option<PathBuf>,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
-    width: f32,
+    /// Shared with the commit window, which takes the tree's place in the left island.
+    width: ui::LeftIslandWidth,
     /// Reads in flight: the number of the latest request per directory.
     reads: HashMap<PathBuf, u64>,
     next_read: u64,
@@ -252,6 +251,9 @@ pub struct FileTreePanel {
     resizing: bool,
     _watcher: Option<Watcher>,
     _watch_task: Task<()>,
+    /// Git of the project: names are colored by their change (set by the workspace).
+    git: Option<Entity<crate::git::GitStore>>,
+    _git_subscription: Option<Subscription>,
 }
 
 impl EventEmitter<FileTreeEvent> for FileTreePanel {}
@@ -259,7 +261,12 @@ impl EventEmitter<FileTreeEvent> for FileTreePanel {}
 impl FileTreePanel {
     /// Panel for the project at `root` (a canonical path): reads the root right away and starts
     /// watching for changes on disk.
-    pub fn new(root: PathBuf, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        root: PathBuf,
+        width: ui::LeftIslandWidth,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let watch_task = Self::watch(root.clone(), cx);
         let mut panel = Self {
             tree: FileTree::new(root.clone()),
@@ -269,7 +276,7 @@ impl FileTreePanel {
             reveal_target: None,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
-            width: DEFAULT_WIDTH,
+            width,
             reads: HashMap::new(),
             next_read: 0,
             edit: None,
@@ -279,9 +286,18 @@ impl FileTreePanel {
             resizing: false,
             _watcher: None,
             _watch_task: watch_task,
+            git: None,
+            _git_subscription: None,
         };
         panel.changed(cx);
         panel
+    }
+
+    /// Git of the project: file and directory names follow their changes.
+    pub fn set_git(&mut self, git: Entity<crate::git::GitStore>, cx: &mut Context<Self>) {
+        self._git_subscription = Some(cx.observe(&git, |_, _, cx| cx.notify()));
+        self.git = Some(git);
+        cx.notify();
     }
 
     /// The active tab's file: expands the directories leading to it, selects it and scrolls to it.
@@ -423,6 +439,15 @@ impl FileTreePanel {
                 let refreshed = this.update(cx, |this, cx| {
                     let plan = this.tree.refresh_plan(&batch);
                     this.reread(plan, cx);
+                    let mut paths = Vec::new();
+                    let mut rescan = false;
+                    for change in &batch {
+                        match change {
+                            FsChange::Paths(changed) => paths.extend(changed.iter().cloned()),
+                            FsChange::Rescan => rescan = true,
+                        }
+                    }
+                    cx.emit(FileTreeEvent::DiskChanged((!rescan).then_some(paths)));
                 });
                 if refreshed.is_err() {
                     break;
@@ -1330,11 +1355,26 @@ impl FileTreePanel {
                 .child(body.child(self.render_edit_field(ui)))
                 .into_any_element();
         }
+        // Git: a changed file in its status color, a directory with changes inside in the modified
+        // one, a wholly untracked directory in the untracked one (as the Project view of JetBrains
+        // IDEs colors them).
+        let status = self.git.as_ref().and_then(|git| {
+            let git = git.read(cx);
+            match row.kind {
+                EntryKind::File => git.status_of(&row.path),
+                EntryKind::Dir => git.dir_status(&row.path),
+            }
+        });
+        let color = match status {
+            _ if muted => ui.dim,
+            Some(status) => crate::git::status_color(status, &ui),
+            None => ui.foreground,
+        };
         let name = div()
             .ml(px(NAME_GAP))
             .min_w_0()
             .truncate()
-            .text_color(if muted { ui.dim } else { ui.foreground })
+            .text_color(color)
             .child(row.name.clone());
         let (click, secondary) = (row.path.clone(), row.path.clone());
         let dragged = DraggedEntry {
@@ -1467,7 +1507,7 @@ impl Render for FileTreePanel {
             .track_focus(&self.focus_handle)
             .relative()
             .flex_none()
-            .w(px(self.width))
+            .w(px(self.width.get()))
             .h_full()
             .flex()
             .flex_col()
@@ -1551,7 +1591,7 @@ impl Render for FileTreePanel {
                     // the mouse without jumping.
                     let width = f32::from(event.event.position.x - event.bounds.left())
                         - RESIZE_HANDLE_OFFSET;
-                    this.width = width.clamp(MIN_WIDTH, MAX_WIDTH);
+                    this.width.set(width);
                     this.resizing = true;
                     cx.notify();
                 }),

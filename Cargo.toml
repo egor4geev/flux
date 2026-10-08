@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 flux-core = { path = "crates/flux-core" }
 flux-fs = { path = "crates/flux-fs" }
+flux-git = { path = "crates/flux-git" }
 flux-lsp = { path = "crates/flux-lsp" }
 flux-syntax = { path = "crates/flux-syntax" }
 flux-search = { path = "crates/flux-search" }

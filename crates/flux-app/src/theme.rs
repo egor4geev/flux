@@ -129,6 +129,29 @@ pub struct UiColors {
     pub search_match: Hsla,
     pub search_match_active: Hsla,
 
+    // --- Version control: a file's change against HEAD (names in the tree, tabs, the commit
+    // window), as JetBrains IDEs color them. ---
+    pub vcs_modified: Hsla,
+    pub vcs_added: Hsla,
+    pub vcs_deleted: Hsla,
+    pub vcs_renamed: Hsla,
+    /// Not tracked: "Unversioned Files".
+    pub vcs_untracked: Hsla,
+    pub vcs_conflict: Hsla,
+
+    // --- Diffs: markers in the editor's gutter (solid), blocks in the diff viewer (background),
+    // changed words inside a modified block (a stronger background). Added is green, modified blue,
+    // deleted gray, as in JetBrains IDEs. ---
+    pub diff_added: Hsla,
+    pub diff_modified: Hsla,
+    pub diff_deleted: Hsla,
+    pub diff_added_bg: Hsla,
+    pub diff_modified_bg: Hsla,
+    pub diff_deleted_bg: Hsla,
+    pub diff_added_word: Hsla,
+    pub diff_modified_word: Hsla,
+    pub diff_deleted_word: Hsla,
+
     // --- Shade palette: meaning, not decoration (file types, categories, counters). ---
     pub blue: Hsla,
     pub indigo: Hsla,
@@ -325,6 +348,23 @@ impl Theme {
                 match_text: rgb(0xaab2ff).into(),
                 search_match: rgba(0xffc56038).into(),
                 search_match_active: rgba(0xffc5608f).into(),
+
+                vcs_modified: rgb(0x6cb0ff).into(),
+                vcs_added: rgb(0x5fd38d).into(),
+                vcs_deleted: rgb(0x8a91ab).into(),
+                vcs_renamed: rgb(0x3cd3c4).into(),
+                vcs_untracked: rgb(0xe8806b).into(),
+                vcs_conflict: rgb(0xff6b6b).into(),
+
+                diff_added: rgb(0x3fb950).into(),
+                diff_modified: rgb(0x5aa9ff).into(),
+                diff_deleted: rgb(0x8b949e).into(),
+                diff_added_bg: rgba(0x3fb9501f).into(),
+                diff_modified_bg: rgba(0x5aa9ff1c).into(),
+                diff_deleted_bg: rgba(0x8b949e1f).into(),
+                diff_added_word: rgba(0x3fb95052).into(),
+                diff_modified_word: rgba(0x5aa9ff4d).into(),
+                diff_deleted_word: rgba(0x8b949e4d).into(),
 
                 blue: rgb(0x5aa9ff).into(),
                 indigo: rgb(INDIGO).into(),

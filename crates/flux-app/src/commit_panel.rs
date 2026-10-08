@@ -1,0 +1,2187 @@
+//! The commit window: the left island in place of the project tree (⌘0, ⌘K), as the Commit tool
+//! window of JetBrains IDEs.
+//!
+//! - The changed files of every repository: "Changes" and "Unversioned Files" (with several
+//!   repositories — under a node per repository with its branch), grouped by directory (or flat,
+//!   with the directory dimmed after the name). Checkboxes decide what the commit takes: a file
+//!   wholly, partly (only some of its changes — set in the diff viewer), or not at all; a group or a
+//!   directory checks everything inside. What is checked lives in `GitStore`, so the diff viewer and
+//!   this window agree.
+//! - The keyboard: ↑↓, ←→ (collapse, expand), Space (checkbox), ↵ / ⌘D / double click (diff), F4 /
+//!   ⌘↓ (open the file), ⌥⌘Z (rollback), ⇥ (to the message), Esc (back to the editor); the context
+//!   menu (right button, ⇧F10).
+//! - The message (the code font, history of recent messages), Amend (the last commit's message comes
+//!   into an empty field), "Commit" (⌘↵) and "Commit and Push…" (⌥⇧⌘K: the push dialog after).
+//!
+//! A commit first saves the open documents it takes, then commits each repository: a file checked
+//! partly goes in as its HEAD version with only the checked changes applied (`flux_git::apply_hunks`).
+//! A rollback asks first, then git puts the files back and the open documents follow (one undoable
+//! edit each, saved).
+
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashSet};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+use flux_core::Rope;
+use flux_git::{CommitContent, CommitFile, CommitRequest, FileStatus, Hunk};
+use gpui::{
+    Action, AnyElement, App, AsyncApp, ClickEvent, ClipboardItem, Context, CursorStyle,
+    DismissEvent, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    KeyBinding, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, Render, ScrollStrategy,
+    Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
+    uniform_list,
+};
+
+use crate::context_menu::ContextMenu;
+use crate::editor::{self, Editor};
+use crate::git::{self, Change, CheckState, GitEvent, GitStore};
+use crate::i18n::{tr, trf, trn};
+use crate::icons::{IconName, file_icon, folder_icon, icon};
+use crate::rename::difference;
+use crate::theme::{self, Theme, UiColors};
+use crate::ui::{self, RADIUS_MD, RADIUS_SM};
+
+const HEADER_HEIGHT: f32 = 40.;
+const ROW_HEIGHT: f32 = 26.;
+/// Rows are inset from the island's edges; the highlight is a rounded box inside the row.
+const ROW_INSET: f32 = 6.;
+const ROW_PADDING: f32 = 6.;
+const INDENT: f32 = 14.;
+const CHEVRON_WIDTH: f32 = 16.;
+const CHEVRON_SIZE: f32 = 12.;
+/// Height of the message field.
+const MESSAGE_HEIGHT: f32 = 112.;
+/// The width handle sits in the gap to the right of the island, as the tree's does.
+const RESIZE_HANDLE_WIDTH: f32 = ui::GAP;
+const RESIZE_HANDLE_OFFSET: f32 = 1. + RESIZE_HANDLE_WIDTH / 2.;
+/// How many recent messages the history offers.
+const HISTORY_LIMIT: usize = 20;
+/// A history item shows the first line of a message, shortened to this many characters.
+const HISTORY_ITEM_CHARS: usize = 60;
+/// How many file names a rollback question lists before "and N more".
+const LISTED_FILES: usize = 8;
+const ROW_GROUP: &str = "commit-row";
+
+// The list of changes (context "CommitChanges"): the message field is outside it, so Space and the
+// arrows keep typing there.
+actions!(
+    commit_panel,
+    [
+        SelectNext,
+        SelectPrevious,
+        SelectFirst,
+        SelectLast,
+        Expand,
+        Collapse,
+        ToggleChecked,
+        ShowDiff,
+        JumpToSource,
+        Rollback,
+        Delete,
+        CopyPath,
+        AddToGitignore,
+        ExpandAll,
+        CollapseAll,
+        ToggleGroupByDirectory,
+        ShowContextMenu,
+        FocusMessage,
+        Cancel,
+        Refresh,
+    ]
+);
+
+// The whole window (context "CommitPanel"): also from the message field.
+actions!(commit_panel, [CommitChanges, CommitAndPush, ToggleAmend]);
+
+/// Puts a message from the history into the field (by its index in the list).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = commit_panel, no_json)]
+pub struct UseMessage(pub usize);
+
+pub fn init(cx: &mut App) {
+    let list = Some("CommitChanges");
+    cx.bind_keys([
+        KeyBinding::new("down", SelectNext, list),
+        KeyBinding::new("up", SelectPrevious, list),
+        KeyBinding::new("home", SelectFirst, list),
+        KeyBinding::new("end", SelectLast, list),
+        KeyBinding::new("right", Expand, list),
+        KeyBinding::new("left", Collapse, list),
+        KeyBinding::new("space", ToggleChecked, list),
+        // As in the Commit tool window of JetBrains IDEs.
+        KeyBinding::new("enter", ShowDiff, list),
+        KeyBinding::new("cmd-d", ShowDiff, list),
+        KeyBinding::new("f4", JumpToSource, list),
+        KeyBinding::new("cmd-down", JumpToSource, list),
+        KeyBinding::new("alt-cmd-z", Rollback, list),
+        KeyBinding::new("cmd-backspace", Delete, list),
+        KeyBinding::new("alt-cmd-c", CopyPath, list),
+        KeyBinding::new("shift-f10", ShowContextMenu, list),
+        KeyBinding::new("tab", FocusMessage, list),
+        KeyBinding::new("escape", Cancel, list),
+    ]);
+    let panel = Some("CommitPanel");
+    cx.bind_keys([
+        KeyBinding::new("cmd-enter", CommitChanges, panel),
+        KeyBinding::new("alt-shift-cmd-k", CommitAndPush, panel),
+    ]);
+}
+
+/// What the commit window asks the workspace to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitPanelEvent {
+    /// Show the diff of a file.
+    OpenDiff(PathBuf),
+    /// Open a file (F4, Jump to Source).
+    OpenFile(PathBuf),
+    /// Return focus to the editor (Esc).
+    FocusEditor,
+    /// "Commit and Push…" committed: open the push dialog.
+    Push,
+    /// Files are gone from disk (deleted, or added ones rolled back with their copies): their
+    /// unmodified tabs close.
+    Removed(Vec<PathBuf>),
+}
+
+/// The two groups of a repository's changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum GroupKind {
+    Changes,
+    Unversioned,
+}
+
+impl GroupKind {
+    fn of(status: FileStatus) -> Self {
+        match status {
+            FileStatus::Untracked => GroupKind::Unversioned,
+            _ => GroupKind::Changes,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            GroupKind::Changes => tr("Changes"),
+            GroupKind::Unversioned => tr("Unversioned Files"),
+        }
+    }
+}
+
+/// What a row is, kept across refreshes: the selection and the collapsed nodes follow it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum RowKey {
+    Repo(usize),
+    Group(usize, GroupKind),
+    /// A directory of a group, by its path relative to the repository.
+    Dir(usize, GroupKind, String),
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RowKind {
+    Repo {
+        name: String,
+        branch: Option<String>,
+    },
+    Group(GroupKind),
+    /// A directory (single-child chains are joined: `src/app/ui`).
+    Dir {
+        label: String,
+    },
+    /// A file: its name and, in the flat view, its directory.
+    File {
+        name: String,
+        detail: Option<String>,
+    },
+}
+
+/// A visible row of the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Row {
+    pub key: RowKey,
+    pub depth: usize,
+    pub kind: RowKind,
+    /// The changes under the row (indices into the change list): the file itself, or everything
+    /// inside a node.
+    pub files: Vec<usize>,
+    pub expanded: bool,
+}
+
+impl Row {
+    fn expandable(&self) -> bool {
+        !matches!(self.kind, RowKind::File { .. })
+    }
+}
+
+/// A repository for the tree: its folder name and branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoLabel {
+    pub name: String,
+    pub branch: Option<String>,
+}
+
+/// The visible rows: per repository (a node of its own when there are several) the groups
+/// "Changes" and "Unversioned Files", then directories (joined through single-child chains) and
+/// files in natural order — or files by path, flat. Collapsed nodes hide what is inside.
+pub(crate) fn build_rows(
+    changes: &[Change],
+    repos: &[RepoLabel],
+    by_directory: bool,
+    collapsed: &HashSet<RowKey>,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let several = repos.len() > 1;
+    for (repo, label) in repos.iter().enumerate() {
+        let in_repo: Vec<usize> = (0..changes.len())
+            .filter(|&index| changes[index].repo == repo)
+            .collect();
+        if in_repo.is_empty() {
+            continue;
+        }
+        let mut depth = 0;
+        if several {
+            let key = RowKey::Repo(repo);
+            let expanded = !collapsed.contains(&key);
+            rows.push(Row {
+                key,
+                depth,
+                kind: RowKind::Repo {
+                    name: label.name.clone(),
+                    branch: label.branch.clone(),
+                },
+                files: in_repo.clone(),
+                expanded,
+            });
+            if !expanded {
+                continue;
+            }
+            depth = 1;
+        }
+        for group in [GroupKind::Changes, GroupKind::Unversioned] {
+            let files: Vec<usize> = in_repo
+                .iter()
+                .copied()
+                .filter(|&index| GroupKind::of(changes[index].status) == group)
+                .collect();
+            if files.is_empty() {
+                continue;
+            }
+            let key = RowKey::Group(repo, group);
+            let expanded = !collapsed.contains(&key);
+            rows.push(Row {
+                key,
+                depth,
+                kind: RowKind::Group(group),
+                files: files.clone(),
+                expanded,
+            });
+            if !expanded {
+                continue;
+            }
+            if by_directory {
+                let tree = DirTree::build(changes, &files);
+                tree.emit(changes, repo, group, "", depth + 1, collapsed, &mut rows);
+            } else {
+                let mut sorted = files;
+                sorted.sort_by(|&a, &b| compare_paths(&changes[a].relative, &changes[b].relative));
+                for index in sorted {
+                    let (dir, name) = split_relative(&changes[index].relative);
+                    rows.push(file_row(
+                        changes,
+                        index,
+                        name,
+                        (!dir.is_empty()).then(|| dir.into()),
+                        depth + 1,
+                    ));
+                }
+            }
+        }
+    }
+    rows
+}
+
+fn file_row(
+    changes: &[Change],
+    index: usize,
+    name: &str,
+    detail: Option<String>,
+    depth: usize,
+) -> Row {
+    Row {
+        key: RowKey::File(changes[index].path.clone()),
+        depth,
+        kind: RowKind::File {
+            name: name.to_string(),
+            detail,
+        },
+        files: vec![index],
+        expanded: false,
+    }
+}
+
+/// `src/app/main.rs` → (`src/app`, `main.rs`).
+fn split_relative(relative: &str) -> (&str, &str) {
+    match relative.rsplit_once('/') {
+        Some((dir, name)) => (dir, name),
+        None => ("", relative),
+    }
+}
+
+/// Paths in the order of the project tree: by component, natural order.
+fn compare_paths(a: &str, b: &str) -> Ordering {
+    let mut left = a.split('/');
+    let mut right = b.split('/');
+    loop {
+        match (left.next(), right.next()) {
+            (Some(x), Some(y)) => match flux_fs::compare_names(x, y) {
+                Ordering::Equal => continue,
+                other => return other,
+            },
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
+/// The directories of a group's files.
+#[derive(Default)]
+struct DirTree {
+    dirs: BTreeMap<String, DirTree>,
+    /// Files directly inside, as indices into the change list.
+    files: Vec<usize>,
+}
+
+impl DirTree {
+    fn build(changes: &[Change], files: &[usize]) -> Self {
+        let mut root = DirTree::default();
+        for &index in files {
+            let mut node = &mut root;
+            let parts: Vec<&str> = changes[index].relative.split('/').collect();
+            for part in &parts[..parts.len() - 1] {
+                node = node.dirs.entry(part.to_string()).or_default();
+            }
+            node.files.push(index);
+        }
+        root
+    }
+
+    /// Every file inside, at any depth.
+    fn all_files(&self) -> Vec<usize> {
+        let mut files = self.files.clone();
+        for dir in self.dirs.values() {
+            files.extend(dir.all_files());
+        }
+        files
+    }
+
+    /// Rows for the directories (first, natural order) and the files of this node.
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &self,
+        changes: &[Change],
+        repo: usize,
+        group: GroupKind,
+        prefix: &str,
+        depth: usize,
+        collapsed: &HashSet<RowKey>,
+        rows: &mut Vec<Row>,
+    ) {
+        let mut dirs: Vec<(&String, &DirTree)> = self.dirs.iter().collect();
+        dirs.sort_by(|a, b| flux_fs::compare_names(a.0, b.0));
+        for (name, dir) in dirs {
+            // A chain of directories with a single child directory and no files is one row.
+            let mut label = name.clone();
+            let mut node = dir;
+            while node.files.is_empty() && node.dirs.len() == 1 {
+                let (child, next) = node.dirs.iter().next().expect("one child");
+                label = format!("{label}/{child}");
+                node = next;
+            }
+            let path = if prefix.is_empty() {
+                label.clone()
+            } else {
+                format!("{prefix}/{label}")
+            };
+            let key = RowKey::Dir(repo, group, path.clone());
+            let expanded = !collapsed.contains(&key);
+            rows.push(Row {
+                key,
+                depth,
+                kind: RowKind::Dir { label },
+                files: node.all_files(),
+                expanded,
+            });
+            if expanded {
+                node.emit(changes, repo, group, &path, depth + 1, collapsed, rows);
+            }
+        }
+        let mut files = self.files.clone();
+        files.sort_by(|&a, &b| {
+            flux_fs::compare_names(
+                split_relative(&changes[a].relative).1,
+                split_relative(&changes[b].relative).1,
+            )
+        });
+        for index in files {
+            let name = split_relative(&changes[index].relative).1;
+            rows.push(file_row(changes, index, name, None, depth));
+        }
+    }
+}
+
+/// The checkbox of a node: all checked, none, or some (a partly checked file counts as some).
+pub(crate) fn aggregate(states: impl IntoIterator<Item = CheckState>) -> CheckState {
+    let mut checked = false;
+    let mut unchecked = false;
+    for state in states {
+        match state {
+            CheckState::Checked => checked = true,
+            CheckState::Unchecked => unchecked = true,
+            CheckState::Partial => return CheckState::Partial,
+        }
+    }
+    match (checked, unchecked) {
+        (true, false) => CheckState::Checked,
+        (false, _) => CheckState::Unchecked,
+        (true, true) => CheckState::Partial,
+    }
+}
+
+/// What a partly checked file commits: its HEAD version with only the included changes applied.
+/// The texts are compared without `\r` (as the gutter compares them, so the hunks are the same);
+/// a file with CRLF line endings gets them back.
+pub(crate) fn partial_content(
+    base: &str,
+    current: &str,
+    include: impl Fn(&Hunk) -> bool,
+) -> String {
+    let crlf = current.contains("\r\n");
+    let base = base.replace("\r\n", "\n");
+    let current = current.replace("\r\n", "\n");
+    let hunks = flux_git::diff_lines(&base, &current);
+    let content = flux_git::apply_hunks(&base, &current, &hunks, include);
+    if crlf {
+        content.replace('\n', "\r\n")
+    } else {
+        content
+    }
+}
+
+/// A popup menu of the window: the context menu or the message history.
+struct Menu {
+    menu: Entity<ContextMenu>,
+    position: Point<Pixels>,
+    _subscriptions: [Subscription; 2],
+}
+
+/// Dragging the island's right edge.
+#[derive(Debug, Clone, Copy)]
+struct DraggedCommitEdge;
+
+impl Render for DraggedCommitEdge {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+pub struct CommitPanel {
+    git: Entity<GitStore>,
+    message: Entity<Editor>,
+    amend: bool,
+    /// The message Amend put into the field: turning Amend off takes it back, if it is unchanged.
+    amend_message: Option<String>,
+    group_by_directory: bool,
+    collapsed: HashSet<RowKey>,
+    /// The changes and the visible rows, rebuilt when the git status or the view changes.
+    changes: Vec<Change>,
+    rows: Vec<Row>,
+    selected: Option<RowKey>,
+    /// A commit is running: the buttons wait.
+    committing: bool,
+    /// The list of changes; the message field has its own.
+    focus_handle: FocusHandle,
+    scroll: UniformListScrollHandle,
+    /// Shared with the project tree: the left island keeps its width whichever is shown.
+    width: ui::LeftIslandWidth,
+    resizing: bool,
+    menu: Option<Menu>,
+    /// Recent messages, for the history menu ([`UseMessage`] picks by index).
+    history: Vec<String>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<CommitPanelEvent> for CommitPanel {}
+
+impl CommitPanel {
+    pub fn new(
+        git: Entity<GitStore>,
+        width: ui::LeftIslandWidth,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let message = cx.new(|cx| Editor::message(tr("Commit Message"), window, cx));
+        let subscriptions = vec![cx.observe(&git, |this, _, cx| this.rebuild(cx))];
+        let mut panel = Self {
+            git,
+            message,
+            amend: false,
+            amend_message: None,
+            group_by_directory: true,
+            collapsed: HashSet::new(),
+            changes: Vec::new(),
+            rows: Vec::new(),
+            selected: None,
+            committing: false,
+            focus_handle: cx.focus_handle(),
+            scroll: UniformListScrollHandle::new(),
+            width,
+            resizing: false,
+            menu: None,
+            history: Vec::new(),
+            _subscriptions: subscriptions,
+        };
+        panel.rebuild(cx);
+        panel
+    }
+
+    /// ⌘K: focus in the message.
+    pub fn focus_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.message.focus_handle(cx));
+    }
+
+    /// ⌘0: focus in the list of changes; the first row is selected if nothing is.
+    pub fn focus_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        if self.selected_index().is_none() && !self.rows.is_empty() {
+            self.select_row(0, ScrollStrategy::Top, cx);
+        }
+    }
+
+    pub fn contains_focus(&self, window: &Window, cx: &App) -> bool {
+        self.focus_handle.contains_focused(window, cx)
+            || self.message.focus_handle(cx).contains_focused(window, cx)
+            || self
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.menu.focus_handle(cx).contains_focused(window, cx))
+    }
+
+    // --- The tree ---
+
+    fn rebuild(&mut self, cx: &mut Context<Self>) {
+        let git = self.git.read(cx);
+        self.changes = git.changes();
+        let repos: Vec<RepoLabel> = git
+            .repos()
+            .iter()
+            .map(|entry| RepoLabel {
+                name: entry
+                    .repo
+                    .work_dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                branch: entry.status.branch.label(),
+            })
+            .collect();
+        self.rows = build_rows(
+            &self.changes,
+            &repos,
+            self.group_by_directory,
+            &self.collapsed,
+        );
+        // A selected file hidden in a collapsed node: the node is selected; one that went away
+        // (committed, rolled back): nothing is.
+        if self.selected_index().is_none() {
+            self.selected = match self.selected.take() {
+                Some(RowKey::File(path)) => self
+                    .changes
+                    .iter()
+                    .position(|change| change.path == path)
+                    .and_then(|index| {
+                        self.rows
+                            .iter()
+                            .filter(|row| row.files.contains(&index))
+                            .max_by_key(|row| row.depth)
+                    })
+                    .map(|row| row.key.clone()),
+                _ => None,
+            };
+        }
+        cx.notify();
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        let selected = self.selected.as_ref()?;
+        self.rows.iter().position(|row| row.key == *selected)
+    }
+
+    fn selected_row(&self) -> Option<&Row> {
+        self.selected_index().map(|index| &self.rows[index])
+    }
+
+    fn select_row(&mut self, index: usize, strategy: ScrollStrategy, cx: &mut Context<Self>) {
+        let Some(row) = self.rows.get(index) else {
+            return;
+        };
+        self.selected = Some(row.key.clone());
+        self.scroll.scroll_to_item(index, strategy);
+        cx.notify();
+    }
+
+    fn move_selection(
+        &mut self,
+        to: impl FnOnce(Option<usize>, usize) -> usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let current = self.selected_index();
+        let index = to(current, self.rows.len()).min(self.rows.len() - 1);
+        let strategy = match current {
+            Some(current) if index < current => ScrollStrategy::Top,
+            _ => ScrollStrategy::Bottom,
+        };
+        self.select_row(index, strategy, cx);
+    }
+
+    fn set_expanded(&mut self, key: &RowKey, expanded: bool, cx: &mut Context<Self>) {
+        if expanded {
+            self.collapsed.remove(key);
+        } else {
+            self.collapsed.insert(key.clone());
+        }
+        self.rebuild(cx);
+    }
+
+    /// → : expands a collapsed node; on an expanded one, goes to its first child.
+    fn expand(&mut self, _: &Expand, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        let row = self.rows[index].clone();
+        if !row.expandable() {
+            return;
+        }
+        if row.expanded {
+            self.select_row(index + 1, ScrollStrategy::Bottom, cx);
+        } else {
+            self.set_expanded(&row.key, true, cx);
+        }
+    }
+
+    /// ← : collapses an expanded node; otherwise goes to the parent.
+    fn collapse(&mut self, _: &Collapse, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        let row = self.rows[index].clone();
+        if row.expandable() && row.expanded {
+            return self.set_expanded(&row.key, false, cx);
+        }
+        if let Some(parent) = self.rows[..index].iter().rposition(|r| r.depth < row.depth) {
+            self.select_row(parent, ScrollStrategy::Top, cx);
+        }
+    }
+
+    /// Expand All, or Collapse All down to the groups (and repositories).
+    fn set_all_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        self.collapsed.clear();
+        self.rebuild(cx);
+        if !expanded {
+            let nodes: Vec<RowKey> = self
+                .rows
+                .iter()
+                .filter(|row| matches!(row.kind, RowKind::Dir { .. }))
+                .map(|row| row.key.clone())
+                .collect();
+            self.collapsed.extend(nodes);
+            self.rebuild(cx);
+        }
+    }
+
+    // --- Checkboxes ---
+
+    fn row_state(&self, row: &Row, cx: &App) -> CheckState {
+        let git = self.git.read(cx);
+        aggregate(
+            row.files
+                .iter()
+                .filter_map(|&index| self.changes.get(index))
+                .map(|change| git.check_state(change)),
+        )
+    }
+
+    /// Clicking a checkbox: a checked node is unchecked, anything else is checked wholly.
+    fn toggle_row(&mut self, key: &RowKey, cx: &mut Context<Self>) {
+        let Some(row) = self.rows.iter().find(|row| row.key == *key).cloned() else {
+            return;
+        };
+        let include = self.row_state(&row, cx) != CheckState::Checked;
+        let paths: Vec<PathBuf> = row
+            .files
+            .iter()
+            .filter_map(|&index| self.changes.get(index))
+            .map(|change| change.path.clone())
+            .collect();
+        self.git.update(cx, |git, cx| {
+            for path in &paths {
+                git.set_included(path, include, cx);
+            }
+        });
+    }
+
+    fn toggle_checked(&mut self, _: &ToggleChecked, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(key) = self.selected.clone() {
+            self.toggle_row(&key, cx);
+        }
+    }
+
+    // --- Operations on the selection ---
+
+    /// The changes the operations act on: under the selected row; with nothing selected, the
+    /// checked ones.
+    fn target_changes(&self, cx: &App) -> Vec<Change> {
+        match self.selected_row() {
+            Some(row) => row
+                .files
+                .iter()
+                .filter_map(|&index| self.changes.get(index).cloned())
+                .collect(),
+            None => {
+                let git = self.git.read(cx);
+                self.changes
+                    .iter()
+                    .filter(|change| git.check_state(change) != CheckState::Unchecked)
+                    .cloned()
+                    .collect()
+            }
+        }
+    }
+
+    fn selected_file(&self) -> Option<&Change> {
+        match self.selected_row()? {
+            Row {
+                kind: RowKind::File { .. },
+                files,
+                ..
+            } => self.changes.get(*files.first()?),
+            _ => None,
+        }
+    }
+
+    /// ↵ / ⌘D: the diff of the selected file; on a node, ↵ expands or collapses it.
+    fn show_diff(&mut self, _: &ShowDiff, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(change) = self.selected_file() {
+            return cx.emit(CommitPanelEvent::OpenDiff(change.path.clone()));
+        }
+        if let Some(row) = self.selected_row().cloned()
+            && row.expandable()
+        {
+            self.set_expanded(&row.key, !row.expanded, cx);
+        }
+    }
+
+    /// F4: the selected file in its tab.
+    fn jump_to_source(&mut self, _: &JumpToSource, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(change) = self.selected_file().cloned() else {
+            return;
+        };
+        if change.status == FileStatus::Deleted {
+            let message = trf("“{0}” is deleted", &[&file_name(&change.path)]);
+            return self.report(GitEvent::Message(message.into()), cx);
+        }
+        cx.emit(CommitPanelEvent::OpenFile(change.path));
+    }
+
+    /// ⌥⌘Z: rolls back the selected changes (the checked ones, with nothing selected), after a
+    /// question.
+    fn rollback(&mut self, _: &Rollback, window: &mut Window, cx: &mut Context<Self>) {
+        let changes = self.target_changes(cx);
+        let this = cx.weak_entity();
+        confirm_rollback(self.git.clone(), changes, window, cx, move |removed, cx| {
+            this.update(cx, |_, cx| cx.emit(CommitPanelEvent::Removed(removed)))
+                .ok();
+        });
+    }
+
+    /// ⌘⌫ on unversioned files: to the Trash, after a question. Tracked files are rolled back
+    /// instead (as in JetBrains IDEs, Delete doesn't touch history).
+    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .target_changes(cx)
+            .into_iter()
+            .filter(|change| change.status == FileStatus::Untracked)
+            .map(|change| change.path)
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let question = match paths.as_slice() {
+            [path] => trf("Move “{0}” to Trash?", &[&file_name(path)]),
+            _ => trf(
+                "Move {0} to Trash?",
+                &[&trn(paths.len(), "{n} file", "{n} files")],
+            ),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &question,
+            Some(tr("You can restore it from the Trash.")),
+            &[tr("Move to Trash"), tr("Cancel")],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let trashed = paths.clone();
+            let result = cx
+                .background_spawn(async move { flux_fs::trash(&trashed) })
+                .await;
+            this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    this.git.update(cx, |git, cx| git.refresh(cx));
+                    cx.emit(CommitPanelEvent::Removed(paths));
+                }
+                Err(err) => this.report(GitEvent::Message(err.to_string().into()), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The selected file's (or node's) absolute path to the clipboard.
+    fn copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        let path = match &row.key {
+            RowKey::File(path) => Some(path.clone()),
+            RowKey::Dir(repo, _, relative) => {
+                self.repo_dir(*repo, cx).map(|dir| dir.join(relative))
+            }
+            RowKey::Group(repo, _) | RowKey::Repo(repo) => self.repo_dir(*repo, cx),
+        };
+        if let Some(path) = path {
+            cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+        }
+    }
+
+    fn repo_dir(&self, repo: usize, cx: &App) -> Option<PathBuf> {
+        let git = self.git.read(cx);
+        git.repos()
+            .get(repo)
+            .map(|entry| entry.repo.work_dir.clone())
+    }
+
+    /// Adds the selected unversioned file, or directory, to `.gitignore`.
+    fn add_to_gitignore(&mut self, _: &AddToGitignore, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.selected_row().cloned() else {
+            return;
+        };
+        let path = match &row.key {
+            RowKey::File(path) => path.clone(),
+            RowKey::Dir(repo, GroupKind::Unversioned, relative) => {
+                let Some(dir) = self.repo_dir(*repo, cx) else {
+                    return;
+                };
+                dir.join(relative)
+            }
+            _ => return,
+        };
+        let name = file_name(&path);
+        let task = self
+            .git
+            .update(cx, |git, cx| git.add_to_gitignore(&path, cx));
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                let message = match result {
+                    Ok(()) => trf("Added to .gitignore: {0}", &[&name]),
+                    Err(err) => err,
+                };
+                this.git.update(cx, |git, cx| git.refresh(cx));
+                this.report(GitEvent::Message(message.into()), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn report(&mut self, event: GitEvent, cx: &mut Context<Self>) {
+        self.git.update(cx, |git, cx| git.report(event, cx));
+    }
+
+    // --- Mouse and menus ---
+
+    fn click_row(
+        &mut self,
+        key: RowKey,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+        self.selected = Some(key.clone());
+        let row = self.rows.iter().find(|row| row.key == key).cloned();
+        match row {
+            Some(row) if row.expandable() && click_count == 1 => {
+                self.set_expanded(&row.key, !row.expanded, cx)
+            }
+            Some(_) if click_count == 2 => {
+                if let RowKey::File(path) = key {
+                    cx.emit(CommitPanelEvent::OpenDiff(path));
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// The context menu for a row (or the empty space under the rows) at the cursor.
+    fn secondary_click(
+        &mut self,
+        key: Option<RowKey>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+        self.selected = key;
+        let file = self.selected_file().cloned();
+        let row = self.selected_row().cloned();
+        let tracked = self
+            .target_changes(cx)
+            .iter()
+            .any(|change| change.status != FileStatus::Untracked);
+        let unversioned = row.as_ref().is_some_and(|row| {
+            row.files
+                .iter()
+                .any(|&index| self.changes[index].status == FileStatus::Untracked)
+        });
+        let ignorable = matches!(
+            row.as_ref().map(|row| &row.key),
+            Some(RowKey::File(_)) | Some(RowKey::Dir(_, GroupKind::Unversioned, _))
+        ) && unversioned;
+        let menu = cx.new(|cx| {
+            ContextMenu::new(window, cx)
+                .entry_if(file.is_some(), tr("Show Diff"), ShowDiff)
+                .entry_if(
+                    file.as_ref()
+                        .is_some_and(|file| file.status != FileStatus::Deleted),
+                    tr("Jump to Source"),
+                    JumpToSource,
+                )
+                .separator()
+                .entry_if(tracked, tr("Rollback…"), Rollback)
+                .entry_if(ignorable, tr("Add to .gitignore"), AddToGitignore)
+                .entry_if(unversioned, tr("Delete…"), Delete)
+                .separator()
+                .entry_if(row.is_some(), tr("Copy Path"), CopyPath)
+                .separator()
+                .entry(tr("Expand All"), ExpandAll)
+                .entry(tr("Collapse All"), CollapseAll)
+                .entry(tr("Refresh"), Refresh)
+        });
+        self.open_menu(menu, position, window, cx);
+        cx.notify();
+    }
+
+    fn open_menu(
+        &mut self,
+        menu: Entity<ContextMenu>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = menu.focus_handle(cx);
+        let subscriptions = [
+            cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
+                this.close_menu(menu, window, cx)
+            }),
+            cx.on_focus_out(&focus, window, {
+                let menu = menu.clone();
+                move |this, _, window, cx| this.close_menu(&menu, window, cx)
+            }),
+        ];
+        window.focus(&focus);
+        self.menu = Some(Menu {
+            menu,
+            position,
+            _subscriptions: subscriptions,
+        });
+    }
+
+    /// Closes the menu (if it is still the same one); Esc in it returns focus to the list.
+    fn close_menu(
+        &mut self,
+        menu: &Entity<ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.menu.as_ref().is_none_or(|open| open.menu != *menu) {
+            return;
+        }
+        let had_focus = menu.focus_handle(cx).contains_focused(window, cx);
+        self.menu = None;
+        if had_focus {
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    /// ⇧F10: the menu for the selected row, below it.
+    fn show_context_menu(
+        &mut self,
+        _: &ShowContextMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (bounds, offset) = {
+            let state = self.scroll.0.borrow();
+            (state.base_handle.bounds(), state.base_handle.offset())
+        };
+        let (index, depth) = self
+            .selected_index()
+            .map(|index| (index as f32 + 1., self.rows[index].depth))
+            .unwrap_or((0., 0));
+        let position = gpui::point(
+            bounds.left() + px(ROW_INSET + ROW_PADDING + depth as f32 * INDENT + CHEVRON_WIDTH),
+            bounds.top() + offset.y + px(index * ROW_HEIGHT),
+        );
+        self.secondary_click(self.selected.clone(), position, window, cx);
+    }
+
+    /// The history of recent messages, at the button.
+    fn show_history(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.message_repo(cx) else {
+            return;
+        };
+        let read = cx.background_spawn(async move {
+            flux_git::recent_messages(&repo, HISTORY_LIMIT).unwrap_or_default()
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let messages = read.await;
+            this.update_in(cx, |this, window, cx| {
+                if messages.is_empty() {
+                    let message = tr("No commit messages yet");
+                    return this.report(GitEvent::Message(message.into()), cx);
+                }
+                // Items dispatch to the message field: focus it first.
+                window.focus(&this.message.focus_handle(cx));
+                let menu = cx.new(|cx| {
+                    messages.iter().enumerate().fold(
+                        ContextMenu::new(window, cx),
+                        |menu, (index, message)| {
+                            menu.entry(history_label(message), UseMessage(index))
+                        },
+                    )
+                });
+                this.history = messages;
+                this.open_menu(menu, position, window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // --- The message ---
+
+    fn message_text(&self, cx: &App) -> String {
+        self.message.read(cx).document.text().to_string()
+    }
+
+    fn set_message(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.message.update(cx, |editor, cx| {
+            let new = Rope::from_str(text);
+            if let Some((range, text)) = difference(editor.document.text(), &new) {
+                editor.replace_ranges(vec![(range, text)], cx);
+            }
+        });
+    }
+
+    /// The repository whose history and last commit the message field uses: of the first checked
+    /// change, otherwise the first repository.
+    fn message_repo(&self, cx: &App) -> Option<flux_git::Repo> {
+        let git = self.git.read(cx);
+        let repo = self
+            .changes
+            .iter()
+            .find(|change| git.check_state(change) != CheckState::Unchecked)
+            .map(|change| change.repo)
+            .unwrap_or(0);
+        git.repos().get(repo).map(|entry| entry.repo.clone())
+    }
+
+    /// Amend on: the last commit's message comes into an empty field. Off: it goes away again,
+    /// unless it was edited.
+    fn toggle_amend(&mut self, cx: &mut Context<Self>) {
+        self.amend = !self.amend;
+        cx.notify();
+        if !self.amend {
+            if self.amend_message.take().as_deref() == Some(self.message_text(cx).as_str()) {
+                self.set_message("", cx);
+            }
+            return;
+        }
+        if !self.message_text(cx).trim().is_empty() {
+            return;
+        }
+        let Some(repo) = self.message_repo(cx) else {
+            return;
+        };
+        let read = cx.background_spawn(async move { flux_git::head_message(&repo) });
+        cx.spawn(async move |this, cx| {
+            let Ok(Some(message)) = read.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if this.amend && this.message_text(cx).trim().is_empty() {
+                    this.set_message(&message, cx);
+                    this.amend_message = Some(message);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // --- Commit ---
+
+    /// Commits the checked changes of every repository with the message; with `push`, the push
+    /// dialog opens after. Open documents of the committed files are saved first.
+    fn commit(&mut self, push: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.committing {
+            return;
+        }
+        let message = self.message_text(cx);
+        if message.trim().is_empty() {
+            self.report(GitEvent::Message(tr("Enter a commit message").into()), cx);
+            return self.focus_message(window, cx);
+        }
+        let (included, editors) = {
+            let git = self.git.read(cx);
+            let included: Vec<Included> = self
+                .changes
+                .iter()
+                .map(|change| (change, git.check_state(change)))
+                .filter(|(_, state)| *state != CheckState::Unchecked)
+                .map(|(change, state)| Included {
+                    change: change.clone(),
+                    partial: state == CheckState::Partial,
+                    // A rename commits the removal of the old path too.
+                    orig_relative: change
+                        .orig_path
+                        .as_deref()
+                        .and_then(|orig| git.repos().get(change.repo)?.repo.relative(orig)),
+                })
+                .collect();
+            (included, git.editors())
+        };
+        if included.is_empty() {
+            return self.report(GitEvent::Message(tr("No changes are checked").into()), cx);
+        }
+        let paths: HashSet<PathBuf> = included
+            .iter()
+            .map(|item| item.change.path.clone())
+            .collect();
+        let to_save: Vec<Entity<Editor>> = editors
+            .into_iter()
+            .filter(|editor| {
+                let document = &editor.read(cx).document;
+                document.is_modified() && document.path().is_some_and(|path| paths.contains(path))
+            })
+            .collect();
+        let saves: Vec<Task<bool>> = to_save
+            .into_iter()
+            .map(|editor| editor.update(cx, |editor, cx| editor.save(cx)))
+            .collect();
+        let bases: Vec<(PathBuf, Task<Option<std::sync::Arc<str>>>)> = included
+            .iter()
+            .filter(|item| item.partial)
+            .map(|item| {
+                let path = item.change.path.clone();
+                let base = self.git.update(cx, |git, cx| git.base_text(&path, cx));
+                (path, base)
+            })
+            .collect();
+        self.committing = true;
+        cx.notify();
+        let amend = self.amend;
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = run_commit(&this, included, saves, bases, message, amend, cx).await;
+            this.update(cx, |this, cx| {
+                this.committing = false;
+                match outcome {
+                    Ok((count, summary)) => {
+                        this.set_message("", cx);
+                        this.amend = false;
+                        this.amend_message = None;
+                        let files = trn(count, "{n} file", "{n} files");
+                        let message = trf("Committed {0}: {1}", &[&files, &summary]);
+                        this.report(GitEvent::Message(message.into()), cx);
+                        if push {
+                            cx.emit(CommitPanelEvent::Push);
+                        }
+                    }
+                    Err(event) => this.report(event, cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // --- Rendering ---
+
+    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let ui = Theme::ui(cx);
+        let button = |id: &'static str,
+                      name: IconName,
+                      label: &'static str,
+                      action: Box<dyn Action>,
+                      on: Option<bool>| {
+            let keys = ui::shortcut_in(action.as_ref(), &self.focus_handle, window);
+            let button = match on {
+                Some(on) => ui::toggle_button(id, name, on, ui),
+                None => ui::icon_button(id, name, ui),
+            };
+            let focus = self.focus_handle.clone();
+            button
+                .tooltip(ui::tooltip(label, keys))
+                .on_click(move |_, window, cx| {
+                    window.focus(&focus);
+                    window.dispatch_action(action.boxed_clone(), cx)
+                })
+        };
+        div()
+            .flex_none()
+            .h(px(HEADER_HEIGHT))
+            .pl(px(ROW_INSET + ROW_PADDING + 2.))
+            .pr(px(ROW_INSET))
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .child(
+                ui::section_label(tr("Commit"), ui)
+                    .flex_1()
+                    .min_w_0()
+                    .truncate(),
+            )
+            .child(button(
+                "commit-refresh",
+                IconName::Refresh,
+                tr("Refresh"),
+                Box::new(Refresh),
+                None,
+            ))
+            .child(button(
+                "commit-rollback",
+                IconName::Rollback,
+                tr("Rollback…"),
+                Box::new(Rollback),
+                None,
+            ))
+            .child(button(
+                "commit-diff",
+                IconName::Diff,
+                tr("Show Diff"),
+                Box::new(ShowDiff),
+                None,
+            ))
+            .child(button(
+                "commit-group",
+                IconName::Folder,
+                tr("Group by Directory"),
+                Box::new(ToggleGroupByDirectory),
+                Some(self.group_by_directory),
+            ))
+            .child(button(
+                "commit-expand",
+                IconName::ExpandAll,
+                tr("Expand All"),
+                Box::new(ExpandAll),
+                None,
+            ))
+            .child(button(
+                "commit-collapse",
+                IconName::CollapseAll,
+                tr("Collapse All"),
+                Box::new(CollapseAll),
+                None,
+            ))
+    }
+
+    fn render_row(&self, index: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        let ui = Theme::ui(cx);
+        let Some(row) = self.rows.get(index) else {
+            return div().into_any_element();
+        };
+        let selected = self.selected.as_ref() == Some(&row.key);
+        let state = self.row_state(row, cx);
+        let (icon_element, name, name_color, detail, strike) = match &row.kind {
+            RowKind::Repo { name, branch } => (
+                icon(IconName::Branch, ui.violet)
+                    .size(px(14.))
+                    .into_any_element(),
+                name.clone(),
+                ui.foreground,
+                branch.clone(),
+                false,
+            ),
+            // The count is a bare number: "Unversioned Files 2 files" doesn't fit the island in
+            // Russian («Неотслеживаемые файлы 2 файла»).
+            RowKind::Group(group) => (
+                div().into_any_element(),
+                group.label().to_string(),
+                ui.foreground,
+                Some(row.files.len().to_string()),
+                false,
+            ),
+            RowKind::Dir { label } => (
+                folder_icon(row.expanded, &ui).render().into_any_element(),
+                label.clone(),
+                ui.foreground,
+                None,
+                false,
+            ),
+            RowKind::File { name, detail } => {
+                let change = &self.changes[row.files[0]];
+                (
+                    file_icon(name, &ui).render().into_any_element(),
+                    name.clone(),
+                    git::status_color(change.status, &ui),
+                    detail.clone(),
+                    change.status == FileStatus::Deleted,
+                )
+            }
+        };
+        let group_row = matches!(row.kind, RowKind::Group(_) | RowKind::Repo { .. });
+        let key = row.key.clone();
+        let (click, secondary, toggle) = (key.clone(), key.clone(), key.clone());
+        let body = div()
+            .size_full()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .pl(px(ROW_PADDING + row.depth as f32 * INDENT))
+            .pr_2()
+            .rounded(px(RADIUS_SM))
+            .map(|body| match (selected, focused) {
+                (true, true) => body.bg(ui.list_selected),
+                (true, false) => body.bg(ui.list_selected_inactive),
+                _ => body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover)),
+            })
+            .child(chevron(row.expandable(), row.expanded, ui))
+            .child(
+                ui::checkbox(("check", index), state, ui).on_click(cx.listener(
+                    move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.focus_handle);
+                        this.toggle_row(&toggle, cx);
+                        cx.stop_propagation();
+                    },
+                )),
+            )
+            .child(icon_element)
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(name_color)
+                    .when(group_row, |name| name.font_weight(FontWeight::MEDIUM))
+                    .when(strike, |name| name.line_through())
+                    .child(name),
+            )
+            .children(detail.map(|detail| {
+                div()
+                    .flex_none()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(ui.dim)
+                    .child(detail)
+            }));
+        div()
+            .id(index)
+            .group(ROW_GROUP)
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .px(px(ROW_INSET))
+            .whitespace_nowrap()
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.click_row(click.clone(), event.click_count(), window, cx)
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.secondary_click(Some(secondary.clone()), event.position, window, cx)
+                }),
+            )
+            .child(body)
+            .into_any_element()
+    }
+
+    /// No changes, no repository, or still looking for repositories.
+    fn render_empty(&self, cx: &App) -> impl IntoElement + use<> {
+        let ui = Theme::ui(cx);
+        let git = self.git.read(cx);
+        let (glyph, title, hint) = if git.is_discovering() {
+            (IconName::Refresh, tr("Looking for repositories…"), None)
+        } else if git.repos().is_empty() {
+            (
+                IconName::Branch,
+                tr("No Git repository"),
+                Some(tr("Open a folder with a repository: ⌘O")),
+            )
+        } else {
+            (
+                IconName::Check,
+                tr("No changes"),
+                Some(tr("Edits to the project's files show up here")),
+            )
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .px_4()
+            .child(icon(glyph, ui.dim).size(px(20.)))
+            .child(div().text_color(ui.text_muted).child(title))
+            .children(hint.map(|hint| {
+                div()
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(ui.dim)
+                    .text_center()
+                    .child(hint)
+            }))
+    }
+
+    fn render_message(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let ui = Theme::ui(cx);
+        let focused = self.message.focus_handle(cx).is_focused(window);
+        div()
+            .flex_none()
+            .relative()
+            .h(px(MESSAGE_HEIGHT))
+            .mx_2()
+            .pl_1()
+            .pt_1()
+            .rounded(px(RADIUS_MD))
+            .bg(ui.input_background)
+            .border_1()
+            .border_color(if focused {
+                ui.focus_border
+            } else {
+                ui.input_border
+            })
+            .when(focused, |field| field.shadow(ui::focus_ring(ui)))
+            .child(self.message.clone())
+            .child(
+                div().absolute().top(px(3.)).right(px(3.)).child(
+                    ui::icon_button("commit-history", IconName::History, ui)
+                        .tooltip(ui::tooltip(tr("Commit Message History"), None))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.show_history(event.position, window, cx)
+                            }),
+                        ),
+                ),
+            )
+    }
+
+    fn render_footer(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let ui = Theme::ui(cx);
+        let can_commit = !self.committing && !self.changes.is_empty();
+        let commit_keys = ui::shortcut_for(&CommitChanges, window);
+        let push_keys = ui::shortcut_for(&CommitAndPush, window);
+        div()
+            .flex_none()
+            .px_2()
+            .pt_2()
+            .pb_2()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("commit-amend")
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .cursor_pointer()
+                            .text_size(px(theme::TEXT_SM))
+                            .text_color(ui.text_muted)
+                            .hover(move |style| style.text_color(ui.foreground))
+                            .on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_amend(cx)),
+                            )
+                            .child(ui::checkbox(
+                                "commit-amend-check",
+                                if self.amend {
+                                    CheckState::Checked
+                                } else {
+                                    CheckState::Unchecked
+                                },
+                                ui,
+                            ))
+                            .child(tr("Amend")),
+                    )
+                    .child(div().flex_1())
+                    .children(self.committing.then(|| {
+                        div()
+                            .text_size(px(theme::TEXT_SM))
+                            .text_color(ui.dim)
+                            .child(tr("Committing…"))
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        ui::primary_button("commit-button", tr("Commit"), can_commit, ui)
+                            .tooltip(ui::tooltip(tr("Commit"), commit_keys))
+                            .when(can_commit, |button| {
+                                button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.commit(false, window, cx)
+                                }))
+                            }),
+                    )
+                    .child(
+                        ui::text_button("commit-push-button", tr("Commit and Push…"), false, ui)
+                            .tooltip(ui::tooltip(tr("Commit and Push…"), push_keys))
+                            .when(!can_commit, |button| button.opacity(0.5))
+                            .when(can_commit, |button| {
+                                button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.commit(true, window, cx)
+                                }))
+                            }),
+                    ),
+            )
+    }
+}
+
+/// A change the commit takes.
+struct Included {
+    change: Change,
+    /// Only some of its hunks.
+    partial: bool,
+    /// The old path of a rename, relative to the working tree.
+    orig_relative: Option<String>,
+}
+
+/// Saves the documents, computes the partial contents, and commits each repository. `Ok` — how
+/// many files went in and the message's first line.
+async fn run_commit(
+    this: &gpui::WeakEntity<CommitPanel>,
+    included: Vec<Included>,
+    saves: Vec<Task<bool>>,
+    bases: Vec<(PathBuf, Task<Option<std::sync::Arc<str>>>)>,
+    message: String,
+    amend: bool,
+    cx: &mut gpui::AsyncWindowContext,
+) -> Result<(usize, String), GitEvent> {
+    for save in saves {
+        if !save.await {
+            return Err(GitEvent::Message(
+                tr("Commit canceled: a document couldn't be saved").into(),
+            ));
+        }
+    }
+    // The checked changes of partly checked files, applied to their HEAD versions.
+    let mut partial: Vec<(PathBuf, String)> = Vec::new();
+    for (path, base) in bases {
+        let base = base.await.unwrap_or_default();
+        let read = path.clone();
+        let current = cx
+            .background_spawn(async move { std::fs::read_to_string(&read) })
+            .await
+            .map_err(|err| GitEvent::Message(err.to_string().into()))?;
+        let content = this
+            .update(cx, |this, cx| {
+                let git = this.git.read(cx);
+                partial_content(&base, &current, |hunk| git.is_hunk_included(&path, hunk))
+            })
+            .map_err(|_| GitEvent::Message(tr("Commit canceled").into()))?;
+        partial.push((path, content));
+    }
+    let mut requests: Vec<(usize, CommitRequest)> = Vec::new();
+    let count = included.len();
+    for item in &included {
+        let change = &item.change;
+        let mut files = vec![CommitFile {
+            path: change.relative.clone(),
+            content: match partial.iter().find(|(path, _)| *path == change.path) {
+                Some((_, content)) => CommitContent::Partial(content.clone().into_bytes()),
+                None => CommitContent::WorkTree,
+            },
+        }];
+        if let Some(orig) = &item.orig_relative {
+            files.push(CommitFile {
+                path: orig.clone(),
+                content: CommitContent::WorkTree,
+            });
+        }
+        match requests.iter_mut().find(|(repo, _)| *repo == change.repo) {
+            Some((_, request)) => request.files.extend(files),
+            None => requests.push((
+                change.repo,
+                CommitRequest {
+                    message: message.clone(),
+                    amend,
+                    files,
+                    author: None,
+                },
+            )),
+        }
+    }
+    let tasks = this
+        .update(cx, |this, cx| {
+            requests
+                .into_iter()
+                .map(|(repo, request)| this.git.update(cx, |git, cx| git.commit(repo, request, cx)))
+                .collect::<Vec<_>>()
+        })
+        .map_err(|_| GitEvent::Message(tr("Commit canceled").into()))?;
+    let mut summary = String::new();
+    for task in tasks {
+        match task.await {
+            Ok(result) => summary = result.summary,
+            Err(err) => {
+                return Err(GitEvent::Error {
+                    message: trf("Commit failed: {0}", &[&err]).into(),
+                    details: err.details().map(str::to_string),
+                });
+            }
+        }
+    }
+    Ok((count, summary))
+}
+
+/// Asks about rolling back `changes` (untracked files are not rolled back) and does it: git puts
+/// the files back, the open documents follow them (one undoable edit each, then saved), and
+/// `on_removed` gets the files that are gone from disk.
+pub(crate) fn confirm_rollback(
+    git: Entity<GitStore>,
+    changes: Vec<Change>,
+    window: &mut Window,
+    cx: &mut App,
+    on_removed: impl FnOnce(Vec<PathBuf>, &mut App) + 'static,
+) {
+    let changes: Vec<Change> = changes
+        .into_iter()
+        .filter(|change| change.status != FileStatus::Untracked)
+        .collect();
+    if changes.is_empty() {
+        return;
+    }
+    let added = changes
+        .iter()
+        .any(|change| matches!(change.status, FileStatus::Added | FileStatus::Renamed));
+    let question = match changes.as_slice() {
+        [change] => trf("Roll back changes in “{0}”?", &[&file_name(&change.path)]),
+        _ => trf(
+            "Roll back changes {0}?",
+            &[&trn(changes.len(), "in {n} file", "in {n} files")],
+        ),
+    };
+    let mut detail = changes
+        .iter()
+        .take(LISTED_FILES)
+        .map(|change| change.relative.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if changes.len() > LISTED_FILES {
+        detail.push('\n');
+        detail.push_str(&trf("and {0} more", &[&(changes.len() - LISTED_FILES)]));
+    }
+    detail.push_str("\n\n");
+    detail.push_str(tr("The files return to their last committed state."));
+    if added {
+        detail.push(' ');
+        detail.push_str(tr(
+            "Added files stay on disk as unversioned, unless you delete them too.",
+        ));
+    }
+    let buttons: Vec<&str> = if added {
+        vec![
+            tr("Rollback"),
+            tr("Rollback and Delete Added"),
+            tr("Cancel"),
+        ]
+    } else {
+        vec![tr("Rollback"), tr("Cancel")]
+    };
+    let answer = window.prompt(
+        PromptLevel::Warning,
+        &question,
+        Some(&detail),
+        buttons.as_slice(),
+        cx,
+    );
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let delete_added = match answer.await {
+            Ok(0) => false,
+            Ok(1) if added => true,
+            _ => return,
+        };
+        let Ok(task) = git.update(cx, |git, cx| {
+            git.rollback(changes.clone(), delete_added, cx)
+        }) else {
+            return;
+        };
+        let result = task.await;
+        cx.update(|cx| {
+            if let Err(err) = result {
+                let event = GitEvent::Error {
+                    message: trf("Rollback failed: {0}", &[&err]).into(),
+                    details: err.details().map(str::to_string),
+                };
+                return git.update(cx, |git, cx| git.report(event, cx));
+            }
+            let removed = follow_rollback(&git, &changes, cx);
+            let message = match changes.as_slice() {
+                [change] => trf("Rolled back: {0}", &[&file_name(&change.path)]),
+                _ => trf(
+                    "Rolled back {0}",
+                    &[&trn(changes.len(), "{n} file", "{n} files")],
+                ),
+            };
+            git.update(cx, |git, cx| {
+                git.report(GitEvent::Message(message.into()), cx)
+            });
+            if !removed.is_empty() {
+                on_removed(removed, cx);
+            }
+        })
+        .ok();
+    })
+    .detach();
+}
+
+/// Open documents of rolled-back files take the content from disk (one edit, saved state); the files
+/// that are gone are returned.
+fn follow_rollback(git: &Entity<GitStore>, changes: &[Change], cx: &mut App) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for change in changes {
+        paths.push(change.path.clone());
+        paths.extend(change.orig_path.clone());
+    }
+    let mut removed = Vec::new();
+    let editors = git.read(cx).editors();
+    for path in &paths {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            if !path.exists() {
+                removed.push(path.clone());
+            }
+            continue;
+        };
+        for editor in &editors {
+            if editor.read(cx).document.path() != Some(path.as_path()) {
+                continue;
+            }
+            editor.update(cx, |editor, cx| editor.reload(&content, cx));
+        }
+    }
+    removed
+}
+
+/// A history item: the message's first line, shortened.
+fn history_label(message: &str) -> String {
+    let line = message.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= HISTORY_ITEM_CHARS {
+        return line.to_string();
+    }
+    let mut short: String = line.chars().take(HISTORY_ITEM_CHARS - 1).collect();
+    short.push('…');
+    short
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// A node's chevron (right when collapsed, down when expanded); for a file, an empty column.
+fn chevron(expandable: bool, expanded: bool, ui: UiColors) -> impl IntoElement {
+    let glyph = expandable.then_some(if expanded {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronRight
+    });
+    div()
+        .flex_none()
+        .w(px(CHEVRON_WIDTH))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .children(glyph.map(|glyph| icon(glyph, ui.dim).size(px(CHEVRON_SIZE))))
+}
+
+/// The island's right edge, in the gap between islands: an accent line on hover and while dragged.
+fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
+    div()
+        .id("commit-resize")
+        .group("commit-resize")
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right(px(-(1. + RESIZE_HANDLE_WIDTH)))
+        .w(px(RESIZE_HANDLE_WIDTH))
+        .py(px(ui::RADIUS_LG))
+        .flex()
+        .justify_center()
+        .cursor(CursorStyle::ResizeLeftRight)
+        .on_drag(DraggedCommitEdge, |_, _, _, cx| {
+            cx.new(|_| DraggedCommitEdge)
+        })
+        .child(
+            div()
+                .w(px(2.))
+                .h_full()
+                .rounded(px(1.))
+                .bg(ui.focus_border)
+                .when(!resizing, |line| {
+                    line.invisible()
+                        .group_hover("commit-resize", |style| style.visible())
+                }),
+        )
+}
+
+impl Focusable for CommitPanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for CommitPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        let focused = self.focus_handle.contains_focused(window, cx)
+            || self
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.menu.focus_handle(cx).is_focused(window));
+        self.resizing &= cx.has_active_drag();
+        let list = if self.rows.is_empty() {
+            self.render_empty(cx).into_any_element()
+        } else {
+            uniform_list(
+                "commit-rows",
+                self.rows.len(),
+                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                    range
+                        .map(|index| this.render_row(index, focused, cx))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(self.scroll.clone())
+            .size_full()
+            .into_any_element()
+        };
+        let hints = (focused && !self.rows.is_empty()).then(|| {
+            div().flex_none().px_3().pb_1p5().child(
+                ui::hint_bar(
+                    &[("␣", tr("check")), ("↵", tr("diff")), ("F4", tr("open"))],
+                    ui,
+                )
+                .gap_3(),
+            )
+        });
+        div()
+            .key_context("CommitPanel")
+            .relative()
+            .flex_none()
+            .w(px(self.width.get()))
+            .h_full()
+            .flex()
+            .flex_col()
+            .font_family(theme::UI_FONT)
+            .text_size(px(theme::TEXT_MD))
+            .text_color(ui.foreground)
+            .on_action(
+                cx.listener(|this, _: &CommitChanges, window, cx| this.commit(false, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &CommitAndPush, window, cx| this.commit(true, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ToggleAmend, _, cx| this.toggle_amend(cx)))
+            .on_action(cx.listener(|this, action: &UseMessage, _, cx| {
+                if let Some(message) = this.history.get(action.0).cloned() {
+                    this.set_message(&message, cx);
+                }
+            }))
+            // Esc in the message field, with nothing for the field to clear: back to the editor.
+            .on_action(
+                cx.listener(|_, _: &editor::Cancel, _, cx| cx.emit(CommitPanelEvent::FocusEditor)),
+            )
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedCommitEdge>, _, cx| {
+                    let width = f32::from(event.event.position.x - event.bounds.left())
+                        - RESIZE_HANDLE_OFFSET;
+                    this.width.set(width);
+                    this.resizing = true;
+                    cx.notify();
+                }),
+            )
+            .child(self.render_header(window, cx))
+            .child(
+                div()
+                    .key_context("CommitChanges")
+                    .track_focus(&self.focus_handle)
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
+                        this.move_selection(|current, _| current.map_or(0, |i| i + 1), cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| {
+                        this.move_selection(
+                            |current, _| current.map_or(0, |i| i.saturating_sub(1)),
+                            cx,
+                        )
+                    }))
+                    .on_action(
+                        cx.listener(|this, _: &SelectFirst, _, cx| {
+                            this.move_selection(|_, _| 0, cx)
+                        }),
+                    )
+                    .on_action(cx.listener(|this, _: &SelectLast, _, cx| {
+                        this.move_selection(|_, len| len - 1, cx)
+                    }))
+                    .on_action(cx.listener(Self::expand))
+                    .on_action(cx.listener(Self::collapse))
+                    .on_action(cx.listener(Self::toggle_checked))
+                    .on_action(cx.listener(Self::show_diff))
+                    .on_action(cx.listener(Self::jump_to_source))
+                    .on_action(cx.listener(Self::rollback))
+                    .on_action(cx.listener(Self::delete))
+                    .on_action(cx.listener(Self::copy_path))
+                    .on_action(cx.listener(Self::add_to_gitignore))
+                    .on_action(
+                        cx.listener(|this, _: &ExpandAll, _, cx| this.set_all_expanded(true, cx)),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &CollapseAll, _, cx| {
+                            this.set_all_expanded(false, cx)
+                        }),
+                    )
+                    .on_action(cx.listener(|this, _: &ToggleGroupByDirectory, _, cx| {
+                        this.group_by_directory = !this.group_by_directory;
+                        this.rebuild(cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                        this.git.update(cx, |git, cx| git.refresh(cx))
+                    }))
+                    .on_action(cx.listener(Self::show_context_menu))
+                    .on_action(cx.listener(|this, _: &FocusMessage, window, cx| {
+                        this.focus_message(window, cx)
+                    }))
+                    .on_action(
+                        cx.listener(|_, _: &Cancel, _, cx| cx.emit(CommitPanelEvent::FocusEditor)),
+                    )
+                    .child(
+                        div()
+                            .id("commit-list")
+                            .flex_1()
+                            .min_h_0()
+                            .pt_0p5()
+                            .pb_2()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, _| window.focus(&this.focus_handle)),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.secondary_click(None, event.position, window, cx)
+                                }),
+                            )
+                            .child(list),
+                    )
+                    .children(hints),
+            )
+            .child(ui::divider(ui).mx(px(ui::GAP)))
+            .child(div().h_2())
+            .child(self.render_message(window, cx))
+            .child(self.render_footer(window, cx))
+            .child(resize_handle(self.resizing, ui))
+            .children(
+                self.menu
+                    .as_ref()
+                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(repo: usize, relative: &str, status: FileStatus) -> Change {
+        Change {
+            repo,
+            path: PathBuf::from(format!("/r{repo}/{relative}")),
+            relative: relative.into(),
+            orig_path: None,
+            status,
+        }
+    }
+
+    fn labels(rows: &[Row]) -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                let text = match &row.kind {
+                    RowKind::Repo { name, .. } => format!("repo {name}"),
+                    RowKind::Group(GroupKind::Changes) => "Changes".into(),
+                    RowKind::Group(GroupKind::Unversioned) => "Unversioned".into(),
+                    RowKind::Dir { label } => format!("{label}/"),
+                    RowKind::File { name, detail } => match detail {
+                        Some(detail) => format!("{name} ({detail})"),
+                        None => name.clone(),
+                    },
+                };
+                format!("{}{text}", "  ".repeat(row.depth))
+            })
+            .collect()
+    }
+
+    fn one_repo() -> Vec<RepoLabel> {
+        vec![RepoLabel {
+            name: "demo".into(),
+            branch: Some("main".into()),
+        }]
+    }
+
+    #[test]
+    fn changes_group_by_directory_with_joined_chains() {
+        let changes = vec![
+            change(0, "src/app/ui/view.rs", FileStatus::Modified),
+            change(0, "src/main.rs", FileStatus::Modified),
+            change(0, "README.md", FileStatus::Deleted),
+            change(0, "file10.rs", FileStatus::Untracked),
+            change(0, "file2.rs", FileStatus::Untracked),
+        ];
+        let rows = build_rows(&changes, &one_repo(), true, &HashSet::new());
+        assert_eq!(
+            labels(&rows),
+            vec![
+                "Changes",
+                "  src/",
+                "    app/ui/",
+                "      view.rs",
+                "    main.rs",
+                "  README.md",
+                "Unversioned",
+                "  file2.rs",
+                "  file10.rs",
+            ]
+        );
+        // A node knows every file under it.
+        assert_eq!(rows[1].files.len(), 2);
+        assert_eq!(rows[0].files.len(), 3);
+    }
+
+    #[test]
+    fn the_flat_view_shows_directories_after_names() {
+        let changes = vec![
+            change(0, "src/main.rs", FileStatus::Modified),
+            change(0, "Cargo.toml", FileStatus::Modified),
+        ];
+        let rows = build_rows(&changes, &one_repo(), false, &HashSet::new());
+        assert_eq!(
+            labels(&rows),
+            vec!["Changes", "  Cargo.toml", "  main.rs (src)"]
+        );
+    }
+
+    #[test]
+    fn collapsed_nodes_hide_their_contents_and_several_repositories_get_nodes() {
+        let changes = vec![
+            change(0, "a.rs", FileStatus::Modified),
+            change(1, "lib/b.rs", FileStatus::Added),
+        ];
+        let repos = vec![
+            RepoLabel {
+                name: "app".into(),
+                branch: Some("main".into()),
+            },
+            RepoLabel {
+                name: "core".into(),
+                branch: None,
+            },
+        ];
+        let collapsed: HashSet<RowKey> = [RowKey::Dir(1, GroupKind::Changes, "lib".into())].into();
+        let rows = build_rows(&changes, &repos, true, &collapsed);
+        assert_eq!(
+            labels(&rows),
+            vec![
+                "repo app",
+                "  Changes",
+                "    a.rs",
+                "repo core",
+                "  Changes",
+                "    lib/"
+            ]
+        );
+        assert!(!rows[5].expanded);
+        let collapsed: HashSet<RowKey> = [RowKey::Repo(0)].into();
+        let rows = build_rows(&changes, &repos, true, &collapsed);
+        assert_eq!(labels(&rows)[0..2], ["repo app", "repo core"]);
+    }
+
+    #[test]
+    fn nodes_aggregate_their_checkboxes() {
+        use CheckState::*;
+        assert_eq!(aggregate([Checked, Checked]), Checked);
+        assert_eq!(aggregate([Unchecked, Unchecked]), Unchecked);
+        assert_eq!(aggregate([Checked, Unchecked]), Partial);
+        assert_eq!(aggregate([Checked, Partial]), Partial);
+        assert_eq!(aggregate([]), Unchecked);
+    }
+
+    #[test]
+    fn partial_content_keeps_only_included_hunks_and_crlf() {
+        let base = "a\r\nb\r\nc\r\n";
+        let current = "A\r\nb\r\nC\r\n";
+        // Only the first change goes in.
+        let content = partial_content(base, current, |hunk| hunk.old.start == 0);
+        assert_eq!(content, "A\r\nb\r\nc\r\n");
+        let content = partial_content("a\nb\n", "a\nb\nc\n", |_| false);
+        assert_eq!(content, "a\nb\n");
+    }
+
+    #[test]
+    fn history_items_are_first_lines() {
+        assert_eq!(history_label("Fix parser\n\nLong body"), "Fix parser");
+        let long = "x".repeat(80);
+        assert_eq!(history_label(&long).chars().count(), HISTORY_ITEM_CHARS);
+    }
+}

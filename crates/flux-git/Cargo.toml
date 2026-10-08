@@ -1,0 +1,17 @@
+[package]
+name = "flux-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Line and word diffs: histogram with git's indent heuristic.
+imara-diff = "0.2.0"
+# git's children run in a new session: ssh and credential helpers can't prompt on the terminal Flux
+# was started from.
+libc = "0.2.190"
+# Watching the working tree and the git directory: FSEvents on macOS.
+notify = "8.2.0"
+
+[dev-dependencies]
+tempfile = "3"

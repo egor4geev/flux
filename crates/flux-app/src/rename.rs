@@ -208,7 +208,7 @@ pub(crate) fn apply_workspace_edit(
 ) -> Result<(), String> {
     let files = group_by_file(flux_lsp::edit::workspace_files(edit)?);
     let editors: Vec<(PathBuf, Entity<Editor>)> = workspace
-        .editors()
+        .editors(cx)
         .into_iter()
         .filter_map(|editor| {
             let path = canonical(editor.read(cx).document.path()?);
@@ -308,7 +308,7 @@ fn document_edits(
 
 /// The span where `new` differs from `old` (after the common start and before the common end),
 /// and what `new` has there; `None` if the texts are equal.
-fn difference(old: &Rope, new: &Rope) -> Option<(Range<usize>, String)> {
+pub(crate) fn difference(old: &Rope, new: &Rope) -> Option<(Range<usize>, String)> {
     let prefix = old
         .chars()
         .zip(new.chars())

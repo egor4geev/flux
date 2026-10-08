@@ -17,6 +17,7 @@ scenario = []
 anyhow = "1.0.104"
 flux-core.workspace = true
 flux-fs.workspace = true
+flux-git.workspace = true
 flux-lsp.workspace = true
 flux-search.workspace = true
 flux-syntax.workspace = true

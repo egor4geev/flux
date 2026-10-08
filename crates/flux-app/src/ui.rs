@@ -4,7 +4,7 @@
 //! `p_2` = 8 px, `gap_3` = 12 px).
 
 use gpui::{
-    Action, AnyView, App, BoxShadow, Context, Div, ElementId, FocusHandle, Hsla, IntoElement,
+    Action, AnyView, App, BoxShadow, Context, Div, ElementId, FocusHandle, FontWeight, Hsla, IntoElement,
     KeyBinding, Render, SharedString, Stateful, Window, div, linear_color_stop, linear_gradient,
     point, prelude::*, px,
 };
@@ -29,6 +29,38 @@ pub const TITLE_BAR_HEIGHT: f32 = 40.;
 pub const STATUS_BAR_HEIGHT: f32 = 28.;
 /// Icon button and toggle.
 pub const ICON_BUTTON_SIZE: f32 = 26.;
+
+/// The width of the left island. The project tree and the commit window take turns in it and share
+/// it: dragging the edge of either resizes both, so switching between them (⌘1, ⌘0) doesn't move
+/// the editor.
+#[derive(Clone)]
+pub struct LeftIslandWidth(std::rc::Rc<std::cell::Cell<f32>>);
+
+impl LeftIslandWidth {
+    pub const DEFAULT: f32 = 260.;
+    /// The commit window's buttons («Commit», «Commit and Push…») need this much.
+    pub const MIN: f32 = 220.;
+    pub const MAX: f32 = 640.;
+
+    pub fn new() -> Self {
+        Self(std::rc::Rc::new(std::cell::Cell::new(Self::DEFAULT)))
+    }
+
+    pub fn get(&self) -> f32 {
+        self.0.get()
+    }
+
+    /// Sets the width, kept within the limits.
+    pub fn set(&self, width: f32) {
+        self.0.set(width.clamp(Self::MIN, Self::MAX));
+    }
+}
+
+impl Default for LeftIslandWidth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Island: a standalone panel on the window's glass frame (tree, editor). The corner rounding
 /// doesn't clip children: their backgrounds must keep away from the edge at the corners.
@@ -232,6 +264,84 @@ fn button_base(id: impl Into<ElementId>, ui: UiColors) -> Stateful<Div> {
         .rounded(px(RADIUS_SM))
         .cursor_pointer()
         .active(move |style| style.bg(ui.pressed))
+}
+
+/// A checkbox: on, off, or partly on (a file with some of its changes in the commit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    Checked,
+    Partial,
+    Unchecked,
+}
+
+impl CheckState {
+    pub fn from_bool(on: bool) -> Self {
+        if on { CheckState::Checked } else { CheckState::Unchecked }
+    }
+}
+
+/// Size of a checkbox.
+const CHECKBOX_SIZE: f32 = 14.;
+
+/// A checkbox: empty, checked (accent with a check), or partly checked (accent with a dash).
+pub fn checkbox(
+    id: impl Into<gpui::ElementId>,
+    state: CheckState,
+    ui: UiColors,
+) -> Stateful<Div> {
+    let on = state != CheckState::Unchecked;
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(CHECKBOX_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .border_1()
+        .cursor_pointer()
+        .when(on, |check| check.bg(ui.accent).border_color(ui.accent))
+        .when(!on, move |check| {
+            check
+                .border_color(ui.text_muted)
+                .hover(move |style| style.border_color(ui.foreground))
+        })
+        .children(match state {
+            CheckState::Checked => Some(icon(IconName::Check, ui.foreground).size(px(11.))),
+            CheckState::Partial => Some(icon(IconName::Minus, ui.foreground).size(px(11.))),
+            CheckState::Unchecked => None,
+        })
+}
+
+/// The main button of a window (Commit, Push): an accent-tinted pill; dimmed when unavailable.
+pub fn primary_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    enabled: bool,
+    ui: UiColors,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .h(px(ICON_BUTTON_SIZE))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .rounded(px(RADIUS_SM))
+        .border_1()
+        .border_color(UiColors::tint(ui.accent, 0.55))
+        .bg(UiColors::tint(ui.accent, 0.24))
+        .text_size(px(theme::TEXT_SM))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(ui.accent_text)
+        .when(enabled, move |button| {
+            button
+                .cursor_pointer()
+                .hover(move |style| style.bg(UiColors::tint(ui.accent, 0.34)))
+                .active(move |style| style.bg(UiColors::tint(ui.accent, 0.42)))
+        })
+        .when(!enabled, |button| button.opacity(0.5))
+        .child(label.into())
 }
 
 /// Shortcut keys: "⇧⌘F" → ⇧ ⌘ F, "⌘K ⌘S" → two groups. Modifiers get one key each; the rest of a

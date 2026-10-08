@@ -470,7 +470,7 @@ async fn show_list(
 ) {
     let Ok((texts, root, origin)) = this.update(cx, |this, cx| {
         let texts = this
-            .editors()
+            .editors(cx)
             .iter()
             .filter_map(|editor| {
                 let document = &editor.read(cx).document;

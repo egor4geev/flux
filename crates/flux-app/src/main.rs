@@ -1,14 +1,18 @@
 mod app_menu;
 mod command_palette;
+mod commit_panel;
 mod completion;
 mod context_menu;
 mod diagnostics;
+mod diff_view;
 mod display;
 mod editor;
 mod element;
 mod file_finder;
 mod file_tree;
 mod find_bar;
+mod git;
+mod git_gutter;
 mod go_to_line;
 mod highlighter;
 mod hover;
@@ -23,6 +27,7 @@ mod navigation;
 mod picker;
 mod popup;
 mod project_search;
+mod push_dialog;
 mod recent;
 mod rename;
 mod settings;
@@ -38,6 +43,7 @@ mod terminal_search;
 mod terminal_view;
 mod theme;
 mod ui;
+mod vcs_menu;
 mod workspace;
 
 use std::path::{PathBuf, absolute};
@@ -93,6 +99,11 @@ fn main() {
             terminal_search::init(cx);
             terminal_group::init(cx);
             terminal_panel::init(cx);
+            git::init(cx);
+            git_gutter::init(cx);
+            commit_panel::init(cx);
+            push_dialog::init(cx);
+            diff_view::init(cx);
 
             let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
             // A custom title bar on a glass window frame: the system title bar is transparent, the

@@ -16,8 +16,11 @@ use gpui::{
     Window, WindowHandle, actions, anchored, deferred, div, prelude::*, px, relative,
 };
 
+use crate::commit_panel::{CommitPanel, CommitPanelEvent};
+use crate::diff_view::{DiffView, DiffViewEvent};
 use crate::editor::{self, Editor};
 use crate::file_tree::{self, FileTreeEvent, FileTreePanel};
+use crate::git::{GitEvent, GitStore};
 use crate::find_bar::{self, FindBar};
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
@@ -157,9 +160,18 @@ pub struct Workspace {
     tree_open: bool,
     /// The file last shown in the tree: the tree follows the active tab.
     revealed: Option<PathBuf>,
-    /// The git branch of the project root, shown in the title bar; re-read when the window is
-    /// activated.
-    branch: Option<SharedString>,
+    /// Git of the project: repositories, changes, the branch in the title bar; recreated with the
+    /// root.
+    git: Entity<GitStore>,
+    _git_subscription: Subscription,
+    /// The width of the left island, shared by the tree and the commit window.
+    left_width: ui::LeftIslandWidth,
+    /// The commit window: in the left island instead of the tree (⌘0, ⌘K); made when first shown.
+    commit_panel: Option<CommitPanelHandle>,
+    commit_open: bool,
+    /// The tree was shown when the commit window took its place: hiding the commit window brings it
+    /// back.
+    tree_before_commit: bool,
     /// Recent projects for the start screen, most recent first.
     recent: Vec<PathBuf>,
     /// Language servers of the project; recreated with the root.
@@ -168,6 +180,12 @@ pub struct Workspace {
     terminal_panel: Entity<TerminalPanel>,
     terminal_open: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The commit window and the subscription to its events; recreated with the git hub.
+struct CommitPanelHandle {
+    panel: Entity<CommitPanel>,
+    _subscription: Subscription,
 }
 
 /// The file tree and the subscription to its events; recreated whenever the project root changes.
@@ -184,25 +202,33 @@ struct Tab {
     _subscriptions: Vec<Subscription>,
 }
 
-/// What a tab shows: a document, or a terminal tab brought over from the panel.
+/// What a tab shows: a document, a terminal tab brought over from the panel, or a diff.
 #[derive(Clone, PartialEq)]
 enum TabItem {
     Editor(Entity<Editor>),
     Terminal(Entity<TerminalGroup>),
+    Diff(Entity<DiffView>),
 }
 
 impl TabItem {
     fn editor(&self) -> Option<&Entity<Editor>> {
         match self {
             TabItem::Editor(editor) => Some(editor),
-            TabItem::Terminal(_) => None,
+            _ => None,
         }
     }
 
     fn terminal(&self) -> Option<&Entity<TerminalGroup>> {
         match self {
             TabItem::Terminal(group) => Some(group),
-            TabItem::Editor(_) => None,
+            _ => None,
+        }
+    }
+
+    fn diff(&self) -> Option<&Entity<DiffView>> {
+        match self {
+            TabItem::Diff(view) => Some(view),
+            _ => None,
         }
     }
 
@@ -210,12 +236,17 @@ impl TabItem {
         match self {
             TabItem::Editor(editor) => editor.focus_handle(cx),
             TabItem::Terminal(group) => group.focus_handle(cx),
+            TabItem::Diff(view) => view.focus_handle(cx),
         }
     }
 
-    /// Unsaved changes: only a document has them.
+    /// Unsaved changes: a document's, or those of the working copy a diff opened without a tab.
     fn is_modified(&self, cx: &App) -> bool {
-        self.editor().is_some_and(|editor| is_modified(editor, cx))
+        match self {
+            TabItem::Editor(editor) => is_modified(editor, cx),
+            TabItem::Diff(view) => owned_editor(view, cx).is_some_and(|e| is_modified(&e, cx)),
+            TabItem::Terminal(_) => false,
+        }
     }
 }
 
@@ -270,16 +301,25 @@ impl Workspace {
         window.focus(&focus_handle);
         let find_bar = cx.new(|cx| FindBar::new(window, cx));
         let project_search = cx.new(|cx| ProjectSearch::new(root.clone(), window, cx));
-        let file_tree = root.clone().map(|root| Self::build_tree(root, window, cx));
         let lsp = Self::build_lsp(root.clone(), cx);
+        let (git, git_subscription) = Self::build_git(root.clone(), window, cx);
+        let left_width = ui::LeftIslandWidth::new();
+        let file_tree = root.clone().map(|root| {
+            let tree = Self::build_tree(root, left_width.clone(), window, cx);
+            tree.panel
+                .update(cx, |panel, cx| panel.set_git(git.clone(), cx));
+            tree
+        });
         let terminal_panel = cx.new(|cx| TerminalPanel::new(root.clone(), window, cx));
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
         let subscriptions = vec![
-            // The branch may have been switched in a terminal while the window was inactive.
+            // Files may have changed while the window was inactive (git in a terminal, another
+            // editor): the watcher reports them, and a refresh on return makes sure.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
-                    this.refresh_branch(cx);
+                    this.git.update(cx, |git, cx| git.refresh(cx));
+                    this.sync_documents(None, cx);
                 }
             }),
             cx.observe(&find_bar, |_, _, cx| cx.notify()),
@@ -297,7 +337,6 @@ impl Workspace {
                 },
             ),
         ];
-        let branch = root.as_deref().and_then(read_branch);
         let recent = match &root {
             Some(root) => recent::record(root),
             None => recent::load(),
@@ -324,7 +363,12 @@ impl Workspace {
             file_tree,
             tree_open: true,
             revealed: None,
-            branch,
+            git,
+            _git_subscription: git_subscription,
+            left_width,
+            commit_panel: None,
+            commit_open: false,
+            tree_before_commit: false,
             recent,
             lsp,
             terminal_panel,
@@ -346,17 +390,27 @@ impl Workspace {
         let root = fs::canonicalize(&root).unwrap_or(root);
         self.project_search
             .update(cx, |search, cx| search.set_root(Some(root.clone()), cx));
-        self.file_tree = Some(Self::build_tree(root.clone(), window, cx));
+        let (git, git_subscription) = Self::build_git(Some(root.clone()), window, cx);
+        self.git = git;
+        self._git_subscription = git_subscription;
+        self.commit_panel = None;
+        self.commit_open = false;
+        let tree = Self::build_tree(root.clone(), self.left_width.clone(), window, cx);
+        tree.panel
+            .update(cx, |panel, cx| panel.set_git(self.git.clone(), cx));
+        self.file_tree = Some(tree);
+        self.tree_open = true;
         self.revealed = None;
-        self.branch = read_branch(&root);
         self.recent = recent::record(&root);
         self.show_message(trf("Project: {0}", &[&tilde(&root)]).into(), cx);
         self.root = Some(root.clone());
         self.terminal_panel
             .update(cx, |panel, _| panel.set_root(Some(root.clone())));
         self.lsp = Self::build_lsp(Some(root), cx);
-        for editor in self.editors() {
+        for editor in self.editors(cx) {
             self.lsp
+                .update(cx, |store, cx| store.register(&editor, cx));
+            self.git
                 .update(cx, |store, cx| store.register(&editor, cx));
         }
         self.reveal_active(cx);
@@ -370,21 +424,68 @@ impl Workspace {
         lsp
     }
 
-    /// Re-reads the git branch (`.git/HEAD`); redraws only if it changed.
-    fn refresh_branch(&mut self, cx: &mut Context<Self>) {
-        let branch = self.root.as_deref().and_then(read_branch);
-        if branch != self.branch {
-            self.branch = branch;
-            cx.notify();
+    /// Git of a project root; its messages and errors go to the status bar and dialogs.
+    fn build_git(
+        root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<GitStore>, Subscription) {
+        let git = cx.new(|cx| GitStore::new(root, cx));
+        cx.observe(&git, |_, _, cx| cx.notify()).detach();
+        let subscription = cx.subscribe_in(&git, window, |this, _, event, window, cx| {
+            this.on_git_event(event, window, cx)
+        });
+        (git, subscription)
+    }
+
+    pub(crate) fn git(&self) -> &Entity<GitStore> {
+        &self.git
+    }
+
+    fn on_git_event(&mut self, event: &GitEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            GitEvent::Message(message) => self.show_message(message.clone(), cx),
+            GitEvent::Error { message, details } => {
+                self.show_message(message.clone(), cx);
+                if let Some(details) = details {
+                    // The answer doesn't matter: the dialog only shows git's output.
+                    drop(window.prompt(
+                        PromptLevel::Critical,
+                        message,
+                        Some(details),
+                        &[tr("OK")],
+                        cx,
+                    ));
+                }
+            }
         }
     }
 
-    /// The documents in the tabs (terminal tabs aside).
-    pub(crate) fn editors(&self) -> Vec<Entity<Editor>> {
-        self.tabs
-            .iter()
-            .filter_map(|tab| tab.item.editor().cloned())
-            .collect()
+    /// The documents of the window: in tabs, and the working copies diffs opened without a tab.
+    pub(crate) fn editors(&self, cx: &App) -> Vec<Entity<Editor>> {
+        let mut editors: Vec<Entity<Editor>> = Vec::new();
+        for tab in &self.tabs {
+            let editor = match &tab.item {
+                TabItem::Editor(editor) => Some(editor.clone()),
+                TabItem::Diff(view) => owned_editor(view, cx),
+                TabItem::Terminal(_) => None,
+            };
+            if let Some(editor) = editor
+                && !editors.contains(&editor)
+            {
+                editors.push(editor);
+            }
+        }
+        editors
+    }
+
+    /// The file of the active tab: a document's, or the file a diff shows.
+    pub(crate) fn active_path(&self, cx: &App) -> Option<PathBuf> {
+        match self.active_item()? {
+            TabItem::Editor(editor) => editor.read(cx).document.path().map(Path::to_path_buf),
+            TabItem::Diff(view) => Some(view.read(cx).path().to_path_buf()),
+            TabItem::Terminal(_) => None,
+        }
     }
 
     /// The active tab, if it is a document.
@@ -481,9 +582,32 @@ impl Workspace {
 
     /// Adds a new tab to the right of the active one; it becomes the active tab.
     fn add_document(&mut self, document: Document, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.new_editor(document, window, cx);
+        self.add_editor_tab(editor, window, cx);
+    }
+
+    /// An editor for a document, on the window's language servers and git.
+    fn new_editor(
+        &mut self,
+        document: Document,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
         let editor = cx.new(|cx| Editor::new(document, window, cx));
         self.lsp
             .update(cx, |store, cx| store.register(&editor, cx));
+        self.git
+            .update(cx, |store, cx| store.register(&editor, cx));
+        editor
+    }
+
+    /// A tab for an editor (a new one, or the working copy a diff opened without a tab).
+    fn add_editor_tab(
+        &mut self,
+        editor: Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // A document's path changes on "Save As": the tree then shows the new file.
         let observer = cx.observe(&editor, |this, _, cx| {
             this.reveal_active(cx);
@@ -708,8 +832,21 @@ impl Workspace {
         });
         if let Some(index) = found {
             self.activate(index, window, cx);
+            return true;
         }
-        found.is_some()
+        // The working copy of a diff, opened without a tab: it gets its own tab, the same editor.
+        let owned = self.tabs.iter().find_map(|tab| {
+            let view = tab.item.diff()?;
+            let editor = owned_editor(view, cx)?;
+            let path = editor.read(cx).document.path().map(canonical)?;
+            (path == target).then(|| (view.clone(), editor))
+        });
+        if let Some((view, editor)) = owned {
+            view.update(cx, |view, _| view.set_owns_working(false));
+            self.add_editor_tab(editor, window, cx);
+            return true;
+        }
+        false
     }
 
     fn finish_open(
@@ -770,11 +907,18 @@ impl Workspace {
     /// A message to the user: in the active editor's status bar; under a terminal tab, in the
     /// window's status bar for a few seconds; in an empty window, under the hint.
     pub(crate) fn show_message(&mut self, message: SharedString, cx: &mut Context<Self>) {
+        let editor = match self.active_item() {
+            Some(TabItem::Diff(view)) => view.read(cx).working().cloned(),
+            _ => None,
+        };
+        if let Some(editor) = editor {
+            return editor.update(cx, |editor, cx| editor.show_status(message, cx));
+        }
         match self.active_item() {
             Some(TabItem::Editor(editor)) => {
                 editor.update(cx, |editor, cx| editor.show_status(message, cx))
             }
-            Some(TabItem::Terminal(_)) => {
+            Some(TabItem::Terminal(_) | TabItem::Diff(_)) => {
                 self.status_message = Some(message);
                 self.status_message_task = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor()
@@ -811,7 +955,177 @@ impl Workspace {
         match item {
             TabItem::Editor(editor) => self.close_tab(editor, window, cx),
             TabItem::Terminal(group) => self.close_terminal_tab(group, window, cx),
+            TabItem::Diff(view) => self.close_diff_tab(view, window, cx),
         }
+    }
+
+    /// Closes a diff; the working copy it opened without a tab is asked about if it has unsaved
+    /// changes.
+    fn close_diff_tab(&mut self, view: Entity<DiffView>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        let owned = owned_editor(&view, cx).filter(|editor| is_modified(editor, cx));
+        let remove = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            if let Some(index) = this.tabs.iter().position(|tab| tab.item.diff() == Some(&view)) {
+                this.remove_tab_at(index, window, cx);
+            }
+        };
+        let Some(editor) = owned else {
+            return remove(self, window, cx);
+        };
+        let confirm = self.confirm(vec![editor], window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if confirm.await {
+                this.update_in(cx, |this, window, cx| remove(this, window, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    // --- Git ---
+
+    /// Opens the diff of a file against HEAD in a tab (or activates the one that is open). The right
+    /// side is the file's editor: the one of its tab, otherwise a new one the diff holds; a deleted
+    /// file has none.
+    pub fn open_diff(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let target = canonical(&path);
+        let open = self.tabs.iter().position(|tab| {
+            tab.item
+                .diff()
+                .is_some_and(|view| canonical(view.read(cx).path()) == target)
+        });
+        if let Some(index) = open {
+            return self.activate(index, window, cx);
+        }
+        let editor = self.tabs.iter().find_map(|tab| {
+            let editor = tab.item.editor()?;
+            let path = editor.read(cx).document.path().map(canonical)?;
+            (path == target).then(|| editor.clone())
+        });
+        if let Some(editor) = editor {
+            return self.add_diff_tab(path, Some(editor), false, window, cx);
+        }
+        if !path.exists() {
+            return self.add_diff_tab(path, None, false, window, cx);
+        }
+        self.loading += 1;
+        let read = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { read_document(path) }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = read.await;
+            this.update_in(cx, |this, window, cx| {
+                this.loading -= 1;
+                match result {
+                    Ok(document) => {
+                        let editor = this.new_editor(document, window, cx);
+                        this.add_diff_tab(path, Some(editor), true, window, cx)
+                    }
+                    Err(error) => this.report_dialog(vec![error], cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn add_diff_tab(
+        &mut self,
+        path: PathBuf,
+        working: Option<Entity<Editor>>,
+        owns_working: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git = self.git.clone();
+        let view = cx.new(|cx| DiffView::new(path, git, working, owns_working, window, cx));
+        let subscriptions = vec![
+            cx.observe(&view, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+                DiffViewEvent::OpenFile(location) => {
+                    this.open_location(location.clone(), true, window, cx)
+                }
+            }),
+        ];
+        self.insert_tab(TabItem::Diff(view), subscriptions, None, window, cx);
+    }
+
+    /// ⌘K (`focus_message`) and ⌘0: shows the commit window in place of the tree.
+    pub fn show_commit_window(
+        &mut self,
+        focus_message: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = self.commit_panel(window, cx);
+        if !self.commit_open {
+            self.tree_before_commit = self.tree_open;
+            self.tree_open = false;
+            self.commit_open = true;
+        }
+        panel.update(cx, |panel, cx| {
+            if focus_message {
+                panel.focus_message(window, cx)
+            } else {
+                panel.focus_changes(window, cx)
+            }
+        });
+        cx.notify();
+    }
+
+    /// ⌘0, as the Commit tool window in JetBrains IDEs: shows the commit window and focuses it; from
+    /// the commit window, hides it (the tree comes back if it was there).
+    pub fn toggle_commit_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = self
+            .commit_panel
+            .as_ref()
+            .is_some_and(|handle| handle.panel.read(cx).contains_focus(window, cx));
+        if self.commit_open && focused {
+            return self.hide_commit_window(window, cx);
+        }
+        self.show_commit_window(false, window, cx)
+    }
+
+    fn hide_commit_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = self
+            .commit_panel
+            .as_ref()
+            .is_some_and(|handle| handle.panel.read(cx).contains_focus(window, cx));
+        self.commit_open = false;
+        self.tree_open = self.tree_before_commit;
+        if focused {
+            self.focus_active(window, cx);
+        }
+        self.revealed = None;
+        self.reveal_active(cx);
+        cx.notify();
+    }
+
+    /// The commit window, made on first use.
+    fn commit_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<CommitPanel> {
+        if let Some(handle) = &self.commit_panel {
+            return handle.panel.clone();
+        }
+        let git = self.git.clone();
+        let width = self.left_width.clone();
+        let panel = cx.new(|cx| CommitPanel::new(git, width, window, cx));
+        let subscription = cx.subscribe_in(&panel, window, |this, _, event, window, cx| {
+            match event {
+                CommitPanelEvent::OpenDiff(path) => this.open_diff(path.clone(), window, cx),
+                CommitPanelEvent::OpenFile(path) => this.open_file(path.clone(), true, window, cx),
+                CommitPanelEvent::FocusEditor => this.focus_active(window, cx),
+                CommitPanelEvent::Push => crate::push_dialog::open(this, window, cx),
+                CommitPanelEvent::Removed(paths) => this.documents_removed(paths, window, cx),
+            }
+        });
+        self.commit_panel = Some(CommitPanelHandle {
+            panel: panel.clone(),
+            _subscription: subscription,
+        });
+        panel
     }
 
     /// Closes a terminal tab (× on the tab, ⌘W with focus outside its terminals); a running command
@@ -891,7 +1205,7 @@ impl Workspace {
         if self.closing {
             return Task::ready(false);
         }
-        let editors = self.editors();
+        let editors = self.editors(cx);
         let Some(detail) = running_processes_detail(&self.running_processes(cx)) else {
             return self.confirm(editors, window, cx);
         };
@@ -981,8 +1295,13 @@ impl Workspace {
 
     // --- File tree ---
 
-    fn build_tree(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> TreePanel {
-        let panel = cx.new(|cx| FileTreePanel::new(root, window, cx));
+    fn build_tree(
+        root: PathBuf,
+        width: ui::LeftIslandWidth,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TreePanel {
+        let panel = cx.new(|cx| FileTreePanel::new(root, width, window, cx));
         let subscription = cx.subscribe_in(&panel, window, Self::on_tree_event);
         TreePanel {
             panel,
@@ -1003,6 +1322,7 @@ impl Workspace {
             FileTreeEvent::Moved { from, to } => self.documents_moved(from, to, cx),
             FileTreeEvent::Removed { paths } => self.documents_removed(paths, window, cx),
             FileTreeEvent::Message(message) => self.show_message(message.clone(), cx),
+            FileTreeEvent::DiskChanged(paths) => self.sync_documents(paths.clone(), cx),
         }
     }
 
@@ -1010,8 +1330,17 @@ impl Workspace {
     pub(crate) fn tool_open(&self, tool: Tool, cx: &App) -> bool {
         match tool {
             Tool::Project => self.tree_open && self.file_tree.is_some(),
+            Tool::Commit => self.commit_open,
             Tool::FindInFiles => self.project_search.read(cx).is_open(),
             Tool::Terminal => self.terminal_open,
+        }
+    }
+
+    /// A count on a launchpad tool: the number of changes on Commit.
+    pub(crate) fn tool_badge(&self, tool: Tool, cx: &App) -> Option<usize> {
+        match tool {
+            Tool::Commit => Some(self.git.read(cx).change_count()).filter(|count| *count > 0),
+            _ => None,
         }
     }
 
@@ -1043,6 +1372,23 @@ impl Workspace {
             return self.show_message(tr("No project folder — open one with ⌘O").into(), cx);
         };
         let focused = panel.focus_handle(cx).contains_focused(window, cx);
+        // The commit window gives its place back to the tree, and its focus with it: a hidden panel
+        // that keeps focus would take the keys away — gpui finds no path from it to the window, and
+        // ⌘0, ⌘K and the rest go nowhere.
+        if self.commit_open {
+            let commit_focused = self
+                .commit_panel
+                .as_ref()
+                .is_some_and(|handle| handle.panel.read(cx).contains_focus(window, cx));
+            self.commit_open = false;
+            self.tree_open = true;
+            if commit_focused {
+                window.focus(&panel.focus_handle(cx));
+            }
+            self.revealed = None;
+            self.reveal_active(cx);
+            return cx.notify();
+        }
         self.tree_open = !self.tree_open;
         if !self.tree_open && focused {
             self.focus_active(window, cx);
@@ -1062,6 +1408,7 @@ impl Workspace {
         if self.tree_open && handle.contains_focused(window, cx) {
             return self.focus_active(window, cx);
         }
+        self.commit_open = false;
         if !self.tree_open {
             self.tree_open = true;
             self.revealed = None;
@@ -1071,10 +1418,80 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Files changed on disk (`None` — any may have: the window was activated, events were lost):
+    /// an open document without unsaved changes takes the new content, as one edit that ⌘Z undoes;
+    /// one with unsaved changes keeps them, and the status bar says the file changed.
+    fn sync_documents(&mut self, paths: Option<Vec<PathBuf>>, cx: &mut Context<Self>) {
+        let editors: Vec<(Entity<Editor>, PathBuf)> = self
+            .editors(cx)
+            .into_iter()
+            .filter_map(|editor| {
+                let path = editor.read(cx).document.path()?.to_path_buf();
+                let affected = paths
+                    .as_ref()
+                    .is_none_or(|paths| paths.contains(&path));
+                affected.then_some((editor, path))
+            })
+            .collect();
+        if editors.is_empty() {
+            return;
+        }
+        let known: Vec<Option<std::time::SystemTime>> = editors
+            .iter()
+            .map(|(editor, _)| editor.read(cx).disk_mtime)
+            .collect();
+        let paths: Vec<PathBuf> = editors.iter().map(|(_, path)| path.clone()).collect();
+        // Only files written since the editor last saw them are read; unreadable or missing ones are
+        // left alone: deletion has its own path (the tree, git).
+        let read = cx.background_spawn(async move {
+            paths
+                .into_iter()
+                .zip(known)
+                .map(|(path, known)| {
+                    let mtime = editor::file_mtime(&path)?;
+                    if Some(mtime) == known {
+                        return None;
+                    }
+                    Some((mtime, fs::read_to_string(&path).ok()?))
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let contents = read.await;
+            this.update(cx, |this, cx| {
+                for ((editor, _), read) in editors.into_iter().zip(contents) {
+                    let Some((mtime, content)) = read else {
+                        continue;
+                    };
+                    let (same, modified) = {
+                        let document = &editor.read(cx).document;
+                        (document.text() == content.as_str(), document.is_modified())
+                    };
+                    editor.update(cx, |editor, _| editor.disk_mtime = Some(mtime));
+                    if same {
+                        continue;
+                    }
+                    if modified {
+                        let name = editor.read(cx).document.display_name();
+                        let message = trf(
+                            "“{0}” changed on disk; your unsaved changes are kept",
+                            &[&name],
+                        );
+                        this.show_message(message.into(), cx);
+                        continue;
+                    }
+                    editor.update(cx, |editor, cx| editor.reload(&content, cx));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// A file or directory was moved (renamed, or moved within the tree): the open documents inside
     /// it are switched to the new paths.
     fn documents_moved(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
-        for editor in self.editors() {
+        for editor in self.editors(cx) {
             let moved = editor
                 .read(cx)
                 .document
@@ -1098,7 +1515,7 @@ impl Workspace {
         // came from the tree, so focus must stay there (unless it was in the closed tab).
         let mut keep_focus = window.focused(cx);
         let mut kept = false;
-        for editor in self.editors() {
+        for editor in self.editors(cx) {
             let (removed, modified) = {
                 let document = &editor.read(cx).document;
                 let removed = document
@@ -1291,6 +1708,8 @@ impl Workspace {
             },
             TerminalLink::Directory(path) => {
                 if let Some(panel) = self.tree_panel() {
+                    // The commit window gives its place to the tree, which shows the directory.
+                    self.commit_open = false;
                     self.tree_open = true;
                     self.revealed = None;
                     panel.update(cx, |panel, cx| panel.reveal(path, cx));
@@ -1466,6 +1885,9 @@ impl Workspace {
                 format!("{modified}{} — {project}", document_name(document))
             }
             Some(TabItem::Terminal(group)) => format!("{} — {project}", group.read(cx).title(cx)),
+            Some(TabItem::Diff(view)) => {
+                trf("{0} (diff) — {1}", &[&view.read(cx).title(), &project])
+            }
             None => project.clone(),
         };
         if title != self.title {
@@ -1533,7 +1955,9 @@ impl Workspace {
                 .child(icon(IconName::FolderPlus, ui.folder).size(px(14.)))
                 .child(tr("Open Folder…"))
         });
-        let branch = self.branch.clone().map(|branch| {
+        let active = self.active_path(cx);
+        let branch = self.git.read(cx).branch_label(active.as_deref());
+        let branch = branch.map(|branch| {
             div()
                 .flex()
                 .items_center()
@@ -1645,6 +2069,13 @@ impl Workspace {
         let editor = match self.active_item() {
             Some(TabItem::Editor(editor)) => editor,
             Some(TabItem::Terminal(group)) => return self.terminal_status(bar, &group, cx),
+            Some(TabItem::Diff(view)) => match view.read(cx).working().cloned() {
+                Some(editor) => editor,
+                None => {
+                    let path = self.display_path(view.read(cx).path());
+                    return bar.child(div().flex_1().min_w_0().truncate().child(path));
+                }
+            },
             None => {
                 return bar.child(div().text_color(ui.dim).child(match &self.root {
                     Some(root) => tilde(root),
@@ -1704,6 +2135,7 @@ impl Workspace {
                     .child(item(status.language)),
             )
             .children(crate::diagnostics::status_item(editor, ui))
+            .children(crate::git::status_item(self.git.read(cx), ui))
             .children(crate::lsp::status_item(self.lsp.read(cx), Some(editor_id), ui))
             .child(item(status.line_ending.to_string()).text_color(ui.dim))
     }
@@ -1772,6 +2204,7 @@ impl Workspace {
                 TabItem::Terminal(group) => self
                     .render_terminal_tab(index, group, detail, cx)
                     .into_any_element(),
+                TabItem::Diff(view) => self.render_diff_tab(index, view, cx).into_any_element(),
             })
             .collect();
         // While a tab is dragged over the strip: a marker where it would land.
@@ -1884,6 +2317,9 @@ impl Workspace {
             name: title.clone().into(),
         };
         let dot = document.is_modified().then_some(ui.modified);
+        let status_color = document
+            .path()
+            .and_then(|path| crate::git::file_color(&self.git, path, &ui, cx));
         tab_shell(editor.entity_id(), active, ui)
             .on_mouse_down(
                 MouseButton::Left,
@@ -1899,9 +2335,52 @@ impl Workspace {
             )
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .child(file.render().size(px(14.)))
-            .child(label(&title))
+            .child(match status_color {
+                Some(color) => label(&title).text_color(color),
+                None => label(&title),
+            })
             .children(detail.map(|detail| label(&detail).text_color(ui.dim)))
             .child(close_button(TabItem::Editor(editor.clone()), active, dot, cx))
+    }
+
+    /// A diff tab: the diff icon, the file name, "diff"; a dot while the working copy it opened
+    /// without a tab has unsaved changes.
+    fn render_diff_tab(
+        &self,
+        index: usize,
+        view: &Entity<DiffView>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        let active = index == self.active;
+        let title = view.read(cx).title();
+        let dot = TabItem::Diff(view.clone())
+            .is_modified(cx)
+            .then_some(ui.modified);
+        let (activate, close) = (view.clone(), view.clone());
+        tab_shell(view.entity_id(), active, ui)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    let index = this
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.item.diff() == Some(&activate));
+                    if let Some(index) = index {
+                        this.activate(index, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    this.close_diff_tab(close.clone(), window, cx)
+                }),
+            )
+            .child(icon(IconName::Diff, ui.vcs_modified).size(px(14.)))
+            .child(label(&title))
+            .child(label(tr("diff")).text_color(ui.dim))
+            .child(close_button(TabItem::Diff(view.clone()), active, dot, cx))
     }
 
     /// A terminal tab: the process of its active terminal, a mark when the bell rang while it was
@@ -2013,9 +2492,10 @@ impl Workspace {
             self.start_drawn = true;
             cx.on_next_frame(window, |_, _, cx| cx.notify());
         }
+        let branch = self.git.read(cx).branch_label(None);
         let screen = StartScreen {
             root: self.root.as_deref(),
-            branch: self.branch.as_ref().map(|branch| branch.as_ref()),
+            branch: branch.as_ref().map(|branch| branch.as_ref()),
             recent: &self.recent,
             notice: self.notice.as_ref(),
             loading: self.loading > 0,
@@ -2049,6 +2529,8 @@ impl Render for Workspace {
                 crate::settings_view::toggle(this, window, cx)
             }))
             .map(|root| crate::lsp::workspace_actions(root, cx))
+            .map(|root| crate::git::workspace_actions(root, cx))
+            .map(|root| crate::vcs_menu::workspace_actions(root, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
                 // A directory from the recent list may have disappeared since launch.
                 if !action.0.is_dir() {
@@ -2180,6 +2662,7 @@ impl Render for Workspace {
                 let content = match &item {
                     TabItem::Editor(editor) => editor.clone().into_any_element(),
                     TabItem::Terminal(group) => group.clone().into_any_element(),
+                    TabItem::Diff(view) => view.clone().into_any_element(),
                 };
                 main.child(self.render_tab_bar(cx))
                     .when(
@@ -2206,10 +2689,15 @@ impl Render for Workspace {
             }
             None => main.child(body(self.render_start(window, cx).into_any_element())),
         };
-        let tree = self
-            .tree_panel()
-            .filter(|_| self.tree_open)
-            .map(|panel| ui::island(ui).flex_none().h_full().child(panel));
+        // The left island: the commit window in place of the tree, or the tree.
+        let left = match &self.commit_panel {
+            Some(handle) if self.commit_open => Some(handle.panel.clone().into_any_element()),
+            _ => self
+                .tree_panel()
+                .filter(|_| self.tree_open)
+                .map(|panel| panel.into_any_element()),
+        };
+        let tree = left.map(|panel| ui::island(ui).flex_none().h_full().child(panel));
         // The editor island and, under it, the terminal panel; the tree stays full height. A panel
         // terminal can move to the editor area: the command is offered inside the panel.
         let terminal = self.terminal_open.then(|| {
@@ -2374,9 +2862,18 @@ fn is_modified(editor: &Entity<Editor>, cx: &App) -> bool {
     editor.read(cx).document.is_modified()
 }
 
+/// The working copy a diff opened without a tab of its own.
+fn owned_editor(view: &Entity<DiffView>, cx: &App) -> Option<Entity<Editor>> {
+    let view = view.read(cx);
+    view.working().filter(|_| view.owns_working()).cloned()
+}
+
 /// Reads a file (on a background thread). A directory is not opened as a file: it can only be a
 /// project root.
 fn read_document(path: PathBuf) -> Result<Document, OpenError> {
+    // The real path: the same file opened as `/tmp/x` and `/private/tmp/x` is one tab, and git (whose
+    // working trees are canonical) recognizes it.
+    let path = canonical(&path);
     if path.is_dir() {
         let reason = "is a directory".into();
         return Err(OpenError { path, reason });
@@ -2657,34 +3154,6 @@ impl Render for DraggedEditorTab {
     }
 }
 
-/// The git branch of a directory: `ref: refs/heads/main` → "main"; a detached HEAD gives the first
-/// 7 characters of the hash. A linked worktree (`.git` is a file with `gitdir:`) is also read.
-fn read_branch(root: &Path) -> Option<SharedString> {
-    let git = root.join(".git");
-    let dir = if git.is_file() {
-        let link = fs::read_to_string(&git).ok()?;
-        let target = link.strip_prefix("gitdir:")?.trim();
-        root.join(target)
-    } else {
-        git
-    };
-    let head = fs::read_to_string(dir.join("HEAD")).ok()?;
-    branch_from_head(&head)
-}
-
-fn branch_from_head(head: &str) -> Option<SharedString> {
-    let head = head.trim();
-    match head.strip_prefix("ref:") {
-        Some(reference) => {
-            let reference = reference.trim();
-            let name = reference.strip_prefix("refs/heads/").unwrap_or(reference);
-            Some(name.to_string().into())
-        }
-        None if head.len() >= 7 => Some(head[..7].to_string().into()),
-        None => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2728,29 +3197,6 @@ mod tests {
         assert_eq!(tilde(&home), "~");
         assert_eq!(tilde(&home.join("dev/flux")), "~/dev/flux");
         assert_eq!(tilde(Path::new("/opt/x")), "/opt/x");
-    }
-
-    #[test]
-    fn branch_comes_from_head() {
-        assert_eq!(
-            branch_from_head("ref: refs/heads/main\n")
-                .as_ref()
-                .map(|b| b.as_ref()),
-            Some("main")
-        );
-        assert_eq!(
-            branch_from_head("ref: refs/heads/feature/x")
-                .as_ref()
-                .map(|b| b.as_ref()),
-            Some("feature/x")
-        );
-        assert_eq!(
-            branch_from_head("4d7de13a9f00c0ffee\n")
-                .as_ref()
-                .map(|b| b.as_ref()),
-            Some("4d7de13")
-        );
-        assert_eq!(branch_from_head(""), None);
     }
 
     #[test]

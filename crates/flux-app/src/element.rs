@@ -115,6 +115,13 @@ pub struct PrepaintState {
     cursors: Vec<PaintQuad>,
     /// Language server diagnostics: underlines and line number colors.
     diagnostics: crate::diagnostics::DiagnosticsPaint,
+    /// Git change markers in the gutter.
+    git: crate::git_gutter::GutterPaint,
+    /// A host view's decorations (the diff viewer): line backgrounds under everything, changed
+    /// words under the text.
+    decorations: crate::diff_view::DecorationsPaint,
+    /// The placeholder of an empty commit message field.
+    placeholder: Option<(ShapedLine, Point<Pixels>)>,
 }
 
 impl IntoElement for EditorElement {
@@ -178,7 +185,12 @@ impl Element for EditorElement {
 
         let total_lines = text.len_lines();
         let digits = total_lines.to_string().len().max(3);
-        let gutter_width = em * (digits + 2) as f32;
+        // A commit message field has no gutter.
+        let gutter_width = if editor.message.is_some() {
+            px(0.)
+        } else {
+            em * (digits + 2) as f32
+        };
         let text_bounds = Bounds::from_corners(
             point(bounds.left() + gutter_width, bounds.top()),
             bounds.bottom_right(),
@@ -272,7 +284,10 @@ impl Element for EditorElement {
             lines,
         };
 
-        let current_line = (selection.len() == 1 && primary.is_empty()).then(|| {
+        let current_line = (selection.len() == 1
+            && primary.is_empty()
+            && editor.message.is_none())
+        .then(|| {
             fill(
                 Bounds::new(
                     point(bounds.left(), layout.line_top(head_line)),
@@ -373,6 +388,22 @@ impl Element for EditorElement {
 
         let diagnostics =
             crate::diagnostics::prepaint(&editor.diagnostics, &text, &layout, last_line, em, &ui);
+        let gutter_bounds = Bounds::from_corners(
+            bounds.origin,
+            point(bounds.left() + gutter_width, bounds.bottom()),
+        );
+        let git =
+            crate::git_gutter::prepaint(&editor.git, &layout, last_line, gutter_bounds, em, &ui, window);
+        let placeholder = editor
+            .message
+            .as_ref()
+            .filter(|_| text.len_chars() == 0)
+            .map(|placeholder| {
+                let runs = [run(placeholder.len(), ui.dim)];
+                let shaped =
+                    text_system.shape_line(placeholder.clone(), font_size, &runs, None);
+                (shaped, layout.origin)
+            });
 
         let gutter = (first_line..last_line)
             .map(|line| {
@@ -389,10 +420,19 @@ impl Element for EditorElement {
             })
             .collect();
 
-        self.editor.update(cx, |editor, _| {
+        let decorations = self.editor.update(cx, |editor, _| {
             editor.scroll = scroll;
             editor.autoscroll = None;
+            editor.frame_decorations.take()
         });
+        let decorations = crate::diff_view::prepaint_decorations(
+            decorations.as_deref(),
+            &text,
+            &layout,
+            last_line,
+            bounds,
+            &ui,
+        );
 
         PrepaintState {
             layout: Some(layout),
@@ -401,6 +441,9 @@ impl Element for EditorElement {
             highlights,
             cursors,
             diagnostics,
+            git,
+            decorations,
+            placeholder,
         }
     }
 
@@ -430,17 +473,23 @@ impl Element for EditorElement {
             .expect("prepaint always produces a layout");
         let line_height = layout.line_height;
 
+        state.decorations.paint_lines(window);
         if let Some(quad) = state.current_line.take() {
             window.paint_quad(quad);
         }
         for (number, origin) in &state.gutter {
             number.paint(*origin, line_height, window, cx).ok();
         }
+        state.git.paint(window);
 
         let mask = ContentMask {
             bounds: layout.text_bounds,
         };
         window.with_content_mask(Some(mask), |window| {
+            state.decorations.paint_words(window);
+            if let Some((placeholder, origin)) = &state.placeholder {
+                placeholder.paint(*origin, line_height, window, cx).ok();
+            }
             for quad in state.highlights.drain(..) {
                 window.paint_quad(quad);
             }

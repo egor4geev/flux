@@ -9,7 +9,7 @@ use crate::icons::IconName;
 use crate::theme::Theme;
 use crate::ui;
 use crate::workspace::Workspace;
-use crate::{file_tree, project_search, terminal_panel};
+use crate::{file_tree, git, project_search, terminal_panel};
 
 /// Width of the strip; the buttons are centered.
 pub const WIDTH: f32 = 40.;
@@ -21,6 +21,8 @@ const BUTTON_SIZE: f32 = 32.;
 pub enum Tool {
     /// Project tree: an island on the left.
     Project,
+    /// The commit window: the left island, in place of the tree.
+    Commit,
     /// Project search: the "Find in Files" window over the islands.
     FindInFiles,
     /// Terminals: an island under the editor.
@@ -29,11 +31,12 @@ pub enum Tool {
 
 impl Tool {
     /// Order in the strip, top to bottom.
-    pub const ALL: [Tool; 3] = [Tool::Project, Tool::FindInFiles, Tool::Terminal];
+    pub const ALL: [Tool; 4] = [Tool::Project, Tool::Commit, Tool::FindInFiles, Tool::Terminal];
 
     fn icon(self) -> IconName {
         match self {
             Tool::Project => IconName::Project,
+            Tool::Commit => IconName::Commit,
             Tool::FindInFiles => IconName::FindInFiles,
             Tool::Terminal => IconName::Terminal,
         }
@@ -42,6 +45,7 @@ impl Tool {
     fn label(self) -> &'static str {
         match self {
             Tool::Project => tr("Project"),
+            Tool::Commit => tr("Commit"),
             Tool::FindInFiles => tr("Find in Files"),
             Tool::Terminal => tr("Terminal"),
         }
@@ -51,6 +55,7 @@ impl Tool {
     fn action(self) -> Box<dyn Action> {
         match self {
             Tool::Project => Box::new(file_tree::ToggleOpen),
+            Tool::Commit => Box::new(git::ToggleCommitWindow),
             Tool::FindInFiles => Box::new(project_search::Toggle),
             Tool::Terminal => Box::new(terminal_panel::TogglePanel),
         }
@@ -76,6 +81,7 @@ pub fn render(
         .pb(px(ui::GAP))
         .children(Tool::ALL.into_iter().map(|tool| {
             let open = workspace.tool_open(tool, cx);
+            let badge = workspace.tool_badge(tool, cx);
             let action = tool.action();
             let keys = ui::shortcut_for(action.as_ref(), window);
             div()
@@ -89,6 +95,25 @@ pub fn render(
                             window.dispatch_action(action.boxed_clone(), cx)
                         }),
                 )
+                // A count in the corner: the changes waiting for a commit.
+                .children(badge.map(|count| {
+                    div()
+                        .absolute()
+                        .top(px(-3.))
+                        .right(px(-5.))
+                        .min_w(px(15.))
+                        .h(px(15.))
+                        .px(px(3.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.))
+                        .bg(ui.accent)
+                        .text_size(px(crate::theme::TEXT_XS - 2.))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(ui.frame)
+                        .child(if count > 99 { "99+".to_string() } else { count.to_string() })
+                }))
                 // Marker of the open window: at the edge of the strip, like an IDE tool tab.
                 .when(open, |button| {
                     button.child(
