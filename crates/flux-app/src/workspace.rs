@@ -1,5 +1,5 @@
-//! Корневой вид окна: дерево файлов, вкладки с документами, открытие файлов, закрытие
-//! вкладок и окна, выход — с вопросами о несохранённых изменениях.
+//! Root view of the window: the file tree, tabs with documents, opening files, closing tabs and the
+//! window, and quitting, with prompts about unsaved changes.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ use gpui::{
 use crate::editor::{self, Editor};
 use crate::file_tree::{self, FileTreeEvent, FileTreePanel};
 use crate::find_bar::{self, FindBar};
+use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
 use crate::launchpad::{self, Tool};
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
@@ -25,19 +26,21 @@ use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, GAP, RADIUS_MD, RADIUS_SM, STATUS_BAR_HEIGHT, TITLE_BAR_HEIGHT};
 use crate::{command_palette, file_finder, go_to_line, recent};
 
-/// Полоса вкладок внутри острова редактора и сами вкладки.
+/// The tab strip inside the editor island, and the tabs themselves.
 const TAB_BAR_HEIGHT: f32 = 40.;
 const TAB_HEIGHT: f32 = 30.;
-/// Длинные имена файлов и каталогов на вкладке сокращаются посередине.
+/// Long file and directory names on a tab are shortened in the middle.
 const TAB_LABEL_MAX_CHARS: usize = 32;
-/// Отступ всплывающего окна (палитра, поиск файла) от верха окна.
+/// Offset of the overlay window (palette, file search) from the top of the window.
 const MODAL_TOP: f32 = TITLE_BAR_HEIGHT + 32.;
-/// Место под светофор macOS в шапке (кнопки ставит `main` — `traffic_light_position`).
+/// Space for the macOS traffic lights in the title bar (the buttons are placed by `main` via
+/// `traffic_light_position`).
 const TRAFFIC_LIGHTS_WIDTH: f32 = 84.;
-/// Поиск по проекту — окно поверх: доля ширины окна и предел.
+/// Project search is an overlay window: its share of the window width, and the upper limit.
 const SEARCH_WIDTH: f32 = 0.84;
 const SEARCH_MAX_WIDTH: f32 = 1080.;
-/// Уже этого окна строка поиска файла в шапке не показывается: не влезет между кнопками.
+/// In a window narrower than this, the file search bar is not shown in the title bar: it would not
+/// fit between the buttons.
 const TITLE_SEARCH_MIN_WINDOW: f32 = 920.;
 
 actions!(
@@ -54,12 +57,12 @@ actions!(
     ]
 );
 
-/// Перейти на вкладку с номером (с нуля): cmd-1…cmd-8.
+/// Go to the tab with the given number (zero-based): cmd-1…cmd-8.
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = workspace, no_json)]
 pub struct ActivateTab(pub usize);
 
-/// Сделать каталог корнем проекта окна (недавний проект на начальном экране).
+/// Make the directory the window's project root (a recent project on the start screen).
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = workspace, no_json)]
 pub struct OpenProject(pub PathBuf);
@@ -77,7 +80,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-w", CloseTab, context),
         KeyBinding::new("cmd-shift-w", CloseWindow, context),
         KeyBinding::new("cmd-q", Quit, context),
-        // macOS присылает cmd-shift-] как cmd-}: shift уже учтён в символе.
+        // macOS sends cmd-shift-] as cmd-}: shift is already accounted for in the character.
         KeyBinding::new("cmd-}", NextTab, context),
         KeyBinding::new("cmd-{", PrevTab, context),
         KeyBinding::new("cmd-shift-]", NextTab, context),
@@ -85,7 +88,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextTab, context),
         KeyBinding::new("ctrl-shift-tab", PrevTab, context),
         KeyBinding::new("cmd-9", LastTab, context),
-        // Фокус вне редактора (дерево файлов, поля поиска) — сохраняется активный документ.
+        // When focus is outside the editor (file tree, search fields), the active document is
+        // saved.
         KeyBinding::new("cmd-s", editor::Save, context),
     ]);
     cx.bind_keys(
@@ -93,7 +97,8 @@ fn bind_keys(cx: &mut App) {
     );
 }
 
-/// Место в файле для перехода: строка с нуля и колонки в символах, выделяется `start..end`.
+/// A location in a file to jump to: a zero-based line and columns in characters; `start..end` is
+/// selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub path: PathBuf,
@@ -102,45 +107,46 @@ pub struct Location {
     pub end: usize,
 }
 
-/// Корневой вид окна: вкладки (по редактору на документ) и активная из них, панели поиска,
-/// всплывающие окна.
+/// Root view of the window: the tabs (one editor per document) and the active one among them, the
+/// search panels, the overlay windows.
 pub struct Workspace {
-    /// Корень проекта: по нему ищут файлы (cmd-p) и текст (cmd-shift-f).
+    /// Project root: files (cmd-p) and text (cmd-shift-f) are searched within it.
     root: Option<PathBuf>,
     tabs: Vec<Tab>,
     active: usize,
-    /// Фокус пустого окна: без него не сработали бы cmd-o, cmd-n, cmd-w и cmd-q.
+    /// Focus handle of the empty window: without it, cmd-o, cmd-n, cmd-w, and cmd-q would not work.
     focus_handle: FocusHandle,
     tab_scroll: ScrollHandle,
-    /// Идёт разбор несохранённых документов: новые запросы закрытия игнорируются.
+    /// Unsaved documents are being reviewed: new close requests are ignored.
     closing: bool,
-    /// Сколько пачек файлов ещё читается в фоне.
+    /// How many batches of files are still being read in the background.
     loading: usize,
-    /// Сообщение в пустом окне; при открытых вкладках сообщения идут в статус-бар редактора.
+    /// Message in the empty window; when tabs are open, messages go to the editor's status bar.
     notice: Option<SharedString>,
-    /// Последние выставленные заголовок окна и признак «есть несохранённое».
+    /// The window title and the "has unsaved changes" flag as last set.
     title: String,
     edited: bool,
-    /// Всплывающее окно поверх вкладок: палитра команд, поиск файла.
+    /// Overlay window above the tabs: command palette, file search.
     modal: Option<Modal>,
-    /// Строка поиска в документе (между вкладками и текстом).
+    /// The in-document find bar (between the tabs and the text).
     find_bar: Entity<FindBar>,
-    /// Панель поиска по проекту (под текстом).
+    /// Project search panel (below the text).
     project_search: Entity<ProjectSearch>,
-    /// Дерево файлов слева; есть, только когда есть корень проекта.
+    /// The file tree on the left; present only when there is a project root.
     file_tree: Option<TreePanel>,
-    /// Дерево показано (cmd-b).
+    /// The tree is shown (cmd-b).
     tree_open: bool,
-    /// Файл, последним показанный в дереве: дерево следует за активной вкладкой.
+    /// The file last shown in the tree: the tree follows the active tab.
     revealed: Option<PathBuf>,
-    /// Ветка git корня проекта — в шапке; перечитывается при активации окна.
+    /// The git branch of the project root, shown in the title bar; re-read when the window is
+    /// activated.
     branch: Option<SharedString>,
-    /// Недавние проекты для начального экрана, последние — первыми.
+    /// Recent projects for the start screen, most recent first.
     recent: Vec<PathBuf>,
     _subscriptions: Vec<Subscription>,
 }
 
-/// Дерево файлов и подписка на его события; заводится заново со сменой корня проекта.
+/// The file tree and the subscription to its events; recreated whenever the project root changes.
 struct TreePanel {
     panel: Entity<FileTreePanel>,
     _subscription: Subscription,
@@ -148,13 +154,13 @@ struct TreePanel {
 
 struct Tab {
     editor: Entity<Editor>,
-    /// Полоса вкладок и заголовок окна перерисовываются при изменениях в редакторе.
+    /// The tab strip and the window title are redrawn when the editor changes.
     _observer: Subscription,
 }
 
-/// Всплывающее окно. Закрывается само (`DismissEvent`: Esc, выбор), щелчком мимо него,
-/// повторным вызовом того же окна или когда фокус ушёл из него (например, cmd-n открыл
-/// вкладку); фокус возвращается туда, где был до открытия.
+/// Overlay window. It closes by itself (`DismissEvent`: Esc, making a choice), on a click outside
+/// it, when the same window is invoked again, or when focus has left it (for example, cmd-n opened
+/// a tab); focus returns to where it was before opening.
 struct Modal {
     view: AnyView,
     focus_handle: FocusHandle,
@@ -162,22 +168,22 @@ struct Modal {
     _subscriptions: [Subscription; 2],
 }
 
-/// Откуда пришли пути — от этого зависит, куда сообщать об ошибках.
+/// Where the paths came from: this determines where errors are reported.
 #[derive(Clone, Copy)]
 enum Source {
     CommandLine,
     Dialog,
 }
 
-/// Файл, который не удалось открыть.
+/// A file that could not be opened.
 struct OpenError {
     path: PathBuf,
     reason: String,
 }
 
 impl Workspace {
-    /// Окно проекта `root` с файлами из командной строки (читаются в фоне). Без файлов —
-    /// начальный экран.
+    /// A window for the project `root` with the files from the command line (read in the
+    /// background). Without files, the start screen is shown.
     pub fn new(
         root: Option<PathBuf>,
         paths: Vec<PathBuf>,
@@ -185,7 +191,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let this = cx.weak_entity();
-        // Красная кнопка окна — то же, что cmd-shift-w.
+        // The window's red button: the same as cmd-shift-w.
         window.on_window_should_close(cx, move |window, cx| {
             this.update(cx, |this, cx| this.request_close_window(window, cx))
                 .unwrap_or(true)
@@ -195,9 +201,10 @@ impl Workspace {
         let find_bar = cx.new(|cx| FindBar::new(window, cx));
         let project_search = cx.new(|cx| ProjectSearch::new(root.clone(), window, cx));
         let file_tree = root.clone().map(|root| Self::build_tree(root, window, cx));
-        // Панели открываются и закрываются сами (Esc, ×) — тогда меняется и раскладка окна.
+        // The panels open and close on their own (Esc, ×); when they do, the window layout changes
+        // too.
         let subscriptions = vec![
-            // Ветку могли переключить в терминале, пока окно было неактивно.
+            // The branch may have been switched in a terminal while the window was inactive.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.refresh_branch(cx);
@@ -252,7 +259,7 @@ impl Workspace {
         self.root.as_deref()
     }
 
-    /// Новый корень проекта (cmd-o с каталогом).
+    /// A new project root (cmd-o with a directory).
     fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let root = fs::canonicalize(&root).unwrap_or(root);
         self.project_search
@@ -261,13 +268,13 @@ impl Workspace {
         self.revealed = None;
         self.branch = read_branch(&root);
         self.recent = recent::record(&root);
-        self.show_message(format!("Project: {}", tilde(&root)).into(), cx);
+        self.show_message(trf("Project: {0}", &[&tilde(&root)]).into(), cx);
         self.root = Some(root);
         self.reveal_active(cx);
         cx.notify();
     }
 
-    /// Перечитывает ветку git (`.git/HEAD`); перерисовка — только если она сменилась.
+    /// Re-reads the git branch (`.git/HEAD`); redraws only if it changed.
     fn refresh_branch(&mut self, cx: &mut Context<Self>) {
         let branch = self.root.as_deref().and_then(read_branch);
         if branch != self.branch {
@@ -288,9 +295,9 @@ impl Workspace {
         self.tabs.iter().position(|tab| tab.editor == *editor)
     }
 
-    // --- Вкладки ---
+    // --- Tabs ---
 
-    /// Делает вкладку активной и переводит фокус в её редактор.
+    /// Makes the tab active and moves focus to its editor.
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(index) else {
             return;
@@ -306,7 +313,7 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Фокус — в активный редактор, а без вкладок — на само окно.
+    /// Focuses the active editor, or the window itself when there are no tabs.
     fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_editor() {
             Some(editor) => window.focus(&editor.focus_handle(cx)),
@@ -314,9 +321,9 @@ impl Workspace {
         }
     }
 
-    /// gpui прокручивает полосу к вкладке, только если полоса уже была нарисована; в её
-    /// первом кадре запрос теряется (запуск с множеством файлов). Тогда повторяем его
-    /// перед следующим кадром.
+    /// gpui scrolls the strip to a tab only if the strip has already been drawn; the request is
+    /// lost in its first frame (launching with many files). In that case we repeat it before the
+    /// next frame.
     fn retry_tab_scroll(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab_scroll.bounds().size.width > px(0.) {
             return;
@@ -338,7 +345,7 @@ impl Workspace {
         }
     }
 
-    /// Соседняя вкладка по кругу: `step` = 1 — следующая, -1 — предыдущая.
+    /// The adjacent tab, wrapping around: `step` = 1 is the next one, -1 the previous one.
     fn cycle(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         let len = self.tabs.len() as isize;
         if len > 0 {
@@ -347,10 +354,10 @@ impl Workspace {
         }
     }
 
-    /// Новая вкладка справа от активной; она и становится активной.
+    /// Adds a new tab to the right of the active one; it becomes the active tab.
     fn add_document(&mut self, document: Document, window: &mut Window, cx: &mut Context<Self>) {
         let editor = cx.new(|cx| Editor::new(document, window, cx));
-        // Путь документа меняется при «Сохранить как» — дерево показывает новый файл.
+        // A document's path changes on "Save As": the tree then shows the new file.
         let observer = cx.observe(&editor, |this, _, cx| {
             this.reveal_active(cx);
             cx.notify()
@@ -371,8 +378,8 @@ impl Workspace {
         self.activate(index, window, cx);
     }
 
-    /// Убирает вкладку. Если она была активной, фокус уходит в соседнюю (правую, у последней —
-    /// левую); без вкладок — на само окно.
+    /// Removes a tab. If it was active, focus moves to a neighboring one (the right one; for the
+    /// last tab, the left one); with no tabs left, to the window itself.
     fn remove_tab(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.index_of(editor) else {
             return;
@@ -393,9 +400,9 @@ impl Workspace {
         self.activate(active, window, cx);
     }
 
-    // --- Открытие ---
+    // --- Opening ---
 
-    /// cmd-o: файлы открываются во вкладках, выбранный каталог становится корнем проекта.
+    /// cmd-o: files open in tabs; a chosen directory becomes the project root.
     fn open(&mut self, _: &Open, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -419,13 +426,13 @@ impl Workspace {
         .detach();
     }
 
-    /// Открывает файлы (как из cmd-o): уже открытые только активируются.
+    /// Opens files (as from cmd-o): those already open are just activated.
     pub fn open_files(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         self.open_paths(paths, Source::Dialog, window, cx);
     }
 
-    /// Открывает файл (или активирует его вкладку) и выделяет место в нём. `focus == false` —
-    /// фокус остаётся там, где был (например, в панели результатов поиска).
+    /// Opens a file (or activates its tab) and selects a location in it. With `focus == false`,
+    /// focus stays where it was (for example, in the search results panel).
     pub fn open_location(
         &mut self,
         location: Location,
@@ -439,8 +446,8 @@ impl Workspace {
         });
     }
 
-    /// Открывает файл (или активирует его вкладку). `focus == false` — фокус остаётся там,
-    /// где был (в дереве файлов).
+    /// Opens a file (or activates its tab). With `focus == false`, focus stays where it was (in the
+    /// file tree).
     pub fn open_file(
         &mut self,
         path: PathBuf,
@@ -451,8 +458,8 @@ impl Workspace {
         self.open_and(path, focus, window, cx, |_, _| {});
     }
 
-    /// Открывает или активирует файл, затем `then` с ним в активной вкладке. Без `focus`
-    /// фокус возвращается туда, где был до открытия.
+    /// Opens or activates a file, then calls `then` with it in the active tab. Without `focus`,
+    /// focus returns to where it was before opening.
     fn open_and(
         &mut self,
         path: PathBuf,
@@ -486,7 +493,7 @@ impl Workspace {
         .detach();
     }
 
-    /// Выделяет место в активном редакторе.
+    /// Selects a location in the active editor.
     fn select_location(&mut self, location: &Location, cx: &mut Context<Self>) {
         if let Some(editor) = self.active_editor() {
             editor.update(cx, |editor, cx| {
@@ -497,8 +504,8 @@ impl Workspace {
         }
     }
 
-    /// Открывает файлы во вкладках по порядку. Уже открытые только активируются,
-    /// остальные читаются в фоне, чтобы большой файл не блокировал окно.
+    /// Opens files in tabs, in order. Those already open are just activated; the rest are read in
+    /// the background so that a large file does not block the window.
     fn open_paths(
         &mut self,
         paths: Vec<PathBuf>,
@@ -528,7 +535,7 @@ impl Workspace {
         .detach();
     }
 
-    /// Если файл уже открыт (сравниваем канонические пути), активирует его вкладку.
+    /// If the file is already open (compared by canonical paths), activates its tab.
     fn activate_path(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let target = canonical(path);
         let found = self.tabs.iter().position(|tab| {
@@ -563,7 +570,8 @@ impl Workspace {
         }
     }
 
-    /// Файл могли выбрать дважды, пока он читался, — тогда активируем уже открытую вкладку.
+    /// The file may have been chosen twice while it was being read; in that case we activate the
+    /// tab that is already open.
     fn add_or_activate(&mut self, document: Document, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = document.path()
             && self.activate_path(path, window, cx)
@@ -573,7 +581,7 @@ impl Workspace {
         self.add_document(document, window, cx);
     }
 
-    /// Ошибки командной строки — в stderr; если не открылось ничего, остаётся начальный экран.
+    /// Command-line errors go to stderr; if nothing was opened, the start screen remains.
     fn report_startup(&mut self, errors: Vec<OpenError>) {
         for error in errors {
             eprintln!("flux: {}: {}", error.path.display(), error.reason);
@@ -586,13 +594,19 @@ impl Workspace {
         }
         let message = errors
             .iter()
-            .map(|error| format!("Cannot open {}: {}", file_name(&error.path), error.reason))
+            .map(|error| {
+                trf(
+                    "Cannot open {0}: {1}",
+                    &[&file_name(&error.path), &tr(&error.reason)],
+                )
+            })
             .collect::<Vec<_>>()
             .join("; ");
         self.show_message(message.into(), cx);
     }
 
-    /// Сообщение пользователю: в статус-баре активного редактора, а в пустом окне — под подсказкой.
+    /// A message to the user: in the active editor's status bar, or, in an empty window, under the
+    /// hint.
     pub(crate) fn show_message(&mut self, message: SharedString, cx: &mut Context<Self>) {
         match self.active_editor() {
             Some(editor) => editor.update(cx, |editor, cx| editor.show_status(message, cx)),
@@ -603,17 +617,17 @@ impl Workspace {
         }
     }
 
-    // --- Закрытие ---
+    // --- Closing ---
 
     fn close_active_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_editor() {
             Some(editor) => self.close_tab(editor, window, cx),
-            // В пустом окне cmd-w закрывает само окно.
+            // In an empty window, cmd-w closes the window itself.
             None => window.remove_window(),
         }
     }
 
-    /// Закрывает вкладку; изменённую — только после ответа на вопрос о сохранении.
+    /// Closes a tab; a modified one only after the save prompt is answered.
     fn close_tab(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         if self.closing {
             return;
@@ -637,8 +651,8 @@ impl Workspace {
         }
     }
 
-    /// `true` — окно можно закрыть сразу. Иначе спрашивает про несохранённые документы
-    /// и закрывает окно само, если пользователь ничего не отменил.
+    /// `true` means the window can be closed right away. Otherwise asks about the unsaved documents
+    /// and closes the window itself unless the user cancels.
     fn request_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.closing {
             return false;
@@ -656,9 +670,9 @@ impl Workspace {
         false
     }
 
-    /// Спрашивает по очереди про каждый изменённый документ из `editors`, показывая его вкладку.
-    /// `true` — все разобраны (сохранены или брошены); `false` — отмена, ошибка сохранения
-    /// или уже идёт другой разбор.
+    /// Asks about each modified document in `editors` in turn, showing its tab. `true` means all
+    /// are resolved (saved or discarded); `false` means canceled, a save error, or another review
+    /// already in progress.
     fn confirm(
         &mut self,
         editors: Vec<Entity<Editor>>,
@@ -681,14 +695,14 @@ impl Workspace {
         })
     }
 
-    /// cmd-f / cmd-alt-f: строка поиска для активной вкладки.
+    /// cmd-f / cmd-alt-f: the find bar for the active tab.
     fn deploy_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
         let editor = self.active_editor();
         self.find_bar
             .update(cx, |bar, cx| bar.deploy(replace, editor, window, cx));
     }
 
-    // --- Дерево файлов ---
+    // --- File tree ---
 
     fn build_tree(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> TreePanel {
         let panel = cx.new(|cx| FileTreePanel::new(root, window, cx));
@@ -715,7 +729,7 @@ impl Workspace {
         }
     }
 
-    /// Открыто ли окно инструмента лаунчпада — его кнопка подсвечивается.
+    /// Whether a launchpad tool window is open: its button is highlighted.
     pub(crate) fn tool_open(&self, tool: Tool, cx: &App) -> bool {
         match tool {
             Tool::Project => self.tree_open && self.file_tree.is_some(),
@@ -727,8 +741,8 @@ impl Workspace {
         self.file_tree.as_ref().map(|tree| tree.panel.clone())
     }
 
-    /// Дерево следует за активной вкладкой: её файл раскрыт и выделен. Зовётся при смене
-    /// вкладки и любом изменении редактора — дерево трогаем, только когда сменился файл.
+    /// The tree follows the active tab: its file is revealed and selected. Called when the tab
+    /// changes and on any editor change; the tree is touched only when the file has changed.
     fn reveal_active(&mut self, cx: &mut Context<Self>) {
         let Some(panel) = self.tree_panel().filter(|_| self.tree_open) else {
             return;
@@ -745,10 +759,10 @@ impl Workspace {
         self.revealed = path;
     }
 
-    /// cmd-b: показать или скрыть дерево файлов.
+    /// cmd-b: show or hide the file tree.
     fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.tree_panel() else {
-            return self.show_message("No project folder — open one with ⌘O".into(), cx);
+            return self.show_message(tr("No project folder — open one with ⌘O").into(), cx);
         };
         let focused = panel.focus_handle(cx).contains_focused(window, cx);
         self.tree_open = !self.tree_open;
@@ -760,10 +774,11 @@ impl Workspace {
         cx.notify();
     }
 
-    /// cmd-shift-e: фокус в дерево файлов (показав его), из дерева — обратно в редактор.
+    /// cmd-shift-e: move focus to the file tree (showing it first); from the tree, back to the
+    /// editor.
     fn toggle_tree_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.tree_panel() else {
-            return self.show_message("No project folder — open one with ⌘O".into(), cx);
+            return self.show_message(tr("No project folder — open one with ⌘O").into(), cx);
         };
         let handle = panel.focus_handle(cx);
         if self.tree_open && handle.contains_focused(window, cx) {
@@ -778,8 +793,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Файл или каталог переехал (переименован, перемещён в дереве): открытые документы
-    /// внутри него — на новые пути.
+    /// A file or directory was moved (renamed, or moved within the tree): the open documents inside
+    /// it are switched to the new paths.
     fn documents_moved(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
         for editor in self.editors() {
             let moved = editor
@@ -793,16 +808,16 @@ impl Workspace {
         }
     }
 
-    /// Файлы удалены в Корзину: их вкладки закрываются. Изменённые остаются открытыми —
-    /// правки не теряются, сохранение создаст файл заново.
+    /// Files were moved to the Trash: their tabs are closed. Modified ones stay open, so edits are
+    /// not lost; saving will recreate the file.
     fn documents_removed(
         &mut self,
         paths: &[PathBuf],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Закрытие вкладки активирует соседнюю и уводит в неё фокус, а удаляли из дерева —
-        // фокус должен остаться там (если не был в закрытой вкладке).
+        // Closing a tab activates the adjacent one and moves focus into it, but here the deletion
+        // came from the tree, so focus must stay there (unless it was in the closed tab).
         let mut keep_focus = window.focused(cx);
         let mut kept = false;
         for editor in self.editors() {
@@ -827,17 +842,17 @@ impl Workspace {
         restore_focus(keep_focus, window);
         if kept {
             self.show_message(
-                "Deleted files with unsaved changes stay open — save to restore them".into(),
+                tr("Deleted files with unsaved changes stay open — save to restore them").into(),
                 cx,
             );
         }
     }
 
-    // --- Всплывающие окна ---
+    // --- Overlay windows ---
 
-    /// Открывает всплывающее окно `V`; если оно уже открыто — закрывает. Другое открытое
-    /// окно заменяется. `build` вызывается до переноса фокуса: в нём `window.focused` — тот,
-    /// кто был в фокусе (палитре команд это нужно, чтобы собрать доступные ему действия).
+    /// Opens the overlay window `V`; if it is already open, closes it. Any other open window is
+    /// replaced. `build` is called before focus is moved: inside it, `window.focused` is whatever
+    /// had focus before (the command palette needs this to collect the actions available to it).
     pub fn toggle_modal<V: ManagedView>(
         &mut self,
         window: &mut Window,
@@ -849,7 +864,7 @@ impl Workspace {
         {
             return self.dismiss_modal(window, cx);
         }
-        // Поиск по проекту — тоже окно поверх: уступает место без возврата фокуса.
+        // Project search is also an overlay window: it gives way without restoring focus.
         if self.project_search.read(cx).is_open() {
             self.project_search.update(cx, |search, cx| search.hide(cx));
             if self
@@ -884,8 +899,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Закрывает всплывающее окно. Фокус возвращается на прежнее место, только если он был
-    /// в окне: при щелчке мимо фокус уже ушёл туда, куда щёлкнули.
+    /// Closes the overlay window. Focus returns to its previous place only if it was inside the
+    /// window: on a click outside, focus has already moved to wherever was clicked.
     pub fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(modal) = self.modal.take() else {
             return;
@@ -920,7 +935,7 @@ impl Workspace {
         )
     }
 
-    /// Поиск по проекту — окно поверх островов; щелчок мимо закрывает его.
+    /// Project search is a window over the islands; a click outside closes it.
     fn render_project_search(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
         if !self.project_search.read(cx).is_open() {
             return None;
@@ -947,8 +962,8 @@ impl Workspace {
         )
     }
 
-    /// Прячет поиск по проекту (щелчок мимо): фокус возвращается в редактор, только если
-    /// он оставался в поиске — иначе он уже там, куда щёлкнули.
+    /// Hides project search (on a click outside): focus returns to the editor only if it was still
+    /// in the search; otherwise it is already wherever was clicked.
     fn hide_project_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let inside = self
             .project_search
@@ -960,14 +975,14 @@ impl Workspace {
         }
     }
 
-    // --- Отображение ---
+    // --- Display ---
 
-    /// Заголовок окна «● имя — проект» по активной вкладке (без проекта — «— flux») и точка
-    /// на красной кнопке, если есть несохранённое. Платформу дёргаем, только когда что-то
-    /// поменялось.
+    /// The window title "● name — project", derived from the active tab (without a project: "—
+    /// flux"), and a dot on the red button if there are unsaved changes. We call into the platform
+    /// only when something has changed.
     fn update_title(&mut self, window: &mut Window, cx: &App) {
         let project = self.root.as_deref().and_then(Path::file_name).map_or_else(
-            || "flux".to_string(),
+            || "Flux".to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
         let title = self.active_editor().map_or_else(
@@ -975,7 +990,7 @@ impl Workspace {
             |editor| {
                 let document = &editor.read(cx).document;
                 let modified = if document.is_modified() { "● " } else { "" };
-                format!("{modified}{} — {project}", document.display_name())
+                format!("{modified}{} — {project}", document_name(document))
             },
         );
         if title != self.title {
@@ -989,8 +1004,9 @@ impl Workspace {
         }
     }
 
-    /// Шапка окна на рамке: место под светофор, проект и ветка, строка поиска файла
-    /// посередине, кнопки справа. Двойной щелчок — как по заголовку окна macOS.
+    /// The title bar on the window frame: space for the traffic lights, the project and branch, the
+    /// file search bar in the middle, buttons on the right. A double-click acts like one on a macOS
+    /// window title bar.
     fn render_title_bar(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let leading = if window.is_fullscreen() {
@@ -1034,10 +1050,13 @@ impl Workspace {
                 .cursor_pointer()
                 .text_color(ui.text_muted)
                 .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
-                .tooltip(ui::tooltip("Open Folder…", ui::shortcut_for(&Open, window)))
+                .tooltip(ui::tooltip(
+                    tr("Open Folder…"),
+                    ui::shortcut_for(&Open, window),
+                ))
                 .on_click(|_, window, cx| window.dispatch_action(Open.boxed_clone(), cx))
                 .child(icon(IconName::FolderPlus, ui.folder).size(px(14.)))
-                .child("Open Folder…")
+                .child(tr("Open Folder…"))
         });
         let branch = self.branch.clone().map(|branch| {
             div()
@@ -1085,7 +1104,7 @@ impl Workspace {
                                 window.dispatch_action(file_finder::Toggle.boxed_clone(), cx)
                             })
                             .child(icon(IconName::Search, ui.dim).size(px(13.)))
-                            .child(div().flex_1().child("Search files"))
+                            .child(div().flex_1().child(tr("Search files")))
                             .children(
                                 ui::shortcut_for(&file_finder::Toggle, window)
                                     .map(|keys| ui::keys(&keys, ui)),
@@ -1122,20 +1141,21 @@ impl Workspace {
             .child(button(
                 "title-find-in-files",
                 IconName::FindInFiles,
-                "Find in Files",
+                tr("Find in Files"),
                 project_search::Toggle.boxed_clone(),
             ))
             .child(button(
                 "title-commands",
                 IconName::Command,
-                "Command Palette",
+                tr("Command Palette"),
                 command_palette::Toggle.boxed_clone(),
             ))
     }
 
-    /// Статус-бар на рамке окна: сообщение слева; справа позиция, курсоры, язык, переводы строк.
-    /// Статус-бар на рамке окна: слева сообщение или путь активного файла; справа позиция,
-    /// курсоры, язык цветной плашкой (цвет типа файла), переводы строк.
+    /// Status bar on the window frame: message on the left; position, cursors, language, and line
+    /// endings on the right. Status bar on the window frame: on the left, a message or the path of
+    /// the active file; on the right, the position, cursors, language as a colored badge (the file
+    /// type color), and line endings.
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let bar = div()
@@ -1150,7 +1170,7 @@ impl Workspace {
         let Some(editor) = self.active_editor() else {
             return bar.child(div().text_color(ui.dim).child(match &self.root {
                 Some(root) => tilde(root),
-                None => "No project — open a folder with ⌘O".into(),
+                None => tr("No project — open a folder with ⌘O").into(),
             }));
         };
         let editor = editor.read(cx);
@@ -1174,15 +1194,18 @@ impl Workspace {
                 .child(file.render().size(px(13.)))
                 .child(div().truncate().child(match path {
                     Some(path) => self.display_path(path),
-                    None => "Untitled".into(),
+                    None => tr("Untitled").into(),
                 })),
         };
         let item = |text: String| div().flex_none().whitespace_nowrap().child(text);
         bar.child(div().flex_1().min_w_0().flex().child(left))
-            .child(item(format!("Ln {}, Col {}", status.line, status.column)))
+            .child(item(trf(
+                "Ln {0}, Col {1}",
+                &[&status.line, &status.column],
+            )))
             .when(status.cursors > 1, |bar| {
                 bar.child(ui::badge(
-                    format!("{} cursors", status.cursors),
+                    trn(status.cursors, "{n} cursor", "{n} cursors"),
                     ui.accent_text,
                 ))
             })
@@ -1203,7 +1226,7 @@ impl Workspace {
             .child(item(status.line_ending.to_string()).text_color(ui.dim))
     }
 
-    /// Путь для показа: относительно корня проекта, вне его — с `~`.
+    /// Display path: relative to the project root, or with `~` outside it.
     fn display_path(&self, path: &Path) -> String {
         match self
             .root
@@ -1233,7 +1256,8 @@ impl Workspace {
             .relative()
             .flex_none()
             .h(px(TAB_BAR_HEIGHT))
-            // Линия под вкладками — от края до края острова, с отступом от скруглений.
+            // The line under the tabs runs from edge to edge of the island, inset from the rounded
+            // corners.
             .child(
                 div()
                     .absolute()
@@ -1269,6 +1293,7 @@ impl Workspace {
         let active = index == self.active;
         let (activate, close) = (tab.editor.clone(), tab.editor.clone());
         let name = document.display_name();
+        let title = document_name(document);
         let file = file_icon(&name, &ui);
         div()
             .id(("tab", tab.editor.entity_id()))
@@ -1306,7 +1331,7 @@ impl Workspace {
                 }),
             )
             .child(file.render().size(px(14.)))
-            .child(label(&name))
+            .child(label(&title))
             .children(detail.map(|detail| label(&detail).text_color(ui.dim)))
             .child(close_button(
                 tab.editor.clone(),
@@ -1348,9 +1373,9 @@ impl Render for Workspace {
             .text_size(px(theme::TEXT_MD))
             .on_action(cx.listener(Self::open))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
-                // Каталог из списка недавних мог исчезнуть после запуска.
+                // A directory from the recent list may have disappeared since launch.
                 if !action.0.is_dir() {
-                    let message = format!("Folder not found: {}", tilde(&action.0));
+                    let message = trf("Folder not found: {0}", &[&tilde(&action.0)]);
                     return this.show_message(message.into(), cx);
                 }
                 this.set_root(action.0.clone(), window, cx)
@@ -1358,9 +1383,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 this.add_document(Document::from_text(""), window, cx)
             }))
-            // Esc в редакторе: открытая строка поиска закрывается раньше, чем редактор снимет
-            // выделение; когда снимать нечего (редактор пропускает Esc дальше) — поиск по
-            // проекту.
+            // Esc in the editor: an open find bar is closed before the editor clears its selection;
+            // when there is nothing to clear (the editor passes Esc on), project search is closed.
             .capture_action(cx.listener(|this, _: &editor::Cancel, window, cx| {
                 if this.find_bar.read(cx).is_open() {
                     this.find_bar.update(cx, |bar, cx| bar.close(window, cx));
@@ -1422,7 +1446,7 @@ impl Render for Workspace {
                 this.toggle_tree_focus(window, cx)
             }))
             .on_action(cx.listener(|this, _: &project_search::Toggle, window, cx| {
-                // Поиск по проекту и другие окна поверх не открыты одновременно.
+                // Project search and other overlay windows are never open at the same time.
                 this.dismiss_modal(window, cx);
                 let seed = this
                     .active_editor()
@@ -1430,8 +1454,9 @@ impl Render for Workspace {
                 this.project_search
                     .update(cx, |search, cx| search.toggle(seed, window, cx))
             }));
-        // Рамка окна: шапка, лаунчпад и острова (дерево слева; справа — вкладки, строка поиска
-        // и текст или начальный экран), статус-бар. Поверх — поиск по проекту и всплывающие окна.
+        // The window frame: the title bar, the launchpad and the islands (the tree on the left; on
+        // the right, the tabs, the find bar, and the text or the start screen), the status bar. On
+        // top: project search and overlay windows.
         let active = self.active_editor();
         let main = ui::island(ui).flex_1().min_w_0().h_full().flex().flex_col();
         let main = match &active {
@@ -1456,7 +1481,7 @@ impl Render for Workspace {
             .tree_panel()
             .filter(|_| self.tree_open)
             .map(|panel| ui::island(ui).flex_none().h_full().child(panel));
-        // Слева — лаунчпад (полоса инструментов) на рамке, за ним острова.
+        // On the left, the launchpad (the tool strip) on the frame, followed by the islands.
         root.child(ui::frame_glow(ui))
             .child(self.render_title_bar(window, cx))
             .child(
@@ -1478,7 +1503,7 @@ impl Render for Workspace {
     }
 }
 
-// --- Вопросы о несохранённых документах ---
+// --- Prompts about unsaved documents ---
 
 async fn ask_each(
     this: &WeakEntity<Workspace>,
@@ -1493,17 +1518,17 @@ async fn ask_each(
     true
 }
 
-/// Save / Don't Save / Cancel для одного документа; Save без пути — «Сохранить как».
-/// `true` — документ сохранён или его разрешили бросить.
+/// Save / Don't Save / Cancel for a single document; Save on a document with no path becomes "Save
+/// As". `true` means the document was saved or it was allowed to be discarded.
 async fn ask_to_save(
     this: &WeakEntity<Workspace>,
     editor: Entity<Editor>,
     cx: &mut AsyncWindowContext,
 ) -> bool {
-    // Пока очередь дошла до документа, его могли сохранить.
+    // By the time the queue reached the document, it may have been saved.
     let Ok(Some(name)) = editor.read_with(cx, |editor, _| {
         let document = &editor.document;
-        document.is_modified().then(|| document.display_name())
+        document.is_modified().then(|| document_name(document))
     }) else {
         return true;
     };
@@ -1515,9 +1540,9 @@ async fn ask_to_save(
     }
     let answer = cx.prompt(
         PromptLevel::Warning,
-        &format!("Save changes to {name}?"),
-        Some("Your changes will be lost if you don’t save them."),
-        &["Save", "Don’t Save", "Cancel"],
+        &trf("Save changes to {0}?", &[&name]),
+        Some(tr("Your changes will be lost if you don’t save them.")),
+        &[tr("Save"), tr("Don’t Save"), tr("Cancel")],
     );
     match answer.await {
         Ok(0) => match editor.update(cx, |editor, cx| editor.save(cx)) {
@@ -1529,13 +1554,15 @@ async fn ask_to_save(
     }
 }
 
-/// Выход уже идёт: повторный cmd-q, пока открыты диалоги, второй разбор не начинает.
+/// Quitting is already in progress: a repeated cmd-q while dialogs are open does not start a second
+/// review.
 #[derive(Default)]
 struct Quitting(bool);
 
 impl Global for Quitting {}
 
-/// Выход: окна по очереди разбирают несохранённые документы; отказ в любом отменяет выход.
+/// Quit: the windows go through their unsaved documents in turn; declining in any of them cancels
+/// the quit.
 fn quit(_: &Quit, cx: &mut App) {
     let quitting = cx.default_global::<Quitting>();
     if quitting.0 {
@@ -1566,7 +1593,7 @@ async fn confirm_windows(windows: Vec<WindowHandle<Workspace>>, cx: &mut AsyncAp
         let confirm = handle.update(cx, |workspace, window, cx| {
             workspace.confirm(workspace.editors(), window, cx)
         });
-        // Окно успели закрыть — спрашивать не о чем.
+        // The window was closed in the meantime: there is nothing to ask about.
         let Ok(confirm) = confirm else {
             continue;
         };
@@ -1577,9 +1604,9 @@ async fn confirm_windows(windows: Vec<WindowHandle<Workspace>>, cx: &mut AsyncAp
     true
 }
 
-// --- Мелочи ---
+// --- Miscellaneous ---
 
-/// Возвращает фокус туда, где он был (если был запомнен).
+/// Restores focus to where it was (if it was remembered).
 fn restore_focus(focus: Option<FocusHandle>, window: &mut Window) {
     if let Some(focus) = focus {
         window.focus(&focus);
@@ -1590,8 +1617,8 @@ fn is_modified(editor: &Entity<Editor>, cx: &App) -> bool {
     editor.read(cx).document.is_modified()
 }
 
-/// Читает файл (в фоновом потоке). Каталог как файл не открывается: он может быть только
-/// корнем проекта.
+/// Reads a file (on a background thread). A directory is not opened as a file: it can only be a
+/// project root.
 fn read_document(path: PathBuf) -> Result<Document, OpenError> {
     if path.is_dir() {
         let reason = "is a directory".into();
@@ -1603,8 +1630,8 @@ fn read_document(path: PathBuf) -> Result<Document, OpenError> {
     })
 }
 
-/// Путь для сравнения «тот же ли это файл»: канонический, а для ещё не созданного
-/// файла — канонический каталог плюс имя.
+/// Path for the "is this the same file" comparison: canonical, or, for a file that does not exist
+/// yet, the canonical directory plus the name.
 fn canonical(path: &Path) -> PathBuf {
     if let Ok(path) = fs::canonicalize(path) {
         return path;
@@ -1618,7 +1645,7 @@ fn canonical(path: &Path) -> PathBuf {
     }
 }
 
-/// Путь для показа: домашний каталог — как `~`.
+/// Display path: the home directory is shown as `~`.
 pub(crate) fn tilde(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     match home
@@ -1631,6 +1658,14 @@ pub(crate) fn tilde(path: &Path) -> String {
     }
 }
 
+/// The name of a document in the interface: its file name, «untitled» before it is saved.
+fn document_name(document: &Document) -> String {
+    match document.path() {
+        Some(_) => document.display_name(),
+        None => tr("untitled").to_string(),
+    }
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name().map_or_else(
         || path.display().to_string(),
@@ -1638,8 +1673,8 @@ fn file_name(path: &Path) -> String {
     )
 }
 
-/// Подписи каталогов для вкладок с одинаковыми именами файлов: столько последних
-/// компонентов пути каталога, сколько нужно, чтобы отличить файл от тёзок.
+/// Directory labels for tabs with identical file names: as many trailing components of the
+/// directory path as needed to tell the file apart from its namesakes.
 fn tab_details(paths: &[Option<PathBuf>]) -> Vec<Option<String>> {
     let all: Vec<&Path> = paths.iter().flatten().map(PathBuf::as_path).collect();
     paths
@@ -1666,7 +1701,7 @@ fn tab_details(paths: &[Option<PathBuf>]) -> Vec<Option<String>> {
         .collect()
 }
 
-/// Последние `n` компонентов каталога, в котором лежит файл.
+/// The last `n` components of the directory containing the file.
 fn dir_tail(path: &Path, n: usize) -> PathBuf {
     let dir: Vec<_> = path
         .parent()
@@ -1681,9 +1716,9 @@ fn label(text: &str) -> gpui::Div {
         .child(shorten(text, TAB_LABEL_MAX_CHARS))
 }
 
-/// Сокращает посередине: «начало…конец» — так видны и начало имени, и расширение.
-/// Шрифт моноширинный, поэтому число символов — это и ширина. (Многоточие средствами
-/// gpui здесь не работает: в прокручиваемой полосе ширина текста не ограничена.)
+/// Shortens in the middle: "start…end", so that both the beginning of the name and the extension
+/// stay visible. The font is monospaced, so the character count is also the width. (gpui's own
+/// ellipsis does not work here: in a scrollable strip the text width is unconstrained.)
 fn shorten(text: &str, max_chars: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max_chars {
@@ -1697,7 +1732,7 @@ fn shorten(text: &str, max_chars: usize) -> String {
     short
 }
 
-/// Правый край вкладки: «●» у изменённой, «×» — при наведении (у активной без изменений — всегда).
+/// Right edge of a tab: "●" on a modified one, "×" on hover (always on an active unmodified tab).
 fn close_button(
     editor: Entity<Editor>,
     active: bool,
@@ -1721,7 +1756,7 @@ fn close_button(
                 .invisible()
                 .group_hover("tab", |style| style.visible())
         })
-        // Нажатие на «×» не должно активировать вкладку.
+        // Clicking "×" must not activate the tab.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.close_tab(editor.clone(), window, cx)
@@ -1749,8 +1784,8 @@ fn close_button(
         .child(close)
 }
 
-/// Ветка git каталога: `ref: refs/heads/main` → «main», отделённый HEAD — первые 7
-/// знаков хеша. Рабочее дерево-ссылка (`.git` — файл с `gitdir:`) тоже читается.
+/// The git branch of a directory: `ref: refs/heads/main` → "main"; a detached HEAD gives the first
+/// 7 characters of the hash. A linked worktree (`.git` is a file with `gitdir:`) is also read.
 fn read_branch(root: &Path) -> Option<SharedString> {
     let git = root.join(".git");
     let dir = if git.is_file() {

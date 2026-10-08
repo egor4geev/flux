@@ -1,9 +1,9 @@
-//! Начальный экран — в окне без открытых документов: логотип, текущий проект, быстрые
-//! действия с сочетаниями и недавние проекты.
+//! The start screen, shown in a window with no open documents: the logo, the current project, quick
+//! actions with their shortcuts, and recent projects.
 //!
-//! Действия отправляются в окно (`window.dispatch_action`) — те же, что у клавиш; недавний
-//! проект открывается действием [`OpenProject`]. Состояния у экрана нет: всё, что он
-//! показывает, передаёт Workspace ([`StartScreen`]).
+//! Actions are dispatched to the window (`window.dispatch_action`), the same ones the keys trigger;
+//! a recent project is opened with the [`OpenProject`] action. The screen has no state: everything
+//! it shows is passed in by the Workspace ([`StartScreen`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,50 +13,52 @@ use gpui::{
     linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 
+use crate::i18n::tr;
 use crate::icons::{self, IconName, icon};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_LG, RADIUS_MD};
 use crate::workspace::{self, OpenProject, Workspace, tilde};
 use crate::{command_palette, file_finder, file_tree, project_search};
 
-/// Ширина содержимого по центру острова; уже — во всю ширину с полями.
+/// Width of the content, centered in the island; if the island is narrower, the content takes its
+/// full width with margins.
 const CONTENT_WIDTH: f32 = 720.;
-/// Столбцы «Start» и «Recent Projects» стоят рядом, пока каждому хватает этой ширины,
-/// иначе встают друг под друга.
+/// The "Start" and "Recent Projects" columns sit side by side as long as this width is enough for
+/// each; otherwise they stack on top of each other.
 const COLUMN_WIDTH: f32 = 300.;
-/// Сколько недавних проектов показывать.
+/// How many recent projects to show.
 const RECENT_SHOWN: usize = 6;
 const ACTION_ROW_HEIGHT: f32 = 36.;
 const RECENT_ROW_HEIGHT: f32 = 44.;
-/// Плитка логотипа и плитки значков действий.
+/// The logo tile and the action icon tiles.
 const LOGO_SIZE: f32 = 76.;
 const TILE_SIZE: f32 = 26.;
-/// Пути длиннее сокращаются посередине («~/…/flux-dev/flux»): многоточие gpui в строках
-/// с гибкой шириной не срабатывает, а конец пути важнее начала.
+/// Longer paths are shortened in the middle ("~/…/flux-dev/flux"): the gpui ellipsis does not work
+/// in rows with flexible width, and the end of a path matters more than its beginning.
 const CARD_PATH_CHARS: usize = 64;
 const RECENT_PATH_CHARS: usize = 44;
 
-/// Что знает о себе окно для начального экрана.
+/// What the window knows about itself, for the start screen.
 pub struct StartScreen<'a> {
     pub root: Option<&'a Path>,
-    /// Ветка git проекта.
+    /// The project's git branch.
     pub branch: Option<&'a str>,
-    /// Недавние проекты, последние — первыми (текущий тоже среди них).
+    /// Recent projects, most recent first (the current one is among them too).
     pub recent: &'a [PathBuf],
-    /// Сообщение окна: ошибки открытия файлов, «Project: ~/…».
+    /// Window message: file-opening errors, "Project: ~/…".
     pub notice: Option<&'a SharedString>,
-    /// Файлы из командной строки ещё читаются — экран не показываем.
+    /// Files from the command line are still being read, so the screen is not shown.
     pub loading: bool,
 }
 
-/// Быстрое действие: подпись, значок, оттенок плитки и действие окна.
+/// A quick action: label, icon, tile tint, and the window action.
 struct QuickAction {
     id: &'static str,
     label: &'static str,
     icon: IconName,
     hue: Hsla,
     action: Box<dyn Action>,
-    /// Без корня проекта действие бессмысленно (поиск, дерево) — не показывается.
+    /// Without a project root the action makes no sense (search, tree), so it is not shown.
     needs_project: bool,
 }
 
@@ -72,7 +74,7 @@ fn quick_actions(ui: &UiColors) -> Vec<QuickAction> {
     vec![
         action(
             "find-file",
-            "Find File",
+            tr("Find File"),
             IconName::Search,
             ui.blue,
             &file_finder::Toggle,
@@ -80,7 +82,7 @@ fn quick_actions(ui: &UiColors) -> Vec<QuickAction> {
         ),
         action(
             "find-in-files",
-            "Find in Files",
+            tr("Find in Files"),
             IconName::FindInFiles,
             ui.amber,
             &project_search::Toggle,
@@ -88,7 +90,7 @@ fn quick_actions(ui: &UiColors) -> Vec<QuickAction> {
         ),
         action(
             "command-palette",
-            "Command Palette",
+            tr("Command Palette"),
             IconName::Command,
             ui.violet,
             &command_palette::Toggle,
@@ -96,7 +98,7 @@ fn quick_actions(ui: &UiColors) -> Vec<QuickAction> {
         ),
         action(
             "new-file",
-            "New File",
+            tr("New File"),
             IconName::FilePlus,
             ui.green,
             &workspace::NewFile,
@@ -104,7 +106,7 @@ fn quick_actions(ui: &UiColors) -> Vec<QuickAction> {
         ),
         action(
             "open",
-            "Open…",
+            tr("Open…"),
             IconName::FolderOpen,
             ui.cyan,
             &workspace::Open,
@@ -112,7 +114,7 @@ fn quick_actions(ui: &UiColors) -> Vec<QuickAction> {
         ),
         action(
             "toggle-tree",
-            "Toggle Project Tree",
+            tr("Toggle Project Tree"),
             IconName::Sidebar,
             ui.pink,
             &file_tree::ToggleOpen,
@@ -175,11 +177,11 @@ pub fn render(screen: StartScreen, window: &mut Window, cx: &mut Context<Workspa
                 .flex_wrap()
                 .gap_x_8()
                 .gap_y_6()
-                .child(column("Start", action_rows, ui))
-                .child(column("Recent Projects", recent, ui)),
+                .child(column(tr("Start"), action_rows, ui))
+                .child(column(tr("Recent Projects"), recent, ui)),
         );
-    // Содержимое — по центру; не помещается по высоте — прокручивается (поля `my_auto`
-    // сжимаются до нуля).
+    // The content is centered; if it does not fit in height, it scrolls (the `my_auto` margins
+    // shrink to zero).
     div()
         .id("start-screen")
         .size_full()
@@ -194,8 +196,9 @@ pub fn render(screen: StartScreen, window: &mut Window, cx: &mut Context<Workspa
         .into_any_element()
 }
 
-/// Сочетания берутся из дерева прошлого кадра: в самом первом кадре окна их ещё нет.
-/// Тогда — один лишний кадр, чтобы клавиши появились, не дожидаясь движения мыши.
+/// Shortcuts are taken from the previous frame's tree, so they are not there yet in the window's
+/// very first frame. In that case one extra frame is requested so that the keys appear without
+/// waiting for mouse movement.
 fn request_frame_for_shortcuts(shortcuts: &[Option<SharedString>], window: &mut Window) {
     static REQUESTED: AtomicBool = AtomicBool::new(false);
     if shortcuts.iter().all(Option::is_none) && !REQUESTED.swap(true, Ordering::Relaxed) {
@@ -203,9 +206,9 @@ fn request_frame_for_shortcuts(shortcuts: &[Option<SharedString>], window: &mut 
     }
 }
 
-/// Логотип на градиенте акцента, название и версия.
+/// The logo on an accent gradient, the name, and the version.
 fn hero(ui: UiColors) -> Div {
-    // Плитка как у иконки приложения: тёмное стекло, блик, цветной логотип и мягкое свечение.
+    // A tile like the app icon: dark glass, a highlight, a colored logo, and a soft glow.
     let logo = div()
         .relative()
         .flex_none()
@@ -260,7 +263,7 @@ fn hero(ui: UiColors) -> Div {
                                 .font_weight(FontWeight::BOLD)
                                 .line_height(px(theme::TEXT_DISPLAY + 6.))
                                 .text_color(ui.foreground)
-                                .child("flux"),
+                                .child("Flux"),
                         )
                         .child(ui::badge(
                             concat!("v", env!("CARGO_PKG_VERSION")),
@@ -271,12 +274,12 @@ fn hero(ui: UiColors) -> Div {
                     div()
                         .text_size(px(theme::TEXT_MD))
                         .text_color(ui.text_muted)
-                        .child("A fast, minimal code editor"),
+                        .child(tr("A fast, minimal code editor")),
                 ),
         )
 }
 
-/// Подложка карточек: чуть светлее острова.
+/// Card background: slightly lighter than the island.
 fn card(ui: UiColors) -> Div {
     div()
         .w_full()
@@ -286,7 +289,7 @@ fn card(ui: UiColors) -> Div {
         .border_color(ui.island_border)
 }
 
-/// Текущий проект: значок, имя, путь и ветка.
+/// The current project: icon, name, path, and branch.
 fn project_card(root: &Path, branch: Option<&str>, ui: UiColors) -> Div {
     card(ui)
         .flex()
@@ -330,7 +333,7 @@ fn project_card(root: &Path, branch: Option<&str>, ui: UiColors) -> Div {
         .children(branch.map(|branch| branch_chip(branch, ui)))
 }
 
-/// Ветка git: фиолетовый чип, как в шапке окна.
+/// Git branch: a purple chip, as in the window title bar.
 fn branch_chip(branch: &str, ui: UiColors) -> Div {
     div()
         .flex_none()
@@ -347,10 +350,10 @@ fn branch_chip(branch: &str, ui: UiColors) -> Div {
         .child(branch.to_string())
 }
 
-/// Без проекта: та же карточка, что у проекта, — приглашение и заметная основная кнопка.
+/// No project: the same card as for a project, with an invitation and a prominent primary button.
 fn open_folder_card(window: &Window, ui: UiColors) -> Div {
     let keys = ui::shortcut_for(&workspace::Open, window);
-    // Тёмный текст на светлом акценте читается лучше белого.
+    // Dark text reads better than white on the light accent.
     let on_accent = UiColors::tint(ui.island, 1.);
     card(ui)
         .flex()
@@ -381,14 +384,16 @@ fn open_folder_card(window: &Window, ui: UiColors) -> Div {
                         .text_size(px(theme::TEXT_LG))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(ui.foreground)
-                        .child("No project open"),
+                        .child(tr("No project open")),
                 )
                 .child(
                     div()
                         .truncate()
                         .text_size(px(theme::TEXT_SM))
                         .text_color(ui.text_muted)
-                        .child("Open a folder to browse, search and keep it in recent projects"),
+                        .child(tr(
+                            "Open a folder to browse, search and keep it in recent projects",
+                        )),
                 ),
         )
         .child(
@@ -417,14 +422,14 @@ fn open_folder_card(window: &Window, ui: UiColors) -> Div {
                 .text_color(on_accent)
                 .hover(|style| style.opacity(0.9))
                 .active(|style| style.opacity(0.8))
-                .tooltip(ui::tooltip("Open a folder or files", keys))
+                .tooltip(ui::tooltip(tr("Open a folder or files"), keys))
                 .on_click(|_, window, cx| window.dispatch_action(workspace::Open.boxed_clone(), cx))
                 .child(icon(IconName::FolderOpen, on_accent).size(px(14.)))
-                .child("Open Folder…"),
+                .child(tr("Open Folder…")),
         )
 }
 
-/// Столбец с подписью раздела.
+/// A column with a section label.
 fn column(title: &'static str, rows: impl IntoIterator<Item = AnyElement>, ui: UiColors) -> Div {
     div()
         .flex_grow()
@@ -438,7 +443,7 @@ fn column(title: &'static str, rows: impl IntoIterator<Item = AnyElement>, ui: U
         .children(rows)
 }
 
-/// Строка быстрого действия: плитка значка, подпись, клавиши.
+/// A quick action row: icon tile, label, keys.
 fn action_row(action: QuickAction, keys: Option<SharedString>, ui: UiColors) -> impl IntoElement {
     let QuickAction {
         id,
@@ -472,7 +477,7 @@ fn action_row(action: QuickAction, keys: Option<SharedString>, ui: UiColors) -> 
         .children(keys.map(|keys| ui::keys(&keys, ui)))
 }
 
-/// Цветная плитка со значком: подложка и значок одного оттенка.
+/// A colored tile with an icon: the backing and the icon are the same hue.
 fn tile(name: IconName, hue: Hsla) -> Div {
     div()
         .flex_none()
@@ -485,7 +490,7 @@ fn tile(name: IconName, hue: Hsla) -> Div {
         .child(icon(name, hue).size(px(14.)))
 }
 
-/// Недавний проект: имя и путь; текущий — с бейджем и без щелчка.
+/// A recent project: name and path; the current one gets a badge and is not clickable.
 fn recent_row(index: usize, path: &Path, current: bool, ui: UiColors) -> impl IntoElement {
     let row = div()
         .id(("recent-project", index))
@@ -518,7 +523,7 @@ fn recent_row(index: usize, path: &Path, current: bool, ui: UiColors) -> impl In
                 ),
         );
     if current {
-        return row.child(ui::badge("current", ui.accent_text));
+        return row.child(ui::badge(tr("current"), ui.accent_text));
     }
     let path = path.to_path_buf();
     row.cursor_pointer()
@@ -538,10 +543,10 @@ fn empty_recent(ui: UiColors) -> impl IntoElement {
         .gap_2()
         .text_color(ui.dim)
         .child(icon(IconName::Clock, ui.dim).size(px(14.)))
-        .child("Projects you open will appear here")
+        .child(tr("Projects you open will appear here"))
 }
 
-/// Сообщение окна: ошибка — красной плашкой, остальное — информационной.
+/// Window message: an error is shown as a red banner, anything else as an informational one.
 fn notice_banner(notice: &SharedString, ui: UiColors) -> Div {
     let (name, color) = if looks_like_error(notice) {
         (IconName::Error, ui.error)
@@ -569,7 +574,8 @@ fn notice_banner(notice: &SharedString, ui: UiColors) -> Div {
         )
 }
 
-/// Сообщения окна не делятся на уровни: ошибку узнаём по словам (Cannot open…).
+/// Window messages have no severity levels, so an error is recognized by its wording (Cannot
+/// open…).
 fn looks_like_error(message: &str) -> bool {
     let message = message.to_lowercase();
     [
@@ -579,14 +585,19 @@ fn looks_like_error(message: &str) -> bool {
         "denied",
         "not found",
         "no such",
+        // Russian messages (`i18n::tr`).
+        "не удалось",
+        "не найден",
+        "ошибк",
     ]
     .iter()
     .any(|word| message.contains(word))
 }
 
-/// Сокращает путь посередине до `max_chars` символов, по границам каталогов: начало
-/// (`~` или первый каталог от корня) и столько последних компонентов, сколько влезет —
-/// «/private/…/scratchpad/wt-start». Последний компонент длиннее предела — «…» и его конец.
+/// Shortens a path in the middle to `max_chars` characters, on directory boundaries: the beginning
+/// (`~` or the first directory from the root) and as many trailing components as fit, e.g.
+/// "/private/…/scratchpad/wt-start". If the last component is longer than the limit, "…" and its
+/// tail.
 fn shorten_path(path: &str, max_chars: usize) -> String {
     let len = |text: &str| text.chars().count();
     if len(path) <= max_chars {
@@ -598,7 +609,7 @@ fn shorten_path(path: &str, max_chars: usize) -> String {
         [first, rest @ ..] => (first.to_string(), rest),
         [] => return path.to_string(),
     };
-    // «head/…/» и хвост из последних компонентов.
+    // "head/…/" and a tail of the last components.
     let mut budget = max_chars.saturating_sub(len(&head) + 3);
     let mut tail: Vec<&str> = Vec::new();
     for part in rest.iter().rev() {
@@ -619,7 +630,7 @@ fn shorten_path(path: &str, max_chars: usize) -> String {
     format!("{head}/…/{}", tail.join("/"))
 }
 
-/// Имя каталога; корень диска — путь целиком.
+/// The directory name; for a disk root, the whole path.
 fn display_name(path: &Path) -> String {
     path.file_name()
         .map_or_else(|| tilde(path), |name| name.to_string_lossy().into_owned())
@@ -650,9 +661,9 @@ mod tests {
             shorten_path("~/dev/personal/flux-dev/playground/tree-sandbox", 32),
             "~/…/playground/tree-sandbox"
         );
-        // Последний компонент сам длиннее предела.
+        // The last component alone is longer than the limit.
         assert_eq!(shorten_path("/a/abcdefghijklmnop", 8), "…jklmnop");
-        // Кириллица — по символам, не по байтам.
+        // Cyrillic is counted by characters, not bytes.
         assert_eq!(
             shorten_path("/дом/проекты/очень-длинное-имя", 12),
             "…длинное-имя"

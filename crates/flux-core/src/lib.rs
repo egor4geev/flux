@@ -1,6 +1,6 @@
-//! Ядро редактора: текст, выделения, транзакции, история.
+//! The editor core: text, selections, transactions, history.
 //!
-//! Ничего не знает про UI. Все позиции — индексы символов (`char`) в документе.
+//! Knows nothing about the UI. All positions are character (`char`) indices in the document.
 
 pub mod document;
 pub mod edit;

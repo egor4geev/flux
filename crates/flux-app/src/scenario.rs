@@ -1,25 +1,26 @@
-//! Сценарии проверки UI (фича `scenario`, в обычную сборку не входит).
+//! UI verification scenarios (the `scenario` feature, not part of the regular build).
 //!
-//! Агент не может нажимать клавиши в окне: нет прав Accessibility. Поэтому нажатия
-//! подаются изнутри приложения тем же путём, что и настоящие: `Window::dispatch_keystroke`
-//! проходит через keymap и контексты клавиш, а печатные символы — через input handler.
+//! The agent can't press keys in the window: it has no Accessibility permission. So keystrokes are
+//! fed from inside the app along the same path as real ones: `Window::dispatch_keystroke` goes
+//! through the keymap and key contexts, and printable characters go through the input handler.
 //!
-//! - `FLUX_SCENARIO` — шаги через пробел:
-//!   - `cmd-s`, `enter`, `space`, `left` — нажатие в синтаксисе keymap gpui;
-//!   - `type:текст` — набрать текст по символу (пробел — отдельным шагом `space`);
-//!   - `wait:500` — пауза в мс;
-//!   - `shot:имя` — напечатать `SHOT имя` и подождать, пока окно снимут снаружи.
+//! - `FLUX_SCENARIO` — steps separated by spaces:
+//!   - `cmd-s`, `enter`, `space`, `left` — a keystroke in gpui keymap syntax;
+//!   - `type:text` — type the text character by character (a space is a separate `space` step);
+//!   - `wait:500` — a pause in ms;
+//!   - `shot:name` — print `SHOT name` and wait for the window to be captured from outside.
 //!
-//!   После последнего шага печатается `END`.
-//! - `FLUX_ANSWERS=0,1` — системные диалоги заменяются автоответчиком: номера кнопок
-//!   по порядку; когда ответы кончились — последняя кнопка (обычно Cancel). Каждый
-//!   диалог печатает `PROMPT вопрос -> ответ` и метку `SHOT prompt-N`.
+//!   `END` is printed after the last step.
+//! - `FLUX_ANSWERS=0,1` — system dialogs are replaced by an auto-responder: button numbers in
+//!   order; when the answers run out, the last button (usually Cancel). Each dialog prints `PROMPT
+//!   question -> answer` and a `SHOT prompt-N` marker.
 //!
-//! Диалоги выбора файла (Cmd+O, «Сохранить как») — системные панели, автоответчик их
-//! не заменяет. Обвязка со скриншотами — `scripts/ui-scenario.sh`.
+//! File picker dialogs (Cmd+O, "Save As") are system panels, and the auto-responder doesn't replace
+//! them. The screenshot harness is `scripts/ui-scenario.sh`.
 //!
-//! Окно сценария — поверх всех окон ([`window_options`]): перекрытое другим приложением
-//! окно gpui не перерисовывает, и снимки вышли бы устаревшими, пока автор работает рядом.
+//! The scenario window is above all other windows ([`window_options`]): gpui doesn't redraw a
+//! window covered by another app, and the screenshots would come out stale while the author works
+//! alongside.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -32,18 +33,18 @@ use gpui::{
     RenderablePromptHandle, Window, WindowKind, WindowOptions, div, prelude::*, rgb,
 };
 
-/// Перед первым шагом: окно открылось, файлы из командной строки прочитаны.
+/// Before the first step: the window has opened and the files from the command line have been read.
 const START_DELAY: Duration = Duration::from_millis(1500);
-/// После шага: окно успевает перерисоваться.
+/// After a step: the window has time to redraw.
 const STEP_PAUSE: Duration = Duration::from_millis(150);
-/// На метке `shot:` и на диалоге: снаружи успевают снять окно.
+/// At a `shot:` marker and at a dialog: gives time to capture the window from outside.
 const SHOT_PAUSE: Duration = Duration::from_millis(1500);
 
 static ANSWERS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
 static PROMPTS: AtomicUsize = AtomicUsize::new(0);
 
-/// С `FLUX_SCENARIO` окно — всплывающая панель поверх всех окон: её не перекроет
-/// приложение, в котором работает автор, и кадры рисуются.
+/// With `FLUX_SCENARIO` the window is a pop-up panel above all other windows: the app the author is
+/// working in can't cover it, and frames get drawn.
 pub fn window_options(options: WindowOptions) -> WindowOptions {
     if std::env::var_os("FLUX_SCENARIO").is_none() {
         return options;
@@ -76,7 +77,7 @@ pub fn run(window: AnyWindowHandle, cx: &mut App) {
     .detach();
 }
 
-/// Выполняет шаг и возвращает паузу после него.
+/// Executes a step and returns the pause to take after it.
 fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration {
     if let Some(name) = step.strip_prefix("shot:") {
         println!("SHOT {name}");
@@ -108,7 +109,7 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
     STEP_PAUSE
 }
 
-/// Нажатие, которое печатает символ `c`, — как ввод с клавиатуры без модификаторов.
+/// A keystroke that types the character `c`, like typing on the keyboard without modifiers.
 fn typed(c: char) -> Keystroke {
     Keystroke {
         modifiers: Modifiers::default(),
@@ -117,7 +118,7 @@ fn typed(c: char) -> Keystroke {
     }
 }
 
-/// Плашка вместо системного диалога: на скриншоте видно вопрос и выбранный ответ.
+/// A banner in place of the system dialog: the screenshot shows the question and the chosen answer.
 struct AutoPrompt {
     focus_handle: FocusHandle,
     text: String,

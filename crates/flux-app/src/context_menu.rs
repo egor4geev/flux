@@ -1,11 +1,12 @@
-//! Контекстное меню (правая кнопка мыши): список пунктов поверх окна у курсора.
+//! Context menu (right mouse button): a list of items over the window at the mouse cursor.
 //!
-//! [`ContextMenu`] — вид со своим фокусом: ↑/↓, ↵, ⎋ работают сразу. Владелец рисует его
-//! поверх всего у точки щелчка ([`ContextMenu::overlay`]) и закрывает по [`DismissEvent`]:
-//! выбор пункта, Esc, щелчок мимо. Пункт — действие gpui: перед отправкой фокус
-//! возвращается туда, где был до меню (`dispatch_action` берёт фокус в момент вызова, как
-//! в палитре команд), поэтому действие получает тот, кто открыл меню. Сочетания справа —
-//! из keymap того же места.
+//! [`ContextMenu`] is a view with its own focus: ↑/↓, ↵, ⎋ work right away. The owner draws it on
+//! top of everything at the click point ([`ContextMenu::overlay`]) and closes it on
+//! [`DismissEvent`]: an item is chosen, Esc is pressed, or the user clicks outside. An item is a
+//! gpui action: before dispatching it, focus returns to where it was before the menu
+//! (`dispatch_action` takes the focus at the moment of the call, as in the command palette), so the
+//! action is received by whoever opened the menu. The shortcuts on the right come from the keymap
+//! of that same place.
 
 use gpui::{
     Action, AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
@@ -19,7 +20,7 @@ use crate::ui::{self, RADIUS_LG, RADIUS_SM};
 
 const MENU_MIN_WIDTH: f32 = 240.;
 const ITEM_HEIGHT: f32 = 28.;
-/// Отступ пунктов от края меню; скругление пункта = скругление меню − отступ.
+/// Inset of the items from the menu edge; item corner radius = menu corner radius − inset.
 const MENU_PADDING: f32 = 5.;
 
 actions!(context_menu, [SelectNext, SelectPrevious, Confirm, Cancel]);
@@ -45,17 +46,19 @@ enum Item {
 
 pub struct ContextMenu {
     items: Vec<Item>,
-    /// Пункт, выбранный стрелками; мышь подсвечивает свой сама.
+    /// The item selected with the arrow keys; the mouse highlights its own item on its own.
     selected: Option<usize>,
     focus_handle: FocusHandle,
-    /// Кто был в фокусе до меню: ему уходит действие, по нему ищутся сочетания.
+    /// Whoever was focused before the menu: the action is dispatched to it, and shortcuts are
+    /// looked up from it.
     previous_focus: Option<FocusHandle>,
 }
 
 impl EventEmitter<DismissEvent> for ContextMenu {}
 
 impl ContextMenu {
-    /// Пустое меню для того, кто сейчас в фокусе. Пункты — [`Self::entry`], [`Self::separator`].
+    /// An empty menu for whoever is currently in focus. Items: [`Self::entry`],
+    /// [`Self::separator`].
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             items: Vec::new(),
@@ -69,7 +72,8 @@ impl ContextMenu {
         self.entry_if(true, label, action)
     }
 
-    /// Пункт, который виден, но недоступен при `!enabled` (например, «Paste» без скопированного).
+    /// An item that is visible but unavailable when `!enabled` (for example, "Paste" with nothing
+    /// copied).
     pub fn entry_if(
         mut self,
         enabled: bool,
@@ -84,7 +88,7 @@ impl ContextMenu {
         self
     }
 
-    /// Разделитель; в начале, в конце и подряд — не рисуется.
+    /// A separator; not drawn at the start, at the end, or twice in a row.
     pub fn separator(mut self) -> Self {
         if !self.items.is_empty() && !matches!(self.items.last(), Some(Item::Separator)) {
             self.items.push(Item::Separator);
@@ -92,7 +96,8 @@ impl ContextMenu {
         self
     }
 
-    /// Меню поверх окна в точке `position` (координаты окна); у края окна — сдвигается внутрь.
+    /// The menu over the window at the point `position` (window coordinates); near the window edge
+    /// it is shifted inward.
     pub fn overlay(menu: &Entity<Self>, position: Point<Pixels>) -> AnyElement {
         deferred(
             anchored()
@@ -139,7 +144,8 @@ impl ContextMenu {
         }
     }
 
-    /// Выполняет пункт: фокус — назад, действие — туда же, меню закрывается.
+    /// Executes the item: focus goes back, the action is dispatched to the same place, and the menu
+    /// closes.
     fn run(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Item::Entry {
             action,
@@ -157,7 +163,7 @@ impl ContextMenu {
         window.dispatch_action(action, cx);
     }
 
-    /// Сочетание действия значками macOS — в контексте клавиш того, кто открыл меню.
+    /// The action's shortcut as macOS symbols, in the key context of whoever opened the menu.
     fn keys_for(&self, action: &dyn Action, window: &Window) -> Option<SharedString> {
         let bindings = match &self.previous_focus {
             Some(focus) => window.bindings_for_action_in(action, focus),

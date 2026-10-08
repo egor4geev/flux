@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Логотип flux — «гранёная искра»: шесть лучей-лент разной длины, у каждого светлая и
-тёмная грань (сгиб по оси), скруглённые концы, светлая точка в центре. Источник цветного
-логотипа `crates/flux-app/assets/brand/logo.svg`:
+"""The flux logo, a "faceted spark": six ribbon rays of different lengths, each with a light and a
+dark facet (folded along its axis), rounded tips and a light dot in the middle. Source of the
+colour logo `crates/flux-app/assets/brand/logo.svg`:
 
     python3 scripts/gen-logo.py crates/flux-app/assets/brand/logo.svg
 
-Монохромный силуэт той же геометрии — значок `logo` в scripts/gen-icons.py (менять вместе:
-таблица `RAYS`). Иконка приложения строится из цветного логотипа (scripts/app-icon.swift)."""
+The single-colour silhouette with the same geometry is the `logo` icon in scripts/gen-icons.py
+(change them together: table `RAYS`). The app icon is built from the colour logo
+(scripts/app-icon.swift)."""
 import math, sys
 
-# Луч: угол (градусы, по часовой от оси x) и длина (из 100). Неровные — как у искры.
+# Ray: angle (degrees, clockwise from the x axis) and length (out of 100). Uneven, like a spark's.
 RAYS = [(-96, 45), (-37, 35), (14, 42), (70, 33), (122, 44), (178, 36)]
-BASE, TIP = 17, 9  # ширина луча у центра и у скруглённого конца
+BASE, TIP = 17, 9  # ray width at the center and at the rounded end
 
 def ray(ang, length, light, dark, c=50, k=1.0):
     ax = (math.cos(math.radians(ang)), math.sin(math.radians(ang)))
@@ -20,7 +21,8 @@ def ray(ang, length, light, dark, c=50, k=1.0):
     f = lambda q: f"{q[0]:.2f} {q[1]:.2f}"
     L, base, r = length * k, BASE * k, TIP * k / 2
     o, te = p(0, 0), p(L, 0)
-    # Дуги конца — против часовой (флаг 0): скругление наружу, а не выемка.
+    # End arcs run counterclockwise (flag 0): the rounding bulges outward instead of cutting a
+    # notch.
     left = f'<path d="M{f(o)} L{f(p(0, base / 2))} L{f(p(L - r, r))} A{r:.2f} {r:.2f} 0 0 0 {f(te)} Z" fill="{light}"/>'
     right = f'<path d="M{f(o)} L{f(te)} A{r:.2f} {r:.2f} 0 0 0 {f(p(L - r, -r))} L{f(p(0, -base / 2))} Z" fill="{dark}"/>'
     return left + right

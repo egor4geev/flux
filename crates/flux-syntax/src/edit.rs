@@ -1,15 +1,14 @@
-//! [`ChangeSet`] (позиции в символах) → [`InputEdit`] для tree-sitter
-//! (байты UTF-8 и точки «строка, байт в строке»).
+//! [`ChangeSet`] (positions in characters) → [`InputEdit`] for tree-sitter (UTF-8 bytes and "line,
+//! byte within the line" points).
 //!
-//! Правки считаются в координатах *старого* текста и по возрастанию позиции,
-//! а к дереву применяются в обратном порядке: правка, применённая первой,
-//! лежит правее всех остальных и не сдвигает их координаты (как `generate_edits`
-//! в Helix).
+//! Edits are computed in the coordinates of the *old* text and in ascending order of position, but
+//! are applied to the tree in reverse order: the edit applied first lies to the right of all the
+//! others and doesn't shift their coordinates (like `generate_edits` in Helix).
 //!
-//! Точки — по правилам tree-sitter: строки делятся только по `\n`, колонка —
-//! в **байтах** от последнего `\n`. Лексер tree-sitter считает их так же, а
-//! внешние сканеры с `get_column` (heredoc в bash) отматывают `byte - column`
-//! к началу строки, так что неточная колонка ломает инкрементальный разбор.
+//! Points follow tree-sitter's rules: lines are split only on `\n`, and the column is counted in
+//! **bytes** from the last `\n`. The tree-sitter lexer counts them the same way, and external
+//! scanners that use `get_column` (heredoc in bash) rewind `byte - column` to the start of the
+//! line, so an inexact column breaks incremental parsing.
 
 use flux_core::Rope;
 use flux_core::transaction::{ChangeSet, Operation};
@@ -17,17 +16,16 @@ use tree_sitter::{InputEdit, Point};
 
 use crate::text::count_byte;
 
-/// Правки дерева для одного [`ChangeSet`].
+/// Tree edits for a single [`ChangeSet`].
 pub(crate) struct EditBatch {
-    /// По возрастанию позиции, в координатах старого текста.
-    /// Применять к дереву в обратном порядке.
+    /// In ascending order of position, in old-text coordinates. Apply to the tree in reverse order.
     pub edits: Vec<InputEdit>,
-    /// Число `\n` в новом тексте.
+    /// The number of `\n` in the new text.
     pub newlines: usize,
 }
 
-/// `newlines` — число `\n` в `old_text`; `changes` должен быть построен для
-/// `old_text` (`changes.len() == old_text.len_chars()`).
+/// `newlines` is the number of `\n` in `old_text`; `changes` must have been built for `old_text`
+/// (`changes.len() == old_text.len_chars()`).
 pub(crate) fn input_edits(old_text: &Rope, changes: &ChangeSet, newlines: usize) -> EditBatch {
     let mut points = Points::new(old_text, newlines);
     let mut edits = Vec::new();
@@ -41,7 +39,7 @@ pub(crate) fn input_edits(old_text: &Rope, changes: &ChangeSet, newlines: usize)
             i += 1;
             continue;
         }
-        // Подряд идущие вставки и удаления — одна правка.
+        // Consecutive insertions and deletions form a single edit.
         let start_byte = old_text.char_to_byte(pos);
         let start_position = points.at(start_byte);
         let mut new_end_byte = start_byte;
@@ -72,12 +70,12 @@ pub(crate) fn input_edits(old_text: &Rope, changes: &ChangeSet, newlines: usize)
     }
     EditBatch {
         edits,
-        // Насыщение — только от неверного `newlines` (правка не от этого текста).
+        // Saturation happens only with an incorrect `newlines` (the edit is not for this text).
         newlines: (newlines + added).saturating_sub(removed),
     }
 }
 
-/// Точка после текста `s`, начатого в точке `point`.
+/// The point after text `s` that starts at `point`.
 fn advance(mut point: Point, s: &str) -> Point {
     let bytes = s.as_bytes();
     match bytes.iter().rposition(|&b| b == b'\n') {
@@ -90,22 +88,21 @@ fn advance(mut point: Point, s: &str) -> Point {
     point
 }
 
-/// Точки tree-sitter для неубывающих байтовых смещений текста.
+/// tree-sitter points for non-decreasing byte offsets into the text.
 ///
-/// ropey делит строки не только по `\n`, но и по одинокому `\r`, VT, FF, NEL,
-/// U+2028 и U+2029. Если таких «чужих» переводов строк в тексте нет (строк
-/// ropey ровно на одну больше, чем `\n`), строка ropey и есть строка
-/// tree-sitter, и точка находится за O(log n). Иначе — честный проход по
-/// тексту от начала до последней правки: O(n), но такие файлы редки.
+/// ropey splits lines not only on `\n` but also on a lone `\r`, VT, FF, NEL, U+2028 and U+2029. If
+/// the text has no such "foreign" line breaks (ropey has exactly one more line than there are
+/// `\n`), a ropey line is a tree-sitter line, and a point is found in O(log n). Otherwise, a plain
+/// pass over the text from the start to the last edit: O(n), but such files are rare.
 enum Points<'a> {
     Lines(&'a Rope),
     Scan {
         text: &'a Rope,
-        /// Докуда просмотрен текст.
+        /// How far the text has been scanned.
         byte: usize,
-        /// Сколько `\n` встретилось до `byte`.
+        /// How many `\n` were encountered before `byte`.
         row: usize,
-        /// Байт сразу после последнего `\n` до `byte`.
+        /// The byte immediately after the last `\n` before `byte`.
         row_start: usize,
     },
 }
@@ -126,7 +123,8 @@ impl<'a> Points<'a> {
 
     fn at(&mut self, byte: usize) -> Point {
         match self {
-            // Позиция между `\r` и `\n` у ropey остаётся в строке `\r`, как и у tree-sitter.
+            // A position between `\r` and `\n` stays on the `\r` line in ropey, just as in
+            // tree-sitter.
             Self::Lines(text) => {
                 let row = text.byte_to_line(byte);
                 Point::new(row, byte - text.line_to_byte(row))
@@ -159,7 +157,7 @@ mod tests {
     use super::*;
     use crate::text::count_newlines;
 
-    /// Точка по определению tree-sitter — прямым подсчётом.
+    /// A point by tree-sitter's definition, computed by direct counting.
     fn naive_point(text: &str, byte: usize) -> Point {
         let before = &text.as_bytes()[..byte];
         let row = count_byte(before, b'\n');
@@ -262,7 +260,7 @@ mod tests {
 
     #[test]
     fn touching_ranges_become_one_edit() {
-        // Канонический ChangeSet склеивает соседние правки.
+        // A canonical ChangeSet merges adjacent edits.
         let rope = Rope::from_str("abcdef");
         let cs = ChangeSet::from_changes(6, [(1, 2, Some("X".into())), (2, 4, None)]);
         let batch = input_edits(&rope, &cs, 0);

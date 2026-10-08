@@ -1,10 +1,10 @@
-//! Тема — данные: цвета интерфейса и стили областей подсветки. Ставится глобально
-//! (`cx.set_global`), читается через [`Theme::get`] и [`Theme::ui`]. Метрики шрифта,
-//! табуляция и мигание — константы: это будущие настройки, а не тема.
+//! The theme is data: UI colors and highlight scope styles. It is set globally (`cx.set_global`)
+//! and read via [`Theme::get`] and [`Theme::ui`]. Font metrics, tab width, and blinking are
+//! constants: they are future settings, not part of the theme.
 //!
-//! Цвета интерфейса — токены дизайн-системы (вики: «Design System»): поверхности стекла
-//! (рамка окна, острова, всплывающие панели), текст трёх уровней, акцент, состояния и
-//! палитра оттенков для смысла (типы файлов, категории, счётчики). Компоненты — в `ui.rs`.
+//! UI colors are the design system's tokens (wiki: "Design System"): glass surfaces (window frame,
+//! islands, popovers), text at three levels, accent, states, and a palette of shades that carry
+//! meaning (file types, categories, counters). Components are in `ui.rs`.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -12,9 +12,9 @@ use std::time::Duration;
 use flux_syntax::Highlight;
 use gpui::{App, Global, Hsla, rgb, rgba};
 
-/// Шрифт интерфейса — системный (SF Pro на macOS).
+/// The UI font is the system font (SF Pro on macOS).
 pub const UI_FONT: &str = ".SystemUIFont";
-/// Шрифт кода — первый установленный из списка ([`init_fonts`]).
+/// The code font is the first installed one from the list ([`init_fonts`]).
 const CODE_FONTS: [&str; 4] = [
     "JetBrains Mono",
     "JetBrainsMono Nerd Font Mono",
@@ -24,14 +24,14 @@ const CODE_FONTS: [&str; 4] = [
 pub const FONT_SIZE: f32 = 14.;
 pub const LINE_HEIGHT: f32 = 21.;
 pub const TAB_WIDTH: usize = 4;
-/// Отступ текста от гаттера.
+/// Padding between the gutter and the text.
 pub const TEXT_PADDING: f32 = 8.;
-/// Сколько строк держать между курсором и краем окна при автоскролле.
+/// How many lines to keep between the cursor and the window edge when auto-scrolling.
 pub const SCROLL_MARGIN_LINES: usize = 3;
-/// Период мигания курсора; `None` — курсор не мигает.
+/// Cursor blink period; `None` means the cursor does not blink.
 pub const CURSOR_BLINK: Option<Duration> = Some(Duration::from_millis(500));
 
-/// Кегли интерфейса (шрифт [`UI_FONT`]).
+/// UI font sizes (for the [`UI_FONT`] font).
 pub const TEXT_XS: f32 = 11.;
 pub const TEXT_SM: f32 = 12.;
 pub const TEXT_MD: f32 = 13.;
@@ -40,8 +40,8 @@ pub const TEXT_DISPLAY: f32 = 34.;
 
 static CODE_FONT: OnceLock<&'static str> = OnceLock::new();
 
-/// Выбирает шрифт кода: первый установленный из [`CODE_FONTS`]. Без такой проверки
-/// gpui молча подставил бы пропорциональный системный шрифт.
+/// Picks the code font: the first installed one from [`CODE_FONTS`]. Without this check, gpui would
+/// silently substitute a proportional system font.
 pub fn init_fonts(cx: &App) {
     let installed = cx.text_system().all_font_names();
     let family = CODE_FONTS
@@ -51,81 +51,81 @@ pub fn init_fonts(cx: &App) {
     CODE_FONT.set(family).ok();
 }
 
-/// Шрифт кода: редактор, поля поиска, строки результатов.
+/// The code font: editor, search fields, result rows.
 pub fn code_font() -> &'static str {
     CODE_FONT.get().copied().unwrap_or("Menlo")
 }
 
-/// Цвета интерфейса. `Copy`: читаются из глобальной темы одним значением.
+/// UI colors. `Copy`: read from the global theme as a single value.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UiColors {
-    // --- Поверхности (стекло). Альфа — сквозь неё видно размытый рабочий стол. ---
-    /// Рамка окна: фон под островами, шапка и статус-бар.
+    // --- Surfaces (glass). The alpha lets the blurred desktop show through. ---
+    /// Window frame: the background under the islands, the title bar, and the status bar.
     pub frame: Hsla,
-    /// Цветной отсвет рамки (градиент из верхнего левого угла).
+    /// Colored glow of the frame (a gradient from the top-left corner).
     pub frame_glow: Hsla,
-    /// Остров — самостоятельная панель: дерево, редактор.
+    /// Island: a self-contained panel (tree, editor).
     pub island: Hsla,
     pub island_border: Hsla,
-    /// Блик стекла по верхнему краю острова и всплывающей панели.
+    /// Glass sheen along the top edge of an island and of a popover.
     pub sheen: Hsla,
-    /// Всплывающие панели: меню, списки выбора, поиск по проекту, подсказки.
+    /// Popovers: menus, pickers, project search, tooltips.
     pub elevated: Hsla,
     pub elevated_border: Hsla,
     pub shadow: Hsla,
-    /// Тонкие разделители внутри островов.
+    /// Thin dividers inside the islands.
     pub divider: Hsla,
 
-    // --- Текст ---
+    // --- Text ---
     pub foreground: Hsla,
-    /// Вторичный текст: пути, подписи, неактивные вкладки.
+    /// Secondary text: paths, labels, inactive tabs.
     pub text_muted: Hsla,
-    /// Третичный: номера строк, подсказки, плейсхолдеры.
+    /// Tertiary: line numbers, hints, placeholders.
     pub dim: Hsla,
     pub text_disabled: Hsla,
 
-    // --- Взаимодействие ---
+    // --- Interaction ---
     pub accent: Hsla,
-    /// Акцент для текста и значков на тёмном (светлее основного).
+    /// Accent for text and icons on dark backgrounds (lighter than the main accent).
     pub accent_text: Hsla,
-    /// Подложка акцента: включённый переключатель, значок действия.
+    /// Accent background: an enabled toggle, an action icon.
     pub accent_soft: Hsla,
     pub hover: Hsla,
     pub pressed: Hsla,
-    /// Выбранная строка списка в фокусе.
+    /// Selected list row while the list has focus.
     pub list_selected: Hsla,
-    /// Выбранная строка без фокуса: файл активной вкладки в дереве.
+    /// Selected row without focus: the file of the active tab in the tree.
     pub list_selected_inactive: Hsla,
     pub input_background: Hsla,
     pub input_border: Hsla,
-    /// Рамка поля в фокусе и кольцо вокруг него.
+    /// Border of a focused field and the ring around it.
     pub focus_border: Hsla,
     pub focus_ring: Hsla,
-    /// Каталог, на который сейчас бросят перетаскиваемый файл (дерево файлов).
+    /// The directory the dragged file is about to be dropped on (file tree).
     pub drop_target: Hsla,
-    /// Клавиша в подсказке сочетания.
+    /// A key in a shortcut hint.
     pub keycap: Hsla,
     pub keycap_border: Hsla,
 
-    // --- Состояния ---
+    // --- States ---
     pub success: Hsla,
     pub warning: Hsla,
     pub error: Hsla,
     pub info: Hsla,
-    /// Несохранённые изменения: точка на вкладке, отметка в статус-баре.
+    /// Unsaved changes: the dot on a tab, the marker in the status bar.
     pub modified: Hsla,
 
-    // --- Редактор ---
+    // --- Editor ---
     pub current_line: Hsla,
     pub selection: Hsla,
     pub cursor: Hsla,
-    /// Совпавшие символы в списках: нечёткий поиск, результаты поиска по проекту.
+    /// Matched characters in lists: fuzzy search, project search results.
     pub match_text: Hsla,
-    /// Фон найденных вхождений в тексте и текущего из них.
+    /// Background of the matches found in the text, and of the current match.
     pub search_match: Hsla,
     pub search_match_active: Hsla,
 
-    // --- Палитра оттенков: смысл, а не украшение (типы файлов, категории, счётчики). ---
+    // --- Shade palette: meaning, not decoration (file types, categories, counters). ---
     pub blue: Hsla,
     pub indigo: Hsla,
     pub violet: Hsla,
@@ -137,18 +137,18 @@ pub struct UiColors {
     pub green: Hsla,
     pub teal: Hsla,
     pub cyan: Hsla,
-    /// Значок каталога.
+    /// Directory icon.
     pub folder: Hsla,
 }
 
 impl UiColors {
-    /// Цвет `color` с непрозрачностью `alpha` — подложки оттенков (бейджи, плитки значков).
+    /// Returns `color` with opacity `alpha`, for shade backgrounds (badges, icon tiles).
     pub fn tint(color: Hsla, alpha: f32) -> Hsla {
         Hsla { a: alpha, ..color }
     }
 }
 
-/// Как рисовать область подсветки.
+/// How to draw a highlight scope.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SyntaxStyle {
     pub color: Hsla,
@@ -159,9 +159,9 @@ pub struct SyntaxStyle {
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub ui: UiColors,
-    /// Области подсветки — имена как у capture tree-sitter (`keyword`,
-    /// `function.method`). Общее имя покрывает частные: `function` действует
-    /// и для `function.method`, если у того нет своей строки.
+    /// Highlight scopes: names like tree-sitter captures (`keyword`, `function.method`). A general
+    /// name covers the specific ones: `function` also applies to `function.method` if the latter
+    /// has no entry of its own.
     pub syntax: Vec<(String, SyntaxStyle)>,
 }
 
@@ -176,8 +176,8 @@ impl Theme {
         Self::get(cx).ui
     }
 
-    /// Имена областей по порядку — для `flux_syntax::HighlightMap`, индекс в
-    /// этом списке и есть [`Highlight`].
+    /// Scope names in order, for `flux_syntax::HighlightMap`; the index in this list is the
+    /// [`Highlight`].
     pub fn syntax_scopes(&self) -> Vec<&str> {
         self.syntax
             .iter()
@@ -189,13 +189,13 @@ impl Theme {
         self.syntax.get(highlight.0).map(|(_, style)| *style)
     }
 
-    /// Тёмная тема «Flux Night»: стеклянная рамка и острова в холодных сине-фиолетовых
-    /// нейтралях, акцент — индиго. Подсветка кода — палитра GitHub Dark (Primer,
-    /// «prettylights»): ключевые слова и операторы — красный, функции — фиолетовый, типы и
-    /// конструкторы — оранжевый, строки — светло-голубой, константы, числа, свойства и
-    /// встроенное — голубой, теги, регулярки и ключи JSON — зелёный, комментарии — серый.
-    /// Обычные переменные и пунктуация — цветом текста, чтобы не шуметь; параметры —
-    /// оранжевым (цвет `variable` у GitHub), чтобы отличать их от локальных.
+    /// The dark theme "Flux Night": a glass frame and islands in cool blue-violet neutrals; the
+    /// accent is indigo. Code highlighting uses the GitHub Dark palette (Primer, "prettylights"):
+    /// keywords and operators are red; functions are purple; types and constructors are orange;
+    /// strings are light blue; constants, numbers, properties, and built-ins are blue; tags,
+    /// regexes, and JSON keys are green; comments are gray. Plain variables and punctuation use the
+    /// text color to avoid noise; parameters are orange (GitHub's `variable` color) to tell them
+    /// apart from locals.
     pub fn flux_night() -> Self {
         const RED: u32 = 0xff7b72;
         const PURPLE: u32 = 0xd2a8ff;
@@ -221,7 +221,7 @@ impl Theme {
             ("comment", plain(GRAY)),
             ("constant", plain(BLUE)),
             ("constructor", plain(ORANGE)),
-            // Код внутри `${…}` и f-строк — не строка.
+            // Code inside `${…}` and f-strings is not a string.
             ("embedded", plain(TEXT)),
             ("escape", plain(BLUE)),
             ("function", plain(PURPLE)),
@@ -247,7 +247,7 @@ impl Theme {
             ("variable.parameter", plain(ORANGE)),
         ];
 
-        // Оттенки подобраны под тёмное стекло: близкая светлота, разный тон.
+        // The shades are tuned for dark glass: similar lightness, different hue.
         const INDIGO: u32 = 0x8590ff;
         const AMBER: u32 = 0xffc560;
         Self {
@@ -321,8 +321,8 @@ mod tests {
     use super::*;
     use flux_syntax::{HighlightMap, languages};
 
-    /// Каждый capture каждого языка находит область темы — свою или более
-    /// общую по откату через точки. `none` (служебный в markdown) — не красим.
+    /// Every capture of every language resolves to a theme scope: its own or a more general one, by
+    /// falling back along the dots. `none` (an internal one in markdown) is left uncolored.
     #[test]
     fn dark_theme_covers_every_capture() {
         let theme = Theme::flux_night();

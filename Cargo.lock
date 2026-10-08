@@ -1704,6 +1704,8 @@ name = "flux-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core-foundation 0.10.0",
+ "core-foundation-sys",
  "flux-core",
  "flux-fs",
  "flux-search",

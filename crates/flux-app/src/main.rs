@@ -8,6 +8,7 @@ mod file_tree;
 mod find_bar;
 mod go_to_line;
 mod highlighter;
+mod i18n;
 mod icons;
 mod input;
 mod launchpad;
@@ -34,8 +35,9 @@ use theme::Theme;
 use workspace::Workspace;
 
 fn main() {
-    // `flux [пути...]`: каталог среди аргументов — корень проекта, файлы — во вкладки. Пути
-    // абсолютные: по ним сравниваются вкладки и различаются одноимённые файлы.
+    // `flux [paths...]`: a directory among the arguments is the project root; files go into tabs.
+    // Paths are absolute: tabs are compared by path, and files with the same name are told apart by
+    // path.
     let args: Vec<PathBuf> = std::env::args_os()
         .skip(1)
         .map(PathBuf::from)
@@ -43,6 +45,7 @@ fn main() {
         .collect();
     let (dirs, paths): (Vec<_>, Vec<_>) = args.into_iter().partition(|path| path.is_dir());
     let root = project_root(dirs);
+    i18n::init();
 
     Application::new()
         .with_assets(icons::Assets)
@@ -62,12 +65,13 @@ fn main() {
             project_search::init(cx);
 
             let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
-            // Своя шапка на стеклянной рамке: системный заголовок прозрачен, светофор — по
-            // центру шапки, за окном — размытый рабочий стол.
+            // A custom title bar on a glass window frame: the system title bar is transparent, the
+            // traffic lights are centered in the title bar, and the desktop behind the window is
+            // blurred.
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("flux".into()),
+                    title: Some("Flux".into()),
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(16.), px(13.))),
                 }),
@@ -95,9 +99,9 @@ fn main() {
         });
 }
 
-/// Корень проекта: каталог из аргументов; без него — ближайший предок текущего каталога
-/// с репозиторием (`.git` и т.п.), иначе сам текущий каталог. Запуск не из терминала
-/// (текущий каталог — `/`) — без проекта.
+/// Project root: the directory from the arguments; without one, the nearest ancestor of the current
+/// directory that contains a repository (`.git`, etc.), otherwise the current directory itself. If
+/// not launched from a terminal (the current directory is `/`), there is no project.
 fn project_root(dirs: Vec<PathBuf>) -> Option<PathBuf> {
     let mut dirs = dirs.into_iter();
     let root = match dirs.next() {

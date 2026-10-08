@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Генератор значков flux: 16×16, однотонные (цвет даёт gpui). UI-глифы — обводка 1.5,
-круглые концы и стыки; типы файлов — узнаваемые глифы (заливка или обводка).
+"""flux icon generator: 16×16, single-colour (gpui supplies the colour). UI glyphs use a 1.5
+stroke with round caps and joins; file types are recognisable glyphs (filled or stroked).
 
-Источник набора: значки правятся здесь, затем
+Source of the icon set: edit icons here, then
     python3 scripts/gen-icons.py crates/flux-app/assets/icons
-Новый значок — ещё и вариант в `icons!` (`crates/flux-app/src/icons.rs`). Посмотреть набор
-целиком — `swift scripts/icon-sheet.swift crates/flux-app/assets/icons sheet.png [фильтр]`
-(лист значков: 64 px и 16/32 px, как в дереве). Правила — вики, «Iconography»."""
+A new icon also needs a variant in `icons!` (`crates/flux-app/src/icons.rs`). To see the whole
+set: `swift scripts/icon-sheet.swift crates/flux-app/assets/icons sheet.png [filter]`
+(64 px plus 16/32 px as in the tree). Rules: the wiki note "Iconography"."""
 import sys, os
 
 OUT = sys.argv[1]
@@ -14,11 +14,12 @@ S = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" str
 F = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#000">'
 B = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
 
-# Контур документа со сгибом: общий для file, file-code, file-text, file-plus, find-in-files.
+# Document outline with a folded corner: shared by file, file-code, file-text, file-plus,
+# find-in-files.
 DOC = '<path d="M9.25 1.75H4.75a1.5 1.5 0 0 0-1.5 1.5v9.5a1.5 1.5 0 0 0 1.5 1.5h6.5a1.5 1.5 0 0 0 1.5-1.5V5.25z"/><path d="M9.25 1.75v2.5a1 1 0 0 0 1 1h2.5"/>'
 
 def knockout(shape, cut, sw="1.4"):
-    """Залитая фигура с вырезанными обводкой буквами/знаками (маска)."""
+    """A filled shape with letters or signs cut out by a stroke (mask)."""
     return (B + '<defs><mask id="k" maskUnits="userSpaceOnUse" x="0" y="0" width="16" height="16">'
             '<rect width="16" height="16" fill="#fff"/>'
             f'<g fill="none" stroke="#000" stroke-width="{sw}" stroke-linecap="round" stroke-linejoin="round">{cut}</g>'
@@ -26,9 +27,9 @@ def knockout(shape, cut, sw="1.4"):
 
 
 def spark_silhouette():
-    """Логотип flux одним цветом: шесть лучей-лент разной длины со скруглёнными концами и
-    точка в центре — та же геометрия, что у цветного логотипа (`scripts/gen-logo.py`,
-    таблица `RAYS`; менять вместе), масштаб 100 → 16."""
+    """The flux logo in one colour: six ribbon rays of different lengths with rounded tips and a
+    dot in the middle — the same geometry as the colour logo (`scripts/gen-logo.py`, table `RAYS`;
+    change them together), scaled 100 → 16."""
     import math
     k = 0.16
     spec = [(-96, 45), (-37, 35), (14, 42), (70, 33), (122, 44), (178, 36)]
@@ -44,7 +45,7 @@ def spark_silhouette():
     return "".join(out) + '<circle cx="8" cy="8" r="1.3"/>'
 
 ICONS = {
-  # ---------- Интерфейс ----------
+  # ---------- Interface ----------
   "arrow-down": (S, '<path d="M8 2.75v10.5M3.75 9 8 13.25 12.25 9"/>'),
   "arrow-up": (S, '<path d="M8 13.25V2.75M3.75 7 8 2.75 12.25 7"/>'),
   "chevron-down": (S, '<path d="M4 6l4 4 4-4"/>'),
@@ -74,15 +75,15 @@ ICONS = {
   "sparkle": (F, '<path d="M7 1.5c.42 3.15 1.35 4.08 4.5 4.5C8.35 6.42 7.42 7.35 7 10.5 6.58 7.35 5.65 6.42 2.5 6 5.65 5.58 6.58 4.65 7 1.5zM12 9c.24 1.75.75 2.26 2.5 2.5-1.75.24-2.26.75-2.5 2.5-.24-1.75-.75-2.26-2.5-2.5 1.75-.24 2.26-.75 2.5-2.5z"/>'),
   "settings": (S, '<path d="M6.85 1.75h2.3l.35 1.8 1.35.78 1.73-.6 1.15 2-1.38 1.2v1.54l1.38 1.2-1.15 2-1.73-.6-1.35.78-.35 1.8h-2.3l-.35-1.8-1.35-.78-1.73.6-1.15-2 1.38-1.2V6.73l-1.38-1.2 1.15-2 1.73.6 1.35-.78z"/><circle cx="8" cy="8" r="2"/>'),
   "terminal": (S, '<rect x="1.75" y="2.75" width="12.5" height="10.5" rx="2"/><path d="M4.75 6.25 6.75 8l-2 1.75M8.5 10h2.75"/>'),
-  # Знак flux: поток — три линии, сходящиеся в стебель «f».
+  # The flux mark: a flow of three lines converging into the stem of an "f".
   "logo": (F, spark_silhouette()),
   "folder": (F, '<path d="M1.25 4.25c0-1.1.9-2 2-2h2.55c.53 0 1.04.21 1.41.59l.99.99c.14.14.33.22.53.22h4.02c1.1 0 2 .9 2 2v6.2c0 1.1-.9 2-2 2H3.25c-1.1 0-2-.9-2-2z"/>'),
   "folder-open": (F, '<path d="M1.25 4.25c0-1.1.9-2 2-2h2.55c.53 0 1.04.21 1.41.59l.99.99c.14.14.33.22.53.22h3.52c1.1 0 2 .9 2 2v.45H5.4c-.86 0-1.62.55-1.9 1.36l-1.73 5.1A2 2 0 0 1 1.25 12z"/><path d="M4.45 8.15c.14-.4.52-.65.94-.65h9.12c.68 0 1.16.67.95 1.32l-1.3 3.95c-.27.83-1.04 1.38-1.9 1.38H2.98c-.34 0-.58-.34-.47-.66z"/>'),
 
-  # ---------- Типы файлов ----------
+  # ---------- File types ----------
   "file-code": (S, DOC + '<path d="M6.75 8.25 5.25 9.75l1.5 1.5M9.25 8.25l1.5 1.5-1.5 1.5"/>'),
   "file-text": (S, DOC + '<path d="M5.75 8.25h4.5M5.75 10.75h3"/>'),
-  # Rust: шестерёнка с вырезанной «R».
+  # Rust: a gear with a cut-out "R".
   "file-rust": ("raw", knockout(
       '<path d="M7.1 1.1h1.8l.33 1.53 1.13.47 1.32-.86 1.27 1.27-.86 1.32.47 1.13 1.54.33v1.8l-1.54.33-.47 1.13.86 1.32-1.27 1.27-1.32-.86-1.13.47-.33 1.53H7.1l-.33-1.53-1.13-.47-1.32.86-1.27-1.27.86-1.32-.47-1.13L1.1 8.9V7.1l1.54-.33.47-1.13-.86-1.32 1.27-1.27 1.32.86 1.13-.47z"/>',
       '<path d="M6.1 11V5.1h2.4a1.6 1.6 0 0 1 0 3.2H6.1M8.3 8.3 10.1 11"/>', "1.45")),

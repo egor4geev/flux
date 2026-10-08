@@ -1,6 +1,5 @@
-//! Образцы кода для каждого языка — без синтаксических ошибок, с кириллицей,
-//! эмодзи и строками CRLF. В исходниках `⏎` в конце строки означает `\r\n`,
-//! `⇥` — табуляцию.
+//! Code samples for each language: free of syntax errors, with Cyrillic, emoji, and CRLF lines. In
+//! the sources, `⏎` at the end of a line stands for `\r\n`, and `⇥` for a tab.
 
 const RUST: &str = r##"//! Модуль 🦀⏎
 use std::collections::HashMap;
@@ -228,7 +227,7 @@ pub fn sample(language: &str) -> String {
     raw.replace("⏎\n", "\r\n").replace('⇥', "\t")
 }
 
-/// Вставки, осмысленные для языка: ключевые слова, конструкции, отступы.
+/// Insertions that make sense for the language: keywords, constructs, indentation.
 pub fn snippets(language: &str) -> &'static [&'static str] {
     match language {
         "rust" => &[

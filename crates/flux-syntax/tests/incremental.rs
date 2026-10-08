@@ -1,5 +1,5 @@
-//! Инкрементальный разбор: после правок дерево совпадает со свежим разбором
-//! нового текста, а точки всех узлов — с байтами по правилам tree-sitter.
+//! Incremental parsing: after edits, the tree matches a fresh parse of the new text, and the points
+//! of all nodes match the bytes according to tree-sitter's rules.
 
 mod common;
 
@@ -10,14 +10,14 @@ use common::{NaiveTree, Rng, check_points, dump, fresh_tree, parse_now, random_c
 use flux_core::{ChangeSet, Rope};
 use flux_syntax::{Syntax, language_by_name};
 
-/// Итог случайных правок для одного языка.
+/// The outcome of random edits for one language.
 #[derive(Debug, Default)]
 struct Stats {
-    /// Разборов после правок.
+    /// Number of parses after edits.
     parses: usize,
-    /// Из них свежий разбор без ошибок: деревья обязаны совпасть целиком.
+    /// Of these, those where the fresh parse has no errors: the trees must match completely.
     clean: usize,
-    /// Из них с ошибками, где восстановление после ошибки разошлось со свежим.
+    /// Of these, those with errors where error recovery diverged from the fresh parse.
     error_recovery_diffs: usize,
 }
 
@@ -29,8 +29,8 @@ impl Stats {
     }
 }
 
-/// Документ под правками сразу в двух видах: через [`Syntax`] и через
-/// наивный эталон [`NaiveTree`].
+/// The document under edits in two forms at once: through [`Syntax`] and through the naive
+/// reference [`NaiveTree`].
 struct Session {
     language_name: &'static str,
     seed: u64,
@@ -64,13 +64,12 @@ impl Session {
         changes.apply(&mut self.text);
     }
 
-    /// Разбор и проверки:
-    /// - дерево совпадает с эталоном с наивными координатами — всегда;
-    /// - точки всех узлов точны — всегда;
-    /// - дерево совпадает со свежим разбором, если в тексте нет ошибок. С
-    ///   ошибками tree-sitter вправе восстановиться иначе, чем при разборе
-    ///   с нуля: его собственные тесты такие деревья сравнивают только на
-    ///   согласованность, поэтому здесь расхождения только считаются.
+    /// Parsing and checks:
+    /// - the tree matches the reference with naive coordinates: always;
+    /// - the points of all nodes are exact: always;
+    /// - the tree matches a fresh parse if the text has no errors. With errors, tree-sitter is
+    ///   entitled to recover differently than when parsing from scratch: its own tests compare such
+    ///   trees only for consistency, so here the divergences are only counted.
     fn parse_and_check(&mut self, what: &str) {
         parse_now(&mut self.syntax, &self.text);
         let string = self.text.to_string();
@@ -102,9 +101,9 @@ impl Session {
     }
 }
 
-/// Раунды случайных правок: несколько правок с разбором после каждой (иногда
-/// пачкой без разбора), затем отмена всех правок по одной через
-/// [`ChangeSet::invert`] — в конце раунда текст снова исходный и без ошибок.
+/// Rounds of random edits: several edits with a parse after each one (sometimes in a batch without
+/// a parse), then all the edits are undone one by one via [`ChangeSet::invert`]: at the end of the
+/// round the text is the original again and has no errors.
 fn random_edits(language_name: &'static str, seed: u64, rounds: usize) -> Stats {
     let mut session = Session::new(language_name, seed);
     let mut rng = Rng::new(seed);
@@ -163,7 +162,7 @@ fn every_language_incremental_matches_fresh_parse() {
     eprintln!("all: {total:?}");
 }
 
-/// Сплошь «чужие» переводы строк: `\r`, U+2028, FF — медленный путь точек.
+/// Nothing but "foreign" line breaks: `\r`, U+2028, FF; the slow path for points.
 #[test]
 fn foreign_line_breaks_keep_points_exact() {
     let language = language_by_name("rust").unwrap();
@@ -194,11 +193,10 @@ fn foreign_line_breaks_keep_points_exact() {
     }
 }
 
-/// Правки, пришедшие во время разбора, доигрываются на его результате.
-/// Эталон повторяет ту же последовательность разборов с наивными координатами,
-/// так что деревья обязаны совпасть всегда, даже с синтаксическими ошибками.
-/// Вторая работа идёт, пока все правки отменяются: в конце текст снова
-/// исходный, без ошибок, и дерево сравнивается со свежим разбором.
+/// Edits that arrive during a parse are replayed on top of its result. The reference repeats the
+/// same sequence of parses with naive coordinates, so the trees must always match, even with syntax
+/// errors. The second job runs while all the edits are being undone: at the end the text is the
+/// original again, without errors, and the tree is compared with a fresh parse.
 #[test]
 fn edits_during_parse_are_replayed() {
     let language = language_by_name("rust").unwrap();
@@ -216,8 +214,8 @@ fn edits_during_parse_are_replayed() {
                 naive.edit(&text.to_string(), changes);
                 changes.apply(text);
             };
-        // Нечётные сиды — с готовым деревом (правки считаются сразу), чётные —
-        // первый разбор (правки откладываются до числа строк из результата).
+        // Odd seeds start with a ready tree (edits are processed immediately); even seeds start
+        // with the first parse (edits are deferred until the line count from the result).
         if seed % 2 == 1 {
             parse_now(&mut syntax, &text);
             let changes = random_changes(&mut rng, &text, snippets("rust"));
@@ -244,7 +242,7 @@ fn edits_during_parse_are_replayed() {
         );
         check_points(syntax.tree().unwrap(), &text.to_string()).unwrap();
 
-        // Вторая работа; пока она идёт, все правки отменяются.
+        // The second job; while it runs, all the edits are undone.
         let job = syntax.parse_job(&text).unwrap();
         naive.reparse(&text.to_string());
         while let Some(changes) = undo.pop() {
@@ -307,7 +305,7 @@ fn abandoned_job_is_replaced() {
         dump(&fresh_tree(syntax.language(), &text))
     );
 
-    // Брошенный результат — то же самое.
+    // A dropped result: the same thing.
     let changes = ChangeSet::from_changes(text.len_chars(), [(0, 2, None)]);
     syntax.edit(&text, &changes);
     changes.apply(&mut text);
@@ -329,7 +327,7 @@ fn foreign_and_stale_results_are_rejected() {
     assert!(!a.finish(job_b.run()), "result of another Syntax");
     assert!(a.tree().is_none());
 
-    // После reset результат старой работы устарел.
+    // After a reset, the result of the old job is stale.
     a.reset();
     assert!(!a.finish(job_a.run()));
     assert!(a.tree().is_none());
@@ -356,7 +354,7 @@ fn mismatched_edit_resets_instead_of_panicking() {
     );
 }
 
-/// Большой текст: тысячи функций.
+/// A large text: thousands of functions.
 fn big_rust() -> Rope {
     let mut source = String::new();
     for i in 0..3000 {
@@ -379,13 +377,13 @@ fn tiny_budget_on_big_text_yields_job_that_can_finish() {
     };
     assert!(syntax.is_parsing());
 
-    // Пока работа отложена, документ правят дальше.
+    // While the job is deferred, the document keeps being edited.
     let changes =
         ChangeSet::from_changes(text.len_chars(), [(0, 0, Some("fn новая() {}\n".into()))]);
     syntax.edit(&text, &changes);
     changes.apply(&mut text);
 
-    // Довести до конца маленькими порциями: каждая продолжает предыдущую.
+    // Run it to completion in small slices: each one continues the previous one.
     let mut job = job;
     let mut slices = 0;
     let result = loop {
@@ -413,13 +411,13 @@ fn small_edit_reparses_within_budget() {
     let mut text = big_rust();
     let mut syntax = Syntax::new(language);
     parse_now(&mut syntax, &text);
-    // Перевод строки между функциями: текст остаётся без ошибок.
+    // A newline between functions: the text stays error-free.
     let at = text.line_to_char(text.len_lines() / 2 / 6 * 6);
     let changes = ChangeSet::from_changes(text.len_chars(), [(at, at, Some("\n".into()))]);
     syntax.edit(&text, &changes);
     changes.apply(&mut text);
     let job = syntax.parse_job(&text).unwrap();
-    // В отладочной сборке C-код грамматик не оптимизирован: бюджет щедрый.
+    // In a debug build the C code of the grammars is not optimized, so the budget is generous.
     let result = job
         .run_with_budget(Duration::from_millis(500))
         .unwrap_or_else(|_| panic!("incremental reparse of one char should be fast"));

@@ -1,5 +1,5 @@
-//! Подсветка строк: области, колонки в символах, инварианты спанов,
-//! устойчивость к устаревшему дереву.
+//! Line highlighting: scopes, columns in characters, span invariants, robustness against a stale
+//! tree.
 
 mod common;
 
@@ -9,7 +9,7 @@ use flux_core::text::line_len;
 use flux_core::{ChangeSet, Rope};
 use flux_syntax::{Highlight, HighlightMap, HighlightSpan, Syntax, language_by_name, languages};
 
-/// Тема для тестов — объединение имён capture всех запросов, с откатами.
+/// The theme for the tests is the union of the capture names of all queries, with fallbacks.
 const SCOPES: &[&str] = &[
     "attribute",
     "boolean",
@@ -74,7 +74,7 @@ impl Doc {
             .highlight_lines(&self.text, 0..self.text.len_lines(), &self.map)
     }
 
-    /// Спаны строки как (начало, конец, область).
+    /// A line's spans as (start, end, scope).
     fn line(&self, line: usize) -> Vec<(usize, usize, &'static str)> {
         let spans = self
             .syntax
@@ -85,7 +85,7 @@ impl Doc {
             .collect()
     }
 
-    /// Область первого символа первого вхождения `needle`.
+    /// The scope of the first character of the first occurrence of `needle`.
     fn scope_of(&self, needle: &str) -> Option<&'static str> {
         let byte = self
             .text
@@ -102,7 +102,7 @@ impl Doc {
     }
 }
 
-/// Спаны отсортированы, не пересекаются, непусты и не выходят за содержимое строки.
+/// Spans are sorted, non-overlapping, non-empty, and do not extend beyond the line content.
 fn check_invariants(text: &Rope, first_line: usize, lines: &[Vec<HighlightSpan>]) {
     for (i, spans) in lines.iter().enumerate() {
         let line = first_line + i;
@@ -129,7 +129,7 @@ fn rust_keywords_strings_comments() {
         THEME,
     );
     assert_eq!(doc.line(0), vec![(0, 2, "keyword"), (3, 7, "function")]);
-    // Колонки — символы: кириллица и эмодзи из двух code point.
+    // Columns are characters: Cyrillic and an emoji made of two code points.
     assert_eq!(
         doc.line(1),
         vec![(4, 7, "keyword"), (12, 23, "string"), (25, 39, "comment")]
@@ -161,7 +161,7 @@ fn every_sample_is_highlighted_consistently() {
         let spans: usize = lines.iter().map(Vec::len).sum();
         assert!(spans > 10, "{}: only {spans} spans", language.name());
 
-        // Окно в середине совпадает с тем же участком полной подсветки.
+        // A window in the middle matches the same section of the full highlighting.
         let middle = 3..lines.len() - 2;
         let window = doc
             .syntax
@@ -224,8 +224,8 @@ fn no_highlight_before_first_parse() {
     assert_eq!(lines, vec![Vec::new(), Vec::new()]);
 }
 
-/// Дерево отредактировано, но не разобрано: подсветка не паникует и
-/// соблюдает инварианты, как бы ни разошлись дерево и текст.
+/// The tree is edited but not parsed: highlighting does not panic and upholds the invariants,
+/// however far the tree and the text diverge.
 #[test]
 fn stale_tree_never_panics() {
     for language in languages() {
@@ -234,7 +234,7 @@ fn stale_tree_never_panics() {
         let mut rng = Rng::new(11);
         for step in 0..60 {
             let changes = if step % 20 == 19 {
-                // Удалить почти всё: узлы дерева далеко за концом текста.
+                // Delete almost everything: the tree nodes are far past the end of the text.
                 ChangeSet::from_changes(doc.text.len_chars(), [(1, doc.text.len_chars(), None)])
             } else {
                 random_changes(&mut rng, &doc.text, snippets(name))
@@ -249,12 +249,11 @@ fn stale_tree_never_panics() {
     }
 }
 
-/// Устаревшее дерево с узлами, смещения которых попадают внутрь
-/// многобайтовых символов нового текста.
+/// A stale tree with nodes whose offsets fall inside multi-byte characters of the new text.
 #[test]
 fn stale_offsets_inside_multibyte_chars() {
     let mut doc = Doc::new("rust", "let s = \"абвгд\"; // эюя\n", SCOPES);
-    // Подменяем текст без правки дерева: смещения теперь режут символы.
+    // We swap out the text without editing the tree: the offsets now cut through characters.
     doc.text = Rope::from_str("ы👍🏽ы👍🏽ы👍🏽ы👍🏽ы👍🏽ы👍🏽\n");
     check_invariants(&doc.text, 0, &doc.lines());
     doc.text = Rope::from_str("ы");
@@ -279,9 +278,8 @@ fn highlight_map_falls_back_by_dots() {
     assert_eq!(doc.scope_of("("), None, "punctuation is not in the theme");
 }
 
-/// Для одного и того же узла побеждает поздний паттерн — так работает
-/// tree-sitter-highlight ≥ 0.21, и под это написан запрос JavaScript:
-/// `(identifier) @variable` стоит в нём первым.
+/// For one and the same node the later pattern wins; this is how tree-sitter-highlight ≥ 0.21
+/// works, and the JavaScript query is written for it: `(identifier) @variable` comes first in it.
 #[test]
 fn javascript_later_pattern_wins() {
     let doc = Doc::new(
@@ -299,8 +297,8 @@ fn javascript_later_pattern_wins() {
     assert_eq!(doc.scope_of("var"), Some("keyword"));
 }
 
-/// Capture без области в теме не участвует в разрешении перекрытий и не
-/// заслоняет другие capture того же узла.
+/// A capture with no scope in the theme takes no part in overlap resolution and does not shadow
+/// other captures of the same node.
 #[test]
 fn unmapped_capture_does_not_hide_others() {
     const THEME: &[&str] = &["variable"];
@@ -308,7 +306,7 @@ fn unmapped_capture_does_not_hide_others() {
     assert_eq!(doc.scope_of("foo"), Some("variable"));
 }
 
-/// Запросы Go и JSON написаны под «побеждает ранний паттерн».
+/// The Go and JSON queries are written for "early pattern wins".
 #[test]
 fn go_and_json_earlier_pattern_wins() {
     let go = Doc::new(
@@ -329,7 +327,7 @@ fn go_and_json_earlier_pattern_wins() {
     assert_eq!(json.scope_of("true"), Some("constant.builtin"));
 }
 
-/// Запрос TypeScript дополняет JavaScript и должен его перекрывать.
+/// The TypeScript query extends JavaScript and must override it.
 #[test]
 fn typescript_extends_javascript() {
     let doc = Doc::new(
@@ -375,8 +373,8 @@ fn other_languages_basic_scopes() {
 
     let toml = Doc::new("toml", &sample("toml"), SCOPES);
     assert_eq!(toml.scope_of("dependencies"), Some("type"));
-    // `(pair (bare_key)) @property` идёт после `(bare_key) @type` и начинается
-    // там же, где ключ, — как в tree-sitter-highlight, ключ пары становится property.
+    // `(pair (bare_key)) @property` comes after `(bare_key) @type` and starts at the same place as
+    // the key, so, as in tree-sitter-highlight, the key of the pair becomes a property.
     assert_eq!(toml.scope_of("name = \"flux\""), Some("property"));
     assert_eq!(toml.scope_of("= \"flux\""), Some("operator"));
     assert_eq!(toml.scope_of("\"flux\""), Some("string"));

@@ -1,15 +1,16 @@
-//! Строка поиска и замены в активном документе (cmd-f, cmd-alt-f).
+//! The find and replace bar in the active document (cmd-f, cmd-alt-f).
 //!
-//! Одна на окно (её держит Workspace), работает с активной вкладкой. Ищет
-//! `flux_search::find_all` в фоне по снимку текста; найденное хранит и рисует редактор
-//! (`Editor::set_search_highlights`) — он же сдвигает вхождения своими правками, пока не придут
-//! свежие результаты. Строка помнит запрос, переключатели и итог последнего поиска.
+//! One per window (held by Workspace), works with the active tab. Searches with
+//! `flux_search::find_all` in the background over a snapshot of the text; the editor stores and
+//! draws the matches (`Editor::set_search_highlights`) and also shifts them with its own edits
+//! until fresh results arrive. The bar remembers the query, the toggles, and the outcome of the
+//! last search.
 //!
-//! Когда ищем и что выделяем ([`SearchMode`]):
-//! - запрос или переключатель изменился — поиск «по мере набора»: текущим становится первое
-//!   вхождение, которое кончается после начала выделения, и оно выделяется в редакторе;
-//! - документ изменился (пока строка открыта) или сменилась вкладка — выделение не трогаем;
-//! - после «заменить» — выделяется следующее вхождение от конца вставки.
+//! When we search and what we select ([`SearchMode`]):
+//! - the query or a toggle changed — search "as you type": the current match becomes the first
+//!   match that ends after the start of the selection, and it is selected in the editor;
+//! - the document changed (while the bar is open) or the tab changed — the selection is left alone;
+//! - after "replace" — the next match from the end of the inserted text is selected.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -22,14 +23,15 @@ use gpui::{
 };
 
 use crate::editor::{Editor, EditorEvent};
+use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::theme::{self, Theme};
 use crate::ui::{self, GAP, ICON_BUTTON_SIZE};
 
-/// Ширина полей запроса и замены.
+/// Width of the query and replace fields.
 const INPUT_WIDTH: f32 = 380.;
-/// Сообщение об ошибке в запросе — не шире этого.
+/// A query error message is no wider than this.
 const COUNTER_MAX_WIDTH: f32 = 320.;
 
 actions!(
@@ -57,7 +59,7 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-f", Deploy, workspace),
         KeyBinding::new("cmd-alt-f", DeployReplace, workspace),
-        // Как в JetBrains.
+        // As in JetBrains.
         KeyBinding::new("cmd-r", DeployReplace, workspace),
         KeyBinding::new("cmd-g", FindNext, workspace),
         KeyBinding::new("cmd-shift-g", FindPrevious, workspace),
@@ -74,7 +76,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("alt-cmd-w", ToggleWholeWord, bar),
         KeyBinding::new("alt-cmd-r", ToggleRegex, bar),
     ]);
-    // Поле замены вложено в строку: его контекст глубже, и Enter здесь — «заменить».
+    // The replace field is nested inside the bar: its context is deeper, and Enter here means
+    // "replace".
     let replace = Some("ReplaceField");
     cx.bind_keys([
         KeyBinding::new("enter", ReplaceNext, replace),
@@ -82,33 +85,33 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// Что делать с выделением, когда придут результаты поиска.
+/// What to do with the selection when the search results arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchMode {
-    /// Запрос или переключатель изменился: текущее — первое вхождение, которое кончается после
-    /// начала выделения (курсор внутри слова находит само слово); оно выделяется.
+    /// The query or a toggle changed: the current match is the first one that ends after the start
+    /// of the selection (a cursor inside a word finds the word itself); it gets selected.
     Incremental,
-    /// Документ изменился или сменилась вкладка: выделение не трогать; текущее — вхождение,
-    /// совпадающее с выделением.
+    /// The document or the tab changed: leave the selection alone; the current match is the one
+    /// that coincides with the selection.
     KeepSelection,
-    /// Cmd+G при закрытой строке: найти и перейти к следующему (`backward` — предыдущему).
+    /// Cmd+G with the bar closed: find and go to the next match (`backward`: the previous one).
     Step { backward: bool },
-    /// После «заменить»: выделить первое вхождение, которое начинается с этой позиции.
+    /// After "replace": select the first match that starts at or after this position.
     SelectFrom(usize),
 }
 
-/// Итог последнего поиска — для счётчика.
+/// The outcome of the last search, for the counter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Status {
-    /// Запрос пуст (или поиск в новой вкладке ещё не закончился).
+    /// The query is empty (or the search in a new tab hasn't finished yet).
     Idle,
-    /// Вхождения и текущее — в редакторе; `truncated` — найдены не все.
+    /// The matches and the current one are in the editor; `truncated` means not all were found.
     Found { truncated: bool },
-    /// Запрос не собрался (ошибка в регулярном выражении).
+    /// The query could not be built (error in the regular expression).
     Error(SharedString),
 }
 
-/// Строка поиска окна: одна на Workspace, работает с активной вкладкой.
+/// The window's find bar: one per Workspace, works with the active tab.
 pub struct FindBar {
     open: bool,
     replace_open: bool,
@@ -120,25 +123,30 @@ pub struct FindBar {
     editor: Option<WeakEntity<Editor>>,
     editor_subscription: Option<Subscription>,
     status: Status,
-    /// Запрос последнего запущенного поиска: повторный Changed с тем же текстом не ищет снова.
+    /// The query of the last search that was started: a repeated Changed with the same text doesn't
+    /// search again.
     searched: Option<SearchQuery>,
-    /// Номер последнего поиска: результаты прежних отбрасываются.
+    /// The number of the last search: results of earlier ones are discarded.
     generation: u64,
     cancel: Arc<AtomicBool>,
     search_task: Option<Task<()>>,
     replace_task: Option<Task<()>>,
-    /// Правок активного документа с тех пор, как он стал активным: «заменить всё» применяется,
-    /// только если за время фонового расчёта их не прибавилось.
+    /// The count of edits to the active document since it became active: "replace all" is applied
+    /// only if that count didn't grow during the background computation.
     edits: u64,
-    /// После «заменить»: от какой позиции выделить вхождение, когда придут свежие результаты.
+    /// After "replace": the position from which to select a match when fresh results arrive.
     select_from: Option<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl FindBar {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| TextInput::new("Find", cx).code().icon(IconName::Search));
-        let replacement = cx.new(|cx| TextInput::new("Replace", cx).code().icon(IconName::Replace));
+        let query = cx.new(|cx| TextInput::new(tr("Find"), cx).code().icon(IconName::Search));
+        let replacement = cx.new(|cx| {
+            TextInput::new(tr("Replace"), cx)
+                .code()
+                .icon(IconName::Replace)
+        });
         let subscriptions = vec![cx.subscribe_in(
             &query,
             window,
@@ -176,9 +184,9 @@ impl FindBar {
         self.open
     }
 
-    /// Открыть строку поиска (с заменой — `replace`) для `editor` и перевести в неё фокус.
-    /// Запрос берётся из выделения или слова под курсором; если фокус уже в строке — только
-    /// выделяется текст поля.
+    /// Opens the find bar (with replacement when `replace`) for `editor` and moves focus into it.
+    /// The query is taken from the selection or the word under the cursor; if focus is already in
+    /// the bar, only the field text is selected.
     pub fn deploy(
         &mut self,
         replace: bool,
@@ -202,7 +210,7 @@ impl FindBar {
         let seed = (!focused_here).then(|| self.seed(&editor, cx)).flatten();
         let current = self.query.read(cx).text();
         match seed {
-            // Changed запустит поиск по мере набора.
+            // Changed will start the as-you-type search.
             Some(seed) if seed != current => {
                 self.query.update(cx, |query, cx| query.set_text(&seed, cx));
             }
@@ -220,8 +228,8 @@ impl FindBar {
         cx.notify();
     }
 
-    /// Следующее (`backward` — предыдущее) вхождение в активном документе — cmd-g. При закрытой
-    /// строке открывает её, не трогая фокус; пустой запрос берётся из выделения.
+    /// The next (`backward`: previous) match in the active document, cmd-g. With the bar closed,
+    /// opens it without touching focus; an empty query is taken from the selection.
     pub fn select_next(&mut self, backward: bool, _: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.editor() else {
             return;
@@ -233,7 +241,7 @@ impl FindBar {
             let Some(seed) = self.seed(&editor, cx) else {
                 return;
             };
-            // Changed с этим текстом поиск не повторит: `searched` уже будет он.
+            // Changed with this text won't repeat the search: `searched` will already be it.
             self.query.update(cx, |query, cx| query.set_text(&seed, cx));
         }
         self.open = true;
@@ -241,7 +249,7 @@ impl FindBar {
         cx.notify();
     }
 
-    /// Сменилась активная вкладка или вкладок не осталось.
+    /// The active tab changed, or no tabs are left.
     pub fn set_active_editor(
         &mut self,
         editor: Option<Entity<Editor>>,
@@ -272,8 +280,8 @@ impl FindBar {
         self.editor.as_ref()?.upgrade()
     }
 
-    /// Запрос из выделения или слова под курсором; в режиме regex — экранированный, чтобы
-    /// искался буквально.
+    /// The query from the selection or the word under the cursor; in regex mode it is escaped so
+    /// that it is searched literally.
     fn seed(&self, editor: &Entity<Editor>, cx: &App) -> Option<String> {
         let seed = editor.read(cx).search_seed()?;
         Some(if self.regex {
@@ -292,7 +300,7 @@ impl FindBar {
         }
     }
 
-    /// Фокус в одном из полей строки.
+    /// Focus is in one of the bar's fields.
     fn contains_focus(&self, window: &Window, cx: &App) -> bool {
         self.query.focus_handle(cx).is_focused(window)
             || self.replacement.focus_handle(cx).is_focused(window)
@@ -319,9 +327,10 @@ impl FindBar {
         }
     }
 
-    // --- Поиск ---
+    // --- Search ---
 
-    /// Ищет запрос в активном документе в фоне; прошлый поиск отменяется.
+    /// Searches for the query in the active document in the background; the previous search is
+    /// canceled.
     fn search(&mut self, mode: SearchMode, cx: &mut Context<Self>) {
         self.cancel.store(true, Ordering::Relaxed);
         self.search_task = None;
@@ -400,7 +409,7 @@ impl FindBar {
         self.select_from = None;
     }
 
-    /// Следующее или предыдущее вхождение от выделения (по уже найденному).
+    /// The next or previous match from the selection (based on the matches already found).
     fn step(&mut self, backward: bool, cx: &mut Context<Self>) {
         let Some(editor) = self.editor() else {
             return;
@@ -419,7 +428,7 @@ impl FindBar {
         cx.notify();
     }
 
-    /// Alt+Enter: все вхождения — выделениями (мультикурсор), фокус в редактор.
+    /// Alt+Enter: all matches become selections (multi-cursor), focus goes to the editor.
     fn select_all_matches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.editor() else {
             return;
@@ -435,10 +444,10 @@ impl FindBar {
         window.focus(&editor.read(cx).focus_handle);
     }
 
-    // --- Замена ---
+    // --- Replace ---
 
-    /// Заменяет текущее вхождение, если выделено ровно оно, и переходит к следующему; иначе —
-    /// просто к следующему.
+    /// Replaces the current match if exactly that one is selected, then moves to the next;
+    /// otherwise just moves to the next.
     fn replace_next(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = self.editor() else {
             return;
@@ -464,7 +473,7 @@ impl FindBar {
         };
         match edit {
             Some((range, text)) => {
-                // Следующее вхождение выделится, когда пересчёт после правки закончится.
+                // The next match gets selected once the recalculation after the edit finishes.
                 self.select_from = Some(range.start + text.chars().count());
                 editor.update(cx, |editor, cx| {
                     editor.replace_ranges(vec![(range, text)], cx)
@@ -474,8 +483,8 @@ impl FindBar {
         }
     }
 
-    /// Заменяет все вхождения одной правкой (один шаг undo). Считается в фоне; если документ
-    /// за это время изменился или сменилась вкладка — ничего не делает.
+    /// Replaces all matches in a single edit (one undo step). Computed in the background; if the
+    /// document changed in the meantime or the tab changed, does nothing.
     fn replace_all(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = self.editor() else {
             return;
@@ -519,10 +528,10 @@ impl FindBar {
         }));
     }
 
-    // --- Строка ---
+    // --- Bar ---
 
-    /// Escape (в строке или в редакторе), ×: убрать подсветку и вернуть фокус в редактор
-    /// (выделение остаётся на последнем текущем вхождении).
+    /// Escape (in the bar or in the editor), ×: removes the highlighting and returns focus to the
+    /// editor (the selection stays on the last current match).
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
         self.cancel_search();
@@ -541,7 +550,7 @@ impl FindBar {
         cx.notify();
     }
 
-    /// Tab: между полями запроса и замены (если замена открыта).
+    /// Tab: switches between the query and replace fields (if replace is open).
     fn focus_next_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.replace_open {
             return;
@@ -562,7 +571,7 @@ impl FindBar {
         cx.notify();
     }
 
-    /// Что показать за переключателями: счётчик вхождений или ошибку в запросе.
+    /// What to show after the toggles: the match counter or a query error.
     fn counter(&self, cx: &App) -> Counter {
         match &self.status {
             Status::Idle => Counter::None,
@@ -583,19 +592,20 @@ impl FindBar {
     }
 }
 
-/// Правая часть строки поиска после переключателей.
+/// The right part of the find bar, after the toggles.
 enum Counter {
     None,
     /// «3 of 12», «12 results».
     Found(SharedString),
-    /// «No results» или ошибка в регулярном выражении.
+    /// "No results" or a regular expression error.
     Error(SharedString),
 }
 
 impl Render for FindBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        // Подсказки — с сочетаниями так, будто фокус в поле: они верны и когда фокус в тексте.
+        // Tooltips show shortcuts as if focus were in the field: they are correct when focus is in
+        // the text, too.
         let query_focus = self.query.focus_handle(cx);
         let replace_focus = self.replacement.focus_handle(cx);
         let tip = |label: &'static str, action: &dyn Action, focus: &FocusHandle| {
@@ -626,7 +636,7 @@ impl Render for FindBar {
         let find_row = row()
             .child(
                 ui::icon_button("toggle-replace", chevron, ui)
-                    .tooltip(tip("Toggle Replace", &DeployReplace, &query_focus))
+                    .tooltip(tip(tr("Toggle Replace"), &DeployReplace, &query_focus))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.toggle_replace(window, cx)
                     })),
@@ -639,21 +649,21 @@ impl Render for FindBar {
             )
             .child(
                 ui::toggle_button("case", IconName::CaseSensitive, self.case_sensitive, ui)
-                    .tooltip(tip("Match Case", &ToggleCaseSensitive, &query_focus))
+                    .tooltip(tip(tr("Match Case"), &ToggleCaseSensitive, &query_focus))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.toggle_option(|this| &mut this.case_sensitive, cx)
                     })),
             )
             .child(
                 ui::toggle_button("word", IconName::WholeWord, self.whole_word, ui)
-                    .tooltip(tip("Whole Word", &ToggleWholeWord, &query_focus))
+                    .tooltip(tip(tr("Whole Word"), &ToggleWholeWord, &query_focus))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.toggle_option(|this| &mut this.whole_word, cx)
                     })),
             )
             .child(
                 ui::toggle_button("regex", IconName::Regex, self.regex, ui)
-                    .tooltip(tip("Regular Expression", &ToggleRegex, &query_focus))
+                    .tooltip(tip(tr("Regular Expression"), &ToggleRegex, &query_focus))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.toggle_option(|this| &mut this.regex, cx)
                     })),
@@ -662,25 +672,29 @@ impl Render for FindBar {
             .children(counter)
             .child(
                 ui::icon_button("previous", IconName::ArrowUp, ui)
-                    .tooltip(tip("Previous Match", &SelectPreviousMatch, &query_focus))
+                    .tooltip(tip(
+                        tr("Previous Match"),
+                        &SelectPreviousMatch,
+                        &query_focus,
+                    ))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.step(true, cx))),
             )
             .child(
                 ui::icon_button("next", IconName::ArrowDown, ui)
-                    .tooltip(tip("Next Match", &SelectNextMatch, &query_focus))
+                    .tooltip(tip(tr("Next Match"), &SelectNextMatch, &query_focus))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.step(false, cx))),
             )
             .child(div().flex_1())
             .child(
                 ui::icon_button("close", IconName::Close, ui)
-                    .tooltip(tip("Close", &Dismiss, &query_focus))
+                    .tooltip(tip(tr("Close"), &Dismiss, &query_focus))
                     .on_click(
                         cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx)),
                     ),
             );
         let replace_row = self.replace_open.then(|| {
             row()
-                // Под шевроном — пусто: поля стоят друг под другом.
+                // Nothing under the chevron: the fields are stacked one under the other.
                 .child(div().flex_none().w(px(ICON_BUTTON_SIZE)))
                 .child(
                     div()
@@ -691,12 +705,12 @@ impl Render for FindBar {
                 )
                 .child(
                     ui::icon_button("replace", IconName::Replace, ui)
-                        .tooltip(tip("Replace", &ReplaceNext, &replace_focus))
+                        .tooltip(tip(tr("Replace"), &ReplaceNext, &replace_focus))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.replace_next(cx))),
                 )
                 .child(
                     ui::icon_button("replace-all", IconName::ReplaceAll, ui)
-                        .tooltip(tip("Replace All", &ReplaceAll, &replace_focus))
+                        .tooltip(tip(tr("Replace All"), &ReplaceAll, &replace_focus))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.replace_all(cx))),
                 )
         });
@@ -737,7 +751,8 @@ impl Render for FindBar {
             .on_action(cx.listener(|this, _: &ReplaceAll, _, cx| this.replace_all(cx)))
             .child(find_row)
             .children(replace_row)
-            // Разделитель под строкой — от края до края острова, с отступом от скруглений.
+            // The divider under the bar runs from edge to edge of the island, inset from the
+            // rounded corners.
             .child(
                 div()
                     .absolute()
@@ -750,20 +765,20 @@ impl Render for FindBar {
     }
 }
 
-// --- Выбор вхождения: вхождения — по возрастанию, без пересечений ---
+// --- Choosing a match: matches are in ascending order, non-overlapping ---
 
-/// Первое вхождение, которое кончается после `pos` (содержит `pos` или правее); дальше
-/// конца — первое (по кругу).
+/// The first match that ends after `pos` (contains `pos` or lies to the right of it); past the end,
+/// the first one (wrapping around).
 fn match_around(matches: &[Range<usize>], pos: usize) -> Option<usize> {
     wrap_forward(matches, matches.partition_point(|m| m.end <= pos))
 }
 
-/// Первое вхождение, которое начинается в `pos` или правее; по кругу.
+/// The first match that starts at `pos` or to the right of it; wraps around.
 fn next_match(matches: &[Range<usize>], pos: usize) -> Option<usize> {
     wrap_forward(matches, matches.partition_point(|m| m.start < pos))
 }
 
-/// Последнее вхождение, которое кончается в `pos` или левее; по кругу — последнее.
+/// The last match that ends at `pos` or to the left of it; wrapping around, the last one.
 fn previous_match(matches: &[Range<usize>], pos: usize) -> Option<usize> {
     if matches.is_empty() {
         return None;
@@ -782,8 +797,8 @@ fn wrap_forward(matches: &[Range<usize>], index: usize) -> Option<usize> {
     }
 }
 
-/// Следующее (`backward` — предыдущее) вхождение от выделения `from..to`: выделенное
-/// вхождение пропускается.
+/// The next (`backward`: previous) match from the selection `from..to`; the selected match itself
+/// is skipped.
 fn step_index(matches: &[Range<usize>], from: usize, to: usize, backward: bool) -> Option<usize> {
     if backward {
         previous_match(matches, from)
@@ -792,7 +807,7 @@ fn step_index(matches: &[Range<usize>], from: usize, to: usize, backward: bool) 
     }
 }
 
-/// Вхождение, совпадающее с выделением `from..to`.
+/// The match that coincides with the selection `from..to`.
 fn exact_match(matches: &[Range<usize>], from: usize, to: usize) -> Option<usize> {
     let index = matches.partition_point(|m| m.start < from);
     matches
@@ -801,7 +816,7 @@ fn exact_match(matches: &[Range<usize>], from: usize, to: usize) -> Option<usize
         .map(|_| index)
 }
 
-/// «3 of 17», «17 results», «No results»; найдены не все — «100000+».
+/// "3 of 17", "17 results", "No results"; if not all were found, "100000+".
 fn counter_label(count: usize, active: Option<usize>, truncated: bool) -> String {
     let total = if truncated {
         format!("{count}+")
@@ -809,21 +824,18 @@ fn counter_label(count: usize, active: Option<usize>, truncated: bool) -> String
         count.to_string()
     };
     match (count, active) {
-        (0, _) => "No results".into(),
-        (_, Some(index)) => format!("{} of {total}", index + 1),
-        (1, None) if !truncated => "1 result".into(),
-        (_, None) => format!("{total} results"),
+        (0, _) => tr("No results").into(),
+        (_, Some(index)) => trf("{0} of {1}", &[&(index + 1), &total]),
+        (_, None) if truncated => trn(count, "{n}+ result", "{n}+ results"),
+        (_, None) => trn(count, "{n} result", "{n} results"),
     }
 }
 
 fn replaced_label(count: usize) -> String {
-    match count {
-        1 => "Replaced 1 occurrence".into(),
-        _ => format!("Replaced {count} occurrences"),
-    }
+    trn(count, "Replaced {n} occurrence", "Replaced {n} occurrences")
 }
 
-/// Выделенный текст для запроса в режиме регулярного выражения ищется буквально.
+/// In regular expression mode, the selected text used as the query is searched literally.
 fn escape_regex(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for c in text.chars() {
@@ -839,36 +851,36 @@ fn escape_regex(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// «ab let cd let ef let»: вхождения let — 3..6, 10..13, 17..20.
+    /// "ab let cd let ef let": the matches of let are 3..6, 10..13, 17..20.
     const MATCHES: [Range<usize>; 3] = [3..6, 10..13, 17..20];
 
     #[test]
     fn incremental_search_finds_the_match_around_or_after_the_selection() {
         assert_eq!(match_around(&MATCHES, 0), Some(0));
-        // Курсор внутри слова и сразу перед ним — само слово.
+        // A cursor inside a word, or right before it, yields the word itself.
         assert_eq!(match_around(&MATCHES, 4), Some(0));
         assert_eq!(match_around(&MATCHES, 3), Some(0));
-        // Сразу за словом — следующее.
+        // Right after the word, the next one.
         assert_eq!(match_around(&MATCHES, 6), Some(1));
-        // За последним — по кругу первое.
+        // After the last one, wraps around to the first.
         assert_eq!(match_around(&MATCHES, 20), Some(0));
         assert_eq!(match_around(&[], 5), None);
     }
 
     #[test]
     fn next_and_previous_skip_the_selected_match_and_wrap() {
-        // Выделено второе вхождение.
+        // The second match is selected.
         assert_eq!(step_index(&MATCHES, 10, 13, false), Some(2));
         assert_eq!(step_index(&MATCHES, 10, 13, true), Some(0));
-        // С последнего — на первое и наоборот.
+        // From the last to the first and vice versa.
         assert_eq!(step_index(&MATCHES, 17, 20, false), Some(0));
         assert_eq!(step_index(&MATCHES, 3, 6, true), Some(2));
-        // Курсор между вхождениями.
+        // The cursor is between matches.
         assert_eq!(step_index(&MATCHES, 8, 8, false), Some(1));
         assert_eq!(step_index(&MATCHES, 8, 8, true), Some(0));
-        // Курсор в начале вхождения — оно и есть следующее.
+        // The cursor at the start of a match: that match is the next one.
         assert_eq!(step_index(&MATCHES, 10, 10, false), Some(1));
-        // Курсор внутри вхождения: назад — предыдущее, вперёд — следующее.
+        // The cursor inside a match: backward gives the previous match, forward the next.
         assert_eq!(step_index(&MATCHES, 11, 11, true), Some(0));
         assert_eq!(step_index(&MATCHES, 11, 11, false), Some(2));
         assert_eq!(step_index(&[], 0, 0, false), None);
@@ -885,9 +897,9 @@ mod tests {
 
     #[test]
     fn after_a_replacement_the_next_match_is_selected() {
-        // Заменили второе: вставка кончается на 12 — следующее начинается на 17.
+        // Replaced the second match: the insertion ends at 12, the next match starts at 17.
         assert_eq!(next_match(&MATCHES, 12), Some(2));
-        // Заменили последнее — по кругу первое.
+        // Replaced the last one: wraps around to the first.
         assert_eq!(next_match(&MATCHES, 25), Some(0));
     }
 

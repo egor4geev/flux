@@ -1,12 +1,11 @@
-//! Реестр языков: грамматика tree-sitter, запрос подсветки и определение
-//! языка по пути файла.
+//! Language registry: the tree-sitter grammar, the highlighting query, and language detection by
+//! file path.
 //!
-//! Грамматика и запрос создаются лениво и один раз (`OnceLock`): компиляция
-//! запроса стоит от долей миллисекунды до ~20 мс (Rust в release), а
-//! большинству языков за сеанс она не понадобится. [`Language`] живёт в
-//! статической таблице и `Sync`, поэтому `&'static Language` можно отдавать
-//! в фоновый поток — [`ParseJob::run`](crate::ParseJob::run) заодно компилирует
-//! там запрос, чтобы UI-поток за это не платил.
+//! The grammar and query are created lazily and only once (`OnceLock`): compiling a query costs
+//! from a fraction of a millisecond up to ~20 ms (Rust in release), and most languages won't need
+//! it during a session. [`Language`] lives in a static table and is `Sync`, so a `&'static
+//! Language` can be handed to a background thread; [`ParseJob::run`](crate::ParseJob::run) compiles
+//! the query there as well, so the UI thread doesn't pay for it.
 
 use std::fmt;
 use std::path::Path;
@@ -14,35 +13,35 @@ use std::sync::OnceLock;
 
 use tree_sitter::Query;
 
-/// Кто побеждает, если один и тот же участок захвачен несколькими паттернами.
+/// Which pattern wins when the same span is captured by several patterns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Precedence {
-    /// Поздний паттерн запроса. Так работает tree-sitter-highlight начиная с 0.21,
-    /// и под это написано большинство запросов (общий `(identifier) @variable`
-    /// стоит в начале, частные случаи — после).
+    /// The later pattern in the query. This is how tree-sitter-highlight has worked since 0.21, and
+    /// most queries are written for it (the generic `(identifier) @variable` comes first, special
+    /// cases after).
     LastPattern,
-    /// Ранний паттерн: запросы, оставшиеся с времён старого tree-sitter-highlight
-    /// (частные случаи стоят перед общими).
+    /// The earlier pattern: queries left over from the days of the old tree-sitter-highlight
+    /// (special cases come before generic ones).
     FirstPattern,
 }
 
 pub struct Language {
     name: &'static str,
-    /// Имя для людей: «Rust», «TypeScript».
+    /// Human-readable name: "Rust", "TypeScript".
     display_name: &'static str,
-    /// Расширения без точки, в нижнем регистре.
+    /// Extensions without the dot, in lowercase.
     extensions: &'static [&'static str],
-    /// Точные имена файлов: `Cargo.lock`, `.bashrc`.
+    /// Exact file names: `Cargo.lock`, `.bashrc`.
     file_names: &'static [&'static str],
     load_grammar: fn() -> tree_sitter::Language,
-    /// Части запроса подсветки, склеиваются по порядку.
+    /// Parts of the highlighting query, concatenated in order.
     queries: &'static [&'static str],
     precedence: Precedence,
     grammar: OnceLock<Option<tree_sitter::Language>>,
     query: OnceLock<Option<Query>>,
 }
 
-/// Параметры функций JavaScript: файл есть в грамматике, но не в её Rust-биндинге.
+/// JavaScript function parameters: the file is in the grammar but not in its Rust binding.
 const JAVASCRIPT_PARAMS_QUERY: &str = include_str!("../queries/javascript-params.scm");
 
 static LANGUAGES: [Language; 11] = [
@@ -64,7 +63,7 @@ static LANGUAGES: [Language; 11] = [
         &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY],
         Precedence::LastPattern,
     ),
-    // Запрос JSON ставит ключи `(pair key: …)` перед общим `(string)`.
+    // The JSON query puts the keys `(pair key: …)` before the generic `(string)`.
     Language::new(
         "json",
         "JSON",
@@ -74,7 +73,7 @@ static LANGUAGES: [Language; 11] = [
         &[tree_sitter_json::HIGHLIGHTS_QUERY],
         Precedence::FirstPattern,
     ),
-    // Только блочная грамматика: инлайн-разметка и код в блоках — это инъекции.
+    // Block grammar only: inline markup and code in blocks are injections.
     Language::new(
         "markdown",
         "Markdown",
@@ -123,8 +122,8 @@ static LANGUAGES: [Language; 11] = [
         &[tree_sitter_python::HIGHLIGHTS_QUERY],
         Precedence::LastPattern,
     ),
-    // Запрос Go ставит `(identifier) @variable` и `(field_identifier) @property`
-    // после вызовов функций и методов.
+    // The Go query puts `(identifier) @variable` and `(field_identifier) @property` after function
+    // and method calls.
     Language::new(
         "go",
         "Go",
@@ -134,7 +133,7 @@ static LANGUAGES: [Language; 11] = [
         &[tree_sitter_go::HIGHLIGHTS_QUERY],
         Precedence::FirstPattern,
     ),
-    // Порядок частей — как в tree-sitter.json грамматики.
+    // The order of the parts follows the grammar's tree-sitter.json.
     Language::new(
         "javascript",
         "JavaScript",
@@ -148,10 +147,10 @@ static LANGUAGES: [Language; 11] = [
         ],
         Precedence::LastPattern,
     ),
-    // Запрос TypeScript дополняет запрос JavaScript. tree-sitter.json грамматики
-    // ставит его первым — это порядок времён «ранний паттерн побеждает».
-    // При нынешнем «побеждает поздний» части TypeScript должны идти после
-    // JavaScript, иначе общий `(identifier) @variable` из JS перекроет их.
+    // The TypeScript query supplements the JavaScript query. The grammar's tree-sitter.json lists
+    // it first, which is the order from the "earlier pattern wins" days. With the current "later
+    // pattern wins" rule, the TypeScript parts must come after JavaScript, otherwise the generic
+    // `(identifier) @variable` from JS would override them.
     Language::new(
         "typescript",
         "TypeScript",
@@ -179,7 +178,7 @@ static LANGUAGES: [Language; 11] = [
     ),
 ];
 
-/// Все известные языки.
+/// All known languages.
 pub fn languages() -> &'static [Language] {
     &LANGUAGES
 }
@@ -188,7 +187,7 @@ pub fn language_by_name(name: &str) -> Option<&'static Language> {
     LANGUAGES.iter().find(|language| language.name == name)
 }
 
-/// Язык по имени файла (`Cargo.lock`, `.zshrc`), иначе по расширению.
+/// The language by file name (`Cargo.lock`, `.zshrc`), otherwise by extension.
 pub fn language_for_path(path: &Path) -> Option<&'static Language> {
     let file_name = path.file_name()?.to_str()?;
     if let Some(language) = LANGUAGES
@@ -234,8 +233,8 @@ impl Language {
         self.display_name
     }
 
-    /// Грамматика tree-sitter. `None`, если её ABI не поддерживается
-    /// подключённой версией tree-sitter.
+    /// The tree-sitter grammar. `None` if its ABI is not supported by the linked version of
+    /// tree-sitter.
     pub fn grammar(&self) -> Option<&tree_sitter::Language> {
         self.grammar
             .get_or_init(|| {
@@ -248,9 +247,9 @@ impl Language {
             .as_ref()
     }
 
-    /// Запрос подсветки; компилируется при первом обращении — до ~20 мс,
-    /// поэтому лучше не в UI-потоке. `None`, если грамматика не загрузилась
-    /// или запрос не скомпилировался.
+    /// The highlighting query; it is compiled on first access, which takes up to ~20 ms, so it is
+    /// better not to do that on the UI thread. `None` if the grammar failed to load or the query
+    /// failed to compile.
     pub fn query(&self) -> Option<&Query> {
         self.query
             .get_or_init(|| {
@@ -262,13 +261,13 @@ impl Language {
             .as_ref()
     }
 
-    /// Запрос, если он уже скомпилирован. Не компилирует и не ждёт чужой
-    /// компиляции — можно звать из UI-потока.
+    /// The query, if it has already been compiled. Doesn't compile or wait for another caller's
+    /// compilation, so it can be called from the UI thread.
     pub fn compiled_query(&self) -> Option<&Query> {
         self.query.get().and_then(Option::as_ref)
     }
 
-    /// Имена capture запроса подсветки; индекс в этом списке — индекс capture.
+    /// The capture names of the highlighting query; an index in this list is the capture index.
     pub fn capture_names(&self) -> &[&str] {
         self.query().map_or(&[], Query::capture_names)
     }
@@ -278,16 +277,17 @@ impl Language {
     }
 }
 
-/// Предикаты, которые [`tree_sitter::QueryCursor`] проверяет сам: `#eq?`, `#match?`,
-/// `#any-of?` и их варианты `not-`/`any-`. Остальные он пропускает, и мы тоже:
-/// - `#is-not? local` (и любое `#is-not?`) — локальные переменные мы не отслеживаем,
-///   то есть ни один узел не «local»: условие выполнено, паттерн работает;
-/// - `#set!` — свойства паттерна нужны инъекциям и locals, которых здесь нет;
-/// - неизвестные общие предикаты (`#lua-match?`…) — как tree-sitter-highlight,
-///   совпадение не фильтруем.
+/// Predicates that [`tree_sitter::QueryCursor`] checks itself: `#eq?`, `#match?`, `#any-of?` and
+/// their `not-`/`any-` variants. It skips the others, and so do we:
+/// - `#is-not? local` (and any `#is-not?`): we don't track local variables, so no node is "local":
+///   the condition is satisfied and the pattern applies;
+/// - `#set!`: pattern properties are needed by injections and locals, neither of which we have
+///   here;
+/// - unknown general predicates (`#lua-match?`…): like tree-sitter-highlight, we don't filter the
+///   match.
 ///
-/// Единственное исключение — `#is?`: утверждать свойство нам нечем, поэтому
-/// такие паттерны отключаются, а не срабатывают на всём подряд.
+/// The only exception is `#is?`: we have no way to assert a property, so such patterns are disabled
+/// rather than firing on everything.
 fn disable_property_patterns(query: &mut Query) {
     for pattern in 0..query.pattern_count() {
         if query
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn compiled_query_never_compiles() {
-        // Свой экземпляр: запросы из статической таблицы компилируют другие тесты.
+        // Its own instance: other tests compile the queries from the static table.
         let language: &'static Language = Box::leak(Box::new(Language::new(
             "rust",
             "Rust",

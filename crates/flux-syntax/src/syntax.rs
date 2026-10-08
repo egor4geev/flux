@@ -1,16 +1,17 @@
-//! Дерево разбора документа как синхронный автомат состояний без потоков.
+//! The document parse tree as a synchronous state machine with no threads.
 //!
-//! Цикл жизни:
-//! 1. [`Syntax::edit`] — на каждую правку, в UI-потоке: только `Tree::edit`,
-//!    микросекунды. Дерево остаётся пригодным для подсветки, пока идёт разбор.
-//! 2. [`Syntax::parse_job`] — снимок текста и дерева ([`ParseJob`], `Send + 'static`).
-//! 3. [`ParseJob::run`] где угодно (обычно в фоновом executor'е) или
-//!    [`ParseJob::run_with_budget`] прямо в UI-потоке с бюджетом ~1 мс.
-//! 4. [`Syntax::finish`] — ставит новое дерево, доигрывая на нём правки,
-//!    сделанные после старта работы.
+//! Lifecycle:
+//! 1. [`Syntax::edit`] is called on every edit, on the UI thread: just `Tree::edit`, microseconds.
+//!    The tree stays usable for highlighting while a parse is in progress.
+//! 2. [`Syntax::parse_job`] takes a snapshot of the text and the tree ([`ParseJob`], `Send +
+//!    'static`).
+//! 3. [`ParseJob::run`] anywhere (usually on a background executor) or
+//!    [`ParseJob::run_with_budget`] directly on the UI thread with a budget of ~1 ms.
+//! 4. [`Syntax::finish`] installs the new tree, replaying onto it the edits made after the job
+//!    started.
 //!
-//! Одновременно идёт не больше одной работы: правки за время разбора копятся
-//! и уходят в следующий разбор, поэтому длинный разбор не плодит очередь.
+//! At most one job runs at a time: edits made during a parse accumulate and go into the next parse,
+//! so a long parse doesn't build up a queue.
 
 use std::ops::{ControlFlow, Range};
 use std::sync::{Arc, Weak};
@@ -26,41 +27,41 @@ use crate::text::{chunk_from, count_newlines};
 
 pub struct Syntax {
     language: &'static Language,
-    /// Последнее дерево, отредактированное под текущий текст. Может быть
-    /// устаревшим (правки после разбора), но смещения узлов уже сдвинуты.
+    /// The latest tree, edited to match the current text. It may be stale (edits made after the
+    /// parse), but its node offsets have already been shifted.
     tree: Option<Tree>,
-    /// Число `\n` в текущем тексте, если известно. При дереве известно всегда:
-    /// по нему правки понимают, совпадают ли строки ropey со строками tree-sitter.
+    /// The number of `\n` in the current text, if known. Always known when there is a tree: edits
+    /// use it to tell whether ropey lines match tree-sitter lines.
     newlines: Option<usize>,
-    /// Текст изменился после снимка последней работы (или работ ещё не было).
+    /// The text has changed since the snapshot of the last job (or there have been no jobs yet).
     dirty: bool,
-    /// Версия текста: число правок с момента создания.
+    /// Text version: the number of edits since creation.
     version: u64,
     job: Option<InFlight>,
-    /// Парсер между работами — чтобы не выделять память заново на каждую.
+    /// The parser kept between jobs, so memory isn't reallocated for each one.
     parser: Option<Parser>,
 }
 
-/// Работа, отданная приложению.
+/// The job handed out to the application.
 struct InFlight {
-    /// Жива ли работа: ссылку держат [`ParseJob`], затем [`ParseResult`].
+    /// Whether the job is alive: the reference is held by [`ParseJob`], then by [`ParseResult`].
     token: Weak<()>,
-    /// Версия текста в снимке.
+    /// Text version in the snapshot.
     version: u64,
-    /// Правки после снимка — доиграть на результат работы.
+    /// Edits made after the snapshot, to be replayed onto the job's result.
     pending: Vec<PendingEdit>,
 }
 
 enum PendingEdit {
-    /// Посчитанные правки дерева (по возрастанию позиции).
+    /// The computed tree edits (in ascending order of position).
     Ready(Vec<InputEdit>),
-    /// Дерева ещё нет, число строк неизвестно: правки посчитает `finish`
-    /// по числу строк из результата работы.
+    /// There is no tree yet and the line count is unknown: `finish` will compute the edits from the
+    /// line count in the job's result.
     Deferred { old_text: Rope, changes: ChangeSet },
 }
 
 impl Syntax {
-    /// Пустое состояние: подсветки нет до первого разбора.
+    /// Empty state: no highlighting until the first parse.
     pub fn new(language: &'static Language) -> Self {
         Self {
             language,
@@ -77,36 +78,36 @@ impl Syntax {
         self.language
     }
 
-    /// Текущее дерево; после правок без разбора — отредактированное, устаревшее.
+    /// The current tree; after edits with no re-parse, it is the edited, stale one.
     pub fn tree(&self) -> Option<&Tree> {
         self.tree.as_ref()
     }
 
-    /// Идёт ли работа (выдана и ещё не завершена и не брошена).
+    /// Whether a job is in progress (handed out and neither finished nor abandoned).
     pub fn is_parsing(&self) -> bool {
         self.job.as_ref().is_some_and(InFlight::is_alive)
     }
 
-    /// Вернёт ли [`Syntax::parse_job`] работу прямо сейчас.
+    /// Whether [`Syntax::parse_job`] would return a job right now.
     pub fn needs_parse(&self) -> bool {
         let pending = match &self.job {
             Some(job) if job.is_alive() => false,
-            // Брошенная работа: её снимок так и не разобран.
+            // An abandoned job: its snapshot was never parsed.
             Some(_) => true,
             None => self.dirty,
         };
         pending && self.language.grammar().is_some()
     }
 
-    /// Правка документа: `old_text` — текст до `changes`. Дёшево: только
-    /// сдвигает узлы дерева. Если идёт разбор, правка запоминается, чтобы
-    /// доиграть её на его результате.
+    /// A document edit: `old_text` is the text before `changes`. Cheap: it only shifts the tree's
+    /// nodes. If a parse is in progress, the edit is remembered so it can be replayed onto the
+    /// parse result.
     pub fn edit(&mut self, old_text: &Rope, changes: &ChangeSet) {
         if changes.is_empty() {
             return;
         }
         if changes.len() != old_text.len_chars() {
-            // Правка не от этого текста: дереву больше верить нельзя.
+            // The edit is not for this text: the tree can no longer be trusted.
             self.reset();
             return;
         }
@@ -114,7 +115,7 @@ impl Syntax {
         self.dirty = true;
         self.forget_abandoned_job();
         if self.tree.is_none() && self.job.is_none() {
-            // Править нечего: следующий разбор всё равно пойдёт с нуля.
+            // Nothing to edit: the next parse will start from scratch anyway.
             self.newlines = None;
             return;
         }
@@ -130,7 +131,8 @@ impl Syntax {
                 }
             }
             None => {
-                // Число строк неизвестно, значит, дерева нет, а идёт первый разбор.
+                // The line count is unknown, so there is no tree and the first parse is in
+                // progress.
                 debug_assert!(self.tree.is_none());
                 if let Some(job) = &mut self.job {
                     job.pending.push(PendingEdit::Deferred {
@@ -142,8 +144,8 @@ impl Syntax {
         }
     }
 
-    /// Работа по разбору `text` — текущего текста документа. `None`, если
-    /// разбор не нужен или уже идёт (тогда после [`Syntax::finish`] спросите снова).
+    /// A job to parse `text`, the document's current text. `None` if no parse is needed or one is
+    /// already in progress (in that case, ask again after [`Syntax::finish`]).
     pub fn parse_job(&mut self, text: &Rope) -> Option<ParseJob> {
         if self.is_parsing() {
             return None;
@@ -171,10 +173,9 @@ impl Syntax {
         })
     }
 
-    /// Ставит результат работы, выданной этим `Syntax`, доигрывая правки,
-    /// сделанные после её старта; если такие были, остаётся «нужен разбор».
-    /// Чужой или устаревший (после [`Syntax::reset`]) результат отбрасывается:
-    /// возвращается `false`.
+    /// Installs the result of a job issued by this `Syntax`, replaying the edits made after the job
+    /// started; if there were any, the state stays "needs parse". A foreign or stale result (after
+    /// [`Syntax::reset`]) is discarded: returns `false`.
     pub fn finish(&mut self, result: ParseResult) -> bool {
         let ParseResult {
             tree,
@@ -193,7 +194,7 @@ impl Syntax {
         debug_assert_eq!(job.version + job.pending.len() as u64, self.version);
         self.parser.get_or_insert(parser);
         let Some(mut tree) = tree else {
-            // Разбор не удался: остаётся прежнее (отредактированное) дерево.
+            // The parse failed: the previous (edited) tree stays.
             return true;
         };
         let mut newlines = newlines;
@@ -212,9 +213,9 @@ impl Syntax {
         true
     }
 
-    /// Забыть дерево: следующий разбор — с нуля, подсветки до него нет.
-    /// Для правок, которые нельзя выразить через [`ChangeSet`] (файл
-    /// перечитан с диска). Результат уже выданной работы будет отброшен.
+    /// Forgets the tree: the next parse starts from scratch, and there is no highlighting until
+    /// then. For edits that can't be expressed through a [`ChangeSet`] (the file was re-read from
+    /// disk). The result of an already issued job will be discarded.
     pub fn reset(&mut self) {
         self.tree = None;
         self.newlines = None;
@@ -223,9 +224,9 @@ impl Syntax {
         self.version += 1;
     }
 
-    /// Подсветка строк `lines` (строки ropey): по вектору спанов на каждую
-    /// существующую строку диапазона. Колонки — в символах внутри строки,
-    /// без перевода строки. До первого разбора — пустые векторы.
+    /// Highlighting for the lines `lines` (ropey lines): a vector of spans for each existing line
+    /// in the range. Columns are in characters within the line, excluding the newline. Before the
+    /// first parse, the vectors are empty.
     pub fn highlight_lines(
         &self,
         text: &Rope,
@@ -243,7 +244,7 @@ impl Syntax {
         highlight::highlight_lines(tree, text, lines, map)
     }
 
-    /// Работа брошена, не дойдя до `finish`: её снимок так и не разобран.
+    /// The job was abandoned before reaching `finish`: its snapshot was never parsed.
     fn forget_abandoned_job(&mut self) {
         if self.job.take_if(|job| !job.is_alive()).is_some() {
             self.dirty = true;
@@ -263,51 +264,51 @@ fn apply_edits(tree: &mut Tree, edits: &[InputEdit]) {
     }
 }
 
-/// Разбор снимка текста. `Send + 'static`: можно отдать в фоновый поток.
+/// A parse of a text snapshot. `Send + 'static`: can be handed to a background thread.
 pub struct ParseJob {
     language: &'static Language,
     text: Rope,
-    /// Отредактированное дерево для инкрементального разбора.
+    /// The edited tree for incremental parsing.
     old_tree: Option<Tree>,
-    /// Парсер с состоянием прерванного разбора, если он был.
+    /// A parser carrying the state of an interrupted parse, if there was one.
     parser: Option<Parser>,
     newlines: Option<usize>,
     token: Arc<()>,
     version: u64,
 }
 
-/// Результат работы — отдать в [`Syntax::finish`].
+/// The job's result; pass it to [`Syntax::finish`].
 pub struct ParseResult {
     tree: Option<Tree>,
     parser: Parser,
-    /// Число `\n` в тексте снимка.
+    /// The number of `\n` in the snapshot text.
     newlines: usize,
     token: Arc<()>,
     version: u64,
 }
 
 impl ParseJob {
-    /// Разобрать до конца. Заодно компилирует запрос подсветки языка, чтобы
-    /// первая подсветка в UI-потоке не платила за это миллисекунды.
+    /// Parses to completion. Also compiles the language's highlighting query, so the first
+    /// highlighting on the UI thread doesn't pay milliseconds for it.
     pub fn run(mut self) -> ParseResult {
         self.language.query();
         let tree = self.parse(None);
         self.into_result(tree)
     }
 
-    /// Разбирать не дольше `budget`. Не успели — `Err` с той же работой:
-    /// парсер помнит, где остановился, и следующий запуск продолжит с того же
-    /// места. Бюджет проверяется раз в сотню шагов парсера, так что небольшой
-    /// текст успевает даже с нулевым бюджетом.
+    /// Parses for no longer than `budget`. If it doesn't finish in time, returns `Err` with the
+    /// same job: the parser remembers where it stopped, and the next run continues from the same
+    /// place. The budget is checked once every hundred parser steps, so a small text finishes even
+    /// with a zero budget.
     pub fn run_with_budget(mut self, budget: Duration) -> Result<ParseResult, ParseJob> {
-        // Бюджет, не помещающийся в Instant, — всё равно что без бюджета.
+        // A budget that doesn't fit in an Instant is the same as no budget.
         match self.parse(Instant::now().checked_add(budget)) {
             Some(tree) => Ok(self.into_result(Some(tree))),
             None => Err(self),
         }
     }
 
-    /// `deadline` — когда прервать разбор; `None` — разбирать до конца.
+    /// `deadline` is when to interrupt the parse; `None` means parse to completion.
     fn parse(&mut self, deadline: Option<Instant>) -> Option<Tree> {
         let language = self.language;
         let Self {
@@ -337,7 +338,8 @@ impl ParseJob {
 
     fn into_result(self, tree: Option<Tree>) -> ParseResult {
         let newlines = self.newlines.unwrap_or_else(|| count_newlines(&self.text));
-        // Парсер есть всегда, кроме неподдержанной грамматики: её до работы не допускает parse_job.
+        // The parser is always there except for an unsupported grammar, which parse_job never lets
+        // into a job.
         let parser = self.parser.unwrap_or_default();
         ParseResult {
             tree,

@@ -1,4 +1,4 @@
-//! Содержимое одного каталога для дерева файлов.
+//! The contents of a single directory for the file tree.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -9,33 +9,35 @@ use std::path::Path;
 
 use crate::rules::{is_skipped, project_walker};
 
-/// Файл или каталог. Симлинк — по тому, на что он указывает; битый — файл.
+/// A file or a directory. A symlink is classified by what it points to; a broken one counts as a
+/// file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EntryKind {
     File,
     Dir,
 }
 
-/// Строка каталога.
+/// A directory entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {
-    /// Имя в каталоге (не путь).
+    /// The name within the directory (not a path).
     pub name: String,
     pub kind: EntryKind,
-    /// Исключён `.gitignore` / `.ignore` (или лежит в исключённом каталоге): в дереве
-    /// приглушён, в поиске файла и по проекту его нет.
+    /// Excluded by `.gitignore` / `.ignore` (or located in an excluded directory): dimmed in the
+    /// tree, absent from file search and project search.
     pub ignored: bool,
 }
 
-/// Читает каталог `dir` внутри проекта `root`: каталоги первыми, имена — в естественном
-/// порядке ([`compare_names`]); служебные каталоги VCS и мусор ([`is_skipped`]) пропущены.
+/// Reads the directory `dir` inside the project `root`: directories first, names in natural order
+/// ([`compare_names`]); VCS metadata directories and junk ([`is_skipped`]) are skipped.
 ///
-/// `ignored` — ровно то, что исключил бы обход проекта (поиск файла и по проекту): тот же
-/// обход ([`project_walker`]) на глубину одного каталога, что он не отдал — исключено.
-/// `dir_ignored` — сам `dir` исключён: тогда исключено и всё внутри (git не заглядывает
-/// в исключённые каталоги, и правила внутри них не действуют), обход не нужен.
+/// `ignored` is exactly what the project walk (file search and project search) would exclude: the
+/// same walk ([`project_walker`]) limited to the depth of one directory, and whatever it did not
+/// return is excluded. `dir_ignored` means `dir` itself is excluded: then everything inside is
+/// excluded too (git does not look into excluded directories, and rules inside them have no
+/// effect), so no walk is needed.
 ///
-/// Имена не в UTF-8 пропускаются (на APFS их не бывает). Блокирует — звать из фона.
+/// Names that are not UTF-8 are skipped (APFS has none). Blocks; call it from the background.
 pub fn list_dir(root: &Path, dir: &Path, dir_ignored: bool) -> io::Result<Vec<DirEntry>> {
     let read = fs::read_dir(dir)?;
     let visible = if dir_ignored {
@@ -54,7 +56,8 @@ pub fn list_dir(root: &Path, dir: &Path, dir_ignored: bool) -> io::Result<Vec<Di
         let Ok(name) = name.into_string() else {
             continue;
         };
-        // Тип — из самого каталога (без лишнего `stat`); симлинк — по тому, на что указывает.
+        // The type comes from the directory entry itself (no extra `stat`); a symlink is typed by
+        // what it points to.
         let is_dir = match entry.file_type() {
             Ok(kind) if !kind.is_symlink() => kind.is_dir(),
             _ => fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir()),
@@ -74,7 +77,7 @@ pub fn list_dir(root: &Path, dir: &Path, dir_ignored: bool) -> io::Result<Vec<Di
     Ok(entries)
 }
 
-/// Имена в `dir`, которые обход проекта не исключает.
+/// Names in `dir` that the project walk does not exclude.
 fn visible_names(root: &Path, dir: &Path) -> HashSet<OsString> {
     project_walker(root, dir)
         .max_depth(Some(1))
@@ -90,9 +93,9 @@ fn compare_entries(a: &DirEntry, b: &DirEntry) -> Ordering {
     dirs_first.then_with(|| compare_names(&a.name, &b.name))
 }
 
-/// Естественный порядок имён: без учёта регистра (и для кириллицы, «ё» — рядом с «е»),
-/// числа — по значению (`file2` раньше `file10`). Имена, равные в этом смысле (`a1` и
-/// `a01`, `Readme` и `README`), упорядочены по байтам — порядок полный.
+/// Natural name order: case-insensitive (Cyrillic too, with "ё" next to "е"), numbers by value
+/// (`file2` before `file10`). Names that are equal in this sense (`a1` and `a01`, `Readme` and
+/// `README`) are ordered by bytes, so the order is total.
 pub fn compare_names(a: &str, b: &str) -> Ordering {
     natural(a, b).then_with(|| a.cmp(b))
 }
@@ -122,7 +125,8 @@ fn natural(a: &str, b: &str) -> Ordering {
     }
 }
 
-/// Символ для сравнения: строчный; «ё» — как «е» (иначе «ёж» встал бы после «яблоко»).
+/// The character used for comparison: lowercase; "ё" is treated as "е" (otherwise "ёж" would sort
+/// after "яблоко").
 fn fold(c: char) -> impl Iterator<Item = char> {
     c.to_lowercase().map(|c| if c == 'ё' { 'е' } else { c })
 }
@@ -131,7 +135,8 @@ fn digits_len(text: &str) -> usize {
     text.bytes().take_while(u8::is_ascii_digit).count()
 }
 
-/// Числа из цифр любой длины — без переполнения: длина без ведущих нулей, затем цифры.
+/// Numbers made of digits of any length, without overflow: the length without leading zeros first,
+/// then the digits.
 fn compare_numbers(a: &str, b: &str) -> Ordering {
     let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
@@ -141,7 +146,8 @@ fn compare_numbers(a: &str, b: &str) -> Ordering {
 mod tests {
     use super::*;
 
-    /// Дерево во временном каталоге: `(путь, содержимое)`; путь на `/` — пустой каталог.
+    /// A tree in a temporary directory: `(path, contents)`; a path ending in `/` is an empty
+    /// directory.
     pub(crate) fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for (path, contents) in files {
@@ -156,7 +162,7 @@ mod tests {
         dir
     }
 
-    /// Строки каталога: имя (у каталога — с `/`) и признак «исключён».
+    /// Directory entries: the name (with `/` for a directory) and the "excluded" flag.
     fn list(root: &Path, dir: &str, dir_ignored: bool) -> Vec<(String, bool)> {
         list_dir(root, &root.join(dir), dir_ignored)
             .unwrap()
@@ -208,7 +214,7 @@ mod tests {
                 "file10.rs"
             ]
         );
-        // Вне репозитория .gitignore не действует, скрытые файлы — не исключены.
+        // Outside a repository .gitignore has no effect, and hidden files are not excluded.
         assert!(ignored(&got).is_empty());
     }
 
@@ -227,7 +233,7 @@ mod tests {
         ]);
         let root = dir.path();
         let top = list(root, "", false);
-        // .git нет вовсе, .gitignore виден и не исключён.
+        // There is no .git at all; .gitignore is visible and not excluded.
         assert_eq!(
             names(&top),
             [
@@ -240,7 +246,7 @@ mod tests {
             ]
         );
         assert_eq!(ignored(&top), ["target/", "debug.log"]);
-        // Правила корня действуют и в подкаталогах: `build/` — каталог на любой глубине.
+        // Root rules apply in subdirectories too: `build/` matches a directory at any depth.
         let src = list(root, "src", false);
         assert_eq!(names(&src), ["build/", "main.rs", "trace.log"]);
         assert_eq!(ignored(&src), ["build/", "trace.log"]);
@@ -340,7 +346,7 @@ mod tests {
                 ("broken", EntryKind::File),
             ]
         );
-        // Симлинк на каталог раскрывается, как каталог, и его содержимое не исключено.
+        // A symlink to a directory expands like a directory, and its contents are not excluded.
         assert_eq!(list(root, "link", false), [("file.txt".to_string(), false)]);
     }
 
@@ -405,12 +411,12 @@ mod tests {
         assert_eq!(compare_names("a01", "a1"), Less);
         assert_eq!(compare_names("a1", "a01"), Greater);
         assert_eq!(compare_names("README", "readme"), Less);
-        // Огромные числа не переполняются.
+        // Huge numbers do not overflow.
         assert_eq!(
             compare_names("v99999999999999999999999", "v100000000000000000000000"),
             Less
         );
-        // Цифры раньше букв, как в Finder.
+        // Digits come before letters, as in Finder.
         assert_eq!(compare_names("1abc", "abc"), Less);
     }
 }

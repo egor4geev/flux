@@ -1,4 +1,4 @@
-//! Документ: текст, выделение, история и связь с файлом на диске.
+//! A document: text, selection, history, and the link to the file on disk.
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter};
@@ -12,24 +12,24 @@ use crate::selection::Selection;
 use crate::text::detect_line_ending;
 use crate::transaction::{ChangeSet, Transaction};
 
-/// Правки одного вида, сделанные быстро и подряд, отменяются вместе.
+/// Edits of the same kind made quickly one after another are undone together.
 const COALESCE_WINDOW: Duration = Duration::from_secs(1);
 
-/// Вид правки — по нему решаем, склеивать ли её с предыдущей в истории.
+/// The kind of an edit: it decides whether the edit is merged with the previous one in the history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditKind {
     Insert,
     Delete,
-    /// Никогда не склеивается: вставка из буфера, перевод строки и т.п.
+    /// Never merged: paste from the clipboard, a newline, etc.
     Other,
 }
 
-/// Изменение текста документа — для тех, кто следит за текстом со стороны
-/// (подсветка синтаксиса, в будущем LSP): `changes`, применённый к `old_text`,
-/// даёт текст после изменения.
+/// A change to the document text, for those who watch the text from the outside (syntax
+/// highlighting, LSP in the future): `changes` applied to `old_text` gives the text after the
+/// change.
 #[derive(Debug, Clone)]
 pub struct TextChange {
-    /// Текст до изменения (клон rope — O(1)).
+    /// The text before the change (a clone of the rope, O(1)).
     pub old_text: Rope,
     pub changes: ChangeSet,
 }
@@ -57,8 +57,7 @@ impl Document {
         Self::new(Rope::from_str(text), None)
     }
 
-    /// Открывает файл. Несуществующий файл — пустой документ, который
-    /// создастся при сохранении.
+    /// Opens a file. A nonexistent file gives an empty document, which will be created on save.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let text = match File::open(path) {
@@ -93,7 +92,7 @@ impl Document {
         self.path.as_deref()
     }
 
-    /// Привязывает документ к файлу (для «Сохранить как»).
+    /// Binds the document to a file (for "Save As").
     pub fn set_path(&mut self, path: PathBuf) {
         self.path = Some(path);
     }
@@ -123,8 +122,8 @@ impl Document {
         });
     }
 
-    /// Применяет правку и записывает её в историю. `None` — текст не изменился
-    /// (правка двигала только выделение).
+    /// Applies an edit and records it in the history. `None` means the text did not change (the
+    /// edit only moved the selection).
     pub fn apply(&mut self, transaction: Transaction, kind: EditKind) -> Option<TextChange> {
         let selection_before = self.selection.clone();
         let Transaction { changes, selection } = transaction;
@@ -166,14 +165,14 @@ impl Document {
         Some(change)
     }
 
-    /// Отменяет последнюю группу правок. Изменения текста — по одному на ревизию,
-    /// в порядке применения. `None` — отменять нечего.
+    /// Undoes the last group of edits. Text changes are returned one per revision, in the order
+    /// they were applied. `None` means there is nothing to undo.
     pub fn undo(&mut self) -> Option<Vec<TextChange>> {
         let txs = self.history.undo()?;
         Some(self.replay(txs))
     }
 
-    /// Повторяет отменённую группу правок; `None` — повторять нечего.
+    /// Redoes the group of edits that was undone; `None` means there is nothing to redo.
     pub fn redo(&mut self) -> Option<Vec<TextChange>> {
         let txs = self.history.redo()?;
         Some(self.replay(txs))
@@ -198,14 +197,14 @@ impl Document {
         changes
     }
 
-    /// Сохраняет атомарно: пишет во временный файл рядом и переименовывает.
-    /// При сбое посреди записи старый файл остаётся целым.
+    /// Saves atomically: writes to a temporary file next to the target, then renames it. If a
+    /// failure happens in the middle of the write, the old file stays intact.
     pub fn save(&mut self) -> io::Result<()> {
         let path = self
             .path
             .clone()
             .ok_or_else(|| io::Error::other("document has no path"))?;
-        // Пишем в файл, на который указывает симлинк, а не поверх самого симлинка.
+        // Writes to the file the symlink points to, not over the symlink itself.
         let target = fs::canonicalize(&path).unwrap_or(path);
         let permissions = fs::metadata(&target).ok().map(|m| m.permissions());
 
@@ -246,8 +245,8 @@ mod tests {
         }
     }
 
-    /// `changes` по очереди от `old_text` первого шага дают текст `after`,
-    /// а `old_text` каждого шага — текст перед этим шагом.
+    /// Applying `changes` in turn, starting from the first step's `old_text`, gives the text
+    /// `after`, and each step's `old_text` is the text before that step.
     fn check_changes(before: &Rope, changes: &[TextChange], after: &Rope) {
         let mut text = before.clone();
         for change in changes {
@@ -269,12 +268,12 @@ mod tests {
         check_changes(&before, &[change.unwrap()], doc.text());
         assert_eq!(doc.text(), "- один\n- два");
 
-        // Правка одного выделения текст не меняет.
+        // A selection-only edit does not change the text.
         let only_selection = Transaction::new(ChangeSet::identity(doc.text().len_chars()))
             .with_selection(Selection::point(0));
         assert!(doc.apply(only_selection, EditKind::Other).is_none());
 
-        // Группа undo из нескольких ревизий: подряд набранные символы.
+        // An undo group of several revisions: characters typed one after another.
         type_str(&mut doc, "abc");
         let typed = doc.text().clone();
         let changes = doc.undo().unwrap();
@@ -347,7 +346,7 @@ mod tests {
         assert!(!doc.is_modified());
         assert_eq!(fs::read_to_string(&path).unwrap(), "xone\r\ntwo\r\n");
 
-        // Сохранение закрывает группу undo: "y" отменяется отдельно от "x".
+        // Saving closes the undo group: "y" is undone separately from "x".
         type_str(&mut doc, "y");
         assert!(doc.is_modified());
         doc.undo();

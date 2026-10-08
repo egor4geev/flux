@@ -1,5 +1,5 @@
-//! Отрисовка редактора. Каждый кадр рисует только видимые строки:
-//! стоимость кадра не зависит от размера файла.
+//! Editor rendering. Each frame draws only the visible lines, so the cost of a frame doesn't depend
+//! on the file size.
 
 use flux_core::Rope;
 use flux_core::text::{line_len, line_start};
@@ -13,12 +13,12 @@ use crate::display::{display_line, text_runs};
 use crate::editor::{Autoscroll, Editor};
 use crate::theme::{self, Theme};
 
-/// Раскладка видимой части с прошлого кадра: по ней мышь и IME
-/// переводят пиксели в позиции текста и обратно.
+/// Layout of the visible part from the previous frame: the mouse and IME use it to convert pixels
+/// to text positions and back.
 pub struct LayoutCache {
     pub text_bounds: Bounds<Pixels>,
     pub line_height: Pixels,
-    /// Экранные координаты начала строки 0 (с учётом скролла).
+    /// Screen coordinates of the start of line 0 (accounting for scroll).
     pub origin: Point<Pixels>,
     pub first_line: usize,
     pub lines: Vec<LineLayout>,
@@ -26,8 +26,8 @@ pub struct LayoutCache {
 
 pub struct LineLayout {
     pub shaped: ShapedLine,
-    /// Байтовое смещение в отображаемой строке для каждой колонки (+ конец).
-    /// Отображаемая строка отличается от исходной: табы развёрнуты в пробелы.
+    /// Byte offset within the displayed line for each column (+ the end). The displayed line
+    /// differs from the source line: tabs are expanded to spaces.
     pub char_to_byte: Vec<usize>,
 }
 
@@ -43,7 +43,7 @@ impl LineLayout {
         if next == self.char_to_byte.len() {
             return next - 1;
         }
-        // Внутри развёрнутого таба — к ближайшему краю.
+        // Inside an expanded tab, snap to the nearest edge.
         if next > 0 && self.char_to_byte[next] != byte {
             let prev = next - 1;
             if byte - self.char_to_byte[prev] < self.char_to_byte[next] - byte {
@@ -69,21 +69,21 @@ impl LayoutCache {
             .max(1.) as usize
     }
 
-    /// Позиция в тексте под точкой экрана.
+    /// The text position under a screen point.
     pub fn position_for_point(&self, text: &Rope, p: Point<Pixels>) -> usize {
         let last_line = text.len_lines() - 1;
         let y = (p.y - self.origin.y) / self.line_height;
         let line = (y.max(0.) as usize).min(last_line);
         let column = match self.line(line) {
             Some(layout) => layout.column_for_x(p.x - self.origin.x),
-            // Строка вне экрана (тянем выделение за край).
+            // The line is off screen (the selection is being dragged past the edge).
             None if line < self.first_line => 0,
             None => line_len(text, line),
         };
         line_start(text, line) + column.min(line_len(text, line))
     }
 
-    /// Прямоугольник символа в позиции `pos`, если он на экране.
+    /// The rectangle of the character at `pos`, if it is on screen.
     pub fn bounds_for_position(&self, text: &Rope, pos: usize) -> Option<Bounds<Pixels>> {
         let line = text.char_to_line(pos);
         let layout = self.line(line)?;
@@ -109,8 +109,8 @@ pub struct PrepaintState {
     layout: Option<LayoutCache>,
     gutter: Vec<(ShapedLine, Point<Pixels>)>,
     current_line: Option<PaintQuad>,
-    /// Найденное поиском, выделения и подчёркивание IME — рисуются под текстом, в пределах
-    /// области текста.
+    /// Search matches, selections, and the IME underline are drawn under the text, within the text
+    /// area.
     highlights: Vec<PaintQuad>,
     cursors: Vec<PaintQuad>,
 }
@@ -187,8 +187,8 @@ impl Element for EditorElement {
         let primary = selection.primary();
         let head_line = text.char_to_line(primary.head);
 
-        // Вертикальный автоскролл: держим курсор в окне с запасом в несколько строк, а при
-        // переходе к найденному — ставим невидимую строку в середину.
+        // Vertical autoscroll: keep the cursor in the viewport with a margin of a few lines, and
+        // when jumping to a match, put a line that is out of view in the middle.
         let top = head_line as f32 * lh;
         match autoscroll {
             Some(Autoscroll::Fit) => {
@@ -204,7 +204,8 @@ impl Element for EditorElement {
             Some(Autoscroll::Center) if top < scroll.y || top + lh > scroll.y + height => {
                 scroll.y = top - (height - lh) / 2.;
             }
-            // Посередине, но с целой верхней строкой: превью не начинается с обрезка.
+            // In the middle, but with a whole top line: the preview doesn't start with a clipped
+            // line.
             Some(Autoscroll::Middle) => scroll.y = ((top - (height - lh) / 2.) / lh).round() * lh,
             Some(Autoscroll::Center) | None => {}
         }
@@ -222,7 +223,7 @@ impl Element for EditorElement {
             strikethrough: None,
         };
 
-        // Подсветка видимых строк: символьные колонки → байты отображаемой строки.
+        // Highlighting of the visible lines: character columns → bytes of the displayed line.
         let highlights = editor
             .highlighter
             .highlight_lines(&text, first_line..last_line);
@@ -241,7 +242,7 @@ impl Element for EditorElement {
             });
         }
 
-        // Горизонтальный автоскролл — после раскладки строки, когда известен x курсора.
+        // Horizontal autoscroll: after the line is laid out, when the cursor's x is known.
         let visible_width = f32::from(text_bounds.size.width) - theme::TEXT_PADDING * 2.;
         if autoscroll.is_some()
             && let Some(layout) = lines.get(head_line.wrapping_sub(first_line))
@@ -281,8 +282,8 @@ impl Element for EditorElement {
 
         let mut highlights = Vec::new();
         let newline_width = em * 0.5;
-        // Квады диапазона `from..to` по видимым строкам; перевод строки внутри диапазона —
-        // «хвост» за концом строки.
+        // Quads for the range `from..to` over the visible lines; a line break inside the range is a
+        // "tail" past the end of the line.
         let mut range_quads = |from: usize, to: usize, color: Hsla| {
             let from_line = text.char_to_line(from);
             let to_line = text.char_to_line(to);
@@ -312,8 +313,9 @@ impl Element for EditorElement {
             }
         };
 
-        // Найденное поиском — только пересекающее видимые строки. Текущее вхождение — поверх
-        // выделения (обычно оно и выделено): иначе синий выделения смешивается с его цветом.
+        // Search matches: only those that intersect the visible lines. The current match goes on
+        // top of the selection (it is usually the selected one): otherwise the selection's blue
+        // blends with its color.
         let search = &editor.search;
         let visible_start = line_start(&text, first_line);
         let visible_end = if last_line < total_lines {
@@ -408,7 +410,7 @@ impl Element for EditorElement {
     ) {
         let editor = self.editor.read(cx);
         let focus_handle = editor.focus_handle.clone();
-        // Курсоры — только в фокусе и в «видимой» фазе мигания.
+        // Cursors: only when focused and in the "visible" phase of the blink.
         let show_cursors = editor.cursor_visible && focus_handle.is_focused(window);
         window.handle_input(
             &focus_handle,

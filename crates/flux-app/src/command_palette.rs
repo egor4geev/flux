@@ -1,8 +1,8 @@
-//! Палитра команд (cmd-shift-p): все действия, доступные там, где был фокус, по имени.
+//! Command palette (cmd-shift-p): all actions available where focus was, by name.
 //!
-//! Список собирается при открытии — до того, как фокус уйдёт в поле палитры: gpui
-//! знает, какие действия обрабатывает путь от сфокусированного элемента до корня.
-//! Выбор возвращает фокус на место и отправляет туда действие.
+//! The list is built when the palette opens, before focus moves into the palette's input field:
+//! gpui knows which actions are handled along the path from the focused element to the root. Making
+//! a choice returns focus to where it was and dispatches the action there.
 
 use flux_search::{FuzzyMatch, match_list};
 use gpui::{
@@ -10,12 +10,13 @@ use gpui::{
     Modifiers, SharedString, Window, actions, div, prelude::*, px,
 };
 
+use crate::i18n::{tr, trn};
 use crate::picker::{Picker, PickerDelegate, highlighted_text};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_SM};
 use crate::workspace::Workspace;
 
-/// Колонка чипа пространства имён: названия команд встают ровным столбцом.
+/// Namespace chip column: command names line up in an even column.
 const NAMESPACE_WIDTH: f32 = 108.;
 
 actions!(command_palette, [Toggle]);
@@ -32,28 +33,30 @@ pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
 }
 
 struct Command {
-    /// Полная подпись — по ней нечёткий поиск: «editor: move word left».
+    /// Full label, which fuzzy search matches against: "editor: move word left".
     label: String,
-    /// Длина пространства имён в символах (до «: »): позиции совпадений делятся между чипом
-    /// и названием.
+    /// Namespace length in characters (up to ": "): match positions are split between the chip and
+    /// the name.
     namespace_chars: usize,
-    /// Сочетание клавиш значками macOS, если есть.
+    /// English namespace («file tree»): it picks the color of the chip, whatever the language.
+    namespace: String,
+    /// Key binding in macOS symbols, if there is one.
     keys: Option<SharedString>,
     action: Box<dyn Action>,
 }
 
 pub struct CommandPalette {
-    /// По алфавиту подписей.
+    /// Alphabetical by label.
     commands: Vec<Command>,
     matches: Vec<FuzzyMatch>,
-    /// Запрос пуст — в подвале всего команд, иначе «N of M».
+    /// If the query is empty, the footer shows the total number of commands; otherwise "N of M".
     query_empty: bool,
-    /// Где был фокус до открытия: туда вернётся фокус и уйдёт действие.
+    /// Where focus was before opening: focus returns there, and the action is dispatched there.
     previous_focus: Option<FocusHandle>,
 }
 
 impl CommandPalette {
-    /// Вызывать до переноса фокуса в палитру.
+    /// Call before moving focus into the palette.
     fn new(window: &mut Window, cx: &mut App) -> Self {
         let previous_focus = window.focused(cx);
         let mut commands: Vec<Command> = window
@@ -65,8 +68,8 @@ impl CommandPalette {
                     Some(focus) => window.bindings_for_action_in(action.as_ref(), focus),
                     None => window.bindings_for_action(action.as_ref()),
                 };
-                // Основное сочетание у нас привязывается первым, запасные (`home` к cmd-left,
-                // `shift-backspace` к backspace) — после него.
+                // Our primary binding is registered first, with the alternates (`home` for
+                // cmd-left, `shift-backspace` for backspace) after it.
                 let keys = bindings.first().map(|binding| {
                     binding
                         .keystrokes()
@@ -76,18 +79,26 @@ impl CommandPalette {
                         .join(" ")
                         .into()
                 });
-                let label = humanize_action_name(action.name());
+                let humanized = humanize_action_name(action.name());
+                let (namespace, title) = humanized.split_once(": ").unwrap_or(("", &humanized));
+                // The chip and the title are looked up as «Editor» and «Move Word Left».
+                let chip = tr(&title_case(namespace)).to_string();
+                let title = tr(&title_case(title)).to_string();
+                let label = if chip.is_empty() {
+                    title
+                } else {
+                    format!("{chip}: {title}")
+                };
                 Command {
-                    namespace_chars: label
-                        .find(": ")
-                        .map_or(0, |end| label[..end].chars().count()),
+                    namespace_chars: chip.chars().count(),
+                    namespace: namespace.to_string(),
                     label,
                     keys,
                     action,
                 }
             })
             .collect();
-        commands.sort_by(|a, b| a.label.cmp(&b.label));
+        commands.sort_by_cached_key(|command| command.label.to_lowercase());
         Self {
             commands,
             matches: Vec::new(),
@@ -99,7 +110,7 @@ impl CommandPalette {
 
 impl PickerDelegate for CommandPalette {
     fn placeholder(&self) -> SharedString {
-        "Run a command…".into()
+        tr("Run a command…").into()
     }
 
     fn match_count(&self) -> usize {
@@ -117,7 +128,8 @@ impl PickerDelegate for CommandPalette {
             return;
         };
         let action = self.commands[found.index].action.boxed_clone();
-        // `dispatch_action` берёт фокус в момент вызова — сначала вернуть его на место.
+        // `dispatch_action` takes focus at the moment of the call, so restore focus to its place
+        // first.
         if let Some(focus) = &self.previous_focus {
             window.focus(focus);
         }
@@ -135,9 +147,14 @@ impl PickerDelegate for CommandPalette {
         let ui = Theme::ui(cx);
         let found = &self.matches[index];
         let command = &self.commands[found.index];
-        let parts = LabelParts::new(&command.label, command.namespace_chars, &found.positions);
-        let chip = (!parts.namespace.is_empty()).then(|| {
-            let color = namespace_color(&parts.namespace, &ui);
+        let LabelParts {
+            namespace,
+            namespace_positions,
+            title,
+            title_positions,
+        } = LabelParts::new(&command.label, command.namespace_chars, &found.positions);
+        let chip = (!namespace.is_empty()).then(|| {
+            let color = namespace_color(&command.namespace, &ui);
             div()
                 .flex_none()
                 .max_w_full()
@@ -153,8 +170,8 @@ impl PickerDelegate for CommandPalette {
                 .whitespace_nowrap()
                 .overflow_hidden()
                 .child(highlighted_text(
-                    title_case(&parts.namespace),
-                    &parts.namespace_positions,
+                    namespace,
+                    &namespace_positions,
                     ui.foreground,
                 ))
         });
@@ -176,11 +193,7 @@ impl PickerDelegate for CommandPalette {
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .child(highlighted_text(
-                        title_case(&parts.title),
-                        &parts.title_positions,
-                        ui.match_text,
-                    )),
+                    .child(highlighted_text(title, &title_positions, ui.match_text)),
             )
             .children(command.keys.as_ref().map(|keys| ui::keys(keys, ui)))
             .into_any_element()
@@ -189,24 +202,28 @@ impl PickerDelegate for CommandPalette {
     fn render_footer(&self, _: &mut Window, _: &mut Context<Picker<Self>>) -> Option<AnyElement> {
         let total = self.commands.len();
         let text = if self.query_empty {
-            format!("{total} commands")
+            trn(total, "{n} command", "{n} commands")
         } else {
-            format!("{} of {total} commands", self.matches.len())
+            let shown = self.matches.len();
+            format!(
+                "{shown} {}",
+                trn(total, "of {n} command", "of {n} commands")
+            )
         };
         Some(text.into_any_element())
     }
 
     fn empty_message(&self) -> SharedString {
-        "No matching commands".into()
+        tr("No matching commands").into()
     }
 
     fn confirm_label(&self) -> &'static str {
-        "run"
+        tr("run")
     }
 }
 
-/// Подпись, разделённая на пространство имён (чип) и название; позиции совпадений — в
-/// символах каждой части.
+/// A label split into the namespace (chip) and the name; match positions are in characters of each
+/// part.
 #[derive(Debug, PartialEq, Eq)]
 struct LabelParts {
     namespace: String,
@@ -216,8 +233,8 @@ struct LabelParts {
 }
 
 impl LabelParts {
-    /// `label` — «пространство: название»; `namespace_chars` — длина пространства имён
-    /// (0 — его нет); `positions` — символы подписи, совпавшие с запросом.
+    /// `label` is "namespace: name"; `namespace_chars` is the namespace length (0 if there is
+    /// none); `positions` are the label characters that matched the query.
     fn new(label: &str, namespace_chars: usize, positions: &[usize]) -> Self {
         let title_start = if namespace_chars == 0 {
             0
@@ -242,7 +259,7 @@ impl LabelParts {
     }
 }
 
-/// Цвет чипа: свой оттенок у каждой области приложения.
+/// Chip color: each area of the app has its own shade.
 fn namespace_color(namespace: &str, ui: &UiColors) -> Hsla {
     match namespace {
         "editor" => ui.blue,
@@ -255,8 +272,8 @@ fn namespace_color(namespace: &str, ui: &UiColors) -> Hsla {
     }
 }
 
-/// «move word left» → «Move Word Left». Длина в символах не меняется — позиции совпадений
-/// остаются верными (буква, которая при переводе в заглавную разрастается, остаётся как есть).
+/// "move word left" → "Move Word Left". The length in characters doesn't change, so match positions
+/// stay valid (a letter that would expand when uppercased is left as is).
 fn title_case(text: &str) -> String {
     let mut title = String::with_capacity(text.len());
     let mut word_start = true;
@@ -271,8 +288,8 @@ fn title_case(text: &str) -> String {
     title
 }
 
-/// `editor::MoveWordLeft` → «editor: move word left», `command_palette::Toggle` →
-/// «command palette: toggle»: пространство имён, двоеточие, слова из CamelCase.
+/// `editor::MoveWordLeft` → "editor: move word left", `command_palette::Toggle` → "command palette:
+/// toggle": the namespace, a colon, then the words from the CamelCase name.
 pub fn humanize_action_name(name: &str) -> String {
     let (namespace, action) = name.rsplit_once("::").unwrap_or(("", name));
     let mut label = namespace.replace("::", " ").replace('_', " ");
@@ -287,7 +304,7 @@ pub fn humanize_action_name(name: &str) -> String {
         }
         let prev = i.checked_sub(1).map(|p| chars[p]);
         let next = chars.get(i + 1).copied();
-        // Граница слова: «moveWord», «move2Word», конец аббревиатуры «HTMLParser».
+        // Word boundary: "moveWord", "move2Word", the end of an acronym as in "HTMLParser".
         let boundary = c.is_uppercase()
             && prev.is_some_and(|p| {
                 p.is_lowercase()
@@ -302,7 +319,7 @@ pub fn humanize_action_name(name: &str) -> String {
     label
 }
 
-/// Нажатие значками macOS в принятом порядке ⌃⌥⇧⌘: `cmd-shift-p` → «⇧⌘P».
+/// A keystroke in macOS symbols, in the standard order ⌃⌥⇧⌘: `cmd-shift-p` → "⇧⌘P".
 pub fn keystroke_label(modifiers: &Modifiers, key: &str) -> String {
     let mut label = String::new();
     if modifiers.function {
@@ -339,7 +356,7 @@ fn key_label(key: &str) -> String {
         "home" => "Home",
         "end" => "End",
         key => {
-            // Буква — заглавной, `f12` → «F12», остальное как есть.
+            // A letter is uppercased, `f12` → "F12", anything else is left as is.
             let mut chars = key.chars();
             return match chars.next() {
                 Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -381,19 +398,19 @@ mod tests {
         assert_eq!(title_case("file tree"), "File Tree");
         assert_eq!(title_case("utf16 range"), "Utf16 Range");
         assert_eq!(title_case(""), "");
-        // ß в заглавной — «SS»: длина изменилась бы, поэтому буква остаётся.
+        // ß uppercases to "SS", which would change the length, so the letter is left as is.
         assert_eq!(title_case("ßa b"), "ßa B");
     }
 
     #[test]
     fn match_positions_split_between_chip_and_title() {
-        // «editor: move left»: 0–5 — «editor», 6–7 — «: », с 8 — «move left».
+        // "editor: move left": 0–5 is "editor", 6–7 is ": ", from 8 on is "move left".
         let parts = LabelParts::new("editor: move left", 6, &[0, 1, 7, 8, 13]);
         assert_eq!(parts.namespace, "editor");
         assert_eq!(parts.namespace_positions, [0, 1]);
         assert_eq!(parts.title, "move left");
         assert_eq!(parts.title_positions, [0, 5]);
-        // Без пространства имён всё — название.
+        // Without a namespace, everything is the name.
         let parts = LabelParts::new("quit", 0, &[0, 3]);
         assert_eq!(parts.namespace, "");
         assert_eq!(parts.title, "quit");

@@ -1,25 +1,24 @@
-//! Rope глазами tree-sitter: байтовые куски без копирования текста,
-//! счёт переводов строк и символов.
+//! The rope as tree-sitter sees it: byte chunks without copying the text, and counting of line
+//! breaks and characters.
 
 use std::ops::Range;
 
 use flux_core::Rope;
 
-/// Текст с байта `byte` до конца его куска — для callback'а парсера.
-/// Пустой срез означает конец текста.
+/// The text from byte `byte` to the end of its chunk, for the parser callback. An empty slice means
+/// the end of the text.
 pub(crate) fn chunk_from(text: &Rope, byte: usize) -> &[u8] {
     if byte >= text.len_bytes() {
         return &[];
     }
-    // Кусок, *содержащий* байт: на стыке ropey отдаёт следующий кусок,
-    // так что срез не пуст.
+    // The chunk that *contains* the byte: at a seam, ropey returns the next chunk, so the slice is
+    // not empty.
     let (chunk, chunk_start, _, _) = text.chunk_at_byte(byte);
     &chunk.as_bytes()[byte - chunk_start..]
 }
 
-/// Байты диапазона кусками rope — текст узла для предикатов запроса.
-/// Диапазон обрезается по длине текста: узлы отредактированного, но ещё не
-/// разобранного дерева могут выходить за конец.
+/// The bytes of a range as rope chunks: the node text for query predicates. The range is clamped to
+/// the text length: nodes of an edited but not yet parsed tree may extend past the end.
 pub(crate) fn byte_chunks(text: &Rope, range: Range<usize>) -> ByteChunks<'_> {
     let end = range.end.min(text.len_bytes());
     ByteChunks {
@@ -50,7 +49,7 @@ impl<'a> Iterator for ByteChunks<'a> {
     }
 }
 
-/// Число `\n` в тексте. Строки tree-sitter делит только по ним.
+/// The number of `\n` in the text. tree-sitter splits lines only on them.
 pub(crate) fn count_newlines(text: &Rope) -> usize {
     text.chunks()
         .map(|chunk| count_byte(chunk.as_bytes(), b'\n'))
@@ -61,9 +60,9 @@ pub(crate) fn count_byte(bytes: &[u8], needle: u8) -> usize {
     bytes.iter().filter(|&&b| b == needle).count()
 }
 
-/// Переводит неубывающие байтовые смещения в число символов от начальной
-/// точки — один проход по видимому тексту вместо `byte_to_char` (спуск по
-/// дереву rope) на каждую границу спана.
+/// Converts non-decreasing byte offsets into character counts from a starting point: one pass over
+/// the visible text instead of `byte_to_char` (a descent through the rope tree) for every span
+/// boundary.
 pub(crate) struct CharCounter<'a> {
     text: &'a Rope,
     chunk: &'a [u8],
@@ -84,9 +83,9 @@ impl<'a> CharCounter<'a> {
         }
     }
 
-    /// Сколько символов начинается между начальной точкой и `byte`.
-    /// Смещение внутри многобайтового символа засчитывает этот символ:
-    /// так получается граница символа, а не паника.
+    /// How many characters start between the starting point and `byte`. An offset inside a
+    /// multi-byte character counts that character: this yields a character boundary instead of a
+    /// panic.
     pub fn chars_to(&mut self, byte: usize) -> usize {
         let byte = byte.min(self.text.len_bytes());
         while self.byte < byte {
@@ -105,7 +104,7 @@ impl<'a> CharCounter<'a> {
     }
 }
 
-/// Первые байты символов UTF-8 — все, кроме продолжений `0b10xx_xxxx`.
+/// The leading bytes of UTF-8 characters: all bytes except the continuation bytes `0b10xx_xxxx`.
 fn count_char_starts(bytes: &[u8]) -> usize {
     bytes.iter().filter(|&&b| (b as i8) >= -0x40).count()
 }
@@ -114,7 +113,7 @@ fn count_char_starts(bytes: &[u8]) -> usize {
 mod tests {
     use super::*;
 
-    /// Rope из многих кусков: правки посередине дробят его.
+    /// A rope of many chunks: edits in the middle fragment it.
     fn chunky_rope() -> (Rope, String) {
         let mut text = Rope::new();
         let piece = "ab\nвг👍🏽\r\nx";

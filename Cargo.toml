@@ -24,8 +24,8 @@ tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-yaml = "0.7.2"
 
-# Разбор и запросы tree-sitter — C-код; без оптимизаций отладочная сборка
-# разбирает в разы медленнее. Оптимизируем только эти крейты.
+# Parsing and queries in tree-sitter are C code; without optimizations a debug build parses several
+# times slower. Only these crates are optimized.
 [profile.dev.package.tree-sitter]
 opt-level = 3
 [profile.dev.package.tree-sitter-bash]
@@ -49,10 +49,10 @@ opt-level = 3
 [profile.dev.package.tree-sitter-yaml]
 opt-level = 3
 
-# Поиск (flux-search): движок регулярных выражений, поиск подстрок и нечёткий поиск.
-# В отладочной сборке без оптимизаций они в 10–15 раз медленнее: поиск в файле на
-# 50 тыс. строк — 10 мс вместо 1, сопоставление 36 тыс. путей — 20–30 мс на букву.
-# regex-automata, aho-corasick и memchr нужны и gpui — один раз пересоберутся зависимые.
+# Search (flux-search): the regular expression engine, substring search, and fuzzy search. In a
+# debug build without optimizations they are 10–15 times slower: searching a 50k-line file takes 10
+# ms instead of 1, matching 36k paths takes 20–30 ms per letter. regex-automata, aho-corasick, and
+# memchr are needed by gpui too: the dependent crates will be rebuilt once.
 [profile.dev.package.regex-automata]
 opt-level = 3
 [profile.dev.package.regex-syntax]
@@ -71,8 +71,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.nucleo-matcher]
 opt-level = 3
-# Дерево файлов (flux-fs): правила .gitignore при чтении каталога. Без оптимизаций
-# каталог на 10 тыс. файлов читается ~145 мс вместо 13.
+# File tree (flux-fs): .gitignore rules applied when reading a directory. Without optimizations, a
+# directory of 10k files takes ~145 ms to read instead of 13.
 [profile.dev.package.ignore]
 opt-level = 3
 [profile.dev.package.globset]

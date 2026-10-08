@@ -9,8 +9,8 @@ name = "flux"
 path = "src/main.rs"
 
 [features]
-# Сценарии проверки UI для агентов: нажатия и автоответы диалогов из переменных
-# окружения (`src/scenario.rs`, обвязка — `scripts/ui-scenario.sh`).
+# UI check scenarios for agents: key presses and automatic dialog answers taken from environment
+# variables (`src/scenario.rs`; wrapper script: `scripts/ui-scenario.sh`).
 scenario = []
 
 [dependencies]
@@ -19,6 +19,11 @@ flux-core.workspace = true
 flux-fs.workspace = true
 flux-search.workspace = true
 flux-syntax.workspace = true
-# Каналы между фоновыми потоками поиска и UI-задачами gpui.
+# Channels between the background search threads and gpui UI tasks.
 futures = "0.3.34"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+
+# The UI language follows the system's preferred languages (CFLocaleCopyPreferredLanguages).
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.0"
+core-foundation-sys = "0.8.7"

@@ -1,5 +1,5 @@
-//! Поиск по проекту: параллельный обход ([`crate::files`]) и построчный поиск
-//! `grep-searcher` в каждом файле. Результаты уходят потоком, по файлу.
+//! Project search: a parallel walk ([`crate::files`]) and line-by-line searching with
+//! `grep-searcher` in each file. Results are streamed out, one file at a time.
 
 use std::io;
 use std::ops::Range;
@@ -14,15 +14,15 @@ use ignore::WalkState;
 use crate::files::{file_entry, relative, walker};
 use crate::query::{QueryError, SearchQuery};
 
-/// Ограничения поиска по проекту.
+/// Project search limits.
 #[derive(Debug, Clone)]
 pub struct GrepOptions {
-    /// Всего вхождений: дальше поиск останавливается (`truncated`).
+    /// Total number of matches, after which the search stops (`truncated`).
     pub max_matches: usize,
-    /// Длинная строка (минифицированный код) показывается окном такой ширины в символах
-    /// вокруг первого вхождения. `0` — без ограничения.
+    /// A long line (minified code) is shown as a window of this many characters around the first
+    /// match. `0` means no limit.
     pub max_line_chars: usize,
-    /// Файлы крупнее пропускаются.
+    /// Larger files are skipped.
     pub max_file_bytes: u64,
 }
 
@@ -36,51 +36,52 @@ impl Default for GrepOptions {
     }
 }
 
-/// Вхождения в одном файле.
+/// Matches in a single file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMatches {
-    /// Путь относительно корня проекта.
+    /// Path relative to the project root.
     pub path: PathBuf,
-    /// Строки с вхождениями по возрастанию номера.
+    /// Lines with matches, in ascending line-number order.
     pub lines: Vec<LineMatch>,
 }
 
-/// Строка с вхождениями.
+/// A line with matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineMatch {
-    /// Номер строки с нуля (строки разделяются `\n`).
+    /// Zero-based line number (lines are separated by `\n`).
     pub line: usize,
-    /// Текст строки без перевода строки. Длинная строка — окно
-    /// [`GrepOptions::max_line_chars`] символов вокруг первого вхождения.
+    /// Line text without the trailing newline. For a long line, a window of
+    /// [`GrepOptions::max_line_chars`] characters around the first match.
     pub text: String,
-    /// Колонка (в символах) начала `text` в настоящей строке: больше нуля, если начало
-    /// строки обрезано окном.
+    /// Column (in characters) where `text` starts within the real line: greater than zero if the
+    /// start of the line was cut off by the window.
     pub column_offset: usize,
-    /// Вхождения — колонки в символах внутри `text`, по возрастанию. Вышедшие за окно
-    /// обрезаны по его краю или отброшены.
+    /// Matches: columns in characters within `text`, in ascending order. Those that fall outside
+    /// the window are clipped at its edge or dropped.
     pub ranges: Vec<Range<usize>>,
 }
 
-/// Итог поиска.
+/// Search summary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GrepSummary {
-    /// Сколько файлов просмотрено (включая бинарные).
+    /// How many files were scanned (including binary ones).
     pub files_searched: usize,
-    /// В скольких файлах нашлись вхождения.
+    /// How many files contained matches.
     pub files_matched: usize,
-    /// Сколько вхождений отдано (не больше [`GrepOptions::max_matches`]).
+    /// How many matches were returned (at most [`GrepOptions::max_matches`]).
     pub matches: usize,
-    /// Остановились на [`GrepOptions::max_matches`].
+    /// Stopped at [`GrepOptions::max_matches`].
     pub truncated: bool,
-    /// Остановились по флагу отмены.
+    /// Stopped because of the cancellation flag.
     pub cancelled: bool,
 }
 
-/// Ищет запрос в файлах проекта — по тем же правилам обхода, что
-/// [`walk_files`](crate::files::walk_files). Бинарные файлы (с байтом NUL) и файлы крупнее
-/// [`GrepOptions::max_file_bytes`] пропускаются. Блокирует до конца поиска — вызывать в
-/// фоне. `sink` вызывается из рабочих потоков, по файлу, в произвольном порядке.
-/// Ошибка в запросе возвращается сразу, до обхода; пустой запрос ничего не ищет.
+/// Searches the project files for the query, using the same walk rules as
+/// [`walk_files`](crate::files::walk_files). Binary files (containing a NUL byte) and files larger
+/// than [`GrepOptions::max_file_bytes`] are skipped. Blocks until the search finishes, so call it
+/// in the background. `sink` is called from worker threads, once per file, in arbitrary order. An
+/// error in the query is returned immediately, before the walk; an empty query searches for
+/// nothing.
 pub fn search_project(
     root: &Path,
     query: &SearchQuery,
@@ -143,8 +144,8 @@ struct Counters {
 }
 
 impl Counters {
-    /// Учитывает вхождения файла в общем лимите. Файл, не влезший целиком, обрезается;
-    /// `None` — отдавать нечего.
+    /// Counts a file's matches against the overall limit. A file that doesn't fit entirely is
+    /// truncated; `None` means there is nothing to return.
     fn take(&self, lines: Vec<FoundLine>, max_matches: usize) -> Option<Vec<LineMatch>> {
         let count: usize = lines.iter().map(|line| line.count).sum();
         if count == 0 {
@@ -180,13 +181,13 @@ impl Counters {
     }
 }
 
-/// Строка с вхождениями и их настоящее число (часть могла не попасть в окно).
+/// A line with matches and their actual number (some may not have fit in the window).
 struct FoundLine {
     line: LineMatch,
     count: usize,
 }
 
-/// Вхождения в одном файле; бинарный или нечитаемый файл — пусто.
+/// Matches in a single file; empty for a binary or unreadable file.
 fn search_file(
     searcher: &mut Searcher,
     matcher: &RegexMatcher,
@@ -213,7 +214,7 @@ struct Collector<'a> {
     max_line_chars: usize,
     cancel: &'a AtomicBool,
     lines: Vec<FoundLine>,
-    /// Нашёлся байт NUL: файл бинарный, найденное в нём выбрасывается.
+    /// A NUL byte was found: the file is binary, and anything found in it is discarded.
     binary: bool,
 }
 
@@ -232,7 +233,7 @@ impl Sink for Collector<'_> {
             }
             true
         });
-        // Строка «совпала» только пустым вхождением (`^`, `a*`) — пропускаем.
+        // The line "matched" only via an empty match (`^`, `a*`): skip it.
         if matches.is_empty() {
             return Ok(true);
         }
@@ -256,8 +257,8 @@ fn trim_line_terminator(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\r").unwrap_or(bytes)
 }
 
-/// Строка для показа: текст (невалидный UTF-8 — через замену на U+FFFD), колонки
-/// вхождений в символах, окно для длинной строки.
+/// The line to display: the text (invalid UTF-8 is replaced with U+FFFD), match columns in
+/// characters, and the window for a long line.
 fn line_match(
     line: usize,
     bytes: &[u8],
@@ -265,8 +266,8 @@ fn line_match(
     max_line_chars: usize,
 ) -> LineMatch {
     let text = String::from_utf8_lossy(bytes);
-    // Колонки считаются по тексту после замены: смещения байтов — по исходным байтам,
-    // поэтому для каждого берём длину в символах префикса до него.
+    // Columns are computed on the text after replacement: byte offsets refer to the original bytes,
+    // so for each one we take the length in characters of the prefix before it.
     let column = |byte: usize| String::from_utf8_lossy(&bytes[..byte]).chars().count();
     let ranges: Vec<Range<usize>> = match std::str::from_utf8(bytes) {
         Ok(valid) => {
@@ -287,7 +288,8 @@ fn line_match(
             ranges,
         };
     }
-    // Окно: первое вхождение — на пятой части ширины от левого края, но не дальше конца.
+    // Window: the first match is placed a fifth of the width from the left edge, but not past the
+    // end.
     let first = ranges[0].start;
     let start = first
         .saturating_sub(max_line_chars / 5)
@@ -308,7 +310,7 @@ fn line_match(
 }
 
 #[cfg(test)]
-// Диапазоны в ожиданиях — именно списки диапазонов, а не `(a..b).collect()`.
+// The ranges in the expectations are specifically lists of ranges, not `(a..b).collect()`.
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
@@ -461,7 +463,7 @@ mod tests {
         );
         assert_eq!(summary.matches, 2);
 
-        // Вхождение у самого конца строки: окно прижимается к концу.
+        // A match right at the end of the line: the window is pushed up against the end.
         let tail = format!("{}needle", "x".repeat(500));
         let dir = tree(&[("tail.js", &tail)]);
         let (files, _) = search(dir.path(), &SearchQuery::new("needle"), &options);

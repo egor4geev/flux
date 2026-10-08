@@ -1,24 +1,25 @@
-//! Поисковый запрос: текст и флаги. Одна семантика для поиска в документе и по проекту —
-//! оба строят матчер `grep_regex` из одного [`SearchQuery`].
+//! A search query: text and flags. The semantics are the same for in-document search and project
+//! search: both build a `grep_regex` matcher from the same [`SearchQuery`].
 
 use std::fmt;
 
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 
-/// Что искать. Без `regex` текст ищется буквально; `whole_word` — вхождение не продолжает
-/// слово ни слева, ни справа (как `rg -w`: шаблон `->` тоже ищется «целым словом»).
+/// What to search for. Without `regex` the text is matched literally; with `whole_word`, a match
+/// must not continue a word on either the left or the right (as with `rg -w`: the pattern `->` is
+/// also searched as a "whole word").
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct SearchQuery {
     pub text: String,
-    /// Без него регистр не учитывается, в том числе для кириллицы.
+    /// Without it, case is ignored, including for Cyrillic.
     pub case_sensitive: bool,
     pub whole_word: bool,
-    /// Регулярное выражение в синтаксисе крейта `regex` (как в ripgrep).
+    /// A regular expression in the syntax of the `regex` crate (as in ripgrep).
     pub regex: bool,
 }
 
-/// Запрос не собрался — обычно ошибка в регулярном выражении. `message` — одна короткая
-/// строка для статуса в UI.
+/// The query could not be built, usually because of an error in the regular expression. `message`
+/// is a single short line for the status in the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryError {
     pub message: String,
@@ -33,8 +34,8 @@ impl fmt::Display for QueryError {
 impl std::error::Error for QueryError {}
 
 impl From<grep_regex::Error> for QueryError {
-    /// Ошибки разбора у regex-syntax многострочные: шаблон, указатель `^` и строка
-    /// `error: …`. Для статуса оставляем только суть.
+    /// regex-syntax parse errors are multi-line: the pattern, a `^` pointer and an `error: …` line.
+    /// For the status we keep only the gist.
     fn from(err: grep_regex::Error) -> Self {
         let text = err.to_string();
         let reason = text
@@ -56,7 +57,7 @@ impl From<grep_regex::Error> for QueryError {
 }
 
 impl SearchQuery {
-    /// Буквальный поиск без учёта регистра.
+    /// Literal, case-insensitive search.
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -68,8 +69,8 @@ impl SearchQuery {
         self.text.is_empty()
     }
 
-    /// Общие настройки. `multi_line` — это флаг `(?m)`: `^` и `$` — границы строк
-    /// (ripgrep включает его всегда). `crlf` — `$` срабатывает и перед `\r\n`.
+    /// Common settings. `multi_line` is the `(?m)` flag: `^` and `$` match at line boundaries
+    /// (ripgrep always enables it). With `crlf`, `$` also matches before `\r\n`.
     fn builder(&self) -> RegexMatcherBuilder {
         let mut builder = RegexMatcherBuilder::new();
         builder
@@ -81,18 +82,17 @@ impl SearchQuery {
         builder
     }
 
-    /// Матчер для документа: вхождение может переходить через перевод строки
-    /// (`foo\nbar`). `crlf(true)` ставит и терминатор строки — снимаем его, иначе
-    /// `\n` в шаблоне был бы запрещён.
+    /// Matcher for a document: a match may cross a line break (`foo\nbar`). `crlf(true)` also sets
+    /// the line terminator, so we clear it; otherwise `\n` in the pattern would be forbidden.
     pub(crate) fn buffer_matcher(&self) -> Result<RegexMatcher, QueryError> {
         let mut builder = self.builder();
         builder.line_terminator(None);
         Ok(builder.build(&self.text)?)
     }
 
-    /// Построчный матчер для поиска по проекту: вхождение никогда не содержит `\r` и
-    /// `\n` (терминатор CRLF — как у `rg --crlf`), литерал `\n` в шаблоне — ошибка.
-    /// Поиск должен идти с тем же терминатором (`LineTerminator::crlf()`).
+    /// Line-by-line matcher for project search: a match never contains `\r` or `\n` (CRLF
+    /// terminator, as with `rg --crlf`), and a literal `\n` in the pattern is an error. The search
+    /// must use the same terminator (`LineTerminator::crlf()`).
     pub(crate) fn line_matcher(&self) -> Result<RegexMatcher, QueryError> {
         Ok(self.builder().build(&self.text)?)
     }
@@ -148,8 +148,8 @@ mod tests {
         };
         let matcher = word("foo").buffer_matcher().unwrap();
         assert_eq!(find_all(&matcher, "foo food foo_ (foo)"), ["foo", "foo"]);
-        // Шаблон с не-словесными символами по краям: `\b->\b` не нашёл бы отдельно
-        // стоящую стрелку. Вплотную к буквам — не «целое слово» (как у `rg -w`).
+        // A pattern with non-word characters at its edges: `\b->\b` wouldn't find a standalone
+        // arrow. Right next to letters it is not a "whole word" (as with `rg -w`).
         let matcher = word("->").buffer_matcher().unwrap();
         assert_eq!(find_all(&matcher, "a -> b, (->), a->b"), ["->", "->"]);
     }
@@ -174,7 +174,7 @@ mod tests {
         assert!(regex(r"a\nb").buffer_matcher().is_ok());
         let err = regex(r"a\nb").line_matcher().unwrap_err();
         assert!(err.message.contains("not allowed"), "{}", err.message);
-        // `\s` в построчном поиске просто не захватывает перевод строки.
+        // In line-by-line search, `\s` simply doesn't capture a newline.
         let matcher = regex(r"a\s+").line_matcher().unwrap();
         assert_eq!(find_all(&matcher, "a  \r\nb"), ["a  "]);
     }

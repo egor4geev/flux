@@ -1,13 +1,14 @@
-//! Замеры скорости — запускаются вручную:
+//! Speed benchmarks, run manually:
 //!
 //! ```sh
 //! cargo test -p flux-search --release --test bench -- --ignored --nocapture
-//! cargo test -p flux-search --test bench -- --ignored --nocapture   # отладочная сборка
+//! cargo test -p flux-search --test bench -- --ignored --nocapture   # debug build
 //! ```
 //!
-//! Проекты — `FLUX_SEARCH_BENCH_ROOTS` (через `:`), иначе сам репозиторий flux и каталог
-//! над ним (`flux-dev`: репозиторий, вики, образцы). Файл для поиска в документе —
-//! `FLUX_SEARCH_BENCH_FILE`, иначе `../playground/big.rs` (51 тыс. строк Rust).
+//! Projects come from `FLUX_SEARCH_BENCH_ROOTS` (separated by `:`); otherwise, the flux repository
+//! itself and the directory above it (`flux-dev`: the repository, the wiki, samples). The file for
+//! the in-document search comes from `FLUX_SEARCH_BENCH_FILE`; otherwise `../playground/big.rs`
+//! (51k lines of Rust).
 
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
@@ -45,7 +46,7 @@ fn bench_file() -> PathBuf {
         .unwrap_or_else(|| repo_root().join("../playground/big.rs"))
 }
 
-/// Лучшее из нескольких прогонов: первый прогревает кеш файловой системы.
+/// Best of several runs: the first one warms up the file system cache.
 fn best<T>(runs: usize, mut f: impl FnMut() -> T) -> (Duration, T) {
     let mut best = Duration::MAX;
     let mut value = None;
@@ -97,7 +98,7 @@ fn walk_and_grep() {
                 },
             ),
             (r"regex «fn \w+\(»", regex(r"fn \w+\(")),
-            // Склеено из частей, чтобы не найтись в этом же файле.
+            // Concatenated from parts so that it is not found in this very file.
             (
                 "literal, no hits",
                 SearchQuery::new(["qqq", "zzz"].concat()),
@@ -214,7 +215,8 @@ fn fuzzy_paths() {
             start.elapsed(),
             summary.files
         );
-        // Набор запроса по букве: время до готового результата после каждой.
+        // Typing a query one letter at a time: the time until the result is ready after each
+        // letter.
         let query = "srceditrs";
         for end in 1..=query.len() {
             let start = Instant::now();

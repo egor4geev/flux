@@ -1,10 +1,10 @@
-//! Поиск файла проекта по имени (cmd-p): нечёткий поиск по путям относительно корня.
+//! Project file search by name (cmd-p): fuzzy search over paths relative to the root.
 //!
-//! При каждом открытии проект обходится заново (`flux_search::walk_files`, в фоне):
-//! список всегда свежий, а обход обычного проекта — миллисекунды. Пути сразу уходят в
-//! `PathMatcher` (nucleo): он сопоставляет их с запросом в своих потоках, пока обход ещё
-//! идёт. О новых результатах nucleo сообщает из своих потоков — сигналы склеиваются в
-//! канале, и Picker перерисовывается не чаще кадра.
+//! The project is re-walked on every open (`flux_search::walk_files`, in the background): the list
+//! is always fresh, and walking an ordinary project takes milliseconds. Paths go straight into
+//! `PathMatcher` (nucleo), which matches them against the query on its own threads while the walk
+//! is still running. nucleo reports new results from its own threads; the signals are coalesced in
+//! a channel, so the Picker redraws at most once per frame.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use gpui::{
     Window, actions, div, prelude::*, px,
 };
 
+use crate::i18n::{tr, trf, trn};
 use crate::icons::file_icon;
 use crate::picker::{Picker, PickerDelegate, highlighted_text};
 use crate::theme::{self, Theme};
@@ -26,7 +27,7 @@ use crate::workspace::Workspace;
 
 actions!(file_finder, [Toggle]);
 
-/// Перерисовка по сигналам nucleo — не чаще раза в кадр.
+/// Redraws on nucleo signals happen at most once per frame.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(16);
 
 pub fn init(cx: &mut App) {
@@ -35,7 +36,7 @@ pub fn init(cx: &mut App) {
 
 pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let Some(root) = workspace.root().map(Path::to_path_buf) else {
-        workspace.show_message("No project folder — open one with ⌘O".into(), cx);
+        workspace.show_message(tr("No project folder — open one with ⌘O").into(), cx);
         return;
     };
     let weak = cx.entity().downgrade();
@@ -49,22 +50,22 @@ pub struct FileFinder {
     root: PathBuf,
     workspace: WeakEntity<Workspace>,
     matcher: PathMatcher,
-    /// Итог обхода; `None` — обход ещё идёт.
+    /// Result of the walk; `None` means the walk is still running.
     walk: Option<WalkSummary>,
-    /// Окно закрыли — обход останавливается.
+    /// When the window is closed, the walk stops.
     cancel: Arc<AtomicBool>,
     _tasks: [Task<()>; 2],
 }
 
 impl FileFinder {
-    /// Сразу начинает обход проекта в фоне.
+    /// Immediately starts walking the project in the background.
     fn new(
         root: PathBuf,
         workspace: WeakEntity<Workspace>,
         cx: &mut Context<Picker<Self>>,
     ) -> Self {
-        // nucleo зовёт `notify` из своих потоков на каждый добавленный путь и на каждый
-        // досчитанный результат — в канал, а UI-задача их склеивает.
+        // nucleo calls `notify` from its own threads for every added path and every computed
+        // result; each call goes into a channel, and the UI task coalesces them.
         let (notify, mut signals) = mpsc::unbounded::<()>();
         let matcher = PathMatcher::new(Arc::new(move || {
             notify.unbounded_send(()).ok();
@@ -87,8 +88,8 @@ impl FileFinder {
         let injector = matcher.injector();
         let walking = cx.background_spawn({
             let (root, cancel) = (root.clone(), cancel.clone());
-            // Инжектор живёт до конца обхода: пока он жив, `is_running` считает, что
-            // список растёт.
+            // The injector lives until the walk ends: while it is alive, `is_running` considers the
+            // list to be still growing.
             async move { walk_files(&root, &cancel, |path| injector.push(path)) }
         });
         let walk = cx.spawn(async move |picker, cx| {
@@ -121,7 +122,7 @@ impl Drop for FileFinder {
 
 impl PickerDelegate for FileFinder {
     fn placeholder(&self) -> SharedString {
-        "Search files by name…".into()
+        tr("Search files by name…").into()
     }
 
     fn match_count(&self) -> usize {
@@ -190,32 +191,34 @@ impl PickerDelegate for FileFinder {
         let truncated = self.walk.is_some_and(|walk| walk.truncated);
         let mut footer = footer_text(self.matcher.match_count(), total, truncated);
         if self.walk.is_none() {
-            footer.push_str(" · indexing…");
+            footer.push_str(" · ");
+            footer.push_str(tr("indexing…"));
         }
         Some(footer.into_any_element())
     }
 
     fn empty_message(&self) -> SharedString {
         if self.walk.is_none() {
-            "Indexing…".into()
+            tr("Indexing…").into()
         } else {
-            "No matching files".into()
+            tr("No matching files").into()
         }
     }
 }
 
-/// Строка списка: имя файла и каталог отдельно, совпавшие символы — в обеих частях.
+/// A list row: the file name and the directory separately, with matched characters in both parts.
 #[derive(Debug, PartialEq, Eq)]
 struct PathRow {
     name: String,
     name_positions: Vec<usize>,
-    /// Каталог относительно корня без завершающего `/`; пусто — файл в корне.
+    /// The directory relative to the root without a trailing `/`; empty means the file is in the
+    /// root.
     dir: String,
     dir_positions: Vec<usize>,
 }
 
 impl PathRow {
-    /// Позиции `PathMatch` — индексы `char` во всём относительном пути `dir/name`.
+    /// `PathMatch` positions are `char` indices into the whole relative path `dir/name`.
     fn new(found: &PathMatch) -> Self {
         let path: &str = &found.path;
         let (dir, name) = match path.rfind('/') {
@@ -242,15 +245,12 @@ impl PathRow {
     }
 }
 
-/// «12 of 345 files»; обход упёрся в лимит — «12 of 100000+ files».
+/// "12 of 345 files"; if the walk hit the limit, "12 of 100000+ files".
 fn footer_text(matched: usize, total: usize, truncated: bool) -> String {
-    let plus = if truncated { "+" } else { "" };
-    let total = if truncated {
-        total.max(MAX_FILES)
-    } else {
-        total
-    };
-    format!("{matched} of {total}{plus} files")
+    if truncated {
+        return trf("{0} of {1}+ files", &[&matched, &total.max(MAX_FILES)]);
+    }
+    format!("{matched} {}", trn(total, "of {n} file", "of {n} files"))
 }
 
 #[cfg(test)]
@@ -269,7 +269,8 @@ mod tests {
         let got = row("crates/flux-app/src/editor.rs", &[0, 16, 20, 21]);
         assert_eq!(got.name, "editor.rs");
         assert_eq!(got.dir, "crates/flux-app/src");
-        // 20, 21 — «ed» в имени (имя начинается с 20-го символа); 0 и 16 — в каталоге.
+        // 20, 21 are "ed" in the name (the name starts at the 20th character); 0 and 16 are in the
+        // directory.
         assert_eq!(got.name_positions, vec![0, 1]);
         assert_eq!(got.dir_positions, vec![0, 16]);
     }
@@ -285,7 +286,7 @@ mod tests {
 
     #[test]
     fn slash_position_belongs_to_neither_part() {
-        // «a/b»: позиция 1 — сам `/`.
+        // "a/b": position 1 is the `/` itself.
         let got = row("a/b", &[1]);
         assert!(got.name_positions.is_empty());
         assert!(got.dir_positions.is_empty());
@@ -293,7 +294,7 @@ mod tests {
 
     #[test]
     fn positions_are_chars_in_non_ascii_paths() {
-        // «заметки/план.md»: имя начинается с 8-го символа.
+        // "заметки/план.md": the name starts at the 8th character.
         let got = row("заметки/план.md", &[0, 8, 9]);
         assert_eq!(got.name, "план.md");
         assert_eq!(got.dir, "заметки");

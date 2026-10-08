@@ -1,14 +1,16 @@
-//! Поиск по проекту (cmd-shift-f): окно поверх островов в духе «Find in Files» JetBrains —
-//! поле запроса с переключателями (регистр, целое слово, регулярное выражение), результаты
-//! по файлам (группы сворачиваются щелчком по заголовку) и превью выбранного вхождения.
+//! Project search (cmd-shift-f): an overlay window on top of the islands in the spirit of JetBrains
+//! "Find in Files": a query field with toggles (case, whole word, regular expression), results
+//! grouped by file (a group collapses when its header is clicked), and a preview of the selected
+//! match.
 //!
-//! Поиск идёт в фоне (`flux_search::search_project`) после короткой паузы в наборе.
-//! Результаты приходят потоком, по файлу, и встают в список по порядку путей. Новый
-//! запрос отменяет прошлый поиск: выставляет его флаг отмены и бросает его задачу — поздние
-//! результаты до окна не доходят. Превью — настоящий редактор только для чтения
-//! (`Editor::preview`): файл читается с диска в фоне, найденное в нём подсвечено, строка
-//! выбранного вхождения — посередине. Открыть вхождение просит Workspace
-//! ([`ProjectSearchEvent::Open`]): он открывает файл и выделяет место в нём, окно закрывается.
+//! The search runs in the background (`flux_search::search_project`) after a short pause in typing.
+//! Results arrive as a stream, one file at a time, and are inserted into the list in path order. A
+//! new query cancels the previous search: it sets its cancellation flag and drops its task, so late
+//! results never reach the window. The preview is a real read-only editor (`Editor::preview`): the
+//! file is read from disk in the background, matches in it are highlighted, and the line of the
+//! selected match is in the middle. The window asks the Workspace to open a match
+//! ([`ProjectSearchEvent::Open`]): the Workspace opens the file and selects the spot in it, and the
+//! window closes.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -31,28 +33,30 @@ use gpui::{
 };
 
 use crate::editor::Editor;
+use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 use crate::workspace::Location;
 
-/// Пауза после изменения запроса: слово, набранное подряд, — один поиск.
+/// Pause after the query changes: a word typed in one go triggers a single search.
 const SEARCH_DELAY: Duration = Duration::from_millis(150);
-/// Строка списка: заголовок файла и строка с вхождениями одной высоты (`uniform_list`).
+/// A list row: the file header and a line with matches have the same height (`uniform_list`).
 const ROW_HEIGHT: f32 = 26.;
-/// Колонка номеров строк (номер выровнен по правому краю) и отступ перед ней — номер
-/// стоит под значком файла.
+/// The line-number column (the number is right-aligned) and the indent before it: the number sits
+/// under the file icon.
 const LINE_NUMBER_WIDTH: f32 = 40.;
 const LINE_INDENT: f32 = 10.;
-/// Доля высоты окна под превью.
+/// The share of the window height given to the preview.
 const PREVIEW_HEIGHT: f32 = 0.46;
 const PREVIEW_HEADER_HEIGHT: f32 = 34.;
-/// Файлы крупнее не показываются в превью: чтение и разбор заняли бы заметное время.
+/// Larger files are not shown in the preview: reading and parsing them would take a noticeable
+/// amount of time.
 const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
-/// Шаг PageUp/PageDown — столько вхождений.
+/// PageUp/PageDown step: this many matches.
 const PAGE_MATCHES: usize = 10;
-/// Статус шире не растягивается: длинный текст видно частично.
+/// The status does not stretch any wider: long text is only partly visible.
 const STATUS_MAX_WIDTH: f32 = 420.;
 
 actions!(
@@ -74,7 +78,8 @@ actions!(
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("cmd-shift-f", Toggle, Some("Workspace"))]);
-    // Контекст окна объемлет поле запроса: стрелки и Enter работают прямо во время набора.
+    // The window context encloses the query field, so the arrow keys and Enter work right while
+    // typing.
     let context = Some("ProjectSearch");
     cx.bind_keys([
         KeyBinding::new("down", SelectNextMatch, context),
@@ -90,28 +95,28 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// Что окно просит у Workspace.
+/// What the window asks of the Workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectSearchEvent {
-    /// Открыть файл и выделить вхождение; `focus` — перевести фокус в редактор.
+    /// Open the file and select the match; `focus` moves focus to the editor.
     Open { location: Location, focus: bool },
-    /// Вернуть фокус в редактор (Esc, окно закрылось).
+    /// Return focus to the editor (Esc, the window has closed).
     FocusEditor,
 }
 
-/// Строка списка результатов.
+/// A row of the results list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
-    /// Заголовок файла (индекс в `results`).
+    /// A file header (index into `results`).
     File(usize),
-    /// Строка с вхождениями: файл и строка в нём.
+    /// A line with matches: the file and the line within it.
     Line { file: usize, line: usize },
 }
 
-/// Состояние поиска — для статуса в шапке и пустого списка.
+/// Search state, for the status in the header and for the empty list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Status {
-    /// Запрос пуст.
+    /// The query is empty.
     Idle,
     NoRoot,
     Searching,
@@ -119,16 +124,16 @@ enum Status {
     Error(String),
 }
 
-/// Превью выбранного вхождения: его файл в редакторе только для чтения.
+/// Preview of the selected match: its file in a read-only editor.
 #[derive(Default)]
 struct Preview {
-    /// Показанный файл (путь относительно корня) и его редактор.
+    /// The file being shown (path relative to the root) and its editor.
     shown: Option<(PathBuf, Entity<Editor>)>,
-    /// Файл, который читается сейчас; пока он читается, видно прежнее.
+    /// The file currently being read; while it is being read, the previous one stays visible.
     loading: Option<PathBuf>,
-    /// Вместо файла — сообщение: слишком большой, не прочитался.
+    /// A message in place of the file: it is too large or could not be read.
     message: Option<(PathBuf, SharedString)>,
-    /// Чтение в фоне; новое чтение заменяет (отменяет) прошлое.
+    /// Background read; a new read replaces (cancels) the previous one.
     _task: Option<Task<()>>,
 }
 
@@ -138,7 +143,7 @@ impl Preview {
     }
 }
 
-/// Окно поиска по проекту: одно на Workspace; запрос и результаты живут, пока оно скрыто.
+/// The project search window: one per Workspace; the query and results persist while it is hidden.
 pub struct ProjectSearch {
     root: Option<PathBuf>,
     open: bool,
@@ -146,27 +151,27 @@ pub struct ProjectSearch {
     case_sensitive: bool,
     whole_word: bool,
     regex: bool,
-    /// Файлы с вхождениями — по порядку путей.
+    /// Files with matches, in path order.
     results: Vec<FileMatches>,
-    /// Свёрнутые файлы (пути относительно корня): видны только их заголовки.
+    /// Collapsed files (paths relative to the root): only their headers are visible.
     collapsed: HashSet<PathBuf>,
-    /// Плоский список для отрисовки: заголовок файла, затем его строки (у развёрнутых).
+    /// Flat list for rendering: a file header, then its rows (for expanded files).
     rows: Vec<Row>,
-    /// Сколько вхождений и файлов уже пришло — для статуса во время поиска.
+    /// How many matches and files have arrived so far, for the status during the search.
     found: (usize, usize),
-    /// Выбранная строка совпадения (индекс в `rows`).
+    /// The selected match row (index into `rows`).
     selected: Option<usize>,
-    /// Строку выбрал пользователь (стрелки, щелчок): при приходе новых результатов выбор
-    /// остаётся на ней. Иначе выбрано первое совпадение списка.
+    /// The user picked the row (arrows, click): when new results arrive, the selection stays on it.
+    /// Otherwise the first match in the list is selected.
     selection_pinned: bool,
     status: Status,
-    /// Флаг отмены идущего поиска.
+    /// Cancellation flag of the search in progress.
     cancel: Arc<AtomicBool>,
-    /// Пауза, поиск и приём результатов; сброс задачи — отмена.
+    /// The pause, the search, and receiving the results; dropping the task cancels it.
     search: Option<Task<()>>,
     scroll: UniformListScrollHandle,
     preview: Preview,
-    /// Запрос одной строкой — для пояснений в пустом списке (обновляется при отрисовке).
+    /// The query as a single line, for the explanations in the empty list (updated on render).
     last_query: String,
     _subscription: Subscription,
 }
@@ -176,7 +181,7 @@ impl EventEmitter<ProjectSearchEvent> for ProjectSearch {}
 impl ProjectSearch {
     pub fn new(root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| {
-            TextInput::new("Search in project", cx)
+            TextInput::new(tr("Search in project"), cx)
                 .code()
                 .icon(IconName::Search)
         });
@@ -211,7 +216,7 @@ impl ProjectSearch {
         }
     }
 
-    /// Новый корень проекта: результаты сбрасываются; открытое окно с запросом ищет заново.
+    /// New project root: the results are cleared; an open window with a query searches again.
     pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
         self.root = root;
         self.cancel_search();
@@ -232,8 +237,9 @@ impl ProjectSearch {
         self.open
     }
 
-    /// cmd-shift-f: закрытое окно открыть и перевести фокус в поле запроса (`seed` — текст
-    /// для него, например выделение); открытое без фокуса — сфокусировать; в фокусе — закрыть.
+    /// cmd-shift-f: opens a closed window and moves focus to the query field (`seed` is the text
+    /// for it, e.g. the selection); focuses an open window that does not have focus; closes a
+    /// focused one.
     pub fn toggle(&mut self, seed: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let input_focus = self.query.focus_handle(cx);
         if self.open && input_focus.is_focused(window) {
@@ -243,11 +249,11 @@ impl ProjectSearch {
         self.open = true;
         let current = self.query.read(cx).text();
         match seed {
-            // Новый текст сам запустит поиск (`InputEvent::Changed`).
+            // The new text starts the search by itself (`InputEvent::Changed`).
             Some(seed) if seed != current => {
                 self.query.update(cx, |query, cx| query.set_text(&seed, cx));
             }
-            // Файлы могли измениться, пока окно было скрыто.
+            // Files may have changed while the window was hidden.
             _ if reopened && !current.is_empty() => self.schedule_search(cx),
             _ => {}
         }
@@ -256,22 +262,22 @@ impl ProjectSearch {
         cx.notify();
     }
 
-    /// Esc (в окне или в редакторе, когда там снимать нечего), ×, cmd-shift-f из поля,
-    /// открытие вхождения: окно скрывается, фокус — в редактор.
+    /// Esc (in the window, or in the editor when there is nothing to clear there), ×, cmd-shift-f
+    /// from the field, opening a match: the window hides and focus goes to the editor.
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.open = false;
         cx.emit(ProjectSearchEvent::FocusEditor);
         cx.notify();
     }
 
-    /// Скрыть без возврата фокуса: щелчок мимо окна, другое окно поверх (фокусом
-    /// распоряжается Workspace).
+    /// Hides the window without returning focus: a click outside the window, another window on top
+    /// (the Workspace manages focus).
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         self.open = false;
         cx.notify();
     }
 
-    // --- Поиск ---
+    // --- Search ---
 
     fn search_query(&self, cx: &App) -> SearchQuery {
         SearchQuery {
@@ -282,8 +288,8 @@ impl ProjectSearch {
         }
     }
 
-    /// Запрос или переключатель изменились: прошлый поиск отменяется сразу, новый
-    /// начинается после паузы.
+    /// The query or a toggle changed: the previous search is canceled immediately, and the new one
+    /// starts after a pause.
     fn schedule_search(&mut self, cx: &mut Context<Self>) {
         self.cancel_search();
         let query = self.search_query(cx);
@@ -316,7 +322,7 @@ impl ProjectSearch {
                     sender.unbounded_send(file).ok();
                 })
             });
-            // Канал закрывается, когда поиск закончился (отправитель уничтожен).
+            // The channel closes when the search finishes (the sender is dropped).
             while let Some(file) = receiver.next().await {
                 let mut batch = vec![file];
                 while let Ok(file) = receiver.try_recv() {
@@ -345,7 +351,8 @@ impl ProjectSearch {
         self.search = None;
     }
 
-    /// Сбрасывает результаты. Превью остаётся до прихода новых: пока идёт поиск, оно не мигает.
+    /// Clears the results. The preview stays until new results arrive, so it does not flicker while
+    /// the search is running.
     fn clear_results(&mut self) {
         self.results.clear();
         self.collapsed.clear();
@@ -356,8 +363,8 @@ impl ProjectSearch {
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
 
-    /// Пачка файлов от поиска: встают по порядку путей; выбор сохраняется на той же строке
-    /// (если его делал пользователь) или переходит на первое совпадение.
+    /// A batch of files from the search: they are inserted in path order; the selection stays on
+    /// the same row (if the user made it) or moves to the first match.
     fn add_files(&mut self, files: Vec<FileMatches>, cx: &mut Context<Self>) {
         let pinned = self
             .selected_match()
@@ -388,7 +395,7 @@ impl ProjectSearch {
         self.sync_preview(cx);
     }
 
-    // --- Выбор, сворачивание и открытие ---
+    // --- Selection, collapsing and opening ---
 
     fn selected_match(&self) -> Option<(usize, usize)> {
         match self.rows.get(self.selected?)? {
@@ -397,14 +404,15 @@ impl ProjectSearch {
         }
     }
 
-    /// Выбрать совпадение на `steps` шагов вперёд или назад (у края списка — крайнее).
+    /// Selects the match `steps` steps forward or backward (at the edge of the list, the outermost
+    /// one).
     fn select_match(&mut self, forward: bool, steps: usize, cx: &mut Context<Self>) {
         let Some(row) = step_match_rows(&self.rows, self.selected, forward, steps) else {
             return;
         };
         self.select_row(row, cx);
-        // Прокрутка на минимум: вниз — строка у нижнего края, вверх — у верхнего, вместе
-        // с заголовком файла, если строка в файле первая.
+        // Scrolls by the minimum amount: down, the row ends up at the bottom edge; up, at the top
+        // edge, together with the file header if the row is the first one in its file.
         if forward {
             self.scroll.scroll_to_item(row, ScrollStrategy::Bottom);
         } else {
@@ -416,7 +424,7 @@ impl ProjectSearch {
         }
     }
 
-    /// Выбор строки пользователем (стрелки, щелчок): он закрепляется, превью следует за ним.
+    /// The user selected a row (arrows, click): the selection is pinned and the preview follows it.
     fn select_row(&mut self, row: usize, cx: &mut Context<Self>) {
         self.selected = Some(row);
         self.selection_pinned = true;
@@ -424,8 +432,8 @@ impl ProjectSearch {
         cx.notify();
     }
 
-    /// Щелчок по заголовку файла: свернуть или развернуть его строки. Выбор из свёрнутого
-    /// файла переходит на ближайшее видимое совпадение.
+    /// A click on a file header: collapses or expands its rows. A selection in a collapsed file
+    /// moves to the nearest visible match.
     fn toggle_file(&mut self, file: usize, cx: &mut Context<Self>) {
         let selected = self.selected_match();
         let path = self.results[file].path.clone();
@@ -440,7 +448,7 @@ impl ProjectSearch {
         cx.notify();
     }
 
-    /// Открывает выбранное вхождение в редакторе и закрывает окно.
+    /// Opens the selected match in the editor and closes the window.
     fn open_selected(&mut self, cx: &mut Context<Self>) {
         let (Some(root), Some((file, line))) = (&self.root, self.selected_match()) else {
             return;
@@ -453,7 +461,7 @@ impl ProjectSearch {
         self.close(cx);
     }
 
-    /// Щелчок по переключателю или его сочетание: искать заново, фокус — в поле.
+    /// A click on a toggle or its shortcut: searches again and moves focus to the field.
     fn toggle_option(
         &mut self,
         option: fn(&mut Self) -> &mut bool,
@@ -467,11 +475,12 @@ impl ProjectSearch {
         cx.notify();
     }
 
-    // --- Превью ---
+    // --- Preview ---
 
-    /// Превью следует за выбором: тот же файл — только найденное и место; другой — чтение
-    /// в фоне (пока читается, видно прежнее). Без выбора превью убирается — кроме поиска на
-    /// ходу, когда выбор вот-вот появится.
+    /// The preview follows the selection: for the same file, only the matches and the position are
+    /// updated; for another file, it is read in the background (the previous one stays visible
+    /// while it is being read). With no selection the preview is removed, except during a search in
+    /// progress, when a selection is about to appear.
     fn sync_preview(&mut self, cx: &mut Context<Self>) {
         let Some((file, line)) = self.selected_match() else {
             if self.status != Status::Searching {
@@ -494,7 +503,7 @@ impl ProjectSearch {
                         editor.position(*line, columns.start)..editor.position(*line, columns.end)
                     })
                     .collect();
-                // У строки может не быть вхождений (окно длинной строки их обрезало).
+                // A line may have no matches (the window of a long line cut them off).
                 let position = active
                     .and_then(|active| ranges.get(active))
                     .map_or_else(|| editor.position(document_line, 0), |r| r.start);
@@ -530,7 +539,7 @@ impl ProjectSearch {
         result: Result<Document, SharedString>,
         cx: &mut Context<Self>,
     ) {
-        // Выбор успел уйти в другой файл — это чтение уже никому не нужно.
+        // The selection has already moved to another file, so this read is no longer needed.
         if self.preview.loading.as_ref() != Some(&path) {
             return;
         }
@@ -547,7 +556,7 @@ impl ProjectSearch {
         cx.notify();
     }
 
-    // --- Отображение ---
+    // --- Rendering ---
 
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
@@ -573,10 +582,10 @@ impl ProjectSearch {
                 div()
                     .text_size(px(theme::TEXT_LG))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Find in Files"),
+                    .child(tr("Find in Files")),
             );
         let close = ui::icon_button("close", IconName::Close, ui)
-            .tooltip(ui::tooltip("Close", Some("⎋".into())))
+            .tooltip(ui::tooltip(tr("Close"), Some("⎋".into())))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close(cx)));
         div()
             .flex_none()
@@ -606,7 +615,7 @@ impl ProjectSearch {
                         "case",
                         IconName::CaseSensitive,
                         self.case_sensitive,
-                        "Match Case",
+                        tr("Match Case"),
                         &ToggleCaseSensitive,
                         |this| &mut this.case_sensitive,
                         cx,
@@ -615,7 +624,7 @@ impl ProjectSearch {
                         "word",
                         IconName::WholeWord,
                         self.whole_word,
-                        "Words",
+                        tr("Words"),
                         &ToggleWholeWord,
                         |this| &mut this.whole_word,
                         cx,
@@ -624,7 +633,7 @@ impl ProjectSearch {
                         "regex",
                         IconName::Regex,
                         self.regex,
-                        "Regex",
+                        tr("Regex"),
                         &ToggleRegex,
                         |this| &mut this.regex,
                         cx,
@@ -632,8 +641,8 @@ impl ProjectSearch {
             )
     }
 
-    /// Статус в шапке: идёт поиск, сколько найдено, остановились на пределе. Ошибки и «ничего
-    /// не найдено» — крупно вместо списка.
+    /// Status in the header: search in progress, how many matches were found, stopped at the limit.
+    /// Errors and "no results" are shown large in place of the list.
     fn render_status(&self, ui: UiColors) -> AnyElement {
         let row = || {
             div()
@@ -661,16 +670,16 @@ impl ProjectSearch {
             Status::Done(summary) if summary.matches > 0 => row()
                 .text_color(ui.text_muted)
                 .child(ui::badge(
-                    count_label(summary.matches, "result"),
+                    trn(summary.matches, "{n} result", "{n} results"),
                     ui.accent_text,
                 ))
-                .child(format!("in {}", count_label(summary.files_matched, "file")))
+                .child(trn(summary.files_matched, "in {n} file", "in {n} files"))
                 .into_any_element(),
             _ => div().into_any_element(),
         }
     }
 
-    /// Список результатов или, если показывать нечего, крупное пояснение по центру.
+    /// The results list or, if there is nothing to show, a large explanation in the center.
     fn render_results(&self, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
         if let Some((name, title, detail, color)) = self.empty_state(ui) {
@@ -724,7 +733,7 @@ impl ProjectSearch {
         .into_any_element()
     }
 
-    /// Значок, заголовок, пояснение и цвет пустого списка; `None` — показывать список.
+    /// Icon, title, explanation, and color of the empty list; `None` means show the list.
     fn empty_state(&self, ui: UiColors) -> Option<(IconName, String, String, gpui::Hsla)> {
         if !self.rows.is_empty() {
             return None;
@@ -733,33 +742,37 @@ impl ProjectSearch {
         Some(match &self.status {
             Status::NoRoot => (
                 IconName::Folder,
-                "No project folder".into(),
-                "Open a folder with ⌘O to search across its files.".into(),
+                tr("No project folder").into(),
+                tr("Open a folder with ⌘O to search across its files.").into(),
                 ui.folder,
             ),
             Status::Idle => (
                 IconName::FindInFiles,
-                "Search across the project".into(),
-                "Type text to find it in every file. Match Case ⌥⌘C, Words ⌥⌘W and Regex ⌥⌘R \
-                 narrow the search; ↑↓ pick a result, ↵ opens it."
-                    .into(),
+                tr("Search across the project").into(),
+                format!(
+                    "{} {}",
+                    tr("Type text to find it in every file."),
+                    tr(
+                        "Match Case ⌥⌘C, Words ⌥⌘W and Regex ⌥⌘R narrow the search; ↑↓ pick a result, ↵ opens it."
+                    )
+                ),
                 ui.accent_text,
             ),
             Status::Searching => (
                 IconName::Search,
-                "Searching…".into(),
-                format!("Looking for “{query}” in the project files."),
+                tr("Searching…").into(),
+                trf("Looking for “{0}” in the project files.", &[query]),
                 ui.text_muted,
             ),
             Status::Done(_) => (
                 IconName::Search,
-                format!("No results for “{query}”"),
-                "Check the spelling or turn off Match Case, Words and Regex.".into(),
+                trf("No results for “{0}”", &[query]),
+                tr("Check the spelling or turn off Match Case, Words and Regex.").into(),
                 ui.text_muted,
             ),
             Status::Error(message) => (
                 IconName::Error,
-                "Invalid regular expression".into(),
+                tr("Invalid regular expression").into(),
                 message.clone(),
                 ui.error,
             ),
@@ -820,7 +833,8 @@ impl ProjectSearch {
                 let selected = self.selected == Some(index);
                 let found = &self.results[file].lines[line];
                 let (text, ranges) = display_text(found);
-                // В выбранной строке вхождения — цветом текущего, как в превью.
+                // In the selected row, matches use the color of the current match, as in the
+                // preview.
                 let style = HighlightStyle {
                     background_color: Some(if selected {
                         ui.search_match_active
@@ -879,7 +893,7 @@ impl ProjectSearch {
         }
     }
 
-    /// Превью под списком: шапка (файл, строка, номер вхождения) и редактор только для чтения.
+    /// Preview below the list: a header (file, line, match number) and a read-only editor.
     fn render_preview(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.preview.is_empty() {
             return None;
@@ -909,11 +923,11 @@ impl ProjectSearch {
             (Some((failed, text)), _) if *failed == path => message(text.clone(), ui.text_muted),
             (_, Some((shown, editor))) => div()
                 .size_full()
-                // Пока читается другой файл, прежний виден приглушённым.
+                // While another file is being read, the previous one is shown dimmed.
                 .when(*shown != path, |body| body.opacity(0.45))
                 .child(editor.clone())
                 .into_any_element(),
-            _ => message("Loading…".into(), ui.dim),
+            _ => message(tr("Loading…").into(), ui.dim),
         };
         let header = div()
             .flex_none()
@@ -926,7 +940,8 @@ impl ProjectSearch {
             .text_size(px(theme::TEXT_SM))
             .child(file_icon(&name, &ui).render().size(px(14.)))
             .child(
-                // Путь одной строкой: каталог приглушён, имя ярче, номер строки — акцентом.
+                // The path on one line: the directory is dimmed, the name is brighter, the line
+                // number is in the accent color.
                 div()
                     .min_w_0()
                     .flex()
@@ -959,7 +974,7 @@ impl ProjectSearch {
                 div()
                     .flex_none()
                     .text_color(ui.dim)
-                    .child(format!("{ordinal} of {}", self.found.0))
+                    .child(trf("{0} of {1}", &[&ordinal, &self.found.0]))
             }));
         Some(
             div()
@@ -978,7 +993,7 @@ impl ProjectSearch {
                         .min_h_0()
                         .pt_0p5()
                         .pb_1()
-                        // Двойной щелчок по превью — открыть вхождение в редакторе.
+                        // Double-clicking the preview opens the match in the editor.
                         .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
                             if event.click_count() >= 2 {
                                 this.open_selected(cx);
@@ -1007,10 +1022,10 @@ impl ProjectSearch {
             .border_color(ui.divider)
             .child(ui::hint_bar(
                 &[
-                    ("↑↓", "select"),
-                    ("↵", "open"),
-                    ("PgUp PgDn", "page"),
-                    ("esc", "close"),
+                    ("↑↓", tr("select")),
+                    ("↵", tr("open")),
+                    ("PgUp PgDn", tr("page")),
+                    ("esc", tr("close")),
                 ],
                 ui,
             ))
@@ -1021,7 +1036,7 @@ impl ProjectSearch {
                     .gap_1p5()
                     .text_size(px(theme::TEXT_SM))
                     .text_color(ui.dim)
-                    .child("in")
+                    .child(tr("in"))
                     .child(icon(IconName::Folder, ui.folder).size(px(13.)))
                     .child(div().text_color(ui.text_muted).child(root))
             }))
@@ -1086,7 +1101,7 @@ impl Drop for ProjectSearch {
     }
 }
 
-/// Пульсирующая точка «идёт поиск».
+/// A pulsing "search in progress" dot.
 fn pulse(ui: UiColors) -> impl IntoElement {
     div()
         .flex_none()
@@ -1100,29 +1115,34 @@ fn pulse(ui: UiColors) -> impl IntoElement {
         )
 }
 
-/// Читает файл для превью (в фоновом потоке); слишком большой — сообщение вместо текста.
+/// Reads a file for the preview (on a background thread); a file that is too large yields a message
+/// instead of text.
 fn read_preview(path: &Path) -> Result<Document, SharedString> {
     let size = std::fs::metadata(path)
         .map_err(|err| SharedString::from(err.to_string()))?
         .len();
     if size > MAX_PREVIEW_BYTES {
         let megabytes = size as f64 / (1024. * 1024.);
-        return Err(format!("{megabytes:.1} MB — too large to preview").into());
+        return Err(trf(
+            "{0} MB — too large to preview",
+            &[&format!("{megabytes:.1}")],
+        )
+        .into());
     }
     Document::open(path).map_err(|err| err.to_string().into())
 }
 
-// --- Чистая логика ---
+// --- Pure logic ---
 
-/// Вставляет файл по порядку путей; возвращает его место.
+/// Inserts a file in path order; returns its position.
 fn insert_sorted(results: &mut Vec<FileMatches>, file: FileMatches) -> usize {
     let index = results.partition_point(|other| other.path < file.path);
     results.insert(index, file);
     index
 }
 
-/// Плоский список: заголовок каждого файла, за ним — его строки с вхождениями, если файл
-/// не свёрнут.
+/// A flat list: each file's header followed by its lines with matches, unless the file is
+/// collapsed.
 fn flatten(results: &[FileMatches], collapsed: &HashSet<PathBuf>) -> Vec<Row> {
     results
         .iter()
@@ -1139,8 +1159,8 @@ fn flatten(results: &[FileMatches], collapsed: &HashSet<PathBuf>) -> Vec<Row> {
         .collect()
 }
 
-/// Следующая (`forward`) или предыдущая строка совпадения после `from`; без выбора — первая
-/// в списке. Заголовки файлов пропускаются; у края списка — `None` (выбор остаётся).
+/// The next (`forward`) or previous match row relative to `from`; with no selection, the first one
+/// in the list. File headers are skipped; at the edge of the list, `None` (the selection stays).
 fn next_match_row(rows: &[Row], from: Option<usize>, forward: bool) -> Option<usize> {
     let is_match = |index: &usize| matches!(rows[*index], Row::Line { .. });
     match (from, forward) {
@@ -1150,8 +1170,8 @@ fn next_match_row(rows: &[Row], from: Option<usize>, forward: bool) -> Option<us
     }
 }
 
-/// До `steps` шагов по совпадениям от `from`; у края списка — крайнее совпадение. `None` —
-/// шагать некуда (выбор остаётся).
+/// Up to `steps` steps through the matches from `from`; at the edge of the list, the outermost
+/// match. `None` means there is nowhere to step (the selection stays).
 fn step_match_rows(
     rows: &[Row],
     from: Option<usize>,
@@ -1175,25 +1195,25 @@ fn step_match_rows(
     moved
 }
 
-/// Строка списка с вхождениями строки `line` файла `file`, если она видна.
+/// The list row with the matches of line `line` of file `file`, if it is visible.
 fn row_of(rows: &[Row], file: usize, line: usize) -> Option<usize> {
     rows.iter().position(|row| *row == Row::Line { file, line })
 }
 
-/// Куда уходит выбор из свёрнутого файла `file`: на первое совпадение после его заголовка,
-/// а если ниже ничего нет — на последнее перед ним.
+/// Where the selection goes from a collapsed file `file`: to the first match after its header, or,
+/// if there is nothing below, to the last one before it.
 fn fallback_row(rows: &[Row], file: usize) -> Option<usize> {
     let header = rows.iter().position(|row| *row == Row::File(file))?;
     next_match_row(rows, Some(header), true).or_else(|| next_match_row(rows, Some(header), false))
 }
 
-/// Сколько вхождений в файле.
+/// The number of matches in a file.
 fn match_count(file: &FileMatches) -> usize {
     file.lines.iter().map(|line| line.ranges.len().max(1)).sum()
 }
 
-/// Номер (с единицы) первого вхождения строки `line` файла `file` среди всех найденных —
-/// «3 of 72» в превью; считается так же, как общий счётчик (`match_count`).
+/// The number (from one) of the first match in line `line` of file `file` among all those found: "3
+/// of 72" in the preview; counted the same way as the total counter (`match_count`).
 fn match_ordinal(results: &[FileMatches], file: usize, line: usize) -> usize {
     let before_files: usize = results[..file].iter().map(match_count).sum();
     let before_lines: usize = results[file].lines[..line]
@@ -1203,8 +1223,8 @@ fn match_ordinal(results: &[FileMatches], file: usize, line: usize) -> usize {
     before_files + before_lines + 1
 }
 
-/// Вхождения файла для превью — (строка, колонки в символах настоящей строки) по порядку —
-/// и номер текущего: первого вхождения в строке `selected`.
+/// The file's matches for the preview, in order, as (line, columns in characters of the real line),
+/// and the number of the current one: the first match in line `selected`.
 fn preview_matches(
     file: &FileMatches,
     selected: usize,
@@ -1224,7 +1244,7 @@ fn preview_matches(
     (matches, active)
 }
 
-/// Куда перейти по строке совпадения: на первое вхождение в ней.
+/// Where to jump for a match row: to the first match in it.
 fn location_for(root: &Path, file: &FileMatches, line: usize) -> Location {
     let found = &file.lines[line];
     let first = found.ranges.first().cloned().unwrap_or(0..0);
@@ -1236,7 +1256,7 @@ fn location_for(root: &Path, file: &FileMatches, line: usize) -> Location {
     }
 }
 
-/// Имя файла и каталог (относительный, через `/`) для заголовка.
+/// The file name and directory (relative, `/`-separated) for the header.
 fn split_path(path: &Path) -> (String, String) {
     let name = path.file_name().map_or_else(
         || path.display().to_string(),
@@ -1254,11 +1274,12 @@ fn split_path(path: &Path) -> (String, String) {
     (name, dir)
 }
 
-/// Строка совпадения для показа: без отступа в начале, табы — пробелами, обрезанное окном
-/// начало строки — с «…». Вхождения — байтовые диапазоны в этой строке.
+/// The match line for display: no leading indentation, tabs replaced with spaces, and the start of
+/// the line cut off by the window prefixed with "…". Matches are byte ranges in this line.
 fn display_text(found: &LineMatch) -> (String, Vec<Range<usize>>) {
     let indent = found.text.chars().take_while(|c| c.is_whitespace()).count();
-    // Отступ режется только до первого вхождения: поиск мог найти и сами пробелы.
+    // Indentation is trimmed only up to the first match: the search may have matched the spaces
+    // themselves.
     let skip = found.ranges.first().map_or(indent, |r| indent.min(r.start));
     let ellipsis = found.column_offset > 0;
     let mut text = String::with_capacity(found.text.len() + 3);
@@ -1282,7 +1303,8 @@ fn display_text(found: &LineMatch) -> (String, Vec<Range<usize>>) {
     (text, ranges)
 }
 
-/// Символьные диапазоны → байтовые; за концом строки — обрезаются, пустые — отбрасываются.
+/// Character ranges → byte ranges; ranges past the end of the line are clipped, empty ones are
+/// dropped.
 fn char_ranges_to_bytes(
     text: &str,
     ranges: impl IntoIterator<Item = Range<usize>>,
@@ -1300,17 +1322,20 @@ fn char_ranges_to_bytes(
         .collect()
 }
 
-/// Текст статуса и признак ошибки. `found` — вхождения и файлы, пришедшие во время поиска.
+/// The status text and the error flag. `found` holds the matches and files that arrived during the
+/// search.
 fn status_text(status: &Status, found: (usize, usize)) -> (SharedString, bool) {
     let text = match status {
         Status::Idle => String::new(),
-        Status::NoRoot => "No project folder — open one with ⌘O".into(),
-        Status::Searching if found.0 == 0 => "Searching…".into(),
-        Status::Searching => format!("Searching… {}", results_label(found.0, found.1)),
-        Status::Done(summary) if summary.matches == 0 => "No results".into(),
-        Status::Done(summary) if summary.truncated => {
-            format!("Stopped at {} results", summary.matches)
-        }
+        Status::NoRoot => tr("No project folder — open one with ⌘O").into(),
+        Status::Searching if found.0 == 0 => tr("Searching…").into(),
+        Status::Searching => trf("Searching… {0}", &[&results_label(found.0, found.1)]),
+        Status::Done(summary) if summary.matches == 0 => tr("No results").into(),
+        Status::Done(summary) if summary.truncated => trn(
+            summary.matches,
+            "Stopped at {n} result",
+            "Stopped at {n} results",
+        ),
         Status::Done(summary) => results_label(summary.matches, summary.files_matched),
         Status::Error(message) => return (message.clone().into(), true),
     };
@@ -1320,19 +1345,13 @@ fn status_text(status: &Status, found: (usize, usize)) -> (SharedString, bool) {
 /// «3 results in 2 files», «1 result in 1 file».
 fn results_label(matches: usize, files: usize) -> String {
     format!(
-        "{} in {}",
-        count_label(matches, "result"),
-        count_label(files, "file")
+        "{} {}",
+        trn(matches, "{n} result", "{n} results"),
+        trn(files, "in {n} file", "in {n} files")
     )
 }
 
-/// «1 result», «3 results».
-fn count_label(count: usize, noun: &str) -> String {
-    let plural = if count == 1 { "" } else { "s" };
-    format!("{count} {noun}{plural}")
-}
-
-/// Запрос для пояснений: одна строка, длинный — сокращён.
+/// The query for the explanations: a single line, shortened if it is long.
 fn single_line_label(query: &str) -> String {
     const MAX_CHARS: usize = 60;
     let line = query.lines().next().unwrap_or_default();
@@ -1348,7 +1367,8 @@ fn single_line_label(query: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Диапазон без литерала `a..b` в одноэлементных массивах (clippy принимает его за ошибку).
+    /// A range without the `a..b` literal, for single-element arrays (clippy takes that for a
+    /// mistake).
     fn span(start: usize, end: usize) -> Range<usize> {
         start..end
     }
@@ -1381,7 +1401,7 @@ mod tests {
         }
         let paths: Vec<_> = results.iter().map(|f| f.path.to_str().unwrap()).collect();
         assert_eq!(paths, ["Cargo.toml", "README.md", "src/a.rs", "src/b.rs"]);
-        // Каталог — по компонентам: `src/x` раньше `src.rs`.
+        // A directory is compared by components: `src/x` comes before `src.rs`.
         let mut results = Vec::new();
         insert_sorted(&mut results, file("src.rs", 1));
         assert_eq!(insert_sorted(&mut results, file("src/x.rs", 1)), 0);
@@ -1410,7 +1430,7 @@ mod tests {
             rows,
             [Row::File(0), Row::File(1), Row::Line { file: 1, line: 0 }]
         );
-        // Стрелки проходят мимо свёрнутого файла.
+        // The arrows skip past a collapsed file.
         assert_eq!(next_match_row(&rows, None, true), Some(2));
         assert_eq!(next_match_row(&rows, Some(2), false), None);
     }
@@ -1430,14 +1450,14 @@ mod tests {
 
     #[test]
     fn pages_step_over_matches_and_stop_at_the_edges() {
-        // Строки: 0 — a.rs, 1..=4 — его строки, 5 — b.rs, 6..=8 — его строки.
+        // Rows: 0 is a.rs, 1..=4 are its lines, 5 is b.rs, 6..=8 are its lines.
         let rows = flatten(&[file("a.rs", 4), file("b.rs", 3)], &expanded());
         assert_eq!(step_match_rows(&rows, Some(1), true, 3), Some(4));
         assert_eq!(step_match_rows(&rows, Some(1), true, 4), Some(6));
         assert_eq!(step_match_rows(&rows, Some(2), true, 10), Some(8));
         assert_eq!(step_match_rows(&rows, Some(7), false, 10), Some(1));
         assert_eq!(step_match_rows(&rows, Some(8), true, 10), None);
-        // Без выбора — первое совпадение, сколько бы шагов ни просили.
+        // With no selection, the first match, however many steps are requested.
         assert_eq!(step_match_rows(&rows, None, true, 10), Some(1));
         assert_eq!(step_match_rows(&[], None, true, 10), None);
     }
@@ -1445,15 +1465,16 @@ mod tests {
     #[test]
     fn collapsing_the_selected_file_moves_the_selection() {
         let results = [file("a.rs", 2), file("b.rs", 1), file("c.rs", 1)];
-        // Свернули b.rs: выбор уходит на первое совпадение ниже — в c.rs.
+        // b.rs is collapsed: the selection moves to the first match below, in c.rs.
         let collapsed = HashSet::from([PathBuf::from("b.rs")]);
         let rows = flatten(&results, &collapsed);
         assert_eq!(fallback_row(&rows, 1), row_of(&rows, 2, 0));
-        // Свернули последний файл: ниже ничего — на последнее совпадение выше.
+        // The last file is collapsed: there is nothing below, so the selection goes to the last
+        // match above.
         let collapsed = HashSet::from([PathBuf::from("c.rs")]);
         let rows = flatten(&results, &collapsed);
         assert_eq!(fallback_row(&rows, 2), row_of(&rows, 1, 0));
-        // Свёрнуто всё — выбора нет.
+        // Everything is collapsed: there is no selection.
         let collapsed: HashSet<_> = ["a.rs", "b.rs", "c.rs"].map(PathBuf::from).into();
         let rows = flatten(&results, &collapsed);
         assert_eq!(fallback_row(&rows, 0), None);
@@ -1478,7 +1499,7 @@ mod tests {
             [(3, span(0, 3)), (3, span(4, 7)), (9, span(100, 103))]
         );
         assert_eq!(active, Some(2));
-        // Текущее — первое вхождение выбранной строки.
+        // The current one is the first match of the selected line.
         assert_eq!(preview_matches(&found, 0).1, Some(0));
     }
 
@@ -1518,16 +1539,17 @@ mod tests {
 
     #[test]
     fn display_text_drops_indent_and_keeps_matches_aligned() {
-        // «    let ы = foo;»: вхождения «ы» (символы 8..9) и «foo» (12..15).
+        // "    let ы = foo;": matches "ы" (characters 8..9) and "foo" (12..15).
         let (text, ranges) = display_text(&line(0, "    let ы = foo;", &[8..9, 12..15]));
         assert_eq!(text, "let ы = foo;");
         assert_eq!(ranges, [4..6, 9..12]);
         assert_eq!(&text[ranges[1].clone()], "foo");
-        // Табы — пробелы, длина в символах та же.
+        // Tabs become spaces; the length in characters is the same.
         let (text, ranges) = display_text(&line(0, "\tx\ty", &[span(3, 4)]));
         assert_eq!(text, "x y");
         assert_eq!(&text[ranges[0].clone()], "y");
-        // Искали сами пробелы: отступ режется только до вхождения.
+        // The search was for the spaces themselves: the indentation is trimmed only up to the
+        // match.
         let (text, ranges) = display_text(&line(0, "    x", &[span(2, 4)]));
         assert_eq!(text, "  x");
         assert_eq!(ranges, [span(0, 2)]);

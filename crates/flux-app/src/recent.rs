@@ -1,25 +1,26 @@
-//! Недавние проекты: каталоги, последние — первыми. Хранятся между запусками в файле
-//! `~/Library/Application Support/flux/recent-projects` (путь на строку).
+//! Recent projects: directories, most recent first. Stored between launches in the file
+//! `~/Library/Application Support/flux/recent-projects` (one path per line).
 //!
-//! Путь файла переопределяет `FLUX_RECENT_FILE`. В сценариях проверки (`FLUX_SCENARIO`)
-//! без него список не читается и не пишется: прогоны агентов не попадают в список автора.
-//! Ошибки ввода-вывода не мешают работе — список просто не сохранится (сообщение в stderr).
+//! The file path can be overridden with `FLUX_RECENT_FILE`. In verification scenarios
+//! (`FLUX_SCENARIO`), without it the list is neither read nor written: agent runs don't end up in
+//! the author's list. I/O errors don't interfere with operation: the list simply won't be saved (a
+//! message goes to stderr).
 
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Сколько проектов помнить.
+/// How many projects to remember.
 pub const MAX_RECENT: usize = 10;
 
-/// Недавние проекты, последние — первыми; исчезнувшие каталоги пропускаются.
+/// Recent projects, most recent first; directories that have disappeared are skipped.
 pub fn load() -> Vec<PathBuf> {
     store_path().map_or_else(Vec::new, |file| load_from(&file))
 }
 
-/// Запоминает проект первым в списке; возвращает новый список (исчезнувшие каталоги в нём
-/// пропущены, но в файле остаются: том мог быть просто не подключён).
+/// Remembers the project as the first in the list; returns the new list (directories that have
+/// disappeared are skipped in it but remain in the file: the volume may simply not be connected).
 pub fn record(root: &Path) -> Vec<PathBuf> {
     match store_path() {
         Some(file) => record_in(&file, root),
@@ -35,7 +36,7 @@ fn store_path() -> Option<PathBuf> {
     )
 }
 
-/// Где хранится список: явный файл, иначе (не в сценарии) — в Application Support.
+/// Where the list is stored: an explicit file, otherwise (outside a scenario) Application Support.
 fn store_path_for(
     recent_file: Option<OsString>,
     scenario: bool,
@@ -76,8 +77,8 @@ fn read(file: &Path) -> Vec<PathBuf> {
     }
 }
 
-/// Файл → список: путь на строку; пустые строки, относительные пути и повторы
-/// пропускаются, лишнее сверх [`MAX_RECENT`] отбрасывается.
+/// File → list: one path per line; empty lines, relative paths, and duplicates are skipped, and
+/// anything beyond [`MAX_RECENT`] is dropped.
 fn parse(text: &str) -> Vec<PathBuf> {
     let mut list: Vec<PathBuf> = Vec::new();
     for line in text.lines() {
@@ -90,7 +91,7 @@ fn parse(text: &str) -> Vec<PathBuf> {
     list
 }
 
-/// `root` — первым; его прежнее место освобождается; длина — не больше [`MAX_RECENT`].
+/// `root` goes first; its previous place is freed; the length is at most [`MAX_RECENT`].
 fn push_front(mut list: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
     list.retain(|known| known != root);
     list.insert(0, root.to_path_buf());
@@ -98,8 +99,8 @@ fn push_front(mut list: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
     list
 }
 
-/// Список → текст файла. Пути, которые не записать строкой (не UTF-8, с переводом
-/// строки), пропускаются — иначе при чтении получился бы другой путь.
+/// List → file text. Paths that can't be written as a line (non-UTF-8, containing a line break) are
+/// skipped; otherwise reading would produce a different path.
 fn serialize(list: &[PathBuf]) -> String {
     list.iter()
         .filter_map(|path| path.to_str())
@@ -108,8 +109,9 @@ fn serialize(list: &[PathBuf]) -> String {
         .collect()
 }
 
-/// Запись через временный файл рядом и `rename`: файл никогда не бывает недописанным.
-/// Имя временного файла — с номером процесса: два окна flux не пишут в один временный файл.
+/// Writes through a temporary file next to the target and a `rename`: the file is never left
+/// half-written. The temporary file's name includes the process ID: two flux windows don't write to
+/// the same temporary file.
 fn write(file: &Path, list: &[PathBuf]) -> io::Result<()> {
     if let Some(dir) = file.parent() {
         fs::create_dir_all(dir)?;
@@ -131,7 +133,7 @@ mod tests {
         list.iter().map(PathBuf::from).collect()
     }
 
-    /// Свой временный каталог на тест: тесты идут параллельно.
+    /// Each test has its own temporary directory: tests run in parallel.
     fn temp_dir(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("flux-recent-test-{}-{name}", std::process::id()));
@@ -204,7 +206,7 @@ mod tests {
         let (one, two) = (dir.join("one"), dir.join("two"));
         fs::create_dir_all(&one).unwrap();
         fs::create_dir_all(&two).unwrap();
-        // Каталог хранилища создаётся при первой записи.
+        // The storage directory is created on the first write.
         let file = dir.join("store/recent-projects");
 
         assert_eq!(record_in(&file, &one), vec![one.clone()]);
@@ -212,11 +214,11 @@ mod tests {
         assert_eq!(record_in(&file, &one), vec![one.clone(), two.clone()]);
         assert_eq!(load_from(&file), vec![one.clone(), two.clone()]);
 
-        // Исчезнувший каталог не показывается, но остаётся в файле.
+        // A directory that has disappeared is not shown but stays in the file.
         fs::remove_dir_all(&two).unwrap();
         assert_eq!(load_from(&file), vec![one.clone()]);
         assert_eq!(read(&file), vec![one.clone(), two.clone()]);
-        // Временных файлов не осталось.
+        // No temporary files are left.
         let leftovers = fs::read_dir(dir.join("store")).unwrap().count();
         assert_eq!(leftovers, 1);
 

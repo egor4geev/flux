@@ -1,5 +1,5 @@
-//! Общее для интеграционных тестов: детерминированный ГПСЧ, случайные
-//! мультикурсорные правки, сравнение деревьев.
+//! Shared by the integration tests: a deterministic PRNG, random multi-cursor edits, tree
+//! comparison.
 
 #![allow(dead_code)]
 
@@ -12,7 +12,7 @@ use flux_core::{ChangeSet, Rope};
 use flux_syntax::tree_sitter::{InputEdit, Parser, Point, Tree};
 use flux_syntax::{Language, Syntax};
 
-/// SplitMix64: без зависимостей и одинаково на любой машине.
+/// SplitMix64: dependency-free and identical on any machine.
 pub struct Rng(u64);
 
 impl Rng {
@@ -28,7 +28,7 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    /// Число в `0..n`; `n > 0`.
+    /// A number in `0..n`; `n > 0`.
     pub fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
     }
@@ -42,8 +42,8 @@ impl Rng {
     }
 }
 
-/// Вставки, общие для всех языков: многобайтовые символы, переводы строк,
-/// скобки и кавычки, ломающие и чинящие разбор.
+/// Insertions common to all languages: multibyte characters, newlines, brackets and quotes that
+/// break and repair the parse.
 pub const COMMON_SNIPPETS: &[&str] = &[
     "x",
     " ",
@@ -74,9 +74,8 @@ pub const COMMON_SNIPPETS: &[&str] = &[
     "    ",
 ];
 
-/// Случайный ChangeSet: от одного до четырёх диапазонов (мультикурсор),
-/// вставки, удаления (в том числе через несколько строк), замены и
-/// иногда вставка в самый конец.
+/// A random ChangeSet: one to four ranges (multi-cursor), insertions, deletions (including ones
+/// spanning several lines), replacements, and occasionally an insertion at the very end.
 pub fn random_changes(rng: &mut Rng, text: &Rope, snippets: &[&str]) -> ChangeSet {
     let len = text.len_chars();
     let snippet = |rng: &mut Rng| -> String {
@@ -95,7 +94,7 @@ pub fn random_changes(rng: &mut Rng, text: &Rope, snippets: &[&str]) -> ChangeSe
     for from in starts {
         let to = match rng.below(if shrink { 3 } else { 6 }) {
             0 => {
-                // Удаление через несколько строк.
+                // A deletion spanning several lines.
                 let line = text.char_to_line(from);
                 let last = (line + 1 + rng.below(3)).min(text.len_lines() - 1);
                 text.line_to_char(last) + rng.below(text.line(last).len_chars() + 1)
@@ -124,14 +123,14 @@ pub fn fresh_tree(language: &Language, text: &Rope) -> Tree {
     parser.parse(text.to_string(), None).unwrap()
 }
 
-/// Разбор до конца прямо здесь, как сделал бы фоновый поток.
+/// Parses to completion right here, as a background thread would.
 pub fn parse_now(syntax: &mut Syntax, text: &Rope) {
     if let Some(job) = syntax.parse_job(text) {
         assert!(syntax.finish(job.run()));
     }
 }
 
-/// Все узлы дерева, включая анонимные, с байтами и точками.
+/// All nodes of the tree, including anonymous ones, with their bytes and points.
 pub fn dump(tree: &Tree) -> String {
     let mut out = String::new();
     let mut cursor = tree.walk();
@@ -168,7 +167,7 @@ pub fn dump(tree: &Tree) -> String {
     }
 }
 
-/// Точки по определению tree-sitter: строки — по `\n`, колонка — байты.
+/// Points by tree-sitter's definition: lines are split on `\n`, the column is in bytes.
 pub struct PointIndex {
     row_starts: Vec<usize>,
 }
@@ -191,8 +190,8 @@ impl PointIndex {
     }
 }
 
-/// Эталон для правок дерева: те же правки, что строит крейт, но координаты —
-/// наивно, по `String` (символ → байт перебором, точки — по таблице строк).
+/// The reference for tree edits: the same edits the crate builds, but with coordinates computed
+/// naively on a `String` (character → byte by iteration, points via a line table).
 pub struct NaiveTree {
     parser: Parser,
     pub tree: Tree,
@@ -258,7 +257,7 @@ impl NaiveTree {
     }
 }
 
-/// Каждый узел дерева лежит в тексте, и его точки совпадают с байтами.
+/// Every tree node lies within the text, and its points agree with its bytes.
 pub fn check_points(tree: &Tree, text: &str) -> Result<(), String> {
     let index = PointIndex::new(text);
     let mut cursor = tree.walk();

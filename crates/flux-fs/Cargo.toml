@@ -6,11 +6,11 @@ license.workspace = true
 
 [dependencies]
 ignore = "0.4.33"
-# Переименование без замены существующего: `renamex_np` (macOS), `renameat2` (Linux).
+# Renaming without overwriting an existing file: `renamex_np` (macOS), `renameat2` (Linux).
 libc = "0.2.190"
-# Наблюдение за файлами проекта: на macOS — FSEvents.
+# Watching project files: FSEvents on macOS.
 notify = "8.2.0"
-# Удаление в Корзину; на macOS — `NSFileManager trashItemAtURL` (без запроса прав).
+# Moving to the Trash; on macOS, `NSFileManager trashItemAtURL` (without a permission request).
 trash = { version = "5.2.9", default-features = false }
 
 [dev-dependencies]

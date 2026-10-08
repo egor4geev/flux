@@ -1,11 +1,11 @@
 #!/bin/bash
-# Приложение flux.app для macOS: release-сборка, иконка из логотипа, Info.plist.
+# Flux.app for macOS: a release build, an icon made from the logo, Info.plist.
 #
-#   scripts/bundle-macos.sh            → target/release/flux.app
-#   open target/release/flux.app       # запуск как приложение (иконка в Dock, Finder)
-#   open target/release/flux.app --args ~/dev/project
+#   scripts/bundle-macos.sh            → target/release/Flux.app
+#   open target/release/Flux.app       # launch as an app (icon in the Dock and Finder)
+#   open target/release/Flux.app --args ~/dev/project
 #
-# Без подписи и нотаризации — это этап 7 (Roadmap). Иконка генерируется из
+# Unsigned and not notarized: that is stage 7 (Roadmap). The icon is generated from
 # crates/flux-app/assets/brand/logo.svg (scripts/app-icon.swift + iconutil).
 set -euo pipefail
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
@@ -14,7 +14,7 @@ cd "$ROOT"
 
 cargo build --quiet --release -p flux-app
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-APP=target/release/flux.app
+APP=target/release/Flux.app
 ICONSET=target/release/flux.iconset
 
 rm -rf "$APP" "$ICONSET"
@@ -29,8 +29,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>flux</string>
-    <key>CFBundleDisplayName</key><string>flux</string>
+    <key>CFBundleName</key><string>Flux</string>
+    <key>CFBundleDisplayName</key><string>Flux</string>
     <key>CFBundleIdentifier</key><string>dev.flux.editor</string>
     <key>CFBundleExecutable</key><string>flux</string>
     <key>CFBundleIconFile</key><string>flux</string>
@@ -43,6 +43,6 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-# Finder и Dock кешируют значки: свежая дата пакета заставляет перечитать иконку.
+# Finder and the Dock cache icons: a fresh bundle date forces the icon to be re-read.
 touch "$APP"
 echo "$ROOT/$APP"

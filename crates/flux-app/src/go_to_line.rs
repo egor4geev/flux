@@ -1,7 +1,7 @@
-//! Переход к строке (cmd-l): «строка» или «строка:колонка», с единицы.
+//! Go to line (cmd-l): "line" or "line:column", counting from one.
 //!
-//! Маленькое всплывающее окно с полем ввода. Строка вне документа — ошибка в подсказке,
-//! окно не закрывается; колонка за краем строки — курсор в её конец.
+//! A small popover with an input field. A line outside the document shows an error in the hint and
+//! the window stays open; a column past the end of the line puts the cursor at the end of the line.
 
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, Render,
@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use crate::editor::Editor;
+use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::theme::{self, Theme};
@@ -18,7 +19,7 @@ use crate::workspace::Workspace;
 actions!(go_to_line, [Toggle, Confirm, Dismiss]);
 
 const WIDTH: f32 = 460.;
-/// Шапка с полем и подвал с подсказкой — как у списков выбора.
+/// Header with the input field and footer with the hint, as in the pickers.
 const HEADER_HEIGHT: f32 = 50.;
 const FOOTER_HEIGHT: f32 = 36.;
 
@@ -42,10 +43,10 @@ pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
 pub struct GoToLine {
     editor: Entity<Editor>,
     input: Entity<TextInput>,
-    /// Строк в документе и строка курсора — с единицы, для подсказки.
+    /// Line count of the document and the cursor line (one-based), for the hint.
     line_count: usize,
     current_line: usize,
-    /// Ввод не разобрался или строка вне документа.
+    /// The input could not be parsed, or the line is outside the document.
     error: Option<SharedString>,
     _subscription: Subscription,
 }
@@ -61,14 +62,14 @@ impl GoToLine {
             (text.len_lines(), text.char_to_line(head) + 1)
         };
         let input = cx.new(|cx| {
-            TextInput::new("Line number or line:column", cx)
+            TextInput::new(tr("Line number or line:column"), cx)
                 .borderless()
                 .large()
         });
         let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
             match event {
                 InputEvent::Changed => {
-                    // Ошибку показываем по мере ввода, но пустое поле — не ошибка.
+                    // The error is shown as the user types, but an empty field is not an error.
                     let text = input.read(cx).text();
                     this.error = match text.trim() {
                         "" => None,
@@ -88,13 +89,13 @@ impl GoToLine {
         }
     }
 
-    /// Строка и колонка с нуля — или текст ошибки для подсказки.
+    /// Zero-based line and column, or the error text for the hint.
     fn check(&self, text: &str) -> Result<(usize, usize), SharedString> {
         let Some(target) = parse_target(text) else {
-            return Err("Type a line number, or line:column".into());
+            return Err(tr("Type a line number, or line:column").into());
         };
         if target.line > self.line_count {
-            return Err(format!("Line must be between 1 and {}", self.line_count).into());
+            return Err(trf("Line must be between 1 and {0}", &[&self.line_count]).into());
         }
         Ok((
             target.line - 1,
@@ -140,9 +141,9 @@ impl Render for GoToLine {
                 .text_color(ui.error)
                 .child(icon(IconName::Warning, ui.error).size(px(13.)))
                 .child(error.clone()),
-            None => div().child(format!(
-                "Current line {} of {}",
-                self.current_line, self.line_count
+            None => div().child(trf(
+                "Current line {0} of {1}",
+                &[&self.current_line, &self.line_count],
             )),
         };
         ui::popover(ui)
@@ -176,19 +177,19 @@ impl Render for GoToLine {
                     .text_size(px(theme::TEXT_SM))
                     .text_color(ui.dim)
                     .child(div().min_w_0().truncate().child(hint))
-                    .child(ui::hint_bar(&[("↵", "go"), ("esc", "close")], ui)),
+                    .child(ui::hint_bar(&[("↵", tr("go")), ("esc", tr("close"))], ui)),
             )
     }
 }
 
-/// Куда перейти: строка и колонка — с единицы, как их видит человек.
+/// Where to jump: line and column, one-based, as a person sees them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Target {
     line: usize,
     column: Option<usize>,
 }
 
-/// «12», «12:5», «12,5», « 12 : 5 », «12:» — да; «0», «abc», «12:0», «1:2:3» — нет.
+/// "12", "12:5", "12,5", " 12 : 5 ", "12:" are accepted; "0", "abc", "12:0", "1:2:3" are rejected.
 fn parse_target(text: &str) -> Option<Target> {
     let mut parts = text.trim().splitn(2, [':', ',']);
     let line = parse_positive(parts.next()?)?;

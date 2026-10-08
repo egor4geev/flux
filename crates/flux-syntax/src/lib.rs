@@ -1,16 +1,16 @@
-//! Подсветка синтаксиса через tree-sitter с инкрементальным разбором.
+//! Syntax highlighting via tree-sitter with incremental parsing.
 //!
-//! Крейт не знает ни про UI, ни про цвета:
-//! - [`Language`] — грамматика и запрос подсветки, создаются лениво;
-//!   [`language_for_path`] выбирает язык по имени файла;
-//! - [`Syntax`] — дерево документа: дешёвые правки по [`ChangeSet`](flux_core::ChangeSet)
-//!   и разбор в виде [`ParseJob`], который приложение запускает где хочет
-//!   (обычно в фоне — разбор не должен блокировать UI-поток);
-//! - [`HighlightMap`] переводит имена capture (`keyword`, `function.method`…)
-//!   в индексы областей темы, [`Syntax::highlight_lines`] отдаёт спаны строк.
+//! The crate knows nothing about the UI or colors:
+//! - [`Language`] is a grammar plus a highlighting query, created lazily; [`language_for_path`]
+//!   picks the language by file name;
+//! - [`Syntax`] is the document tree: cheap edits via [`ChangeSet`](flux_core::ChangeSet) and
+//!   parsing as a [`ParseJob`], which the application runs wherever it likes (usually in the
+//!   background, since parsing must not block the UI thread);
+//! - [`HighlightMap`] maps capture names (`keyword`, `function.method`…) to theme scope indices,
+//!   and [`Syntax::highlight_lines`] returns the spans for lines.
 //!
-//! Позиции снаружи — символы (как во всём flux), внутри — байты UTF-8 и
-//! точки tree-sitter.
+//! Positions are characters on the outside (as everywhere in flux) and UTF-8 bytes and tree-sitter
+//! points on the inside.
 
 mod edit;
 mod highlight;

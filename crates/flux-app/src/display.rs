@@ -1,5 +1,5 @@
-//! Отображаемая строка: табы развёрнуты в пробелы, подсветка переведена в
-//! `TextRun`. Чистые функции — без окна и контекста gpui.
+//! Displayed line: tabs are expanded to spaces, highlighting is converted to `TextRun`s. Pure
+//! functions, with no window or gpui context.
 
 use flux_core::Rope;
 use flux_core::text::{line_end, line_start};
@@ -8,9 +8,9 @@ use gpui::{FontStyle, FontWeight, TextRun};
 
 use crate::theme::{self, SyntaxStyle};
 
-/// Строка для отрисовки: без перевода строки, табы развёрнуты в пробелы.
-/// Второе значение — байтовое смещение в отображаемой строке для каждой
-/// колонки исходной строки и ещё одно, последнее, — длина отображаемой строки.
+/// The line to draw: no line break, tabs expanded to spaces. The second value is the byte offset
+/// into the displayed line for each column of the source line, plus one last entry: the length of
+/// the displayed line.
 pub fn display_line(text: &Rope, line: usize) -> (String, Vec<usize>) {
     let slice = text.slice(line_start(text, line)..line_end(text, line));
     let mut display = String::with_capacity(slice.len_bytes());
@@ -31,11 +31,11 @@ pub fn display_line(text: &Rope, line: usize) -> (String, Vec<usize>) {
     (display, char_to_byte)
 }
 
-/// `TextRun` отображаемой строки по спанам подсветки. Колонки спанов — символы
-/// исходной строки; `char_to_byte` (из [`display_line`]) переводит их в байты
-/// отображаемой, так что таб под спаном красится целиком. Промежутки — шрифтом и
-/// цветом `base`; всё за концом строки отбрасывается. Длины прогонов в сумме
-/// равны длине отображаемой строки, как того требует `shape_line`.
+/// Builds the `TextRun`s of a displayed line from the highlight spans. Span columns are measured in
+/// characters of the source line; `char_to_byte` (from [`display_line`]) converts them to bytes of
+/// the displayed line, so a tab under a span is colored as a whole. Gaps use the font and color of
+/// `base`; anything past the end of the line is discarded. The run lengths sum to the length of the
+/// displayed line, as `shape_line` requires.
 pub fn text_runs(
     spans: &[HighlightSpan],
     char_to_byte: &[usize],
@@ -60,7 +60,7 @@ pub fn text_runs(
                 run.font.style = FontStyle::Italic;
             }
         }
-        // Соседние прогоны одного вида сливаются: меньше работы раскладке.
+        // Adjacent runs of the same kind are merged, so layout has less work to do.
         match runs.last_mut() {
             Some(last) if last.color == run.color && last.font == run.font => last.len += len,
             _ => runs.push(run),
@@ -131,7 +131,7 @@ mod tests {
         }
     }
 
-    /// Прогоны как (длина, цвет) — для сравнения.
+    /// Runs as (length, color) pairs, for comparison.
     fn runs(source: &str, spans: &[HighlightSpan]) -> (String, Vec<(usize, Hsla)>) {
         let text = Rope::from_str(source);
         let (display, char_to_byte) = display_line(&text, 0);
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn tab_under_a_span_is_painted_whole() {
-        // «\t» в колонке 0 — четыре пробела; спан на табе и на «fn».
+        // "\t" in column 0 is four spaces; one span on the tab and one on "fn".
         let (display, got) = runs("\tfn x", &[span(0, 1, STRING), span(1, 3, KEYWORD)]);
         assert_eq!(display, "    fn x");
         assert_eq!(
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn columns_are_chars_and_runs_are_bytes() {
-        // «ы» — 2 байта, «👍🏽» — 2 символа по 4 байта.
+        // "ы" is 2 bytes; "👍🏽" is 2 characters of 4 bytes each.
         let (_, got) = runs("ы = \"п👍🏽\";", &[span(4, 9, STRING)]);
         assert_eq!(
             got,

@@ -1,8 +1,10 @@
-//! Однострочное поле ввода: запрос палитры команд, поиска файла, строки поиска и замены.
+//! A single-line input field: the query in the command palette, in file search, and in the find and
+//! replace bar.
 //!
-//! Текст, выделение и undo — `flux_core::Document`, движения и правки — функции ядра, как
-//! у редактора: графемы, слова и умный Home работают так же. Enter, Esc, ↑/↓ и Tab поле
-//! не обрабатывает — они всплывают к родителю (список выбора, строка поиска).
+//! Text, selection, and undo come from `flux_core::Document`; movements and edits are core
+//! functions, as in the editor: graphemes, words, and smart Home work the same way. The field
+//! doesn't handle Enter, Esc, ↑/↓, and Tab; they bubble up to the parent (the picker list, the find
+//! bar).
 
 use std::ops::Range as Utf16Range;
 
@@ -23,11 +25,12 @@ use crate::icons::{IconName, icon};
 use crate::theme::{self, Theme};
 use crate::ui;
 
-/// Кегль и высота строки поля; крупное поле — запрос в шапке всплывающего окна.
+/// Font size and line height of the field; the large field is the query in a popover header.
 const INPUT_TEXT_SIZE: f32 = 13.;
 const INPUT_LINE_HEIGHT: f32 = 20.;
 const LARGE_LINE_HEIGHT: f32 = 22.;
-/// Высота поля с рамкой; компактного — под строку списка (поле имени в дереве).
+/// Height of a field with a border; for the compact one, it fits a list row (the name field in the
+/// tree).
 const FIELD_HEIGHT: f32 = 30.;
 const COMPACT_HEIGHT: f32 = 22.;
 const ICON_SIZE: f32 = 14.;
@@ -94,10 +97,10 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// События поля для родителя.
+/// Field events, for the parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEvent {
-    /// Текст изменился: ввод, вставка, удаление, undo/redo, `set_text`.
+    /// The text changed: typing, paste, deletion, undo/redo, `set_text`.
     Changed,
 }
 
@@ -105,28 +108,29 @@ pub struct TextInput {
     document: Document,
     focus_handle: FocusHandle,
     placeholder: SharedString,
-    /// Текст, который сейчас набирается через IME (ещё не подтверждён).
+    /// Text currently being typed through the IME (not yet committed).
     marked_range: Option<std::ops::Range<usize>>,
-    /// Горизонтальный сдвиг текста: курсор всегда в пределах поля.
+    /// Horizontal text offset: the cursor always stays within the field.
     scroll_x: Pixels,
-    /// Раскладка прошлого кадра: по ней мышь и IME переводят пиксели в позиции.
+    /// The previous frame's layout: the mouse and IME use it to convert pixels to positions.
     layout: Option<InputLayout>,
     selecting: bool,
-    /// Без внутренних отступов: высота — строка текста и рамка (поле в строке списка).
+    /// No inner padding: the height is a text line plus the border (a field inside a list row).
     compact: bool,
-    /// Шрифт кода вместо шрифта интерфейса: запросы поиска по тексту.
+    /// The code font instead of the interface font: text search queries.
     code: bool,
-    /// Значок слева от текста (лупа у полей поиска).
+    /// Icon to the left of the text (a magnifier on search fields).
     icon: Option<IconName>,
-    /// Без фона и рамки: поле встроено в шапку всплывающего окна, рамка — у окна.
+    /// No background or border: the field is embedded in a popover header; the border belongs to
+    /// the window.
     borderless: bool,
-    /// Крупный кегль: запрос в шапке палитры, поиска файла, перехода к строке.
+    /// Large font size: the query in the header of the palette, file search, and go to line.
     large: bool,
 }
 
 struct InputLayout {
     line: LineLayout,
-    /// Экранная точка начала текста (с учётом сдвига).
+    /// Screen point of the start of the text (accounting for the offset).
     origin: Point<Pixels>,
     bounds: Bounds<Pixels>,
 }
@@ -151,13 +155,13 @@ impl TextInput {
         }
     }
 
-    /// Без фона и рамки — поле в шапке всплывающего окна.
+    /// No background or border: the field sits in a popover header.
     pub fn borderless(mut self) -> Self {
         self.borderless = true;
         self
     }
 
-    /// Крупный кегль — главный запрос всплывающего окна.
+    /// Large font size: the main query of a popover.
     pub fn large(mut self) -> Self {
         self.large = true;
         self
@@ -179,13 +183,13 @@ impl TextInput {
         })
     }
 
-    /// Текст поля — шрифтом кода (запросы поиска по тексту, regex).
+    /// The field text uses the code font (text search queries, regex).
     pub fn code(mut self) -> Self {
         self.code = true;
         self
     }
 
-    /// Значок слева от текста.
+    /// Icon to the left of the text.
     pub fn icon(mut self, icon: IconName) -> Self {
         self.icon = Some(icon);
         self
@@ -199,7 +203,7 @@ impl TextInput {
         }
     }
 
-    /// Поле высотой в строку списка (правка имени в дереве файлов).
+    /// A field the height of a list row (editing a name in the file tree).
     pub fn compact(mut self) -> Self {
         self.compact = true;
         self
@@ -213,8 +217,8 @@ impl TextInput {
         self.document.text().len_chars() == 0
     }
 
-    /// Заменяет текст целиком (одной правкой — её можно отменить), курсор — в конец.
-    /// `Changed` — только если текст стал другим.
+    /// Replaces the entire text (as a single edit that can be undone), cursor to the end. `Changed`
+    /// is emitted only if the text became different.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = single_line(text);
         if *self.document.text() == text.as_str() {
@@ -233,7 +237,7 @@ impl TextInput {
         self.set_selection(Selection::single(0, end), cx);
     }
 
-    /// Выделяет символы `range` (курсор — в конце): имя файла без расширения.
+    /// Selects the characters of `range` (cursor at the end): the file name without the extension.
     pub fn select_range(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
         let len = self.document.text().len_chars();
         self.set_selection(
@@ -325,7 +329,7 @@ impl TextInput {
         });
     }
 
-    /// Cmd+Backspace: всё от начала строки до курсора (или выделение).
+    /// Cmd+Backspace: everything from the start of the line to the cursor (or the selection).
     fn delete_to_line_start(
         &mut self,
         _: &DeleteToLineStart,
@@ -339,7 +343,7 @@ impl TextInput {
         self.apply(tx, EditKind::Other, cx);
     }
 
-    // --- Мышь ---
+    // --- Mouse ---
 
     fn position_for_mouse(&self, position: Point<Pixels>) -> usize {
         let len = self.document.text().len_chars();
@@ -383,7 +387,7 @@ impl TextInput {
         self.set_selection(Selection::from_range(primary), cx);
     }
 
-    // --- UTF-16 ↔ символы: IME и macOS считают позиции в UTF-16 ---
+    // --- UTF-16 ↔ characters: IME and macOS count positions in UTF-16 ---
 
     fn utf16_range(&self, range: &std::ops::Range<usize>) -> Utf16Range<usize> {
         let text = self.document.text();
@@ -396,7 +400,7 @@ impl TextInput {
         text.utf16_cu_to_char(range.start.min(len))..text.utf16_cu_to_char(range.end.min(len))
     }
 
-    /// Диапазон, который заменяет IME: явно заданный или текущая композиция.
+    /// The range the IME replaces: an explicitly given one or the current composition.
     fn input_range(
         &self,
         range_utf16: Option<Utf16Range<usize>>,
@@ -407,13 +411,13 @@ impl TextInput {
     }
 }
 
-/// Текст для однострочного поля: переводы строк и табы — пробелы.
+/// Text for a single-line field: line breaks and tabs become spaces.
 pub fn single_line(text: &str) -> String {
     text.replace("\r\n", " ").replace(['\n', '\r', '\t'], " ")
 }
 
-/// Нажатие Enter или Tab, которое не перехватил никто выше, приходит в поле как текст —
-/// его не вставляем.
+/// An Enter or Tab press that nobody higher up intercepted arrives in the field as text; we don't
+/// insert it.
 fn is_only_breaks(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| matches!(c, '\n' | '\r' | '\t'))
 }
@@ -458,7 +462,7 @@ impl EntityInputHandler for TextInput {
         self.marked_range = None;
     }
 
-    /// Обычный ввод символов приходит сюда, а не через действия.
+    /// Regular character input arrives here rather than through actions.
     fn replace_text_in_range(
         &mut self,
         range_utf16: Option<Utf16Range<usize>>,
@@ -484,7 +488,7 @@ impl EntityInputHandler for TextInput {
         self.apply(tx, EditKind::Insert, cx);
     }
 
-    /// Промежуточный текст IME (иероглифы, «ё» через долгое нажатие).
+    /// Intermediate IME text (CJK characters, "ё" via long press).
     fn replace_and_mark_text_in_range(
         &mut self,
         range_utf16: Option<Utf16Range<usize>>,
@@ -499,7 +503,7 @@ impl EntityInputHandler for TextInput {
             .input_range(range_utf16)
             .unwrap_or(primary.from()..primary.to());
         let len = new_text.chars().count();
-        // Выделение внутри композиции IME передаёт в UTF-16 относительно её начала.
+        // The selection inside the IME composition comes in UTF-16, relative to its start.
         let selected = new_selected_range_utf16
             .map(|r| {
                 let starts: Vec<usize> = new_text
@@ -579,8 +583,8 @@ impl Render for TextInput {
             .font_family(self.font_family())
             .text_size(self.text_size())
             .cursor(CursorStyle::IBeam);
-        // Компактное поле стоит в строке списка: кольцо фокуса вылезло бы на соседние строки,
-        // поэтому у него только акцентная рамка.
+        // The compact field sits in a list row: a focus ring would spill onto the neighboring rows,
+        // so it has only an accent border.
         let field = match (self.borderless, self.compact) {
             (true, _) => field,
             (false, true) => field
@@ -681,14 +685,14 @@ impl Render for TextInput {
     }
 }
 
-/// Строка поля: текст (или подсказка), выделение, курсор.
+/// The field's line: text (or placeholder), selection, cursor.
 struct InputElement {
     input: Entity<TextInput>,
 }
 
 struct InputPrepaint {
     line: LineLayout,
-    /// Подсказка вместо пустого текста.
+    /// Placeholder instead of empty text.
     placeholder: Option<ShapedLine>,
     origin: Point<Pixels>,
     selection: Option<PaintQuad>,
@@ -757,7 +761,7 @@ impl Element for InputElement {
             strikethrough: None,
         };
         let (display, char_to_byte) = display_line(&text, 0);
-        // Композиция IME подчёркивается.
+        // The IME composition is underlined.
         let runs = match &marked {
             Some(marked) if !display.is_empty() => {
                 let start = char_to_byte[marked.start.min(char_to_byte.len() - 1)];
@@ -790,7 +794,8 @@ impl Element for InputElement {
             text_system.shape_line(placeholder_text, font_size, &runs, None)
         });
 
-        // Сдвиг: курсор в пределах поля, без пустоты справа, когда текст укоротился.
+        // Offset: the cursor stays within the field, with no empty space on the right when the text
+        // gets shorter.
         let width = bounds.size.width;
         let cursor_width = px(CURSOR_WIDTH);
         let cursor_x = line.x_for_column(primary.head);

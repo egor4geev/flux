@@ -1,4 +1,4 @@
-//! Вью редактора: связывает документ из ядра с окном, клавиатурой, мышью и IME.
+//! The editor view: connects a document from the core with the window, keyboard, mouse, and IME.
 
 use std::ops::Range as Utf16Range;
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ use gpui::{
 
 use crate::element::{EditorElement, LayoutCache};
 use crate::highlighter::{self, Highlighter, ParseMode};
+use crate::i18n::{tr, trf};
 use crate::theme::{self, Theme};
 
 actions!(
@@ -101,7 +102,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-backspace", Backspace, context),
         KeyBinding::new("delete", Delete, context),
         KeyBinding::new("alt-backspace", DeleteWordBackward, context),
-        // Как Delete Line в JetBrains: строка целиком.
+        // Like Delete Line in JetBrains: the whole line.
         KeyBinding::new("cmd-backspace", DeleteLine, context),
         KeyBinding::new("enter", Newline, context),
         KeyBinding::new("shift-enter", Newline, context),
@@ -115,28 +116,29 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// События редактора — для тех, кто следит за ним со стороны (строка поиска).
+/// Editor events, for those who observe the editor from outside (the find bar).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorEvent {
-    /// Текст документа изменился: правка, вставка, IME, undo, redo.
+    /// The document text changed: an edit, paste, IME, undo, redo.
     Edited,
 }
 
-/// Как прокрутить к главному курсору при следующей отрисовке.
+/// How to scroll to the primary cursor on the next render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Autoscroll {
-    /// Держать курсор в окне с запасом в несколько строк — обычное движение и правка.
+    /// Keep the cursor in the viewport with a margin of a few lines: ordinary movement and editing.
     Fit,
-    /// Если строка курсора не видна — поставить её в середину окна: переход к найденному,
-    /// к строке, к результату поиска по проекту.
+    /// If the cursor line is not visible, put it in the middle of the viewport: jumping to a match,
+    /// to a line, to a project search result.
     Center,
-    /// Строку курсора — в середину окна, даже если она видна: превью поиска по проекту.
+    /// Put the cursor line in the middle of the viewport even if it is visible: the project search
+    /// preview.
     Middle,
 }
 
-/// Вхождения, найденные строкой поиска: по возрастанию, без пересечений; `active` — текущее
-/// (рисуется ярче). Владеет ими редактор: он рисует их и сдвигает своими правками, пока не
-/// придут свежие результаты поиска.
+/// Matches found by the find bar: in ascending order, non-overlapping; `active` is the current one
+/// (drawn brighter). The editor owns them: it draws them and shifts them with its own edits until
+/// fresh search results arrive.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchHighlights {
     pub matches: Vec<std::ops::Range<usize>>,
@@ -144,7 +146,7 @@ pub struct SearchHighlights {
 }
 
 impl SearchHighlights {
-    /// Сдвигает вхождения правкой; схлопнувшиеся до пустых убираются.
+    /// Shifts the matches by an edit; those that collapse to empty are removed.
     fn map(&mut self, changes: &ChangeSet) {
         let positions = self
             .matches
@@ -165,38 +167,38 @@ impl SearchHighlights {
     }
 }
 
-/// Вид одного документа: свои скролл, выделение и состояние IME.
+/// A view of a single document: its own scroll, selection, and IME state.
 pub struct Editor {
     pub(crate) document: Document,
     pub(crate) focus_handle: FocusHandle,
-    /// Смещение видимой области в пикселях.
+    /// Offset of the visible area, in pixels.
     pub(crate) scroll: Point<f32>,
-    /// Прокрутить к курсору при следующей отрисовке.
+    /// Scroll to the cursor on the next render.
     pub(crate) autoscroll: Option<Autoscroll>,
-    /// Текст, который сейчас набирается через IME (ещё не подтверждён).
+    /// Text currently being typed through the IME (not yet committed).
     pub(crate) marked_range: Option<std::ops::Range<usize>>,
     pub(crate) layout: Option<LayoutCache>,
-    /// Подсветка синтаксиса документа и её фоновый разбор.
+    /// The document's syntax highlighting and its background parsing.
     pub(crate) highlighter: Highlighter,
-    /// Фаза мигания: курсор сейчас нарисован.
+    /// Blink phase: the cursor is currently drawn.
     pub(crate) cursor_visible: bool,
-    /// Таймер мигания; есть, только пока редактор в фокусе и окно активно.
+    /// Blink timer; exists only while the editor is focused and the window is active.
     blink_task: Option<Task<()>>,
     selecting: bool,
     status: Option<SharedString>,
-    /// Подсветка найденного строкой поиска.
+    /// Highlighting of the matches found by the find bar.
     pub(crate) search: SearchHighlights,
-    /// Только для чтения (превью поиска по проекту): без фокуса, правок и мыши — кроме
-    /// колеса прокрутки; щелчки уходят родителю.
+    /// Read-only (project search preview): no focus, no edits, and no mouse handling except the
+    /// scroll wheel; clicks go to the parent.
     preview: bool,
     _subscriptions: Vec<Subscription>,
 }
 
-/// Статус документа для статус-бара окна: позиция, курсоры, язык, переводы строк и
-/// сообщение (ошибка ввода-вывода и т.п.).
+/// Document status for the window's status bar: position, cursors, language, line endings, and a
+/// message (I/O error, etc.).
 pub(crate) struct StatusInfo {
     pub message: Option<SharedString>,
-    /// Строка и колонка с единицы.
+    /// Line and column, 1-based.
     pub line: usize,
     pub column: usize,
     pub cursors: usize,
@@ -209,12 +211,12 @@ impl EventEmitter<EditorEvent> for Editor {}
 impl Editor {
     pub fn new(document: Document, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        // Мигание включается и выключается вместе с фокусом и активностью окна.
+        // Blinking is turned on and off together with focus and window activity.
         let subscriptions = vec![
             cx.on_focus(&focus_handle, window, Self::restart_blink),
             cx.on_blur(&focus_handle, window, Self::restart_blink),
             cx.observe_window_activation(window, Self::restart_blink),
-            // Новая тема — новое отображение capture на её области.
+            // A new theme means a new mapping of captures to its scopes.
             cx.observe_global::<Theme>(|this, cx| {
                 this.highlighter.refresh_map(Theme::get(cx));
                 cx.notify();
@@ -223,8 +225,8 @@ impl Editor {
         Self::build(document, focus_handle, false, subscriptions, cx)
     }
 
-    /// Превью только для чтения: документ с подсветкой, без фокуса, курсора и правок. Место
-    /// показывает [`Editor::show_position`], найденное — [`Editor::set_search_highlights`].
+    /// A read-only preview: a document with highlighting, but no focus, cursor, or edits.
+    /// [`Editor::show_position`] shows the location, [`Editor::set_search_highlights`] the matches.
     pub fn preview(document: Document, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let subscriptions = vec![cx.observe_global::<Theme>(|this, cx| {
@@ -258,13 +260,14 @@ impl Editor {
             preview,
             _subscriptions: subscriptions,
         };
-        // Первый разбор — сразу в фон: заодно там скомпилируется запрос подсветки.
+        // The first parse goes straight to the background, where the highlight query also gets
+        // compiled.
         highlighter::parse(&mut editor, ParseMode::Background, cx);
         editor
     }
 
-    /// Ставит курсор в `position` и прокручивает так, чтобы его строка была посередине
-    /// (превью: курсор не рисуется, строка подсвечена как текущая).
+    /// Puts the cursor at `position` and scrolls so that its line is in the middle (in a preview
+    /// the cursor isn't drawn; the line is highlighted as the current one).
     pub fn show_position(&mut self, position: usize, cx: &mut Context<Self>) {
         let position = position.min(self.document.text().len_chars());
         self.document.set_selection(Selection::point(position));
@@ -281,7 +284,7 @@ impl Editor {
         cx.notify();
     }
 
-    /// Двигает каждое выделение функцией из `movement`.
+    /// Moves each selection using a function from `movement`.
     fn motion(&mut self, cx: &mut Context<Self>, f: impl Fn(&Rope, Range) -> Range) {
         let text = self.document.text().clone();
         let selection = self
@@ -301,7 +304,7 @@ impl Editor {
         cx.notify();
     }
 
-    /// Undo или Redo; `step` возвращает изменения текста или `None`, если шагать некуда.
+    /// Undo or Redo; `step` returns the text changes, or `None` if there is nowhere to step.
     fn history_step(
         &mut self,
         cx: &mut Context<Self>,
@@ -316,8 +319,8 @@ impl Editor {
         }
     }
 
-    /// Текст изменился: подсветка сдвигает дерево и запускает разбор, найденное сдвигается
-    /// до прихода свежих результатов; подписчики узнают о правке.
+    /// The text changed: the highlighter shifts the tree and starts a parse; the matches are
+    /// shifted until fresh results arrive; subscribers are notified of the edit.
     fn text_changed(&mut self, changes: &[TextChange], cx: &mut Context<Self>) {
         for change in changes {
             self.highlighter.edit(change);
@@ -376,8 +379,8 @@ impl Editor {
         self.set_selection(Selection::new(ranges, primary), cx);
     }
 
-    /// Esc: несколько курсоров — оставить главный, выделение — снять. Снимать нечего — Esc
-    /// уходит выше: Workspace закроет панель поиска по проекту.
+    /// Esc: with several cursors, keep the primary one; with a selection, clear it. With nothing to
+    /// clear, Esc goes up: Workspace will close the project search panel.
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         let selection = self.document.selection();
         if selection.len() == 1 && selection.primary().is_empty() {
@@ -392,9 +395,9 @@ impl Editor {
         self.set_selection(selection, cx);
     }
 
-    // --- Поиск и переходы: их вызывают строка поиска, поиск по проекту, переход к строке ---
+    // --- Search and navigation: called by the find bar, project search, and go to line ---
 
-    /// Подсвечивает найденные вхождения (по возрастанию, без пересечений).
+    /// Highlights the matches that were found (in ascending order, non-overlapping).
     pub fn set_search_highlights(
         &mut self,
         matches: Vec<std::ops::Range<usize>>,
@@ -423,19 +426,21 @@ impl Editor {
         }
     }
 
-    /// Позиция по строке (с нуля) и колонке в символах; за краем — конец строки или документа.
+    /// Position for a line (0-based) and a column in characters; past the edge, the end of the line
+    /// or of the document.
     pub fn position(&self, line: usize, column: usize) -> usize {
         let text = self.document.text();
         let line = line.min(text.len_lines() - 1);
         line_start(text, line) + column.min(line_len(text, line))
     }
 
-    /// Выделяет диапазон (курсор — в конце) и прокручивает к нему: если он не виден — к середине окна.
+    /// Selects a range (cursor at the end) and scrolls to it: if it is not visible, to the middle
+    /// of the viewport.
     pub fn select_range(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
         self.select_ranges(vec![range], 0, cx);
     }
 
-    /// Несколько выделений разом (например, все найденные вхождения); к `primary` — прокрутка.
+    /// Several selections at once (for example, all found matches); scrolls to `primary`.
     pub fn select_ranges(
         &mut self,
         ranges: Vec<std::ops::Range<usize>>,
@@ -453,8 +458,8 @@ impl Editor {
         self.autoscroll = Some(Autoscroll::Center);
     }
 
-    /// Что искать по Cmd+F: главное выделение, если оно в одну строку, а без выделения — слово
-    /// под курсором.
+    /// What to search for on Cmd+F: the primary selection if it is on a single line, and the word
+    /// under the cursor if there is no selection.
     pub fn search_seed(&self) -> Option<String> {
         let text = self.document.text();
         let primary = self.document.selection().primary();
@@ -474,8 +479,8 @@ impl Editor {
         (single_line && !seed.trim().is_empty()).then_some(seed)
     }
 
-    /// Заменяет диапазоны текстами одной правкой — один шаг undo. Диапазоны — по возрастанию,
-    /// без пересечений.
+    /// Replaces ranges with texts in a single edit: one undo step. Ranges must be in ascending
+    /// order and non-overlapping.
     pub fn replace_ranges(
         &mut self,
         edits: Vec<(std::ops::Range<usize>, String)>,
@@ -491,7 +496,7 @@ impl Editor {
         self.apply(tx, EditKind::Other, cx);
     }
 
-    // --- Буфер обмена ---
+    // --- Clipboard ---
 
     fn selected_text(&self) -> Option<String> {
         let text = self.document.text();
@@ -505,7 +510,7 @@ impl Editor {
         (!parts.is_empty()).then(|| parts.join(self.document.line_ending()))
     }
 
-    /// Целые строки под курсорами — Copy/Cut без выделения работают со строкой.
+    /// Whole lines under the cursors: Copy/Cut with no selection operate on the line.
     fn line_selection(&self) -> Selection {
         let text = self.document.text();
         self.document.selection().transform(|range| {
@@ -556,10 +561,10 @@ impl Editor {
         });
     }
 
-    // --- Файл ---
+    // --- File ---
 
-    /// Сохраняет документ; без пути — через «Сохранить как». Результат можно дождаться:
-    /// `true` — документ записан на диск.
+    /// Saves the document; without a path, goes through "Save As". The result can be awaited:
+    /// `true` means the document was written to disk.
     pub fn save(&mut self, cx: &mut Context<Self>) -> Task<bool> {
         if self.document.path().is_some() {
             Task::ready(self.save_now(cx))
@@ -571,11 +576,11 @@ impl Editor {
     fn save_now(&mut self, cx: &mut Context<Self>) -> bool {
         let saved = match self.document.save() {
             Ok(()) => {
-                self.status = Some("Saved".into());
+                self.status = Some(tr("Saved").into());
                 true
             }
             Err(err) => {
-                self.status = Some(format!("Save failed: {err}").into());
+                self.status = Some(trf("Save failed: {0}", &[&err]).into());
                 false
             }
         };
@@ -583,7 +588,7 @@ impl Editor {
         saved
     }
 
-    /// `false` — пользователь отменил выбор файла или запись не удалась.
+    /// `false` means the user canceled the file selection or the write failed.
     fn save_as(&mut self, cx: &mut Context<Self>) -> Task<bool> {
         let directory = std::env::current_dir().unwrap_or_default();
         let path = cx.prompt_for_new_path(&directory, Some("untitled.txt"));
@@ -596,15 +601,15 @@ impl Editor {
         })
     }
 
-    /// Привязывает документ к `path` и сохраняет.
+    /// Binds the document to `path` and saves it.
     pub(crate) fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
         self.set_path(path, cx);
         self.save_now(cx)
     }
 
-    /// Привязывает документ к `path` без записи на диск: «Сохранить как», файл
-    /// переименован или перемещён в дереве файлов. Со сменой расширения может смениться
-    /// язык — тогда подсветка заводится заново и разбирается в фоне.
+    /// Binds the document to `path` without writing to disk: for "Save As" and for a file renamed
+    /// or moved in the file tree. Changing the extension may change the language, in which case
+    /// highlighting is set up anew and parsed in the background.
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.highlighter.set_path(&path, self.document.text()) {
             highlighter::parse(self, ParseMode::Background, cx);
@@ -613,16 +618,16 @@ impl Editor {
         cx.notify();
     }
 
-    /// Сообщение в статус-баре — до следующей правки или движения курсора.
+    /// A status bar message, until the next edit or cursor movement.
     pub fn show_status(&mut self, message: SharedString, cx: &mut Context<Self>) {
         self.status = Some(message);
         cx.notify();
     }
 
-    // --- Мигание курсора ---
+    // --- Cursor blinking ---
 
-    /// Вызывается при смене фокуса и активности окна: курсор сразу виден, а таймер
-    /// мигания есть, только пока редактор в фокусе и окно активно.
+    /// Called when focus or window activity changes: the cursor is shown immediately, and the blink
+    /// timer exists only while the editor is focused and the window is active.
     fn restart_blink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let blinking = self.focus_handle.is_focused(window) && window.is_window_active();
         self.cursor_visible = true;
@@ -632,8 +637,8 @@ impl Editor {
         cx.notify();
     }
 
-    /// Правка или движение: курсор сразу виден, следующее мигание — через полный период.
-    /// Поэтому во время набора курсор не мигает.
+    /// An edit or movement: the cursor is shown immediately, and the next blink comes after a full
+    /// period. That is why the cursor doesn't blink while typing.
     fn pause_blink(&mut self, cx: &mut Context<Self>) {
         self.cursor_visible = true;
         if self.blink_task.is_some()
@@ -658,7 +663,7 @@ impl Editor {
         })
     }
 
-    // --- Мышь ---
+    // --- Mouse ---
 
     fn position_for_mouse(&self, position: Point<Pixels>) -> Option<usize> {
         let layout = self.layout.as_ref()?;
@@ -727,10 +732,10 @@ impl Editor {
         cx.notify();
     }
 
-    // --- Отображение ---
+    // --- Display ---
 
-    /// Статус-бар окна для этого редактора: рисует его Workspace внизу окна, под панелями.
-    /// Что показать в статус-баре окна про этот документ (рисует Workspace).
+    /// The window status bar for this editor: Workspace draws it at the bottom of the window, below
+    /// the panels. What to show in the window status bar about this document (drawn by Workspace).
     pub(crate) fn status_info(&self) -> StatusInfo {
         let text = self.document.text();
         let primary = self.document.selection().primary();
@@ -749,7 +754,7 @@ impl Editor {
         }
     }
 
-    // --- UTF-16 ↔ символы: IME и macOS считают позиции в UTF-16 ---
+    // --- UTF-16 ↔ characters: IME and macOS count positions in UTF-16 ---
 
     fn utf16_range(&self, range: &std::ops::Range<usize>) -> Utf16Range<usize> {
         let text = self.document.text();
@@ -762,7 +767,8 @@ impl Editor {
         text.utf16_cu_to_char(range.start.min(len))..text.utf16_cu_to_char(range.end.min(len))
     }
 
-    /// Диапазон, который заменяет IME: явно заданный, текущая композиция или выделение.
+    /// The range the IME replaces: an explicitly given one, the current composition, or the
+    /// selection.
     fn input_range(
         &self,
         range_utf16: Option<Utf16Range<usize>>,
@@ -813,7 +819,7 @@ impl EntityInputHandler for Editor {
         self.marked_range = None;
     }
 
-    /// Обычный ввод символов приходит сюда, а не через действия.
+    /// Regular character input arrives here rather than through actions.
     fn replace_text_in_range(
         &mut self,
         range_utf16: Option<Utf16Range<usize>>,
@@ -833,14 +839,14 @@ impl EntityInputHandler for Editor {
                 Transaction::change(text, [(range.start, range.end, Some(new_text.to_owned()))])
                     .with_selection(Selection::point(end))
             }
-            // Без явного диапазона — печатаем во все курсоры.
+            // Without an explicit range, we type at all cursors.
             None => edit::insert_text(self.document.text(), self.document.selection(), new_text),
         };
         self.marked_range = None;
         self.apply(tx, kind, cx);
     }
 
-    /// Промежуточный текст IME (например, набор иероглифов или «ё» через долгое нажатие).
+    /// Intermediate IME text (for example, typing CJK characters, or "ё" via long press).
     fn replace_and_mark_text_in_range(
         &mut self,
         range_utf16: Option<Utf16Range<usize>>,
@@ -854,7 +860,7 @@ impl EntityInputHandler for Editor {
             .input_range(range_utf16)
             .unwrap_or(primary.from()..primary.to());
         let len = new_text.chars().count();
-        // Выделение внутри композиции IME передаёт в UTF-16 относительно её начала.
+        // The selection inside the IME composition comes in UTF-16, relative to its start.
         let selected = new_selected_range_utf16
             .map(|r| {
                 let chars: Vec<usize> = new_text
@@ -913,7 +919,8 @@ impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use Direction::{Backward, Forward};
         let ui = Theme::ui(cx);
-        // Превью не берёт фокус: иначе щелчок по нему увёл бы ввод из поля поиска.
+        // The preview doesn't take focus: otherwise a click on it would pull input away from the
+        // search field.
         let root = div().key_context("Editor");
         let root = if self.preview {
             root
@@ -926,7 +933,7 @@ impl Render for Editor {
             .text_color(ui.foreground)
             .font_family(theme::code_font())
             .text_size(px(theme::FONT_SIZE))
-            // Движение
+            // Movement
             .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
                 this.motion(cx, |t, r| {
                     movement::move_horizontally(t, r, Backward, false)
@@ -1005,7 +1012,7 @@ impl Render for Editor {
                 let end = this.document.text().len_chars();
                 this.set_selection(Selection::single(0, end), cx)
             }))
-            // Правка
+            // Edit
             .on_action(cx.listener(|this, _: &Backspace, _, cx| {
                 this.edit(EditKind::Delete, cx, edit::delete_backward)
             }))
@@ -1034,7 +1041,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
-            // Файл
+            // File
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx).detach()))
             .child(
                 div()
@@ -1067,7 +1074,7 @@ mod tests {
         }
     }
 
-    /// Правка документа длины `len`: `(from, to, вставка)`.
+    /// An edit of a document of length `len`: `(from, to, insertion)`.
     fn mapped(
         search: &SearchHighlights,
         len: usize,
@@ -1083,7 +1090,7 @@ mod tests {
 
     #[test]
     fn matches_shift_with_edits_before_them() {
-        // «ab foo cd foo»: вхождения foo — 3..6 и 10..13.
+        // "ab foo cd foo": the matches of foo are 3..6 and 10..13.
         let search = highlights(&[(3, 6), (10, 13)], Some(1));
         let got = mapped(&search, 13, vec![(0, 0, Some("xx"))]);
         assert_eq!(got, highlights(&[(5, 8), (12, 15)], Some(1)));
@@ -1099,10 +1106,10 @@ mod tests {
     #[test]
     fn deleted_matches_disappear_and_active_follows_its_match() {
         let search = highlights(&[(3, 6), (10, 13)], Some(1));
-        // Удалили первое вхождение целиком: текущее — теперь первое по счёту.
+        // The first match was deleted entirely: the current one is now the first in order.
         let got = mapped(&search, 13, vec![(2, 7, None)]);
         assert_eq!(got, highlights(&[(5, 8)], Some(0)));
-        // Удалили текущее: текущего нет.
+        // The current match was deleted: there is no current match.
         let got = mapped(&search, 13, vec![(9, 13, None)]);
         assert_eq!(got, highlights(&[(3, 6)], None));
     }

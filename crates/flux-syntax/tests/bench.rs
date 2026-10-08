@@ -1,12 +1,12 @@
-//! Замеры скорости — запускаются вручную:
+//! Speed benchmarks; run them manually:
 //!
 //! ```sh
 //! cargo test -p flux-syntax --release --test bench -- --ignored --nocapture
-//! cargo test -p flux-syntax --test bench -- --ignored --nocapture   # отладочная сборка
+//! cargo test -p flux-syntax --test bench -- --ignored --nocapture   # debug build
 //! ```
 //!
-//! Файл — из `FLUX_SYNTAX_BENCH_FILE`, иначе `gpui-0.2.2/src/window.rs`
-//! из реестра cargo (≈190 КБ, 5 тыс. строк Rust).
+//! The file comes from `FLUX_SYNTAX_BENCH_FILE`, otherwise `gpui-0.2.2/src/window.rs` from the
+//! cargo registry (≈190 KB, 5k lines of Rust).
 
 mod common;
 
@@ -82,7 +82,7 @@ impl Samples {
 }
 
 #[test]
-#[ignore = "замеры скорости, запускать вручную с --ignored --nocapture"]
+#[ignore = "speed measurements, run manually with --ignored --nocapture"]
 fn bench() {
     let path = bench_file();
     let source = fs::read_to_string(&path).unwrap();
@@ -94,19 +94,19 @@ fn bench() {
         "release"
     };
     eprintln!(
-        "\n[{profile}] {} — {} строк, {} КБ, язык {}",
+        "\n[{profile}] {} — {} lines, {} KB, language {}",
         path.display(),
         text.len_lines(),
         text.len_bytes() / 1024,
         language.name()
     );
 
-    eprintln!("компиляция запроса подсветки (один раз на язык за процесс):");
+    eprintln!("highlight query compilation (once per language per process):");
     for language in languages() {
         let start = Instant::now();
         let query = language.query().unwrap();
         eprintln!(
-            "  {:<12} {:>10.3?}  ({} паттернов, {} capture)",
+            "  {:<12} {:>10.3?}  ({} patterns, {} captures)",
             language.name(),
             start.elapsed(),
             query.pattern_count(),
@@ -134,10 +134,10 @@ fn bench() {
         let result = full.time(|| job.run());
         assert!(syntax.finish(result));
     }
-    full.report("первичный разбор всего файла");
+    full.report("initial parse of the whole file");
 
-    // Один символ: вставляем «x» в случайное место и следующим шагом удаляем,
-    // так что после каждой пары текст снова исходный.
+    // A single character: we insert "x" at a random place and delete it in the next step, so after
+    // each pair the text is back to the original.
     let original = text.clone();
     let mut rng = Rng::new(1);
     let mut edits = Samples::new();
@@ -160,7 +160,7 @@ fn bench() {
             let result = reparse.time(|| job.run());
             assert!(syntax.finish(result));
         } else {
-            // Как в приложении после нажатия клавиши: синхронно с бюджетом 1 мс.
+            // As in the app after a key press: synchronously, with a 1 ms budget.
             let attempt = budget_attempt.time(|| job.run_with_budget(Duration::from_millis(1)));
             let result = match attempt {
                 Ok(result) => {
@@ -172,12 +172,12 @@ fn bench() {
             assert!(syntax.finish(result));
         }
     }
-    edits.report("Syntax::edit (один символ, только Tree::edit)");
-    reparse.report("повторный разбор после правки одного символа");
-    budget_attempt.report("run_with_budget(1 мс) после правки");
+    edits.report("Syntax::edit (one character, Tree::edit only)");
+    reparse.report("reparse after a one-character edit");
+    budget_attempt.report("run_with_budget(1 ms) after an edit");
     eprintln!(
         "{:<46} {within_budget}/{}",
-        "  из них уложились в бюджет",
+        "  of them fit in the budget",
         steps / 2
     );
 
@@ -190,8 +190,8 @@ fn bench() {
             spans = result.iter().map(Vec::len).sum::<usize>();
         }
     }
-    highlight.report("highlight_lines, окно 60 строк");
-    eprintln!("{:<46} {spans}", "  спанов в последнем окне");
+    highlight.report("highlight_lines, 60-line window");
+    eprintln!("{:<46} {spans}", "  spans in the last window");
 
     let mut cursor = Samples::new();
     for _ in 0..100 {
@@ -199,7 +199,7 @@ fn bench() {
     }
     cursor.report("QueryCursor::new");
 
-    // Проверка, что замер мерил правду: дерево после всех правок верное.
+    // A check that the benchmark measured the real thing: the tree is correct after all the edits.
     assert_eq!(text, original);
     let mut fresh = Syntax::new(language);
     parse_now(&mut fresh, &text);

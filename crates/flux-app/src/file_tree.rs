@@ -1,15 +1,16 @@
-//! Дерево файлов проекта — панель слева от текста (⌘B — показать/скрыть, ⇧⌘E — фокус).
+//! Project file tree: a panel to the left of the text (⌘B shows/hides it, ⇧⌘E focuses it).
 //!
-//! Состояние — `flux_fs::tree::FileTree`: какие каталоги прочитаны и раскрыты. Каталоги
-//! читаются только в фоне (`flux_fs::list_dir`): корень — при создании панели, остальные —
-//! когда их раскрывают или когда дерево идёт к файлу активной вкладки ([`FileTreePanel::reveal`]).
-//! Ответ на устаревший запрос чтения (каталог успели запросить ещё раз) отбрасывается по
-//! номеру запроса. Изменения на диске сообщает `flux_fs::Watcher`: события склеиваются, и
-//! перечитываются только прочитанные каталоги, которых они касаются.
+//! State lives in `flux_fs::tree::FileTree`: which directories have been read and which are
+//! expanded. Directories are read only in the background (`flux_fs::list_dir`): the root when the
+//! panel is created, the others when they are expanded or when the tree navigates to the active
+//! tab's file ([`FileTreePanel::reveal`]). The response to a stale read request (the directory was
+//! requested again in the meantime) is discarded by request number. Changes on disk are reported by
+//! `flux_fs::Watcher`: events are coalesced, and only the directories that have been read and are
+//! affected by them are re-read.
 //!
-//! Операции — создать, переименовать, переместить (⌘X ⌘V, перетаскивание), скопировать,
-//! удалить в Корзину — тоже в фоне; затронутые каталоги после них перечитываются сразу, не
-//! дожидаясь событий. Открытые документы правит Workspace по событиям [`FileTreeEvent`].
+//! Operations — create, rename, move (⌘X ⌘V, drag and drop), copy, delete to the Trash — also run
+//! in the background; the affected directories are re-read right after them, without waiting for
+//! events. Workspace updates the open documents in response to [`FileTreeEvent`] events.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -33,49 +34,51 @@ use gpui::{
 };
 
 use crate::context_menu::ContextMenu;
+use crate::i18n::{tr, trf};
 use crate::icons::{FileIcon, ICON_SIZE, IconName, file_icon, folder_icon, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 use crate::workspace::tilde;
 
-/// Ширина панели по умолчанию и пределы, в которых её тянут мышью.
+/// Default panel width and the limits within which it can be dragged with the mouse.
 pub const DEFAULT_WIDTH: f32 = 260.;
 const MIN_WIDTH: f32 = 180.;
 const MAX_WIDTH: f32 = 600.;
 const ROW_HEIGHT: f32 = 26.;
-/// Шапка: подпись проекта и кнопки-значки.
+/// Title bar: the project label and icon buttons.
 const HEADER_HEIGHT: f32 = 40.;
-/// Строки отступают от краёв острова; подсветка — скруглённая плашка внутри строки.
+/// Rows are inset from the island's edges; the highlight is a rounded box inside the row.
 const ROW_INSET: f32 = 6.;
-/// Отступ плашки слева и на уровень вложенности.
+/// Left inset of the box, and the indent per nesting level.
 const ROW_PADDING: f32 = 6.;
 const INDENT: f32 = 14.;
-/// Колонка шеврона: у файлов она пустая — значки и имена выровнены с каталогами. Направляющая
-/// вложенности идёт по её середине.
+/// Chevron column: it is empty for files, so icons and names line up with those of directories. The
+/// indent guide runs through its middle.
 const CHEVRON_WIDTH: f32 = 16.;
 const CHEVRON_SIZE: f32 = 12.;
-/// Зазоры: шеврон — значок, значок — имя.
+/// Gaps: chevron to icon, icon to name.
 const ICON_GAP: f32 = 2.;
 const NAME_GAP: f32 = 6.;
 const TEXT_SIZE: f32 = 13.;
-/// Непрозрачность значка у приглушённой строки (исключённое .gitignore, вырезанное).
+/// Icon opacity in a muted row (excluded by .gitignore, or cut).
 const MUTED_ICON_ALPHA: f32 = 0.45;
-/// Ручка ширины занимает зазор между островами справа от панели: от рамки острова (1 px) на
-/// ширину зазора. Её середина — на столько правее края панели.
+/// The width handle occupies the gap between islands to the right of the panel: from the island's
+/// border (1 px) for the width of the gap. Its center is that much to the right of the panel's
+/// edge.
 const RESIZE_HANDLE_WIDTH: f32 = ui::GAP;
 const RESIZE_HANDLE_OFFSET: f32 = 1. + RESIZE_HANDLE_WIDTH / 2.;
-/// Группа наведения строки: подсветка плашки, когда мышь над строкой с её отступами.
+/// Row hover group: the box is highlighted when the mouse is over the row, including its insets.
 const ROW_GROUP: &str = "file-tree-row";
-/// Склейка событий наблюдателя: после первого ждём, пока придут остальные.
+/// Watcher event coalescing: after the first event, wait for the rest to arrive.
 const WATCH_DELAY: Duration = Duration::from_millis(80);
-/// PageUp/PageDown, пока высота списка неизвестна.
+/// PageUp/PageDown while the list height is unknown.
 const DEFAULT_PAGE_ROWS: usize = 20;
 
-// Действия уровня окна: их обрабатывает Workspace.
+// Window-level actions: handled by Workspace.
 actions!(file_tree, [ToggleOpen, ToggleFocus]);
 
-// Действия панели (контекст "FileTree").
+// Panel actions (context "FileTree").
 actions!(
     file_tree,
     [
@@ -113,7 +116,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleOpen, Some("Workspace")),
         KeyBinding::new("cmd-shift-e", ToggleFocus, Some("Workspace")),
     ]);
-    // Пока правится имя, клавиши дерева молчат: стрелки, пробел, ⌫ и ⌘C/⌘V — у поля.
+    // While a name is being edited, the tree's keys are inactive: arrow keys, Space, ⌫ and ⌘C/⌘V
+    // belong to the field.
     let tree = Some("FileTree && !editing");
     cx.bind_keys([
         KeyBinding::new("down", SelectNext, tree),
@@ -131,7 +135,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("alt-cmd-n", NewFolder, tree),
         KeyBinding::new("f2", Rename, tree),
         KeyBinding::new("cmd-d", Duplicate, tree),
-        // Основное сочетание — первым: его показывают контекстное меню и палитра.
+        // The primary binding goes first: the context menu and the palette show it.
         KeyBinding::new("cmd-backspace", MoveToTrash, tree),
         KeyBinding::new("backspace", MoveToTrash, tree),
         KeyBinding::new("delete", MoveToTrash, tree),
@@ -144,7 +148,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-f10", ShowContextMenu, tree),
         KeyBinding::new("escape", Cancel, tree),
     ]);
-    // Поле правки имени отдаёт Enter и Esc строке.
+    // The name edit field hands Enter and Esc over to the row.
     let edit = Some("FileTreeEdit");
     cx.bind_keys([
         KeyBinding::new("enter", ConfirmEdit, edit),
@@ -152,38 +156,39 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// Что панель просит у Workspace.
+/// What the panel asks Workspace to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileTreeEvent {
-    /// Открыть файл (или активировать его вкладку); `focus` — перевести фокус в редактор,
-    /// иначе он остаётся в дереве.
+    /// Opens a file (or activates its tab); `focus` moves focus to the editor, otherwise it stays
+    /// in the tree.
     Open { path: PathBuf, focus: bool },
-    /// Вернуть фокус в редактор (Esc в дереве).
+    /// Returns focus to the editor (Esc in the tree).
     FocusEditor,
-    /// Файл или каталог `from` переименован или перемещён в `to` — открытые документы
-    /// внутри него переезжают на новые пути.
+    /// The file or directory `from` was renamed or moved to `to`: open documents inside it move to
+    /// the new paths.
     Moved { from: PathBuf, to: PathBuf },
-    /// Файлы и каталоги удалены в Корзину: вкладки документов внутри них закрываются
-    /// (изменённые — остаются).
+    /// Files and directories were deleted to the Trash: tabs of documents inside them are closed
+    /// (modified ones stay open).
     Removed { paths: Vec<PathBuf> },
-    /// Сообщение пользователю (ошибка операции) — в статус-бар.
+    /// A message for the user (an operation error), shown in the status bar.
     Message(SharedString),
 }
 
-/// Правка имени на месте: новый файл или каталог, переименование.
+/// In-place name editing: a new file or directory, or a rename.
 struct Edit {
     target: EditTarget,
     input: Entity<TextInput>,
-    /// Почему не вышло (неверное имя, такое уже есть): красным под полем, поле остаётся.
+    /// Why the operation failed (invalid name, name already exists): shown in red under the field,
+    /// and the field stays.
     error: Option<SharedString>,
-    /// Операция уже идёт — повторный ↵ ничего не делает.
+    /// An operation is already in progress, so a repeated ↵ does nothing.
     pending: bool,
     _subscriptions: [Subscription; 2],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EditTarget {
-    /// Новый файл или каталог в `dir`: строка поля — первой среди его детей.
+    /// A new file or directory in `dir`: the field row goes first among its children.
     New {
         dir: PathBuf,
         kind: EntryKind,
@@ -193,7 +198,7 @@ enum EditTarget {
     },
 }
 
-/// Вырезанное (⌘X) или скопированное (⌘C) — до вставки.
+/// What was cut (⌘X) or copied (⌘C), until it is pasted.
 #[derive(Debug, Clone)]
 struct Clipboard {
     path: PathBuf,
@@ -202,12 +207,12 @@ struct Clipboard {
 
 struct Menu {
     menu: Entity<ContextMenu>,
-    /// Точка щелчка в координатах окна.
+    /// The click point in window coordinates.
     position: Point<Pixels>,
     _subscriptions: [Subscription; 2],
 }
 
-/// Перетаскиваемая строка; она же — подпись у курсора (значок и имя).
+/// The row being dragged; it also serves as the label next to the cursor (icon and name).
 #[derive(Debug, Clone)]
 struct DraggedEntry {
     path: PathBuf,
@@ -215,32 +220,32 @@ struct DraggedEntry {
     is_dir: bool,
 }
 
-/// Перетаскивание правого края панели.
+/// Dragging the panel's right edge.
 #[derive(Debug, Clone, Copy)]
 struct DraggedEdge;
 
-/// Панель дерева файлов: одна на окно, живёт, пока у окна тот же корень проекта.
+/// File tree panel: one per window; it lives as long as the window keeps the same project root.
 pub struct FileTreePanel {
     root: PathBuf,
     tree: FileTree,
-    /// Видимые строки — пересобираются при каждом изменении дерева.
+    /// Visible rows, rebuilt on every tree change.
     rows: Vec<Row>,
-    /// Выбранная строка — по пути: переживает перечитывание каталогов.
+    /// The selected row, tracked by path, so it survives directory re-reads.
     selected: Option<PathBuf>,
-    /// Выделить этот путь, как только дочитаются каталоги до него (reveal, новый файл).
+    /// Select this path as soon as the directories leading to it have been read (reveal, new file).
     reveal_target: Option<PathBuf>,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     width: f32,
-    /// Идущие чтения: номер последнего запроса по каталогу.
+    /// Reads in flight: the number of the latest request per directory.
     reads: HashMap<PathBuf, u64>,
     next_read: u64,
     edit: Option<Edit>,
     clipboard: Option<Clipboard>,
     menu: Option<Menu>,
-    /// Куда бросят перетаскиваемую строку: каталог под курсором.
+    /// Where the dragged row would be dropped: the directory under the cursor.
     drop_target: Option<PathBuf>,
-    /// Тянут ширину: ручка подсвечена, пока идёт перетаскивание.
+    /// The width is being dragged: the handle stays highlighted while the drag lasts.
     resizing: bool,
     _watcher: Option<Watcher>,
     _watch_task: Task<()>,
@@ -249,8 +254,8 @@ pub struct FileTreePanel {
 impl EventEmitter<FileTreeEvent> for FileTreePanel {}
 
 impl FileTreePanel {
-    /// Панель проекта `root` (канонический путь): сразу читает корень и начинает следить
-    /// за изменениями на диске.
+    /// Panel for the project at `root` (a canonical path): reads the root right away and starts
+    /// watching for changes on disk.
     pub fn new(root: PathBuf, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let watch_task = Self::watch(root.clone(), cx);
         let mut panel = Self {
@@ -276,8 +281,8 @@ impl FileTreePanel {
         panel
     }
 
-    /// Файл активной вкладки: раскрыть каталоги до него, выделить и прокрутить к нему.
-    /// Файл вне корня проекта — снять выделение.
+    /// The active tab's file: expands the directories leading to it, selects it and scrolls to it.
+    /// For a file outside the project root, the selection is cleared.
     pub fn reveal(&mut self, path: &Path, cx: &mut Context<Self>) {
         if path == self.root || !self.tree.reveal(path) {
             self.selected = None;
@@ -288,9 +293,10 @@ impl FileTreePanel {
         self.changed(cx);
     }
 
-    // --- Чтение каталогов ---
+    // --- Reading directories ---
 
-    /// Дерево изменилось: пересобрать строки, дочитать видимое, довести reveal, перерисовать.
+    /// The tree changed: rebuild the rows, finish reading what is visible, advance the reveal,
+    /// repaint.
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.rows = self.tree.rows();
         for (dir, ignored) in self.tree.pending_loads() {
@@ -302,7 +308,7 @@ impl FileTreePanel {
         cx.notify();
     }
 
-    /// Перечитывает каталоги: после своих операций и изменений на диске.
+    /// Re-reads directories after the panel's own operations and after changes on disk.
     fn reread(&mut self, dirs: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
         for dir in dirs {
             let ignored = self.tree.is_ignored(&dir);
@@ -310,7 +316,8 @@ impl FileTreePanel {
         }
     }
 
-    /// Читает каталог в фоне. Новый запрос по тому же каталогу делает прежний устаревшим.
+    /// Reads a directory in the background. A new request for the same directory makes the previous
+    /// one stale.
     fn read(&mut self, dir: PathBuf, ignored: bool, cx: &mut Context<Self>) {
         self.next_read += 1;
         let id = self.next_read;
@@ -340,15 +347,15 @@ impl FileTreePanel {
         self.reads.remove(&dir);
         let entries = match result {
             Ok(entries) => entries,
-            // Каталог удалили: его родителя перечитают по тому же событию.
+            // The directory was deleted: its parent is re-read on the same event.
             Err(err) if err.kind() == io::ErrorKind::NotFound && dir != self.root => {
                 self.tree.remove(&dir);
                 return self.changed(cx);
             }
-            // Перечитать не вышло — остаётся прежний список.
+            // If the re-read fails, the previous listing stays.
             Err(_) if self.tree.is_loaded(&dir) => return self.changed(cx),
             Err(err) => {
-                let message = format!("Cannot read {}: {err}", display_name(&dir));
+                let message = trf("Cannot read {0}: {1}", &[&display_name(&dir), &err]);
                 cx.emit(FileTreeEvent::Message(message.into()));
                 Vec::new()
             }
@@ -358,8 +365,8 @@ impl FileTreePanel {
         self.changed(cx);
     }
 
-    /// Выделяет `reveal_target`, когда его строка появилась; всё дочитано, а строки нет —
-    /// цель снимается.
+    /// Selects `reveal_target` once its row has appeared; if everything has been read and there is
+    /// still no row, the target is cleared.
     fn finish_reveal(&mut self) {
         let Some(target) = &self.reveal_target else {
             return;
@@ -374,13 +381,13 @@ impl FileTreePanel {
         }
     }
 
-    /// Выделить `path`, как только дочитаются каталоги до него.
+    /// Selects `path` as soon as the directories leading to it have been read.
     fn select_when_shown(&mut self, path: PathBuf) {
         self.tree.reveal(&path);
         self.reveal_target = Some(path);
     }
 
-    /// Наблюдение за корнем: события склеиваются в пачку и превращаются в план перечитывания.
+    /// Watching the root: events are coalesced into a batch and turned into a re-read plan.
     fn watch(root: PathBuf, cx: &mut Context<Self>) -> Task<()> {
         let (sender, mut changes) = mpsc::unbounded::<FsChange>();
         let started = cx.background_spawn(async move {
@@ -392,7 +399,7 @@ impl FileTreePanel {
             let watcher = match started.await {
                 Ok(watcher) => watcher,
                 Err(err) => {
-                    let message = format!("Not watching the project for changes: {err}");
+                    let message = trf("Not watching the project for changes: {0}", &[&err]);
                     this.update(cx, |_, cx| cx.emit(FileTreeEvent::Message(message.into())))
                         .ok();
                     return;
@@ -421,7 +428,7 @@ impl FileTreePanel {
         })
     }
 
-    // --- Выбор и навигация ---
+    // --- Selection and navigation ---
 
     fn row_index(&self, path: &Path) -> Option<usize> {
         self.rows.iter().position(|row| row.path == path)
@@ -433,7 +440,7 @@ impl FileTreePanel {
             .and_then(|path| self.row_index(path))
     }
 
-    /// Строка поля нового файла: место в списке, вложенность и вид.
+    /// The new-file field row: its position in the list, nesting depth and kind.
     fn new_entry_slot(&self) -> Option<(usize, usize, EntryKind)> {
         let Some(Edit {
             target: EditTarget::New { dir, kind },
@@ -449,7 +456,7 @@ impl FileTreePanel {
         Some((index + 1, self.rows[index].depth + 1, *kind))
     }
 
-    /// Номер в списке для строки дерева: поле нового файла сдвигает строки после себя.
+    /// List index for a tree row: the new-file field shifts the rows after it.
     fn list_index(&self, row: usize) -> usize {
         match self.new_entry_slot() {
             Some((at, ..)) if row >= at => row + 1,
@@ -467,7 +474,7 @@ impl FileTreePanel {
         cx.notify();
     }
 
-    /// Строки на страницу — по высоте списка в прошлом кадре.
+    /// Rows per page, based on the list height in the previous frame.
     fn page_rows(&self) -> usize {
         let height = f32::from(self.scroll.0.borrow().base_handle.bounds().size.height);
         if height <= 0. {
@@ -476,7 +483,8 @@ impl FileTreePanel {
         ((height / ROW_HEIGHT) as usize).saturating_sub(1).max(1)
     }
 
-    /// Прокрутка на минимум: вниз — строка встаёт к нижнему краю, вверх — к верхнему.
+    /// Scrolls by the minimum amount: down, the row ends up at the bottom edge; up, at the top
+    /// edge.
     fn move_selection(
         &mut self,
         to: impl FnOnce(Option<usize>, usize) -> usize,
@@ -494,7 +502,7 @@ impl FileTreePanel {
         self.select_row(index, strategy, cx);
     }
 
-    /// → : свёрнутый каталог раскрыть, раскрытый — к первому ребёнку.
+    /// → : expands a collapsed directory; on an expanded one, moves to the first child.
     fn expand(&mut self, _: &Expand, _: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.selected_index() else {
             return;
@@ -517,7 +525,7 @@ impl FileTreePanel {
         }
     }
 
-    /// ← : раскрытый каталог свернуть, иначе — к родителю.
+    /// ← : collapses an expanded directory; otherwise moves to the parent.
     fn collapse(&mut self, _: &Collapse, _: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.selected_index() else {
             return;
@@ -534,7 +542,7 @@ impl FileTreePanel {
         }
     }
 
-    /// ↵, пробел, щелчок: каталог раскрыть или свернуть, файл — открыть.
+    /// ↵, Space, click: expands or collapses a directory; opens a file.
     fn activate(&mut self, path: PathBuf, focus: bool, cx: &mut Context<Self>) {
         if self.tree.is_dir(&path) {
             self.tree.toggle(&path);
@@ -545,7 +553,8 @@ impl FileTreePanel {
         }
     }
 
-    /// Выбранная строка скрылась в свёрнутом каталоге — выбрать ближайший видимый каталог над ней.
+    /// The selected row got hidden inside a collapsed directory: select the nearest visible
+    /// directory above it.
     fn keep_selection_visible(&mut self) {
         let Some(selected) = &self.selected else {
             return;
@@ -567,7 +576,7 @@ impl FileTreePanel {
         self.changed(cx);
     }
 
-    /// Esc: снять «вырезано», иначе — фокус в редактор.
+    /// Esc: clears the "cut" state; otherwise moves focus to the editor.
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         if self
             .clipboard
@@ -580,7 +589,7 @@ impl FileTreePanel {
         cx.emit(FileTreeEvent::FocusEditor);
     }
 
-    // --- Правка имени: новый файл, новый каталог, переименование ---
+    // --- Name editing: new file, new directory, rename ---
 
     fn new_entry(&mut self, kind: EntryKind, window: &mut Window, cx: &mut Context<Self>) {
         let dir = self.tree.target_dir(self.selected.as_deref());
@@ -609,8 +618,8 @@ impl FileTreePanel {
             EditTarget::New {
                 kind: EntryKind::Dir,
                 ..
-            } => "Folder name",
-            EditTarget::New { .. } => "File name",
+            } => tr("Folder name"),
+            EditTarget::New { .. } => tr("File name"),
             EditTarget::Rename { .. } => "",
         };
         let input = cx.new(|cx| {
@@ -623,7 +632,7 @@ impl FileTreePanel {
             input
         });
         let focus = input.focus_handle(cx);
-        // Без ↵ на диске ничего не меняется: уход фокуса — отмена.
+        // Nothing on disk changes without ↵: losing focus cancels.
         let subscriptions = [
             cx.on_focus_out(&focus, window, |this, _, window, cx| {
                 this.cancel_edit(false, window, cx)
@@ -653,8 +662,8 @@ impl FileTreePanel {
         }
     }
 
-    /// Закрывает поле без изменений на диске. `refocus` — вернуть фокус в дерево (Esc); при
-    /// уходе фокуса он уже там, куда его увели.
+    /// Closes the field without changing anything on disk. `refocus` returns focus to the tree
+    /// (Esc); when focus is lost, it is already wherever it was moved to.
     fn cancel_edit(&mut self, refocus: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.edit.take().is_none() {
             return;
@@ -741,9 +750,9 @@ impl FileTreePanel {
         self.changed(cx);
     }
 
-    /// `from` переехал в `to` (переименование, перемещение): дерево, выбор и открытые документы —
-    /// следом; оба каталога перечитываются. Тот же путь (то же имя, тот же каталог) — операция
-    /// ничего не сделала, только выбор.
+    /// `from` has moved to `to` (rename, move): the tree, the selection and the open documents
+    /// follow; both directories are re-read. The same path (same name, same directory) means the
+    /// operation did nothing, so only the selection changes.
     fn moved(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
         if from == to {
             return self.select_when_shown(to.to_path_buf());
@@ -767,9 +776,9 @@ impl FileTreePanel {
         });
     }
 
-    // --- Операции ---
+    // --- Operations ---
 
-    /// Операция над файлами в фоне; `done` — с результатом в UI-потоке.
+    /// Runs a file operation in the background; `done` is called with the result on the UI thread.
     fn run<T: Send + 'static>(
         &mut self,
         op: impl FnOnce() -> io::Result<T> + Send + 'static,
@@ -792,15 +801,15 @@ impl FileTreePanel {
         };
         let name = display_name(&path);
         let detail = if self.tree.is_dir(&path) {
-            "The folder and everything in it will be moved to the Trash."
+            tr("The folder and everything in it will be moved to the Trash.")
         } else {
-            "You can restore it from the Trash."
+            tr("You can restore it from the Trash.")
         };
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Move “{name}” to Trash?"),
+            &trf("Move “{0}” to Trash?", &[&name]),
             Some(detail),
-            &["Move to Trash", "Cancel"],
+            &[tr("Move to Trash"), tr("Cancel")],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -825,7 +834,7 @@ impl FileTreePanel {
         if let Err(err) = result {
             return cx.emit(FileTreeEvent::Message(err.to_string().into()));
         }
-        // Выбор — на соседа: следующую строку, у последней — предыдущую.
+        // The selection moves to a neighbor: the next row, or the previous one for the last row.
         let index = self.row_index(&path);
         self.tree.remove(&path);
         if self
@@ -857,8 +866,8 @@ impl FileTreePanel {
         }
     }
 
-    /// ⌘V: вырезанное переезжает в выбранный каталог (у файла — в его каталог), скопированное —
-    /// копируется туда под свободным именем.
+    /// ⌘V: what was cut moves into the selected directory (for a file, into its directory); what
+    /// was copied is copied there under an unused name.
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         let Some(clipboard) = self.clipboard.clone() else {
             return;
@@ -897,7 +906,7 @@ impl FileTreePanel {
         );
     }
 
-    /// Копия в `dir`; `rename_after` — сразу переименовать её (⌘D).
+    /// Copies into `dir`; `rename_after` starts renaming the copy right away (⌘D).
     fn copy_entry(
         &mut self,
         path: PathBuf,
@@ -925,13 +934,13 @@ impl FileTreePanel {
         );
     }
 
-    /// Переименование копии: её строка появится после перечитывания каталога.
+    /// Renaming the copy: its row will appear after the directory is re-read.
     fn rename_when_shown(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.row_index(&path).is_some() {
             return self.start_rename(path, window, cx);
         }
         cx.spawn_in(window, async move |this, cx| {
-            // Перечитывание — доли миллисекунды; ждём несколько кадров, не дольше.
+            // Re-reading takes a fraction of a millisecond; we wait a few frames at most.
             for _ in 0..30 {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
@@ -961,7 +970,8 @@ impl FileTreePanel {
         self.copy_entry(path, dir, true, window, cx);
     }
 
-    /// ⌥⌘C и ⌥⇧⌘C: путь выбранного (без выбора — корня) в буфер обмена.
+    /// ⌥⌘C and ⌥⇧⌘C: the path of the selected item (of the root, if nothing is selected) to the
+    /// clipboard.
     fn copy_path(&mut self, relative: bool, cx: &mut Context<Self>) {
         let path = self.selected.clone().unwrap_or_else(|| self.root.clone());
         let text = if relative {
@@ -977,11 +987,11 @@ impl FileTreePanel {
         cx.reveal_path(&path);
     }
 
-    // --- Мышь ---
+    // --- Mouse ---
 
-    /// Щелчок по строке, как в VS Code: файл открывается, а фокус остаётся в дереве (можно
-    /// листать дальше); двойной щелчок по файлу — фокус в редактор. Каталог раскрывается или
-    /// сворачивается первым щелчком — второй щелчок двойного его не трогает.
+    /// Clicking a row works like in VS Code: the file opens, but focus stays in the tree (so you
+    /// can keep browsing); double-clicking a file moves focus to the editor. A directory expands or
+    /// collapses on the first click; the second click of a double-click leaves it alone.
     fn click_row(
         &mut self,
         path: PathBuf,
@@ -1003,7 +1013,8 @@ impl FileTreePanel {
         cx.notify();
     }
 
-    /// Правая кнопка: выбрать строку (`None` — пустое место: корень) и открыть меню у курсора.
+    /// Right-click: selects the row (`None` means empty space, i.e. the root) and opens the menu at
+    /// the cursor.
     fn secondary_click(
         &mut self,
         path: Option<PathBuf>,
@@ -1017,28 +1028,28 @@ impl FileTreePanel {
         let can_paste = self.clipboard.is_some();
         let menu = cx.new(|cx| {
             let menu = ContextMenu::new(window, cx)
-                .entry("New File", NewFile)
-                .entry("New Folder", NewFolder)
+                .entry(tr("New File"), NewFile)
+                .entry(tr("New Folder"), NewFolder)
                 .separator();
             let menu = match path {
                 Some(_) => menu
-                    .entry("Rename", Rename)
-                    .entry("Duplicate", Duplicate)
-                    .entry("Move to Trash", MoveToTrash)
+                    .entry(tr("Rename"), Rename)
+                    .entry(tr("Duplicate"), Duplicate)
+                    .entry(tr("Move to Trash"), MoveToTrash)
                     .separator()
-                    .entry("Cut", Cut)
-                    .entry("Copy", Copy)
-                    .entry_if(can_paste, "Paste", Paste)
+                    .entry(tr("Cut"), Cut)
+                    .entry(tr("Copy"), Copy)
+                    .entry_if(can_paste, tr("Paste"), Paste)
                     .separator()
-                    .entry("Copy Path", CopyPath)
-                    .entry("Copy Relative Path", CopyRelativePath),
+                    .entry(tr("Copy Path"), CopyPath)
+                    .entry(tr("Copy Relative Path"), CopyRelativePath),
                 None => menu
-                    .entry_if(can_paste, "Paste", Paste)
-                    .entry("Collapse All", CollapseAll)
+                    .entry_if(can_paste, tr("Paste"), Paste)
+                    .entry(tr("Collapse All"), CollapseAll)
                     .separator()
-                    .entry("Copy Path", CopyPath),
+                    .entry(tr("Copy Path"), CopyPath),
             };
-            menu.entry("Reveal in Finder", RevealInFinder)
+            menu.entry(tr("Reveal in Finder"), RevealInFinder)
         });
         let focus = menu.focus_handle(cx);
         let subscriptions = [
@@ -1059,7 +1070,7 @@ impl FileTreePanel {
         cx.notify();
     }
 
-    /// Закрывает меню (если это всё ещё оно); Esc в меню возвращает фокус в дерево.
+    /// Closes the menu (if it is still the same one); Esc in the menu returns focus to the tree.
     fn close_menu(
         &mut self,
         menu: &Entity<ContextMenu>,
@@ -1077,8 +1088,9 @@ impl FileTreePanel {
         cx.notify();
     }
 
-    /// Фокус в дереве — в нём самом, в поле правки имени или в его меню. Поле и меню
-    /// проверяются напрямую: в первом кадре после создания их ещё нет в дереве фокуса.
+    /// Focus is in the tree when it is on the tree itself, on the name edit field or on its menu.
+    /// The field and the menu are checked directly: in the first frame after creation they are not
+    /// in the focus tree yet.
     fn is_focused(&self, window: &Window, cx: &App) -> bool {
         self.focus_handle.contains_focused(window, cx)
             || self
@@ -1091,7 +1103,8 @@ impl FileTreePanel {
                 .is_some_and(|menu| menu.menu.focus_handle(cx).is_focused(window))
     }
 
-    /// ⇧F10: меню выбранной строки (без выбора — корня) — под ней, как после щелчка.
+    /// ⇧F10: the menu for the selected row (for the root, if nothing is selected), opened below it,
+    /// as after a click.
     fn show_context_menu(
         &mut self,
         _: &ShowContextMenu,
@@ -1123,7 +1136,7 @@ impl FileTreePanel {
         }
     }
 
-    /// Строка списка под точкой окна — по раскладке прошлого кадра.
+    /// The list row under a window point, based on the previous frame's layout.
     fn list_index_at(&self, position: Point<Pixels>) -> Option<usize> {
         let state = self.scroll.0.borrow();
         let bounds = state.base_handle.bounds();
@@ -1135,8 +1148,9 @@ impl FileTreePanel {
         (index >= 0.).then_some(index as usize)
     }
 
-    /// Перетаскивание над панелью: цель — каталог строки под курсором (у файла — его
-    /// каталог), под строками и над шапкой — корень; вне панели — никуда.
+    /// Dragging over the panel: the target is the directory of the row under the cursor (for a
+    /// file, its directory); below the rows and over the title bar, the root; outside the panel,
+    /// nowhere.
     fn drag_over(&mut self, event: &DragMoveEvent<DraggedEntry>, cx: &mut Context<Self>) {
         let dragged = event.drag(cx).path.clone();
         let position = event.event.position;
@@ -1158,7 +1172,7 @@ impl FileTreePanel {
         self.move_entry(entry.path.clone(), dir, window, cx);
     }
 
-    /// Строка дерева по номеру в списке; строка поля нового файла — `None`.
+    /// The tree row at a list index; for the new-file field row, `None`.
     fn list_row(&self, index: usize) -> Option<&Row> {
         match self.new_entry_slot() {
             Some((at, ..)) if index == at => None,
@@ -1167,9 +1181,9 @@ impl FileTreePanel {
         }
     }
 
-    // --- Отображение ---
+    // --- Rendering ---
 
-    /// Шапка: подпись проекта и кнопки «новый файл», «новая папка», «свернуть всё».
+    /// Title bar: the project label and the "new file", "new folder" and "collapse all" buttons.
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let name = self.root.file_name().map_or_else(
@@ -1198,21 +1212,21 @@ impl FileTreePanel {
             )
             .child(ui::section_label(name, ui).flex_1().min_w_0().truncate())
             .child(self.header_button(
-                ("new-file", IconName::FilePlus, "New File"),
+                ("new-file", IconName::FilePlus, tr("New File")),
                 &NewFile,
                 window,
                 cx,
                 |this, window, cx| this.new_entry(EntryKind::File, window, cx),
             ))
             .child(self.header_button(
-                ("new-folder", IconName::FolderPlus, "New Folder"),
+                ("new-folder", IconName::FolderPlus, tr("New Folder")),
                 &NewFolder,
                 window,
                 cx,
                 |this, window, cx| this.new_entry(EntryKind::Dir, window, cx),
             ))
             .child(self.header_button(
-                ("collapse-all", IconName::CollapseAll, "Collapse All"),
+                ("collapse-all", IconName::CollapseAll, tr("Collapse All")),
                 &CollapseAll,
                 window,
                 cx,
@@ -1220,7 +1234,8 @@ impl FileTreePanel {
             ))
     }
 
-    /// Кнопка шапки: подсказка с сочетанием из keymap дерева; щелчок — фокус в дерево и действие.
+    /// Title bar button: the tooltip shows the key binding from the tree's keymap; a click moves
+    /// focus to the tree and runs the action.
     fn header_button(
         &self,
         (id, name, label): (&'static str, IconName, &'static str),
@@ -1279,7 +1294,8 @@ impl FileTreePanel {
             Some(Edit { target: EditTarget::Rename { path }, .. }) if *path == row.path
         );
         let muted = row.ignored || cut;
-        // Пока имя правится, значок следует за набранным: `.rs` → значок Rust.
+        // While the name is being edited, the icon follows what has been typed: `.rs` → the Rust
+        // icon.
         let typed = self
             .edit
             .as_ref()
@@ -1339,7 +1355,7 @@ impl FileTreePanel {
             .into_any_element()
     }
 
-    /// Строка поля нового файла или каталога: значок файла следует за набранным именем.
+    /// The row of the new file or directory field: the file icon follows the name being typed.
     fn render_new_entry(
         &self,
         list_index: usize,
@@ -1366,7 +1382,7 @@ impl FileTreePanel {
             .into_any_element()
     }
 
-    /// Поле правки имени; ошибка — плашкой под полем поверх соседних строк.
+    /// Name edit field; an error is shown as a box under the field, on top of the neighboring rows.
     fn render_edit_field(&self, ui: UiColors) -> AnyElement {
         let Some(edit) = &self.edit else {
             return div().into_any_element();
@@ -1393,7 +1409,7 @@ impl FileTreePanel {
                         .px_2()
                         .py_1p5()
                         .rounded(px(RADIUS_MD))
-                        // Непрозрачная: под плашкой — текст соседних строк.
+                        // Opaque: the text of the neighboring rows lies under the box.
                         .bg(UiColors::tint(ui.elevated, 1.))
                         .border_1()
                         .border_color(UiColors::tint(ui.error, 0.6))
@@ -1434,9 +1450,10 @@ impl Render for FileTreePanel {
         .track_scroll(self.scroll.clone())
         .size_full();
         let dropping_root = self.drop_target.as_ref() == Some(&self.root);
-        // Отпустили ручку где угодно — перетаскивания больше нет, подсветка гаснет.
+        // The handle was released anywhere: the drag is over and the highlight goes away.
         self.resizing &= cx.has_active_drag();
-        // Во время правки имени — свой контекст: клавиши дерева (стрелки, ⌫, пробел) молчат.
+        // A separate context applies while a name is being edited: the tree's keys (arrow keys, ⌫,
+        // Space) are inactive.
         let context = if self.edit.is_some() {
             "FileTree editing"
         } else {
@@ -1527,7 +1544,8 @@ impl Render for FileTreePanel {
             }))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
-                    // Ручка — в зазоре правее края: край панели идёт за мышью без скачка.
+                    // The handle sits in the gap to the right of the edge: the panel edge follows
+                    // the mouse without jumping.
                     let width = f32::from(event.event.position.x - event.bounds.left())
                         - RESIZE_HANDLE_OFFSET;
                     this.width = width.clamp(MIN_WIDTH, MAX_WIDTH);
@@ -1542,8 +1560,8 @@ impl Render for FileTreePanel {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    // Отступы — у обёртки: геометрия строк (`list_index_at`) считается от
-                    // границ самого списка.
+                    // The insets are on the wrapper: row geometry (`list_index_at`) is computed
+                    // from the bounds of the list itself.
                     .pt_0p5()
                     .pb_2()
                     .when(dropping_root, |list| {
@@ -1586,7 +1604,7 @@ impl Render for DraggedEntry {
             .pl_2()
             .pr_2p5()
             .rounded(px(RADIUS_MD))
-            // Непрозрачная: плашка плывёт над строками, их текст не должен просвечивать.
+            // Opaque: the box floats over the rows, and their text must not show through.
             .bg(UiColors::tint(ui.elevated, 1.))
             .border_1()
             .border_color(ui.elevated_border)
@@ -1605,7 +1623,7 @@ impl Render for DraggedEdge {
     }
 }
 
-/// Строка списка во всю ширину с отступами от краёв острова; подсветка — у плашки внутри.
+/// A full-width list row inset from the island's edges; the highlight belongs to the box inside it.
 fn row_shell(list_index: usize) -> Stateful<Div> {
     div()
         .id(list_index)
@@ -1616,8 +1634,8 @@ fn row_shell(list_index: usize) -> Stateful<Div> {
         .whitespace_nowrap()
 }
 
-/// Плашка строки: направляющие вложенности, шеврон (у файла — пустая колонка), значок.
-/// Имя или поле правки добавляет вызывающий.
+/// Row box: indent guides, chevron (an empty column for a file), icon. The caller adds the name or
+/// the edit field.
 fn row_body(depth: usize, kind: EntryKind, expanded: bool, file: FileIcon, ui: UiColors) -> Div {
     div()
         .size_full()
@@ -1630,8 +1648,8 @@ fn row_body(depth: usize, kind: EntryKind, expanded: bool, file: FileIcon, ui: U
         .child(file.render().ml(px(ICON_GAP)))
 }
 
-/// Отступ по вложенности с тонкими направляющими: по линии на каждый уровень предков —
-/// посередине колонки шеврона каталога этого уровня.
+/// Nesting indent with thin guides: one line per ancestor level, in the middle of the chevron
+/// column of that level's directory.
 fn indent_guides(depth: usize, ui: UiColors) -> impl IntoElement {
     div()
         .flex_none()
@@ -1648,7 +1666,8 @@ fn indent_guides(depth: usize, ui: UiColors) -> impl IntoElement {
         }))
 }
 
-/// Шеврон каталога (вправо — свёрнут, вниз — раскрыт); у файла — пустая колонка той же ширины.
+/// Directory chevron (pointing right when collapsed, down when expanded); for a file, an empty
+/// column of the same width.
 fn chevron(kind: EntryKind, expanded: bool, ui: UiColors) -> impl IntoElement {
     let glyph = match (kind, expanded) {
         (EntryKind::Dir, true) => Some(IconName::ChevronDown),
@@ -1665,7 +1684,7 @@ fn chevron(kind: EntryKind, expanded: bool, ui: UiColors) -> impl IntoElement {
         .children(glyph.map(|glyph| icon(glyph, ui.dim).size(px(CHEVRON_SIZE))))
 }
 
-/// Подсветка корня как цели перетаскивания: скруглённая плашка с отступами от краёв острова.
+/// Highlight for the root as a drop target: a rounded box inset from the island's edges.
 fn drop_overlay(ui: UiColors) -> Div {
     div()
         .absolute()
@@ -1675,7 +1694,7 @@ fn drop_overlay(ui: UiColors) -> Div {
         .bg(ui.drop_target)
 }
 
-/// Ручка ширины в зазоре между островами: акцентная линия при наведении и пока тянут.
+/// Width handle in the gap between islands: an accent line on hover and while it is being dragged.
 fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
     div()
         .id("file-tree-resize")
@@ -1703,7 +1722,7 @@ fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
         )
 }
 
-// --- Чистая логика ---
+// --- Pure logic ---
 
 fn display_name(path: &Path) -> String {
     path.file_name().map_or_else(
@@ -1712,8 +1731,8 @@ fn display_name(path: &Path) -> String {
     )
 }
 
-/// Что выделить при переименовании: имя без расширения (как в Finder); у каталога и у имени
-/// на точку (`.gitignore`) — всё. В символах.
+/// What to select when renaming: the name without its extension (as in Finder); for a directory, or
+/// for a name that starts with a dot (`.gitignore`), the whole name. In characters.
 fn stem_range(name: &str, is_dir: bool) -> Range<usize> {
     let len = name.chars().count();
     match name.rfind('.') {
@@ -1722,8 +1741,8 @@ fn stem_range(name: &str, is_dir: bool) -> Range<usize> {
     }
 }
 
-/// Проверка имени до операции. Новое имя может быть путём: `src/new/mod.rs` создаст
-/// и каталоги, поэтому проверяется каждая часть.
+/// Validates a name before the operation. The new name may be a path: `src/new/mod.rs` also creates
+/// the directories, so every part is checked.
 fn check_name(target: &EditTarget, name: &str) -> Result<(), String> {
     let check = |part: &str| validate_name(part).map_err(|error| error.to_string());
     match target {
@@ -1739,16 +1758,16 @@ fn check_name(target: &EditTarget, name: &str) -> Result<(), String> {
     }
 }
 
-/// Каталог, куда бросить `dragged`, если курсор над строкой `over` (`None` — пустое место или
-/// шапка: корень): каталог — он сам, файл — его каталог. `None` — некуда: в себя, в своё
-/// поддерево или туда, где он и так лежит.
+/// The directory to drop `dragged` into when the cursor is over the row `over` (`None` is empty
+/// space or the title bar: the root): for a directory, itself; for a file, its directory. `None`
+/// means nowhere to drop: onto itself, into its own subtree, or where it already is.
 fn drop_dir(tree: &FileTree, dragged: &Path, over: Option<&Path>) -> Option<PathBuf> {
     let dir = tree.target_dir(over);
     (!dir.starts_with(dragged) && dragged.parent() != Some(dir.as_path())).then_some(dir)
 }
 
-/// Где начинается имя в строке вложенности `depth` — от левого края списка: меню по ⇧F10
-/// встаёт под имя выбранной строки.
+/// Where the name starts in a row at nesting depth `depth`, measured from the left edge of the
+/// list: the ⇧F10 menu is placed under the selected row's name.
 fn name_offset(depth: usize) -> f32 {
     ROW_INSET
         + ROW_PADDING
@@ -1759,9 +1778,10 @@ fn name_offset(depth: usize) -> f32 {
         + NAME_GAP
 }
 
-/// Строка `index` внутри каталога `target`, куда бросят перетаскиваемое: подсветка идёт одной
-/// полосой от строки каталога до его последнего видимого потомка. `(верх, низ)` — строка
-/// начинает или заканчивает полосу (там скругления); `None` — строка вне полосы.
+/// Row `index` inside the directory `target` where the dragged item will be dropped: the highlight
+/// runs as a single band from the directory's row to its last visible descendant. `(top, bottom)`
+/// means the row starts or ends the band (the corners are rounded there); `None` means the row is
+/// outside the band.
 fn drop_band(rows: &[Row], target: &Path, index: usize) -> Option<(bool, bool)> {
     let row = rows.get(index)?;
     if !row.path.starts_with(target) {
@@ -1774,7 +1794,7 @@ fn drop_band(rows: &[Row], target: &Path, index: usize) -> Option<(bool, bool)> 
     Some((top, bottom))
 }
 
-/// Путь относительно корня через `/`; сам корень — `.`.
+/// Path relative to the root, with `/` separators; the root itself is `.`.
 fn relative_path(root: &Path, path: &Path) -> String {
     match path.strip_prefix(root) {
         Ok(rest) if rest.as_os_str().is_empty() => ".".into(),
@@ -1844,7 +1864,7 @@ mod tests {
     fn drop_goes_into_dirs_and_next_to_files() {
         let tree = tree();
         let p = |path: &str| PathBuf::from(path);
-        // Файл из корня — в каталог и к файлу внутри него.
+        // A file from the root: into a directory, and onto a file inside it.
         assert_eq!(
             drop_dir(&tree, &p("/p/a.rs"), Some(&p("/p/src"))),
             Some(p("/p/src"))
@@ -1853,10 +1873,10 @@ mod tests {
             drop_dir(&tree, &p("/p/a.rs"), Some(&p("/p/src/main.rs"))),
             Some(p("/p/src"))
         );
-        // Туда, где лежит, — некуда; на пустое место — в корень.
+        // Where it already lives, there is nowhere to drop; on empty space, the root.
         assert_eq!(drop_dir(&tree, &p("/p/a.rs"), None), None);
         assert_eq!(drop_dir(&tree, &p("/p/src/main.rs"), None), Some(p("/p")));
-        // Каталог — не в себя и не в своё поддерево.
+        // A directory can't go into itself or into its own subtree.
         assert_eq!(drop_dir(&tree, &p("/p/src"), Some(&p("/p/src"))), None);
         assert_eq!(drop_dir(&tree, &p("/p/src"), Some(&p("/p/src/app"))), None);
         assert_eq!(
@@ -1879,14 +1899,16 @@ mod tests {
             ]
         );
         let band = |target: &str, index| drop_band(&rows, Path::new(target), index);
-        // Каталог с детьми: верх — сам каталог, низ — последний ребёнок, сосед — вне полосы.
+        // A directory with children: the top is the directory itself, the bottom is the last child,
+        // and a neighbor is outside the band.
         assert_eq!(band("/p/src", 0), Some((true, false)));
         assert_eq!(band("/p/src", 1), Some((false, false)));
         assert_eq!(band("/p/src", 2), Some((false, true)));
         assert_eq!(band("/p/src", 3), None);
-        // Свёрнутый (или пустой) каталог — полоса из одной строки.
+        // A collapsed (or empty) directory is a band of a single row.
         assert_eq!(band("/p/src/app", 1), Some((true, true)));
-        // Похожее имя — не потомок: `/p/src2` не начинается с `/p/src` по компонентам.
+        // A similar name is not a descendant: `/p/src2` doesn't start with `/p/src` when compared
+        // by components.
         assert_eq!(drop_band(&rows, Path::new("/p/sr"), 0), None);
         assert_eq!(band("/p/src", 9), None);
     }
@@ -1894,7 +1916,7 @@ mod tests {
     #[test]
     fn names_line_up_with_nesting() {
         assert_eq!(name_offset(1) - name_offset(0), INDENT);
-        // Имя правее значка, значок — правее колонки шеврона.
+        // The name is to the right of the icon, and the icon is to the right of the chevron column.
         assert!(name_offset(0) > ROW_INSET + ROW_PADDING + CHEVRON_WIDTH + ICON_SIZE);
     }
 

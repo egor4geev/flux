@@ -1,6 +1,6 @@
 import AppKit
-// Иконка приложения: плитка тёмного стекла по сетке значков macOS (тело 824 из 1024, скругление
-// ~22.5 %), блик, тень и цветной логотип. Пишет .iconset для `iconutil -c icns`.
+// App icon: a dark glass tile on the macOS icon grid (body 824 of 1024, corner radius ~22.5%),
+// a highlight, a shadow and the colour logo. Writes an .iconset for `iconutil -c icns`.
 //   swift scripts/app-icon.swift crates/flux-app/assets/brand/logo.svg target/release/flux.iconset
 let args = CommandLine.arguments
 guard args.count == 3, let logo = NSImage(contentsOfFile: args[1]) else {
@@ -19,7 +19,7 @@ func render(_ px: Int) -> Data {
     let s = CGFloat(px) / 1024
     let body = NSRect(x: 100 * s, y: 100 * s, width: 824 * s, height: 824 * s)
     let tile = NSBezierPath(roundedRect: body, xRadius: 185 * s, yRadius: 185 * s)
-    // Тень под плиткой, как у системных значков.
+    // Shadow under the tile, as on system icons.
     NSGraphicsContext.saveGraphicsState()
     let shadow = NSShadow()
     shadow.shadowColor = NSColor(white: 0, alpha: 0.35)
@@ -29,10 +29,10 @@ func render(_ px: Int) -> Data {
     NSColor(srgbRed: 0.05, green: 0.06, blue: 0.09, alpha: 1).setFill()
     tile.fill()
     NSGraphicsContext.restoreGraphicsState()
-    // Тело: тёмное стекло сверху светлее, снизу глубже.
+    // Body: dark glass, lighter at the top and deeper at the bottom.
     NSGradient(starting: NSColor(srgbRed: 0.105, green: 0.118, blue: 0.180, alpha: 1),
                ending: NSColor(srgbRed: 0.035, green: 0.040, blue: 0.065, alpha: 1))!.draw(in: tile, angle: -90)
-    // Цветное свечение за логотипом.
+    // A colored glow behind the logo.
     let glow = NSGradient(starting: NSColor(srgbRed: 0.52, green: 0.56, blue: 1, alpha: 0.28),
                           ending: NSColor(srgbRed: 0.52, green: 0.56, blue: 1, alpha: 0))!
     NSGraphicsContext.saveGraphicsState()
@@ -40,7 +40,7 @@ func render(_ px: Int) -> Data {
     glow.draw(fromCenter: NSPoint(x: body.midX, y: body.midY), radius: 0,
               toCenter: NSPoint(x: body.midX, y: body.midY), radius: 420 * s, options: [])
     NSGraphicsContext.restoreGraphicsState()
-    // Рамка и блик по верхнему краю.
+    // Border and a highlight along the top edge.
     NSColor(white: 1, alpha: 0.14).setStroke()
     tile.lineWidth = max(1, 4 * s)
     tile.stroke()
@@ -50,7 +50,7 @@ func render(_ px: Int) -> Data {
     NSColor(white: 1, alpha: 0.30).setStroke()
     sheen.lineWidth = max(1, 3 * s)
     sheen.stroke()
-    // Логотип — 62 % тела.
+    // The logo is 62% of the body.
     let side = 824 * s * 0.62
     logo.draw(in: NSRect(x: body.midX - side / 2, y: body.midY - side / 2, width: side, height: side))
     NSGraphicsContext.restoreGraphicsState()

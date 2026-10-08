@@ -1,21 +1,21 @@
-//! История правок для undo/redo.
+//! Edit history for undo/redo.
 //!
-//! Правки собираются в группы: подряд набранные символы отменяются одним Cmd+Z.
+//! Edits are collected into groups: characters typed in a row are undone with a single Cmd+Z.
 
 use crate::transaction::Transaction;
 
 #[derive(Debug, Clone)]
 pub struct Revision {
-    /// Правка вместе с выделением после неё.
+    /// An edit together with the selection after it.
     pub transaction: Transaction,
-    /// Обратная правка вместе с выделением до неё.
+    /// The inverse edit together with the selection before it.
     pub inversion: Transaction,
 }
 
 #[derive(Debug)]
 struct Group {
-    /// Уникальный id состояния документа после группы. Нужен, чтобы понять,
-    /// совпадает ли текущее состояние с сохранённым.
+    /// A unique id of the document state after the group. Needed to tell whether the current state
+    /// matches the saved one.
     id: u64,
     revisions: Vec<Revision>,
 }
@@ -43,7 +43,7 @@ impl History {
         }
     }
 
-    /// Транзакции, которые надо применить по порядку, чтобы отменить последнюю группу.
+    /// Transactions to apply in sequence to undo the last group.
     pub fn undo(&mut self) -> Option<Vec<Transaction>> {
         let group = self.undo.pop()?;
         let txs = group
@@ -67,7 +67,7 @@ impl History {
         Some(txs)
     }
 
-    /// Id текущего состояния; `0` — исходный документ.
+    /// The id of the current state; `0` is the original document.
     pub fn state_id(&self) -> u64 {
         self.undo.last().map_or(0, |group| group.id)
     }

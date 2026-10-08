@@ -1,15 +1,16 @@
-//! Файлы проекта без UI:
-//! - [`rules`] — какие файлы принадлежат проекту: служебные каталоги VCS и мусор не видны,
-//!   скрытые — видны, `.gitignore` — по правилам ripgrep ([`project_walker`]); те же правила
-//!   у поиска (`flux-search`);
-//! - [`list`] — содержимое одного каталога для дерева: каталоги первыми, естественный
-//!   порядок имён, игнорируемые помечены ([`list_dir`]);
-//! - [`tree`] — состояние дерева файлов: прочитанные и раскрытые каталоги, видимые строки;
-//! - [`ops`] — операции над файлами: создать, переименовать, переместить, скопировать,
-//!   удалить в Корзину — без перезаписи существующих файлов;
-//! - [`watch`] — наблюдение за изменениями на диске ([`Watcher`]).
+//! Project files, without UI:
+//! - [`rules`] — which files belong to the project: VCS metadata directories and junk are hidden,
+//!   hidden files are visible, and `.gitignore` is honored by ripgrep's rules ([`project_walker`]);
+//!   search (`flux-search`) uses the same rules;
+//! - [`list`] — the contents of a single directory for the tree: directories first, natural name
+//!   order, ignored entries marked ([`list_dir`]);
+//! - [`tree`] — the file tree state: read and expanded directories, visible rows;
+//! - [`ops`] — file operations: create, rename, move, copy, delete to the Trash, without
+//!   overwriting existing files;
+//! - [`watch`] — watching for changes on disk ([`Watcher`]).
 //!
-//! Чтение каталогов и операции блокируют поток — их зовут из фона (`background_spawn` gpui).
+//! Directory reads and operations block the thread, so call them from the background (gpui's
+//! `background_spawn`).
 
 pub mod list;
 pub mod ops;

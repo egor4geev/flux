@@ -1,11 +1,12 @@
-//! Нечёткий поиск (fuzzy) через nucleo:
-//! - небольшие списки (палитра команд — сотни строк) — синхронно, [`match_list`];
-//! - большие списки путей (поиск файла — десятки тысяч) — [`PathMatcher`]: nucleo
-//!   сопоставляет в своих потоках, а список пополняется прямо во время обхода.
+//! Fuzzy search through nucleo:
+//! - small lists (the command palette: hundreds of rows) are matched synchronously, with
+//!   [`match_list`];
+//! - large lists of paths (file search: tens of thousands) use [`PathMatcher`]: nucleo matches on
+//!   its own threads, and the list is filled right during the walk.
 //!
-//! Синтаксис запроса — как в fzf: слова через пробел ищутся независимо, `'слово` — точное
-//! вхождение, `^начало`, `конец$`, `!исключить`. Регистр «умный»: заглавная буква в слове
-//! делает это слово чувствительным к регистру.
+//! The query syntax is like fzf's: words separated by spaces are matched independently, `'word` is
+//! an exact match, `^start`, `end$`, `!exclude`. Case is "smart": an uppercase letter in a word
+//! makes that word case-sensitive.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,19 +15,19 @@ use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Injector, Matcher, Nucleo, Utf32Str};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Совпадение элемента списка с запросом.
+/// A list item's match against the query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuzzyMatch {
-    /// Индекс элемента во входном списке.
+    /// The index of the item in the input list.
     pub index: usize,
-    /// Чем больше, тем лучше совпадение.
+    /// The higher, the better the match.
     pub score: u32,
-    /// Совпавшие символы — индексы `char` в строке элемента, по возрастанию, без повторов.
+    /// Matched characters: `char` indices into the item's string, ascending, without duplicates.
     pub positions: Vec<usize>,
 }
 
-/// Сопоставляет запрос со списком строк. Результат — по убыванию оценки, при равной оценке —
-/// в исходном порядке. Пустой запрос — все элементы по порядку, без позиций.
+/// Matches the query against a list of strings. The result is sorted by descending score, with ties
+/// kept in the original order. An empty query gives all items in order, without positions.
 pub fn match_list<S: AsRef<str>>(query: &str, items: &[S]) -> Vec<FuzzyMatch> {
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     if pattern.atoms.is_empty() {
@@ -60,36 +61,36 @@ pub fn match_list<S: AsRef<str>>(query: &str, items: &[S]) -> Vec<FuzzyMatch> {
     matches
 }
 
-/// Совпадение пути с запросом [`PathMatcher`].
+/// A path's match against the query of a [`PathMatcher`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathMatch {
-    /// Путь относительно корня проекта, разделитель — `/`.
+    /// The path relative to the project root, with `/` as the separator.
     pub path: Arc<str>,
-    /// Совпавшие символы — индексы `char` в `path`, по возрастанию, без повторов.
+    /// Matched characters: `char` indices into `path`, ascending, without duplicates.
     pub positions: Vec<usize>,
 }
 
-/// Нечёткий поиск по большому списку путей (поиск файла). Пути добавляются через
-/// [`PathInjector`] из любых потоков, сопоставление идёт в потоках nucleo; результаты
-/// забирает [`tick`](Self::tick) — его стоит звать после каждого `notify` и после
-/// смены запроса. Оценка учитывает границы `/` (как у путей в fzf).
+/// Fuzzy search over a large list of paths (file search). Paths are added through a
+/// [`PathInjector`] from any thread, matching runs on nucleo's threads; results are collected by
+/// [`tick`](Self::tick), which should be called after every `notify` and after the query changes.
+/// The score takes `/` boundaries into account (as for paths in fzf).
 pub struct PathMatcher {
     nucleo: Nucleo<Arc<str>>,
-    /// Для позиций совпавших символов у показанных строк.
+    /// For the positions of matched characters in the shown rows.
     matcher: Matcher,
     query: String,
     running: bool,
 }
 
-/// Пополнение [`PathMatcher`]. Дёшево клонируется и отправляется в другие потоки; пока
-/// жив хотя бы один клон, [`PathMatcher::is_running`] считает, что список ещё растёт.
+/// Feeds a [`PathMatcher`]. Cheap to clone and to send to other threads; while at least one clone
+/// is alive, [`PathMatcher::is_running`] considers the list to be still growing.
 #[derive(Clone)]
 pub struct PathInjector {
     injector: Injector<Arc<str>>,
 }
 
 impl PathInjector {
-    /// Добавляет путь относительно корня проекта.
+    /// Adds a path relative to the project root.
     pub fn push(&self, relative: &Path) {
         let path = path_string(relative);
         self.injector.push(path, |path, columns| {
@@ -99,9 +100,9 @@ impl PathInjector {
 }
 
 impl PathMatcher {
-    /// `notify` вызывается из рабочих потоков nucleo, когда пора вызвать [`tick`](Self::tick):
-    /// появились новые пути или досчитались совпадения. Сам по себе он не ограничен по
-    /// частоте — перерисовку стоит прореживать.
+    /// `notify` is called from nucleo's worker threads when it is time to call
+    /// [`tick`](Self::tick): new paths have appeared or matches have been computed. By itself it is
+    /// not rate-limited, so redraws should be throttled.
     pub fn new(notify: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
             nucleo: Nucleo::new(Config::DEFAULT.match_paths(), notify, None, 1),
@@ -117,15 +118,15 @@ impl PathMatcher {
         }
     }
 
-    /// Новый запрос; сопоставление начнётся на ближайшем [`tick`](Self::tick). Если запрос
-    /// только дописан в конец, nucleo перебирает лишь прошлые совпадения.
+    /// Sets a new query; matching starts on the nearest [`tick`](Self::tick). If the query was only
+    /// appended to, nucleo goes through just the previous matches.
     pub fn set_query(&mut self, query: &str) {
         if query == self.query {
             return;
         }
-        // Дописанный запрос не расширяет выборку, кроме случаев, когда старый кончался
-        // экранированием (`\`) или якорем конца (`$`): тогда меняется смысл последнего
-        // слова. Отрицание (`!слово`) nucleo проверяет сам.
+        // An appended query does not widen the result set, except when the old one ended with an
+        // escape (`\`) or an end anchor (`$`): then the meaning of the last word changes. nucleo
+        // checks negation (`!word`) itself.
         let append = query.starts_with(&self.query)
             && !self.query.ends_with('\\')
             && !self.query.ends_with('$');
@@ -135,33 +136,33 @@ impl PathMatcher {
         self.query = query.to_string();
     }
 
-    /// Забирает готовые результаты, не дожидаясь потоков. `true` — список совпадений
-    /// изменился.
+    /// Collects the ready results without waiting for the threads. `true` means the list of matches
+    /// changed.
     pub fn tick(&mut self) -> bool {
         let status = self.nucleo.tick(0);
         self.running = status.running;
         status.changed
     }
 
-    /// Ещё не всё готово (по последнему [`tick`](Self::tick)): сопоставление идёт или
-    /// кто-то держит [`PathInjector`] — обход продолжается.
+    /// Not everything is ready yet (as of the last [`tick`](Self::tick)): matching is in progress
+    /// or someone holds a [`PathInjector`], so the walk continues.
     pub fn is_running(&self) -> bool {
         self.running || self.nucleo.active_injectors() > 0
     }
 
-    /// Сколько всего путей (по последнему [`tick`](Self::tick)).
+    /// The total number of paths (as of the last [`tick`](Self::tick)).
     pub fn item_count(&self) -> usize {
         self.nucleo.snapshot().item_count() as usize
     }
 
-    /// Сколько путей подходит под запрос (по последнему [`tick`](Self::tick)).
+    /// The number of paths that match the query (as of the last [`tick`](Self::tick)).
     pub fn match_count(&self) -> usize {
         self.nucleo.snapshot().matched_item_count() as usize
     }
 
-    /// `n`-е совпадение по убыванию оценки (при пустом запросе — в порядке добавления)
-    /// с позициями совпавших символов. Позиции считаются здесь, поэтому брать стоит только
-    /// видимые строки.
+    /// The `n`-th match in descending score order (for an empty query, in insertion order) with the
+    /// positions of the matched characters. The positions are computed here, so only the visible
+    /// rows should be requested.
     pub fn get(&mut self, n: usize) -> Option<PathMatch> {
         let snapshot = self.nucleo.snapshot();
         let item = snapshot.get_matched_item(u32::try_from(n).ok()?)?;
@@ -177,7 +178,7 @@ impl PathMatcher {
     }
 }
 
-/// Путь строкой с `/` между компонентами — и для показа, и для сопоставления.
+/// The path as a string with `/` between components, used for both display and matching.
 fn path_string(path: &Path) -> Arc<str> {
     let path = path.to_string_lossy();
     if std::path::MAIN_SEPARATOR == '/' {
@@ -187,17 +188,17 @@ fn path_string(path: &Path) -> Arc<str> {
     }
 }
 
-/// Как nucleo представил строку, по которой считал позиции.
+/// How nucleo represented the string it computed the positions over.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Haystack {
-    /// `Utf32Str::new`: ASCII — побайтно; иначе — по графемам (первый символ графемы),
-    /// но если первые символы всех графем — ASCII, снова побайтно.
+    /// `Utf32Str::new`: ASCII is byte by byte; otherwise by grapheme (the first character of the
+    /// grapheme), but if the first characters of all graphemes are ASCII, byte by byte again.
     Str,
-    /// `Utf32String::from`: ASCII — побайтно, иначе — всегда по графемам.
+    /// `Utf32String::from`: ASCII is byte by byte, otherwise always by grapheme.
     String,
 }
 
-/// Индексы nucleo → индексы `char` в `text`, по возрастанию, без повторов.
+/// nucleo indices → `char` indices into `text`, ascending, without duplicates.
 fn char_positions(text: &str, indices: &mut Vec<u32>, haystack: Haystack) -> Vec<usize> {
     indices.sort_unstable();
     indices.dedup();
@@ -275,18 +276,19 @@ mod tests {
     fn positions_are_char_indices() {
         let m = &match_list("ml", &["move left"])[0];
         assert_eq!(m.positions, [0, 5]);
-        // Кириллица: nucleo считает графемы, у нас — символы.
+        // Cyrillic: nucleo counts graphemes, we count characters.
         let m = &match_list("пф", &["путь к файлу"])[0];
         assert_eq!(m.positions, [0, 7]);
-        // Эмодзи из нескольких символов перед совпадением.
+        // A multi-character emoji before the match.
         let m = &match_list("ok", &["👍🏽 ok"])[0];
         assert_eq!(m.positions, [3, 4]);
-        // Комбинируемый акцент: первые символы графем — ASCII, nucleo считает байты.
+        // A combining accent: the first characters of the graphemes are ASCII, so nucleo counts
+        // bytes.
         let m = &match_list("ex", &["e\u{301}x"])[0];
         assert_eq!(m.positions, [0, 2]);
     }
 
-    /// Ждёт, пока сопоставление и пополнение закончатся.
+    /// Waits for matching and feeding to finish.
     fn settle(matcher: &mut PathMatcher) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -375,20 +377,20 @@ mod tests {
         let mut found = paths(&mut matcher);
         found.sort();
         assert_eq!(found, ["README.md", "crates/flux-app/src/editor.rs"]);
-        // Дописали запрос — nucleo перебирает только прошлые совпадения.
+        // The query was appended to: nucleo goes through only the previous matches.
         matcher.set_query("edit");
         settle(&mut matcher);
         assert_eq!(paths(&mut matcher), ["crates/flux-app/src/editor.rs"]);
-        // Запрос стал короче — снова шире.
+        // The query got shorter: wider again.
         matcher.set_query("e");
         settle(&mut matcher);
         assert_eq!(matcher.match_count(), 3);
-        // `$` — точный конец пути, не нечёткий.
+        // `$` is the exact end of the path, not a fuzzy one.
         matcher.set_query("md$");
         settle(&mut matcher);
         assert_eq!(matcher.match_count(), 2);
 
-        // Кириллица в пути: позиции — индексы символов, а не графем или байтов.
+        // Cyrillic in a path: the positions are character indices, not grapheme or byte indices.
         matcher.set_query("редmd");
         settle(&mut matcher);
         let found = matcher.get(0).unwrap();
@@ -409,7 +411,7 @@ mod tests {
         matcher.set_query("!ab");
         settle(&mut matcher);
         assert_eq!(paths(&mut matcher), ["a.rs"]);
-        // «!abc» исключает меньше, чем «!ab», — дописанный запрос расширил выборку.
+        // "!abc" excludes fewer than "!ab": the appended query widened the result set.
         matcher.set_query("!abc");
         settle(&mut matcher);
         let mut found = paths(&mut matcher);

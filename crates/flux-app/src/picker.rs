@@ -1,8 +1,8 @@
-//! Список выбора с полем запроса — основа палитры команд и поиска файла.
+//! A selection list with a query field: the foundation of the command palette and file search.
 //!
-//! [`Picker`] владеет полем ([`TextInput`]), выбранной строкой, прокруткой и клавишами;
-//! что искать и как рисовать строку — решает [`PickerDelegate`]. Показывается как
-//! всплывающее окно: `Workspace::toggle_modal(window, cx, |window, cx| Picker::new(..))`.
+//! [`Picker`] owns the field ([`TextInput`]), the selected row, scrolling, and the keys; what to
+//! search for and how to draw a row is up to the [`PickerDelegate`]. Shown as an overlay window:
+//! `Workspace::toggle_modal(window, cx, |window, cx| Picker::new(..))`.
 
 use std::ops::Range;
 
@@ -12,20 +12,21 @@ use gpui::{
     Subscription, UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 
+use crate::i18n::tr;
 use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::theme::{self, Theme};
 use crate::ui::{self, RADIUS_MD};
 
-/// Высота строки списка.
+/// Height of a list row.
 const ROW_HEIGHT: f32 = 34.;
-/// Сколько строк видно без прокрутки.
+/// How many rows are visible without scrolling.
 const MAX_VISIBLE_ROWS: usize = 10;
 const PICKER_WIDTH: f32 = 640.;
-/// Шапка с запросом и подвал с подсказками.
+/// Header with the query and footer with hints.
 const HEADER_HEIGHT: f32 = 50.;
 const FOOTER_HEIGHT: f32 = 36.;
-/// Отступ строк от краёв панели и списка от шапки и подвала.
+/// Inset of the rows from the panel edges, and of the list from the header and footer.
 const LIST_INSET: f32 = 6.;
 
 actions!(
@@ -54,26 +55,27 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// Что показывает список выбора. Про клавиши, выбор и прокрутку делегат не знает.
+/// What the selection list displays. The delegate knows nothing about keys, selection, or
+/// scrolling.
 pub trait PickerDelegate: Sized + 'static {
-    /// Подсказка в пустом поле запроса.
+    /// Placeholder text in the empty query field.
     fn placeholder(&self) -> SharedString;
 
     fn match_count(&self) -> usize;
 
-    /// Запрос изменился (и один раз при создании — с пустым запросом): пересчитать
-    /// совпадения. Можно асинхронно: по готовности перерисовать Picker (`cx.notify()` на
-    /// нём) — выбранная строка сама останется в пределах `match_count`.
+    /// The query changed (and once at creation, with an empty query): recompute the matches. May be
+    /// asynchronous: when ready, redraw the Picker (`cx.notify()` on it); the selected row stays
+    /// within `match_count` on its own.
     fn update_matches(&mut self, query: &str, window: &mut Window, cx: &mut Context<Picker<Self>>);
 
-    /// Enter или щелчок по строке `index` (< `match_count`). Закрывает окно сам делегат —
-    /// `cx.emit(DismissEvent)`, — когда и если нужно: палитре сначала нужно вернуть фокус
-    /// и отправить действие.
+    /// Enter or a click on row `index` (< `match_count`). The delegate itself closes the window
+    /// with `cx.emit(DismissEvent)`, when and if needed: the palette first has to restore focus and
+    /// dispatch the action.
     fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<Picker<Self>>);
 
-    /// Содержимое строки `index`; фон выбранной строки и строки под мышью рисует Picker.
-    /// Вызывается только для видимых строк — здесь можно лениво досчитать то, что нужно
-    /// для отрисовки (например, позиции совпавших символов).
+    /// Content of row `index`; the Picker draws the background of the selected row and of the row
+    /// under the mouse. Called only for visible rows, so anything needed for rendering can be
+    /// computed lazily here (for example, the positions of matched characters).
     fn render_match(
         &mut self,
         index: usize,
@@ -82,7 +84,7 @@ pub trait PickerDelegate: Sized + 'static {
         cx: &mut Context<Picker<Self>>,
     ) -> AnyElement;
 
-    /// Левая часть подвала: например, «1234 files · indexing…».
+    /// Left part of the footer: for example, "1234 files · indexing…".
     fn render_footer(
         &self,
         _window: &mut Window,
@@ -91,14 +93,14 @@ pub trait PickerDelegate: Sized + 'static {
         None
     }
 
-    /// Текст вместо пустого списка.
+    /// Text shown instead of an empty list.
     fn empty_message(&self) -> SharedString {
-        "No matches".into()
+        tr("No matches").into()
     }
 
-    /// Что делает Enter — подпись в подсказке подвала («open», «run»).
+    /// What Enter does: the label in the footer hint ("open", "run").
     fn confirm_label(&self) -> &'static str {
-        "open"
+        tr("open")
     }
 }
 
@@ -159,7 +161,8 @@ impl<D: PickerDelegate> Picker<D> {
             return;
         }
         let index = index.min(count - 1);
-        // Прокрутка на минимум: вверх — строка встаёт к верхнему краю, вниз — к нижнему.
+        // Scroll the minimum amount: moving up, the row snaps to the top edge; moving down, to the
+        // bottom edge.
         let strategy = if index < self.selected {
             ScrollStrategy::Top
         } else {
@@ -205,8 +208,8 @@ impl<D: PickerDelegate> Picker<D> {
     ) -> AnyElement {
         let ui = Theme::ui(cx);
         let selected = index == self.selected;
-        // Внешний блок — полная ширина списка (по нему uniform_list меряет высоту строки),
-        // внутренний — скруглённая подложка с отступом от краёв панели.
+        // The outer block spans the full width of the list (uniform_list measures the row height
+        // from it); the inner one is a rounded background inset from the panel edges.
         div()
             .w_full()
             .h(px(ROW_HEIGHT))
@@ -310,9 +313,9 @@ impl<D: PickerDelegate> Render for Picker<D> {
                     .child(div().min_w_0().truncate().children(footer))
                     .child(ui::hint_bar(
                         &[
-                            ("↑↓", "navigate"),
+                            ("↑↓", tr("navigate")),
                             ("↵", self.delegate.confirm_label()),
-                            ("esc", "close"),
+                            ("esc", tr("close")),
                         ],
                         ui,
                     )),
@@ -320,8 +323,8 @@ impl<D: PickerDelegate> Render for Picker<D> {
     }
 }
 
-/// Строка с подсвеченными символами: `positions` — индексы `char` (как у
-/// `flux_search::FuzzyMatch`), подсвечиваются цветом `color`.
+/// Text with highlighted characters: `positions` are `char` indices (as in
+/// `flux_search::FuzzyMatch`), highlighted with `color`.
 pub fn highlighted_text(
     text: impl Into<SharedString>,
     positions: &[usize],
@@ -336,8 +339,8 @@ pub fn highlighted_text(
     StyledText::new(text).with_highlights(ranges.into_iter().map(|range| (range, style)))
 }
 
-/// Индексы символов → байтовые диапазоны, соседние символы — одним диапазоном.
-/// Индексы за концом строки отбрасываются.
+/// Converts character indices to byte ranges, with adjacent characters merged into a single range.
+/// Indices past the end of the string are discarded.
 pub fn byte_ranges(text: &str, positions: &[usize]) -> Vec<Range<usize>> {
     let mut ranges: Vec<Range<usize>> = Vec::new();
     let mut positions = positions.iter().copied().peekable();
@@ -363,9 +366,9 @@ mod tests {
     fn positions_become_merged_byte_ranges() {
         assert_eq!(byte_ranges("move left", &[0, 1, 5]), vec![0..2, 5..6]);
         assert_eq!(byte_ranges("abc", &[]), Vec::<Range<usize>>::new());
-        // «п» и «ф» — по 2 байта.
+        // "п" and "ф" are 2 bytes each.
         assert_eq!(byte_ranges("путь к файлу", &[0, 7]), vec![0..2, 12..14]);
-        // Повторы и индексы за концом строки не мешают.
+        // Duplicates and indices past the end of the string are tolerated.
         assert_eq!(byte_ranges("ab", &[1, 1, 9]), vec![1..2]);
     }
 }

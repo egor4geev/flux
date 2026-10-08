@@ -1,11 +1,11 @@
-//! Состояние дерева файлов проекта: какие каталоги прочитаны и раскрыты, видимые строки.
-//! Ничего не читает с диска сам: списки каталогов приносит вызывающий ([`crate::list_dir`]
-//! в фоне). Что дочитать, говорит [`FileTree::pending_loads`], что перечитать после
-//! изменений на диске — [`FileTree::refresh_plan`].
+//! State of the project's file tree: which directories have been read and expanded, and the visible
+//! rows. It never reads from disk itself: the caller brings the directory listings
+//! ([`crate::list_dir`], in the background). [`FileTree::pending_loads`] says what is still to be
+//! read, and [`FileTree::refresh_plan`] what to re-read after changes on disk.
 //!
-//! Каталоги известны по абсолютным путям. Прочитанный каталог помнит свой список, даже
-//! когда свёрнут: раскрытие снова — без чтения, а наблюдение за диском держит список свежим.
-//! Раскрытие вложенных каталогов сохраняется, пока свёрнут их родитель.
+//! Directories are identified by absolute paths. A directory that has been read remembers its
+//! listing even when collapsed: expanding it again needs no read, and disk watching keeps the
+//! listing fresh. The expansion of nested directories is preserved while their parent is collapsed.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -14,25 +14,25 @@ use crate::list::{DirEntry, EntryKind};
 use crate::ops::remap;
 use crate::watch::FsChange;
 
-/// Файлы правил: их изменение меняет флаг `ignored` у всего каталога.
+/// Rule files: changing one changes the `ignored` flag of the whole directory.
 const IGNORE_FILES: [&str; 2] = [".gitignore", ".ignore"];
 
-/// Видимая строка дерева.
+/// A visible tree row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub path: PathBuf,
     pub name: String,
-    /// Вложенность: дети корня — 0.
+    /// Nesting depth: children of the root are 0.
     pub depth: usize,
     pub kind: EntryKind,
     pub ignored: bool,
-    /// Каталог раскрыт; у файлов — `false`.
+    /// The directory is expanded; `false` for files.
     pub expanded: bool,
 }
 
 #[derive(Debug, Default)]
 struct Dir {
-    /// Прочитанный список; `None` — ещё не прочитан.
+    /// The listing that has been read; `None` means not read yet.
     entries: Option<Vec<DirEntry>>,
     expanded: bool,
 }
@@ -40,8 +40,8 @@ struct Dir {
 #[derive(Debug)]
 pub struct FileTree {
     root: PathBuf,
-    /// Каталоги, о которых что-то известно: прочитанные или раскрытые. Корень есть всегда
-    /// и всегда раскрыт.
+    /// Directories that something is known about: read or expanded ones. The root is always present
+    /// and always expanded.
     dirs: HashMap<PathBuf, Dir>,
 }
 
@@ -62,7 +62,7 @@ impl FileTree {
         &self.root
     }
 
-    /// Видимые строки по порядку: дети раскрытых и прочитанных каталогов.
+    /// Visible rows in order: the children of expanded and read directories.
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
         self.push_rows(&self.root, 0, &mut rows);
@@ -94,7 +94,7 @@ impl FileTree {
         self.dirs.get(dir)?.entries.as_ref()
     }
 
-    /// Запись о `path` в списке его каталога; о корне записи нет.
+    /// The entry for `path` in its directory's listing; there is no entry for the root.
     pub fn entry(&self, path: &Path) -> Option<&DirEntry> {
         let name = path.file_name()?.to_str()?;
         self.entries(path.parent()?)?
@@ -102,7 +102,7 @@ impl FileTree {
             .find(|entry| entry.name == name)
     }
 
-    /// Каталог ли это: корень или каталог в списке своего родителя.
+    /// Whether it is a directory: the root, or a directory in its parent's listing.
     pub fn is_dir(&self, path: &Path) -> bool {
         path == self.root || self.entry(path).is_some_and(|e| e.kind == EntryKind::Dir)
     }
@@ -115,14 +115,15 @@ impl FileTree {
         self.dirs.get(dir).is_some_and(|dir| dir.expanded)
     }
 
-    /// Исключён ли `path` правилами `.gitignore` — по списку родителя; корень — нет.
-    /// Для каталога это аргумент `dir_ignored` у [`crate::list_dir`] его детей.
+    /// Whether `path` is excluded by the `.gitignore` rules, judging by the parent's listing; the
+    /// root is not. For a directory this is the `dir_ignored` argument of [`crate::list_dir`] for
+    /// its children.
     pub fn is_ignored(&self, path: &Path) -> bool {
         self.entry(path).is_some_and(|entry| entry.ignored)
     }
 
-    /// Каталоги, которые видно (все предки раскрыты и прочитаны), но сами ещё не прочитаны, —
-    /// с флагом `ignored` для `list_dir`. Родители — раньше детей.
+    /// Directories that are visible (all ancestors expanded and read) but not read themselves yet,
+    /// with the `ignored` flag for `list_dir`. Parents come before children.
     pub fn pending_loads(&self) -> Vec<(PathBuf, bool)> {
         let mut pending = Vec::new();
         self.collect_pending(&self.root, false, &mut pending);
@@ -142,10 +143,10 @@ impl FileTree {
         }
     }
 
-    /// Список каталога прочитан. Состояние оставшихся подкаталогов сохраняется, исчезнувших
-    /// (и всего внутри них) — забывается. Возвращает прочитанные подкаталоги, у которых
-    /// сменился флаг `ignored`: их нужно перечитать — с ним меняются флаги всего внутри.
-    /// Список каталога, о котором дерево уже забыло, отбрасывается.
+    /// A directory listing has been read. The state of the remaining subdirectories is kept; that
+    /// of vanished ones (and everything inside them) is forgotten. Returns the read subdirectories
+    /// whose `ignored` flag changed: they need to be re-read, since the flags of everything inside
+    /// change with it. A listing for a directory the tree has already forgotten is discarded.
     pub fn set_listing(&mut self, dir: &Path, entries: Vec<DirEntry>) -> Vec<PathBuf> {
         let Some(state) = self.dirs.get_mut(dir) else {
             return Vec::new();
@@ -179,14 +180,14 @@ impl FileTree {
         stale
     }
 
-    /// Забывает каталог и всё внутри него.
+    /// Forgets a directory and everything inside it.
     fn forget(&mut self, dir: &Path) {
         if dir != self.root {
             self.dirs.retain(|path, _| !path.starts_with(dir));
         }
     }
 
-    /// Раскрыть каталог; непрочитанный появится в [`Self::pending_loads`].
+    /// Expands a directory; an unread one will appear in [`Self::pending_loads`].
     pub fn expand(&mut self, dir: &Path) {
         if dir.starts_with(&self.root) {
             self.dirs.entry(dir.to_path_buf()).or_default().expanded = true;
@@ -199,7 +200,8 @@ impl FileTree {
         }
         if let Some(state) = self.dirs.get_mut(dir) {
             state.expanded = false;
-            // Раскрыть и тут же свернуть, не дождавшись чтения: помнить нечего.
+            // Expand and collapse right away, without waiting for the read: there is nothing to
+            // remember.
             if state.entries.is_none() {
                 self.dirs.remove(dir);
             }
@@ -214,7 +216,7 @@ impl FileTree {
         }
     }
 
-    /// Свернуть все каталоги; прочитанные списки остаются.
+    /// Collapses all directories; the listings that have been read stay.
     pub fn collapse_all(&mut self) {
         let root = self.root.clone();
         self.dirs.retain(|path, dir| {
@@ -225,8 +227,8 @@ impl FileTree {
         });
     }
 
-    /// Раскрыть каталоги от корня до `path` (сам `path` — нет): после их чтения строка `path`
-    /// станет видна. `false` — путь вне корня.
+    /// Expands the directories from the root down to `path` (not `path` itself): once they are
+    /// read, the `path` row becomes visible. `false` means the path is outside the root.
     pub fn reveal(&mut self, path: &Path) -> bool {
         let Ok(rest) = path.strip_prefix(&self.root) else {
             return false;
@@ -243,9 +245,10 @@ impl FileTree {
         true
     }
 
-    /// `from` переименован или перемещён в `to`: состояние каталогов внутри едет вместе с ним.
-    /// В том же каталоге запись переименовывается на месте (порядок поправит перечитывание),
-    /// из другого — убирается; новый родитель допишет её, когда его перечитают.
+    /// `from` was renamed or moved to `to`: the state of the directories inside moves along with
+    /// it. In the same directory the entry is renamed in place (re-reading will fix the order); if
+    /// it came from another directory, the entry is removed, and the new parent will add it when it
+    /// is re-read.
     pub fn rename(&mut self, from: &Path, to: &Path) {
         if from == to || from == self.root {
             return;
@@ -280,7 +283,8 @@ impl FileTree {
         }
     }
 
-    /// `path` удалён: убрать его из списка родителя и забыть каталоги внутри.
+    /// `path` was deleted: removes it from the parent's listing and forgets the directories inside
+    /// it.
     pub fn remove(&mut self, path: &Path) {
         if path == self.root {
             return;
@@ -295,7 +299,7 @@ impl FileTree {
         }
     }
 
-    /// Прочитанные каталоги — родители раньше детей.
+    /// Directories that have been read, parents before children.
     pub fn loaded_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = self
             .dirs
@@ -307,10 +311,10 @@ impl FileTree {
         dirs
     }
 
-    /// Что перечитать после изменений на диске. Для каждого пути — его прочитанный каталог
-    /// и сам путь, если это прочитанный каталог; изменился `.gitignore` или `.ignore` — ещё
-    /// и все прочитанные каталоги внутри его каталога. `Rescan` — все прочитанные. Пути вне
-    /// корня пропускаются. Родители — раньше детей.
+    /// What to re-read after changes on disk. For each path: its read directory, plus the path
+    /// itself if it is a read directory; if `.gitignore` or `.ignore` changed, also all read
+    /// directories inside its directory. `Rescan` means all read ones. Paths outside the root are
+    /// skipped. Parents come before children.
     pub fn refresh_plan(&self, changes: &[FsChange]) -> Vec<PathBuf> {
         let mut plan = BTreeSet::new();
         for change in changes {
@@ -343,8 +347,8 @@ impl FileTree {
         plan
     }
 
-    /// Каталог для нового файла или вставки: выбранный каталог, каталог выбранного файла,
-    /// без выбора — корень.
+    /// The directory for a new file or a paste: the selected directory, the directory of the
+    /// selected file, or the root when nothing is selected.
     pub fn target_dir(&self, selected: Option<&Path>) -> PathBuf {
         match selected {
             Some(path) if self.is_dir(path) => path.to_path_buf(),
@@ -358,7 +362,7 @@ impl FileTree {
     }
 }
 
-/// Мельче — раньше: родитель перед ребёнком, порядок полный.
+/// Shallower first: a parent before its child, and the order is total.
 fn sort_parents_first(dirs: &mut [PathBuf]) {
     dirs.sort_by(|a, b| {
         let depth = |path: &PathBuf| path.components().count();
@@ -380,7 +384,7 @@ mod tests {
         }
     }
 
-    /// Список каталога: `name/` — каталог, `!` в начале — исключён `.gitignore`.
+    /// A directory listing: `name/` is a directory, a leading `!` means excluded by `.gitignore`.
     fn listing(names: &[&str]) -> Vec<DirEntry> {
         names
             .iter()
@@ -402,7 +406,7 @@ mod tests {
             .collect()
     }
 
-    /// Строки как «отступ + имя», каталоги — с `/`, раскрытые — с `/-`.
+    /// Rows as "indent + name", directories with `/`, expanded ones with `/-`.
     fn shape(tree: &FileTree) -> Vec<String> {
         tree.rows()
             .iter()
@@ -442,7 +446,7 @@ mod tests {
             tree.pending_loads(),
             [(path("src"), false), (path("target"), true)]
         );
-        // Раскрыт, но не прочитан — пока без детей.
+        // Expanded but not read: no children for now.
         assert_eq!(shape(&tree), ["src/-", "target/-", "Cargo.toml"]);
         tree.set_listing(&path("src"), listing(&["app/", "main.rs"]));
         assert_eq!(
@@ -464,7 +468,7 @@ mod tests {
         tree.set_listing(&path("src/app"), listing(&["lib.rs"]));
         tree.collapse(&path("src"));
         assert_eq!(shape(&tree), ["src/", "target/", "Cargo.toml"]);
-        // Свёрнутый, но прочитанный каталог не просит чтения.
+        // A collapsed but read directory doesn't ask to be read.
         assert!(tree.pending_loads().is_empty());
         tree.toggle(&path("src"));
         assert_eq!(
@@ -489,7 +493,7 @@ mod tests {
         tree.collapse_all();
         assert_eq!(shape(&tree), ["src/", "target/", "Cargo.toml"]);
         assert!(tree.is_loaded(&path("src")));
-        // Раскрытый, но так и не прочитанный — забыт.
+        // Expanded but never read: forgotten.
         assert!(!tree.dirs.contains_key(&path("target")));
         assert!(tree.pending_loads().is_empty());
     }
@@ -507,10 +511,10 @@ mod tests {
         assert!(tree.is_expanded(&path("src/app")));
         assert!(!tree.dirs.contains_key(&path("src/old")));
         assert!(!tree.dirs.contains_key(&path("src/old/deep")));
-        // Каталог стал файлом с тем же именем — тоже забыт.
+        // A directory that became a file with the same name is forgotten too.
         tree.set_listing(&path("src"), listing(&["app"]));
         assert!(!tree.dirs.contains_key(&path("src/app")));
-        // Список забытого каталога отбрасывается.
+        // The listing of a forgotten directory is discarded.
         assert!(
             tree.set_listing(&path("src/old"), listing(&["x"]))
                 .is_empty()
@@ -524,11 +528,12 @@ mod tests {
         tree.expand(&path("target"));
         tree.set_listing(&path("target"), listing(&["!debug/"]));
         tree.expand(&path("src"));
-        // `target` больше не исключён (правку .gitignore откатили).
+        // `target` is no longer excluded (the .gitignore edit was reverted).
         let stale = tree.set_listing(&path(""), listing(&["src/", "target/", "Cargo.toml"]));
         assert_eq!(stale, [path("target")]);
         assert!(!tree.is_ignored(&path("target")));
-        // `src` не прочитан — перечитывать нечего; флаг не менялся — тем более.
+        // `src` has not been read, so there is nothing to re-read; the flag didn't change, all the
+        // more so.
         let stale = tree.set_listing(&path(""), listing(&["src/", "target/", "Cargo.toml"]));
         assert!(stale.is_empty());
     }
@@ -537,7 +542,7 @@ mod tests {
     fn reveal_expands_ancestors_one_level_at_a_time() {
         let mut tree = tree();
         assert!(tree.reveal(&path("src/app/deep/lib.rs")));
-        // Читать можно только `src`: о `src/app` неизвестно, пока не прочитан `src`.
+        // Only `src` can be read: nothing is known about `src/app` until `src` has been read.
         assert_eq!(tree.pending_loads(), [(path("src"), false)]);
         tree.set_listing(&path("src"), listing(&["app/"]));
         assert_eq!(tree.pending_loads(), [(path("src/app"), false)]);
@@ -549,7 +554,7 @@ mod tests {
                 .iter()
                 .any(|row| row.path == path("src/app/deep/lib.rs"))
         );
-        // Сам файл не «раскрывается», вне корня — `false`.
+        // A file itself isn't "expanded"; outside the root, `false`.
         assert!(!tree.dirs.contains_key(&path("src/app/deep/lib.rs")));
         assert!(!tree.reveal(Path::new("/elsewhere/x.rs")));
         assert!(tree.reveal(&path("")));
@@ -559,7 +564,8 @@ mod tests {
     fn reveal_through_a_missing_dir_stops_quietly() {
         let mut tree = tree();
         tree.reveal(&path("gone/file.rs"));
-        // `gone` нет в списке корня — читать нечего, состояние забывается при перечитывании.
+        // `gone` is not in the root's listing: there is nothing to read, and its state is forgotten
+        // on re-reading.
         assert!(tree.pending_loads().is_empty());
         tree.set_listing(&path(""), listing(&["src/"]));
         assert!(!tree.dirs.contains_key(&path("gone")));
@@ -598,7 +604,7 @@ mod tests {
         tree.expand(&path("src/app"));
         tree.set_listing(&path("src/app"), listing(&["lib.rs"]));
         tree.rename(&path("src/app"), &path("target/app"));
-        // Из `src` запись ушла; в `target` её допишет перечитывание.
+        // The entry left `src`; re-reading will add it to `target`.
         assert_eq!(shape(&tree), ["src/-", "target/", "Cargo.toml"]);
         assert!(tree.is_expanded(&path("target/app")));
         assert!(tree.is_loaded(&path("target/app")));
@@ -632,18 +638,18 @@ mod tests {
         tree.set_listing(&path("src/app"), listing(&["lib.rs"]));
         let paths = |paths: &[&str]| vec![FsChange::Paths(paths.iter().map(|p| path(p)).collect())];
         assert_eq!(tree.refresh_plan(&paths(&["src/main.rs"])), [path("src")]);
-        // Сам прочитанный каталог и его родитель; родитель — первым.
+        // The read directory itself and its parent; the parent comes first.
         assert_eq!(
             tree.refresh_plan(&paths(&["src/app"])),
             [path("src"), path("src/app")]
         );
-        // Непрочитанный каталог и пути вне корня — нечего перечитывать.
+        // An unread directory and paths outside the root: nothing to re-read.
         assert!(tree.refresh_plan(&paths(&["target/debug/x"])).is_empty());
         assert!(
             tree.refresh_plan(&[FsChange::Paths(vec![PathBuf::from("/q/x")])])
                 .is_empty()
         );
-        // Правила `.gitignore` — каталог и всё прочитанное внутри.
+        // `.gitignore` rules: the directory and everything read inside it.
         assert_eq!(
             tree.refresh_plan(&paths(&[".gitignore"])),
             [path(""), path("src"), path("src/app")]

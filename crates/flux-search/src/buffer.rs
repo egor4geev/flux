@@ -1,8 +1,9 @@
-//! Поиск и замена в документе. Позиции — индексы `char`, как во всём flux.
+//! Search and replace in a document. Positions are `char` indices, as everywhere in flux.
 //!
-//! Функции рассчитаны на фоновый поток: снимок rope (клон — O(1)) собирается в одну
-//! строку `String` — матчеру нужен непрерывный срез байтов. Это O(n) памяти и времени
-//! на каждый поиск; для файлов в десятки мегабайт заметно (долг).
+//! The functions are designed to run on a background thread: a snapshot of the rope (a clone is
+//! O(1)) is gathered into a single `String`, because the matcher needs a contiguous byte slice.
+//! This costs O(n) memory and time per search; it is noticeable for files of tens of megabytes
+//! (tech debt).
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,24 +14,24 @@ use grep_regex::RegexMatcher;
 
 use crate::query::{QueryError, SearchQuery};
 
-/// Больше вхождений [`find_all`] не собирает (`truncated`): подсветка и счётчик
-/// «N из M» на большем числе бесполезны. На «заменить всё» лимит не действует.
+/// [`find_all`] does not collect more matches than this (`truncated`): highlighting and the "N of
+/// M" counter are useless for a larger number. The limit does not apply to "replace all".
 pub const MAX_BUFFER_MATCHES: usize = 100_000;
 
-/// Как часто (в найденных вхождениях) проверять флаг отмены.
+/// How often (counted in matches found) to check the cancellation flag.
 const CANCEL_CHECK_EVERY: usize = 1024;
 
-/// Вхождения запроса в документе.
+/// The matches of the query in the document.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BufferMatches {
-    /// Диапазоны символов: по возрастанию, без пересечений, непустые.
+    /// Character ranges: ascending, non-overlapping, non-empty.
     pub ranges: Vec<Range<usize>>,
-    /// Вхождений больше [`MAX_BUFFER_MATCHES`] — собраны первые.
+    /// There are more matches than [`MAX_BUFFER_MATCHES`]; only the first ones were collected.
     pub truncated: bool,
 }
 
-/// Все вхождения запроса в тексте. Пустые совпадения (`^`, `a*`) пропускаются. При отмене
-/// (`cancel`) возвращает то, что успело найтись, — результат стоит выбросить.
+/// All matches of the query in the text. Empty matches (`^`, `a*`) are skipped. On cancellation
+/// (`cancel`) it returns whatever was found so far; the result should be discarded.
 pub fn find_all(
     text: &Rope,
     query: &SearchQuery,
@@ -63,10 +64,10 @@ pub fn find_all(
     Ok(result)
 }
 
-/// Текст замены для вхождения `range` (из [`find_all`] для того же текста и запроса).
-/// В режиме регулярного выражения подставляются группы: `$1`, `${1}`, `$name`, `${name}`,
-/// `$$` — знак доллара; без него `replacement` берётся как есть. `None` — в `range`
-/// вхождения больше нет (текст изменился).
+/// The replacement text for the match `range` (from [`find_all`] for the same text and query). In
+/// regular expression mode, groups are substituted: `$1`, `${1}`, `$name`, `${name}`, and `$$` for
+/// a literal dollar sign; outside that mode, `replacement` is used as is. `None` means there is no
+/// match in `range` anymore (the text has changed).
 pub fn replacement_for(
     text: &Rope,
     query: &SearchQuery,
@@ -80,8 +81,8 @@ pub fn replacement_for(
     let haystack = to_string(text);
     let bytes = text.char_to_byte(range.start)..text.char_to_byte(range.end);
     let mut caps = matcher.new_captures().ok()?;
-    // Поиск с `bytes.start`, но с полным текстом вокруг: `^`, `$` и границы слов
-    // смотрят на соседние символы.
+    // Search starting at `bytes.start`, but with the full text around it: `^`, `$`, and word
+    // boundaries look at the neighboring characters.
     if !matcher
         .captures_at(haystack.as_bytes(), bytes.start, &mut caps)
         .ok()?
@@ -101,8 +102,8 @@ pub fn replacement_for(
     ))
 }
 
-/// Все замены разом — для одной транзакции «заменить всё»: `(диапазон символов, текст)`
-/// по возрастанию, без лимита [`MAX_BUFFER_MATCHES`]. Пустые совпадения пропускаются.
+/// All replacements at once, for a single "replace all" transaction: `(character range, text)` in
+/// ascending order, without the [`MAX_BUFFER_MATCHES`] limit. Empty matches are skipped.
 pub fn replace_all(
     text: &Rope,
     query: &SearchQuery,
@@ -139,7 +140,7 @@ pub fn replace_all(
     Ok(edits)
 }
 
-/// Текст замены для найденного вхождения: группы подставляются только в режиме regex.
+/// The replacement text for a found match: groups are substituted only in regex mode.
 fn expand(
     query: &SearchQuery,
     matcher: &RegexMatcher,
@@ -168,8 +169,8 @@ fn to_string(text: &Rope) -> String {
     string
 }
 
-/// Перевод байтовых смещений в индексы символов. Смещения должны идти по возрастанию —
-/// тогда весь проход стоит O(n).
+/// Converts byte offsets to character indices. The offsets must be in ascending order, so the whole
+/// pass costs O(n).
 pub(crate) struct CharCounter<'a> {
     text: &'a str,
     byte: usize,
@@ -185,14 +186,15 @@ impl<'a> CharCounter<'a> {
         }
     }
 
-    /// Индекс символа, в котором лежит байт `byte` (середина символа — к его началу).
+    /// The index of the character that contains the byte `byte` (a byte in the middle of a
+    /// character resolves to that character's start).
     pub(crate) fn char_at(&mut self, byte: usize) -> usize {
         let mut byte = byte.min(self.text.len());
         while !self.text.is_char_boundary(byte) {
             byte -= 1;
         }
         if byte < self.byte {
-            // Назад не ходим по построению; на всякий случай — пересчёт с начала.
+            // By construction we never go backwards; as a safeguard, recount from the start.
             self.byte = 0;
             self.chars = 0;
         }
@@ -201,7 +203,8 @@ impl<'a> CharCounter<'a> {
         self.chars
     }
 
-    /// Диапазон байтов → диапазон символов; конец посреди символа — к концу символа.
+    /// Byte range → character range; an end in the middle of a character moves to the end of that
+    /// character.
     pub(crate) fn range(&mut self, bytes: Range<usize>) -> Range<usize> {
         let start = self.char_at(bytes.start);
         let mut end = bytes.end.min(self.text.len());
@@ -213,7 +216,7 @@ impl<'a> CharCounter<'a> {
 }
 
 #[cfg(test)]
-// Диапазоны в ожиданиях — именно списки диапазонов, а не `(a..b).collect()`.
+// The ranges in the expectations are literally lists of ranges, not `(a..b).collect()`.
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
@@ -266,7 +269,7 @@ mod tests {
     fn multi_line_regex_crosses_newlines() {
         assert_eq!(found("a\nb\r\nc", &regex(r"a\nb")), ["a\nb"]);
         assert_eq!(found("a\nb\r\nc", &regex(r"b\r?\nc")), ["b\r\nc"]);
-        // `^` и `$` — границы строк, в том числе при CRLF.
+        // `^` and `$` are line boundaries, including with CRLF.
         assert_eq!(found("ab\r\nab\nxab", &regex("^ab$")), ["ab", "ab"]);
     }
 
@@ -288,7 +291,7 @@ mod tests {
 
     #[test]
     fn matches_across_rope_chunk_boundaries() {
-        // Rope режет текст на куски по ~1 КБ; вхождения встанут и на стыки.
+        // The rope splits text into chunks of ~1 KB; matches will also land on the seams.
         let unit = "абв needle где ";
         let text: String = unit.repeat(5_000);
         let rope = rope(&text);
@@ -333,7 +336,8 @@ mod tests {
             replacement_for(&text, &q, range.clone(), "${2}_${head}").as_deref(),
             Some("bar_foo")
         );
-        // Имя группы — самое длинное из букв, цифр и `_`: `$2_` — группа «2_», её нет.
+        // The group name is the longest run of letters, digits, and `_`: `$2_` is the group "2_",
+        // which does not exist.
         assert_eq!(
             replacement_for(&text, &q, range.clone(), "$2_$head").as_deref(),
             Some("foo")
@@ -357,7 +361,7 @@ mod tests {
         assert_eq!(replacement_for(&text, &q, 1..4, "x"), None);
         assert_eq!(replacement_for(&text, &q, 4..7, "x"), None);
         assert_eq!(replacement_for(&text, &q, 8..12, "x"), None, "past the end");
-        // Целое слово: внутри «food» вхождения нет.
+        // Whole word: there is no match inside "food".
         let word = SearchQuery {
             whole_word: true,
             ..query("foo")

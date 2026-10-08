@@ -1,17 +1,17 @@
-//! Поиск без UI:
-//! - [`fuzzy`] — нечёткий поиск: синхронно по небольшим спискам ([`match_list`], палитра
-//!   команд) и в потоках nucleo по путям проекта ([`PathMatcher`], поиск файла);
-//! - [`files`] — корень проекта ([`find_vcs_root`]) и обход файлов с учётом `.gitignore`
+//! Search without a UI:
+//! - [`fuzzy`] — fuzzy search: synchronous over small lists ([`match_list`], the command palette)
+//!   and on nucleo threads over the project paths ([`PathMatcher`], file search);
+//! - [`files`] — the project root ([`find_vcs_root`]) and a file walk that respects `.gitignore`
 //!   ([`walk_files`]);
-//! - [`buffer`] — поиск и замена в документе ([`find_all`], [`replace_all`]);
-//! - [`grep`] — поиск по проекту ([`search_project`]), результаты потоком по файлам.
+//! - [`buffer`] — search and replace in a document ([`find_all`], [`replace_all`]);
+//! - [`grep`] — project search ([`search_project`]), results streamed file by file.
 //!
-//! Запрос ([`SearchQuery`]) один для поиска в документе и по проекту: буквально или
-//! регулярным выражением, с учётом регистра или без, целым словом.
+//! The query ([`SearchQuery`]) is the same for document search and project search: literal or
+//! regular expression, case-sensitive or not, whole word.
 //!
-//! Позиции в документе — символы (как во всём flux); колонки в результатах поиска по
-//! проекту — тоже символы внутри строки. Всё, что может занять больше миллисекунды,
-//! рассчитано на фоновый поток и принимает флаг отмены.
+//! Positions in a document are characters (as throughout flux); columns in project search results
+//! are also characters within a line. Anything that can take more than a millisecond is designed
+//! for a background thread and accepts a cancellation flag.
 
 pub mod buffer;
 pub mod files;

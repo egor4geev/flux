@@ -1,7 +1,7 @@
 import AppKit
-// Контактный лист значков: каждый SVG — в 64 px (форма) и в 16/32 px (как в дереве на 1x/2x).
-//   swift scripts/icon-sheet.swift crates/flux-app/assets/icons sheet.png [фильтр имени]
-// AppKit размывает значки с <mask> (TS, JS, Rust, git); resvg в gpui рисует их чётко.
+// Icon contact sheet: each SVG at 64 px (shape) and at 16/32 px (as in the tree at 1x/2x).
+//   swift scripts/icon-sheet.swift crates/flux-app/assets/icons sheet.png [name filter]
+// AppKit blurs icons with <mask> (TS, JS, Rust, git); resvg in gpui renders them crisply.
 let dir = CommandLine.arguments[1]
 let out = CommandLine.arguments[2]
 let filter = CommandLine.arguments.count > 3 ? CommandLine.arguments[3] : ""
@@ -23,7 +23,7 @@ for (i, f) in files.enumerated() {
     guard let img = NSImage(contentsOfFile: dir + "/" + f) else { continue }
     NSColor(white: 0.93, alpha: 1).setFill()
     NSRect(x: x + 8, y: y + 30, width: 72, height: 72).fill()
-    // сетка 16×16 под крупным значком
+    // 16×16 grid under the large icon
     NSColor(white: 0.85, alpha: 1).setStroke()
     for k in 0...4 { let o = CGFloat(k) * 16
         NSBezierPath.strokeLine(from: NSPoint(x: x + 12 + o, y: y + 34), to: NSPoint(x: x + 12 + o, y: y + 98))

@@ -1,19 +1,19 @@
-//! Операции над файлами проекта. Ни одна не перезаписывает существующий файл или
-//! каталог: занятое имя — ошибка (копия получает свободное имя), переименование и
-//! перемещение — атомарные «без замены». Блокируют — звать из фона.
+//! Operations on project files. None of them overwrites an existing file or directory: a taken name
+//! is an error (a copy gets a free name), and rename and move are atomic "no replace" operations.
+//! They block; call them from the background.
 //!
-//! Ошибки — `io::Error` с коротким сообщением для статус-бара (имена — в “ ”).
+//! Errors are `io::Error` with a short message for the status bar (names are in “ ”).
 
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
-/// Самое длинное имя в байтах (UTF-8): ограничение APFS и большинства систем.
+/// The longest name in bytes (UTF-8): the limit of APFS and most file systems.
 const MAX_NAME_BYTES: usize = 255;
 
-/// Можно ли так назвать файл или каталог: не пусто и не из одних пробелов, не `.`/`..`,
-/// без `/` и NUL, не длиннее 255 байт. `Err` — объяснение для пользователя. Пробелы по
-/// краям не запрещены — обрезать их, если нужно, должен тот, кто принял ввод.
+/// Checks whether a file or directory can be given this name: not empty and not only spaces, not
+/// `.`/`..`, no `/` or NUL, no longer than 255 bytes. `Err` is an explanation for the user. Spaces
+/// at the edges are not forbidden; whoever accepted the input must trim them if needed.
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("Name cannot be empty".into());
@@ -33,8 +33,8 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Создаёт пустой файл `dir/name`. `name` может содержать `/` (`src/new/mod.rs`) —
-/// недостающие каталоги создаются. Возвращает путь файла.
+/// Creates an empty file `dir/name`. `name` may contain `/` (`src/new/mod.rs`); missing directories
+/// are created. Returns the file's path.
 pub fn create_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
     if name.ends_with('/') {
         return Err(invalid("A file name cannot end with “/”"));
@@ -49,7 +49,7 @@ pub fn create_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Создаёт каталог `dir/name` (`name` может содержать `/`). Возвращает его путь.
+/// Creates the directory `dir/name` (`name` may contain `/`). Returns its path.
 pub fn create_dir(dir: &Path, name: &str) -> io::Result<PathBuf> {
     let path = nested_path(dir, name)?;
     create_parents(dir, &path)?;
@@ -57,8 +57,8 @@ pub fn create_dir(dir: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Переименовывает в том же каталоге; `new_name` — только имя. Смена одного регистра
-/// (`readme.md` → `README.md`) работает и на регистронезависимой ФС. Возвращает новый путь.
+/// Renames within the same directory; `new_name` is only a name. A change of case alone
+/// (`readme.md` → `README.md`) also works on a case-insensitive file system. Returns the new path.
 pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     validate_name(new_name).map_err(invalid)?;
     fs::symlink_metadata(path).map_err(|err| describe(err, path))?;
@@ -68,7 +68,7 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     }
     match rename_no_replace(path, &target) {
         Err(err) if err.kind() == ErrorKind::AlreadyExists && is_case_change(path, &target) => {
-            // На регистронезависимой ФС новое имя «занято» самим файлом.
+            // On a case-insensitive file system, the new name is "taken" by the file itself.
             fs::rename(path, &target).map_err(|err| describe(err, path))?
         }
         result => result.map_err(|err| describe(err, &target))?,
@@ -76,8 +76,8 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     Ok(target)
 }
 
-/// Перемещает `path` в каталог `dir` под тем же именем. Перемещение в каталог, где он и так
-/// лежит, — ничего не делает. Возвращает новый путь.
+/// Moves `path` into the directory `dir` under the same name. Moving it into the directory it is
+/// already in does nothing. Returns the new path.
 pub fn move_into(path: &Path, dir: &Path) -> io::Result<PathBuf> {
     let name = path.file_name().ok_or_else(|| invalid("Nothing to move"))?;
     fs::symlink_metadata(path).map_err(|err| describe(err, path))?;
@@ -104,9 +104,9 @@ pub fn move_into(path: &Path, dir: &Path) -> io::Result<PathBuf> {
     Ok(target)
 }
 
-/// Копирует `path` (файл или каталог целиком; симлинки — как симлинки) в каталог `dir`.
-/// Имя занято — свободное, как в Finder: «name copy.ext», «name copy 2.ext». Так же
-/// делается и дубликат в том же каталоге. Возвращает путь копии.
+/// Copies `path` (a file, or a whole directory; symlinks are copied as symlinks) into the directory
+/// `dir`. If the name is taken, a free one is chosen, as in Finder: "name copy.ext", "name copy
+/// 2.ext". A duplicate in the same directory is made the same way. Returns the path of the copy.
 pub fn copy_into(path: &Path, dir: &Path) -> io::Result<PathBuf> {
     let meta = fs::symlink_metadata(path).map_err(|err| describe(err, path))?;
     let name = path
@@ -123,16 +123,16 @@ pub fn copy_into(path: &Path, dir: &Path) -> io::Result<PathBuf> {
     let target = dir.join(free_name(dir, &name, meta.is_dir()));
     let copied = copy_entry(path, &target);
     if copied.is_err() {
-        // Недоделанная копия — наша, свежая: её можно убрать.
+        // An unfinished copy is ours and fresh, so it can be removed.
         let _ = remove_entry(&target);
     }
     copied.map_err(|err| describe(err, &target))?;
     Ok(target)
 }
 
-/// Удаляет в Корзину. На macOS — `NSFileManager trashItemAtURL`: без запроса прав на
-/// управление Finder и без звука (зато «Вернуть» в Finder может быть недоступно — файл
-/// можно вытащить из Корзины мышью). Симлинк удаляется сам, а не то, на что указывает.
+/// Moves to the Trash. On macOS this uses `NSFileManager trashItemAtURL`: no permission prompt for
+/// controlling Finder and no sound (but "Put Back" in Finder may be unavailable; the file can be
+/// dragged out of the Trash with the mouse). A symlink itself is trashed, not what it points to.
 pub fn trash(paths: &[PathBuf]) -> io::Result<()> {
     let mut context = trash::TrashContext::default();
     #[cfg(target_os = "macos")]
@@ -156,8 +156,8 @@ pub fn trash(paths: &[PathBuf]) -> io::Result<()> {
     Ok(())
 }
 
-/// Новый путь `path` после переименования или перемещения `from` → `to`: сам `from`
-/// или что-то внутри него; иначе `None`. Сравнение — по компонентам: `src2` не внутри `src`.
+/// The new `path` after renaming or moving `from` → `to`: `from` itself or something inside it;
+/// otherwise `None`. The comparison is by components: `src2` is not inside `src`.
 pub fn remap(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
     let rest = path.strip_prefix(from).ok()?;
     Some(if rest.as_os_str().is_empty() {
@@ -167,10 +167,10 @@ pub fn remap(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
     })
 }
 
-// --- Пути и имена ---
+// --- Paths and names ---
 
-/// `dir/name`, где `name` — один или несколько компонентов через `/` (пустые между `//`
-/// и по краям пропускаются); каждый проходит [`validate_name`].
+/// `dir/name`, where `name` is one or more components separated by `/` (empty ones, between `//`
+/// and at the edges, are skipped); each one is run through [`validate_name`].
 fn nested_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
     let parts: Vec<&str> = name.split('/').filter(|part| !part.is_empty()).collect();
     if parts.is_empty() {
@@ -184,7 +184,8 @@ fn nested_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Создаёт недостающие каталоги между `dir` и `path`; компонент-файл на пути — ошибка.
+/// Creates the missing directories between `dir` and `path`; a file component on the path is an
+/// error.
 fn create_parents(dir: &Path, path: &Path) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -197,9 +198,9 @@ fn create_parents(dir: &Path, path: &Path) -> io::Result<()> {
     fs::create_dir_all(parent).map_err(|err| describe(err, parent))
 }
 
-/// Свободное имя для копии `name` в `dir`: само `name`, если не занято, иначе
-/// «стем copy.ext», «стем copy 2.ext»… У каталога расширения нет: «dir copy». Копия копии
-/// не растёт: «x copy.rs» → «x copy 2.rs».
+/// A free name for a copy of `name` in `dir`: `name` itself if it is not taken, otherwise "stem
+/// copy.ext", "stem copy 2.ext"… A directory has no extension: "dir copy". A copy of a copy does
+/// not grow: "x copy.rs" → "x copy 2.rs".
 fn free_name(dir: &Path, name: &str, is_dir: bool) -> String {
     let occupied = |candidate: &str| fs::symlink_metadata(dir.join(candidate)).is_ok();
     if !occupied(name) {
@@ -223,8 +224,8 @@ fn free_name(dir: &Path, name: &str, is_dir: bool) -> String {
         .expect("an unused name exists")
 }
 
-/// Имя файла и последнее расширение (`archive.tar.gz` → `archive.tar`, `gz`); у скрытого
-/// файла без второй точки (`.env`) и у каталога расширения нет.
+/// The file name and the last extension (`archive.tar.gz` → `archive.tar`, `gz`); a hidden file
+/// without a second dot (`.env`) and a directory have no extension.
 fn split_extension(name: &str, is_dir: bool) -> (&str, Option<&str>) {
     if is_dir {
         return (name, None);
@@ -235,7 +236,7 @@ fn split_extension(name: &str, is_dir: bool) -> (&str, Option<&str>) {
     }
 }
 
-/// «x copy» и «x copy 3» → «x».
+/// "x copy" and "x copy 3" → "x".
 fn strip_copy_suffix(stem: &str) -> &str {
     if let Some(base) = stem.strip_suffix(" copy") {
         return base;
@@ -246,7 +247,7 @@ fn strip_copy_suffix(stem: &str) -> &str {
     }
 }
 
-/// `inner` — это `outer` или лежит внутри него (с учётом симлинков на пути).
+/// `inner` is `outer` or lies inside it (taking symlinks on the path into account).
 fn is_inside(inner: &Path, outer: &Path) -> bool {
     if inner.starts_with(outer) {
         return true;
@@ -265,7 +266,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
         )
 }
 
-/// Новое имя отличается только регистром, и под ним ФС видит тот же файл.
+/// The new name differs only in case, and the file system sees the same file under it.
 fn is_case_change(from: &Path, to: &Path) -> bool {
     let (Some(a), Some(b)) = (from.file_name(), to.file_name()) else {
         return false;
@@ -294,14 +295,14 @@ fn display_name(path: &Path) -> String {
     )
 }
 
-// --- Переименование без замены ---
+// --- Rename without replacing ---
 
-/// `rename`, который не заменяет существующий `to` (обычный `rename(2)` молча заменил бы
-/// файл): занято — `AlreadyExists`.
+/// A `rename` that does not replace an existing `to` (a plain `rename(2)` would silently replace
+/// the file): if it is taken, `AlreadyExists`.
 #[cfg(target_os = "macos")]
 fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     let (from, to) = (c_path(from)?, c_path(to)?);
-    // SAFETY: обе строки — валидные C-строки, живут до конца вызова.
+    // SAFETY: both strings are valid C strings that live until the end of the call.
     let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
     if result == 0 {
         Ok(())
@@ -313,7 +314,7 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     let (from_c, to_c) = (c_path(from)?, c_path(to)?);
-    // SAFETY: обе строки — валидные C-строки, живут до конца вызова.
+    // SAFETY: both strings are valid C strings that live until the end of the call.
     let result = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
@@ -328,7 +329,7 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     }
     let err = io::Error::last_os_error();
     match err.raw_os_error() {
-        // ФС не умеет `RENAME_NOREPLACE` — проверка и обычный rename.
+        // The file system does not support `RENAME_NOREPLACE`: a check followed by a plain rename.
         Some(libc::EINVAL | libc::ENOSYS) => rename_checked(from, to),
         _ => Err(err),
     }
@@ -339,7 +340,7 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     rename_checked(from, to)
 }
 
-/// Запасной путь: проверка и rename (между ними — окно гонки).
+/// The fallback path: a check, then rename (there is a race window between them).
 #[cfg(not(target_os = "macos"))]
 fn rename_checked(from: &Path, to: &Path) -> io::Result<()> {
     if fs::symlink_metadata(to).is_ok() {
@@ -355,11 +356,11 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
         .map_err(|_| invalid("Name cannot contain NUL"))
 }
 
-// --- Копирование ---
+// --- Copying ---
 
-/// Копия `from` в `to` (свободное имя). Файл — без перезаписи; каталог — рекурсивно;
-/// симлинк — симлинком на то же; сокеты, FIFO и устройства пропускаются (чтение FIFO
-/// повисло бы).
+/// Copies `from` to `to` (a free name). A file is copied without overwriting; a directory,
+/// recursively; a symlink, as a symlink to the same target; sockets, FIFOs, and devices are skipped
+/// (reading a FIFO would hang).
 fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(from)?;
     let kind = meta.file_type();
@@ -377,7 +378,8 @@ fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
     if !kind.is_file() {
         return Ok(());
     }
-    // Имя занимаем сами (`create_new`): `fs::copy` молча перезаписал бы чужой файл.
+    // We claim the name ourselves (`create_new`): `fs::copy` would silently overwrite someone
+    // else's file.
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -395,7 +397,7 @@ fn copy_symlink(_: &Path, _: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Убирает недоделанную копию.
+/// Removes the unfinished copy.
 fn remove_entry(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path)? {
         meta if meta.is_dir() => fs::remove_dir_all(path),
@@ -403,7 +405,7 @@ fn remove_entry(path: &Path) -> io::Result<()> {
     }
 }
 
-// --- Ошибки ---
+// --- Errors ---
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidInput, message.into())
@@ -416,7 +418,7 @@ fn not_a_folder(path: &Path) -> io::Error {
     )
 }
 
-/// Ошибка ОС с понятным сообщением для частых случаев; `path` — о чём речь.
+/// An OS error with a clear message for common cases; `path` is what the error is about.
 fn describe(err: io::Error, path: &Path) -> io::Error {
     let name = display_name(path);
     let message = match err.kind() {
@@ -446,7 +448,7 @@ mod tests {
         fs::read_to_string(path).unwrap()
     }
 
-    /// Имена в каталоге по порядку байтов.
+    /// Names in the directory, in byte order.
     fn names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()
@@ -494,7 +496,7 @@ mod tests {
         assert!(nested.is_file());
         let folder = create_dir(root, "docs/img").unwrap();
         assert!(folder.is_dir());
-        // Лишние `/` не мешают.
+        // Extra `/` do no harm.
         assert_eq!(
             create_dir(root, "/a//b/").unwrap(),
             root.join("a").join("b")
@@ -568,7 +570,7 @@ mod tests {
         let renamed = rename(&root.join("a.rs"), "c.rs").unwrap();
         assert_eq!(renamed, root.join("c.rs"));
         assert_eq!(names(root), ["b.rs", "c.rs"]);
-        // То же имя — ничего не делать.
+        // The same name: do nothing.
         assert_eq!(rename(&renamed, "c.rs").unwrap(), renamed);
         assert_eq!(
             message(rename(&renamed, "x/y.rs").unwrap_err()),
@@ -589,7 +591,7 @@ mod tests {
         assert_eq!(renamed, root.join("README.md"));
         assert_eq!(names(root), ["README.md"]);
         assert_eq!(read(&renamed), "text");
-        // Каталог тоже.
+        // A directory too.
         fs::create_dir(root.join("src")).unwrap();
         rename(&root.join("src"), "Src").unwrap();
         assert_eq!(names(root), ["README.md", "Src"]);
@@ -597,14 +599,15 @@ mod tests {
 
     #[test]
     fn rename_keeps_a_case_twin_on_a_case_sensitive_fs() {
-        // Два разных файла, отличающихся регистром (бывает на регистрозависимой ФС):
-        // переименование в «близнеца» — ошибка, а не замена.
+        // Two different files that differ only in case (possible on a case-sensitive file system):
+        // renaming to the "twin" is an error, not a replacement.
         let dir = temp();
         let root = dir.path();
         write(&root.join("a.txt"), "small");
         write(&root.join("B.txt"), "big");
         if root.join("b.txt").exists() {
-            // Регистронезависимая ФС: такого близнеца не создать — проверять нечего.
+            // A case-insensitive file system: such a twin cannot be created, so there is nothing to
+            // check.
             let err = rename(&root.join("a.txt"), "b.txt").unwrap_err();
             assert_eq!(err.kind(), ErrorKind::AlreadyExists);
             assert_eq!(read(&root.join("B.txt")), "big");
@@ -628,16 +631,16 @@ mod tests {
         assert_eq!(read(&moved), "lib");
         assert!(names(&root.join("src")).is_empty());
 
-        // Занято — ошибка, оба файла целы.
+        // If it is taken, that is an error, and both files are intact.
         let err = move_into(&moved, &root.join("docs")).unwrap_err();
         assert_eq!(message(err), "“lib.rs” already exists");
         assert_eq!(read(&root.join("docs/lib.rs")), "other");
         assert_eq!(read(&moved), "lib");
 
-        // Туда, где лежит, — ничего не делать.
+        // Into the directory it is already in: do nothing.
         assert_eq!(move_into(&moved, &root.join("empty")).unwrap(), moved);
 
-        // Каталог целиком — вместе с содержимым.
+        // A whole directory, with its contents.
         let moved_dir = move_into(&root.join("docs"), &root.join("src")).unwrap();
         assert_eq!(moved_dir, root.join("src/docs"));
         assert_eq!(read(&root.join("src/docs/lib.rs")), "other");
@@ -658,7 +661,7 @@ mod tests {
             "Cannot move “a” into itself"
         );
         assert!(root.join("a/b/file.txt").exists());
-        // Соседний `a2` — не внутри `a`.
+        // The neighboring `a2` is not inside `a`.
         fs::create_dir(root.join("a2")).unwrap();
         assert_eq!(move_into(&a, &root.join("a2")).unwrap(), root.join("a2/a"));
     }
@@ -698,7 +701,7 @@ mod tests {
             copy_into(&root.join("main.rs"), root).unwrap(),
             root.join("main copy 2.rs")
         );
-        // Копия копии не растёт: «main copy 3.rs», а не «main copy copy.rs».
+        // A copy of a copy does not grow: "main copy 3.rs", not "main copy copy.rs".
         assert_eq!(copy_into(&copy, root).unwrap(), root.join("main copy 3.rs"));
         assert_eq!(
             copy_into(&root.join(".env"), root).unwrap(),
@@ -764,7 +767,7 @@ mod tests {
             message(copy_into(&src, &src.join("deep")).unwrap_err()),
             "Cannot copy “src” into itself"
         );
-        // А в себя же «рядом» — дубликат.
+        // But copying it "alongside" itself makes a duplicate.
         assert_eq!(copy_into(&src, root).unwrap(), root.join("src copy"));
         assert_eq!(names(&src), ["deep"]);
     }
@@ -814,7 +817,7 @@ mod tests {
         );
     }
 
-    /// Настоящая Корзина автора: запускать вручную (`cargo test -p flux-fs -- --ignored`).
+    /// The author's real Trash: run manually (`cargo test -p flux-fs -- --ignored`).
     #[test]
     #[ignore]
     fn trash_moves_files_and_folders_to_the_trash() {

@@ -1,6 +1,6 @@
-//! Файлы проекта: корень по системе контроля версий и обход с учётом `.gitignore`.
-//! Правила — общие с деревом файлов (`flux_fs::rules`); их же использует поиск по проекту
-//! ([`crate::grep`]).
+//! Project files: the root determined by the version control system, and a walk that respects
+//! `.gitignore`. The rules are shared with the file tree (`flux_fs::rules`); project search
+//! ([`crate::grep`]) uses them too.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9,23 +9,24 @@ use flux_fs::project_walker;
 use flux_fs::rules::VCS_DIRS;
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
-/// Больше файлов обход не отдаёт (`truncated`): поиск файла по всей домашней папке
-/// не должен съесть память и время.
+/// The walk does not yield more files than this (`truncated`): searching for a file across the
+/// whole home directory must not eat up memory and time.
 pub const MAX_FILES: usize = 100_000;
 
-/// Итог обхода.
+/// The result of the walk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalkSummary {
-    /// Сколько файлов отдано.
+    /// How many files were yielded.
     pub files: usize,
-    /// Остановились на [`MAX_FILES`].
+    /// Stopped at [`MAX_FILES`].
     pub truncated: bool,
-    /// Остановились по флагу отмены.
+    /// Stopped by the cancellation flag.
     pub cancelled: bool,
 }
 
-/// Корень проекта для каталога `start`: ближайший предок (включая сам `start`), где есть
-/// `.git` (каталог или файл — у git worktree и подмодулей это файл), `.hg`, `.jj` или `.svn`.
+/// The project root for the directory `start`: the nearest ancestor (including `start` itself) that
+/// contains `.git` (a directory or a file; for git worktrees and submodules it is a file), `.hg`,
+/// `.jj`, or `.svn`.
 pub fn find_vcs_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
@@ -33,12 +34,12 @@ pub fn find_vcs_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Обходит файлы проекта параллельно. Учитываются `.gitignore` (внутри репозитория git),
-/// `.ignore`, глобальный gitignore и `.git/info/exclude`, в том числе из каталогов выше
-/// `root`. Скрытые файлы показываются; каталоги `.git`, `.hg`, `.jj`, `.svn` и файлы
-/// `.DS_Store` — нет. Отдаются только обычные файлы: симлинки пропускаются (и не
-/// разворачиваются). `f` вызывается из рабочих потоков с путём относительно `root`.
-/// Обход останавливается по `cancel` или после [`MAX_FILES`] файлов.
+/// Walks the project files in parallel. Honors `.gitignore` (inside a git repository), `.ignore`,
+/// the global gitignore, and `.git/info/exclude`, including ones from directories above `root`.
+/// Hidden files are included; the directories `.git`, `.hg`, `.jj`, `.svn` and the files
+/// `.DS_Store` are not. Only regular files are yielded: symlinks are skipped (and not followed).
+/// `f` is called from worker threads with a path relative to `root`. The walk stops on `cancel` or
+/// after [`MAX_FILES`] files.
 pub fn walk_files(root: &Path, cancel: &AtomicBool, f: impl Fn(&Path) + Sync) -> WalkSummary {
     walk_files_limited(root, cancel, MAX_FILES, f)
 }
@@ -77,15 +78,15 @@ pub(crate) fn walk_files_limited(
     }
 }
 
-/// Обход проекта для поиска файла и поиска по проекту — по общим правилам
-/// ([`flux_fs::project_walker`]). `max_file_bytes` — файлы крупнее пропускаются.
+/// A project walk for file search and project search, following the shared rules
+/// ([`flux_fs::project_walker`]). `max_file_bytes`: larger files are skipped.
 pub(crate) fn walker(root: &Path, max_file_bytes: Option<u64>) -> WalkBuilder {
     let mut builder = project_walker(root, root);
     builder.max_filesize(max_file_bytes);
     builder
 }
 
-/// Обычный файл из обхода; ошибки чтения каталогов и всё, кроме файлов, — `None`.
+/// A regular file from the walk; directory read errors and anything that is not a file give `None`.
 pub(crate) fn file_entry(entry: Result<DirEntry, ignore::Error>) -> Option<DirEntry> {
     let entry = entry.ok()?;
     entry
@@ -104,7 +105,7 @@ pub(crate) mod tests {
     use std::fs;
     use std::sync::Mutex;
 
-    /// Дерево файлов во временном каталоге: `(путь, содержимое)`.
+    /// A file tree in a temporary directory: `(path, contents)`.
     pub(crate) fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for (path, contents) in files {
@@ -162,7 +163,7 @@ pub(crate) mod tests {
 
     #[test]
     fn gitignore_needs_a_repository() {
-        // Как у git и ripgrep: вне репозитория .gitignore не действует, а .ignore — да.
+        // As in git and ripgrep: outside a repository, .gitignore has no effect, but .ignore does.
         let dir = tree(&[
             (".gitignore", "a.txt\n"),
             (".ignore", "b.txt\n"),
@@ -217,8 +218,8 @@ pub(crate) mod tests {
         assert_eq!(summary.files, 0);
     }
 
-    /// Не исключённые файлы дерева (`flux_fs::list_dir` по каталогам) — ровно то, что
-    /// находит обход: дерево приглушает то же, чего нет в поиске файла.
+    /// The non-excluded files of the tree (`flux_fs::list_dir` over the directories) are exactly
+    /// what the walk finds: the tree dims the same files that are absent from file search.
     #[test]
     fn tree_listing_agrees_with_the_walk() {
         let dir = tree(&[
@@ -279,7 +280,7 @@ pub(crate) mod tests {
         assert_eq!(listed, walked);
     }
 
-    /// Файлы дерева, раскрытого целиком, кроме исключённых.
+    /// The files of a fully expanded tree, except the excluded ones.
     fn list_tree(root: &Path, dir: &Path, ignored: bool, files: &mut Vec<String>) {
         for entry in flux_fs::list_dir(root, dir, ignored).unwrap() {
             let path = dir.join(&entry.name);
@@ -310,8 +311,8 @@ pub(crate) mod tests {
             find_vcs_root(&repo.join("worktree/src")),
             Some(repo.join("worktree"))
         );
-        // Временный каталог может лежать внутри чужого репозитория — сравниваем с тем,
-        // что найдётся от самого временного каталога.
+        // The temporary directory may live inside another repository, so we compare against what is
+        // found starting from the temporary directory itself.
         assert_eq!(find_vcs_root(&root.join("plain/sub")), find_vcs_root(root));
     }
 }

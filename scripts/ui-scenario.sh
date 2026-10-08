@@ -1,13 +1,14 @@
 #!/bin/bash
-# Прогон сценария UI со скриншотами — для агентов, которые не могут нажимать клавиши.
+# Runs a UI scenario with screenshots, for agents that can't press keys.
 #
 #   FLUX_SCENARIO="type:let space type:x cmd-s shot:saved" [FLUX_ANSWERS=1] \
-#       scripts/ui-scenario.sh <каталог-для-снимков> [аргументы flux...]
+#       scripts/ui-scenario.sh <screenshot-dir> [flux args...]
 #
-# Собирает flux с фичей `scenario`, запускает его, по меткам `SHOT имя` снимает все окна
-# процесса в <каталог>/<имя>-<id окна>.png и завершает процесс по `END` (или по таймауту
-# FLUX_SCENARIO_TIMEOUT, по умолчанию 120 с). Вывод flux — в <каталог>/stdout.log, stderr.log.
-# Шаги сценария и автоответы диалогов описаны в crates/flux-app/src/scenario.rs.
+# Builds flux with the `scenario` feature, launches it, takes a screenshot of every window of the
+# process at each `SHOT name` marker into <dir>/<name>-<window id>.png and stops the process at
+# `END` (or after FLUX_SCENARIO_TIMEOUT, 120 s by default). The flux output goes to
+# <dir>/stdout.log and stderr.log. Scenario steps and dialog auto-answers are described in
+# crates/flux-app/src/scenario.rs.
 set -euo pipefail
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 
@@ -22,7 +23,8 @@ shift
 cd "$ROOT"
 cargo build --quiet -p flux-app --features scenario
 
-# Помощник на Swift (есть в Command Line Tools): id окон процесса, активация приложения.
+# A Swift helper (included in the Command Line Tools): the window ids of the process and app
+# activation.
 TOOL="$ROOT/target/scenario-tools/window-tool"
 if [ ! -x "$TOOL" ] || [ "$ROOT/scripts/window-tool.swift" -nt "$TOOL" ]; then
     mkdir -p "$(dirname "$TOOL")"
@@ -44,7 +46,7 @@ while kill -0 "$PID" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
     while [ "$seen" -lt "$count" ]; do
         seen=$((seen + 1))
         name=$(printf '%s\n' "$names" | sed -n "${seen}p")
-        sleep 0.5 # кадр успевает дорисоваться
+        sleep 0.5 # the frame has time to finish drawing
         for id in $("$TOOL" windows "$PID"); do
             screencapture -x -o -l "$id" "$OUT/$name-$id.png"
         done

@@ -1,14 +1,13 @@
-//! Подсветка: capture запроса → области темы → спаны строк.
+//! Highlighting: query captures → theme scopes → line spans.
 //!
-//! Цветов здесь нет. Тема (во flux-app) — это список областей (`keyword`,
-//! `function.method`…). [`HighlightMap`] один раз на язык и тему переводит
-//! индекс capture в индекс области, так что на кадре нет строковых операций.
+//! There are no colors here. The theme (in flux-app) is a list of scopes (`keyword`,
+//! `function.method`…). [`HighlightMap`] translates a capture index into a scope index once per
+//! language and theme, so there are no string operations per frame.
 //!
-//! Перекрытия разрешаются как в tree-sitter-highlight: capture, идущий позже
-//! в порядке курсора (по началу, затем по номеру паттерна), закрашивает свой
-//! участок поверх предыдущих. Вложенный capture перекрывает внешний на своём
-//! участке, для одинакового диапазона побеждает поздний паттерн (у части
-//! языков — ранний, см. `Precedence`).
+//! Overlaps are resolved as in tree-sitter-highlight: a capture that comes later in cursor order
+//! (by start, then by pattern number) paints its span over the earlier ones. A nested capture
+//! overrides the outer one on its own span; for an identical range the later pattern wins (for some
+//! languages, the earlier one; see `Precedence`).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -20,16 +19,16 @@ use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 use crate::language::{Language, Precedence};
 use crate::text::{CharCounter, byte_chunks};
 
-/// Сколько незавершённых совпадений держит курсор запроса. Защита от
-/// патологических файлов, как в Helix: лишние совпадения отбрасываются.
+/// How many unfinished matches the query cursor holds. A guard against pathological files, as in
+/// Helix: excess matches are dropped.
 const MATCH_LIMIT: u32 = 256;
 
-/// Индекс области темы — позиция имени в списке, переданном в [`HighlightMap::new`].
+/// A theme scope index: the position of the name in the list passed to [`HighlightMap::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Highlight(pub usize);
 
-/// Подсвеченный участок строки: символьные колонки `start..end` (конец
-/// не включается) внутри строки, без её перевода строки.
+/// A highlighted span of a line: the character columns `start..end` (end exclusive) within the
+/// line, excluding its line break.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HighlightSpan {
     pub start: usize,
@@ -37,7 +36,7 @@ pub struct HighlightSpan {
     pub highlight: Highlight,
 }
 
-/// Отображение «индекс capture → область темы» для одного языка и одной темы.
+/// The mapping "capture index → theme scope" for one language and one theme.
 #[derive(Debug, Clone)]
 pub struct HighlightMap {
     language: &'static Language,
@@ -45,21 +44,21 @@ pub struct HighlightMap {
 }
 
 impl HighlightMap {
-    /// `scopes` — области темы. Имя capture ищется целиком, затем с откатом
-    /// по точкам: `function.method.builtin` → `function.method` → `function`.
-    /// Capture без совпадения не подсвечивается и не участвует в разрешении
-    /// перекрытий. Имена с `_` в начале — служебные, не подсвечиваются никогда.
+    /// `scopes` are the theme scopes. A capture name is looked up in full first, then by falling
+    /// back along the dots: `function.method.builtin` → `function.method` → `function`. A capture
+    /// with no match is not highlighted and does not take part in overlap resolution. Names that
+    /// start with `_` are internal and are never highlighted.
     ///
-    /// Нужен скомпилированный запрос языка: если его ещё нет, компилирует
-    /// (до ~20 мс). Удобно строить после первого [`ParseResult`](crate::ParseResult):
-    /// фоновый [`ParseJob::run`](crate::ParseJob::run) к тому времени запрос скомпилировал.
+    /// Needs the language's compiled query: if there is none yet, compiles it (up to ~20 ms).
+    /// Convenient to build after the first [`ParseResult`](crate::ParseResult): by then the
+    /// background [`ParseJob::run`](crate::ParseJob::run) has compiled the query.
     pub fn new(language: &'static Language, scopes: &[impl AsRef<str>]) -> Self {
         Self::build(language, language.capture_names(), scopes)
     }
 
-    /// Как [`HighlightMap::new`], но только если запрос языка уже скомпилирован
-    /// (например, фоновым [`ParseJob::run`](crate::ParseJob::run)); иначе `None`.
-    /// Никогда не компилирует запрос — для UI-потока.
+    /// Like [`HighlightMap::new`], but only if the language's query is already compiled (for
+    /// example, by a background [`ParseJob::run`](crate::ParseJob::run)); otherwise `None`. Never
+    /// compiles the query; intended for the UI thread.
     pub fn try_new(language: &'static Language, scopes: &[impl AsRef<str>]) -> Option<Self> {
         let query = language.compiled_query()?;
         Some(Self::build(language, query.capture_names(), scopes))
@@ -88,7 +87,7 @@ impl HighlightMap {
         self.language
     }
 
-    /// Область для capture с индексом `capture`.
+    /// The scope for the capture with index `capture`.
     pub fn get(&self, capture: u32) -> Option<Highlight> {
         self.by_capture.get(capture as usize).copied().flatten()
     }
@@ -107,12 +106,11 @@ fn resolve(capture: &str, scopes: &HashMap<&str, Highlight>) -> Option<Highlight
     }
 }
 
-/// Спаны для строк `lines` (строки ropey, как у редактора). Результат —
-/// по вектору на каждую существующую строку диапазона: строки за концом
-/// текста отбрасываются.
+/// Spans for the lines `lines` (ropey lines, as in the editor). The result is one vector per
+/// existing line of the range: lines past the end of the text are dropped.
 ///
-/// Работает и с деревом, которое отредактировано, но ещё не разобрано:
-/// смещения узлов обрезаются по длине текста и границам символов.
+/// Also works with a tree that has been edited but not yet parsed: node offsets are clamped to the
+/// text length and to character boundaries.
 pub(crate) fn highlight_lines(
     tree: Option<&Tree>,
     text: &Rope,
@@ -122,8 +120,8 @@ pub(crate) fn highlight_lines(
     let last = lines.end.min(text.len_lines());
     let first = lines.start.min(last);
     let mut result = vec![Vec::new(); last - first];
-    // Без дерева запрос не трогаем: его компиляция (до ~20 мс) не должна
-    // случиться в UI-потоке до первого разбора — её делает фоновый ParseJob::run.
+    // Without a tree we do not touch the query: compiling it (up to ~20 ms) must not happen on the
+    // UI thread before the first parse; the background ParseJob::run does it.
     let Some(tree) = tree else {
         return result;
     };
@@ -140,20 +138,20 @@ pub(crate) fn highlight_lines(
     result
 }
 
-/// Capture с уже разрешённой областью, в байтах.
+/// A capture with an already resolved scope, in bytes.
 #[derive(Debug, Clone, Copy)]
 struct Capture {
     start: usize,
     end: usize,
-    /// Узел дерева (`Node::id`).
+    /// Tree node (`Node::id`).
     node: usize,
     highlight: Highlight,
 }
 
-/// Участок без перекрытий, в байтах.
+/// A span without overlaps, in bytes.
 type FlatSpan = (Range<usize>, Highlight);
 
-/// Непересекающиеся отсортированные участки внутри `range`.
+/// Non-overlapping sorted spans within `range`.
 fn flat_spans(
     tree: &Tree,
     query: &Query,
@@ -189,16 +187,16 @@ fn flat_spans(
     resolve_overlaps(captures, precedence, range)
 }
 
-/// Разрешает перекрытия как tree-sitter-highlight. `captures` — в порядке
-/// курсора запроса: по началу, при равном начале — по номеру паттерна.
-/// Каждый capture «закрашивает» свой участок поверх всех предыдущих, поэтому:
-/// - вложенный capture, начавшийся позже, перекрывает объемлющий на своём участке;
-/// - из одинаковых диапазонов побеждает поздний паттерн;
-/// - при общем начале объемлющий capture более позднего паттерна закрывает
-///   вложенный: так в TOML `(pair (bare_key)) @property` перекрашивает ключ.
+/// Resolves overlaps as tree-sitter-highlight does. `captures` are in query cursor order: by start,
+/// and for equal starts, by pattern number. Each capture "paints" its own span on top of all the
+/// previous ones, so:
+/// - a nested capture that starts later overrides the enclosing one on its own span;
+/// - among identical ranges, the later pattern wins;
+/// - with a shared start, an enclosing capture from a later pattern covers the nested one: this is
+///   how `(pair (bare_key)) @property` recolors the key in TOML.
 ///
-/// Для запросов «под ранний паттерн» ([`Precedence::FirstPattern`]) из идущих
-/// подряд capture одного узла остаётся первый — как в tree-sitter-highlight до 0.21.
+/// For queries written for "early pattern wins" ([`Precedence::FirstPattern`]), only the first of
+/// consecutive captures of the same node is kept, as in tree-sitter-highlight before 0.21.
 fn resolve_overlaps(
     mut captures: Vec<Capture>,
     precedence: Precedence,
@@ -207,13 +205,13 @@ fn resolve_overlaps(
     if precedence == Precedence::FirstPattern {
         captures.dedup_by(|later, kept| later.node == kept.node);
     }
-    // Курсор и так отдаёт capture по началу; устойчивая сортировка лишь
-    // страхует это, не меняя порядок capture с общим началом.
+    // The cursor already yields captures by start; the stable sort merely serves as a safety net,
+    // leaving the order of captures that share a start unchanged.
     captures.sort_by_key(|capture| capture.start);
 
     let mut spans = Vec::with_capacity(captures.len());
-    // Начатые участки в порядке начала: верхний — видимый. Кончившиеся
-    // снимаются, когда оказываются сверху.
+    // Started spans in start order: the top one is the visible one. Ended ones are popped once they
+    // reach the top.
     let mut stack: Vec<(usize, Highlight)> = Vec::new();
     let mut pos = range.start;
     let mut next = 0;
@@ -227,7 +225,7 @@ fn resolve_overlaps(
         while stack.last().is_some_and(|&(end, _)| end <= pos) {
             stack.pop();
         }
-        // Следующая граница: начало следующего capture или конец видимого.
+        // The next boundary: the start of the next capture or the end of the visible one.
         let boundary = match (captures.get(next), stack.last()) {
             (None, None) => break,
             (Some(capture), None) => capture.start,
@@ -242,7 +240,7 @@ fn resolve_overlaps(
     spans
 }
 
-/// Добавляет участок, обрезанный по `range`; соседний с той же областью — сливает.
+/// Adds a span clipped to `range`; merges it with an adjacent one that has the same scope.
 fn push_span(
     spans: &mut Vec<FlatSpan>,
     span: Range<usize>,
@@ -264,7 +262,7 @@ fn push_span(
     spans.push((start..end, highlight));
 }
 
-/// Режет байтовые участки по строкам и переводит в символьные колонки.
+/// Splits byte spans by lines and converts them to character columns.
 fn split_into_lines(
     text: &Rope,
     lines: Range<usize>,
@@ -302,7 +300,7 @@ fn split_into_lines(
     }
 }
 
-/// Байт конца содержимого строки — перед её переводом строки.
+/// Byte offset of the end of the line's content, before its line break.
 fn content_end_byte(text: &Rope, line: usize) -> usize {
     let slice = text.line(line);
     let len = slice.len_chars();
@@ -321,7 +319,7 @@ mod tests {
     const STRING: Highlight = Highlight(1);
     const COMMENT: Highlight = Highlight(2);
 
-    /// Capture узла `node`; в тестах узел — просто номер.
+    /// A capture of node `node`; in the tests a node is just a number.
     fn capture(range: Range<usize>, node: usize, highlight: Highlight) -> Capture {
         Capture {
             start: range.start,
@@ -367,7 +365,7 @@ mod tests {
 
     #[test]
     fn nested_capture_wins_on_its_part() {
-        // В порядке курсора: по началу.
+        // In cursor order: by start.
         let spans = resolve_overlaps(
             vec![
                 capture(0..10, 1, KEYWORD),
@@ -391,7 +389,7 @@ mod tests {
 
     #[test]
     fn same_node_goes_by_precedence() {
-        // Один узел, два паттерна: курсор отдаёт их по номеру паттерна.
+        // One node, two patterns: the cursor yields them by pattern number.
         let captures = vec![capture(3..8, 1, STRING), capture(3..8, 1, COMMENT)];
         let last = resolve_overlaps(captures.clone(), Precedence::LastPattern, 0..100);
         assert_eq!(last, vec![(3..8, COMMENT)]);
@@ -401,14 +399,14 @@ mod tests {
 
     #[test]
     fn common_start_goes_by_cursor_order() {
-        // Вложенный узел раньше по паттерну — объемлющий закрашивает его целиком.
+        // The nested node has the earlier pattern: the enclosing one paints over it entirely.
         let spans = resolve_overlaps(
             vec![capture(0..4, 1, STRING), capture(0..10, 2, KEYWORD)],
             Precedence::LastPattern,
             0..100,
         );
         assert_eq!(spans, vec![(0..10, KEYWORD)]);
-        // Объемлющий раньше — вложенный виден на своём участке.
+        // The enclosing one comes first: the nested one is visible on its own span.
         let spans = resolve_overlaps(
             vec![capture(0..10, 2, KEYWORD), capture(0..4, 1, STRING)],
             Precedence::LastPattern,
@@ -434,7 +432,7 @@ mod tests {
 
     #[test]
     fn partial_overlap_paints_in_order() {
-        // У разобранного дерева так не бывает, у устаревшего — может.
+        // This cannot happen in a parsed tree, but can in a stale one.
         let spans = resolve_overlaps(
             vec![
                 capture(0..5, 1, KEYWORD),
@@ -452,7 +450,7 @@ mod tests {
 
     #[test]
     fn buried_capture_does_not_resurface_after_its_end() {
-        // A снаружи, B внутри, C начинается внутри B и длится дольше A.
+        // A is outside, B is inside, C starts inside B and extends past A.
         let spans = resolve_overlaps(
             vec![
                 capture(0..10, 1, KEYWORD),

@@ -1,6 +1,6 @@
-// Помощник scripts/ui-scenario.sh. Прав Accessibility не требует.
-//   window-tool windows <pid>   — id окон процесса на экране (для `screencapture -l`)
-//   window-tool activate <pid>  — вывести приложение на передний план
+// Helper for scripts/ui-scenario.sh. Needs no Accessibility permissions.
+//   window-tool windows <pid>   — ids of the process's on-screen windows (for `screencapture -l`)
+//   window-tool activate <pid>  — bring the app to the foreground
 import AppKit
 
 let args = CommandLine.arguments

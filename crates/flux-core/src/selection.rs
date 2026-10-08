@@ -1,15 +1,15 @@
-//! Курсоры и выделения.
+//! Cursors and selections.
 
 use crate::transaction::{Assoc, ChangeSet};
 
-/// Одно выделение: от `anchor` (где начали) до `head` (где курсор).
-/// Пустое, когда `anchor == head` — тогда это просто курсор.
+/// A single selection: from `anchor` (where it started) to `head` (where the cursor is). Empty when
+/// `anchor == head`, in which case it is just a cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Range {
     pub anchor: usize,
     pub head: usize,
-    /// Колонка, к которой курсор стремится при движении вверх/вниз:
-    /// проходя через короткую строку, он не забывает исходную колонку.
+    /// The column the cursor aims for when moving up/down: when passing through a short line, it
+    /// does not forget the original column.
     pub goal_column: Option<usize>,
 }
 
@@ -38,7 +38,8 @@ impl Range {
         self.anchor == self.head
     }
 
-    /// Переносит курсор в `pos`. С `extend` — растягивает выделение, иначе схлопывает.
+    /// Moves the cursor to `pos`. With `extend`, it extends the selection; otherwise it collapses
+    /// it.
     pub fn put_cursor(&self, pos: usize, extend: bool) -> Self {
         Self::new(if extend { self.anchor } else { pos }, pos)
     }
@@ -72,8 +73,8 @@ impl Range {
     }
 }
 
-/// Набор выделений (мультикурсор). Всегда непустой, отсортирован
-/// и без пересечений. `primary` — главное выделение, за ним следит скролл.
+/// A set of selections (multi-cursor). Always non-empty, sorted, and non-overlapping. `primary` is
+/// the main selection, which scrolling follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
     ranges: Vec<Range>,
@@ -114,10 +115,10 @@ impl Selection {
         &self.ranges
     }
 
-    /// Число выделений (курсоров).
+    /// The number of selections (cursors).
     #[allow(
         clippy::len_without_is_empty,
-        reason = "выделение никогда не пусто: is_empty всегда был бы false"
+        reason = "a selection is never empty: is_empty would always be false"
     )]
     pub fn len(&self) -> usize {
         self.ranges.len()
@@ -127,7 +128,7 @@ impl Selection {
         self.ranges.iter()
     }
 
-    /// Применяет `f` к каждому выделению и снова нормализует результат.
+    /// Applies `f` to every selection and normalizes the result again.
     pub fn transform(&self, f: impl FnMut(&Range) -> Range) -> Self {
         Self {
             ranges: self.ranges.iter().map(f).collect(),

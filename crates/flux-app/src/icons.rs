@@ -1,6 +1,6 @@
-//! Значки: однотонные SVG 16×16, вшитые в бинарник. gpui рисует SVG маской — цвет
-//! задаёт элемент (`text_color`), поэтому один файл служит в любом цвете. Значок файла и
-//! его цвет выбираются по имени ([`file_icon`]), каталога — [`folder_icon`].
+//! Icons: monochrome 16×16 SVGs embedded in the binary. gpui draws an SVG as a mask, so the element
+//! sets the color (`text_color`) and one file works in any color. A file's icon and its color are
+//! chosen by name ([`file_icon`]), a directory's by [`folder_icon`].
 
 use std::borrow::Cow;
 
@@ -8,7 +8,7 @@ use gpui::{AssetSource, Hsla, SharedString, Svg, prelude::*, px, svg};
 
 use crate::theme::UiColors;
 
-/// Перечень значков: имя варианта → файл `assets/icons/<файл>.svg`.
+/// List of icons: variant name → file `assets/icons/<file>.svg`.
 macro_rules! icons {
     ($($name:ident => $file:literal),* $(,)?) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -19,7 +19,7 @@ macro_rules! icons {
         impl IconName {
             pub const ALL: &[IconName] = &[$(IconName::$name),*];
 
-            /// Путь, по которому gpui просит значок у [`Assets`].
+            /// The path gpui uses to request an icon from [`Assets`].
             pub fn path(self) -> &'static str {
                 match self {
                     $(IconName::$name => concat!("icons/", $file, ".svg")),*
@@ -36,7 +36,7 @@ macro_rules! icons {
 }
 
 icons! {
-    // Интерфейс
+    // Interface
     ArrowDown => "arrow-down",
     ArrowUp => "arrow-up",
     Branch => "branch",
@@ -69,7 +69,7 @@ icons! {
     Terminal => "terminal",
     Warning => "warning",
     WholeWord => "whole-word",
-    // Типы файлов
+    // File types
     FileArchive => "file-archive",
     FileC => "file-c",
     FileCode => "file-code",
@@ -98,12 +98,13 @@ icons! {
     FileYaml => "file-yaml",
 }
 
-/// Размер значка по умолчанию — под строку списка и текст 13 px.
+/// Default icon size, to fit a list row and 13 px text.
 pub const ICON_SIZE: f32 = 16.;
 
-/// Значок размером [`ICON_SIZE`] цветом `color`. Цвет обязателен: gpui красит SVG только
-/// собственным цветом элемента, от родителя он не наследуется (без цвета значок не виден).
-/// Смена цвета при наведении на родителя — `group_hover` у самого значка.
+/// An icon of size [`ICON_SIZE`] in color `color`. The color is required: gpui paints an SVG only
+/// with the element's own color, which is not inherited from the parent (without a color the icon
+/// is invisible). To change the color when the parent is hovered, use `group_hover` on the icon
+/// itself.
 pub fn icon(name: IconName, color: Hsla) -> Svg {
     svg()
         .path(name.path())
@@ -112,7 +113,7 @@ pub fn icon(name: IconName, color: Hsla) -> Svg {
         .text_color(color)
 }
 
-/// Значок и цвет для файла или каталога.
+/// Icon and color for a file or directory.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FileIcon {
     pub name: IconName,
@@ -125,9 +126,9 @@ impl FileIcon {
     }
 }
 
-/// Значок файла по имени: сначала точные имена (`Cargo.toml`, `Dockerfile`, `.env.local`),
-/// потом расширение. Цвет — оттенок палитры по языку или роли файла; служебное (замки,
-/// неизвестное) — приглушённое.
+/// A file's icon by name: exact names first (`Cargo.toml`, `Dockerfile`, `.env.local`), then the
+/// extension. The color is a palette shade by the file's language or role; utility files (lock
+/// files, unknown types) are muted.
 pub fn file_icon(file_name: &str, ui: &UiColors) -> FileIcon {
     let lower = file_name.to_ascii_lowercase();
     let (name, color) = match lower.as_str() {
@@ -197,7 +198,7 @@ pub fn file_icon(file_name: &str, ui: &UiColors) -> FileIcon {
     FileIcon { name, color }
 }
 
-/// Значок каталога: открытый или закрытый.
+/// Directory icon: open or closed.
 pub fn folder_icon(expanded: bool, ui: &UiColors) -> FileIcon {
     FileIcon {
         name: if expanded {
@@ -209,13 +210,14 @@ pub fn folder_icon(expanded: bool, ui: &UiColors) -> FileIcon {
     }
 }
 
-/// Логотип flux — цветной SVG (грани и градиенты); рисуется `img(icons::LOGO)`, а не маской.
+/// The flux logo is a color SVG (facets and gradients); it is drawn with `img(icons::LOGO)`, not as
+/// a mask.
 pub const LOGO: &str = "brand/logo.svg";
 
-/// Цветные ресурсы бренда: путь → содержимое.
+/// Color brand assets: path → contents.
 const BRAND: &[(&str, &[u8])] = &[(LOGO, include_bytes!("../assets/brand/logo.svg"))];
 
-/// Ресурсы приложения для gpui: значки `icons/<имя>.svg` и бренд `brand/…`.
+/// App assets for gpui: icons `icons/<name>.svg` and branding `brand/…`.
 pub struct Assets;
 
 impl AssetSource for Assets {
@@ -283,7 +285,7 @@ mod tests {
         assert_eq!(name("trailing."), IconName::File);
     }
 
-    /// Значки каталогов — заливкой, открытый отличается от закрытого.
+    /// Directory icons are filled; the open one differs from the closed one.
     #[test]
     fn folders_open_and_closed() {
         let ui = Theme::flux_night().ui;

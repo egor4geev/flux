@@ -1,5 +1,5 @@
-//! Наблюдение за файлами проекта: на macOS — FSEvents (через `notify`), рекурсивно по
-//! всему корню одним потоком событий, без отдельного наблюдателя на каждый каталог.
+//! Watching project files: on macOS this uses FSEvents (via `notify`), recursively over the whole
+//! root with a single event stream and no separate watcher per directory.
 
 use std::fs;
 use std::io;
@@ -9,27 +9,26 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
 use crate::rules::is_skipped;
 
-/// Что изменилось на диске.
+/// What changed on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsChange {
-    /// Изменились (созданы, удалены, переименованы — старое и новое имя, записаны) эти
-    /// пути — абсолютные, с тем же префиксом, что и корень, данный [`Watcher::new`].
-    /// Событий внутри служебных каталогов VCS (`.git/…`) и про мусор (`.DS_Store`) здесь нет;
-    /// `.gitignore` и `.ignore` — есть (по ним пересчитываются исключённые).
+    /// These paths changed (created, deleted, renamed — both old and new name — or written). They
+    /// are absolute and carry the same prefix as the root passed to [`Watcher::new`]. Events inside
+    /// VCS service directories (`.git/…`) and about junk files (`.DS_Store`) are not reported here;
+    /// `.gitignore` and `.ignore` are (the excluded set is recomputed from them).
     Paths(Vec<PathBuf>),
-    /// События потерялись (переполнение очереди ОС, ошибка наблюдения) — перечитать всё,
-    /// что показано.
+    /// Events were lost (OS queue overflow, watcher error): re-read everything that is shown.
     Rescan,
 }
 
-/// Наблюдатель за корнем проекта; наблюдение прекращается, когда его уничтожают.
+/// Watcher for the project root; watching stops when it is dropped.
 pub struct Watcher {
     _watcher: RecommendedWatcher,
 }
 
 impl Watcher {
-    /// Наблюдает за `root` рекурсивно. `on_change` зовётся из потока наблюдателя на каждое
-    /// событие ОС (часто — по несколько в миллисекунду) — склеивать вызовы должен получатель.
+    /// Watches `root` recursively. `on_change` is called from the watcher thread for every OS event
+    /// (often several per millisecond), so the receiver must coalesce the calls.
     pub fn new(root: &Path, on_change: impl Fn(FsChange) + Send + 'static) -> io::Result<Self> {
         let paths = RootPaths::new(root);
         let mut watcher =
@@ -60,8 +59,8 @@ impl Watcher {
     }
 }
 
-/// Перевод путей событий к корню, каким его дали: FSEvents сообщает настоящие пути
-/// (`/private/tmp/x/a.rs` при корне `/tmp/x`).
+/// Maps event paths back to the root as it was given: FSEvents reports real paths
+/// (`/private/tmp/x/a.rs` for the root `/tmp/x`).
 struct RootPaths {
     root: PathBuf,
     canonical: Option<PathBuf>,
@@ -76,8 +75,8 @@ impl RootPaths {
         }
     }
 
-    /// Путь события внутри проекта — с префиксом `root`; вне корня, внутри `.git` и про
-    /// `.DS_Store` — `None`.
+    /// An event path inside the project comes back with the `root` prefix; for paths outside the
+    /// root, inside `.git` or about `.DS_Store`, the result is `None`.
     fn project_path(&self, path: &Path) -> Option<PathBuf> {
         let rest = path.strip_prefix(&self.root).ok().or_else(|| {
             let canonical = self.canonical.as_deref()?;
@@ -117,7 +116,7 @@ mod tests {
         assert_eq!(mapped("/tmp/p/sub/.hg/store"), None);
         assert_eq!(mapped("/tmp/p/.DS_Store"), None);
         assert_eq!(mapped("/tmp/other/a.rs"), None);
-        // Служебные имена выше корня не мешают.
+        // Special names above the root don't get in the way.
         let paths = RootPaths {
             root: PathBuf::from("/x/.git/worktree"),
             canonical: None,
@@ -128,7 +127,7 @@ mod tests {
         );
     }
 
-    /// Ждёт, пока среди пришедших путей не окажутся все `expected` (не дольше 5 с).
+    /// Waits until all of `expected` are among the received paths (for at most 5 s).
     fn wait_for(events: &mpsc::Receiver<FsChange>, seen: &mut Vec<PathBuf>, expected: &[&Path]) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !expected.iter().all(|path| seen.iter().any(|p| p == path)) {
@@ -143,7 +142,7 @@ mod tests {
 
     #[test]
     fn changes_on_disk_are_reported_under_the_given_root() {
-        // Временный каталог — `/var/folders/…`, а FSEvents сообщает `/private/var/…`.
+        // The temporary directory is `/var/folders/…`, while FSEvents reports `/private/var/…`.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         fs::create_dir(root.join(".git")).unwrap();
@@ -152,7 +151,7 @@ mod tests {
             sender.send(change).ok();
         })
         .unwrap();
-        // Поток событий FSEvents запускается не мгновенно.
+        // The FSEvents event stream doesn't start instantly.
         std::thread::sleep(Duration::from_millis(300));
 
         let mut seen = Vec::new();

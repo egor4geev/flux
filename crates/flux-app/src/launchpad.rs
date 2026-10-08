@@ -1,31 +1,32 @@
-//! Лаунчпад — полоса инструментов слева на рамке окна. Значок открывает и закрывает окно
-//! своего инструмента (остров или окно поверх); открытое — подсвечено. Новый инструмент —
-//! вариант [`Tool`] с его значком, подписью и действием и строка в [`Tool::ALL`].
+//! The launchpad is the tool strip on the left of the window frame. An icon opens and closes the
+//! window of its tool (an island or an overlay window); the open one is highlighted. A new tool is
+//! a [`Tool`] variant with its icon, label, and action, plus an entry in [`Tool::ALL`].
 
 use gpui::{Action, Context, IntoElement, Window, div, prelude::*, px};
 
+use crate::i18n::tr;
 use crate::icons::IconName;
 use crate::theme::Theme;
 use crate::ui;
 use crate::workspace::Workspace;
 use crate::{file_tree, project_search};
 
-/// Ширина полосы; кнопки — по центру.
+/// Width of the strip; the buttons are centered.
 pub const WIDTH: f32 = 40.;
-/// Кнопка инструмента крупнее обычной кнопки-значка: это главная навигация окна.
+/// A tool button is larger than a regular icon button: it is the window's main navigation.
 const BUTTON_SIZE: f32 = 32.;
 
-/// Инструмент лаунчпада.
+/// A launchpad tool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
-    /// Дерево проекта — остров слева.
+    /// Project tree: an island on the left.
     Project,
-    /// Поиск по проекту — окно «Find in Files» поверх островов.
+    /// Project search: the "Find in Files" window over the islands.
     FindInFiles,
 }
 
 impl Tool {
-    /// Порядок в полосе сверху вниз.
+    /// Order in the strip, top to bottom.
     pub const ALL: [Tool; 2] = [Tool::Project, Tool::FindInFiles];
 
     fn icon(self) -> IconName {
@@ -37,12 +38,12 @@ impl Tool {
 
     fn label(self) -> &'static str {
         match self {
-            Tool::Project => "Project",
-            Tool::FindInFiles => "Find in Files",
+            Tool::Project => tr("Project"),
+            Tool::FindInFiles => tr("Find in Files"),
         }
     }
 
-    /// Действие, которое открывает и закрывает окно инструмента.
+    /// The action that opens and closes the tool's window.
     fn action(self) -> Box<dyn Action> {
         match self {
             Tool::Project => Box::new(file_tree::ToggleOpen),
@@ -51,7 +52,8 @@ impl Tool {
     }
 }
 
-/// Полоса инструментов: кнопка на инструмент, у открытого — акцентная подложка и метка слева.
+/// The tool strip: one button per tool; the open one gets an accent background and a marker on the
+/// left.
 pub fn render(
     workspace: &Workspace,
     window: &Window,
@@ -81,7 +83,7 @@ pub fn render(
                             window.dispatch_action(action.boxed_clone(), cx)
                         }),
                 )
-                // Метка открытого окна — у края полосы, как у вкладки инструмента в IDE.
+                // Marker of the open window: at the edge of the strip, like an IDE tool tab.
                 .when(open, |button| {
                     button.child(
                         div()

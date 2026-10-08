@@ -1,5 +1,5 @@
-//! Правки текста. Каждая функция строит [`Transaction`] для всех выделений
-//! сразу — так мультикурсор работает без отдельного кода.
+//! Text edits. Each function builds a [`Transaction`] for all selections at once, so multi-cursor
+//! works without any special code.
 
 use ropey::Rope;
 
@@ -10,8 +10,8 @@ use crate::text::{
 };
 use crate::transaction::{Assoc, Change, ChangeSet, Transaction};
 
-/// Применяет `f` к каждому выделению; после правки каждый курсор встаёт
-/// в конец своего изменённого участка.
+/// Applies `f` to every selection; after the edit, each cursor is placed at the end of its changed
+/// range.
 fn change_by_selection(
     text: &Rope,
     selection: &Selection,
@@ -25,14 +25,14 @@ fn change_by_selection(
     Transaction::new(changes).with_selection(selection)
 }
 
-/// Заменяет каждое выделение на `insert` (обычный ввод и вставка).
+/// Replaces every selection with `insert` (regular typing and paste).
 pub fn insert_text(text: &Rope, selection: &Selection, insert: &str) -> Transaction {
     change_by_selection(text, selection, |range| {
         (range.from(), range.to(), Some(insert.to_owned()))
     })
 }
 
-/// Перевод строки с сохранением отступа текущей строки.
+/// A newline that keeps the indentation of the current line.
 pub fn insert_newline(text: &Rope, selection: &Selection, line_ending: &str) -> Transaction {
     change_by_selection(text, selection, |range| {
         let line = text.char_to_line(range.from());
@@ -44,7 +44,7 @@ pub fn insert_newline(text: &Rope, selection: &Selection, line_ending: &str) -> 
     })
 }
 
-/// Tab: пробелы до следующей позиции табуляции.
+/// Tab: spaces up to the next tab stop.
 pub fn insert_tab(text: &Rope, selection: &Selection, tab_width: usize) -> Transaction {
     change_by_selection(text, selection, |range| {
         let line = text.char_to_line(range.from());
@@ -54,7 +54,7 @@ pub fn insert_tab(text: &Rope, selection: &Selection, tab_width: usize) -> Trans
     })
 }
 
-/// Backspace: удаляет выделение или графему перед курсором.
+/// Backspace: deletes the selection or the grapheme before the cursor.
 pub fn delete_backward(text: &Rope, selection: &Selection) -> Transaction {
     change_by_selection(text, selection, |range| {
         if range.is_empty() {
@@ -65,7 +65,7 @@ pub fn delete_backward(text: &Rope, selection: &Selection) -> Transaction {
     })
 }
 
-/// Delete: удаляет выделение или графему после курсора.
+/// Delete: deletes the selection or the grapheme after the cursor.
 pub fn delete_forward(text: &Rope, selection: &Selection) -> Transaction {
     change_by_selection(text, selection, |range| {
         if range.is_empty() {
@@ -76,7 +76,7 @@ pub fn delete_forward(text: &Rope, selection: &Selection) -> Transaction {
     })
 }
 
-/// Alt+Backspace: удаляет слово перед курсором.
+/// Alt+Backspace: deletes the word before the cursor.
 pub fn delete_word_backward(text: &Rope, selection: &Selection) -> Transaction {
     change_by_selection(text, selection, |range| {
         if range.is_empty() {
@@ -87,15 +87,15 @@ pub fn delete_word_backward(text: &Rope, selection: &Selection) -> Transaction {
     })
 }
 
-/// Cmd+Backspace: удаляет целиком строки, на которых стоят курсоры и выделения, вместе с
-/// переводом строки (как Delete Line в JetBrains). Выделение, которое кончается в начале
-/// строки (строка после тройного щелчка), эту строку не задевает. Курсор встаёт в ту же
-/// колонку строки, поднявшейся на место удалённых, а если удалены последние строки — строки
-/// над ними.
+/// Cmd+Backspace: deletes whole lines that contain cursors and selections, together with the
+/// newline (like Delete Line in JetBrains). A selection that ends at the start of a line (the line
+/// after a triple click) does not touch that line. The cursor is placed at the same column of the
+/// line that moved up into the place of the deleted ones, or, if the last lines were deleted, of
+/// the line above them.
 pub fn delete_lines(text: &Rope, selection: &Selection) -> Transaction {
     let last_line = text.len_lines() - 1;
-    // Участки строк `(первая, последняя, колонка курсора)` по возрастанию; пересекающиеся
-    // и соседние слиты — у слитого колонка первого выделения.
+    // Line spans `(first, last, cursor column)` in ascending order; overlapping and adjacent ones
+    // are merged, and the merged span takes the column of the first selection.
     let mut spans: Vec<(usize, usize, usize)> = Vec::new();
     let mut primary = 0;
     for (index, range) in selection.iter().enumerate() {
@@ -118,7 +118,7 @@ pub fn delete_lines(text: &Rope, selection: &Selection) -> Transaction {
         let (from, to) = if last < last_line {
             (line_start(text, first), line_start(text, last + 1))
         } else if first > 0 {
-            // Последние строки уходят вместе с переводом строки перед ними.
+            // The last lines are removed together with the newline before them.
             (line_end(text, first - 1), text.len_chars())
         } else {
             (0, text.len_chars())
@@ -204,11 +204,11 @@ mod tests {
 
     #[test]
     fn delete_lines_removes_the_line_and_keeps_the_column() {
-        // Курсор в «bbb» на колонке 1 — встаёт на колонку 1 строки «cc».
+        // A cursor in "bbb" at column 1 ends up at column 1 of the line "cc".
         let (text, sel) = run("a\nbbb\ncc", Selection::point(3), delete_lines);
         assert_eq!(text, "a\ncc");
         assert_eq!(sel.primary(), Range::point(3));
-        // Колонка за краем короткой строки — её конец.
+        // A column past the edge of a short line means the end of that line.
         let (text, sel) = run("abcd\nx\n", Selection::point(3), delete_lines);
         assert_eq!(text, "x\n");
         assert_eq!(sel.primary(), Range::point(1));
@@ -219,10 +219,10 @@ mod tests {
         let (text, sel) = run("a\nbb", Selection::point(4), delete_lines);
         assert_eq!(text, "a");
         assert_eq!(sel.primary(), Range::point(1));
-        // Пустая последняя строка после финального перевода строки.
+        // The empty last line after the final newline.
         let (text, _) = run("a\nb\n", Selection::point(4), delete_lines);
         assert_eq!(text, "a\nb");
-        // Единственная строка — пустой документ.
+        // The only line: an empty document.
         let (text, sel) = run("abc", Selection::point(2), delete_lines);
         assert_eq!(text, "");
         assert_eq!(sel.primary(), Range::point(0));
@@ -230,18 +230,18 @@ mod tests {
 
     #[test]
     fn delete_lines_with_cursors_and_selections() {
-        // Курсоры на строках 0 и 2 — обе строки, курсоры на поднявшихся.
+        // Cursors on lines 0 and 2: both lines go, and the cursors land on the lines that moved up.
         let sel = Selection::new(vec![Range::point(0), Range::point(4)], 1);
         let (text, sel) = run("a\nb\nc\nd", sel, delete_lines);
         assert_eq!(text, "b\nd");
         assert_eq!(sel.ranges(), &[Range::point(0), Range::point(2)]);
         assert_eq!(sel.primary_index(), 1);
-        // Курсоры на соседних строках и два на одной — одно удаление.
+        // Cursors on adjacent lines, and two on one line: a single deletion.
         let sel = Selection::new(vec![Range::point(2), Range::point(3), Range::point(5)], 0);
         let (text, sel) = run("a\nbb\nc\nd", sel, delete_lines);
         assert_eq!(text, "a\nd");
         assert_eq!(sel.ranges(), &[Range::point(2)]);
-        // Выделение через строки 1–2, кончается в начале строки 3: строка 3 остаётся.
+        // A selection across lines 1–2 that ends at the start of line 3: line 3 stays.
         let (text, _) = run("a\nb\nc\nd", Selection::single(2, 6), delete_lines);
         assert_eq!(text, "a\nd");
     }

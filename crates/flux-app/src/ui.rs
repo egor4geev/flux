@@ -1,7 +1,7 @@
-//! Компоненты дизайн-системы (вики: «Design System»): острова и всплывающие панели на
-//! стекле, кнопки-значки и переключатели, клавиши сочетаний, бейджи, подписи разделов,
-//! подсказки при наведении. Цвета — токены темы ([`UiColors`]), размеры — константы ниже
-//! и шкала отступов gpui (шаг 4 px: `p_1` = 4 px, `p_2` = 8 px, `gap_3` = 12 px).
+//! Design system components (wiki: "Design System"): islands and popovers on glass, icon buttons
+//! and toggles, shortcut keys, badges, section labels, hover tooltips. Colors are theme tokens
+//! ([`UiColors`]); sizes are the constants below and gpui's spacing scale (4 px step: `p_1` = 4 px,
+//! `p_2` = 8 px, `gap_3` = 12 px).
 
 use gpui::{
     Action, AnyView, App, BoxShadow, Context, Div, ElementId, FocusHandle, Hsla, IntoElement,
@@ -13,24 +13,25 @@ use crate::command_palette::keystroke_label;
 use crate::icons::{IconName, icon};
 use crate::theme::{self, Theme, UiColors};
 
-/// Скругления: клавиши и бейджи · кнопки, поля, строки · карточки · острова · окна поверх.
-/// Вложенное скругление = внешнее − отступ (остров 12, строка с отступом 6 → 6).
+/// Corner radii: keys and badges · buttons, fields, rows · cards · islands · overlay windows. A
+/// nested radius = the outer radius − the inset (island 12, a row with a 6 inset → 6).
 pub const RADIUS_XS: f32 = 4.;
 pub const RADIUS_SM: f32 = 6.;
 pub const RADIUS_MD: f32 = 8.;
 pub const RADIUS_LG: f32 = 12.;
 pub const RADIUS_XL: f32 = 16.;
 
-/// Зазор между островами и от островов до края окна.
+/// The gap between islands and from the islands to the window edge.
 pub const GAP: f32 = 8.;
-/// Шапка окна (светофор macOS, проект, кнопки) и статус-бар — на рамке, без острова.
+/// The window title bar (macOS traffic lights, project, buttons) and the status bar live on the
+/// frame, with no island.
 pub const TITLE_BAR_HEIGHT: f32 = 40.;
 pub const STATUS_BAR_HEIGHT: f32 = 28.;
-/// Кнопка-значок и переключатель.
+/// Icon button and toggle.
 pub const ICON_BUTTON_SIZE: f32 = 26.;
 
-/// Остров: самостоятельная панель на стеклянной рамке окна (дерево, редактор).
-/// Скругление не обрезает детей: их фон у углов должен отступать от края.
+/// Island: a standalone panel on the window's glass frame (tree, editor). The corner rounding
+/// doesn't clip children: their backgrounds must keep away from the edge at the corners.
 pub fn island(ui: UiColors) -> Div {
     div()
         .relative()
@@ -42,8 +43,8 @@ pub fn island(ui: UiColors) -> Div {
         .child(sheen(ui, RADIUS_LG))
 }
 
-/// Всплывающая панель: меню, списки выбора, поиск по проекту, подсказки. Плотнее острова
-/// и с глубокой тенью — она над всем остальным.
+/// Popover: menus, pickers, project search, tooltips. Denser than an island and with a deep shadow:
+/// it is above everything else.
 pub fn popover(ui: UiColors) -> Div {
     div()
         .relative()
@@ -58,8 +59,8 @@ pub fn popover(ui: UiColors) -> Div {
         .child(sheen(ui, RADIUS_XL))
 }
 
-/// Блик стекла: светлая линия по верхнему краю, гаснущая к углам. `inset` — отступ от
-/// боковых краёв (скругление панели).
+/// Glass highlight: a light line along the top edge that fades out toward the corners. `inset` is
+/// the offset from the side edges (the panel's corner radius).
 pub fn sheen(ui: UiColors, inset: f32) -> impl IntoElement {
     let clear = UiColors::tint(ui.sheen, 0.);
     div()
@@ -81,7 +82,7 @@ pub fn sheen(ui: UiColors, inset: f32) -> impl IntoElement {
         )))
 }
 
-/// Фон рамки окна: тонировка стекла и цветной отсвет из верхнего левого угла.
+/// Window frame background: glass tint and a colored glow from the top-left corner.
 pub fn frame_glow(ui: UiColors) -> impl IntoElement {
     div().absolute().inset_0().bg(linear_gradient(
         135.,
@@ -124,7 +125,7 @@ pub fn popover_shadow(ui: UiColors) -> Vec<BoxShadow> {
     ]
 }
 
-/// Кольцо фокуса вокруг поля: акцентная рамка плюс мягкое свечение.
+/// Focus ring around a field: an accent border plus a soft glow.
 pub fn focus_ring(ui: UiColors) -> Vec<BoxShadow> {
     vec![BoxShadow {
         color: ui.focus_ring,
@@ -134,11 +135,11 @@ pub fn focus_ring(ui: UiColors) -> Vec<BoxShadow> {
     }]
 }
 
-/// Группа наведения кнопок: значок меняет цвет, когда мышь над кнопкой.
+/// Button hover group: the icon changes color when the mouse is over the button.
 const BUTTON_GROUP: &str = "icon-button";
 
-/// Кнопка-значок 26×26: приглушённый значок, подложка при наведении. Действие — `on_click`
-/// у вызывающего, подсказка — `tooltip(ui::tooltip(..))`.
+/// 26×26 icon button: a muted icon, a backdrop on hover. The action is the caller's `on_click`, the
+/// tooltip is `tooltip(ui::tooltip(..))`.
 pub fn icon_button(id: impl Into<ElementId>, name: IconName, ui: UiColors) -> Stateful<Div> {
     button_base(id, ui)
         .hover(move |style| style.bg(ui.hover))
@@ -149,7 +150,7 @@ pub fn icon_button(id: impl Into<ElementId>, name: IconName, ui: UiColors) -> St
         )
 }
 
-/// Переключатель (регистр, целое слово, regex): включённый — акцентная подложка и значок.
+/// Toggle (case, whole word, regex): when on, an accent backdrop and icon.
 pub fn toggle_button(
     id: impl Into<ElementId>,
     name: IconName,
@@ -159,8 +160,8 @@ pub fn toggle_button(
     if !on {
         return icon_button(id, name, ui);
     }
-    // `hover` у элемента gpui задаётся один раз (повторный вызов — паника), поэтому у основы
-    // кнопки его нет: обычная и включённая задают свой.
+    // A gpui element's `hover` can be set only once (a second call panics), so the button base has
+    // none: the regular and the enabled variants each set their own.
     button_base(id, ui)
         .bg(ui.accent_soft)
         .hover(move |style| style.bg(UiColors::tint(ui.accent, 0.26)))
@@ -181,8 +182,8 @@ fn button_base(id: impl Into<ElementId>, ui: UiColors) -> Stateful<Div> {
         .active(move |style| style.bg(ui.pressed))
 }
 
-/// Клавиши сочетания: «⇧⌘F» → ⇧ ⌘ F, «⌘K ⌘S» → две группы. Модификаторы — по одной
-/// клавише, остальное в группе — одна клавиша.
+/// Shortcut keys: "⇧⌘F" → ⇧ ⌘ F, "⌘K ⌘S" → two groups. Modifiers get one key each; the rest of a
+/// group is a single key.
 pub fn keys(label: &str, ui: UiColors) -> Div {
     div().flex().flex_none().items_center().gap_1p5().children(
         label
@@ -198,7 +199,7 @@ pub fn keys(label: &str, ui: UiColors) -> Div {
     )
 }
 
-/// Одна клавиша: квадратик со скруглением, моноширинный значок.
+/// A single key: a small rounded square with a monospaced symbol.
 pub fn keycap(key: impl Into<SharedString>, ui: UiColors) -> Div {
     div()
         .flex_none()
@@ -218,7 +219,7 @@ pub fn keycap(key: impl Into<SharedString>, ui: UiColors) -> Div {
         .child(key.into())
 }
 
-/// Группа нажатия → клавиши: модификаторы ⌃⌥⇧⌘ по одному, остаток — одной клавишей.
+/// A keystroke group → keys: modifiers ⌃⌥⇧⌘ one by one, the remainder as a single key.
 fn split_keys(group: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let mut rest = group;
@@ -232,14 +233,14 @@ fn split_keys(group: &str) -> Vec<String> {
     keys
 }
 
-/// Сочетание первой привязки действия значками macOS («⇧⌘P») — для подсказок и кнопок.
-/// Привязки — по пути от элемента в фокусе (прошлый кадр).
+/// The shortcut of an action's first binding in macOS symbols ("⇧⌘P"), for tooltips and buttons.
+/// Bindings are looked up along the path from the focused element (previous frame).
 pub fn shortcut_for(action: &dyn Action, window: &Window) -> Option<SharedString> {
     shortcut_label(&window.bindings_for_action(action))
 }
 
-/// То же, как если бы фокус был в `focus`: кнопки панели показывают её клавиши, даже когда
-/// фокус в другом месте (шапка дерева, кнопки строки поиска).
+/// The same, as if focus were in `focus`: a panel's buttons show its keys even when focus is
+/// elsewhere (the tree header, the find bar buttons).
 pub fn shortcut_in(
     action: &dyn Action,
     focus: &FocusHandle,
@@ -259,7 +260,7 @@ fn shortcut_label(bindings: &[KeyBinding]) -> Option<SharedString> {
     Some(label.into())
 }
 
-/// Бейдж: число или короткая метка цветом `color` на подложке того же оттенка.
+/// Badge: a number or a short label in `color` on a backdrop of the same hue.
 pub fn badge(text: impl Into<SharedString>, color: Hsla) -> Div {
     div()
         .flex_none()
@@ -275,7 +276,7 @@ pub fn badge(text: impl Into<SharedString>, color: Hsla) -> Div {
         .child(text.into())
 }
 
-/// Подпись раздела: мелкие прописные, полужирные, приглушённые.
+/// Section label: small uppercase, semibold, muted.
 pub fn section_label(text: impl Into<SharedString>, ui: UiColors) -> Div {
     div()
         .text_size(px(theme::TEXT_XS))
@@ -284,12 +285,12 @@ pub fn section_label(text: impl Into<SharedString>, ui: UiColors) -> Div {
         .child(text.into().to_uppercase())
 }
 
-/// Горизонтальный разделитель внутри острова или панели.
+/// A horizontal divider inside an island or a panel.
 pub fn divider(ui: UiColors) -> Div {
     div().flex_none().h(px(1.)).bg(ui.divider)
 }
 
-/// Подвал всплывающей панели: «↑↓ navigate · ↵ open · esc close».
+/// Popover footer: "↑↓ navigate · ↵ open · esc close".
 pub fn hint_bar(hints: &[(&str, &str)], ui: UiColors) -> Div {
     div()
         .flex()
@@ -306,7 +307,7 @@ pub fn hint_bar(hints: &[(&str, &str)], ui: UiColors) -> Div {
         }))
 }
 
-/// Подсказка при наведении: текст и, если есть, сочетание. Для `tooltip(..)` у элемента.
+/// Hover tooltip: text and, if there is one, a shortcut. For an element's `tooltip(..)`.
 pub fn tooltip(
     text: impl Into<SharedString>,
     keys: Option<SharedString>,
@@ -329,7 +330,7 @@ struct Tooltip {
 impl Render for Tooltip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        // gpui ставит подсказку в точку мыши — отступ уводит её из-под курсора.
+        // gpui puts the tooltip at the mouse point; the offset moves it out from under the cursor.
         div().pl(px(10.)).pt(px(18.)).child(
             div()
                 .flex()

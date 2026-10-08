@@ -1,8 +1,8 @@
-//! Изменения текста.
+//! Text changes.
 //!
-//! [`ChangeSet`] описывает правку всего документа последовательностью операций
-//! `Retain` / `Delete` / `Insert`, покрывающей его целиком. Такое представление
-//! легко применить, инвертировать (для undo) и использовать для пересчёта позиций.
+//! [`ChangeSet`] describes an edit of the whole document as a sequence of `Retain` / `Delete` /
+//! `Insert` operations that covers it entirely. This representation is easy to apply, to invert
+//! (for undo), and to use for remapping positions.
 
 use ropey::Rope;
 
@@ -10,43 +10,43 @@ use crate::selection::Selection;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
-    /// Пропустить `n` символов без изменений.
+    /// Skip `n` characters without changing them.
     Retain(usize),
-    /// Удалить `n` символов.
+    /// Delete `n` characters.
     Delete(usize),
-    /// Вставить строку.
+    /// Insert a string.
     Insert(String),
 }
 
-/// К какой стороне вставки прилипает позиция, если вставка ровно в ней.
+/// Which side of an insertion a position sticks to when the insertion is exactly at that position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Assoc {
     Before,
     After,
 }
 
-/// Одна правка: заменить символы `from..to` на `text` (`None` — просто удалить).
+/// A single edit: replace the characters `from..to` with `text` (`None` means just delete).
 pub type Change = (usize, usize, Option<String>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChangeSet {
     ops: Vec<Operation>,
-    /// Длина документа до применения, в символах.
+    /// Document length before the change is applied, in characters.
     len: usize,
-    /// Длина документа после применения, в символах.
+    /// Document length after the change is applied, in characters.
     len_after: usize,
 }
 
 impl ChangeSet {
-    /// Тождественное изменение документа длины `len`.
+    /// The identity change for a document of length `len`.
     pub fn identity(len: usize) -> Self {
         let mut cs = Self::default();
         cs.retain(len);
         cs
     }
 
-    /// Строит изменение из списка правок, отсортированных по `from`.
-    /// Пересекающиеся правки обрезаются, чтобы не залезать на предыдущие.
+    /// Builds a change from a list of edits sorted by `from`. Overlapping edits are trimmed so that
+    /// they do not reach into the previous ones.
     pub fn from_changes(len: usize, changes: impl IntoIterator<Item = Change>) -> Self {
         let mut cs = Self::default();
         let mut last = 0;
@@ -76,7 +76,7 @@ impl ChangeSet {
         &self.ops
     }
 
-    /// Ничего не меняет.
+    /// Changes nothing.
     pub fn is_empty(&self) -> bool {
         self.ops.iter().all(|op| matches!(op, Operation::Retain(_)))
     }
@@ -106,8 +106,8 @@ impl ChangeSet {
         }
     }
 
-    /// Вставка всегда идёт перед соседним удалением: так у одного и того же
-    /// изменения ровно одно представление.
+    /// An insertion always comes before an adjacent deletion, so that a given change has exactly
+    /// one representation.
     fn insert(&mut self, text: String) {
         if text.is_empty() {
             return;
@@ -139,7 +139,7 @@ impl ChangeSet {
         }
     }
 
-    /// Изменение, отменяющее это. `original` — документ до применения.
+    /// The change that undoes this one. `original` is the document before it was applied.
     pub fn invert(&self, original: &Rope) -> ChangeSet {
         let mut inverted = Self::default();
         let mut pos = 0;
@@ -159,7 +159,7 @@ impl ChangeSet {
         inverted
     }
 
-    /// Где окажется позиция `pos` после применения изменения.
+    /// Where position `pos` ends up after the change is applied.
     pub fn map_pos(&self, pos: usize, assoc: Assoc) -> usize {
         let mut old = 0;
         let mut new = 0;
@@ -189,10 +189,10 @@ impl ChangeSet {
         new + pos.saturating_sub(old)
     }
 
-    /// То же, что [`map_pos`](Self::map_pos) для каждой позиции, но за один проход по
-    /// изменению: O(операций + позиций). Позиции должны идти по неубыванию, а равные — сначала
-    /// с `Assoc::Before` (так идут концы и начала соседних диапазонов: конец — `Before`,
-    /// следующее начало — `After`).
+    /// The same as [`map_pos`](Self::map_pos) for each position, but in a single pass over the
+    /// change: O(operations + positions). Positions must be non-decreasing, and among equal ones
+    /// those with `Assoc::Before` come first (that is how the ends and starts of adjacent ranges
+    /// are ordered: an end is `Before`, the next start is `After`).
     pub fn map_sorted(&self, positions: impl IntoIterator<Item = (usize, Assoc)>) -> Vec<usize> {
         let mut mapped = Vec::new();
         let (mut i, mut old, mut new) = (0, 0, 0);
@@ -230,11 +230,11 @@ impl ChangeSet {
     }
 }
 
-/// Изменение текста вместе с выделением, которое должно получиться после него.
+/// A text change together with the selection that should result from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub changes: ChangeSet,
-    /// `None` — выделение пересчитывается через [`Selection::map`].
+    /// `None` means the selection is recomputed via [`Selection::map`].
     pub selection: Option<Selection>,
 }
 
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn map_sorted_agrees_with_map_pos() {
-        // Детерминированный «случайный» набор правок и позиций.
+        // A deterministic "random" set of edits and positions.
         let mut seed = 0x2545_f491_u64;
         let mut next = |n: usize| {
             seed ^= seed << 13;
@@ -356,7 +356,7 @@ mod tests {
                 at = to + 1;
             }
             let cs = ChangeSet::from_changes(len, changes);
-            // Диапазоны по возрастанию: начало — After, конец — Before.
+            // Ranges in ascending order: the start is After, the end is Before.
             let mut positions = Vec::new();
             let mut pos = 0;
             while pos < len {

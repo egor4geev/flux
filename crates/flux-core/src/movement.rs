@@ -1,5 +1,5 @@
-//! Движение курсора. Каждая функция берёт выделение и возвращает новое;
-//! `extend` — растягивать выделение (Shift) или переносить курсор.
+//! Cursor movement. Each function takes a selection and returns a new one; `extend`: extend the
+//! selection (Shift) or move the cursor.
 
 use ropey::Rope;
 
@@ -16,7 +16,7 @@ pub enum Direction {
 }
 
 pub fn move_horizontally(text: &Rope, range: Range, dir: Direction, extend: bool) -> Range {
-    // Как в обычных редакторах: стрелка без Shift сначала схлопывает выделение.
+    // As in ordinary editors: an arrow key without Shift first collapses the selection.
     if !extend && !range.is_empty() {
         let pos = match dir {
             Direction::Backward => range.from(),
@@ -60,7 +60,7 @@ pub fn move_vertically(
     range.put_cursor(pos, extend).with_goal_column(Some(column))
 }
 
-/// «Умный» Home: сначала к первому непробельному символу, повторно — в колонку 0.
+/// "Smart" Home: first to the first non-whitespace character, on a repeat to column 0.
 pub fn move_line_start(text: &Rope, range: Range, extend: bool) -> Range {
     let line = text.char_to_line(range.head);
     let start = line_start(text, line);
@@ -91,7 +91,7 @@ pub fn move_document_end(text: &Rope, range: Range, extend: bool) -> Range {
     range.put_cursor(text.len_chars(), extend)
 }
 
-/// Конец следующего слова (Alt+→).
+/// End of the next word (Alt+→).
 pub fn next_word_end(text: &Rope, pos: usize) -> usize {
     let len = text.len_chars();
     let mut i = pos;
@@ -107,7 +107,7 @@ pub fn next_word_end(text: &Rope, pos: usize) -> usize {
     i
 }
 
-/// Начало предыдущего слова (Alt+←).
+/// Start of the previous word (Alt+←).
 pub fn prev_word_start(text: &Rope, pos: usize) -> usize {
     let mut i = pos;
     while i > 0 && char_class(text.char(i - 1)) == CharClass::Whitespace {
@@ -122,13 +122,13 @@ pub fn prev_word_start(text: &Rope, pos: usize) -> usize {
     i
 }
 
-/// Слово (или серия пунктуации/пробелов) под позицией — для двойного клика.
+/// The word (or a run of punctuation/whitespace) at a position, for double-click.
 pub fn word_range_at(text: &Rope, pos: usize) -> Range {
     let len = text.len_chars();
     if len == 0 {
         return Range::point(0);
     }
-    // Клик сразу за словом выделяет это слово, а не пробел после него.
+    // A click right after a word selects that word, not the space after it.
     let probe = if pos >= len
         || (pos > 0 && char_class(text.char(pos)) == CharClass::Whitespace
             && char_class(text.char(pos - 1)) != CharClass::Whitespace)
@@ -167,7 +167,7 @@ mod tests {
         let text = Rope::from_str("long line\nab\nanother line");
         let r = Range::point(7);
         let r = move_vertically(&text, r, Forward, 1, false);
-        assert_eq!(r.head, 12); // конец короткой строки "ab"
+        assert_eq!(r.head, 12); // end of the short line "ab"
         let r = move_vertically(&text, r, Forward, 1, false);
         assert_eq!(r.head, 13 + 7);
     }

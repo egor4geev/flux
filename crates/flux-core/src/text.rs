@@ -1,10 +1,10 @@
-//! Низкоуровневые помощники над текстом: графемы, строки, классы символов.
+//! Low-level text helpers: graphemes, lines, character classes.
 
 use ropey::{Rope, RopeSlice};
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
-/// Граница следующей графемы после `char_idx`. Графема — то, что пользователь
-/// видит как один символ: `é` из двух code point, эмодзи с ZWJ, `\r\n`.
+/// The boundary of the next grapheme after `char_idx`. A grapheme is what the user sees as a single
+/// character: `é` made of two code points, an emoji with a ZWJ, `\r\n`.
 pub fn next_grapheme_boundary(slice: RopeSlice, char_idx: usize) -> usize {
     if char_idx >= slice.len_chars() {
         return slice.len_chars();
@@ -29,7 +29,7 @@ pub fn next_grapheme_boundary(slice: RopeSlice, char_idx: usize) -> usize {
     }
 }
 
-/// Граница предыдущей графемы перед `char_idx`.
+/// The boundary of the previous grapheme before `char_idx`.
 pub fn prev_grapheme_boundary(slice: RopeSlice, char_idx: usize) -> usize {
     if char_idx == 0 {
         return 0;
@@ -56,7 +56,7 @@ pub fn prev_grapheme_boundary(slice: RopeSlice, char_idx: usize) -> usize {
     }
 }
 
-/// Длина перевода строки в конце `line`, в символах (0, 1 или 2 для `\r\n`).
+/// Length of the line break at the end of `line`, in characters (0, 1, or 2 for `\r\n`).
 pub fn line_ending_len(line: RopeSlice) -> usize {
     let len = line.len_chars();
     if len == 0 {
@@ -69,23 +69,23 @@ pub fn line_ending_len(line: RopeSlice) -> usize {
     }
 }
 
-/// Индекс первого символа строки `line`.
+/// The index of the first character of line `line`.
 pub fn line_start(text: &Rope, line: usize) -> usize {
     text.line_to_char(line)
 }
 
-/// Индекс конца строки `line` — перед переводом строки.
+/// The index of the end of line `line`, before the line break.
 pub fn line_end(text: &Rope, line: usize) -> usize {
     let slice = text.line(line);
     text.line_to_char(line) + slice.len_chars() - line_ending_len(slice)
 }
 
-/// Длина строки без перевода строки.
+/// Length of the line without its line break.
 pub fn line_len(text: &Rope, line: usize) -> usize {
     line_end(text, line) - line_start(text, line)
 }
 
-/// Начальные пробелы и табы строки.
+/// The leading spaces and tabs of a line.
 pub fn indentation(text: &Rope, line: usize) -> String {
     text.line(line)
         .chars()
@@ -93,7 +93,7 @@ pub fn indentation(text: &Rope, line: usize) -> String {
         .collect()
 }
 
-/// Перевод строки, который используется в документе (по первой строке).
+/// The line break used in the document (determined from the first line).
 pub fn detect_line_ending(text: &Rope) -> &'static str {
     for line in text.lines().take(100) {
         match line_ending_len(line) {
