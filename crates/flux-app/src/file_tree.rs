@@ -959,11 +959,27 @@ impl FileTreePanel {
 
     // --- Мышь ---
 
-    fn click_row(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    /// Щелчок по строке, как в VS Code: файл открывается, а фокус остаётся в дереве (можно
+    /// листать дальше); двойной щелчок по файлу — фокус в редактор. Каталог раскрывается или
+    /// сворачивается первым щелчком — второй щелчок двойного его не трогает.
+    fn click_row(
+        &mut self,
+        path: PathBuf,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus_handle);
         self.selected = Some(path.clone());
         self.reveal_target = None;
-        self.activate(path, true, cx);
+        if !self.tree.is_dir(&path) {
+            cx.emit(FileTreeEvent::Open {
+                path,
+                focus: click_count >= 2,
+            });
+        } else if click_count == 1 {
+            self.activate(path, false, cx);
+        }
         cx.notify();
     }
 
@@ -1256,8 +1272,8 @@ impl FileTreePanel {
             path: row.path.clone(),
             name: row.name.clone().into(),
         };
-        base.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-            this.click_row(click.clone(), window, cx)
+        base.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            this.click_row(click.clone(), event.click_count(), window, cx)
         }))
         .on_mouse_down(
             MouseButton::Right,

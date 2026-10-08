@@ -65,7 +65,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("up", SelectPreviousMatch, context),
         KeyBinding::new("enter", OpenMatch, context),
         KeyBinding::new("cmd-enter", OpenMatchAndFocus, context),
-        KeyBinding::new("escape", FocusEditor, context),
+        KeyBinding::new("escape", Close, context),
         KeyBinding::new("alt-cmd-c", ToggleCaseSensitive, context),
         KeyBinding::new("alt-cmd-w", ToggleWholeWord, context),
         KeyBinding::new("alt-cmd-r", ToggleRegex, context),
@@ -207,7 +207,9 @@ impl ProjectSearch {
         cx.notify();
     }
 
-    fn close(&mut self, cx: &mut Context<Self>) {
+    /// Esc (в панели или в редакторе, когда там снимать нечего), ×, cmd-shift-f из поля:
+    /// панель скрывается, фокус — в редактор.
+    pub fn close(&mut self, cx: &mut Context<Self>) {
         self.open = false;
         cx.emit(ProjectSearchEvent::FocusEditor);
         cx.notify();

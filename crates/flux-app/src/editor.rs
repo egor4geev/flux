@@ -52,6 +52,7 @@ actions!(
         Backspace,
         Delete,
         DeleteWordBackward,
+        DeleteLine,
         Newline,
         Tab,
         Undo,
@@ -100,6 +101,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-backspace", Backspace, context),
         KeyBinding::new("delete", Delete, context),
         KeyBinding::new("alt-backspace", DeleteWordBackward, context),
+        // Как Delete Line в JetBrains: строка целиком.
+        KeyBinding::new("cmd-backspace", DeleteLine, context),
         KeyBinding::new("enter", Newline, context),
         KeyBinding::new("shift-enter", Newline, context),
         KeyBinding::new("tab", Tab, context),
@@ -322,7 +325,13 @@ impl Editor {
         self.set_selection(Selection::new(ranges, primary), cx);
     }
 
+    /// Esc: несколько курсоров — оставить главный, выделение — снять. Снимать нечего — Esc
+    /// уходит выше: Workspace закроет панель поиска по проекту.
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        let selection = self.document.selection();
+        if selection.len() == 1 && selection.primary().is_empty() {
+            return cx.propagate();
+        }
         let primary = self.document.selection().primary();
         let selection = if self.document.selection().len() > 1 {
             Selection::from_range(primary)
@@ -942,6 +951,9 @@ impl Render for Editor {
             }))
             .on_action(cx.listener(|this, _: &DeleteWordBackward, _, cx| {
                 this.edit(EditKind::Other, cx, edit::delete_word_backward)
+            }))
+            .on_action(cx.listener(|this, _: &DeleteLine, _, cx| {
+                this.edit(EditKind::Other, cx, edit::delete_lines)
             }))
             .on_action(cx.listener(|this, _: &Newline, _, cx| {
                 let ending = this.document.line_ending();

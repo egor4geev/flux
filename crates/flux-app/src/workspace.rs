@@ -1034,6 +1034,21 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 this.add_document(Document::from_text(""), window, cx)
             }))
+            // Esc в редакторе: открытая строка поиска закрывается раньше, чем редактор снимет
+            // выделение; когда снимать нечего (редактор пропускает Esc дальше) — панель поиска
+            // по проекту.
+            .capture_action(cx.listener(|this, _: &editor::Cancel, window, cx| {
+                if this.find_bar.read(cx).is_open() {
+                    this.find_bar.update(cx, |bar, cx| bar.close(window, cx));
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &editor::Cancel, _, cx| {
+                if this.project_search.read(cx).is_open() {
+                    this.project_search
+                        .update(cx, |search, cx| search.close(cx));
+                }
+            }))
             .on_action(cx.listener(|this, _: &editor::Save, _, cx| {
                 if let Some(editor) = this.active_editor() {
                     editor.update(cx, |editor, cx| editor.save(cx).detach());

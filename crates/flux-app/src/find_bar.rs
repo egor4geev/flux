@@ -58,6 +58,8 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-f", Deploy, workspace),
         KeyBinding::new("cmd-alt-f", DeployReplace, workspace),
+        // Как в JetBrains.
+        KeyBinding::new("cmd-r", DeployReplace, workspace),
         KeyBinding::new("cmd-g", FindNext, workspace),
         KeyBinding::new("cmd-shift-g", FindPrevious, workspace),
     ]);
@@ -520,9 +522,9 @@ impl FindBar {
 
     // --- Строка ---
 
-    /// Escape, ×: убрать подсветку и вернуть фокус в редактор (выделение остаётся на
-    /// последнем текущем вхождении).
-    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Escape (в строке или в редакторе), ×: убрать подсветку и вернуть фокус в редактор
+    /// (выделение остаётся на последнем текущем вхождении).
+    pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
         self.cancel_search();
         if let Some(editor) = self.editor() {
