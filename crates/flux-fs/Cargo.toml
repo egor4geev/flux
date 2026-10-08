@@ -1,0 +1,17 @@
+[package]
+name = "flux-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ignore = "0.4.33"
+# Переименование без замены существующего: `renamex_np` (macOS), `renameat2` (Linux).
+libc = "0.2.190"
+# Наблюдение за файлами проекта: на macOS — FSEvents.
+notify = "8.2.0"
+# Удаление в Корзину; на macOS — `NSFileManager trashItemAtURL` (без запроса прав).
+trash = { version = "5.2.9", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

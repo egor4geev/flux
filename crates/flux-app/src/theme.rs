@@ -43,6 +43,10 @@ pub struct UiColors {
     /// Строка списка под мышью и выбранная строка (палитра, поиск файла, результаты поиска).
     pub list_hover: Hsla,
     pub list_selected: Hsla,
+    /// Выбранная строка списка без фокуса: файл активной вкладки в дереве файлов.
+    pub list_selected_inactive: Hsla,
+    /// Каталог, на который сейчас бросят перетаскиваемый файл (дерево файлов).
+    pub drop_target: Hsla,
     /// Совпавшие символы в списках: нечёткий поиск, результаты поиска по проекту.
     pub match_text: Hsla,
     /// Фон найденных вхождений в тексте и текущего из них.
@@ -169,6 +173,8 @@ impl Theme {
                 focus_border: rgb(0x1f6feb).into(),
                 list_hover: rgba(0xb1bac41f).into(),
                 list_selected: rgba(0x388bfd40).into(),
+                list_selected_inactive: rgba(0x6e768140).into(),
+                drop_target: rgba(0x388bfd26).into(),
                 match_text: rgb(0x58a6ff).into(),
                 // Как `editor.findMatch*` в теме GitHub Dark для VS Code.
                 search_match: rgba(0xf2cc6040).into(),

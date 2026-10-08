@@ -105,6 +105,8 @@ pub struct TextInput {
     /// Раскладка прошлого кадра: по ней мышь и IME переводят пиксели в позиции.
     layout: Option<InputLayout>,
     selecting: bool,
+    /// Без внутренних отступов: высота — строка текста и рамка (поле в строке списка).
+    compact: bool,
 }
 
 struct InputLayout {
@@ -126,7 +128,14 @@ impl TextInput {
             scroll_x: px(0.),
             layout: None,
             selecting: false,
+            compact: false,
         }
+    }
+
+    /// Поле высотой в строку списка (правка имени в дереве файлов).
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
     }
 
     pub fn text(&self) -> String {
@@ -155,6 +164,15 @@ impl TextInput {
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
         let end = self.document.text().len_chars();
         self.set_selection(Selection::single(0, end), cx);
+    }
+
+    /// Выделяет символы `range` (курсор — в конце): имя файла без расширения.
+    pub fn select_range(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        let len = self.document.text().len_chars();
+        self.set_selection(
+            Selection::single(range.start.min(len), range.end.min(len)),
+            cx,
+        );
     }
 
     fn set_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
@@ -482,8 +500,8 @@ impl Render for TextInput {
             .key_context("TextInput")
             .track_focus(&self.focus_handle)
             .w_full()
-            .px_2()
-            .py_1()
+            .when(self.compact, |input| input.px_1())
+            .when(!self.compact, |input| input.px_2().py_1())
             .bg(ui.input_background)
             .border_1()
             .border_color(if focused {

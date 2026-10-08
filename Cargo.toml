@@ -9,6 +9,7 @@ license = "MIT"
 
 [workspace.dependencies]
 flux-core = { path = "crates/flux-core" }
+flux-fs = { path = "crates/flux-fs" }
 flux-syntax = { path = "crates/flux-syntax" }
 flux-search = { path = "crates/flux-search" }
 tree-sitter = "0.27.0"
@@ -69,4 +70,10 @@ opt-level = 3
 [profile.dev.package.nucleo]
 opt-level = 3
 [profile.dev.package.nucleo-matcher]
+opt-level = 3
+# Дерево файлов (flux-fs): правила .gitignore при чтении каталога. Без оптимизаций
+# каталог на 10 тыс. файлов читается ~145 мс вместо 13.
+[profile.dev.package.ignore]
+opt-level = 3
+[profile.dev.package.globset]
 opt-level = 3

@@ -1,8 +1,10 @@
 mod command_palette;
+mod context_menu;
 mod display;
 mod editor;
 mod element;
 mod file_finder;
+mod file_tree;
 mod find_bar;
 mod go_to_line;
 mod highlighter;
@@ -45,7 +47,9 @@ fn main() {
         input::init(cx);
         picker::init(cx);
         command_palette::init(cx);
+        context_menu::init(cx);
         file_finder::init(cx);
+        file_tree::init(cx);
         find_bar::init(cx);
         go_to_line::init(cx);
         project_search::init(cx);
@@ -59,6 +63,8 @@ fn main() {
             }),
             ..Default::default()
         };
+        #[cfg(feature = "scenario")]
+        let options = scenario::window_options(options);
         let _window = cx
             .open_window(options, |window, cx| {
                 cx.new(|cx| Workspace::new(root, paths, untitled, window, cx))

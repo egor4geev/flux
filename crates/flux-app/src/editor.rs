@@ -531,14 +531,21 @@ impl Editor {
         })
     }
 
-    /// Привязывает документ к `path` и сохраняет. Со сменой расширения может
-    /// смениться язык — тогда подсветка заводится заново и разбирается в фоне.
+    /// Привязывает документ к `path` и сохраняет.
     pub(crate) fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
+        self.set_path(path, cx);
+        self.save_now(cx)
+    }
+
+    /// Привязывает документ к `path` без записи на диск: «Сохранить как», файл
+    /// переименован или перемещён в дереве файлов. Со сменой расширения может смениться
+    /// язык — тогда подсветка заводится заново и разбирается в фоне.
+    pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.highlighter.set_path(&path, self.document.text()) {
             highlighter::parse(self, ParseMode::Background, cx);
         }
         self.document.set_path(path);
-        self.save_now(cx)
+        cx.notify();
     }
 
     /// Сообщение в статус-баре — до следующей правки или движения курсора.

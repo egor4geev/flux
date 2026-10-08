@@ -17,6 +17,9 @@
 //!
 //! Диалоги выбора файла (Cmd+O, «Сохранить как») — системные панели, автоответчик их
 //! не заменяет. Обвязка со скриншотами — `scripts/ui-scenario.sh`.
+//!
+//! Окно сценария — поверх всех окон ([`window_options`]): перекрытое другим приложением
+//! окно gpui не перерисовывает, и снимки вышли бы устаревшими, пока автор работает рядом.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -26,7 +29,7 @@ use std::time::Duration;
 use gpui::{
     AnyWindowHandle, App, AsyncApp, Context, EventEmitter, FocusHandle, Focusable, Keystroke,
     Modifiers, PromptButton, PromptHandle, PromptLevel, PromptResponse, Render,
-    RenderablePromptHandle, Window, div, prelude::*, rgb,
+    RenderablePromptHandle, Window, WindowKind, WindowOptions, div, prelude::*, rgb,
 };
 
 /// Перед первым шагом: окно открылось, файлы из командной строки прочитаны.
@@ -38,6 +41,18 @@ const SHOT_PAUSE: Duration = Duration::from_millis(1500);
 
 static ANSWERS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
 static PROMPTS: AtomicUsize = AtomicUsize::new(0);
+
+/// С `FLUX_SCENARIO` окно — всплывающая панель поверх всех окон: её не перекроет
+/// приложение, в котором работает автор, и кадры рисуются.
+pub fn window_options(options: WindowOptions) -> WindowOptions {
+    if std::env::var_os("FLUX_SCENARIO").is_none() {
+        return options;
+    }
+    WindowOptions {
+        kind: WindowKind::PopUp,
+        ..options
+    }
+}
 
 pub fn run(window: AnyWindowHandle, cx: &mut App) {
     if let Ok(answers) = std::env::var("FLUX_ANSWERS") {

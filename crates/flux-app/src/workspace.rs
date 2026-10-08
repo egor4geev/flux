@@ -1,10 +1,11 @@
-//! Корневой вид окна: вкладки с документами, открытие файлов, закрытие вкладок и окна,
-//! выход — с вопросами о несохранённых изменениях.
+//! Корневой вид окна: дерево файлов, вкладки с документами, открытие файлов, закрытие
+//! вкладок и окна, выход — с вопросами о несохранённых изменениях.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use flux_core::Document;
+use flux_fs::remap;
 use gpui::{
     Action, AnyView, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, DismissEvent, Entity,
     FocusHandle, Focusable, Global, Hsla, KeyBinding, ManagedView, MouseButton, MouseDownEvent,
@@ -12,7 +13,8 @@ use gpui::{
     Task, WeakEntity, Window, WindowHandle, actions, div, prelude::*, px,
 };
 
-use crate::editor::Editor;
+use crate::editor::{self, Editor};
+use crate::file_tree::{self, FileTreeEvent, FileTreePanel};
 use crate::find_bar::{self, FindBar};
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
 use crate::theme::{self, Theme, UiColors};
@@ -66,6 +68,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextTab, context),
         KeyBinding::new("ctrl-shift-tab", PrevTab, context),
         KeyBinding::new("cmd-9", LastTab, context),
+        // Фокус вне редактора (дерево файлов, поля поиска) — сохраняется активный документ.
+        KeyBinding::new("cmd-s", editor::Save, context),
     ]);
     cx.bind_keys(
         (1..=8).map(|n| KeyBinding::new(&format!("cmd-{n}"), ActivateTab(n - 1), context)),
@@ -106,7 +110,19 @@ pub struct Workspace {
     find_bar: Entity<FindBar>,
     /// Панель поиска по проекту (под текстом).
     project_search: Entity<ProjectSearch>,
+    /// Дерево файлов слева; есть, только когда есть корень проекта.
+    file_tree: Option<TreePanel>,
+    /// Дерево показано (cmd-b).
+    tree_open: bool,
+    /// Файл, последним показанный в дереве: дерево следует за активной вкладкой.
+    revealed: Option<PathBuf>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Дерево файлов и подписка на его события; заводится заново со сменой корня проекта.
+struct TreePanel {
+    panel: Entity<FileTreePanel>,
+    _subscription: Subscription,
 }
 
 struct Tab {
@@ -159,6 +175,7 @@ impl Workspace {
         window.focus(&focus_handle);
         let find_bar = cx.new(|cx| FindBar::new(window, cx));
         let project_search = cx.new(|cx| ProjectSearch::new(root.clone(), window, cx));
+        let file_tree = root.clone().map(|root| Self::build_tree(root, window, cx));
         // Панели открываются и закрываются сами (Esc, ×) — тогда меняется и раскладка окна.
         let subscriptions = vec![
             cx.observe(&find_bar, |_, _, cx| cx.notify()),
@@ -188,6 +205,9 @@ impl Workspace {
             modal: None,
             find_bar,
             project_search,
+            file_tree,
+            tree_open: true,
+            revealed: None,
             _subscriptions: subscriptions,
         };
         if untitled || !paths.is_empty() {
@@ -201,12 +221,15 @@ impl Workspace {
     }
 
     /// Новый корень проекта (cmd-o с каталогом).
-    fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+    fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let root = fs::canonicalize(&root).unwrap_or(root);
         self.project_search
             .update(cx, |search, cx| search.set_root(Some(root.clone()), cx));
+        self.file_tree = Some(Self::build_tree(root.clone(), window, cx));
+        self.revealed = None;
         self.show_message(format!("Project: {}", tilde(&root)).into(), cx);
         self.root = Some(root);
+        self.reveal_active(cx);
         cx.notify();
     }
 
@@ -236,6 +259,7 @@ impl Workspace {
         self.find_bar.update(cx, |bar, cx| {
             bar.set_active_editor(Some(editor), window, cx)
         });
+        self.reveal_active(cx);
         cx.notify();
     }
 
@@ -283,7 +307,11 @@ impl Workspace {
     /// Новая вкладка справа от активной; она и становится активной.
     fn add_document(&mut self, document: Document, window: &mut Window, cx: &mut Context<Self>) {
         let editor = cx.new(|cx| Editor::new(document, window, cx));
-        let observer = cx.observe(&editor, |_, _, cx| cx.notify());
+        // Путь документа меняется при «Сохранить как» — дерево показывает новый файл.
+        let observer = cx.observe(&editor, |this, _, cx| {
+            this.reveal_active(cx);
+            cx.notify()
+        });
         let index = if self.tabs.is_empty() {
             0
         } else {
@@ -339,7 +367,7 @@ impl Workspace {
             this.update_in(cx, |this, window, cx| {
                 let (dirs, files): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| p.is_dir());
                 if let Some(dir) = dirs.into_iter().last() {
-                    this.set_root(dir, cx);
+                    this.set_root(dir, window, cx);
                 }
                 this.open_paths(files, Source::Dialog, window, cx)
             })
@@ -362,22 +390,52 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let previous_focus = window.focused(cx);
-        if self.activate_path(&location.path, window, cx) {
-            return self.reveal(&location, previous_focus.filter(|_| !focus), window, cx);
+        let path = location.path.clone();
+        self.open_and(path, focus, window, cx, move |this, cx| {
+            this.select_location(&location, cx)
+        });
+    }
+
+    /// Открывает файл (или активирует его вкладку). `focus == false` — фокус остаётся там,
+    /// где был (в дереве файлов).
+    pub fn open_file(
+        &mut self,
+        path: PathBuf,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_and(path, focus, window, cx, |_, _| {});
+    }
+
+    /// Открывает или активирует файл, затем `then` с ним в активной вкладке. Без `focus`
+    /// фокус возвращается туда, где был до открытия.
+    fn open_and(
+        &mut self,
+        path: PathBuf,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
+        let keep_focus = window.focused(cx).filter(|_| !focus);
+        if self.activate_path(&path, window, cx) {
+            then(self, cx);
+            return restore_focus(keep_focus, window);
         }
         self.loading += 1;
-        let path = location.path.clone();
-        let read = cx
-            .background_executor()
-            .spawn(async move { read_document(path) });
+        let read = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { read_document(path) }
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = read.await;
             this.update_in(cx, |this, window, cx| {
                 this.loading -= 1;
                 this.finish_open(vec![result], Source::Dialog, window, cx);
-                if this.activate_path(&location.path, window, cx) {
-                    this.reveal(&location, previous_focus.filter(|_| !focus), window, cx);
+                if this.activate_path(&path, window, cx) {
+                    then(this, cx);
+                    restore_focus(keep_focus, window);
                 }
             })
             .ok();
@@ -385,23 +443,14 @@ impl Workspace {
         .detach();
     }
 
-    /// Выделяет место в активном редакторе; `keep_focus` — куда вернуть фокус.
-    fn reveal(
-        &mut self,
-        location: &Location,
-        keep_focus: Option<FocusHandle>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Выделяет место в активном редакторе.
+    fn select_location(&mut self, location: &Location, cx: &mut Context<Self>) {
         if let Some(editor) = self.active_editor() {
             editor.update(cx, |editor, cx| {
                 let start = editor.position(location.line, location.start);
                 let end = editor.position(location.line, location.end);
                 editor.select_range(start..end, cx);
             });
-        }
-        if let Some(focus) = keep_focus {
-            window.focus(&focus);
         }
     }
 
@@ -602,6 +651,143 @@ impl Workspace {
         let editor = self.active_editor();
         self.find_bar
             .update(cx, |bar, cx| bar.deploy(replace, editor, window, cx));
+    }
+
+    // --- Дерево файлов ---
+
+    fn build_tree(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> TreePanel {
+        let panel = cx.new(|cx| FileTreePanel::new(root, window, cx));
+        let subscription = cx.subscribe_in(&panel, window, Self::on_tree_event);
+        TreePanel {
+            panel,
+            _subscription: subscription,
+        }
+    }
+
+    fn on_tree_event(
+        &mut self,
+        _: &Entity<FileTreePanel>,
+        event: &FileTreeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            FileTreeEvent::Open { path, focus } => self.open_file(path.clone(), *focus, window, cx),
+            FileTreeEvent::FocusEditor => self.focus_active(window, cx),
+            FileTreeEvent::Moved { from, to } => self.documents_moved(from, to, cx),
+            FileTreeEvent::Removed { paths } => self.documents_removed(paths, window, cx),
+            FileTreeEvent::Message(message) => self.show_message(message.clone(), cx),
+        }
+    }
+
+    fn tree_panel(&self) -> Option<Entity<FileTreePanel>> {
+        self.file_tree.as_ref().map(|tree| tree.panel.clone())
+    }
+
+    /// Дерево следует за активной вкладкой: её файл раскрыт и выделен. Зовётся при смене
+    /// вкладки и любом изменении редактора — дерево трогаем, только когда сменился файл.
+    fn reveal_active(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.tree_panel().filter(|_| self.tree_open) else {
+            return;
+        };
+        let path = self
+            .active_editor()
+            .and_then(|editor| editor.read(cx).document.path().map(Path::to_path_buf));
+        if path == self.revealed {
+            return;
+        }
+        if let Some(path) = &path {
+            panel.update(cx, |panel, cx| panel.reveal(path, cx));
+        }
+        self.revealed = path;
+    }
+
+    /// cmd-b: показать или скрыть дерево файлов.
+    fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.tree_panel() else {
+            return self.show_message("No project folder — open one with ⌘O".into(), cx);
+        };
+        let focused = panel.focus_handle(cx).contains_focused(window, cx);
+        self.tree_open = !self.tree_open;
+        if !self.tree_open && focused {
+            self.focus_active(window, cx);
+        }
+        self.revealed = None;
+        self.reveal_active(cx);
+        cx.notify();
+    }
+
+    /// cmd-shift-e: фокус в дерево файлов (показав его), из дерева — обратно в редактор.
+    fn toggle_tree_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.tree_panel() else {
+            return self.show_message("No project folder — open one with ⌘O".into(), cx);
+        };
+        let handle = panel.focus_handle(cx);
+        if self.tree_open && handle.contains_focused(window, cx) {
+            return self.focus_active(window, cx);
+        }
+        if !self.tree_open {
+            self.tree_open = true;
+            self.revealed = None;
+            self.reveal_active(cx);
+        }
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    /// Файл или каталог переехал (переименован, перемещён в дереве): открытые документы
+    /// внутри него — на новые пути.
+    fn documents_moved(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+        for editor in self.editors() {
+            let moved = editor
+                .read(cx)
+                .document
+                .path()
+                .and_then(|path| remap(path, from, to));
+            if let Some(path) = moved {
+                editor.update(cx, |editor, cx| editor.set_path(path, cx));
+            }
+        }
+    }
+
+    /// Файлы удалены в Корзину: их вкладки закрываются. Изменённые остаются открытыми —
+    /// правки не теряются, сохранение создаст файл заново.
+    fn documents_removed(
+        &mut self,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Закрытие вкладки активирует соседнюю и уводит в неё фокус, а удаляли из дерева —
+        // фокус должен остаться там (если не был в закрытой вкладке).
+        let mut keep_focus = window.focused(cx);
+        let mut kept = false;
+        for editor in self.editors() {
+            let (removed, modified) = {
+                let document = &editor.read(cx).document;
+                let removed = document
+                    .path()
+                    .is_some_and(|path| paths.iter().any(|removed| path.starts_with(removed)));
+                (removed, document.is_modified())
+            };
+            match (removed, modified) {
+                (true, true) => kept = true,
+                (true, false) => {
+                    if keep_focus.as_ref() == Some(&editor.focus_handle(cx)) {
+                        keep_focus = None;
+                    }
+                    self.remove_tab(&editor, window, cx)
+                }
+                _ => {}
+            }
+        }
+        restore_focus(keep_focus, window);
+        if kept {
+            self.show_message(
+                "Deleted files with unsaved changes stay open — save to restore them".into(),
+                cx,
+            );
+        }
     }
 
     // --- Всплывающие окна ---
@@ -815,7 +1001,7 @@ impl Workspace {
             // Пока читаются файлы из командной строки, подсказку не показываем.
             .when(self.loading == 0, |empty| {
                 empty
-                    .child("⌘P find file · ⌘⇧F search · ⌘O open · ⌘N new")
+                    .child("⌘P find file · ⌘⇧F search · ⌘⇧E files · ⌘O open · ⌘N new")
                     .children(
                         self.root
                             .as_deref()
@@ -847,6 +1033,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open))
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 this.add_document(Document::from_text(""), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &editor::Save, _, cx| {
+                if let Some(editor) = this.active_editor() {
+                    editor.update(cx, |editor, cx| editor.save(cx).detach());
+                }
             }))
             .on_action(cx.listener(Self::close_active_tab))
             .on_action(cx.listener(Self::close_window))
@@ -885,6 +1076,12 @@ impl Render for Workspace {
                 this.find_bar
                     .update(cx, |bar, cx| bar.select_next(true, window, cx))
             }))
+            .on_action(cx.listener(|this, _: &file_tree::ToggleOpen, window, cx| {
+                this.toggle_tree(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &file_tree::ToggleFocus, window, cx| {
+                this.toggle_tree_focus(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &project_search::Toggle, window, cx| {
                 let seed = this
                     .active_editor()
@@ -892,22 +1089,34 @@ impl Render for Workspace {
                 this.project_search
                     .update(cx, |search, cx| search.toggle(seed, window, cx))
             }));
-        // Сверху вниз: вкладки, строка поиска, текст, панель поиска по проекту, статус-бар.
+        // Слева — дерево файлов; справа сверху вниз: вкладки, строка поиска, текст, панель
+        // поиска по проекту. Под ними во всю ширину — статус-бар.
         let active = self.active_editor();
-        let root = match &active {
+        let main = div().flex_1().min_w_0().h_full().flex().flex_col();
+        let main = match &active {
             Some(editor) => {
                 self.retry_tab_scroll(window, cx);
-                root.child(self.render_tab_bar(cx))
-                    .when(self.find_bar.read(cx).is_open(), |root| {
-                        root.child(self.find_bar.clone())
+                main.child(self.render_tab_bar(cx))
+                    .when(self.find_bar.read(cx).is_open(), |main| {
+                        main.child(self.find_bar.clone())
                     })
                     .child(div().flex_1().min_h_0().child(editor.clone()))
             }
-            None => root.child(self.render_empty(ui)),
+            None => main.child(self.render_empty(ui)),
         };
-        root.when(self.project_search.read(cx).is_open(), |root| {
-            root.child(self.project_search.clone())
-        })
+        let main = main.when(self.project_search.read(cx).is_open(), |main| {
+            main.child(self.project_search.clone())
+        });
+        let tree = self.tree_panel().filter(|_| self.tree_open);
+        root.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_row()
+                .children(tree)
+                .child(main),
+        )
         .children(active.map(|editor| editor.read(cx).render_status_bar(ui)))
         .children(self.render_modal(cx))
     }
@@ -1013,6 +1222,13 @@ async fn confirm_windows(windows: Vec<WindowHandle<Workspace>>, cx: &mut AsyncAp
 }
 
 // --- Мелочи ---
+
+/// Возвращает фокус туда, где он был (если был запомнен).
+fn restore_focus(focus: Option<FocusHandle>, window: &mut Window) {
+    if let Some(focus) = focus {
+        window.focus(&focus);
+    }
+}
 
 fn is_modified(editor: &Entity<Editor>, cx: &App) -> bool {
     editor.read(cx).document.is_modified()

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 flux-core.workspace = true
+flux-fs.workspace = true
 grep-matcher = "0.1.9"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"

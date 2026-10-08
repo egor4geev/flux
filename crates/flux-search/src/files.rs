@@ -1,20 +1,17 @@
 //! Файлы проекта: корень по системе контроля версий и обход с учётом `.gitignore`.
-//! Те же правила обхода использует поиск по проекту ([`crate::grep`]).
+//! Правила — общие с деревом файлов (`flux_fs::rules`); их же использует поиск по проекту
+//! ([`crate::grep`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use flux_fs::project_walker;
+use flux_fs::rules::VCS_DIRS;
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
 /// Больше файлов обход не отдаёт (`truncated`): поиск файла по всей домашней папке
 /// не должен съесть память и время.
 pub const MAX_FILES: usize = 100_000;
-
-/// Служебные каталоги систем контроля версий: признак корня проекта; в обход не попадают.
-const VCS_DIRS: [&str; 4] = [".git", ".hg", ".jj", ".svn"];
-
-/// Мусор, который не нужен ни в поиске файла, ни в поиске по проекту.
-const JUNK_FILES: [&str; 1] = [".DS_Store"];
 
 /// Итог обхода.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -80,21 +77,11 @@ pub(crate) fn walk_files_limited(
     }
 }
 
-/// Общие правила обхода для поиска файла и поиска по проекту. `max_file_bytes` —
-/// файлы крупнее пропускаются.
+/// Обход проекта для поиска файла и поиска по проекту — по общим правилам
+/// ([`flux_fs::project_walker`]). `max_file_bytes` — файлы крупнее пропускаются.
 pub(crate) fn walker(root: &Path, max_file_bytes: Option<u64>) -> WalkBuilder {
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(false)
-        .follow_links(false)
-        // Глобальный gitignore применяется относительно корня проекта, а не каталога,
-        // из которого запущен редактор (из Finder это `/`).
-        .current_dir(root)
-        .max_filesize(max_file_bytes)
-        .filter_entry(|entry| {
-            let name = entry.file_name();
-            !VCS_DIRS.iter().chain(&JUNK_FILES).any(|skip| name == *skip)
-        });
+    let mut builder = project_walker(root, root);
+    builder.max_filesize(max_file_bytes);
     builder
 }
 
@@ -228,6 +215,82 @@ pub(crate) mod tests {
         });
         assert!(summary.cancelled);
         assert_eq!(summary.files, 0);
+    }
+
+    /// Не исключённые файлы дерева (`flux_fs::list_dir` по каталогам) — ровно то, что
+    /// находит обход: дерево приглушает то же, чего нет в поиске файла.
+    #[test]
+    fn tree_listing_agrees_with_the_walk() {
+        let dir = tree(&[
+            (".git/HEAD", ""),
+            (".git/info/exclude", "secret.txt\n"),
+            (
+                ".gitignore",
+                "/target\n*.log\nbuild/\n!keep.log\n*.gen\nnode_modules\nlogs/*\n!logs/.gitkeep\ndocs/*.md\n!docs/README.md\n",
+            ),
+            (".ignore", "scratch/\n"),
+            (".github/workflows/ci.yml", ""),
+            (".env.example", ""),
+            ("keep.log", ""),
+            ("debug.log", ""),
+            ("secret.txt", ""),
+            ("target/debug/flux", ""),
+            ("target/.gitignore", "!*\n"),
+            ("src/main.rs", ""),
+            ("src/build/out.o", ""),
+            ("src/deep/er/file.rs", ""),
+            ("src/deep/er/trace.log", ""),
+            ("crates/a/.gitignore", "!wanted.gen\nlocal.txt\n"),
+            ("crates/a/wanted.gen", ""),
+            ("crates/a/other.gen", ""),
+            ("crates/a/local.txt", ""),
+            ("crates/a/node_modules/x/index.js", ""),
+            ("crates/b/local.txt", ""),
+            ("logs/.gitkeep", ""),
+            ("logs/today.txt", ""),
+            ("docs/README.md", ""),
+            ("docs/guide.md", ""),
+            ("docs/img/logo.png", ""),
+            ("scratch/tmp.txt", ""),
+        ]);
+        let root = dir.path();
+        let walked = walk(root);
+        assert_eq!(
+            walked,
+            [
+                ".env.example",
+                ".github/workflows/ci.yml",
+                ".gitignore",
+                ".ignore",
+                "crates/a/.gitignore",
+                "crates/a/wanted.gen",
+                "crates/b/local.txt",
+                "docs/README.md",
+                "docs/img/logo.png",
+                "keep.log",
+                "logs/.gitkeep",
+                "src/deep/er/file.rs",
+                "src/main.rs",
+            ]
+        );
+        let mut listed = Vec::new();
+        list_tree(root, root, false, &mut listed);
+        listed.sort();
+        assert_eq!(listed, walked);
+    }
+
+    /// Файлы дерева, раскрытого целиком, кроме исключённых.
+    fn list_tree(root: &Path, dir: &Path, ignored: bool, files: &mut Vec<String>) {
+        for entry in flux_fs::list_dir(root, dir, ignored).unwrap() {
+            let path = dir.join(&entry.name);
+            match entry.kind {
+                flux_fs::EntryKind::Dir => list_tree(root, &path, entry.ignored, files),
+                flux_fs::EntryKind::File if !entry.ignored => {
+                    files.push(relative(root, &path).to_string_lossy().into_owned())
+                }
+                flux_fs::EntryKind::File => {}
+            }
+        }
     }
 
     #[test]
