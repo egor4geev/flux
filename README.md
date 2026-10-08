@@ -13,7 +13,7 @@
 </div>
 
 <p align="center">
-  <img src="docs/images/editor.png" alt="Flux: the project tree and the editor on a frosted-glass window" width="100%">
+  <img src="docs/images/editor.png" alt="Flux: the project tree, the editor and a split terminal on a frosted-glass window" width="100%">
 </p>
 
 Flux is a code editor that gets out of your way. It opens instantly, stays responsive on huge files
@@ -32,6 +32,9 @@ and keeps everything you need one shortcut away — no setup, no clutter.
 - **Understands your code.** Errors as you type, completion, documentation on hover, go to
   definition, find usages, rename and reformat — with the language servers you already have
   (rust-analyzer, gopls and others), started automatically.
+- **A terminal built in.** Your own shell with its prompt and colours, in a panel under the editor or as
+  a tab next to your files. Split it, search its output, and ⌘-click a `file:line` from a compiler or a
+  test run to jump right there.
 - **Your project at a glance.** A file tree that hides what Git ignores, updates as files change on
   disk and keeps your open tabs in sync when you rename or move files.
 - **Keyboard first.** Every command is in the command palette with its shortcut; familiar keys if
@@ -72,6 +75,7 @@ recent project on the start screen.
 | <kbd>⌘</kbd><kbd>B</kbd> · <kbd>⌥</kbd><kbd>F7</kbd> | Go to definition · find usages |
 | <kbd>⇧</kbd><kbd>F6</kbd> | Rename everywhere |
 | <kbd>⌘</kbd><kbd>1</kbd> | Show or hide the project tree |
+| <kbd>⌥</kbd><kbd>F12</kbd> · <kbd>⌘</kbd><kbd>T</kbd> | Show or hide the terminal · new terminal |
 
 ## Roadmap
 
@@ -80,7 +84,7 @@ recent project on the start screen.
 - [x] Project tree
 - [x] New look
 - [x] Code intelligence: errors, completion, go to definition
-- [ ] Built-in terminal
+- [x] Built-in terminal
 - [ ] Vim mode
 - [ ] Public beta
 

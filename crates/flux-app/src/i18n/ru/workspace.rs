@@ -25,4 +25,15 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Save failed: {0}", "Не удалось сохранить: {0}"),
     ("Plain Text", "Обычный текст"),
     ("{0} (no highlighting)", "{0} (без подсветки)"),
+    // Terminals in the window: closing and quitting with running commands.
+    ("Terminate running processes?", "Завершить запущенные процессы?"),
+    (
+        "“{0}” is still running in a terminal.",
+        "«{0}» ещё работает в терминале.",
+    ),
+    (
+        "{0} are still running in terminals.",
+        "{0} ещё работают в терминалах.",
+    ),
+    ("Terminate", "Завершить"),
 ];

@@ -10,6 +10,9 @@ mod pickers;
 mod search;
 mod settings;
 mod start;
+mod terminal;
+mod terminal_panel;
+mod terminal_search;
 mod tree;
 mod workspace;
 
@@ -27,6 +30,9 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     settings::STRINGS,
     menu::STRINGS,
     completion::STRINGS,
+    terminal::STRINGS,
+    terminal_search::STRINGS,
+    terminal_panel::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов".

@@ -30,6 +30,12 @@ mod settings_view;
 #[cfg(feature = "scenario")]
 mod scenario;
 mod start_screen;
+mod terminal_element;
+mod terminal_group;
+mod terminal_links;
+mod terminal_panel;
+mod terminal_search;
+mod terminal_view;
 mod theme;
 mod ui;
 mod workspace;
@@ -83,6 +89,10 @@ fn main() {
             completion::init(cx);
             hover::init(cx);
             navigation::init(cx);
+            terminal_view::init(cx);
+            terminal_search::init(cx);
+            terminal_group::init(cx);
+            terminal_panel::init(cx);
 
             let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
             // A custom title bar on a glass window frame: the system title bar is transparent, the

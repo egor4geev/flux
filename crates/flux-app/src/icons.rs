@@ -66,6 +66,8 @@ icons! {
     Settings => "settings",
     Sidebar => "sidebar",
     Sparkle => "sparkle",
+    SplitDown => "split-down",
+    SplitRight => "split-right",
     Terminal => "terminal",
     Warning => "warning",
     WholeWord => "whole-word",

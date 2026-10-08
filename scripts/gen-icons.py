@@ -66,6 +66,9 @@ ICONS = {
   "regex": (S, '<path d="M11.25 2.5v6.5M8.4 4.1l5.7 3.3M14.1 4.1 8.4 7.4"/><rect x="2.5" y="10.25" width="3.25" height="3.25" rx=".75" fill="#000" stroke="none"/>'),
   "command": (S, '<path d="M6 6V4.25A1.75 1.75 0 1 0 4.25 6H6zm0 0h4m-4 0v4m4-4V4.25A1.75 1.75 0 1 1 11.75 6H10zm0 0v4m0 0h1.75A1.75 1.75 0 1 1 10 11.75V10zm0 0H6m0 0v1.75A1.75 1.75 0 1 1 4.25 10H6z"/>'),
   "sidebar": (S, '<rect x="1.75" y="2.75" width="12.5" height="10.5" rx="2"/><path d="M6.25 2.75v10.5M3.75 5.5h.5M3.75 7.75h.5"/>'),
+  # Terminal splits: a window halved by a divider, side by side or one above another.
+  "split-right": (S, '<rect x="1.75" y="2.75" width="12.5" height="10.5" rx="2"/><path d="M8 2.75v10.5"/>'),
+  "split-down": (S, '<rect x="1.75" y="2.75" width="12.5" height="10.5" rx="2"/><path d="M1.75 8h12.5"/>'),
   "branch": (S, '<circle cx="4.75" cy="3.75" r="1.5"/><circle cx="4.75" cy="12.25" r="1.5"/><circle cx="11.25" cy="5.75" r="1.5"/><path d="M4.75 5.25v5.5M11.25 7.25c0 2.5-6.5 1.5-6.5 3.5"/>'),
   "clock": (S, '<circle cx="8" cy="8" r="6.25"/><path d="M8 4.75V8l2.25 1.5"/>'),
   "hash": (S, '<path d="M6.5 2.5 5.25 13.5M10.75 2.5 9.5 13.5M2.75 5.75h10.75M2.25 10.25H13"/>'),

@@ -20,6 +20,7 @@ flux-fs.workspace = true
 flux-lsp.workspace = true
 flux-search.workspace = true
 flux-syntax.workspace = true
+flux-term.workspace = true
 # Channels between the background search threads and gpui UI tasks.
 futures = "0.3.34"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }

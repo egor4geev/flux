@@ -13,6 +13,7 @@ flux-fs = { path = "crates/flux-fs" }
 flux-lsp = { path = "crates/flux-lsp" }
 flux-syntax = { path = "crates/flux-syntax" }
 flux-search = { path = "crates/flux-search" }
+flux-term = { path = "crates/flux-term" }
 tree-sitter = "0.27.0"
 tree-sitter-bash = "0.25.1"
 tree-sitter-go = "0.25.0"
@@ -77,4 +78,15 @@ opt-level = 3
 [profile.dev.package.ignore]
 opt-level = 3
 [profile.dev.package.globset]
+opt-level = 3
+# Terminal (flux-term): the VT parser and the grid. In a debug build without optimizations a burst of
+# output (`cat` of a large file, a build log) is parsed several times slower than it arrives.
+# alacritty_terminal's parser, grid, and search are generic over the event listener, so they are
+# compiled into flux-term: it needs the optimizations too (otherwise output is parsed ~4.5× and
+# searched ~6× slower).
+[profile.dev.package.alacritty_terminal]
+opt-level = 3
+[profile.dev.package.vte]
+opt-level = 3
+[profile.dev.package.flux-term]
 opt-level = 3

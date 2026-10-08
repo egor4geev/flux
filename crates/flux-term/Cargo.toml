@@ -1,0 +1,17 @@
+[package]
+name = "flux-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Terminal emulation: the VT parser, the grid with scrollback, selection, regex search, and the PTY
+# with its I/O thread. Without the serde feature: nothing is serialized.
+alacritty_terminal = { version = "0.26.0", default-features = false }
+# The event stream to the UI: awaited by gpui tasks in flux-app, no async runtime.
+futures = "0.3.34"
+# The PTY's foreground process (tcgetpgrp) and its name and directory (libproc on macOS).
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

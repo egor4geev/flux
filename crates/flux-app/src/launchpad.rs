@@ -9,7 +9,7 @@ use crate::icons::IconName;
 use crate::theme::Theme;
 use crate::ui;
 use crate::workspace::Workspace;
-use crate::{file_tree, project_search};
+use crate::{file_tree, project_search, terminal_panel};
 
 /// Width of the strip; the buttons are centered.
 pub const WIDTH: f32 = 40.;
@@ -23,16 +23,19 @@ pub enum Tool {
     Project,
     /// Project search: the "Find in Files" window over the islands.
     FindInFiles,
+    /// Terminals: an island under the editor.
+    Terminal,
 }
 
 impl Tool {
     /// Order in the strip, top to bottom.
-    pub const ALL: [Tool; 2] = [Tool::Project, Tool::FindInFiles];
+    pub const ALL: [Tool; 3] = [Tool::Project, Tool::FindInFiles, Tool::Terminal];
 
     fn icon(self) -> IconName {
         match self {
             Tool::Project => IconName::Project,
             Tool::FindInFiles => IconName::FindInFiles,
+            Tool::Terminal => IconName::Terminal,
         }
     }
 
@@ -40,6 +43,7 @@ impl Tool {
         match self {
             Tool::Project => tr("Project"),
             Tool::FindInFiles => tr("Find in Files"),
+            Tool::Terminal => tr("Terminal"),
         }
     }
 
@@ -48,6 +52,7 @@ impl Tool {
         match self {
             Tool::Project => Box::new(file_tree::ToggleOpen),
             Tool::FindInFiles => Box::new(project_search::Toggle),
+            Tool::Terminal => Box::new(terminal_panel::TogglePanel),
         }
     }
 }

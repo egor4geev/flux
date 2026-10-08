@@ -816,8 +816,9 @@ fn exact_match(matches: &[Range<usize>], from: usize, to: usize) -> Option<usize
         .map(|_| index)
 }
 
-/// "3 of 17", "17 results", "No results"; if not all were found, "100000+".
-fn counter_label(count: usize, active: Option<usize>, truncated: bool) -> String {
+/// "3 of 17", "17 results", "No results"; if not all were found, "100000+". The terminal's search
+/// bar counts the same way.
+pub(crate) fn counter_label(count: usize, active: Option<usize>, truncated: bool) -> String {
     let total = if truncated {
         format!("{count}+")
     } else {
@@ -836,7 +837,7 @@ fn replaced_label(count: usize) -> String {
 }
 
 /// In regular expression mode, the selected text used as the query is searched literally.
-fn escape_regex(text: &str) -> String {
+pub(crate) fn escape_regex(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for c in text.chars() {
         if r"\.+*?()|[]{}^$#&-~".contains(c) {

@@ -31,6 +31,10 @@ pub const SCROLL_MARGIN_LINES: usize = 3;
 /// Cursor blink period; `None` means the cursor does not blink.
 pub const CURSOR_BLINK: Option<Duration> = Some(Duration::from_millis(500));
 
+/// Terminal text: the code font, a little smaller and denser than the editor's.
+pub const TERMINAL_FONT_SIZE: f32 = 13.;
+pub const TERMINAL_LINE_HEIGHT: f32 = 18.;
+
 /// UI font sizes (for the [`UI_FONT`] font).
 pub const TEXT_XS: f32 = 11.;
 pub const TEXT_SM: f32 = 12.;
@@ -156,9 +160,23 @@ pub struct SyntaxStyle {
     pub italic: bool,
 }
 
+/// Terminal colors: the defaults and the 16 ANSI colors programs pick from (`ls`, `git`, prompts).
+/// The 256-color table and true colors are computed, not themed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalColors {
+    pub foreground: Hsla,
+    /// The background programs assume (inverse video, answers to color queries). The terminal
+    /// itself is transparent: cells on the default background show the island.
+    pub background: Hsla,
+    pub cursor: Hsla,
+    /// Black, red, green, yellow, blue, magenta, cyan, white, then the same eight bright.
+    pub ansi: [Hsla; 16],
+}
+
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub ui: UiColors,
+    pub terminal: TerminalColors,
     /// Highlight scopes: names like tree-sitter captures (`keyword`, `function.method`). A general
     /// name covers the specific ones: `function` also applies to `function.method` if the latter
     /// has no entry of its own.
@@ -250,7 +268,20 @@ impl Theme {
         // The shades are tuned for dark glass: similar lightness, different hue.
         const INDIGO: u32 = 0x8590ff;
         const AMBER: u32 = 0xffc560;
+        // The terminal follows GitHub Dark too: its ANSI palette.
+        let ansi = [
+            0x484f58, 0xff7b72, 0x3fb950, 0xd29922, 0x58a6ff, 0xbc8cff, 0x39c5cf, 0xb1bac4,
+            0x6e7681, 0xffa198, 0x56d364, 0xe3b341, 0x79c0ff, 0xd2a8ff, 0x56d4dd, 0xf0f6fc,
+        ]
+        .map(|color| rgb(color).into());
+        let terminal = TerminalColors {
+            foreground: rgb(TEXT).into(),
+            background: rgb(0x0d1018).into(),
+            cursor: rgb(0xaab2ff).into(),
+            ansi,
+        };
         Self {
+            terminal,
             ui: UiColors {
                 frame: rgba(0x07090fc7).into(),
                 frame_glow: rgba(0x8590ff24).into(),

@@ -1,17 +1,19 @@
-//! Root view of the window: the file tree, tabs with documents, opening files, closing tabs and the
-//! window, and quitting, with prompts about unsaved changes.
+//! Root view of the window: the file tree, tabs with documents and terminals, the terminal panel,
+//! opening files, closing tabs and the window, and quitting, with prompts about unsaved changes and
+//! running commands.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use flux_core::Document;
 use flux_fs::remap;
 use gpui::{
-    Action, AnyElement, AnyView, App, AsyncApp, AsyncWindowContext, ClickEvent, Context,
-    DismissEvent, Entity, FocusHandle, Focusable, FontWeight, Global, KeyBinding, ManagedView,
-    MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, PromptLevel,
-    Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window, WindowHandle,
-    actions, anchored, deferred, div, prelude::*, px, relative,
+    Action, AnyElement, AnyView, App, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, Context,
+    DismissEvent, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Global,
+    KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels,
+    Point, PromptLevel, Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity,
+    Window, WindowHandle, actions, anchored, deferred, div, prelude::*, px, relative,
 };
 
 use crate::editor::{self, Editor};
@@ -23,6 +25,9 @@ use crate::launchpad::{self, Tool};
 use crate::lsp::LspStore;
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
 use crate::start_screen::{self, StartScreen};
+use crate::terminal_group::{DraggedTerminal, TerminalGroup, TerminalGroupEvent};
+use crate::terminal_panel::{self, TerminalPanel, TerminalPanelEvent};
+use crate::terminal_view::TerminalLink;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, GAP, RADIUS_MD, RADIUS_SM, STATUS_BAR_HEIGHT, TITLE_BAR_HEIGHT};
 use crate::{command_palette, file_finder, go_to_line, recent};
@@ -43,6 +48,9 @@ const SEARCH_MAX_WIDTH: f32 = 1080.;
 /// In a window narrower than this, the file search bar is not shown in the title bar: it would not
 /// fit between the buttons.
 const TITLE_SEARCH_MIN_WINDOW: f32 = 920.;
+/// How long a status bar message stays while a terminal tab is active (an editor keeps its own until
+/// the next edit).
+const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 
 actions!(
     workspace,
@@ -109,8 +117,8 @@ pub struct Location {
     pub end: usize,
 }
 
-/// Root view of the window: the tabs (one editor per document) and the active one among them, the
-/// search panels, the overlay windows.
+/// Root view of the window: the tabs (one editor per document, terminal tabs moved from the panel)
+/// and the active one among them, the search panels, the terminal panel, the overlay windows.
 pub struct Workspace {
     /// Project root: files (cmd-p) and text (cmd-shift-f) are searched within it.
     root: Option<PathBuf>,
@@ -119,12 +127,19 @@ pub struct Workspace {
     /// Focus handle of the empty window: without it, cmd-o, cmd-n, cmd-w, and cmd-q would not work.
     focus_handle: FocusHandle,
     tab_scroll: ScrollHandle,
+    /// The start screen was in the last drawn frame (see `render_start`).
+    start_drawn: bool,
     /// Unsaved documents are being reviewed: new close requests are ignored.
     closing: bool,
     /// How many batches of files are still being read in the background.
     loading: usize,
     /// Message in the empty window; when tabs are open, messages go to the editor's status bar.
     notice: Option<SharedString>,
+    /// A status bar message while a terminal tab is active; it goes away after a few seconds.
+    status_message: Option<SharedString>,
+    status_message_task: Option<Task<()>>,
+    /// Where a tab dragged over the tab strip would land: the strip shows a marker there.
+    tab_drop: Option<usize>,
     /// The window title and the "has unsaved changes" flag as last set.
     title: String,
     edited: bool,
@@ -149,6 +164,9 @@ pub struct Workspace {
     recent: Vec<PathBuf>,
     /// Language servers of the project; recreated with the root.
     pub(crate) lsp: Entity<LspStore>,
+    /// Terminals: an island under the editor (⌥F12).
+    terminal_panel: Entity<TerminalPanel>,
+    terminal_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -158,10 +176,54 @@ struct TreePanel {
     _subscription: Subscription,
 }
 
+/// A tab of the editor area.
 struct Tab {
+    item: TabItem,
+    /// The tab strip and the window title follow the item: an editor's changes, a terminal tab's
+    /// events.
+    _subscriptions: Vec<Subscription>,
+}
+
+/// What a tab shows: a document, or a terminal tab brought over from the panel.
+#[derive(Clone, PartialEq)]
+enum TabItem {
+    Editor(Entity<Editor>),
+    Terminal(Entity<TerminalGroup>),
+}
+
+impl TabItem {
+    fn editor(&self) -> Option<&Entity<Editor>> {
+        match self {
+            TabItem::Editor(editor) => Some(editor),
+            TabItem::Terminal(_) => None,
+        }
+    }
+
+    fn terminal(&self) -> Option<&Entity<TerminalGroup>> {
+        match self {
+            TabItem::Terminal(group) => Some(group),
+            TabItem::Editor(_) => None,
+        }
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            TabItem::Editor(editor) => editor.focus_handle(cx),
+            TabItem::Terminal(group) => group.focus_handle(cx),
+        }
+    }
+
+    /// Unsaved changes: only a document has them.
+    fn is_modified(&self, cx: &App) -> bool {
+        self.editor().is_some_and(|editor| is_modified(editor, cx))
+    }
+}
+
+/// A file tab being dragged along the tab strip: it is also the label next to the pointer.
+#[derive(Clone)]
+struct DraggedEditorTab {
     editor: Entity<Editor>,
-    /// The tab strip and the window title are redrawn when the editor changes.
-    _observer: Subscription,
+    name: SharedString,
 }
 
 /// Overlay window. It closes by itself (`DismissEvent`: Esc, making a choice), on a click outside
@@ -210,6 +272,7 @@ impl Workspace {
         let project_search = cx.new(|cx| ProjectSearch::new(root.clone(), window, cx));
         let file_tree = root.clone().map(|root| Self::build_tree(root, window, cx));
         let lsp = Self::build_lsp(root.clone(), cx);
+        let terminal_panel = cx.new(|cx| TerminalPanel::new(root.clone(), window, cx));
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
         let subscriptions = vec![
@@ -221,6 +284,8 @@ impl Workspace {
             }),
             cx.observe(&find_bar, |_, _, cx| cx.notify()),
             cx.observe(&project_search, |_, _, cx| cx.notify()),
+            cx.observe(&terminal_panel, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&terminal_panel, window, Self::on_terminal_panel_event),
             cx.subscribe_in(
                 &project_search,
                 window,
@@ -243,9 +308,13 @@ impl Workspace {
             active: 0,
             focus_handle,
             tab_scroll: ScrollHandle::new(),
+            start_drawn: false,
             closing: false,
             loading: 0,
             notice: None,
+            status_message: None,
+            status_message_task: None,
+            tab_drop: None,
             title: String::new(),
             edited: false,
             modal: None,
@@ -258,6 +327,8 @@ impl Workspace {
             branch,
             recent,
             lsp,
+            terminal_panel,
+            terminal_open: false,
             _subscriptions: subscriptions,
         };
         if !paths.is_empty() {
@@ -281,10 +352,12 @@ impl Workspace {
         self.recent = recent::record(&root);
         self.show_message(trf("Project: {0}", &[&tilde(&root)]).into(), cx);
         self.root = Some(root.clone());
+        self.terminal_panel
+            .update(cx, |panel, _| panel.set_root(Some(root.clone())));
         self.lsp = Self::build_lsp(Some(root), cx);
-        for tab in &self.tabs {
+        for editor in self.editors() {
             self.lsp
-                .update(cx, |store, cx| store.register(&tab.editor, cx));
+                .update(cx, |store, cx| store.register(&editor, cx));
         }
         self.reveal_active(cx);
         cx.notify();
@@ -306,40 +379,69 @@ impl Workspace {
         }
     }
 
+    /// The documents in the tabs (terminal tabs aside).
     pub(crate) fn editors(&self) -> Vec<Entity<Editor>> {
-        self.tabs.iter().map(|tab| tab.editor.clone()).collect()
+        self.tabs
+            .iter()
+            .filter_map(|tab| tab.item.editor().cloned())
+            .collect()
     }
 
+    /// The active tab, if it is a document.
     pub(crate) fn active_editor(&self) -> Option<Entity<Editor>> {
-        self.tabs.get(self.active).map(|tab| tab.editor.clone())
+        self.active_item()
+            .and_then(|item| item.editor().cloned())
+    }
+
+    /// The active tab, if it is a terminal tab.
+    fn active_terminal(&self) -> Option<Entity<TerminalGroup>> {
+        self.active_item()
+            .and_then(|item| item.terminal().cloned())
+    }
+
+    fn active_item(&self) -> Option<TabItem> {
+        self.tabs.get(self.active).map(|tab| tab.item.clone())
     }
 
     fn index_of(&self, editor: &Entity<Editor>) -> Option<usize> {
-        self.tabs.iter().position(|tab| tab.editor == *editor)
+        self.tabs
+            .iter()
+            .position(|tab| tab.item.editor() == Some(editor))
+    }
+
+    fn index_of_terminal(&self, group: &Entity<TerminalGroup>) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.item.terminal() == Some(group))
     }
 
     // --- Tabs ---
 
-    /// Makes the tab active and moves focus to its editor.
+    /// Makes the tab active and moves focus into it (its editor, or its terminal).
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
-        let editor = tab.editor.clone();
-        window.focus(&editor.focus_handle(cx));
+        let item = tab.item.clone();
+        window.focus(&item.focus_handle(cx));
         self.active = index;
         self.tab_scroll.scroll_to_item(index);
-        self.find_bar.update(cx, |bar, cx| {
-            bar.set_active_editor(Some(editor), window, cx)
-        });
+        self.status_message = None;
+        if let TabItem::Terminal(group) = &item {
+            group.update(cx, |group, cx| group.clear_bell(cx));
+        }
+        // A terminal tab has no find bar: it searches its output itself.
+        let editor = item.editor().cloned();
+        self.find_bar
+            .update(cx, |bar, cx| bar.set_active_editor(editor, window, cx));
         self.reveal_active(cx);
         cx.notify();
     }
 
-    /// Focuses the active editor, or the window itself when there are no tabs.
+    /// Focuses the active tab, or the window itself when there are no tabs.
     fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.active_editor() {
-            Some(editor) => window.focus(&editor.focus_handle(cx)),
+        match self.active_item() {
+            Some(item) => window.focus(&item.focus_handle(cx)),
             None => window.focus(&self.focus_handle),
         }
     }
@@ -387,28 +489,61 @@ impl Workspace {
             this.reveal_active(cx);
             cx.notify()
         });
-        let index = if self.tabs.is_empty() {
-            0
-        } else {
-            self.active + 1
-        };
+        self.insert_tab(TabItem::Editor(editor), vec![observer], None, window, cx);
+    }
+
+    /// Adds a terminal tab (moved from the panel) at `index`, by default to the right of the
+    /// active tab; it becomes the active tab.
+    fn add_terminal_tab(
+        &mut self,
+        group: Entity<TerminalGroup>,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let subscriptions = vec![
+            cx.subscribe_in(&group, window, Self::on_terminal_tab_event),
+            cx.observe(&group, |_, _, cx| cx.notify()),
+        ];
+        self.insert_tab(TabItem::Terminal(group), subscriptions, index, window, cx);
+    }
+
+    fn insert_tab(
+        &mut self,
+        item: TabItem,
+        subscriptions: Vec<Subscription>,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = index
+            .unwrap_or(if self.tabs.is_empty() { 0 } else { self.active + 1 })
+            .min(self.tabs.len());
         self.tabs.insert(
             index,
             Tab {
-                editor,
-                _observer: observer,
+                item,
+                _subscriptions: subscriptions,
             },
         );
         self.notice = None;
         self.activate(index, window, cx);
     }
 
-    /// Removes a tab. If it was active, focus moves to a neighboring one (the right one; for the
-    /// last tab, the left one); with no tabs left, to the window itself.
+    /// Removes a document's tab.
     fn remove_tab(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.index_of(editor) else {
+        if let Some(index) = self.index_of(editor) {
+            self.remove_tab_at(index, window, cx);
+        }
+    }
+
+    /// Removes the tab at `index` (its item is dropped unless someone else holds it: a terminal tab
+    /// moving to the panel). If it was active, focus moves to a neighboring one (the right one; for
+    /// the last tab, the left one); with no tabs left, to the window itself.
+    fn remove_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
             return;
-        };
+        }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active = 0;
@@ -564,10 +699,12 @@ impl Workspace {
     fn activate_path(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let target = canonical(path);
         let found = self.tabs.iter().position(|tab| {
-            let document = &tab.editor.read(cx).document;
-            document
-                .path()
-                .is_some_and(|path| canonical(path) == target)
+            tab.item.editor().is_some_and(|editor| {
+                let document = &editor.read(cx).document;
+                document
+                    .path()
+                    .is_some_and(|path| canonical(path) == target)
+            })
         });
         if let Some(index) = found {
             self.activate(index, window, cx);
@@ -630,11 +767,27 @@ impl Workspace {
         self.show_message(message.into(), cx);
     }
 
-    /// A message to the user: in the active editor's status bar, or, in an empty window, under the
-    /// hint.
+    /// A message to the user: in the active editor's status bar; under a terminal tab, in the
+    /// window's status bar for a few seconds; in an empty window, under the hint.
     pub(crate) fn show_message(&mut self, message: SharedString, cx: &mut Context<Self>) {
-        match self.active_editor() {
-            Some(editor) => editor.update(cx, |editor, cx| editor.show_status(message, cx)),
+        match self.active_item() {
+            Some(TabItem::Editor(editor)) => {
+                editor.update(cx, |editor, cx| editor.show_status(message, cx))
+            }
+            Some(TabItem::Terminal(_)) => {
+                self.status_message = Some(message);
+                self.status_message_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(STATUS_MESSAGE_DURATION)
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.status_message = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+                cx.notify();
+            }
             None => {
                 self.notice = Some(message);
                 cx.notify();
@@ -645,11 +798,45 @@ impl Workspace {
     // --- Closing ---
 
     fn close_active_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        match self.active_editor() {
-            Some(editor) => self.close_tab(editor, window, cx),
+        match self.active_item() {
+            Some(item) => self.close_item(item, window, cx),
             // In an empty window, cmd-w closes the window itself.
             None => window.remove_window(),
         }
+    }
+
+    /// Closes a tab: a document as [`Self::close_tab`] does, a terminal tab after its terminals'
+    /// running commands are confirmed.
+    fn close_item(&mut self, item: TabItem, window: &mut Window, cx: &mut Context<Self>) {
+        match item {
+            TabItem::Editor(editor) => self.close_tab(editor, window, cx),
+            TabItem::Terminal(group) => self.close_terminal_tab(group, window, cx),
+        }
+    }
+
+    /// Closes a terminal tab (× on the tab, ⌘W with focus outside its terminals); a running command
+    /// is asked about first. Its terminals end with it.
+    fn close_terminal_tab(
+        &mut self,
+        group: Entity<TerminalGroup>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing {
+            return;
+        }
+        let confirm = group.update(cx, |group, cx| group.confirm_close(window, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            if confirm.await {
+                this.update_in(cx, |this, window, cx| {
+                    if let Some(index) = this.index_of_terminal(&group) {
+                        this.remove_tab_at(index, window, cx);
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Closes a tab; a modified one only after the save prompt is answered.
@@ -676,16 +863,18 @@ impl Workspace {
         }
     }
 
-    /// `true` means the window can be closed right away. Otherwise asks about the unsaved documents
-    /// and closes the window itself unless the user cancels.
+    /// `true` means the window can be closed right away. Otherwise asks about the running commands
+    /// and the unsaved documents and closes the window itself unless the user cancels.
     fn request_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.closing {
             return false;
         }
-        if !self.tabs.iter().any(|tab| is_modified(&tab.editor, cx)) {
+        if self.running_processes(cx).is_empty()
+            && !self.tabs.iter().any(|tab| tab.item.is_modified(cx))
+        {
             return true;
         }
-        let confirm = self.confirm(self.editors(), window, cx);
+        let confirm = self.confirm_close_all(window, cx);
         cx.spawn_in(window, async move |_, cx| {
             if confirm.await {
                 cx.update(|window, _| window.remove_window()).ok();
@@ -693,6 +882,60 @@ impl Workspace {
         })
         .detach();
         false
+    }
+
+    /// Before the window closes or the app quits: one question about the commands running in the
+    /// window's terminals (the panel's and the tabs'), then the unsaved documents one by one. `true`
+    /// means everything may go.
+    fn confirm_close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
+        if self.closing {
+            return Task::ready(false);
+        }
+        let editors = self.editors();
+        let Some(detail) = running_processes_detail(&self.running_processes(cx)) else {
+            return self.confirm(editors, window, cx);
+        };
+        self.closing = true;
+        window.activate_window();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            tr("Terminate running processes?"),
+            Some(&detail),
+            &[tr("Terminate"), tr("Cancel")],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let terminate = matches!(answer.await, Ok(0));
+            this.update(cx, |this, _| this.closing = false).ok();
+            if !terminate {
+                return false;
+            }
+            let Ok(confirm) =
+                this.update_in(cx, |this, window, cx| this.confirm(editors, window, cx))
+            else {
+                return false;
+            };
+            confirm.await
+        })
+    }
+
+    /// Names of the commands running in the window's terminals: in the panel and in the tabs.
+    fn running_processes(&self, cx: &App) -> Vec<String> {
+        self.terminal_groups(cx)
+            .iter()
+            .flat_map(|group| group.read(cx).running_processes(cx))
+            .collect()
+    }
+
+    /// All terminal tabs of the window: the panel's, then those in the editor area.
+    fn terminal_groups(&self, cx: &App) -> Vec<Entity<TerminalGroup>> {
+        let mut groups = self.terminal_panel.read(cx).groups();
+        groups.extend(
+            self.tabs
+                .iter()
+                .filter_map(|tab| tab.item.terminal().cloned()),
+        );
+        groups
     }
 
     /// Asks about each modified document in `editors` in turn, showing its tab. `true` means all
@@ -720,8 +963,17 @@ impl Workspace {
         })
     }
 
-    /// cmd-f / cmd-alt-f: the find bar for the active tab.
+    /// cmd-f / cmd-alt-f: the find bar for the active tab. A terminal tab searches its output
+    /// itself (the terminal handles cmd-f when it has focus): focus goes there with the request —
+    /// unless it came from there, unhandled.
     fn deploy_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(group) = self.active_terminal() {
+            if !contains_focus(&group, window, cx) {
+                window.focus(&group.focus_handle(cx));
+                window.dispatch_action(find_bar::Deploy.boxed_clone(), cx);
+            }
+            return;
+        }
         let editor = self.active_editor();
         self.find_bar
             .update(cx, |bar, cx| bar.deploy(replace, editor, window, cx));
@@ -759,6 +1011,7 @@ impl Workspace {
         match tool {
             Tool::Project => self.tree_open && self.file_tree.is_some(),
             Tool::FindInFiles => self.project_search.read(cx).is_open(),
+            Tool::Terminal => self.terminal_open,
         }
     }
 
@@ -873,6 +1126,181 @@ impl Workspace {
         }
     }
 
+    // --- Terminal ---
+
+    /// ⌥F12, as the Terminal tool window in JetBrains IDEs: shows the panel and focuses the
+    /// terminal (starting one in an empty panel); from the terminal, hides the panel.
+    fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_open && self.terminal_panel.read(cx).contains_focus(window, cx) {
+            return self.hide_terminal(window, cx);
+        }
+        self.terminal_open = true;
+        self.terminal_panel
+            .update(cx, |panel, cx| panel.focus(window, cx));
+        cx.notify();
+    }
+
+    /// ⇧Esc in the terminal, or the last terminal closed: the panel hides, focus goes to the editor.
+    fn hide_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = self.terminal_panel.read(cx).contains_focus(window, cx);
+        self.terminal_open = false;
+        if focused || window.focused(cx).is_none() {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// ⌘T: a new terminal tab in the panel.
+    fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_open = true;
+        self.terminal_panel
+            .update(cx, |panel, cx| panel.new_terminal(window, cx));
+        cx.notify();
+    }
+
+    fn on_terminal_panel_event(
+        &mut self,
+        _: &Entity<TerminalPanel>,
+        event: &TerminalPanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TerminalPanelEvent::Empty => self.hide_terminal(window, cx),
+            TerminalPanelEvent::OpenLink(link) => self.open_terminal_link(link, window, cx),
+            TerminalPanelEvent::MoveToPanel { group, index } => {
+                self.move_terminal_to_panel(group.clone(), Some(*index), window, cx)
+            }
+        }
+    }
+
+    /// Events of a terminal tab in the editor area.
+    fn on_terminal_tab_event(
+        &mut self,
+        group: &Entity<TerminalGroup>,
+        event: &TerminalGroupEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            // Its last terminal ended: the tab goes away.
+            TerminalGroupEvent::Empty => {
+                if let Some(index) = self.index_of_terminal(group) {
+                    self.remove_tab_at(index, window, cx);
+                }
+            }
+            TerminalGroupEvent::TitleChanged => cx.notify(),
+            // The tab in front is being looked at: no mark for it.
+            TerminalGroupEvent::Bell => {
+                if self.active_terminal().as_ref() == Some(group) {
+                    group.update(cx, |group, cx| group.clear_bell(cx));
+                }
+                cx.notify();
+            }
+            TerminalGroupEvent::OpenLink(link) => self.open_terminal_link(link, window, cx),
+        }
+    }
+
+    /// A terminal tab moves from the panel to the editor area at `index` (by default, next to the
+    /// active tab) and gets focus. A panel left empty hides.
+    fn move_terminal_to_editor(
+        &mut self,
+        group: Entity<TerminalGroup>,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let removed = self
+            .terminal_panel
+            .update(cx, |panel, cx| panel.remove_group(&group, cx));
+        if !removed {
+            return;
+        }
+        if self.terminal_panel.read(cx).is_empty() {
+            self.terminal_open = false;
+        }
+        self.add_terminal_tab(group, index, window, cx);
+    }
+
+    /// A terminal tab moves from the editor area to the panel at `index` (by default, after the
+    /// panel's active tab); the panel shows and the tab gets focus.
+    fn move_terminal_to_panel(
+        &mut self,
+        group: Entity<TerminalGroup>,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.index_of_terminal(&group) else {
+            return;
+        };
+        self.remove_tab_at(tab, window, cx);
+        self.terminal_open = true;
+        self.terminal_panel
+            .update(cx, |panel, cx| panel.add_group(group, index, window, cx));
+        cx.notify();
+    }
+
+    /// The terminal tab that has focus, in the panel or in the editor area.
+    fn focused_terminal(&self, window: &Window, cx: &App) -> Option<Entity<TerminalGroup>> {
+        self.terminal_groups(cx)
+            .into_iter()
+            .find(|group| contains_focus(group, window, cx))
+    }
+
+    /// "Move to Editor" in the panel: the focused terminal tab, or the panel's active one.
+    fn move_to_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = self.terminal_panel.read(cx);
+        let group = self
+            .focused_terminal(window, cx)
+            .filter(|group| panel.groups().contains(group))
+            .or_else(|| panel.active_group());
+        if let Some(group) = group {
+            self.move_terminal_to_editor(group, None, window, cx);
+        }
+    }
+
+    /// "Move to Panel" in a terminal of the editor area: its tab, or the active tab if it is a
+    /// terminal.
+    fn move_to_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let group = self
+            .focused_terminal(window, cx)
+            .filter(|group| self.index_of_terminal(group).is_some())
+            .or_else(|| self.active_terminal());
+        if let Some(group) = group {
+            self.move_terminal_to_panel(group, None, window, cx);
+        }
+    }
+
+    /// ⌘-click on a link in a terminal: a file opens at its line and column, a directory is shown
+    /// in the tree, a URL opens in the browser.
+    fn open_terminal_link(&mut self, link: &TerminalLink, window: &mut Window, cx: &mut Context<Self>) {
+        match link {
+            TerminalLink::File { path, line, column } => match line {
+                Some(line) => {
+                    let column = column.unwrap_or(1).saturating_sub(1) as usize;
+                    let location = Location {
+                        path: path.clone(),
+                        line: (*line as usize).saturating_sub(1),
+                        start: column,
+                        end: column,
+                    };
+                    self.open_location(location, true, window, cx)
+                }
+                None => self.open_file(path.clone(), true, window, cx),
+            },
+            TerminalLink::Directory(path) => {
+                if let Some(panel) = self.tree_panel() {
+                    self.tree_open = true;
+                    self.revealed = None;
+                    panel.update(cx, |panel, cx| panel.reveal(path, cx));
+                    cx.notify();
+                }
+            }
+            TerminalLink::Url(url) => cx.open_url(url),
+        }
+    }
+
     // --- Overlay windows ---
 
     /// Opens the overlay window `V`; if it is already open, closes it. Any other open window is
@@ -947,10 +1375,9 @@ impl Workspace {
             return;
         };
         if modal.focus_handle.contains_focused(window, cx) || window.focused(cx).is_none() {
-            match (modal.previous_focus, self.active_editor()) {
-                (Some(previous), _) => window.focus(&previous),
-                (None, Some(editor)) => window.focus(&editor.focus_handle(cx)),
-                (None, None) => window.focus(&self.focus_handle),
+            match modal.previous_focus {
+                Some(previous) => window.focus(&previous),
+                None => self.focus_active(window, cx),
             }
         }
         cx.notify();
@@ -1024,27 +1451,28 @@ impl Workspace {
 
     // --- Display ---
 
-    /// The window title "● name — project", derived from the active tab (without a project: "—
-    /// flux"), and a dot on the red button if there are unsaved changes. We call into the platform
-    /// only when something has changed.
+    /// The window title "● name — project", derived from the active tab (a terminal tab: "zsh —
+    /// project"; without a project: "— Flux"), and a dot on the red button if there are unsaved
+    /// changes. We call into the platform only when something has changed.
     fn update_title(&mut self, window: &mut Window, cx: &App) {
         let project = self.root.as_deref().and_then(Path::file_name).map_or_else(
             || "Flux".to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        let title = self.active_editor().map_or_else(
-            || project.clone(),
-            |editor| {
+        let title = match self.active_item() {
+            Some(TabItem::Editor(editor)) => {
                 let document = &editor.read(cx).document;
                 let modified = if document.is_modified() { "● " } else { "" };
                 format!("{modified}{} — {project}", document_name(document))
-            },
-        );
+            }
+            Some(TabItem::Terminal(group)) => format!("{} — {project}", group.read(cx).title(cx)),
+            None => project.clone(),
+        };
         if title != self.title {
             window.set_window_title(&title);
             self.title = title;
         }
-        let edited = self.tabs.iter().any(|tab| is_modified(&tab.editor, cx));
+        let edited = self.tabs.iter().any(|tab| tab.item.is_modified(cx));
         if edited != self.edited {
             window.set_window_edited(edited);
             self.edited = edited;
@@ -1214,11 +1642,15 @@ impl Workspace {
             .gap_3()
             .text_size(px(theme::TEXT_SM))
             .text_color(ui.text_muted);
-        let Some(editor) = self.active_editor() else {
-            return bar.child(div().text_color(ui.dim).child(match &self.root {
-                Some(root) => tilde(root),
-                None => tr("No project — open a folder with ⌘O").into(),
-            }));
+        let editor = match self.active_item() {
+            Some(TabItem::Editor(editor)) => editor,
+            Some(TabItem::Terminal(group)) => return self.terminal_status(bar, &group, cx),
+            None => {
+                return bar.child(div().text_color(ui.dim).child(match &self.root {
+                    Some(root) => tilde(root),
+                    None => tr("No project — open a folder with ⌘O").into(),
+                }));
+            }
         };
         let editor_id = editor.entity_id();
         let editor = editor.read(cx);
@@ -1276,6 +1708,43 @@ impl Workspace {
             .child(item(status.line_ending.to_string()).text_color(ui.dim))
     }
 
+    /// The status bar under a terminal tab: a message for a few seconds, otherwise the active
+    /// terminal's process and directory.
+    fn terminal_status(
+        &self,
+        bar: gpui::Div,
+        group: &Entity<TerminalGroup>,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let ui = Theme::ui(cx);
+        if let Some(message) = &self.status_message {
+            return bar.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .min_w_0()
+                    .text_color(ui.foreground)
+                    .child(icon(IconName::Info, ui.info).size(px(13.)))
+                    .child(div().truncate().child(message.clone())),
+            );
+        }
+        let view = group.read(cx).active_view();
+        let view = view.read(cx);
+        let directory = view.cwd.as_deref().map(tilde);
+        bar.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .child(icon(IconName::Terminal, ui.green).size(px(13.)))
+                .child(div().flex_none().text_color(ui.foreground).child(view.label()))
+                .children(directory.map(|directory| div().truncate().child(directory))),
+        )
+    }
+
     /// Display path: relative to the project root, or with `~` outside it.
     fn display_path(&self, path: &Path) -> String {
         match self
@@ -1290,22 +1759,59 @@ impl Workspace {
 
     fn render_tab_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        let paths: Vec<Option<PathBuf>> = self
-            .tabs
-            .iter()
-            .map(|tab| tab.editor.read(cx).document.path().map(Path::to_path_buf))
-            .collect();
+        let details = self.tab_details(cx);
         let tabs: Vec<_> = self
             .tabs
             .iter()
-            .zip(tab_details(&paths))
+            .zip(details)
             .enumerate()
-            .map(|(index, (tab, detail))| self.render_tab(index, tab, detail, cx))
+            .map(|(index, (tab, detail))| match &tab.item {
+                TabItem::Editor(editor) => self
+                    .render_editor_tab(index, editor, detail, cx)
+                    .into_any_element(),
+                TabItem::Terminal(group) => self
+                    .render_terminal_tab(index, group, detail, cx)
+                    .into_any_element(),
+            })
             .collect();
+        // While a tab is dragged over the strip: a marker where it would land.
+        let marker = self.tab_drop.and_then(|index| {
+            let strip = self.tab_scroll.bounds();
+            let x = match self.tab_scroll.bounds_for_item(index) {
+                Some(tab) => tab.left() - px(3.),
+                None => self.tab_scroll.bounds_for_item(index.checked_sub(1)?)?.right() + px(1.),
+            };
+            Some(
+                div()
+                    .absolute()
+                    .top(px(6.))
+                    .bottom(px(6.))
+                    .left(x - strip.left())
+                    .w(px(2.))
+                    .rounded(px(1.))
+                    .bg(ui.accent),
+            )
+        });
         div()
             .relative()
             .flex_none()
             .h(px(TAB_BAR_HEIGHT))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedTerminal>, _, cx| {
+                    this.drag_over_tabs(event.event.position, event.bounds, cx)
+                }),
+            )
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedEditorTab>, _, cx| {
+                    this.drag_over_tabs(event.event.position, event.bounds, cx)
+                }),
+            )
+            .on_drop(cx.listener(|this, dragged: &DraggedTerminal, window, cx| {
+                this.drop_terminal(dragged.group.clone(), window, cx)
+            }))
+            .on_drop(cx.listener(|this, dragged: &DraggedEditorTab, window, cx| {
+                this.drop_editor_tab(dragged.editor.clone(), window, cx)
+            }))
             // The line under the tabs runs from edge to edge of the island, inset from the rounded
             // corners.
             .child(
@@ -1329,45 +1835,56 @@ impl Workspace {
                     .track_scroll(&self.tab_scroll)
                     .children(tabs),
             )
+            .children(marker)
     }
 
-    fn render_tab(
+    /// The dimmed label after a tab's name: for files with the same name, their directories; for
+    /// terminal tabs with the same process, their working directories.
+    fn tab_details(&self, cx: &App) -> Vec<Option<String>> {
+        let paths: Vec<Option<PathBuf>> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let editor = tab.item.editor()?;
+                editor.read(cx).document.path().map(Path::to_path_buf)
+            })
+            .collect();
+        let terminals: Vec<Option<(SharedString, Option<PathBuf>)>> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let group = tab.item.terminal()?.read(cx);
+                let view = group.active_view();
+                Some((group.title(cx), view.read(cx).cwd.clone()))
+            })
+            .collect();
+        tab_details(&paths)
+            .into_iter()
+            .zip(terminal_details(&terminals))
+            .map(|(file, terminal)| file.or(terminal))
+            .collect()
+    }
+
+    fn render_editor_tab(
         &self,
         index: usize,
-        tab: &Tab,
+        editor: &Entity<Editor>,
         detail: Option<String>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        let document = &tab.editor.read(cx).document;
+        let document = &editor.read(cx).document;
         let active = index == self.active;
-        let (activate, close) = (tab.editor.clone(), tab.editor.clone());
+        let (activate, close) = (editor.clone(), editor.clone());
         let name = document.display_name();
         let title = document_name(document);
         let file = file_icon(&name, &ui);
-        div()
-            .id(("tab", tab.editor.entity_id()))
-            .group("tab")
-            .relative()
-            .flex_none()
-            .h(px(TAB_HEIGHT))
-            .pl_2p5()
-            .pr_1p5()
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded(px(RADIUS_MD))
-            .border_1()
-            .text_color(if active { ui.foreground } else { ui.text_muted })
-            .when(active, |el| {
-                el.bg(ui.pressed)
-                    .border_color(ui.island_border)
-                    .font_weight(FontWeight::MEDIUM)
-            })
-            .when(!active, |el| {
-                el.border_color(gpui::transparent_black())
-                    .hover(|style| style.bg(ui.hover).text_color(ui.foreground))
-            })
+        let dragged = DraggedEditorTab {
+            editor: editor.clone(),
+            name: title.clone().into(),
+        };
+        let dot = document.is_modified().then_some(ui.modified);
+        tab_shell(editor.entity_id(), active, ui)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -1380,18 +1897,122 @@ impl Workspace {
                     this.close_tab(close.clone(), window, cx)
                 }),
             )
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .child(file.render().size(px(14.)))
             .child(label(&title))
             .children(detail.map(|detail| label(&detail).text_color(ui.dim)))
-            .child(close_button(
-                tab.editor.clone(),
-                active,
-                document.is_modified(),
-                cx,
-            ))
+            .child(close_button(TabItem::Editor(editor.clone()), active, dot, cx))
     }
 
-    fn render_start(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A terminal tab: the process of its active terminal, a mark when the bell rang while it was
+    /// in the background.
+    fn render_terminal_tab(
+        &self,
+        index: usize,
+        group: &Entity<TerminalGroup>,
+        detail: Option<String>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        let active = index == self.active;
+        let title = group.read(cx).title(cx);
+        let dot = (!active && group.read(cx).has_bell()).then_some(ui.warning);
+        let (activate, close) = (group.clone(), group.clone());
+        let dragged = DraggedTerminal {
+            group: group.clone(),
+            title: title.clone(),
+        };
+        tab_shell(group.entity_id(), active, ui)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    if let Some(index) = this.index_of_terminal(&activate) {
+                        this.activate(index, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    this.close_terminal_tab(close.clone(), window, cx)
+                }),
+            )
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .child(icon(IconName::Terminal, ui.green).size(px(14.)))
+            .child(label(&title))
+            .children(detail.map(|detail| label(&detail).text_color(ui.dim)))
+            .child(close_button(TabItem::Terminal(group.clone()), active, dot, cx))
+    }
+
+    // --- Dragging tabs ---
+
+    /// A tab is dragged over the tab strip: the marker follows the insertion point; outside the
+    /// strip, it goes away.
+    fn drag_over_tabs(
+        &mut self,
+        position: Point<Pixels>,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let index = bounds.contains(&position).then(|| {
+            let centers: Vec<Pixels> = (0..self.tabs.len())
+                .filter_map(|index| self.tab_scroll.bounds_for_item(index))
+                .map(|tab| tab.center().x)
+                .collect();
+            insertion_index(&centers, position.x)
+        });
+        if index != self.tab_drop {
+            self.tab_drop = index;
+            cx.notify();
+        }
+    }
+
+    /// A terminal tab dropped on the tab strip: one of its own tabs moves along the strip; one from
+    /// the panel joins the tabs where the marker shows.
+    fn drop_terminal(
+        &mut self,
+        group: Entity<TerminalGroup>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        match self.index_of_terminal(&group) {
+            Some(from) => self.move_tab(from, index, window, cx),
+            None => self.move_terminal_to_editor(group, Some(index), window, cx),
+        }
+    }
+
+    fn drop_editor_tab(
+        &mut self,
+        editor: Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        if let Some(from) = self.index_of(&editor) {
+            self.move_tab(from, index, window, cx);
+        }
+    }
+
+    /// Moves a tab to an insertion point (an index between the tabs before the move) and activates
+    /// it.
+    fn move_tab(&mut self, from: usize, to: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let to = moved_index(from, to);
+        let tab = self.tabs.remove(from);
+        let to = to.min(self.tabs.len());
+        self.tabs.insert(to, tab);
+        self.activate(to, window, cx);
+    }
+
+    fn render_start(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Shortcut hints are looked up along the focus path of the last drawn frame. When the start
+        // screen appears (the last tab closed), that frame didn't have it, and the hints would stay
+        // empty until something else redraws the window: draw it once more. Callbacks for the next
+        // frame run before that frame is drawn, so this is scheduled from the drawing itself.
+        if !self.start_drawn {
+            self.start_drawn = true;
+            cx.on_next_frame(window, |_, _, cx| cx.notify());
+        }
         let screen = StartScreen {
             root: self.root.as_deref(),
             branch: self.branch.as_ref().map(|branch| branch.as_ref()),
@@ -1498,6 +2119,19 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &file_tree::ToggleOpen, window, cx| {
                 this.toggle_tree(window, cx)
             }))
+            .on_action(cx.listener(|this, _: &terminal_panel::TogglePanel, window, cx| {
+                this.toggle_terminal(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &terminal_panel::NewTerminal, window, cx| {
+                this.new_terminal(window, cx)
+            }))
+            // ⇧Esc hides the panel only from one of its terminals.
+            .on_action(cx.listener(|this, _: &terminal_panel::HidePanel, window, cx| {
+                if this.terminal_panel.read(cx).contains_focus(window, cx) {
+                    this.hide_terminal(window, cx)
+                }
+            }))
+
             .on_action(cx.listener(|this, _: &file_tree::ToggleFocus, window, cx| {
                 this.toggle_tree_focus(window, cx)
             }))
@@ -1511,32 +2145,90 @@ impl Render for Workspace {
                     .update(cx, |search, cx| search.toggle(seed, window, cx))
             }));
         // The window frame: the title bar, the launchpad and the islands (the tree on the left; on
-        // the right, the tabs, the find bar, and the text or the start screen), the status bar. On
-        // top: project search and overlay windows.
-        let active = self.active_editor();
-        let main = ui::island(ui).flex_1().min_w_0().h_full().flex().flex_col();
-        let main = match &active {
-            Some(editor) => {
+        // the right, the tabs, the find bar, and the text, a terminal tab, or the start screen; under
+        // them, the terminal panel), the status bar. On top: project search and overlay windows.
+        if self.tab_drop.is_some() && !cx.has_active_drag() {
+            self.tab_drop = None;
+        }
+        // The island clips what doesn't fit (the start screen above an open terminal panel);
+        // popups are deferred and escape it.
+        let main = ui::island(ui)
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .flex()
+            .flex_col();
+        // A terminal tab dragged from the panel can be dropped anywhere in the editor area; on the
+        // tab strip, it lands where the marker shows.
+        let drop_terminal = cx.listener(|this, dragged: &DraggedTerminal, window, cx| {
+            // A tab of the editor area dropped back onto it stays where it is.
+            if this.index_of_terminal(&dragged.group).is_none() {
+                this.move_terminal_to_editor(dragged.group.clone(), None, window, cx)
+            }
+        });
+        let body = move |content: AnyElement| {
+            div()
+                .flex_1()
+                .min_h_0()
+                .on_drop(drop_terminal)
+                .child(content)
+        };
+        let main = match self.active_item() {
+            Some(item) => {
+                self.start_drawn = false;
                 self.retry_tab_scroll(window, cx);
+                let content = match &item {
+                    TabItem::Editor(editor) => editor.clone().into_any_element(),
+                    TabItem::Terminal(group) => group.clone().into_any_element(),
+                };
                 main.child(self.render_tab_bar(cx))
-                    .when(self.find_bar.read(cx).is_open(), |main| {
-                        main.child(self.find_bar.clone())
-                    })
-                    .child(
+                    .when(
+                        item.editor().is_some() && self.find_bar.read(cx).is_open(),
+                        |main| main.child(self.find_bar.clone()),
+                    )
+                    .child(body(
                         div()
-                            .flex_1()
-                            .min_h_0()
+                            .size_full()
                             .pt_1p5()
                             .pb_2()
-                            .child(editor.clone()),
-                    )
+                            // Only a terminal of the editor area can move to the panel: the command
+                            // is offered there.
+                            .when(item.terminal().is_some(), |area| {
+                                area.on_action(cx.listener(
+                                    |this, _: &terminal_panel::MoveToPanel, window, cx| {
+                                        this.move_to_panel(window, cx)
+                                    },
+                                ))
+                            })
+                            .child(content)
+                            .into_any_element(),
+                    ))
             }
-            None => main.child(self.render_start(window, cx)),
+            None => main.child(body(self.render_start(window, cx).into_any_element())),
         };
         let tree = self
             .tree_panel()
             .filter(|_| self.tree_open)
             .map(|panel| ui::island(ui).flex_none().h_full().child(panel));
+        // The editor island and, under it, the terminal panel; the tree stays full height. A panel
+        // terminal can move to the editor area: the command is offered inside the panel.
+        let terminal = self.terminal_open.then(|| {
+            ui::island(ui)
+                .flex_none()
+                .on_action(cx.listener(|this, _: &terminal_panel::MoveToEditor, window, cx| {
+                    this.move_to_editor(window, cx)
+                }))
+                .child(self.terminal_panel.clone())
+        });
+        let main = div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap(px(GAP))
+            .child(main)
+            .children(terminal);
         // On the left, the launchpad (the tool strip) on the frame, followed by the islands.
         root.child(ui::frame_glow(ui))
             .child(self.render_title_bar(window, cx))
@@ -1647,7 +2339,7 @@ fn quit(_: &Quit, cx: &mut App) {
 async fn confirm_windows(windows: Vec<WindowHandle<Workspace>>, cx: &mut AsyncApp) -> bool {
     for handle in windows {
         let confirm = handle.update(cx, |workspace, window, cx| {
-            workspace.confirm(workspace.editors(), window, cx)
+            workspace.confirm_close_all(window, cx)
         });
         // The window was closed in the meantime: there is nothing to ask about.
         let Ok(confirm) = confirm else {
@@ -1661,6 +2353,15 @@ async fn confirm_windows(windows: Vec<WindowHandle<Workspace>>, cx: &mut AsyncAp
 }
 
 // --- Miscellaneous ---
+
+/// Whether focus is in one of the terminal tab's terminals.
+fn contains_focus(group: &Entity<TerminalGroup>, window: &Window, cx: &App) -> bool {
+    group
+        .read(cx)
+        .views()
+        .iter()
+        .any(|view| view.focus_handle(cx).contains_focused(window, cx))
+}
 
 /// Restores focus to where it was (if it was remembered).
 fn restore_focus(focus: Option<FocusHandle>, window: &mut Window) {
@@ -1788,11 +2489,39 @@ fn shorten(text: &str, max_chars: usize) -> String {
     short
 }
 
-/// Right edge of a tab: "●" on a modified one, "×" on hover (always on an active unmodified tab).
+/// A tab: a rounded pill, highlighted when active.
+fn tab_shell(id: EntityId, active: bool, ui: UiColors) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(("tab", id))
+        .group("tab")
+        .relative()
+        .flex_none()
+        .h(px(TAB_HEIGHT))
+        .pl_2p5()
+        .pr_1p5()
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded(px(RADIUS_MD))
+        .border_1()
+        .text_color(if active { ui.foreground } else { ui.text_muted })
+        .when(active, |el| {
+            el.bg(ui.pressed)
+                .border_color(ui.island_border)
+                .font_weight(FontWeight::MEDIUM)
+        })
+        .when(!active, |el| {
+            el.border_color(gpui::transparent_black())
+                .hover(|style| style.bg(ui.hover).text_color(ui.foreground))
+        })
+}
+
+/// Right edge of a tab: a dot in `dot`'s color (unsaved changes, a terminal's bell), "×" on hover
+/// (always on an active tab without a dot).
 fn close_button(
-    editor: Entity<Editor>,
+    item: TabItem,
     active: bool,
-    modified: bool,
+    dot: Option<gpui::Hsla>,
     cx: &Context<Workspace>,
 ) -> impl IntoElement {
     let ui = Theme::ui(cx);
@@ -1807,7 +2536,7 @@ fn close_button(
         .rounded(px(ui::RADIUS_XS))
         .text_color(ui.dim)
         .hover(move |style| style.bg(ui.pressed).text_color(ui.foreground))
-        .when(modified || !active, |close| {
+        .when(dot.is_some() || !active, |close| {
             close
                 .invisible()
                 .group_hover("tab", |style| style.visible())
@@ -1815,14 +2544,14 @@ fn close_button(
         // Clicking "×" must not activate the tab.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-            this.close_tab(editor.clone(), window, cx)
+            this.close_item(item.clone(), window, cx)
         }))
         .child(
             icon(IconName::Close, ui.dim)
                 .size(px(12.))
                 .group_hover("tab-close", move |style| style.text_color(ui.foreground)),
         );
-    let dot = modified.then(|| {
+    let dot = dot.map(|color| {
         div()
             .absolute()
             .inset_0()
@@ -1830,7 +2559,7 @@ fn close_button(
             .items_center()
             .justify_center()
             .group_hover("tab", |style| style.invisible())
-            .child(div().size(px(7.)).rounded(px(4.)).bg(ui.modified))
+            .child(div().size(px(7.)).rounded(px(4.)).bg(color))
     });
     div()
         .relative()
@@ -1838,6 +2567,94 @@ fn close_button(
         .size(px(18.))
         .children(dot)
         .child(close)
+}
+
+/// The insertion point for a tab dropped at `x`: the number of tabs whose middle is to its left.
+fn insertion_index(centers: &[Pixels], x: Pixels) -> usize {
+    centers.iter().filter(|center| **center < x).count()
+}
+
+/// Where a tab lands when moved from `from` to the insertion point `to` (counted before the move):
+/// past its own slot, the points shift left by one.
+fn moved_index(from: usize, to: usize) -> usize {
+    if to > from { to - 1 } else { to }
+}
+
+/// Details for terminal tabs (`None` for other tabs): those with the same process name get their
+/// working directory's name, so that "zsh" and "zsh" can be told apart.
+fn terminal_details(terminals: &[Option<(SharedString, Option<PathBuf>)>]) -> Vec<Option<String>> {
+    terminals
+        .iter()
+        .map(|terminal| {
+            let (title, cwd) = terminal.as_ref()?;
+            let namesakes = terminals
+                .iter()
+                .flatten()
+                .filter(|(other, _)| other == title)
+                .count();
+            if namesakes < 2 {
+                return None;
+            }
+            let cwd = cwd.as_deref()?;
+            Some(match cwd.file_name() {
+                Some(_) if tilde(cwd) == "~" => "~".to_string(),
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => cwd.display().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The detail of the "Terminate running processes?" question, naming the commands (each once, with
+/// a count when it runs in several terminals); `None` when nothing is running.
+fn running_processes_detail(names: &[String]) -> Option<String> {
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for name in names {
+        match counted.iter_mut().find(|(seen, _)| seen == name) {
+            Some((_, count)) => *count += 1,
+            None => counted.push((name, 1)),
+        }
+    }
+    match counted.as_slice() {
+        [] => None,
+        [(name, 1)] => Some(trf("“{0}” is still running in a terminal.", &[name])),
+        _ => {
+            let list = counted
+                .iter()
+                .map(|(name, count)| match count {
+                    1 => name.to_string(),
+                    count => format!("{name} ×{count}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(trf("{0} are still running in terminals.", &[&list]))
+        }
+    }
+}
+
+impl Render for DraggedEditorTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        let file = file_icon(&self.name, &ui);
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(TAB_HEIGHT))
+            .pl_2p5()
+            .pr_3()
+            .rounded(px(RADIUS_MD))
+            // Opaque: the label floats over the tabs, and their text must not show through.
+            .bg(UiColors::tint(ui.elevated, 1.))
+            .border_1()
+            .border_color(ui.elevated_border)
+            .shadow(ui::popover_shadow(ui))
+            .font_family(theme::UI_FONT)
+            .text_size(px(theme::TEXT_MD))
+            .text_color(ui.foreground)
+            .child(file.render().size(px(14.)))
+            .child(self.name.clone())
+    }
 }
 
 /// The git branch of a directory: `ref: refs/heads/main` → "main"; a detached HEAD gives the first
@@ -1934,6 +2751,51 @@ mod tests {
             Some("4d7de13")
         );
         assert_eq!(branch_from_head(""), None);
+    }
+
+    #[test]
+    fn dropped_tabs_land_between_the_tabs_under_the_pointer() {
+        let centers = [px(50.), px(150.), px(250.)];
+        assert_eq!(insertion_index(&centers, px(10.)), 0);
+        assert_eq!(insertion_index(&centers, px(120.)), 1);
+        assert_eq!(insertion_index(&centers, px(400.)), 3);
+        // A tab moved to the right skips its own slot; to the left, it lands right there.
+        assert_eq!(moved_index(0, 2), 1);
+        assert_eq!(moved_index(0, 3), 2);
+        assert_eq!(moved_index(2, 0), 0);
+        assert_eq!(moved_index(1, 1), 1);
+    }
+
+    #[test]
+    fn terminal_tabs_with_the_same_process_show_their_directory() {
+        let zsh = |dir: &str| Some((SharedString::from("zsh"), Some(PathBuf::from(dir))));
+        let terminals = vec![
+            zsh("/x/flux"),
+            None,
+            zsh("/x/crates"),
+            Some(("cargo".into(), Some(PathBuf::from("/x/flux")))),
+        ];
+        assert_eq!(
+            terminal_details(&terminals),
+            vec![Some("flux".into()), None, Some("crates".into()), None]
+        );
+    }
+
+    #[test]
+    fn the_quit_question_names_the_running_commands_once() {
+        assert_eq!(running_processes_detail(&[]), None);
+        assert_eq!(
+            running_processes_detail(&["cargo".into()]).as_deref(),
+            Some("“cargo” is still running in a terminal.")
+        );
+        assert_eq!(
+            running_processes_detail(&["cargo".into(), "vim".into(), "cargo".into()]).as_deref(),
+            Some("cargo ×2, vim are still running in terminals.")
+        );
+        assert_eq!(
+            running_processes_detail(&["cargo".into(), "cargo".into()]).as_deref(),
+            Some("cargo ×2 are still running in terminals.")
+        );
     }
 
     #[test]
