@@ -36,7 +36,8 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   a tab next to your files. Split it, search its output, and ⌘-click a `file:line` from a compiler or a
   test run to jump right there.
 - **Your project at a glance.** A file tree that hides what Git ignores, updates as files change on
-  disk and keeps your open tabs in sync when you rename or move files.
+  disk and keeps your open tabs in sync when you rename or move files. Open files pick up changes made
+  outside Flux.
 - **Git, the way JetBrains IDEs do it.** Changed lines marked as you type, with rollback in one click; a
   diff you can edit; a commit window with checkboxes for files and even single changes, amend and
   commit-and-push; push with a preview of what goes. Works with all the repositories in your folder.
@@ -52,6 +53,14 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   <tr>
     <td align="center"><sub><b>Start screen</b></sub></td>
     <td align="center"><sub><b>Find in Files</b></sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/commit.png" alt="The commit window with checkboxes, changed lines in the gutter and the previous text of a change"></td>
+    <td width="50%"><img src="docs/images/diff.png" alt="A side-by-side diff with connectors, changed words and checkboxes for single changes"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Commit window and changed lines</b></sub></td>
+    <td align="center"><sub><b>Diff with checkboxes for single changes</b></sub></td>
   </tr>
 </table>
 
@@ -90,7 +99,9 @@ recent project on the start screen.
 - [x] New look
 - [x] Code intelligence: errors, completion, go to definition
 - [x] Built-in terminal
-- [ ] Git: changes, diff, commit, push · branches, stash, conflicts · history
+- [x] Git: changes, diff, commit and push
+- [ ] Git: branches, stash, conflicts
+- [ ] Git: history and blame
 - [ ] Public beta
 
 ## License
