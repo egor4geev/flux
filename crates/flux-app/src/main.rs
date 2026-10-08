@@ -1,5 +1,7 @@
 mod command_palette;
+mod completion;
 mod context_menu;
+mod diagnostics;
 mod display;
 mod editor;
 mod element;
@@ -8,13 +10,22 @@ mod file_tree;
 mod find_bar;
 mod go_to_line;
 mod highlighter;
+mod hover;
 mod i18n;
 mod icons;
 mod input;
 mod launchpad;
+mod locations;
+mod lsp;
+mod markdown;
+mod navigation;
 mod picker;
+mod popup;
 mod project_search;
 mod recent;
+mod rename;
+mod settings;
+mod settings_view;
 #[cfg(feature = "scenario")]
 mod scenario;
 mod start_screen;
@@ -63,6 +74,13 @@ fn main() {
             find_bar::init(cx);
             go_to_line::init(cx);
             project_search::init(cx);
+            settings::init(cx);
+            settings_view::init(cx);
+            lsp::init(cx);
+            diagnostics::init(cx);
+            completion::init(cx);
+            hover::init(cx);
+            navigation::init(cx);
 
             let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
             // A custom title bar on a glass window frame: the system title bar is transparent, the

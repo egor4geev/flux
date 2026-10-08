@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 flux-core = { path = "crates/flux-core" }
 flux-fs = { path = "crates/flux-fs" }
+flux-lsp = { path = "crates/flux-lsp" }
 flux-syntax = { path = "crates/flux-syntax" }
 flux-search = { path = "crates/flux-search" }
 tree-sitter = "0.27.0"

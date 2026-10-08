@@ -168,6 +168,58 @@ pub fn toggle_button(
         .child(icon(name, ui.accent_text).size(px(15.)))
 }
 
+/// A button with a text label (Update, Delete in Settings): quiet, with a border; `danger` — the
+/// label in the error color.
+pub fn text_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    danger: bool,
+    ui: UiColors,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .h(px(ICON_BUTTON_SIZE))
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .rounded(px(RADIUS_SM))
+        .border_1()
+        .border_color(ui.input_border)
+        .text_size(px(theme::TEXT_SM))
+        .text_color(if danger { ui.error } else { ui.foreground })
+        .cursor_pointer()
+        .hover(move |style| style.bg(ui.hover))
+        .active(move |style| style.bg(ui.pressed))
+        .child(label.into())
+}
+
+/// An on/off switch: a pill with a knob, accent when on.
+pub fn switch(id: impl Into<ElementId>, on: bool, ui: UiColors) -> Stateful<Div> {
+    const WIDTH: f32 = 34.;
+    const HEIGHT: f32 = 20.;
+    const KNOB: f32 = 16.;
+    let inset = (HEIGHT - KNOB) / 2.;
+    div()
+        .id(id)
+        .flex_none()
+        .relative()
+        .w(px(WIDTH))
+        .h(px(HEIGHT))
+        .rounded(px(HEIGHT / 2.))
+        .bg(if on { ui.accent } else { ui.input_border })
+        .cursor_pointer()
+        .child(
+            div()
+                .absolute()
+                .top(px(inset))
+                .left(px(if on { WIDTH - KNOB - inset } else { inset }))
+                .size(px(KNOB))
+                .rounded(px(KNOB / 2.))
+                .bg(ui.foreground),
+        )
+}
+
 fn button_base(id: impl Into<ElementId>, ui: UiColors) -> Stateful<Div> {
     div()
         .id(id)

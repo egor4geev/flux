@@ -191,6 +191,14 @@ pub struct Editor {
     /// Read-only (project search preview): no focus, no edits, and no mouse handling except the
     /// scroll wheel; clicks go to the parent.
     preview: bool,
+    /// The document on its language servers, the main one first; empty without a server.
+    pub(crate) lsp: Vec<crate::lsp::LspDocument>,
+    /// The window's language servers, once Workspace registered the editor: a document that gets a
+    /// path later (Save As, rename) is opened on its server then.
+    pub(crate) lsp_store: Option<gpui::WeakEntity<crate::lsp::LspStore>>,
+    pub(crate) diagnostics: crate::diagnostics::Diagnostics,
+    pub(crate) completion: Option<crate::completion::CompletionMenu>,
+    pub(crate) hover: crate::hover::HoverState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -258,6 +266,11 @@ impl Editor {
             status: None,
             search: SearchHighlights::default(),
             preview,
+            lsp: Vec::new(),
+            lsp_store: None,
+            diagnostics: Default::default(),
+            completion: None,
+            hover: Default::default(),
             _subscriptions: subscriptions,
         };
         // The first parse goes straight to the background, where the highlight query also gets
@@ -294,7 +307,7 @@ impl Editor {
         self.set_selection(selection, cx);
     }
 
-    fn apply(&mut self, tx: Transaction, kind: EditKind, cx: &mut Context<Self>) {
+    pub(crate) fn apply(&mut self, tx: Transaction, kind: EditKind, cx: &mut Context<Self>) {
         if let Some(change) = self.document.apply(tx, kind) {
             self.text_changed(&[change], cx);
         }
@@ -327,7 +340,11 @@ impl Editor {
             if !self.search.matches.is_empty() {
                 self.search.map(&change.changes);
             }
+            self.diagnostics.map(&change.changes);
         }
+        crate::lsp::text_changed(self, changes);
+        crate::completion::text_changed(self, changes);
+        crate::hover::text_changed(self);
         highlighter::parse(self, ParseMode::AfterEdit, cx);
         cx.emit(EditorEvent::Edited);
     }
@@ -576,6 +593,7 @@ impl Editor {
     fn save_now(&mut self, cx: &mut Context<Self>) -> bool {
         let saved = match self.document.save() {
             Ok(()) => {
+                crate::lsp::saved(self);
                 self.status = Some(tr("Saved").into());
                 true
             }
@@ -615,6 +633,7 @@ impl Editor {
             highlighter::parse(self, ParseMode::Background, cx);
         }
         self.document.set_path(path);
+        crate::lsp::path_changed(self, cx);
         cx.notify();
     }
 
@@ -677,6 +696,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        if crate::navigation::cmd_click(self, event, window, cx) {
+            return;
+        }
         let Some(pos) = self.position_for_mouse(event.position) else {
             return;
         };
@@ -709,6 +731,7 @@ impl Editor {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        crate::hover::mouse_moved(self, event, cx);
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
             self.selecting = false;
             return;
@@ -824,7 +847,7 @@ impl EntityInputHandler for Editor {
         &mut self,
         range_utf16: Option<Utf16Range<usize>>,
         new_text: &str,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let kind = if new_text.contains('\n') {
@@ -844,6 +867,7 @@ impl EntityInputHandler for Editor {
         };
         self.marked_range = None;
         self.apply(tx, kind, cx);
+        crate::completion::typed(self, new_text, window, cx);
     }
 
     /// Intermediate IME text (for example, typing CJK characters, or "ё" via long press).
@@ -916,12 +940,18 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use Direction::{Backward, Forward};
         let ui = Theme::ui(cx);
+        // Popups take over some keys while they are shown: the completion menu (↑↓, ↵, ⇥, esc)
+        // and the hover (esc).
+        let mut key_context = gpui::KeyContext::default();
+        key_context.add("Editor");
+        crate::completion::extend_key_context(self, &mut key_context);
+        crate::hover::extend_key_context(self, window, &mut key_context);
+        let root = div().key_context(key_context);
         // The preview doesn't take focus: otherwise a click on it would pull input away from the
         // search field.
-        let root = div().key_context("Editor");
         let root = if self.preview {
             root
         } else {
@@ -1043,6 +1073,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::paste))
             // File
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx).detach()))
+            // Language server features register their own actions.
+            .map(|root| crate::diagnostics::actions(root, cx))
+            .map(|root| crate::completion::actions(root, self, cx))
+            .map(|root| crate::hover::actions(root, self, cx))
             .child(
                 div()
                     .flex_1()
@@ -1060,6 +1094,8 @@ impl Render for Editor {
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
                     .child(EditorElement::new(cx.entity())),
             )
+            .children(crate::completion::render(self, window, cx))
+            .children(crate::hover::render(self, window, cx))
     }
 }
 

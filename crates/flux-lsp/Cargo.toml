@@ -1,0 +1,19 @@
+[package]
+name = "flux-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flux-core.workspace = true
+# Futures for responses and the event stream: awaited by gpui tasks in flux-app, no async runtime.
+futures = "0.3.34"
+lsp-types = "0.97.0"
+# Fast byte search: rope-only line breaks in position conversion, line breaks in deleted text.
+memchr = "2.8.3"
+percent-encoding = "2.3.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

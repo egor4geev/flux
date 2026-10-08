@@ -68,6 +68,7 @@ pub fn render(
         .flex_col()
         .items_center()
         .gap_1p5()
+        .pb(px(ui::GAP))
         .children(Tool::ALL.into_iter().map(|tool| {
             let open = workspace.tool_open(tool, cx);
             let action = tool.action();
@@ -97,4 +98,17 @@ pub fn render(
                     )
                 })
         }))
+        // Settings: at the bottom of the strip, apart from the tools.
+        .child(div().flex_1())
+        .child({
+            let open = crate::settings_view::is_open(workspace);
+            let keys = ui::shortcut_for(&crate::settings_view::Toggle, window);
+            ui::toggle_button("settings", IconName::Settings, open, ui)
+                .size(px(BUTTON_SIZE))
+                .rounded(px(ui::RADIUS_MD))
+                .tooltip(ui::tooltip(tr("Settings"), keys))
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(crate::settings_view::Toggle), cx)
+                })
+        })
 }

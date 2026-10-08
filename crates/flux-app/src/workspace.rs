@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use flux_core::Document;
 use flux_fs::remap;
 use gpui::{
-    Action, AnyView, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, DismissEvent, Entity,
-    FocusHandle, Focusable, FontWeight, Global, KeyBinding, ManagedView, MouseButton,
-    MouseDownEvent, MouseUpEvent, PathPromptOptions, PromptLevel, Render, ScrollHandle,
-    SharedString, Subscription, Task, WeakEntity, Window, WindowHandle, actions, div, prelude::*,
-    px, relative,
+    Action, AnyElement, AnyView, App, AsyncApp, AsyncWindowContext, ClickEvent, Context,
+    DismissEvent, Entity, FocusHandle, Focusable, FontWeight, Global, KeyBinding, ManagedView,
+    MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, PromptLevel,
+    Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window, WindowHandle,
+    actions, anchored, deferred, div, prelude::*, px, relative,
 };
 
 use crate::editor::{self, Editor};
@@ -20,6 +20,7 @@ use crate::find_bar::{self, FindBar};
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
 use crate::launchpad::{self, Tool};
+use crate::lsp::LspStore;
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
 use crate::start_screen::{self, StartScreen};
 use crate::theme::{self, Theme, UiColors};
@@ -57,7 +58,7 @@ actions!(
     ]
 );
 
-/// Go to the tab with the given number (zero-based): cmd-1…cmd-8.
+/// Go to the tab with the given number (zero-based): ctrl-1…ctrl-8.
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = workspace, no_json)]
 pub struct ActivateTab(pub usize);
@@ -87,13 +88,14 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-[", PrevTab, context),
         KeyBinding::new("ctrl-tab", NextTab, context),
         KeyBinding::new("ctrl-shift-tab", PrevTab, context),
-        KeyBinding::new("cmd-9", LastTab, context),
+        KeyBinding::new("ctrl-9", LastTab, context),
         // When focus is outside the editor (file tree, search fields), the active document is
         // saved.
         KeyBinding::new("cmd-s", editor::Save, context),
     ]);
+    // cmd-1 belongs to the file tree (as in JetBrains IDEs), so tabs by number are on ctrl.
     cx.bind_keys(
-        (1..=8).map(|n| KeyBinding::new(&format!("cmd-{n}"), ActivateTab(n - 1), context)),
+        (1..=8).map(|n| KeyBinding::new(&format!("ctrl-{n}"), ActivateTab(n - 1), context)),
     );
 }
 
@@ -128,13 +130,15 @@ pub struct Workspace {
     edited: bool,
     /// Overlay window above the tabs: command palette, file search.
     modal: Option<Modal>,
+    /// Back / Forward along go-to-definition jumps, and the language server request in flight.
+    pub(crate) navigation: crate::navigation::NavState,
     /// The in-document find bar (between the tabs and the text).
     find_bar: Entity<FindBar>,
     /// Project search panel (below the text).
     project_search: Entity<ProjectSearch>,
     /// The file tree on the left; present only when there is a project root.
     file_tree: Option<TreePanel>,
-    /// The tree is shown (cmd-b).
+    /// The tree is shown (cmd-1).
     tree_open: bool,
     /// The file last shown in the tree: the tree follows the active tab.
     revealed: Option<PathBuf>,
@@ -143,6 +147,8 @@ pub struct Workspace {
     branch: Option<SharedString>,
     /// Recent projects for the start screen, most recent first.
     recent: Vec<PathBuf>,
+    /// Language servers of the project; recreated with the root.
+    pub(crate) lsp: Entity<LspStore>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -165,6 +171,8 @@ struct Modal {
     view: AnyView,
     focus_handle: FocusHandle,
     previous_focus: Option<FocusHandle>,
+    /// Shown at this window point (rename, under its symbol) instead of the top center.
+    anchor: Option<Point<Pixels>>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -201,6 +209,7 @@ impl Workspace {
         let find_bar = cx.new(|cx| FindBar::new(window, cx));
         let project_search = cx.new(|cx| ProjectSearch::new(root.clone(), window, cx));
         let file_tree = root.clone().map(|root| Self::build_tree(root, window, cx));
+        let lsp = Self::build_lsp(root.clone(), cx);
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
         let subscriptions = vec![
@@ -240,6 +249,7 @@ impl Workspace {
             title: String::new(),
             edited: false,
             modal: None,
+            navigation: Default::default(),
             find_bar,
             project_search,
             file_tree,
@@ -247,6 +257,7 @@ impl Workspace {
             revealed: None,
             branch,
             recent,
+            lsp,
             _subscriptions: subscriptions,
         };
         if !paths.is_empty() {
@@ -269,9 +280,21 @@ impl Workspace {
         self.branch = read_branch(&root);
         self.recent = recent::record(&root);
         self.show_message(trf("Project: {0}", &[&tilde(&root)]).into(), cx);
-        self.root = Some(root);
+        self.root = Some(root.clone());
+        self.lsp = Self::build_lsp(Some(root), cx);
+        for tab in &self.tabs {
+            self.lsp
+                .update(cx, |store, cx| store.register(&tab.editor, cx));
+        }
         self.reveal_active(cx);
         cx.notify();
+    }
+
+    /// Language servers for a project root; the status bar follows their status.
+    fn build_lsp(root: Option<PathBuf>, cx: &mut Context<Self>) -> Entity<LspStore> {
+        let lsp = cx.new(|cx| LspStore::new(root, cx));
+        cx.observe(&lsp, |_, _, cx| cx.notify()).detach();
+        lsp
     }
 
     /// Re-reads the git branch (`.git/HEAD`); redraws only if it changed.
@@ -283,7 +306,7 @@ impl Workspace {
         }
     }
 
-    fn editors(&self) -> Vec<Entity<Editor>> {
+    pub(crate) fn editors(&self) -> Vec<Entity<Editor>> {
         self.tabs.iter().map(|tab| tab.editor.clone()).collect()
     }
 
@@ -357,6 +380,8 @@ impl Workspace {
     /// Adds a new tab to the right of the active one; it becomes the active tab.
     fn add_document(&mut self, document: Document, window: &mut Window, cx: &mut Context<Self>) {
         let editor = cx.new(|cx| Editor::new(document, window, cx));
+        self.lsp
+            .update(cx, |store, cx| store.register(&editor, cx));
         // A document's path changes on "Save As": the tree then shows the new file.
         let observer = cx.observe(&editor, |this, _, cx| {
             this.reveal_active(cx);
@@ -460,7 +485,7 @@ impl Workspace {
 
     /// Opens or activates a file, then calls `then` with it in the active tab. Without `focus`,
     /// focus returns to where it was before opening.
-    fn open_and(
+    pub(crate) fn open_and(
         &mut self,
         path: PathBuf,
         focus: bool,
@@ -759,7 +784,7 @@ impl Workspace {
         self.revealed = path;
     }
 
-    /// cmd-b: show or hide the file tree.
+    /// cmd-1: show or hide the file tree.
     fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.tree_panel() else {
             return self.show_message(tr("No project folder — open one with ⌘O").into(), cx);
@@ -894,9 +919,25 @@ impl Workspace {
             view: view.into(),
             focus_handle,
             previous_focus,
+            anchor: None,
             _subscriptions: subscriptions,
         });
         cx.notify();
+    }
+
+    /// The open overlay window is a `V` (the launchpad highlights the gear for Settings).
+    pub(crate) fn modal_is<V: 'static>(&self) -> bool {
+        self.modal
+            .as_ref()
+            .is_some_and(|modal| modal.view.clone().downcast::<V>().is_ok())
+    }
+
+    /// Shows the open overlay window at a window point instead of the top center: a popover at the
+    /// text it is about (rename). It stays within the window.
+    pub fn anchor_modal(&mut self, anchor: Point<Pixels>) {
+        if let Some(modal) = &mut self.modal {
+            modal.anchor = Some(anchor);
+        }
     }
 
     /// Closes the overlay window. Focus returns to its previous place only if it was inside the
@@ -915,24 +956,30 @@ impl Workspace {
         cx.notify();
     }
 
-    fn render_modal(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+    fn render_modal(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let modal = self.modal.as_ref()?;
-        Some(
-            div()
+        let view = div()
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)))
+            .child(modal.view.clone());
+        Some(match modal.anchor {
+            Some(anchor) => deferred(
+                anchored()
+                    .position(anchor)
+                    .snap_to_window_with_margin(px(ui::GAP))
+                    .child(view),
+            )
+            .with_priority(1)
+            .into_any_element(),
+            None => div()
                 .absolute()
                 .top(px(MODAL_TOP))
                 .left_0()
                 .right_0()
                 .flex()
                 .justify_center()
-                .child(
-                    div()
-                        .on_mouse_down_out(
-                            cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)),
-                        )
-                        .child(modal.view.clone()),
-                ),
-        )
+                .child(view)
+                .into_any_element(),
+        })
     }
 
     /// Project search is a window over the islands; a click outside closes it.
@@ -1173,6 +1220,7 @@ impl Workspace {
                 None => tr("No project — open a folder with ⌘O").into(),
             }));
         };
+        let editor_id = editor.entity_id();
         let editor = editor.read(cx);
         let status = editor.status_info();
         let path = editor.document.path();
@@ -1223,6 +1271,8 @@ impl Workspace {
                     .child(div().size(px(6.)).rounded(px(3.)).bg(file.color))
                     .child(item(status.language)),
             )
+            .children(crate::diagnostics::status_item(editor, ui))
+            .children(crate::lsp::status_item(self.lsp.read(cx), Some(editor_id), ui))
             .child(item(status.line_ending.to_string()).text_color(ui.dim))
     }
 
@@ -1372,6 +1422,12 @@ impl Render for Workspace {
             .font_family(theme::UI_FONT)
             .text_size(px(theme::TEXT_MD))
             .on_action(cx.listener(Self::open))
+            // Language server navigation and refactoring.
+            .map(|root| crate::navigation::actions(root, cx))
+            .on_action(cx.listener(|this, _: &crate::settings_view::Toggle, window, cx| {
+                crate::settings_view::toggle(this, window, cx)
+            }))
+            .map(|root| crate::lsp::workspace_actions(root, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
                 // A directory from the recent list may have disappeared since launch.
                 if !action.0.is_dir() {

@@ -17,11 +17,14 @@ scenario = []
 anyhow = "1.0.104"
 flux-core.workspace = true
 flux-fs.workspace = true
+flux-lsp.workspace = true
 flux-search.workspace = true
 flux-syntax.workspace = true
 # Channels between the background search threads and gpui UI tasks.
 futures = "0.3.34"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+# Settings file (`settings.json`).
+serde_json = "1"
 
 # The UI language follows the system's preferred languages (CFLocaleCopyPreferredLanguages).
 [target.'cfg(target_os = "macos")'.dependencies]

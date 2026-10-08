@@ -1,4 +1,4 @@
-//! Project file tree: a panel to the left of the text (⌘B shows/hides it, ⇧⌘E focuses it).
+//! Project file tree: a panel to the left of the text (⌘1 shows/hides it, ⇧⌘E focuses it).
 //!
 //! State lives in `flux_fs::tree::FileTree`: which directories have been read and which are
 //! expanded. Directories are read only in the background (`flux_fs::list_dir`): the root when the
@@ -113,7 +113,8 @@ actions!(
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("cmd-b", ToggleOpen, Some("Workspace")),
+        // As the Project tool window in JetBrains IDEs; cmd-b goes to a definition.
+        KeyBinding::new("cmd-1", ToggleOpen, Some("Workspace")),
         KeyBinding::new("cmd-shift-e", ToggleFocus, Some("Workspace")),
     ]);
     // While a name is being edited, the tree's keys are inactive: arrow keys, Space, ⌫ and ⌘C/⌘V
@@ -134,6 +135,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-n", NewFile, tree),
         KeyBinding::new("alt-cmd-n", NewFolder, tree),
         KeyBinding::new("f2", Rename, tree),
+        // Rename as in JetBrains IDEs.
+        KeyBinding::new("shift-f6", Rename, tree),
         KeyBinding::new("cmd-d", Duplicate, tree),
         // The primary binding goes first: the context menu and the palette show it.
         KeyBinding::new("cmd-backspace", MoveToTrash, tree),

@@ -29,6 +29,9 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   Colour is used for meaning: every file type has its own icon.
 - **Find anything.** Jump to a file by a few letters, search the whole project with a live preview,
   find and replace inside a file.
+- **Understands your code.** Errors as you type, completion, documentation on hover, go to
+  definition, find usages, rename and reformat — with the language servers you already have
+  (rust-analyzer, gopls and others), started automatically.
 - **Your project at a glance.** A file tree that hides what Git ignores, updates as files change on
   disk and keeps your open tabs in sync when you rename or move files.
 - **Keyboard first.** Every command is in the command palette with its shortcut; familiar keys if
@@ -66,7 +69,9 @@ recent project on the start screen.
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>F</kbd> | Find in Files |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>P</kbd> | All commands |
 | <kbd>⌘</kbd><kbd>F</kbd> · <kbd>⌘</kbd><kbd>R</kbd> | Find · replace in a file |
-| <kbd>⌘</kbd><kbd>B</kbd> | Show or hide the project tree |
+| <kbd>⌘</kbd><kbd>B</kbd> · <kbd>⌥</kbd><kbd>F7</kbd> | Go to definition · find usages |
+| <kbd>⇧</kbd><kbd>F6</kbd> | Rename everywhere |
+| <kbd>⌘</kbd><kbd>1</kbd> | Show or hide the project tree |
 
 ## Roadmap
 
@@ -74,7 +79,7 @@ recent project on the start screen.
 - [x] Search and navigation
 - [x] Project tree
 - [x] New look
-- [ ] Code intelligence: errors, completion, go to definition
+- [x] Code intelligence: errors, completion, go to definition
 - [ ] Built-in terminal
 - [ ] Vim mode
 - [ ] Public beta

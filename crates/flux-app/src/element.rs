@@ -113,6 +113,8 @@ pub struct PrepaintState {
     /// area.
     highlights: Vec<PaintQuad>,
     cursors: Vec<PaintQuad>,
+    /// Language server diagnostics: underlines and line number colors.
+    diagnostics: crate::diagnostics::DiagnosticsPaint,
 }
 
 impl IntoElement for EditorElement {
@@ -369,13 +371,16 @@ impl Element for EditorElement {
             })
             .collect();
 
+        let diagnostics =
+            crate::diagnostics::prepaint(&editor.diagnostics, &text, &layout, last_line, em, &ui);
+
         let gutter = (first_line..last_line)
             .map(|line| {
                 let number = (line + 1).to_string();
-                let color = if line == head_line {
-                    ui.foreground
-                } else {
-                    ui.dim
+                let color = match diagnostics.number_color(line) {
+                    Some(color) => color,
+                    None if line == head_line => ui.foreground,
+                    None => ui.dim,
                 };
                 let runs = [run(number.len(), color)];
                 let shaped = text_system.shape_line(number.into(), font_size, &runs, None);
@@ -395,6 +400,7 @@ impl Element for EditorElement {
             current_line,
             highlights,
             cursors,
+            diagnostics,
         }
     }
 
@@ -442,6 +448,7 @@ impl Element for EditorElement {
                 let origin = point(layout.origin.x, layout.line_top(layout.first_line + i));
                 line.shaped.paint(origin, line_height, window, cx).ok();
             }
+            state.diagnostics.paint_underlines(window);
             if show_cursors {
                 for cursor in state.cursors.drain(..) {
                     window.paint_quad(cursor);

@@ -2,8 +2,12 @@
 
 mod commands;
 mod common;
+mod completion;
+mod lsp;
+mod navigation;
 mod pickers;
 mod search;
+mod settings;
 mod start;
 mod tree;
 mod workspace;
@@ -17,6 +21,10 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     search::STRINGS,
     pickers::STRINGS,
     commands::STRINGS,
+    lsp::STRINGS,
+    navigation::STRINGS,
+    settings::STRINGS,
+    completion::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов".
