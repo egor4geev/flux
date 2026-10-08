@@ -25,32 +25,48 @@ use flux_fs::{
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, CursorStyle, DismissEvent, DragMoveEvent,
-    Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton, MouseDownEvent, Pixels,
-    Point, PromptLevel, Render, ScrollStrategy, SharedString, Subscription, Task,
-    UniformListScrollHandle, Window, actions, deferred, div, prelude::*, px, uniform_list,
+    Action, AnyElement, App, ClickEvent, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
+    DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton,
+    MouseDownEvent, Pixels, Point, PromptLevel, Render, ScrollStrategy, SharedString, Stateful,
+    Subscription, Task, UniformListScrollHandle, Window, actions, deferred, div, prelude::*, px,
+    relative, uniform_list,
 };
 
 use crate::context_menu::ContextMenu;
+use crate::icons::{FileIcon, ICON_SIZE, IconName, file_icon, folder_icon, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::theme::{self, Theme, UiColors};
+use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 use crate::workspace::tilde;
 
 /// Ширина панели по умолчанию и пределы, в которых её тянут мышью.
-pub const DEFAULT_WIDTH: f32 = 240.;
-const MIN_WIDTH: f32 = 160.;
+pub const DEFAULT_WIDTH: f32 = 260.;
+const MIN_WIDTH: f32 = 180.;
 const MAX_WIDTH: f32 = 600.;
-const ROW_HEIGHT: f32 = 22.;
-const HEADER_HEIGHT: f32 = 28.;
-/// Отступ на уровень вложенности и слева от строк.
-const INDENT: f32 = 12.;
-const ROW_PADDING: f32 = 8.;
-/// Колонка под ▸/▾: у файлов она пустая — имена выровнены.
-const CHEVRON_WIDTH: f32 = 14.;
+const ROW_HEIGHT: f32 = 26.;
+/// Шапка: подпись проекта и кнопки-значки.
+const HEADER_HEIGHT: f32 = 40.;
+/// Строки отступают от краёв острова; подсветка — скруглённая плашка внутри строки.
+const ROW_INSET: f32 = 6.;
+/// Отступ плашки слева и на уровень вложенности.
+const ROW_PADDING: f32 = 6.;
+const INDENT: f32 = 14.;
+/// Колонка шеврона: у файлов она пустая — значки и имена выровнены с каталогами. Направляющая
+/// вложенности идёт по её середине.
+const CHEVRON_WIDTH: f32 = 16.;
+const CHEVRON_SIZE: f32 = 12.;
+/// Зазоры: шеврон — значок, значок — имя.
+const ICON_GAP: f32 = 2.;
+const NAME_GAP: f32 = 6.;
 const TEXT_SIZE: f32 = 13.;
-const HEADER_TEXT_SIZE: f32 = 11.;
-/// Полоса у правого края, за которую тянут ширину.
-const RESIZE_HANDLE_WIDTH: f32 = 6.;
+/// Непрозрачность значка у приглушённой строки (исключённое .gitignore, вырезанное).
+const MUTED_ICON_ALPHA: f32 = 0.45;
+/// Ручка ширины занимает зазор между островами справа от панели: от рамки острова (1 px) на
+/// ширину зазора. Её середина — на столько правее края панели.
+const RESIZE_HANDLE_WIDTH: f32 = ui::GAP;
+const RESIZE_HANDLE_OFFSET: f32 = 1. + RESIZE_HANDLE_WIDTH / 2.;
+/// Группа наведения строки: подсветка плашки, когда мышь над строкой с её отступами.
+const ROW_GROUP: &str = "file-tree-row";
 /// Склейка событий наблюдателя: после первого ждём, пока придут остальные.
 const WATCH_DELAY: Duration = Duration::from_millis(80);
 /// PageUp/PageDown, пока высота списка неизвестна.
@@ -191,11 +207,12 @@ struct Menu {
     _subscriptions: [Subscription; 2],
 }
 
-/// Перетаскиваемая строка; она же — подпись у курсора.
+/// Перетаскиваемая строка; она же — подпись у курсора (значок и имя).
 #[derive(Debug, Clone)]
 struct DraggedEntry {
     path: PathBuf,
     name: SharedString,
+    is_dir: bool,
 }
 
 /// Перетаскивание правого края панели.
@@ -223,6 +240,8 @@ pub struct FileTreePanel {
     menu: Option<Menu>,
     /// Куда бросят перетаскиваемую строку: каталог под курсором.
     drop_target: Option<PathBuf>,
+    /// Тянут ширину: ручка подсвечена, пока идёт перетаскивание.
+    resizing: bool,
     _watcher: Option<Watcher>,
     _watch_task: Task<()>,
 }
@@ -249,6 +268,7 @@ impl FileTreePanel {
             clipboard: None,
             menu: None,
             drop_target: None,
+            resizing: false,
             _watcher: None,
             _watch_task: watch_task,
         };
@@ -1090,7 +1110,7 @@ impl FileTreePanel {
             None => (0., 0),
         };
         let position = gpui::point(
-            bounds.left() + px(ROW_PADDING + CHEVRON_WIDTH + depth as f32 * INDENT),
+            bounds.left() + px(name_offset(depth)),
             bounds.top() + offset.y + px(top * ROW_HEIGHT),
         );
         self.secondary_click(self.selected.clone(), position, window, cx);
@@ -1149,7 +1169,8 @@ impl FileTreePanel {
 
     // --- Отображение ---
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// Шапка: подпись проекта и кнопки «новый файл», «новая папка», «свернуть всё».
+    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let name = self.root.file_name().map_or_else(
             || tilde(&self.root),
@@ -1158,59 +1179,64 @@ impl FileTreePanel {
         let dropping_root = self.drop_target.as_ref() == Some(&self.root);
         div()
             .id("file-tree-header")
-            .group("file-tree-header")
+            .relative()
             .flex_none()
             .h(px(HEADER_HEIGHT))
-            .pl(px(ROW_PADDING + 4.))
-            .pr_2()
+            .pl(px(ROW_INSET + ROW_PADDING + 2.))
+            .pr(px(ROW_INSET))
             .flex()
             .items_center()
-            .gap_1()
-            .when(dropping_root, |header| header.bg(ui.drop_target))
+            .gap_0p5()
+            .when(dropping_root, |header| {
+                header.child(drop_overlay(ui).top(px(ROW_INSET)).bottom(px(2.)))
+            })
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     this.secondary_click(None, event.position, window, cx)
                 }),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(HEADER_TEXT_SIZE))
-                    .text_color(ui.dim)
-                    .child(name.to_uppercase()),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .gap_0p5()
-                    .invisible()
-                    .group_hover("file-tree-header", |style| style.visible())
-                    .child(header_button(
-                        "new-file",
-                        "+ File",
-                        ui,
-                        cx,
-                        |this, window, cx| this.new_entry(EntryKind::File, window, cx),
-                    ))
-                    .child(header_button(
-                        "new-folder",
-                        "+ Folder",
-                        ui,
-                        cx,
-                        |this, window, cx| this.new_entry(EntryKind::Dir, window, cx),
-                    ))
-                    .child(header_button(
-                        "collapse-all",
-                        "⊟",
-                        ui,
-                        cx,
-                        |this, window, cx| this.collapse_all(&CollapseAll, window, cx),
-                    )),
-            )
+            .child(ui::section_label(name, ui).flex_1().min_w_0().truncate())
+            .child(self.header_button(
+                ("new-file", IconName::FilePlus, "New File"),
+                &NewFile,
+                window,
+                cx,
+                |this, window, cx| this.new_entry(EntryKind::File, window, cx),
+            ))
+            .child(self.header_button(
+                ("new-folder", IconName::FolderPlus, "New Folder"),
+                &NewFolder,
+                window,
+                cx,
+                |this, window, cx| this.new_entry(EntryKind::Dir, window, cx),
+            ))
+            .child(self.header_button(
+                ("collapse-all", IconName::CollapseAll, "Collapse All"),
+                &CollapseAll,
+                window,
+                cx,
+                |this, window, cx| this.collapse_all(&CollapseAll, window, cx),
+            ))
+    }
+
+    /// Кнопка шапки: подсказка с сочетанием из keymap дерева; щелчок — фокус в дерево и действие.
+    fn header_button(
+        &self,
+        (id, name, label): (&'static str, IconName, &'static str),
+        action: &dyn Action,
+        window: &Window,
+        cx: &mut Context<Self>,
+        run: fn(&mut Self, &mut Window, &mut Context<Self>),
+    ) -> impl IntoElement + use<> {
+        let ui = Theme::ui(cx);
+        let keys = ui::shortcut_in(action, &self.focus_handle, window);
+        ui::icon_button(id, name, ui)
+            .tooltip(ui::tooltip(label, keys))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                window.focus(&this.focus_handle);
+                run(this, window, cx)
+            }))
     }
 
     fn render_item(
@@ -1239,10 +1265,11 @@ impl FileTreePanel {
             return div().into_any_element();
         };
         let selected = self.selected.as_ref() == Some(&row.path);
-        let dropping = self
+        let band = self
             .drop_target
-            .as_ref()
-            .is_some_and(|target| *target != self.root && row.path.starts_with(target));
+            .as_deref()
+            .filter(|target| *target != self.root)
+            .and_then(|target| drop_band(&self.rows, target, row_index));
         let cut = self
             .clipboard
             .as_ref()
@@ -1251,52 +1278,68 @@ impl FileTreePanel {
             &self.edit,
             Some(Edit { target: EditTarget::Rename { path }, .. }) if *path == row.path
         );
-        let base = row_base(list_index, row.depth)
-            .when(dropping, |base| base.bg(ui.drop_target))
-            .when(selected && !dropping, |base| {
-                base.bg(if focused {
-                    ui.list_selected
-                } else {
-                    ui.list_selected_inactive
-                })
-            })
-            .when(!selected && !dropping, |base| {
-                base.hover(|style| style.bg(ui.list_hover))
-            })
-            .child(chevron(row.kind, row.expanded, ui));
-        if renaming {
-            return base.child(self.render_edit_field(ui)).into_any_element();
+        let muted = row.ignored || cut;
+        // Пока имя правится, значок следует за набранным: `.rs` → значок Rust.
+        let typed = self
+            .edit
+            .as_ref()
+            .filter(|_| renaming)
+            .map(|edit| edit.input.read(cx).text());
+        let mut file = match row.kind {
+            EntryKind::Dir => folder_icon(row.expanded, &ui),
+            EntryKind::File => file_icon(typed.as_deref().unwrap_or(&row.name), &ui),
+        };
+        if muted {
+            file.color = UiColors::tint(file.color, MUTED_ICON_ALPHA);
         }
+        let body = row_body(row.depth, row.kind, row.expanded, file, ui);
+        let body = match band {
+            Some((top, bottom)) => body
+                .bg(ui.drop_target)
+                .rounded(px(0.))
+                .when(top, |body| body.rounded_t(px(RADIUS_SM)))
+                .when(bottom, |body| body.rounded_b(px(RADIUS_SM))),
+            None if selected => body.bg(if focused {
+                ui.list_selected
+            } else {
+                ui.list_selected_inactive
+            }),
+            None => body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover)),
+        };
+        if renaming {
+            return row_shell(list_index)
+                .child(body.child(self.render_edit_field(ui)))
+                .into_any_element();
+        }
+        let name = div()
+            .ml(px(NAME_GAP))
+            .min_w_0()
+            .truncate()
+            .text_color(if muted { ui.dim } else { ui.foreground })
+            .child(row.name.clone());
         let (click, secondary) = (row.path.clone(), row.path.clone());
         let dragged = DraggedEntry {
             path: row.path.clone(),
             name: row.name.clone().into(),
+            is_dir: row.kind == EntryKind::Dir,
         };
-        base.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-            this.click_row(click.clone(), event.click_count(), window, cx)
-        }))
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                cx.stop_propagation();
-                this.secondary_click(Some(secondary.clone()), event.position, window, cx)
-            }),
-        )
-        .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_color(if row.ignored || cut {
-                    ui.dim
-                } else {
-                    ui.foreground
-                })
-                .child(row.name.clone()),
-        )
-        .into_any_element()
+        row_shell(list_index)
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.click_row(click.clone(), event.click_count(), window, cx)
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.secondary_click(Some(secondary.clone()), event.position, window, cx)
+                }),
+            )
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .child(body.child(name))
+            .into_any_element()
     }
 
+    /// Строка поля нового файла или каталога: значок файла следует за набранным именем.
     fn render_new_entry(
         &self,
         list_index: usize,
@@ -1305,13 +1348,25 @@ impl FileTreePanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let ui = Theme::ui(cx);
-        row_base(list_index, depth)
-            .child(chevron(kind, false, ui))
-            .child(self.render_edit_field(ui))
+        let typed = self
+            .edit
+            .as_ref()
+            .map(|edit| edit.input.read(cx).text())
+            .unwrap_or_default();
+        let file = match kind {
+            EntryKind::Dir => folder_icon(false, &ui),
+            EntryKind::File => file_icon(&typed, &ui),
+        };
+        row_shell(list_index)
+            .child(
+                row_body(depth, kind, false, file, ui)
+                    .bg(ui.list_selected_inactive)
+                    .child(self.render_edit_field(ui)),
+            )
             .into_any_element()
     }
 
-    /// Поле правки имени; ошибка — под полем поверх соседних строк.
+    /// Поле правки имени; ошибка — плашкой под полем поверх соседних строк.
     fn render_edit_field(&self, ui: UiColors) -> AnyElement {
         let Some(edit) = &self.edit else {
             return div().into_any_element();
@@ -1321,22 +1376,33 @@ impl FileTreePanel {
             .relative()
             .flex_1()
             .min_w_0()
+            .ml(px(NAME_GAP - 2.))
             .child(edit.input.clone())
             .children(edit.error.clone().map(|error| {
                 deferred(
                     div()
                         .absolute()
-                        .top(px(ROW_HEIGHT))
+                        .top(relative(1.))
+                        .mt_1()
                         .left_0()
-                        .right_0()
+                        .min_w(px(180.))
+                        .max_w(px(320.))
+                        .flex()
+                        .items_start()
+                        .gap_1p5()
                         .px_2()
-                        .py_0p5()
-                        .bg(ui.panel)
+                        .py_1p5()
+                        .rounded(px(RADIUS_MD))
+                        // Непрозрачная: под плашкой — текст соседних строк.
+                        .bg(UiColors::tint(ui.elevated, 1.))
                         .border_1()
-                        .border_color(ui.error)
-                        .rounded_sm()
-                        .text_color(ui.error)
-                        .child(error),
+                        .border_color(UiColors::tint(ui.error, 0.6))
+                        .shadow(ui::popover_shadow(ui))
+                        .whitespace_normal()
+                        .text_size(px(theme::TEXT_SM))
+                        .text_color(ui.foreground)
+                        .child(icon(IconName::Error, ui.error).size(px(13.)).mt(px(1.)))
+                        .child(div().min_w_0().child(error)),
                 )
                 .with_priority(1)
             }))
@@ -1351,7 +1417,7 @@ impl Focusable for FileTreePanel {
 }
 
 impl Render for FileTreePanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let slot = self.new_entry_slot();
         let count = self.rows.len() + usize::from(slot.is_some());
@@ -1368,6 +1434,8 @@ impl Render for FileTreePanel {
         .track_scroll(self.scroll.clone())
         .size_full();
         let dropping_root = self.drop_target.as_ref() == Some(&self.root);
+        // Отпустили ручку где угодно — перетаскивания больше нет, подсветка гаснет.
+        self.resizing &= cx.has_active_drag();
         // Во время правки имени — свой контекст: клавиши дерева (стрелки, ⌫, пробел) молчат.
         let context = if self.edit.is_some() {
             "FileTree editing"
@@ -1383,10 +1451,7 @@ impl Render for FileTreePanel {
             .h_full()
             .flex()
             .flex_col()
-            .bg(ui.panel)
-            .border_r_1()
-            .border_color(ui.border)
-            .font_family(theme::FONT_FAMILY)
+            .font_family(theme::UI_FONT)
             .text_size(px(TEXT_SIZE))
             .text_color(ui.foreground)
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
@@ -1462,18 +1527,28 @@ impl Render for FileTreePanel {
             }))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
-                    let width = f32::from(event.event.position.x - event.bounds.left());
+                    // Ручка — в зазоре правее края: край панели идёт за мышью без скачка.
+                    let width = f32::from(event.event.position.x - event.bounds.left())
+                        - RESIZE_HANDLE_OFFSET;
                     this.width = width.clamp(MIN_WIDTH, MAX_WIDTH);
+                    this.resizing = true;
                     cx.notify();
                 }),
             )
-            .child(self.render_header(cx))
+            .child(self.render_header(window, cx))
             .child(
                 div()
                     .id("file-tree-list")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .when(dropping_root, |list| list.bg(ui.drop_target))
+                    // Отступы — у обёртки: геометрия строк (`list_index_at`) считается от
+                    // границ самого списка.
+                    .pt_0p5()
+                    .pb_2()
+                    .when(dropping_root, |list| {
+                        list.child(drop_overlay(ui).top_0().bottom(px(ROW_INSET)))
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, _| window.focus(&this.focus_handle)),
@@ -1486,17 +1561,7 @@ impl Render for FileTreePanel {
                     )
                     .child(list),
             )
-            .child(
-                div()
-                    .id("file-tree-resize")
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right(px(-RESIZE_HANDLE_WIDTH / 2.))
-                    .w(px(RESIZE_HANDLE_WIDTH))
-                    .cursor(CursorStyle::ResizeLeftRight)
-                    .on_drag(DraggedEdge, |_, _, _, cx| cx.new(|_| DraggedEdge)),
-            )
+            .child(resize_handle(self.resizing, ui))
             .children(
                 self.menu
                     .as_ref()
@@ -1508,17 +1573,28 @@ impl Render for FileTreePanel {
 impl Render for DraggedEntry {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
+        let file = if self.is_dir {
+            folder_icon(false, &ui)
+        } else {
+            file_icon(&self.name, &ui)
+        };
         div()
-            .px_2()
-            .py_0p5()
-            .bg(ui.panel)
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .h(px(ROW_HEIGHT))
+            .pl_2()
+            .pr_2p5()
+            .rounded(px(RADIUS_MD))
+            // Непрозрачная: плашка плывёт над строками, их текст не должен просвечивать.
+            .bg(UiColors::tint(ui.elevated, 1.))
             .border_1()
-            .border_color(ui.border)
-            .rounded_sm()
-            .shadow_md()
-            .font_family(theme::FONT_FAMILY)
+            .border_color(ui.elevated_border)
+            .shadow(ui::popover_shadow(ui))
+            .font_family(theme::UI_FONT)
             .text_size(px(TEXT_SIZE))
             .text_color(ui.foreground)
+            .child(file.render().size(px(14.)))
             .child(self.name.clone())
     }
 }
@@ -1529,54 +1605,102 @@ impl Render for DraggedEdge {
     }
 }
 
-/// Строка списка: высота, отступ по вложенности.
-fn row_base(list_index: usize, depth: usize) -> gpui::Stateful<gpui::Div> {
+/// Строка списка во всю ширину с отступами от краёв острова; подсветка — у плашки внутри.
+fn row_shell(list_index: usize) -> Stateful<Div> {
     div()
         .id(list_index)
+        .group(ROW_GROUP)
         .h(px(ROW_HEIGHT))
         .w_full()
-        .flex()
-        .items_center()
-        .pl(px(ROW_PADDING + depth as f32 * INDENT))
-        .pr_2()
+        .px(px(ROW_INSET))
         .whitespace_nowrap()
 }
 
-/// ▸/▾ у каталога; у файла — пустая колонка той же ширины.
+/// Плашка строки: направляющие вложенности, шеврон (у файла — пустая колонка), значок.
+/// Имя или поле правки добавляет вызывающий.
+fn row_body(depth: usize, kind: EntryKind, expanded: bool, file: FileIcon, ui: UiColors) -> Div {
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .pr_2()
+        .rounded(px(RADIUS_SM))
+        .child(indent_guides(depth, ui))
+        .child(chevron(kind, expanded, ui))
+        .child(file.render().ml(px(ICON_GAP)))
+}
+
+/// Отступ по вложенности с тонкими направляющими: по линии на каждый уровень предков —
+/// посередине колонки шеврона каталога этого уровня.
+fn indent_guides(depth: usize, ui: UiColors) -> impl IntoElement {
+    div()
+        .flex_none()
+        .h_full()
+        .pl(px(ROW_PADDING))
+        .flex()
+        .children((0..depth).map(move |_| {
+            div()
+                .flex_none()
+                .w(px(INDENT))
+                .h_full()
+                .pl(px(CHEVRON_WIDTH / 2. - 0.5))
+                .child(div().w(px(1.)).h_full().bg(ui.divider))
+        }))
+}
+
+/// Шеврон каталога (вправо — свёрнут, вниз — раскрыт); у файла — пустая колонка той же ширины.
 fn chevron(kind: EntryKind, expanded: bool, ui: UiColors) -> impl IntoElement {
     let glyph = match (kind, expanded) {
-        (EntryKind::Dir, true) => "▾",
-        (EntryKind::Dir, false) => "▸",
-        (EntryKind::File, _) => "",
+        (EntryKind::Dir, true) => Some(IconName::ChevronDown),
+        (EntryKind::Dir, false) => Some(IconName::ChevronRight),
+        (EntryKind::File, _) => None,
     };
     div()
         .flex_none()
         .w(px(CHEVRON_WIDTH))
-        .text_color(ui.dim)
-        .child(glyph)
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .children(glyph.map(|glyph| icon(glyph, ui.dim).size(px(CHEVRON_SIZE))))
 }
 
-/// Кнопка шапки: щелчок — фокус в дерево и действие.
-fn header_button(
-    id: &'static str,
-    label: &'static str,
-    ui: UiColors,
-    cx: &mut Context<FileTreePanel>,
-    action: fn(&mut FileTreePanel, &mut Window, &mut Context<FileTreePanel>),
-) -> impl IntoElement + use<> {
+/// Подсветка корня как цели перетаскивания: скруглённая плашка с отступами от краёв острова.
+fn drop_overlay(ui: UiColors) -> Div {
     div()
-        .id(id)
-        .flex_none()
-        .px_1()
-        .rounded_sm()
-        .text_size(px(HEADER_TEXT_SIZE))
-        .text_color(ui.dim)
-        .hover(move |style| style.text_color(ui.foreground).bg(ui.list_hover))
-        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-            window.focus(&this.focus_handle);
-            action(this, window, cx)
-        }))
-        .child(label)
+        .absolute()
+        .left(px(ROW_INSET))
+        .right(px(ROW_INSET))
+        .rounded(px(RADIUS_SM))
+        .bg(ui.drop_target)
+}
+
+/// Ручка ширины в зазоре между островами: акцентная линия при наведении и пока тянут.
+fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
+    div()
+        .id("file-tree-resize")
+        .group("file-tree-resize")
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right(px(-(1. + RESIZE_HANDLE_WIDTH)))
+        .w(px(RESIZE_HANDLE_WIDTH))
+        .py(px(ui::RADIUS_LG))
+        .flex()
+        .justify_center()
+        .cursor(CursorStyle::ResizeLeftRight)
+        .on_drag(DraggedEdge, |_, _, _, cx| cx.new(|_| DraggedEdge))
+        .child(
+            div()
+                .w(px(2.))
+                .h_full()
+                .rounded(px(1.))
+                .bg(ui.focus_border)
+                .when(!resizing, |line| {
+                    line.invisible()
+                        .group_hover("file-tree-resize", |style| style.visible())
+                }),
+        )
 }
 
 // --- Чистая логика ---
@@ -1621,6 +1745,33 @@ fn check_name(target: &EditTarget, name: &str) -> Result<(), String> {
 fn drop_dir(tree: &FileTree, dragged: &Path, over: Option<&Path>) -> Option<PathBuf> {
     let dir = tree.target_dir(over);
     (!dir.starts_with(dragged) && dragged.parent() != Some(dir.as_path())).then_some(dir)
+}
+
+/// Где начинается имя в строке вложенности `depth` — от левого края списка: меню по ⇧F10
+/// встаёт под имя выбранной строки.
+fn name_offset(depth: usize) -> f32 {
+    ROW_INSET
+        + ROW_PADDING
+        + depth as f32 * INDENT
+        + CHEVRON_WIDTH
+        + ICON_GAP
+        + ICON_SIZE
+        + NAME_GAP
+}
+
+/// Строка `index` внутри каталога `target`, куда бросят перетаскиваемое: подсветка идёт одной
+/// полосой от строки каталога до его последнего видимого потомка. `(верх, низ)` — строка
+/// начинает или заканчивает полосу (там скругления); `None` — строка вне полосы.
+fn drop_band(rows: &[Row], target: &Path, index: usize) -> Option<(bool, bool)> {
+    let row = rows.get(index)?;
+    if !row.path.starts_with(target) {
+        return None;
+    }
+    let top = row.path == target;
+    let bottom = !rows
+        .get(index + 1)
+        .is_some_and(|next| next.path.starts_with(target));
+    Some((top, bottom))
 }
 
 /// Путь относительно корня через `/`; сам корень — `.`.
@@ -1712,6 +1863,39 @@ mod tests {
             drop_dir(&tree, &p("/p/src/app"), Some(&p("/p/src/main.rs"))),
             None
         );
+    }
+
+    #[test]
+    fn drop_band_spans_the_dir_and_its_visible_children() {
+        let rows = tree().rows();
+        let paths: Vec<_> = rows.iter().map(|row| row.path.clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/p/src"),
+                PathBuf::from("/p/src/app"),
+                PathBuf::from("/p/src/main.rs"),
+                PathBuf::from("/p/a.rs"),
+            ]
+        );
+        let band = |target: &str, index| drop_band(&rows, Path::new(target), index);
+        // Каталог с детьми: верх — сам каталог, низ — последний ребёнок, сосед — вне полосы.
+        assert_eq!(band("/p/src", 0), Some((true, false)));
+        assert_eq!(band("/p/src", 1), Some((false, false)));
+        assert_eq!(band("/p/src", 2), Some((false, true)));
+        assert_eq!(band("/p/src", 3), None);
+        // Свёрнутый (или пустой) каталог — полоса из одной строки.
+        assert_eq!(band("/p/src/app", 1), Some((true, true)));
+        // Похожее имя — не потомок: `/p/src2` не начинается с `/p/src` по компонентам.
+        assert_eq!(drop_band(&rows, Path::new("/p/sr"), 0), None);
+        assert_eq!(band("/p/src", 9), None);
+    }
+
+    #[test]
+    fn names_line_up_with_nesting() {
+        assert_eq!(name_offset(1) - name_offset(0), INDENT);
+        // Имя правее значка, значок — правее колонки шеврона.
+        assert!(name_offset(0) > ROW_INSET + ROW_PADDING + CHEVRON_WIDTH + ICON_SIZE);
     }
 
     #[test]

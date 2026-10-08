@@ -1,13 +1,26 @@
 //! Тема — данные: цвета интерфейса и стили областей подсветки. Ставится глобально
 //! (`cx.set_global`), читается через [`Theme::get`] и [`Theme::ui`]. Метрики шрифта,
 //! табуляция и мигание — константы: это будущие настройки, а не тема.
+//!
+//! Цвета интерфейса — токены дизайн-системы (вики: «Design System»): поверхности стекла
+//! (рамка окна, острова, всплывающие панели), текст трёх уровней, акцент, состояния и
+//! палитра оттенков для смысла (типы файлов, категории, счётчики). Компоненты — в `ui.rs`.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use flux_syntax::Highlight;
 use gpui::{App, Global, Hsla, rgb, rgba};
 
-pub const FONT_FAMILY: &str = "Menlo";
+/// Шрифт интерфейса — системный (SF Pro на macOS).
+pub const UI_FONT: &str = ".SystemUIFont";
+/// Шрифт кода — первый установленный из списка ([`init_fonts`]).
+const CODE_FONTS: [&str; 4] = [
+    "JetBrains Mono",
+    "JetBrainsMono Nerd Font Mono",
+    "SF Mono",
+    "Menlo",
+];
 pub const FONT_SIZE: f32 = 14.;
 pub const LINE_HEIGHT: f32 = 21.;
 pub const TAB_WIDTH: usize = 4;
@@ -18,42 +31,121 @@ pub const SCROLL_MARGIN_LINES: usize = 3;
 /// Период мигания курсора; `None` — курсор не мигает.
 pub const CURSOR_BLINK: Option<Duration> = Some(Duration::from_millis(500));
 
+/// Кегли интерфейса (шрифт [`UI_FONT`]).
+pub const TEXT_XS: f32 = 11.;
+pub const TEXT_SM: f32 = 12.;
+pub const TEXT_MD: f32 = 13.;
+pub const TEXT_LG: f32 = 15.;
+pub const TEXT_DISPLAY: f32 = 34.;
+
+static CODE_FONT: OnceLock<&'static str> = OnceLock::new();
+
+/// Выбирает шрифт кода: первый установленный из [`CODE_FONTS`]. Без такой проверки
+/// gpui молча подставил бы пропорциональный системный шрифт.
+pub fn init_fonts(cx: &App) {
+    let installed = cx.text_system().all_font_names();
+    let family = CODE_FONTS
+        .into_iter()
+        .find(|family| installed.iter().any(|name| name == family))
+        .unwrap_or("Menlo");
+    CODE_FONT.set(family).ok();
+}
+
+/// Шрифт кода: редактор, поля поиска, строки результатов.
+pub fn code_font() -> &'static str {
+    CODE_FONT.get().copied().unwrap_or("Menlo")
+}
+
 /// Цвета интерфейса. `Copy`: читаются из глобальной темы одним значением.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UiColors {
-    pub background: Hsla,
+    // --- Поверхности (стекло). Альфа — сквозь неё видно размытый рабочий стол. ---
+    /// Рамка окна: фон под островами, шапка и статус-бар.
+    pub frame: Hsla,
+    /// Цветной отсвет рамки (градиент из верхнего левого угла).
+    pub frame_glow: Hsla,
+    /// Остров — самостоятельная панель: дерево, редактор.
+    pub island: Hsla,
+    pub island_border: Hsla,
+    /// Блик стекла по верхнему краю острова и всплывающей панели.
+    pub sheen: Hsla,
+    /// Всплывающие панели: меню, списки выбора, поиск по проекту, подсказки.
+    pub elevated: Hsla,
+    pub elevated_border: Hsla,
+    pub shadow: Hsla,
+    /// Тонкие разделители внутри островов.
+    pub divider: Hsla,
+
+    // --- Текст ---
     pub foreground: Hsla,
-    /// Второстепенный текст: номера строк, статус-бар, неактивные вкладки.
+    /// Вторичный текст: пути, подписи, неактивные вкладки.
+    pub text_muted: Hsla,
+    /// Третичный: номера строк, подсказки, плейсхолдеры.
     pub dim: Hsla,
+    pub text_disabled: Hsla,
+
+    // --- Взаимодействие ---
+    pub accent: Hsla,
+    /// Акцент для текста и значков на тёмном (светлее основного).
+    pub accent_text: Hsla,
+    /// Подложка акцента: включённый переключатель, значок действия.
+    pub accent_soft: Hsla,
+    pub hover: Hsla,
+    pub pressed: Hsla,
+    /// Выбранная строка списка в фокусе.
+    pub list_selected: Hsla,
+    /// Выбранная строка без фокуса: файл активной вкладки в дереве.
+    pub list_selected_inactive: Hsla,
+    pub input_background: Hsla,
+    pub input_border: Hsla,
+    /// Рамка поля в фокусе и кольцо вокруг него.
+    pub focus_border: Hsla,
+    pub focus_ring: Hsla,
+    /// Каталог, на который сейчас бросят перетаскиваемый файл (дерево файлов).
+    pub drop_target: Hsla,
+    /// Клавиша в подсказке сочетания.
+    pub keycap: Hsla,
+    pub keycap_border: Hsla,
+
+    // --- Состояния ---
+    pub success: Hsla,
+    pub warning: Hsla,
+    pub error: Hsla,
+    pub info: Hsla,
+    /// Несохранённые изменения: точка на вкладке, отметка в статус-баре.
+    pub modified: Hsla,
+
+    // --- Редактор ---
     pub current_line: Hsla,
     pub selection: Hsla,
     pub cursor: Hsla,
-    pub status_bar: Hsla,
-    pub border: Hsla,
-    pub tab_bar: Hsla,
-    /// Полоска сверху активной вкладки.
-    pub tab_accent: Hsla,
-    pub error: Hsla,
-    /// Фон панелей и всплывающих окон: строка поиска, поиск по проекту, палитра.
-    pub panel: Hsla,
-    pub input_background: Hsla,
-    pub input_border: Hsla,
-    /// Рамка поля ввода в фокусе.
-    pub focus_border: Hsla,
-    /// Строка списка под мышью и выбранная строка (палитра, поиск файла, результаты поиска).
-    pub list_hover: Hsla,
-    pub list_selected: Hsla,
-    /// Выбранная строка списка без фокуса: файл активной вкладки в дереве файлов.
-    pub list_selected_inactive: Hsla,
-    /// Каталог, на который сейчас бросят перетаскиваемый файл (дерево файлов).
-    pub drop_target: Hsla,
     /// Совпавшие символы в списках: нечёткий поиск, результаты поиска по проекту.
     pub match_text: Hsla,
     /// Фон найденных вхождений в тексте и текущего из них.
     pub search_match: Hsla,
     pub search_match_active: Hsla,
-    /// Фон включённого переключателя (Aa, ab, .*).
-    pub toggle_active: Hsla,
+
+    // --- Палитра оттенков: смысл, а не украшение (типы файлов, категории, счётчики). ---
+    pub blue: Hsla,
+    pub indigo: Hsla,
+    pub violet: Hsla,
+    pub pink: Hsla,
+    pub red: Hsla,
+    pub orange: Hsla,
+    pub amber: Hsla,
+    pub lime: Hsla,
+    pub green: Hsla,
+    pub teal: Hsla,
+    pub cyan: Hsla,
+    /// Значок каталога.
+    pub folder: Hsla,
+}
+
+impl UiColors {
+    /// Цвет `color` с непрозрачностью `alpha` — подложки оттенков (бейджи, плитки значков).
+    pub fn tint(color: Hsla, alpha: f32) -> Hsla {
+        Hsla { a: alpha, ..color }
+    }
 }
 
 /// Как рисовать область подсветки.
@@ -97,14 +189,14 @@ impl Theme {
         self.syntax.get(highlight.0).map(|(_, style)| *style)
     }
 
-    /// Тёмная тема в палитре GitHub Dark (Primer, «prettylights»). Роли цветов
-    /// как на GitHub: ключевые слова и операторы — красный, функции —
-    /// фиолетовый, типы и конструкторы — оранжевый, строки — светло-голубой,
-    /// константы, числа, свойства и встроенное — голубой, теги, регулярки и
-    /// ключи JSON — зелёный, комментарии — серый. Обычные переменные и
-    /// пунктуация — цветом текста, чтобы не шуметь; параметры — оранжевым
-    /// (цвет `variable` у GitHub), чтобы отличать их от локальных.
-    pub fn github_dark() -> Self {
+    /// Тёмная тема «Flux Night»: стеклянная рамка и острова в холодных сине-фиолетовых
+    /// нейтралях, акцент — индиго. Подсветка кода — палитра GitHub Dark (Primer,
+    /// «prettylights»): ключевые слова и операторы — красный, функции — фиолетовый, типы и
+    /// конструкторы — оранжевый, строки — светло-голубой, константы, числа, свойства и
+    /// встроенное — голубой, теги, регулярки и ключи JSON — зелёный, комментарии — серый.
+    /// Обычные переменные и пунктуация — цветом текста, чтобы не шуметь; параметры —
+    /// оранжевым (цвет `variable` у GitHub), чтобы отличать их от локальных.
+    pub fn flux_night() -> Self {
         const RED: u32 = 0xff7b72;
         const PURPLE: u32 = 0xd2a8ff;
         const ORANGE: u32 = 0xffa657;
@@ -154,32 +246,67 @@ impl Theme {
             ("variable.builtin", plain(BLUE)),
             ("variable.parameter", plain(ORANGE)),
         ];
+
+        // Оттенки подобраны под тёмное стекло: близкая светлота, разный тон.
+        const INDIGO: u32 = 0x8590ff;
+        const AMBER: u32 = 0xffc560;
         Self {
             ui: UiColors {
-                background: rgb(0x0d1117).into(),
-                foreground: rgb(TEXT).into(),
-                dim: rgb(0x6e7681).into(),
-                current_line: rgb(0x161b22).into(),
-                selection: rgba(0x388bfd55).into(),
-                cursor: rgb(0x58a6ff).into(),
-                status_bar: rgb(0x010409).into(),
-                border: rgb(0x21262d).into(),
-                tab_bar: rgb(0x010409).into(),
-                tab_accent: rgb(0xf78166).into(),
-                error: rgb(0xf85149).into(),
-                panel: rgb(0x161b22).into(),
-                input_background: rgb(0x0d1117).into(),
-                input_border: rgb(0x30363d).into(),
-                focus_border: rgb(0x1f6feb).into(),
-                list_hover: rgba(0xb1bac41f).into(),
-                list_selected: rgba(0x388bfd40).into(),
-                list_selected_inactive: rgba(0x6e768140).into(),
-                drop_target: rgba(0x388bfd26).into(),
-                match_text: rgb(0x58a6ff).into(),
-                // Как `editor.findMatch*` в теме GitHub Dark для VS Code.
-                search_match: rgba(0xf2cc6040).into(),
-                search_match_active: rgb(0x9e6a03).into(),
-                toggle_active: rgba(0x388bfd66).into(),
+                frame: rgba(0x07090fc7).into(),
+                frame_glow: rgba(0x8590ff24).into(),
+                island: rgba(0x0d1018e6).into(),
+                island_border: rgba(0xffffff14).into(),
+                sheen: rgba(0xffffff2e).into(),
+                elevated: rgba(0x171b28fa).into(),
+                elevated_border: rgba(0xffffff1f).into(),
+                shadow: rgba(0x00000080).into(),
+                divider: rgba(0xffffff12).into(),
+
+                foreground: rgb(0xe6e9f2).into(),
+                text_muted: rgb(0xa3abc3).into(),
+                dim: rgb(0x6b7391).into(),
+                text_disabled: rgb(0x4a516a).into(),
+
+                accent: rgb(INDIGO).into(),
+                accent_text: rgb(0xaab2ff).into(),
+                accent_soft: rgba(0x8590ff2e).into(),
+                hover: rgba(0xffffff0f).into(),
+                pressed: rgba(0xffffff17).into(),
+                list_selected: rgba(0x8590ff3d).into(),
+                list_selected_inactive: rgba(0xffffff14).into(),
+                input_background: rgba(0x00000052).into(),
+                input_border: rgba(0xffffff17).into(),
+                focus_border: rgba(0x8590ffd9).into(),
+                focus_ring: rgba(0x8590ff3d).into(),
+                drop_target: rgba(0x8590ff29).into(),
+                keycap: rgba(0xffffff0f).into(),
+                keycap_border: rgba(0xffffff1a).into(),
+
+                success: rgb(0x4fd18b).into(),
+                warning: rgb(AMBER).into(),
+                error: rgb(0xff6b6b).into(),
+                info: rgb(0x5aa9ff).into(),
+                modified: rgb(0xffb35c).into(),
+
+                current_line: rgba(0xffffff0a).into(),
+                selection: rgba(0x8590ff4d).into(),
+                cursor: rgb(0xaab2ff).into(),
+                match_text: rgb(0xaab2ff).into(),
+                search_match: rgba(0xffc56038).into(),
+                search_match_active: rgba(0xffc5608f).into(),
+
+                blue: rgb(0x5aa9ff).into(),
+                indigo: rgb(INDIGO).into(),
+                violet: rgb(0xb48cff).into(),
+                pink: rgb(0xff7eb6).into(),
+                red: rgb(0xff6b6b).into(),
+                orange: rgb(0xff9c5b).into(),
+                amber: rgb(AMBER).into(),
+                lime: rgb(0xb8e06a).into(),
+                green: rgb(0x4fd18b).into(),
+                teal: rgb(0x3cd3c4).into(),
+                cyan: rgb(0x5ccfff).into(),
+                folder: rgb(0x7fa8ff).into(),
             },
             syntax: syntax
                 .into_iter()
@@ -198,7 +325,7 @@ mod tests {
     /// общую по откату через точки. `none` (служебный в markdown) — не красим.
     #[test]
     fn dark_theme_covers_every_capture() {
-        let theme = Theme::github_dark();
+        let theme = Theme::flux_night();
         let scopes = theme.syntax_scopes();
         for language in languages() {
             let map = HighlightMap::new(language, &scopes);
@@ -215,7 +342,7 @@ mod tests {
 
     #[test]
     fn scopes_are_unique_and_styles_line_up() {
-        let theme = Theme::github_dark();
+        let theme = Theme::flux_night();
         let scopes = theme.syntax_scopes();
         let mut sorted = scopes.clone();
         sorted.sort_unstable();

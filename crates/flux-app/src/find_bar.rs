@@ -17,21 +17,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use flux_search::{BufferMatches, QueryError, SearchQuery, find_all, replacement_for};
 use gpui::{
-    App, AppContext, ClickEvent, Context, Entity, Focusable, Hsla, KeyBinding, Render,
-    SharedString, Subscription, Task, WeakEntity, Window, actions, div, prelude::*, px,
+    Action, App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyBinding,
+    Render, SharedString, Subscription, Task, WeakEntity, Window, actions, div, prelude::*, px,
 };
 
 use crate::editor::{Editor, EditorEvent};
+use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
-use crate::theme::{Theme, UiColors};
+use crate::theme::{self, Theme};
+use crate::ui::{self, GAP, ICON_BUTTON_SIZE};
 
 /// Ширина полей запроса и замены.
 const INPUT_WIDTH: f32 = 380.;
-/// Высота (и наименьшая ширина) кнопок строки.
-const BUTTON_SIZE: f32 = 22.;
-/// Счётчик или сообщение об ошибке в запросе — не шире этого.
+/// Сообщение об ошибке в запросе — не шире этого.
 const COUNTER_MAX_WIDTH: f32 = 320.;
-const TEXT_SIZE: f32 = 12.;
 
 actions!(
     find_bar,
@@ -138,8 +137,8 @@ pub struct FindBar {
 
 impl FindBar {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| TextInput::new("Find", cx));
-        let replacement = cx.new(|cx| TextInput::new("Replace", cx));
+        let query = cx.new(|cx| TextInput::new("Find", cx).code().icon(IconName::Search));
+        let replacement = cx.new(|cx| TextInput::new("Replace", cx).code().icon(IconName::Replace));
         let subscriptions = vec![cx.subscribe_in(
             &query,
             window,
@@ -563,86 +562,126 @@ impl FindBar {
         cx.notify();
     }
 
-    /// Текст счётчика (или ошибки в запросе) и его цвет.
-    fn counter(&self, ui: UiColors, cx: &App) -> (String, Hsla) {
+    /// Что показать за переключателями: счётчик вхождений или ошибку в запросе.
+    fn counter(&self, cx: &App) -> Counter {
         match &self.status {
-            Status::Idle => (String::new(), ui.dim),
-            Status::Error(message) => (message.to_string(), ui.error),
+            Status::Idle => Counter::None,
+            Status::Error(message) => Counter::Error(message.clone()),
             Status::Found { truncated } => {
                 let (count, active) = self.editor().map_or((0, None), |editor| {
                     let highlights = editor.read(cx).search_highlights();
                     (highlights.matches.len(), highlights.active)
                 });
-                let color = if count == 0 { ui.error } else { ui.dim };
-                (counter_label(count, active, *truncated), color)
+                let label = counter_label(count, active, *truncated).into();
+                if count == 0 {
+                    Counter::Error(label)
+                } else {
+                    Counter::Found(label)
+                }
             }
         }
     }
 }
 
+/// Правая часть строки поиска после переключателей.
+enum Counter {
+    None,
+    /// «3 of 12», «12 results».
+    Found(SharedString),
+    /// «No results» или ошибка в регулярном выражении.
+    Error(SharedString),
+}
+
 impl Render for FindBar {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        let (counter, counter_color) = self.counter(ui, cx);
-        let row = || div().flex().items_center().gap_1();
-        let arrow = if self.replace_open { "▾" } else { "▸" };
+        // Подсказки — с сочетаниями так, будто фокус в поле: они верны и когда фокус в тексте.
+        let query_focus = self.query.focus_handle(cx);
+        let replace_focus = self.replacement.focus_handle(cx);
+        let tip = |label: &'static str, action: &dyn Action, focus: &FocusHandle| {
+            ui::tooltip(label, ui::shortcut_in(action, focus, window))
+        };
+        let row = || div().flex().items_center().gap_1p5();
+        let counter = match self.counter(cx) {
+            Counter::None => None,
+            Counter::Found(label) => Some(ui::badge(label, ui.accent_text).into_any_element()),
+            Counter::Error(message) => Some(
+                div()
+                    .flex_none()
+                    .max_w(px(COUNTER_MAX_WIDTH))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_color(ui.error)
+                    .child(icon(IconName::Warning, ui.error).size(px(13.)))
+                    .child(div().min_w_0().truncate().child(message))
+                    .into_any_element(),
+            ),
+        };
+        let chevron = if self.replace_open {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
         let find_row = row()
-            .child(button(
-                "toggle-replace",
-                arrow,
-                false,
-                ui,
-                cx,
-                |this, window, cx| this.toggle_replace(window, cx),
-            ))
+            .child(
+                ui::icon_button("toggle-replace", chevron, ui)
+                    .tooltip(tip("Toggle Replace", &DeployReplace, &query_focus))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.toggle_replace(window, cx)
+                    })),
+            )
             .child(
                 div()
                     .flex_none()
                     .w(px(INPUT_WIDTH))
                     .child(self.query.clone()),
             )
-            .child(button(
-                "case",
-                "Aa",
-                self.case_sensitive,
-                ui,
-                cx,
-                |this, _, cx| this.toggle_option(|this| &mut this.case_sensitive, cx),
-            ))
-            .child(button(
-                "word",
-                "ab",
-                self.whole_word,
-                ui,
-                cx,
-                |this, _, cx| this.toggle_option(|this| &mut this.whole_word, cx),
-            ))
-            .child(button("regex", ".*", self.regex, ui, cx, |this, _, cx| {
-                this.toggle_option(|this| &mut this.regex, cx)
-            }))
             .child(
-                div()
-                    .flex_none()
-                    .max_w(px(COUNTER_MAX_WIDTH))
-                    .px_1()
-                    .truncate()
-                    .text_color(counter_color)
-                    .child(counter),
+                ui::toggle_button("case", IconName::CaseSensitive, self.case_sensitive, ui)
+                    .tooltip(tip("Match Case", &ToggleCaseSensitive, &query_focus))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.toggle_option(|this| &mut this.case_sensitive, cx)
+                    })),
             )
-            .child(button("previous", "↑", false, ui, cx, |this, _, cx| {
-                this.step(true, cx)
-            }))
-            .child(button("next", "↓", false, ui, cx, |this, _, cx| {
-                this.step(false, cx)
-            }))
+            .child(
+                ui::toggle_button("word", IconName::WholeWord, self.whole_word, ui)
+                    .tooltip(tip("Whole Word", &ToggleWholeWord, &query_focus))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.toggle_option(|this| &mut this.whole_word, cx)
+                    })),
+            )
+            .child(
+                ui::toggle_button("regex", IconName::Regex, self.regex, ui)
+                    .tooltip(tip("Regular Expression", &ToggleRegex, &query_focus))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.toggle_option(|this| &mut this.regex, cx)
+                    })),
+            )
+            .child(div().flex_none().w(px(2.)))
+            .children(counter)
+            .child(
+                ui::icon_button("previous", IconName::ArrowUp, ui)
+                    .tooltip(tip("Previous Match", &SelectPreviousMatch, &query_focus))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.step(true, cx))),
+            )
+            .child(
+                ui::icon_button("next", IconName::ArrowDown, ui)
+                    .tooltip(tip("Next Match", &SelectNextMatch, &query_focus))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.step(false, cx))),
+            )
             .child(div().flex_1())
-            .child(button("close", "×", false, ui, cx, |this, window, cx| {
-                this.close(window, cx)
-            }));
+            .child(
+                ui::icon_button("close", IconName::Close, ui)
+                    .tooltip(tip("Close", &Dismiss, &query_focus))
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx)),
+                    ),
+            );
         let replace_row = self.replace_open.then(|| {
             row()
-                // Под стрелкой — пусто: поля стоят друг под другом.
-                .child(div().flex_none().w(px(BUTTON_SIZE)))
+                // Под шевроном — пусто: поля стоят друг под другом.
+                .child(div().flex_none().w(px(ICON_BUTTON_SIZE)))
                 .child(
                     div()
                         .key_context("ReplaceField")
@@ -650,36 +689,29 @@ impl Render for FindBar {
                         .w(px(INPUT_WIDTH))
                         .child(self.replacement.clone()),
                 )
-                .child(button(
-                    "replace",
-                    "Replace",
-                    false,
-                    ui,
-                    cx,
-                    |this, _, cx| this.replace_next(cx),
-                ))
-                .child(button(
-                    "replace-all",
-                    "All",
-                    false,
-                    ui,
-                    cx,
-                    |this, _, cx| this.replace_all(cx),
-                ))
+                .child(
+                    ui::icon_button("replace", IconName::Replace, ui)
+                        .tooltip(tip("Replace", &ReplaceNext, &replace_focus))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.replace_next(cx))),
+                )
+                .child(
+                    ui::icon_button("replace-all", IconName::ReplaceAll, ui)
+                        .tooltip(tip("Replace All", &ReplaceAll, &replace_focus))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.replace_all(cx))),
+                )
         });
 
         div()
             .key_context("FindBar")
+            .relative()
             .flex_none()
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_1p5()
             .px_2()
-            .py_1()
-            .bg(ui.panel)
-            .border_b_1()
-            .border_color(ui.border)
-            .text_size(px(TEXT_SIZE))
+            .py_2()
+            .font_family(theme::UI_FONT)
+            .text_size(px(theme::TEXT_SM))
             .text_color(ui.foreground)
             .on_action(cx.listener(|this, _: &SelectNextMatch, _, cx| this.step(false, cx)))
             .on_action(cx.listener(|this, _: &SelectPreviousMatch, _, cx| this.step(true, cx)))
@@ -705,36 +737,17 @@ impl Render for FindBar {
             .on_action(cx.listener(|this, _: &ReplaceAll, _, cx| this.replace_all(cx)))
             .child(find_row)
             .children(replace_row)
+            // Разделитель под строкой — от края до края острова, с отступом от скруглений.
+            .child(
+                div()
+                    .absolute()
+                    .left(px(GAP))
+                    .right(px(GAP))
+                    .bottom_0()
+                    .h(px(1.))
+                    .bg(ui.divider),
+            )
     }
-}
-
-/// Маленькая кнопка строки; `active` — включённый переключатель. Щелчок не забирает фокус
-/// у полей.
-fn button(
-    id: &'static str,
-    label: &'static str,
-    active: bool,
-    ui: UiColors,
-    cx: &Context<FindBar>,
-    on_click: impl Fn(&mut FindBar, &mut Window, &mut Context<FindBar>) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex_none()
-        .h(px(BUTTON_SIZE))
-        .min_w(px(BUTTON_SIZE))
-        .px_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_sm()
-        .text_color(if active { ui.foreground } else { ui.dim })
-        .when(active, |button| button.bg(ui.toggle_active))
-        .when(!active, |button| {
-            button.hover(|style| style.bg(ui.list_hover).text_color(ui.foreground))
-        })
-        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| on_click(this, window, cx)))
-        .child(label)
 }
 
 // --- Выбор вхождения: вхождения — по возрастанию, без пересечений ---

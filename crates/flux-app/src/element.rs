@@ -64,7 +64,9 @@ impl LayoutCache {
     }
 
     pub fn visible_lines(&self) -> usize {
-        (self.text_bounds.size.height / self.line_height).floor().max(1.) as usize
+        (self.text_bounds.size.height / self.line_height)
+            .floor()
+            .max(1.) as usize
     }
 
     /// Позиция в тексте под точкой экрана.
@@ -164,7 +166,7 @@ impl Element for EditorElement {
         let mut scroll = editor.scroll;
         let autoscroll = editor.autoscroll;
 
-        let font = font(theme::FONT_FAMILY);
+        let font = font(theme::code_font());
         let font_size = px(theme::FONT_SIZE);
         let line_height = px(theme::LINE_HEIGHT);
         let text_system = window.text_system().clone();
@@ -190,8 +192,9 @@ impl Element for EditorElement {
         let top = head_line as f32 * lh;
         match autoscroll {
             Some(Autoscroll::Fit) => {
-                let margin =
-                    (theme::SCROLL_MARGIN_LINES as f32 * lh).min((height - lh) / 2.).max(0.);
+                let margin = (theme::SCROLL_MARGIN_LINES as f32 * lh)
+                    .min((height - lh) / 2.)
+                    .max(0.);
                 if top - margin < scroll.y {
                     scroll.y = top - margin;
                 } else if top + lh + margin > scroll.y + height {
@@ -201,6 +204,8 @@ impl Element for EditorElement {
             Some(Autoscroll::Center) if top < scroll.y || top + lh > scroll.y + height => {
                 scroll.y = top - (height - lh) / 2.;
             }
+            // Посередине, но с целой верхней строкой: превью не начинается с обрезка.
+            Some(Autoscroll::Middle) => scroll.y = ((top - (height - lh) / 2.) / lh).round() * lh,
             Some(Autoscroll::Center) | None => {}
         }
         scroll.y = scroll.y.clamp(0., (total_lines - 1) as f32 * lh);
@@ -249,7 +254,9 @@ impl Element for EditorElement {
                 scroll.x = x - visible_width + margin;
             }
         }
-        scroll.x = scroll.x.clamp(0., (f32::from(max_width) - visible_width / 2.).max(0.));
+        scroll.x = scroll
+            .x
+            .clamp(0., (f32::from(max_width) - visible_width / 2.).max(0.));
 
         let layout = LayoutCache {
             text_bounds,
@@ -409,7 +416,10 @@ impl Element for EditorElement {
             cx,
         );
 
-        let layout = state.layout.take().expect("prepaint always produces a layout");
+        let layout = state
+            .layout
+            .take()
+            .expect("prepaint always produces a layout");
         let line_height = layout.line_height;
 
         if let Some(quad) = state.current_line.take() {
@@ -437,6 +447,7 @@ impl Element for EditorElement {
             }
         });
 
-        self.editor.update(cx, |editor, _| editor.layout = Some(layout));
+        self.editor
+            .update(cx, |editor, _| editor.layout = Some(layout));
     }
 }

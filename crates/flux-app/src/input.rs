@@ -19,11 +19,18 @@ use gpui::{
 
 use crate::display::display_line;
 use crate::element::LineLayout;
+use crate::icons::{IconName, icon};
 use crate::theme::{self, Theme};
+use crate::ui;
 
-/// Кегль и высота строки поля.
-pub const INPUT_TEXT_SIZE: f32 = 13.;
+/// Кегль и высота строки поля; крупное поле — запрос в шапке всплывающего окна.
+const INPUT_TEXT_SIZE: f32 = 13.;
 const INPUT_LINE_HEIGHT: f32 = 20.;
+const LARGE_LINE_HEIGHT: f32 = 22.;
+/// Высота поля с рамкой; компактного — под строку списка (поле имени в дереве).
+const FIELD_HEIGHT: f32 = 30.;
+const COMPACT_HEIGHT: f32 = 22.;
+const ICON_SIZE: f32 = 14.;
 const CURSOR_WIDTH: f32 = 2.;
 
 actions!(
@@ -107,6 +114,14 @@ pub struct TextInput {
     selecting: bool,
     /// Без внутренних отступов: высота — строка текста и рамка (поле в строке списка).
     compact: bool,
+    /// Шрифт кода вместо шрифта интерфейса: запросы поиска по тексту.
+    code: bool,
+    /// Значок слева от текста (лупа у полей поиска).
+    icon: Option<IconName>,
+    /// Без фона и рамки: поле встроено в шапку всплывающего окна, рамка — у окна.
+    borderless: bool,
+    /// Крупный кегль: запрос в шапке палитры, поиска файла, перехода к строке.
+    large: bool,
 }
 
 struct InputLayout {
@@ -129,6 +144,58 @@ impl TextInput {
             layout: None,
             selecting: false,
             compact: false,
+            code: false,
+            icon: None,
+            borderless: false,
+            large: false,
+        }
+    }
+
+    /// Без фона и рамки — поле в шапке всплывающего окна.
+    pub fn borderless(mut self) -> Self {
+        self.borderless = true;
+        self
+    }
+
+    /// Крупный кегль — главный запрос всплывающего окна.
+    pub fn large(mut self) -> Self {
+        self.large = true;
+        self
+    }
+
+    fn text_size(&self) -> Pixels {
+        px(if self.large {
+            theme::TEXT_LG
+        } else {
+            INPUT_TEXT_SIZE
+        })
+    }
+
+    fn line_height(&self) -> Pixels {
+        px(if self.large {
+            LARGE_LINE_HEIGHT
+        } else {
+            INPUT_LINE_HEIGHT
+        })
+    }
+
+    /// Текст поля — шрифтом кода (запросы поиска по тексту, regex).
+    pub fn code(mut self) -> Self {
+        self.code = true;
+        self
+    }
+
+    /// Значок слева от текста.
+    pub fn icon(mut self, icon: IconName) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    fn font_family(&self) -> &'static str {
+        if self.code {
+            theme::code_font()
+        } else {
+            theme::UI_FONT
         }
     }
 
@@ -496,24 +563,47 @@ impl Render for TextInput {
         use Direction::{Backward, Forward};
         let ui = Theme::ui(cx);
         let focused = self.focus_handle.is_focused(window);
-        div()
+        let border = if focused {
+            ui.focus_border
+        } else {
+            ui.input_border
+        };
+        let field = div()
             .key_context("TextInput")
             .track_focus(&self.focus_handle)
             .w_full()
-            .when(self.compact, |input| input.px_1())
-            .when(!self.compact, |input| input.px_2().py_1())
-            .bg(ui.input_background)
-            .border_1()
-            .border_color(if focused {
-                ui.focus_border
-            } else {
-                ui.input_border
-            })
-            .rounded_md()
+            .flex()
+            .items_center()
+            .gap_2()
             .text_color(ui.foreground)
-            .font_family(theme::FONT_FAMILY)
-            .text_size(px(INPUT_TEXT_SIZE))
-            .cursor(CursorStyle::IBeam)
+            .font_family(self.font_family())
+            .text_size(self.text_size())
+            .cursor(CursorStyle::IBeam);
+        // Компактное поле стоит в строке списка: кольцо фокуса вылезло бы на соседние строки,
+        // поэтому у него только акцентная рамка.
+        let field = match (self.borderless, self.compact) {
+            (true, _) => field,
+            (false, true) => field
+                .h(px(COMPACT_HEIGHT))
+                .px_1p5()
+                .rounded(px(ui::RADIUS_SM))
+                .bg(ui.input_background)
+                .border_1()
+                .border_color(border),
+            (false, false) => field
+                .h(px(FIELD_HEIGHT))
+                .px_2p5()
+                .rounded(px(ui::RADIUS_MD))
+                .bg(ui.input_background)
+                .border_1()
+                .border_color(border)
+                .when(focused, |field| field.shadow(ui::focus_ring(ui)))
+                .when(!focused, |field| {
+                    field.hover(move |style| style.border_color(ui.elevated_border))
+                }),
+        };
+        let icon_color = if focused { ui.text_muted } else { ui.dim };
+        field
             .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
                 this.motion(cx, |t, r| {
                     movement::move_horizontally(t, r, Backward, false)
@@ -578,7 +668,16 @@ impl Render for TextInput {
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.selecting = false),
             )
-            .child(InputElement { input: cx.entity() })
+            .children(
+                self.icon
+                    .map(|name| icon(name, icon_color).size(px(ICON_SIZE))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(InputElement { input: cx.entity() }),
+            )
     }
 }
 
@@ -625,7 +724,7 @@ impl Element for InputElement {
     ) -> (LayoutId, ()) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = px(INPUT_LINE_HEIGHT).into();
+        style.size.height = self.input.read(cx).line_height().into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -645,12 +744,13 @@ impl Element for InputElement {
         let marked = input.marked_range.clone();
         let focused = input.focus_handle.is_focused(window);
         let placeholder_text = input.placeholder.clone();
+        let family = input.font_family();
+        let font_size = input.text_size();
         let mut scroll_x = input.scroll_x;
 
-        let font_size = px(INPUT_TEXT_SIZE);
         let run = |len: usize, color| TextRun {
             len,
-            font: font(theme::FONT_FAMILY),
+            font: font(family),
             color,
             background_color: None,
             underline: None,

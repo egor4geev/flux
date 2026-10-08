@@ -9,14 +9,18 @@ use gpui::{
 };
 
 use crate::editor::Editor;
+use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
+use crate::ui;
 use crate::workspace::Workspace;
 
 actions!(go_to_line, [Toggle, Confirm, Dismiss]);
 
-const WIDTH: f32 = 420.;
-const HINT_TEXT_SIZE: f32 = 12.;
+const WIDTH: f32 = 460.;
+/// Шапка с полем и подвал с подсказкой — как у списков выбора.
+const HEADER_HEIGHT: f32 = 50.;
+const FOOTER_HEIGHT: f32 = 36.;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -56,7 +60,11 @@ impl GoToLine {
             let head = document.selection().primary().head;
             (text.len_lines(), text.char_to_line(head) + 1)
         };
-        let input = cx.new(|cx| TextInput::new("Line number or line:column", cx));
+        let input = cx.new(|cx| {
+            TextInput::new("Line number or line:column", cx)
+                .borderless()
+                .large()
+        });
         let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
             match event {
                 InputEvent::Changed => {
@@ -124,34 +132,51 @@ impl Focusable for GoToLine {
 impl Render for GoToLine {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        let (hint, color) = match &self.error {
-            Some(error) => (error.clone(), ui.error),
-            None => (
-                format!("Current: line {} of {}", self.current_line, self.line_count).into(),
-                ui.dim,
-            ),
+        let hint = match &self.error {
+            Some(error) => div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .text_color(ui.error)
+                .child(icon(IconName::Warning, ui.error).size(px(13.)))
+                .child(error.clone()),
+            None => div().child(format!(
+                "Current line {} of {}",
+                self.current_line, self.line_count
+            )),
         };
-        div()
+        ui::popover(ui)
             .key_context("GoToLine")
             .w(px(WIDTH))
             .flex()
             .flex_col()
-            .gap_1()
-            .p_2()
-            .bg(ui.panel)
-            .border_1()
-            .border_color(ui.border)
-            .rounded_lg()
-            .shadow_lg()
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(|_, _: &Dismiss, _, cx| cx.emit(DismissEvent)))
-            .child(self.input.clone())
             .child(
                 div()
-                    .px_1()
-                    .text_size(px(HINT_TEXT_SIZE))
-                    .text_color(color)
-                    .child(hint),
+                    .flex_none()
+                    .h(px(HEADER_HEIGHT))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(icon(IconName::Hash, ui.text_muted))
+                    .child(div().flex_1().min_w_0().child(self.input.clone())),
+            )
+            .child(ui::divider(ui))
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(FOOTER_HEIGHT))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(ui.dim)
+                    .child(div().min_w_0().truncate().child(hint))
+                    .child(ui::hint_bar(&[("↵", "go"), ("esc", "close")], ui)),
             )
     }
 }

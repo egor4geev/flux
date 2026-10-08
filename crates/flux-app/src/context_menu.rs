@@ -15,10 +15,12 @@ use gpui::{
 
 use crate::command_palette::keystroke_label;
 use crate::theme::{self, Theme};
+use crate::ui::{self, RADIUS_LG, RADIUS_SM};
 
-const MENU_MIN_WIDTH: f32 = 220.;
-const ITEM_HEIGHT: f32 = 24.;
-const TEXT_SIZE: f32 = 13.;
+const MENU_MIN_WIDTH: f32 = 240.;
+const ITEM_HEIGHT: f32 = 28.;
+/// Отступ пунктов от края меню; скругление пункта = скругление меню − отступ.
+const MENU_PADDING: f32 = 5.;
 
 actions!(context_menu, [SelectNext, SelectPrevious, Confirm, Cancel]);
 
@@ -187,7 +189,7 @@ impl Render for ContextMenu {
             .enumerate()
             .filter(|(index, item)| !(matches!(item, Item::Separator) && *index == last))
             .map(|(index, item)| match item {
-                Item::Separator => div().my_1().h(px(1.)).bg(ui.border).into_any_element(),
+                Item::Separator => ui::divider(ui).mx_1p5().my_1().into_any_element(),
                 Item::Entry {
                     label,
                     action,
@@ -197,27 +199,32 @@ impl Render for ContextMenu {
                     let selected = self.selected == Some(index);
                     div()
                         .id(index)
-                        .mx_1()
-                        .px_2()
                         .h(px(ITEM_HEIGHT))
+                        .px_2p5()
                         .flex()
                         .items_center()
                         .justify_between()
                         .gap_6()
-                        .rounded_sm()
+                        .rounded(px(RADIUS_SM))
                         .whitespace_nowrap()
-                        .text_color(if *enabled { ui.foreground } else { ui.dim })
+                        .text_color(if *enabled {
+                            ui.foreground
+                        } else {
+                            ui.text_disabled
+                        })
                         .when(*enabled && selected, |item| item.bg(ui.list_selected))
                         .when(*enabled && !selected, |item| {
-                            item.hover(|style| style.bg(ui.list_hover))
+                            item.hover(|style| style.bg(ui.hover))
                         })
                         .when(*enabled, |item| {
-                            item.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.run(index, window, cx)
-                            }))
+                            item.cursor_pointer().on_click(cx.listener(
+                                move |this, _: &ClickEvent, window, cx| this.run(index, window, cx),
+                            ))
                         })
                         .child(label.clone())
-                        .children(keys.map(|keys| div().flex_none().text_color(ui.dim).child(keys)))
+                        .children(keys.map(|keys| {
+                            ui::keys(&keys, ui).when(!*enabled, |keys| keys.opacity(0.5))
+                        }))
                         .into_any_element()
                 }
             })
@@ -225,22 +232,25 @@ impl Render for ContextMenu {
         div()
             .key_context("ContextMenu")
             .track_focus(&self.focus_handle)
+            .relative()
             .min_w(px(MENU_MIN_WIDTH))
-            .py_1()
+            .p(px(MENU_PADDING))
             .flex()
             .flex_col()
-            .bg(ui.panel)
+            .rounded(px(RADIUS_LG))
+            .bg(ui.elevated)
             .border_1()
-            .border_color(ui.border)
-            .rounded_md()
-            .shadow_lg()
-            .font_family(theme::FONT_FAMILY)
-            .text_size(px(TEXT_SIZE))
+            .border_color(ui.elevated_border)
+            .shadow(ui::popover_shadow(ui))
+            .font_family(theme::UI_FONT)
+            .text_size(px(theme::TEXT_MD))
+            .text_color(ui.foreground)
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(|_, _: &Cancel, _, cx| cx.emit(DismissEvent)))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
+            .child(ui::sheen(ui, RADIUS_LG))
             .children(items)
     }
 }

@@ -6,13 +6,17 @@
 
 use flux_search::{FuzzyMatch, match_list};
 use gpui::{
-    Action, AnyElement, App, Context, DismissEvent, FocusHandle, KeyBinding, Modifiers,
-    SharedString, Window, actions, div, prelude::*,
+    Action, AnyElement, App, Context, DismissEvent, FocusHandle, FontWeight, Hsla, KeyBinding,
+    Modifiers, SharedString, Window, actions, div, prelude::*, px,
 };
 
 use crate::picker::{Picker, PickerDelegate, highlighted_text};
-use crate::theme::Theme;
+use crate::theme::{self, Theme, UiColors};
+use crate::ui::{self, RADIUS_SM};
 use crate::workspace::Workspace;
+
+/// Колонка чипа пространства имён: названия команд встают ровным столбцом.
+const NAMESPACE_WIDTH: f32 = 108.;
 
 actions!(command_palette, [Toggle]);
 
@@ -28,7 +32,11 @@ pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
 }
 
 struct Command {
+    /// Полная подпись — по ней нечёткий поиск: «editor: move word left».
     label: String,
+    /// Длина пространства имён в символах (до «: »): позиции совпадений делятся между чипом
+    /// и названием.
+    namespace_chars: usize,
     /// Сочетание клавиш значками macOS, если есть.
     keys: Option<SharedString>,
     action: Box<dyn Action>,
@@ -38,6 +46,8 @@ pub struct CommandPalette {
     /// По алфавиту подписей.
     commands: Vec<Command>,
     matches: Vec<FuzzyMatch>,
+    /// Запрос пуст — в подвале всего команд, иначе «N of M».
+    query_empty: bool,
     /// Где был фокус до открытия: туда вернётся фокус и уйдёт действие.
     previous_focus: Option<FocusHandle>,
 }
@@ -66,8 +76,12 @@ impl CommandPalette {
                         .join(" ")
                         .into()
                 });
+                let label = humanize_action_name(action.name());
                 Command {
-                    label: humanize_action_name(action.name()),
+                    namespace_chars: label
+                        .find(": ")
+                        .map_or(0, |end| label[..end].chars().count()),
+                    label,
                     keys,
                     action,
                 }
@@ -77,6 +91,7 @@ impl CommandPalette {
         Self {
             commands,
             matches: Vec::new(),
+            query_empty: true,
             previous_focus,
         }
     }
@@ -94,6 +109,7 @@ impl PickerDelegate for CommandPalette {
     fn update_matches(&mut self, query: &str, _: &mut Window, _: &mut Context<Picker<Self>>) {
         let labels: Vec<&str> = self.commands.iter().map(|c| c.label.as_str()).collect();
         self.matches = match_list(query, &labels);
+        self.query_empty = query.trim().is_empty();
     }
 
     fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<Picker<Self>>) {
@@ -119,30 +135,140 @@ impl PickerDelegate for CommandPalette {
         let ui = Theme::ui(cx);
         let found = &self.matches[index];
         let command = &self.commands[found.index];
+        let parts = LabelParts::new(&command.label, command.namespace_chars, &found.positions);
+        let chip = (!parts.namespace.is_empty()).then(|| {
+            let color = namespace_color(&parts.namespace, &ui);
+            div()
+                .flex_none()
+                .max_w_full()
+                .h(px(20.))
+                .px_1p5()
+                .flex()
+                .items_center()
+                .rounded(px(RADIUS_SM))
+                .bg(UiColors::tint(color, 0.15))
+                .text_size(px(theme::TEXT_XS))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(color)
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(highlighted_text(
+                    title_case(&parts.namespace),
+                    &parts.namespace_positions,
+                    ui.foreground,
+                ))
+        });
         div()
             .w_full()
             .flex()
             .items_center()
-            .justify_between()
-            .gap_4()
-            .child(div().whitespace_nowrap().child(highlighted_text(
-                command.label.clone(),
-                &found.positions,
-                ui.match_text,
-            )))
-            .children(command.keys.clone().map(|keys| {
+            .gap_3()
+            .child(
                 div()
                     .flex_none()
+                    .w(px(NAMESPACE_WIDTH))
+                    .flex()
+                    .children(chip),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_color(ui.dim)
-                    .child(keys)
-            }))
+                    .child(highlighted_text(
+                        title_case(&parts.title),
+                        &parts.title_positions,
+                        ui.match_text,
+                    )),
+            )
+            .children(command.keys.as_ref().map(|keys| ui::keys(keys, ui)))
             .into_any_element()
+    }
+
+    fn render_footer(&self, _: &mut Window, _: &mut Context<Picker<Self>>) -> Option<AnyElement> {
+        let total = self.commands.len();
+        let text = if self.query_empty {
+            format!("{total} commands")
+        } else {
+            format!("{} of {total} commands", self.matches.len())
+        };
+        Some(text.into_any_element())
     }
 
     fn empty_message(&self) -> SharedString {
         "No matching commands".into()
     }
+
+    fn confirm_label(&self) -> &'static str {
+        "run"
+    }
+}
+
+/// Подпись, разделённая на пространство имён (чип) и название; позиции совпадений — в
+/// символах каждой части.
+#[derive(Debug, PartialEq, Eq)]
+struct LabelParts {
+    namespace: String,
+    namespace_positions: Vec<usize>,
+    title: String,
+    title_positions: Vec<usize>,
+}
+
+impl LabelParts {
+    /// `label` — «пространство: название»; `namespace_chars` — длина пространства имён
+    /// (0 — его нет); `positions` — символы подписи, совпавшие с запросом.
+    fn new(label: &str, namespace_chars: usize, positions: &[usize]) -> Self {
+        let title_start = if namespace_chars == 0 {
+            0
+        } else {
+            namespace_chars + 2
+        };
+        let namespace = label.chars().take(namespace_chars).collect();
+        let title = label.chars().skip(title_start).collect();
+        Self {
+            namespace,
+            namespace_positions: positions
+                .iter()
+                .copied()
+                .filter(|&p| p < namespace_chars)
+                .collect(),
+            title,
+            title_positions: positions
+                .iter()
+                .filter_map(|&p| p.checked_sub(title_start))
+                .collect(),
+        }
+    }
+}
+
+/// Цвет чипа: свой оттенок у каждой области приложения.
+fn namespace_color(namespace: &str, ui: &UiColors) -> Hsla {
+    match namespace {
+        "editor" => ui.blue,
+        "workspace" => ui.violet,
+        "file tree" => ui.green,
+        "find bar" => ui.amber,
+        "project search" => ui.orange,
+        "command palette" | "file finder" | "go to line" | "picker" => ui.teal,
+        _ => ui.indigo,
+    }
+}
+
+/// «move word left» → «Move Word Left». Длина в символах не меняется — позиции совпадений
+/// остаются верными (буква, которая при переводе в заглавную разрастается, остаётся как есть).
+fn title_case(text: &str) -> String {
+    let mut title = String::with_capacity(text.len());
+    let mut word_start = true;
+    for c in text.chars() {
+        let mut upper = c.to_uppercase();
+        match (word_start, upper.next(), upper.next()) {
+            (true, Some(single), None) => title.push(single),
+            _ => title.push(c),
+        }
+        word_start = c == ' ';
+    }
+    title
 }
 
 /// `editor::MoveWordLeft` → «editor: move word left», `command_palette::Toggle` →
@@ -247,6 +373,31 @@ mod tests {
         assert_eq!(humanize_action_name("a::b::SaveAs"), "a b: save as");
         assert_eq!(humanize_action_name("Quit"), "quit");
         assert_eq!(humanize_action_name("x::Utf16Range"), "x: utf16 range");
+    }
+
+    #[test]
+    fn titles_are_capitalized_word_by_word() {
+        assert_eq!(title_case("move word left"), "Move Word Left");
+        assert_eq!(title_case("file tree"), "File Tree");
+        assert_eq!(title_case("utf16 range"), "Utf16 Range");
+        assert_eq!(title_case(""), "");
+        // ß в заглавной — «SS»: длина изменилась бы, поэтому буква остаётся.
+        assert_eq!(title_case("ßa b"), "ßa B");
+    }
+
+    #[test]
+    fn match_positions_split_between_chip_and_title() {
+        // «editor: move left»: 0–5 — «editor», 6–7 — «: », с 8 — «move left».
+        let parts = LabelParts::new("editor: move left", 6, &[0, 1, 7, 8, 13]);
+        assert_eq!(parts.namespace, "editor");
+        assert_eq!(parts.namespace_positions, [0, 1]);
+        assert_eq!(parts.title, "move left");
+        assert_eq!(parts.title_positions, [0, 5]);
+        // Без пространства имён всё — название.
+        let parts = LabelParts::new("quit", 0, &[0, 3]);
+        assert_eq!(parts.namespace, "");
+        assert_eq!(parts.title, "quit");
+        assert_eq!(parts.title_positions, [0, 3]);
     }
 
     fn label(keystroke: &str) -> String {

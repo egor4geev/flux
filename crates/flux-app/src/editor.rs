@@ -11,14 +11,14 @@ use flux_core::{
 };
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection, Window,
-    actions, div, point, prelude::*, px,
+    FocusHandle, Focusable, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point,
+    Render, ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection, Window, actions,
+    div, point, prelude::*, px,
 };
 
 use crate::element::{EditorElement, LayoutCache};
 use crate::highlighter::{self, Highlighter, ParseMode};
-use crate::theme::{self, Theme, UiColors};
+use crate::theme::{self, Theme};
 
 actions!(
     editor,
@@ -130,6 +130,8 @@ pub enum Autoscroll {
     /// Если строка курсора не видна — поставить её в середину окна: переход к найденному,
     /// к строке, к результату поиска по проекту.
     Center,
+    /// Строку курсора — в середину окна, даже если она видна: превью поиска по проекту.
+    Middle,
 }
 
 /// Вхождения, найденные строкой поиска: по возрастанию, без пересечений; `active` — текущее
@@ -184,7 +186,22 @@ pub struct Editor {
     status: Option<SharedString>,
     /// Подсветка найденного строкой поиска.
     pub(crate) search: SearchHighlights,
+    /// Только для чтения (превью поиска по проекту): без фокуса, правок и мыши — кроме
+    /// колеса прокрутки; щелчки уходят родителю.
+    preview: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Статус документа для статус-бара окна: позиция, курсоры, язык, переводы строк и
+/// сообщение (ошибка ввода-вывода и т.п.).
+pub(crate) struct StatusInfo {
+    pub message: Option<SharedString>,
+    /// Строка и колонка с единицы.
+    pub line: usize,
+    pub column: usize,
+    pub cursors: usize,
+    pub language: String,
+    pub line_ending: &'static str,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -203,6 +220,27 @@ impl Editor {
                 cx.notify();
             }),
         ];
+        Self::build(document, focus_handle, false, subscriptions, cx)
+    }
+
+    /// Превью только для чтения: документ с подсветкой, без фокуса, курсора и правок. Место
+    /// показывает [`Editor::show_position`], найденное — [`Editor::set_search_highlights`].
+    pub fn preview(document: Document, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        let subscriptions = vec![cx.observe_global::<Theme>(|this, cx| {
+            this.highlighter.refresh_map(Theme::get(cx));
+            cx.notify();
+        })];
+        Self::build(document, focus_handle, true, subscriptions, cx)
+    }
+
+    fn build(
+        document: Document,
+        focus_handle: FocusHandle,
+        preview: bool,
+        subscriptions: Vec<Subscription>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let highlighter = Highlighter::new(document.path(), document.text());
         let mut editor = Self {
             document,
@@ -217,11 +255,21 @@ impl Editor {
             selecting: false,
             status: None,
             search: SearchHighlights::default(),
+            preview,
             _subscriptions: subscriptions,
         };
         // Первый разбор — сразу в фон: заодно там скомпилируется запрос подсветки.
         highlighter::parse(&mut editor, ParseMode::Background, cx);
         editor
+    }
+
+    /// Ставит курсор в `position` и прокручивает так, чтобы его строка была посередине
+    /// (превью: курсор не рисуется, строка подсвечена как текущая).
+    pub fn show_position(&mut self, position: usize, cx: &mut Context<Self>) {
+        let position = position.min(self.document.text().len_chars());
+        self.document.set_selection(Selection::point(position));
+        self.autoscroll = Some(Autoscroll::Middle);
+        cx.notify();
     }
 
     fn set_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
@@ -236,7 +284,10 @@ impl Editor {
     /// Двигает каждое выделение функцией из `movement`.
     fn motion(&mut self, cx: &mut Context<Self>, f: impl Fn(&Rope, Range) -> Range) {
         let text = self.document.text().clone();
-        let selection = self.document.selection().transform(|range| f(&text, *range));
+        let selection = self
+            .document
+            .selection()
+            .transform(|range| f(&text, *range));
         self.set_selection(selection, cx);
     }
 
@@ -394,7 +445,10 @@ impl Editor {
         if ranges.is_empty() {
             return;
         }
-        let ranges = ranges.into_iter().map(|r| Range::new(r.start, r.end)).collect();
+        let ranges = ranges
+            .into_iter()
+            .map(|r| Range::new(r.start, r.end))
+            .collect();
         self.set_selection(Selection::new(ranges, primary), cx);
         self.autoscroll = Some(Autoscroll::Center);
     }
@@ -497,7 +551,9 @@ impl Editor {
             "\n" => text,
             ending => text.replace('\n', ending),
         };
-        self.edit(EditKind::Other, cx, |rope, sel| edit::insert_text(rope, sel, &text));
+        self.edit(EditKind::Other, cx, |rope, sel| {
+            edit::insert_text(rope, sel, &text)
+        });
     }
 
     // --- Файл ---
@@ -609,7 +665,12 @@ impl Editor {
         Some(layout.position_for_point(self.document.text(), position))
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus_handle);
         let Some(pos) = self.position_for_mouse(event.position) else {
             return;
@@ -669,41 +730,23 @@ impl Editor {
     // --- Отображение ---
 
     /// Статус-бар окна для этого редактора: рисует его Workspace внизу окна, под панелями.
-    pub(crate) fn render_status_bar(&self, ui: UiColors) -> impl IntoElement + use<> {
+    /// Что показать в статус-баре окна про этот документ (рисует Workspace).
+    pub(crate) fn status_info(&self) -> StatusInfo {
         let text = self.document.text();
         let primary = self.document.selection().primary();
         let line = text.char_to_line(primary.head);
         let column = primary.head - line_start(text, line);
-        let cursors = self.document.selection().len();
-
-        let left = self.status.clone().unwrap_or_else(|| {
-            let modified = if self.document.is_modified() { " ●" } else { "" };
-            format!("{}{modified}", self.document.display_name()).into()
-        });
-        let mut right = format!("Ln {}, Col {}", line + 1, column + 1);
-        if cursors > 1 {
-            right.push_str(&format!("  ·  {cursors} cursors"));
+        StatusInfo {
+            message: self.status.clone(),
+            line: line + 1,
+            column: column + 1,
+            cursors: self.document.selection().len(),
+            language: self.highlighter.status(),
+            line_ending: match self.document.line_ending() {
+                "\r\n" => "CRLF",
+                _ => "LF",
+            },
         }
-        right.push_str("  ·  ");
-        right.push_str(&self.highlighter.status());
-        right.push_str(match self.document.line_ending() {
-            "\r\n" => "  ·  CRLF",
-            _ => "  ·  LF",
-        });
-
-        div()
-            .flex()
-            .flex_row()
-            .justify_between()
-            .px_3()
-            .py_1()
-            .text_size(px(12.))
-            .text_color(ui.dim)
-            .bg(ui.status_bar)
-            .border_t_1()
-            .border_color(ui.border)
-            .child(left)
-            .child(right)
     }
 
     // --- UTF-16 ↔ символы: IME и macOS считают позиции в UTF-16 ---
@@ -720,7 +763,10 @@ impl Editor {
     }
 
     /// Диапазон, который заменяет IME: явно заданный, текущая композиция или выделение.
-    fn input_range(&self, range_utf16: Option<Utf16Range<usize>>) -> Option<std::ops::Range<usize>> {
+    fn input_range(
+        &self,
+        range_utf16: Option<Utf16Range<usize>>,
+    ) -> Option<std::ops::Range<usize>> {
         range_utf16
             .map(|r| self.char_range(&r))
             .or_else(|| self.marked_range.clone())
@@ -753,8 +799,14 @@ impl EntityInputHandler for Editor {
         })
     }
 
-    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Utf16Range<usize>> {
-        self.marked_range.as_ref().map(|range| self.utf16_range(range))
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Utf16Range<usize>> {
+        self.marked_range
+            .as_ref()
+            .map(|range| self.utf16_range(range))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -861,28 +913,37 @@ impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use Direction::{Backward, Forward};
         let ui = Theme::ui(cx);
-        div()
-            .key_context("Editor")
-            .track_focus(&self.focus_handle)
-            .size_full()
+        // Превью не берёт фокус: иначе щелчок по нему увёл бы ввод из поля поиска.
+        let root = div().key_context("Editor");
+        let root = if self.preview {
+            root
+        } else {
+            root.track_focus(&self.focus_handle)
+        };
+        root.size_full()
             .flex()
             .flex_col()
-            .bg(ui.background)
             .text_color(ui.foreground)
-            .font_family(theme::FONT_FAMILY)
+            .font_family(theme::code_font())
             .text_size(px(theme::FONT_SIZE))
             // Движение
             .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
-                this.motion(cx, |t, r| movement::move_horizontally(t, r, Backward, false))
+                this.motion(cx, |t, r| {
+                    movement::move_horizontally(t, r, Backward, false)
+                })
             }))
             .on_action(cx.listener(|this, _: &MoveRight, _, cx| {
                 this.motion(cx, |t, r| movement::move_horizontally(t, r, Forward, false))
             }))
             .on_action(cx.listener(|this, _: &MoveUp, _, cx| {
-                this.motion(cx, |t, r| movement::move_vertically(t, r, Backward, 1, false))
+                this.motion(cx, |t, r| {
+                    movement::move_vertically(t, r, Backward, 1, false)
+                })
             }))
             .on_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                this.motion(cx, |t, r| movement::move_vertically(t, r, Forward, 1, false))
+                this.motion(cx, |t, r| {
+                    movement::move_vertically(t, r, Forward, 1, false)
+                })
             }))
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| {
                 this.motion(cx, |t, r| movement::move_horizontally(t, r, Backward, true))
@@ -891,7 +952,9 @@ impl Render for Editor {
                 this.motion(cx, |t, r| movement::move_horizontally(t, r, Forward, true))
             }))
             .on_action(cx.listener(|this, _: &SelectUp, _, cx| {
-                this.motion(cx, |t, r| movement::move_vertically(t, r, Backward, 1, true))
+                this.motion(cx, |t, r| {
+                    movement::move_vertically(t, r, Backward, 1, true)
+                })
             }))
             .on_action(cx.listener(|this, _: &SelectDown, _, cx| {
                 this.motion(cx, |t, r| movement::move_vertically(t, r, Forward, 1, true))
@@ -957,10 +1020,14 @@ impl Render for Editor {
             }))
             .on_action(cx.listener(|this, _: &Newline, _, cx| {
                 let ending = this.document.line_ending();
-                this.edit(EditKind::Other, cx, |t, s| edit::insert_newline(t, s, ending))
+                this.edit(EditKind::Other, cx, |t, s| {
+                    edit::insert_newline(t, s, ending)
+                })
             }))
             .on_action(cx.listener(|this, _: &Tab, _, cx| {
-                this.edit(EditKind::Insert, cx, |t, s| edit::insert_tab(t, s, theme::TAB_WIDTH))
+                this.edit(EditKind::Insert, cx, |t, s| {
+                    edit::insert_tab(t, s, theme::TAB_WIDTH)
+                })
             }))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.history_step(cx, Document::undo)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.history_step(cx, Document::redo)))
@@ -974,16 +1041,20 @@ impl Render for Editor {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .cursor(CursorStyle::IBeam)
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-                    .on_mouse_move(cx.listener(Self::on_mouse_move))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.selecting = false))
+                    .when(!self.preview, |area| {
+                        area.cursor(CursorStyle::IBeam)
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                            .on_mouse_move(cx.listener(Self::on_mouse_move))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, _| this.selecting = false),
+                            )
+                    })
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
                     .child(EditorElement::new(cx.entity())),
             )
     }
 }
-
 
 #[cfg(test)]
 mod tests {

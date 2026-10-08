@@ -1,43 +1,58 @@
-//! Поиск по проекту (cmd-shift-f): панель внизу окна — поле запроса, переключатели
-//! (регистр, целое слово, регулярное выражение) и результаты по файлам.
+//! Поиск по проекту (cmd-shift-f): окно поверх островов в духе «Find in Files» JetBrains —
+//! поле запроса с переключателями (регистр, целое слово, регулярное выражение), результаты
+//! по файлам (группы сворачиваются щелчком по заголовку) и превью выбранного вхождения.
 //!
 //! Поиск идёт в фоне (`flux_search::search_project`) после короткой паузы в наборе.
 //! Результаты приходят потоком, по файлу, и встают в список по порядку путей. Новый
 //! запрос отменяет прошлый поиск: выставляет его флаг отмены и бросает его задачу — поздние
-//! результаты до панели не доходят. Открыть вхождение просит Workspace
-//! ([`ProjectSearchEvent::Open`]): он открывает файл и выделяет место в нём.
+//! результаты до окна не доходят. Превью — настоящий редактор только для чтения
+//! (`Editor::preview`): файл читается с диска в фоне, найденное в нём подсвечено, строка
+//! выбранного вхождения — посередине. Открыть вхождение просит Workspace
+//! ([`ProjectSearchEvent::Open`]): он открывает файл и выделяет место в нём, окно закрывается.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use flux_core::Document;
 use flux_search::{
     FileMatches, GrepOptions, GrepSummary, LineMatch, QueryError, SearchQuery, search_project,
 };
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable, HighlightStyle,
-    KeyBinding, Render, ScrollStrategy, SharedString, StyledText, Subscription, Task,
-    UniformListScrollHandle, Window, actions, div, prelude::*, px, relative, uniform_list,
+    Animation, AnimationExt, AnyElement, App, ClickEvent, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, KeyBinding, Render, ScrollStrategy,
+    SharedString, StyledText, Subscription, Task, UniformListScrollHandle, Window, actions, div,
+    prelude::*, px, relative, uniform_list,
 };
 
+use crate::editor::Editor;
+use crate::icons::{IconName, file_icon, icon};
 use crate::input::{InputEvent, TextInput};
-use crate::theme::{Theme, UiColors};
+use crate::theme::{self, Theme, UiColors};
+use crate::ui;
 use crate::workspace::Location;
 
 /// Пауза после изменения запроса: слово, набранное подряд, — один поиск.
 const SEARCH_DELAY: Duration = Duration::from_millis(150);
-/// Доля высоты окна под панель и нижняя граница высоты.
-const PANEL_HEIGHT: f32 = 0.4;
-const PANEL_MIN_HEIGHT: f32 = 160.;
-const ROW_HEIGHT: f32 = 22.;
-const TEXT_SIZE: f32 = 13.;
-/// Колонка номеров строк (номер выровнен по правому краю).
-const LINE_NUMBER_WIDTH: f32 = 48.;
-/// Статус шире не растягивается: длинную ошибку регулярного выражения видно частично.
+/// Строка списка: заголовок файла и строка с вхождениями одной высоты (`uniform_list`).
+const ROW_HEIGHT: f32 = 26.;
+/// Колонка номеров строк (номер выровнен по правому краю) и отступ перед ней — номер
+/// стоит под значком файла.
+const LINE_NUMBER_WIDTH: f32 = 40.;
+const LINE_INDENT: f32 = 10.;
+/// Доля высоты окна под превью.
+const PREVIEW_HEIGHT: f32 = 0.46;
+const PREVIEW_HEADER_HEIGHT: f32 = 34.;
+/// Файлы крупнее не показываются в превью: чтение и разбор заняли бы заметное время.
+const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
+/// Шаг PageUp/PageDown — столько вхождений.
+const PAGE_MATCHES: usize = 10;
+/// Статус шире не растягивается: длинный текст видно частично.
 const STATUS_MAX_WIDTH: f32 = 420.;
 
 actions!(
@@ -47,8 +62,9 @@ actions!(
         Close,
         SelectNextMatch,
         SelectPreviousMatch,
+        SelectNextPage,
+        SelectPreviousPage,
         OpenMatch,
-        OpenMatchAndFocus,
         FocusEditor,
         ToggleCaseSensitive,
         ToggleWholeWord,
@@ -58,13 +74,15 @@ actions!(
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("cmd-shift-f", Toggle, Some("Workspace"))]);
-    // Контекст панели объемлет поле запроса: стрелки и Enter работают прямо во время набора.
+    // Контекст окна объемлет поле запроса: стрелки и Enter работают прямо во время набора.
     let context = Some("ProjectSearch");
     cx.bind_keys([
         KeyBinding::new("down", SelectNextMatch, context),
         KeyBinding::new("up", SelectPreviousMatch, context),
+        KeyBinding::new("pagedown", SelectNextPage, context),
+        KeyBinding::new("pageup", SelectPreviousPage, context),
         KeyBinding::new("enter", OpenMatch, context),
-        KeyBinding::new("cmd-enter", OpenMatchAndFocus, context),
+        KeyBinding::new("cmd-enter", OpenMatch, context),
         KeyBinding::new("escape", Close, context),
         KeyBinding::new("alt-cmd-c", ToggleCaseSensitive, context),
         KeyBinding::new("alt-cmd-w", ToggleWholeWord, context),
@@ -72,13 +90,12 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// Что панель просит у Workspace.
+/// Что окно просит у Workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectSearchEvent {
-    /// Открыть файл и выделить вхождение; `focus` — перевести фокус в редактор (иначе он
-    /// остаётся в панели).
+    /// Открыть файл и выделить вхождение; `focus` — перевести фокус в редактор.
     Open { location: Location, focus: bool },
-    /// Вернуть фокус в редактор (Esc в панели, панель закрылась).
+    /// Вернуть фокус в редактор (Esc, окно закрылось).
     FocusEditor,
 }
 
@@ -91,7 +108,7 @@ enum Row {
     Line { file: usize, line: usize },
 }
 
-/// Состояние поиска — для строки статуса.
+/// Состояние поиска — для статуса в шапке и пустого списка.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Status {
     /// Запрос пуст.
@@ -102,7 +119,26 @@ enum Status {
     Error(String),
 }
 
-/// Панель поиска по проекту: одна на Workspace; результаты живут, пока панель скрыта.
+/// Превью выбранного вхождения: его файл в редакторе только для чтения.
+#[derive(Default)]
+struct Preview {
+    /// Показанный файл (путь относительно корня) и его редактор.
+    shown: Option<(PathBuf, Entity<Editor>)>,
+    /// Файл, который читается сейчас; пока он читается, видно прежнее.
+    loading: Option<PathBuf>,
+    /// Вместо файла — сообщение: слишком большой, не прочитался.
+    message: Option<(PathBuf, SharedString)>,
+    /// Чтение в фоне; новое чтение заменяет (отменяет) прошлое.
+    _task: Option<Task<()>>,
+}
+
+impl Preview {
+    fn is_empty(&self) -> bool {
+        self.shown.is_none() && self.loading.is_none() && self.message.is_none()
+    }
+}
+
+/// Окно поиска по проекту: одно на Workspace; запрос и результаты живут, пока оно скрыто.
 pub struct ProjectSearch {
     root: Option<PathBuf>,
     open: bool,
@@ -112,7 +148,9 @@ pub struct ProjectSearch {
     regex: bool,
     /// Файлы с вхождениями — по порядку путей.
     results: Vec<FileMatches>,
-    /// Плоский список для отрисовки: заголовок файла, затем его строки.
+    /// Свёрнутые файлы (пути относительно корня): видны только их заголовки.
+    collapsed: HashSet<PathBuf>,
+    /// Плоский список для отрисовки: заголовок файла, затем его строки (у развёрнутых).
     rows: Vec<Row>,
     /// Сколько вхождений и файлов уже пришло — для статуса во время поиска.
     found: (usize, usize),
@@ -127,6 +165,9 @@ pub struct ProjectSearch {
     /// Пауза, поиск и приём результатов; сброс задачи — отмена.
     search: Option<Task<()>>,
     scroll: UniformListScrollHandle,
+    preview: Preview,
+    /// Запрос одной строкой — для пояснений в пустом списке (обновляется при отрисовке).
+    last_query: String,
     _subscription: Subscription,
 }
 
@@ -134,7 +175,11 @@ impl EventEmitter<ProjectSearchEvent> for ProjectSearch {}
 
 impl ProjectSearch {
     pub fn new(root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| TextInput::new("Search in project", cx));
+        let query = cx.new(|cx| {
+            TextInput::new("Search in project", cx)
+                .code()
+                .icon(IconName::Search)
+        });
         let subscription = cx.subscribe_in(&query, window, |this, _, event, _, cx| match event {
             InputEvent::Changed => this.schedule_search(cx),
         });
@@ -151,6 +196,7 @@ impl ProjectSearch {
             whole_word: false,
             regex: false,
             results: Vec::new(),
+            collapsed: HashSet::new(),
             rows: Vec::new(),
             found: (0, 0),
             selected: None,
@@ -159,15 +205,18 @@ impl ProjectSearch {
             cancel: Arc::new(AtomicBool::new(false)),
             search: None,
             scroll: UniformListScrollHandle::new(),
+            preview: Preview::default(),
+            last_query: String::new(),
             _subscription: subscription,
         }
     }
 
-    /// Новый корень проекта: результаты сбрасываются; открытая панель с запросом ищет заново.
+    /// Новый корень проекта: результаты сбрасываются; открытое окно с запросом ищет заново.
     pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
         self.root = root;
         self.cancel_search();
         self.clear_results();
+        self.preview = Preview::default();
         self.status = if self.root.is_some() {
             Status::Idle
         } else {
@@ -183,8 +232,8 @@ impl ProjectSearch {
         self.open
     }
 
-    /// cmd-shift-f: закрытую панель открыть и перевести фокус в поле запроса (`seed` — текст
-    /// для него, например выделение); открытую без фокуса — сфокусировать; в фокусе — закрыть.
+    /// cmd-shift-f: закрытое окно открыть и перевести фокус в поле запроса (`seed` — текст
+    /// для него, например выделение); открытое без фокуса — сфокусировать; в фокусе — закрыть.
     pub fn toggle(&mut self, seed: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let input_focus = self.query.focus_handle(cx);
         if self.open && input_focus.is_focused(window) {
@@ -198,7 +247,7 @@ impl ProjectSearch {
             Some(seed) if seed != current => {
                 self.query.update(cx, |query, cx| query.set_text(&seed, cx));
             }
-            // Файлы могли измениться, пока панель была скрыта.
+            // Файлы могли измениться, пока окно было скрыто.
             _ if reopened && !current.is_empty() => self.schedule_search(cx),
             _ => {}
         }
@@ -207,11 +256,18 @@ impl ProjectSearch {
         cx.notify();
     }
 
-    /// Esc (в панели или в редакторе, когда там снимать нечего), ×, cmd-shift-f из поля:
-    /// панель скрывается, фокус — в редактор.
+    /// Esc (в окне или в редакторе, когда там снимать нечего), ×, cmd-shift-f из поля,
+    /// открытие вхождения: окно скрывается, фокус — в редактор.
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.open = false;
         cx.emit(ProjectSearchEvent::FocusEditor);
+        cx.notify();
+    }
+
+    /// Скрыть без возврата фокуса: щелчок мимо окна, другое окно поверх (фокусом
+    /// распоряжается Workspace).
+    pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.open = false;
         cx.notify();
     }
 
@@ -233,11 +289,13 @@ impl ProjectSearch {
         let query = self.search_query(cx);
         let Some(root) = self.root.clone() else {
             self.clear_results();
+            self.preview = Preview::default();
             self.status = Status::NoRoot;
             return cx.notify();
         };
         if query.is_empty() {
             self.clear_results();
+            self.preview = Preview::default();
             self.status = Status::Idle;
             return cx.notify();
         }
@@ -265,7 +323,7 @@ impl ProjectSearch {
                     batch.push(file);
                 }
                 let added = this.update(cx, |this, cx| {
-                    this.add_files(batch);
+                    this.add_files(batch, cx);
                     cx.notify();
                 });
                 if added.is_err() {
@@ -274,7 +332,7 @@ impl ProjectSearch {
             }
             let summary = search.await;
             this.update(cx, |this, cx| {
-                this.finish(summary);
+                this.finish(summary, cx);
                 cx.notify();
             })
             .ok();
@@ -287,8 +345,10 @@ impl ProjectSearch {
         self.search = None;
     }
 
+    /// Сбрасывает результаты. Превью остаётся до прихода новых: пока идёт поиск, оно не мигает.
     fn clear_results(&mut self) {
         self.results.clear();
+        self.collapsed.clear();
         self.rows.clear();
         self.found = (0, 0);
         self.selected = None;
@@ -298,43 +358,51 @@ impl ProjectSearch {
 
     /// Пачка файлов от поиска: встают по порядку путей; выбор сохраняется на той же строке
     /// (если его делал пользователь) или переходит на первое совпадение.
-    fn add_files(&mut self, files: Vec<FileMatches>) {
+    fn add_files(&mut self, files: Vec<FileMatches>, cx: &mut Context<Self>) {
         let pinned = self
-            .selected
+            .selected_match()
             .filter(|_| self.selection_pinned)
-            .and_then(|row| match self.rows[row] {
-                Row::Line { file, line } => Some((self.results[file].path.clone(), line)),
-                Row::File(_) => None,
-            });
+            .map(|(file, line)| (self.results[file].path.clone(), line));
         for file in files {
             self.found.0 += match_count(&file);
             self.found.1 += 1;
             insert_sorted(&mut self.results, file);
         }
-        self.rows = flatten(&self.results);
+        self.rows = flatten(&self.results, &self.collapsed);
         self.selected = match pinned {
-            Some((path, line)) => self.rows.iter().position(|row| {
-                matches!(*row, Row::Line { file, line: l } if l == line && self.results[file].path == path)
-            }),
+            Some((path, line)) => self
+                .results
+                .iter()
+                .position(|file| file.path == path)
+                .and_then(|file| row_of(&self.rows, file, line)),
             None => next_match_row(&self.rows, None, true),
         };
+        self.sync_preview(cx);
     }
 
-    fn finish(&mut self, summary: Result<GrepSummary, QueryError>) {
+    fn finish(&mut self, summary: Result<GrepSummary, QueryError>, cx: &mut Context<Self>) {
         self.status = match summary {
             Ok(summary) => Status::Done(summary),
             Err(error) => Status::Error(error.message),
         };
+        self.sync_preview(cx);
     }
 
-    // --- Выбор и открытие ---
+    // --- Выбор, сворачивание и открытие ---
 
-    fn select_match(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(row) = next_match_row(&self.rows, self.selected, forward) else {
+    fn selected_match(&self) -> Option<(usize, usize)> {
+        match self.rows.get(self.selected?)? {
+            Row::Line { file, line } => Some((*file, *line)),
+            Row::File(_) => None,
+        }
+    }
+
+    /// Выбрать совпадение на `steps` шагов вперёд или назад (у края списка — крайнее).
+    fn select_match(&mut self, forward: bool, steps: usize, cx: &mut Context<Self>) {
+        let Some(row) = step_match_rows(&self.rows, self.selected, forward, steps) else {
             return;
         };
-        self.selected = Some(row);
-        self.selection_pinned = true;
+        self.select_row(row, cx);
         // Прокрутка на минимум: вниз — строка у нижнего края, вверх — у верхнего, вместе
         // с заголовком файла, если строка в файле первая.
         if forward {
@@ -346,19 +414,43 @@ impl ProjectSearch {
             };
             self.scroll.scroll_to_item(top, ScrollStrategy::Top);
         }
+    }
+
+    /// Выбор строки пользователем (стрелки, щелчок): он закрепляется, превью следует за ним.
+    fn select_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.selected = Some(row);
+        self.selection_pinned = true;
+        self.sync_preview(cx);
         cx.notify();
     }
 
-    /// Просит Workspace открыть выбранное вхождение; `focus` — перевести фокус в редактор.
-    fn open_selected(&mut self, focus: bool, cx: &mut Context<Self>) {
-        let (Some(root), Some(row)) = (&self.root, self.selected) else {
-            return;
-        };
-        let Row::Line { file, line } = self.rows[row] else {
+    /// Щелчок по заголовку файла: свернуть или развернуть его строки. Выбор из свёрнутого
+    /// файла переходит на ближайшее видимое совпадение.
+    fn toggle_file(&mut self, file: usize, cx: &mut Context<Self>) {
+        let selected = self.selected_match();
+        let path = self.results[file].path.clone();
+        if !self.collapsed.remove(&path) {
+            self.collapsed.insert(path);
+        }
+        self.rows = flatten(&self.results, &self.collapsed);
+        self.selected = selected.and_then(|(selected_file, line)| {
+            row_of(&self.rows, selected_file, line).or_else(|| fallback_row(&self.rows, file))
+        });
+        self.sync_preview(cx);
+        cx.notify();
+    }
+
+    /// Открывает выбранное вхождение в редакторе и закрывает окно.
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
+        let (Some(root), Some((file, line))) = (&self.root, self.selected_match()) else {
             return;
         };
         let location = location_for(root, &self.results[file], line);
-        cx.emit(ProjectSearchEvent::Open { location, focus });
+        cx.emit(ProjectSearchEvent::Open {
+            location,
+            focus: true,
+        });
+        self.close(cx);
     }
 
     /// Щелчок по переключателю или его сочетание: искать заново, фокус — в поле.
@@ -372,139 +464,253 @@ impl ProjectSearch {
         *value = !*value;
         self.schedule_search(cx);
         window.focus(&self.query.focus_handle(cx));
+        cx.notify();
+    }
+
+    // --- Превью ---
+
+    /// Превью следует за выбором: тот же файл — только найденное и место; другой — чтение
+    /// в фоне (пока читается, видно прежнее). Без выбора превью убирается — кроме поиска на
+    /// ходу, когда выбор вот-вот появится.
+    fn sync_preview(&mut self, cx: &mut Context<Self>) {
+        let Some((file, line)) = self.selected_match() else {
+            if self.status != Status::Searching {
+                self.preview = Preview::default();
+            }
+            return;
+        };
+        let path = self.results[file].path.clone();
+        if let Some((shown, editor)) = &self.preview.shown
+            && *shown == path
+        {
+            self.preview.loading = None;
+            self.preview.message = None;
+            let (matches, active) = preview_matches(&self.results[file], line);
+            let document_line = self.results[file].lines[line].line;
+            editor.update(cx, |editor, cx| {
+                let ranges: Vec<_> = matches
+                    .iter()
+                    .map(|(line, columns)| {
+                        editor.position(*line, columns.start)..editor.position(*line, columns.end)
+                    })
+                    .collect();
+                // У строки может не быть вхождений (окно длинной строки их обрезало).
+                let position = active
+                    .and_then(|active| ranges.get(active))
+                    .map_or_else(|| editor.position(document_line, 0), |r| r.start);
+                editor.set_search_highlights(ranges, active, cx);
+                editor.show_position(position, cx);
+            });
+            return;
+        }
+        let already = self.preview.loading.as_ref() == Some(&path)
+            || self
+                .preview
+                .message
+                .as_ref()
+                .is_some_and(|(failed, _)| *failed == path);
+        let Some(root) = self.root.clone().filter(|_| !already) else {
+            return;
+        };
+        self.preview.loading = Some(path.clone());
+        let absolute = root.join(&path);
+        let read = cx
+            .background_executor()
+            .spawn(async move { read_preview(&absolute) });
+        self.preview._task = Some(cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| this.preview_loaded(path, result, cx))
+                .ok();
+        }));
+    }
+
+    fn preview_loaded(
+        &mut self,
+        path: PathBuf,
+        result: Result<Document, SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        // Выбор успел уйти в другой файл — это чтение уже никому не нужно.
+        if self.preview.loading.as_ref() != Some(&path) {
+            return;
+        }
+        self.preview.loading = None;
+        match result {
+            Ok(document) => {
+                let editor = cx.new(|cx| Editor::preview(document, cx));
+                self.preview.message = None;
+                self.preview.shown = Some((path, editor));
+                self.sync_preview(cx);
+            }
+            Err(message) => self.preview.message = Some((path, message)),
+        }
+        cx.notify();
     }
 
     // --- Отображение ---
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
-        let (status, is_error) = status_text(&self.status, self.found);
+        let toggle = |id: &'static str,
+                      name: IconName,
+                      on: bool,
+                      label: &'static str,
+                      action: &dyn gpui::Action,
+                      option: fn(&mut ProjectSearch) -> &mut bool,
+                      cx: &mut Context<Self>| {
+            ui::toggle_button(id, name, on, ui)
+                .tooltip(ui::tooltip(label, ui::shortcut_for(action, window)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.toggle_option(option, window, cx)
+                }))
+        };
+        let title = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(icon(IconName::FindInFiles, ui.accent_text))
+            .child(
+                div()
+                    .text_size(px(theme::TEXT_LG))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Find in Files"),
+            );
+        let close = ui::icon_button("close", IconName::Close, ui)
+            .tooltip(ui::tooltip("Close", Some("⎋".into())))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close(cx)));
         div()
             .flex_none()
             .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(ui.border)
-            .child(div().flex_1().min_w_0().child(self.query.clone()))
-            .child(toggle_button(
-                "case",
-                "Aa",
-                self.case_sensitive,
-                ui,
-                cx,
-                |this| &mut this.case_sensitive,
-            ))
-            .child(toggle_button(
-                "word",
-                "ab",
-                self.whole_word,
-                ui,
-                cx,
-                |this| &mut this.whole_word,
-            ))
-            .child(toggle_button("regex", ".*", self.regex, ui, cx, |this| {
-                &mut this.regex
-            }))
+            .flex_col()
+            .gap_3()
+            .px_4()
+            .pt_3()
+            .pb_3()
             .child(
                 div()
-                    .flex_none()
-                    .max_w(px(STATUS_MAX_WIDTH))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_color(if is_error { ui.error } else { ui.dim })
-                    .child(status),
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(title)
+                    .child(div().flex_1())
+                    .child(self.render_status(ui))
+                    .child(close),
             )
             .child(
                 div()
-                    .id("close")
-                    .flex_none()
-                    .px_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_color(ui.dim)
-                    .hover(move |style| style.text_color(ui.foreground).bg(ui.list_hover))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close(cx)))
-                    .child("×"),
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().flex_1().min_w_0().mr_1().child(self.query.clone()))
+                    .child(toggle(
+                        "case",
+                        IconName::CaseSensitive,
+                        self.case_sensitive,
+                        "Match Case",
+                        &ToggleCaseSensitive,
+                        |this| &mut this.case_sensitive,
+                        cx,
+                    ))
+                    .child(toggle(
+                        "word",
+                        IconName::WholeWord,
+                        self.whole_word,
+                        "Words",
+                        &ToggleWholeWord,
+                        |this| &mut this.whole_word,
+                        cx,
+                    ))
+                    .child(toggle(
+                        "regex",
+                        IconName::Regex,
+                        self.regex,
+                        "Regex",
+                        &ToggleRegex,
+                        |this| &mut this.regex,
+                        cx,
+                    )),
             )
     }
 
-    fn render_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let ui = Theme::ui(cx);
-        let row = div()
-            .id(index)
-            .w_full()
-            .h(px(ROW_HEIGHT))
-            .px_3()
-            .flex()
-            .items_center()
-            .gap_2()
-            .overflow_hidden()
-            .whitespace_nowrap();
-        match self.rows[index] {
-            Row::File(file) => {
-                let file = &self.results[file];
-                let (name, dir) = split_path(&file.path);
-                row.child(div().flex_none().text_color(ui.foreground).child(name))
-                    .when(!dir.is_empty(), |row| {
-                        row.child(div().flex_none().text_color(ui.dim).child(dir))
-                    })
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(ui.dim)
-                            .child(match_count(file).to_string()),
-                    )
+    /// Статус в шапке: идёт поиск, сколько найдено, остановились на пределе. Ошибки и «ничего
+    /// не найдено» — крупно вместо списка.
+    fn render_status(&self, ui: UiColors) -> AnyElement {
+        let row = || {
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .max_w(px(STATUS_MAX_WIDTH))
+                .whitespace_nowrap()
+                .text_size(px(theme::TEXT_SM))
+        };
+        match &self.status {
+            Status::Searching => {
+                let (text, _) = status_text(&self.status, self.found);
+                row()
+                    .text_color(ui.text_muted)
+                    .child(pulse(ui))
+                    .child(text)
                     .into_any_element()
             }
-            Row::Line { file, line } => {
-                let selected = self.selected == Some(index);
-                let found = &self.results[file].lines[line];
-                let (text, ranges) = display_text(found);
-                let style = HighlightStyle {
-                    background_color: Some(ui.search_match),
-                    ..Default::default()
-                };
-                row.cursor_pointer()
-                    .when(selected, |row| row.bg(ui.list_selected))
-                    .when(!selected, |row| row.hover(|style| style.bg(ui.list_hover)))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.selected = Some(index);
-                        this.selection_pinned = true;
-                        this.open_selected(true, cx);
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(LINE_NUMBER_WIDTH))
-                            .flex()
-                            .justify_end()
-                            .text_color(ui.dim)
-                            .child((found.line + 1).to_string()),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_color(ui.foreground)
-                            .child(
-                                StyledText::new(text)
-                                    .with_highlights(ranges.into_iter().map(|r| (r, style))),
-                            ),
-                    )
-                    .into_any_element()
-            }
+            Status::Done(summary) if summary.truncated => row()
+                .text_color(ui.warning)
+                .child(icon(IconName::Warning, ui.warning).size(px(14.)))
+                .child(status_text(&self.status, self.found).0)
+                .into_any_element(),
+            Status::Done(summary) if summary.matches > 0 => row()
+                .text_color(ui.text_muted)
+                .child(ui::badge(
+                    count_label(summary.matches, "result"),
+                    ui.accent_text,
+                ))
+                .child(format!("in {}", count_label(summary.files_matched, "file")))
+                .into_any_element(),
+            _ => div().into_any_element(),
         }
     }
-}
 
-impl Render for ProjectSearch {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Список результатов или, если показывать нечего, крупное пояснение по центру.
+    fn render_results(&self, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
-        let list = uniform_list(
+        if let Some((name, title, detail, color)) = self.empty_state(ui) {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_8()
+                .child(
+                    div()
+                        .size(px(44.))
+                        .mb_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(ui::RADIUS_LG))
+                        .bg(UiColors::tint(color, 0.12))
+                        .child(icon(name, color).size(px(22.))),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::TEXT_LG))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ui.foreground)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .max_w(px(560.))
+                        .text_center()
+                        .text_size(px(theme::TEXT_SM))
+                        .text_color(ui.text_muted)
+                        .child(detail),
+                )
+                .into_any_element();
+        }
+        uniform_list(
             "project-search-results",
             self.rows.len(),
             cx.processor(|this, range: Range<usize>, _, cx| {
@@ -514,27 +720,339 @@ impl Render for ProjectSearch {
             }),
         )
         .track_scroll(self.scroll.clone())
-        .size_full();
-        div()
-            .key_context("ProjectSearch")
+        .size_full()
+        .into_any_element()
+    }
+
+    /// Значок, заголовок, пояснение и цвет пустого списка; `None` — показывать список.
+    fn empty_state(&self, ui: UiColors) -> Option<(IconName, String, String, gpui::Hsla)> {
+        if !self.rows.is_empty() {
+            return None;
+        }
+        let query = &self.last_query;
+        Some(match &self.status {
+            Status::NoRoot => (
+                IconName::Folder,
+                "No project folder".into(),
+                "Open a folder with ⌘O to search across its files.".into(),
+                ui.folder,
+            ),
+            Status::Idle => (
+                IconName::FindInFiles,
+                "Search across the project".into(),
+                "Type text to find it in every file. Match Case ⌥⌘C, Words ⌥⌘W and Regex ⌥⌘R \
+                 narrow the search; ↑↓ pick a result, ↵ opens it."
+                    .into(),
+                ui.accent_text,
+            ),
+            Status::Searching => (
+                IconName::Search,
+                "Searching…".into(),
+                format!("Looking for “{query}” in the project files."),
+                ui.text_muted,
+            ),
+            Status::Done(_) => (
+                IconName::Search,
+                format!("No results for “{query}”"),
+                "Check the spelling or turn off Match Case, Words and Regex.".into(),
+                ui.text_muted,
+            ),
+            Status::Error(message) => (
+                IconName::Error,
+                "Invalid regular expression".into(),
+                message.clone(),
+                ui.error,
+            ),
+        })
+    }
+
+    fn render_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let ui = Theme::ui(cx);
+        let row = div().id(index).w_full().h(px(ROW_HEIGHT)).px_1p5();
+        match self.rows[index] {
+            Row::File(file) => {
+                let matches = &self.results[file];
+                let collapsed = self.collapsed.contains(&matches.path);
+                let (name, dir) = split_path(&matches.path);
+                let chevron = if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                };
+                row.cursor_pointer()
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_file(file, cx)),
+                    )
+                    .child(
+                        div()
+                            .id(("file", index))
+                            .size_full()
+                            .px_1p5()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .rounded(px(ui::RADIUS_SM))
+                            .whitespace_nowrap()
+                            .hover(move |style| style.bg(ui.hover))
+                            .child(icon(chevron, ui.dim).size(px(12.)))
+                            .child(file_icon(&name, &ui).render().size(px(14.)))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ui.foreground)
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.dim)
+                                    .child(dir),
+                            )
+                            .child(div().flex_1())
+                            .child(ui::badge(match_count(matches).to_string(), ui.text_muted)),
+                    )
+                    .into_any_element()
+            }
+            Row::Line { file, line } => {
+                let selected = self.selected == Some(index);
+                let found = &self.results[file].lines[line];
+                let (text, ranges) = display_text(found);
+                // В выбранной строке вхождения — цветом текущего, как в превью.
+                let style = HighlightStyle {
+                    background_color: Some(if selected {
+                        ui.search_match_active
+                    } else {
+                        ui.search_match
+                    }),
+                    ..Default::default()
+                };
+                row.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    this.select_row(index, cx);
+                    if event.click_count() >= 2 {
+                        this.open_selected(cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .id(("line", index))
+                        .size_full()
+                        .pl(px(LINE_INDENT))
+                        .pr_2()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .rounded(px(ui::RADIUS_SM))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .font_family(theme::code_font())
+                        .text_size(px(theme::TEXT_MD))
+                        .when(selected, |line| line.bg(ui.list_selected))
+                        .when(!selected, |line| {
+                            line.hover(move |style| style.bg(ui.hover))
+                        })
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(LINE_NUMBER_WIDTH))
+                                .flex()
+                                .justify_end()
+                                .text_size(px(theme::TEXT_SM))
+                                .text_color(if selected { ui.text_muted } else { ui.dim })
+                                .child((found.line + 1).to_string()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_color(ui.foreground)
+                                .child(
+                                    StyledText::new(text)
+                                        .with_highlights(ranges.into_iter().map(|r| (r, style))),
+                                ),
+                        ),
+                )
+                .into_any_element()
+            }
+        }
+    }
+
+    /// Превью под списком: шапка (файл, строка, номер вхождения) и редактор только для чтения.
+    fn render_preview(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.preview.is_empty() {
+            return None;
+        }
+        let ui = Theme::ui(cx);
+        let selected = self.selected_match();
+        let path = match (selected, &self.preview.shown) {
+            (Some((file, _)), _) => self.results[file].path.clone(),
+            (None, Some((path, _))) => path.clone(),
+            (None, None) => self.preview.loading.clone().unwrap_or_default(),
+        };
+        let (name, dir) = split_path(&path);
+        let line = selected.map(|(file, line)| self.results[file].lines[line].line + 1);
+        let ordinal = selected.map(|(file, line)| match_ordinal(&self.results, file, line));
+        let message = |text: SharedString, color| {
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(theme::TEXT_SM))
+                .text_color(color)
+                .child(text)
+                .into_any_element()
+        };
+        let body = match (&self.preview.message, &self.preview.shown) {
+            (Some((failed, text)), _) if *failed == path => message(text.clone(), ui.text_muted),
+            (_, Some((shown, editor))) => div()
+                .size_full()
+                // Пока читается другой файл, прежний виден приглушённым.
+                .when(*shown != path, |body| body.opacity(0.45))
+                .child(editor.clone())
+                .into_any_element(),
+            _ => message("Loading…".into(), ui.dim),
+        };
+        let header = div()
             .flex_none()
-            .h(relative(PANEL_HEIGHT))
-            .min_h(px(PANEL_MIN_HEIGHT))
+            .h(px(PREVIEW_HEADER_HEIGHT))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_2()
+            .whitespace_nowrap()
+            .text_size(px(theme::TEXT_SM))
+            .child(file_icon(&name, &ui).render().size(px(14.)))
+            .child(
+                // Путь одной строкой: каталог приглушён, имя ярче, номер строки — акцентом.
+                div()
+                    .min_w_0()
+                    .flex()
+                    .overflow_hidden()
+                    .when(!dir.is_empty(), |path| {
+                        path.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(ui.dim)
+                                .child(format!("{dir}/")),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ui.foreground)
+                            .child(name),
+                    )
+                    .children(line.map(|line| {
+                        div()
+                            .flex_none()
+                            .text_color(ui.accent_text)
+                            .child(format!(":{line}"))
+                    })),
+            )
+            .child(div().flex_1())
+            .children(ordinal.map(|ordinal| {
+                div()
+                    .flex_none()
+                    .text_color(ui.dim)
+                    .child(format!("{ordinal} of {}", self.found.0))
+            }));
+        Some(
+            div()
+                .flex_none()
+                .h(relative(PREVIEW_HEIGHT))
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(ui.divider)
+                .bg(ui.input_background)
+                .child(header)
+                .child(
+                    div()
+                        .id("preview")
+                        .flex_1()
+                        .min_h_0()
+                        .pt_0p5()
+                        .pb_1()
+                        // Двойной щелчок по превью — открыть вхождение в редакторе.
+                        .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                            if event.click_count() >= 2 {
+                                this.open_selected(cx);
+                            }
+                        }))
+                        .child(body),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_footer(&self, ui: UiColors) -> impl IntoElement + use<> {
+        let root = self
+            .root
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned());
+        div()
+            .flex_none()
+            .h(px(40.))
+            .px_4()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_t_1()
+            .border_color(ui.divider)
+            .child(ui::hint_bar(
+                &[
+                    ("↑↓", "select"),
+                    ("↵", "open"),
+                    ("PgUp PgDn", "page"),
+                    ("esc", "close"),
+                ],
+                ui,
+            ))
+            .children(root.map(|root| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(ui.dim)
+                    .child("in")
+                    .child(icon(IconName::Folder, ui.folder).size(px(13.)))
+                    .child(div().text_color(ui.text_muted).child(root))
+            }))
+    }
+}
+
+impl Render for ProjectSearch {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        self.last_query = single_line_label(&self.query.read(cx).text());
+        let header = self.render_header(window, cx);
+        let results = self.render_results(cx);
+        let preview = self.render_preview(cx);
+        ui::popover(ui)
+            .key_context("ProjectSearch")
+            .size_full()
             .flex()
             .flex_col()
-            .bg(ui.panel)
-            .border_t_1()
-            .border_color(ui.border)
-            .text_size(px(TEXT_SIZE))
-            .text_color(ui.foreground)
-            .on_action(cx.listener(|this, _: &SelectNextMatch, _, cx| this.select_match(true, cx)))
             .on_action(
-                cx.listener(|this, _: &SelectPreviousMatch, _, cx| this.select_match(false, cx)),
+                cx.listener(|this, _: &SelectNextMatch, _, cx| this.select_match(true, 1, cx)),
             )
-            .on_action(cx.listener(|this, _: &OpenMatch, _, cx| this.open_selected(false, cx)))
             .on_action(
-                cx.listener(|this, _: &OpenMatchAndFocus, _, cx| this.open_selected(true, cx)),
+                cx.listener(|this, _: &SelectPreviousMatch, _, cx| this.select_match(false, 1, cx)),
             )
+            .on_action(cx.listener(|this, _: &SelectNextPage, _, cx| {
+                this.select_match(true, PAGE_MATCHES, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectPreviousPage, _, cx| {
+                this.select_match(false, PAGE_MATCHES, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenMatch, _, cx| this.open_selected(cx)))
             .on_action(
                 cx.listener(|_, _: &FocusEditor, _, cx| cx.emit(ProjectSearchEvent::FocusEditor)),
             )
@@ -548,8 +1066,17 @@ impl Render for ProjectSearch {
             .on_action(cx.listener(|this, _: &ToggleRegex, window, cx| {
                 this.toggle_option(|this| &mut this.regex, window, cx)
             }))
-            .child(self.render_header(cx))
-            .child(div().flex_1().min_h_0().py_1().child(list))
+            .child(header)
+            .child(ui::divider(ui))
+            .child(div().flex_1().min_h_0().py_1p5().child(results))
+            .children(preview)
+            .child(self.render_footer(ui))
+    }
+}
+
+impl Focusable for ProjectSearch {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.query.focus_handle(cx)
     }
 }
 
@@ -559,28 +1086,30 @@ impl Drop for ProjectSearch {
     }
 }
 
-/// Переключатель в шапке: `Aa`, `ab`, `.*`; включённый — с фоном `toggle_active`.
-fn toggle_button(
-    id: &'static str,
-    label: &'static str,
-    on: bool,
-    ui: UiColors,
-    cx: &mut Context<ProjectSearch>,
-    option: fn(&mut ProjectSearch) -> &mut bool,
-) -> impl IntoElement + use<> {
+/// Пульсирующая точка «идёт поиск».
+fn pulse(ui: UiColors) -> impl IntoElement {
     div()
-        .id(id)
         .flex_none()
-        .px_1p5()
-        .rounded_sm()
-        .cursor_pointer()
-        .text_color(if on { ui.foreground } else { ui.dim })
-        .when(on, |button| button.bg(ui.toggle_active))
-        .when(!on, |button| button.hover(|style| style.bg(ui.list_hover)))
-        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-            this.toggle_option(option, window, cx)
-        }))
-        .child(label)
+        .size(px(7.))
+        .rounded(px(4.))
+        .bg(ui.accent)
+        .with_animation(
+            "searching",
+            Animation::new(Duration::from_millis(900)).repeat(),
+            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+        )
+}
+
+/// Читает файл для превью (в фоновом потоке); слишком большой — сообщение вместо текста.
+fn read_preview(path: &Path) -> Result<Document, SharedString> {
+    let size = std::fs::metadata(path)
+        .map_err(|err| SharedString::from(err.to_string()))?
+        .len();
+    if size > MAX_PREVIEW_BYTES {
+        let megabytes = size as f64 / (1024. * 1024.);
+        return Err(format!("{megabytes:.1} MB — too large to preview").into());
+    }
+    Document::open(path).map_err(|err| err.to_string().into())
 }
 
 // --- Чистая логика ---
@@ -592,14 +1121,20 @@ fn insert_sorted(results: &mut Vec<FileMatches>, file: FileMatches) -> usize {
     index
 }
 
-/// Плоский список: заголовок каждого файла, за ним его строки с вхождениями.
-fn flatten(results: &[FileMatches]) -> Vec<Row> {
+/// Плоский список: заголовок каждого файла, за ним — его строки с вхождениями, если файл
+/// не свёрнут.
+fn flatten(results: &[FileMatches], collapsed: &HashSet<PathBuf>) -> Vec<Row> {
     results
         .iter()
         .enumerate()
         .flat_map(|(file, matches)| {
+            let lines = if collapsed.contains(&matches.path) {
+                0
+            } else {
+                matches.lines.len()
+            };
             std::iter::once(Row::File(file))
-                .chain((0..matches.lines.len()).map(move |line| Row::Line { file, line }))
+                .chain((0..lines).map(move |line| Row::Line { file, line }))
         })
         .collect()
 }
@@ -615,9 +1150,78 @@ fn next_match_row(rows: &[Row], from: Option<usize>, forward: bool) -> Option<us
     }
 }
 
+/// До `steps` шагов по совпадениям от `from`; у края списка — крайнее совпадение. `None` —
+/// шагать некуда (выбор остаётся).
+fn step_match_rows(
+    rows: &[Row],
+    from: Option<usize>,
+    forward: bool,
+    steps: usize,
+) -> Option<usize> {
+    let mut current = from;
+    let mut moved = None;
+    for _ in 0..steps.max(1) {
+        match next_match_row(rows, current, forward) {
+            Some(next) => {
+                current = Some(next);
+                moved = Some(next);
+            }
+            None => break,
+        }
+        if from.is_none() {
+            break;
+        }
+    }
+    moved
+}
+
+/// Строка списка с вхождениями строки `line` файла `file`, если она видна.
+fn row_of(rows: &[Row], file: usize, line: usize) -> Option<usize> {
+    rows.iter().position(|row| *row == Row::Line { file, line })
+}
+
+/// Куда уходит выбор из свёрнутого файла `file`: на первое совпадение после его заголовка,
+/// а если ниже ничего нет — на последнее перед ним.
+fn fallback_row(rows: &[Row], file: usize) -> Option<usize> {
+    let header = rows.iter().position(|row| *row == Row::File(file))?;
+    next_match_row(rows, Some(header), true).or_else(|| next_match_row(rows, Some(header), false))
+}
+
 /// Сколько вхождений в файле.
 fn match_count(file: &FileMatches) -> usize {
     file.lines.iter().map(|line| line.ranges.len().max(1)).sum()
+}
+
+/// Номер (с единицы) первого вхождения строки `line` файла `file` среди всех найденных —
+/// «3 of 72» в превью; считается так же, как общий счётчик (`match_count`).
+fn match_ordinal(results: &[FileMatches], file: usize, line: usize) -> usize {
+    let before_files: usize = results[..file].iter().map(match_count).sum();
+    let before_lines: usize = results[file].lines[..line]
+        .iter()
+        .map(|line| line.ranges.len().max(1))
+        .sum();
+    before_files + before_lines + 1
+}
+
+/// Вхождения файла для превью — (строка, колонки в символах настоящей строки) по порядку —
+/// и номер текущего: первого вхождения в строке `selected`.
+fn preview_matches(
+    file: &FileMatches,
+    selected: usize,
+) -> (Vec<(usize, Range<usize>)>, Option<usize>) {
+    let mut matches = Vec::new();
+    let mut active = None;
+    for (index, found) in file.lines.iter().enumerate() {
+        for (i, range) in found.ranges.iter().enumerate() {
+            if index == selected && i == 0 {
+                active = Some(matches.len());
+            }
+            let start = found.column_offset + range.start;
+            let end = found.column_offset + range.end;
+            matches.push((found.line, start..end));
+        }
+    }
+    (matches, active)
 }
 
 /// Куда перейти по строке совпадения: на первое вхождение в ней.
@@ -715,12 +1319,29 @@ fn status_text(status: &Status, found: (usize, usize)) -> (SharedString, bool) {
 
 /// «3 results in 2 files», «1 result in 1 file».
 fn results_label(matches: usize, files: usize) -> String {
-    let plural = |n: usize| if n == 1 { "" } else { "s" };
     format!(
-        "{matches} result{} in {files} file{}",
-        plural(matches),
-        plural(files)
+        "{} in {}",
+        count_label(matches, "result"),
+        count_label(files, "file")
     )
+}
+
+/// «1 result», «3 results».
+fn count_label(count: usize, noun: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {noun}{plural}")
+}
+
+/// Запрос для пояснений: одна строка, длинный — сокращён.
+fn single_line_label(query: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let line = query.lines().next().unwrap_or_default();
+    if line.chars().count() <= MAX_CHARS {
+        return line.to_string();
+    }
+    let mut short: String = line.chars().take(MAX_CHARS - 1).collect();
+    short.push('…');
+    short
 }
 
 #[cfg(test)]
@@ -748,6 +1369,10 @@ mod tests {
         }
     }
 
+    fn expanded() -> HashSet<PathBuf> {
+        HashSet::new()
+    }
+
     #[test]
     fn files_are_kept_in_path_order() {
         let mut results = Vec::new();
@@ -764,7 +1389,7 @@ mod tests {
 
     #[test]
     fn rows_are_headers_followed_by_lines() {
-        let rows = flatten(&[file("a.rs", 2), file("b.rs", 1)]);
+        let rows = flatten(&[file("a.rs", 2), file("b.rs", 1)], &expanded());
         assert_eq!(
             rows,
             [
@@ -778,8 +1403,21 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_files_show_only_their_headers() {
+        let collapsed = HashSet::from([PathBuf::from("a.rs")]);
+        let rows = flatten(&[file("a.rs", 2), file("b.rs", 1)], &collapsed);
+        assert_eq!(
+            rows,
+            [Row::File(0), Row::File(1), Row::Line { file: 1, line: 0 }]
+        );
+        // Стрелки проходят мимо свёрнутого файла.
+        assert_eq!(next_match_row(&rows, None, true), Some(2));
+        assert_eq!(next_match_row(&rows, Some(2), false), None);
+    }
+
+    #[test]
     fn selection_skips_headers_and_stops_at_the_edges() {
-        let rows = flatten(&[file("a.rs", 2), file("b.rs", 1)]);
+        let rows = flatten(&[file("a.rs", 2), file("b.rs", 1)], &expanded());
         assert_eq!(next_match_row(&rows, None, true), Some(1));
         assert_eq!(next_match_row(&rows, None, false), Some(1));
         assert_eq!(next_match_row(&rows, Some(1), true), Some(2));
@@ -788,6 +1426,73 @@ mod tests {
         assert_eq!(next_match_row(&rows, Some(4), false), Some(2));
         assert_eq!(next_match_row(&rows, Some(1), false), None);
         assert_eq!(next_match_row(&[], None, true), None);
+    }
+
+    #[test]
+    fn pages_step_over_matches_and_stop_at_the_edges() {
+        // Строки: 0 — a.rs, 1..=4 — его строки, 5 — b.rs, 6..=8 — его строки.
+        let rows = flatten(&[file("a.rs", 4), file("b.rs", 3)], &expanded());
+        assert_eq!(step_match_rows(&rows, Some(1), true, 3), Some(4));
+        assert_eq!(step_match_rows(&rows, Some(1), true, 4), Some(6));
+        assert_eq!(step_match_rows(&rows, Some(2), true, 10), Some(8));
+        assert_eq!(step_match_rows(&rows, Some(7), false, 10), Some(1));
+        assert_eq!(step_match_rows(&rows, Some(8), true, 10), None);
+        // Без выбора — первое совпадение, сколько бы шагов ни просили.
+        assert_eq!(step_match_rows(&rows, None, true, 10), Some(1));
+        assert_eq!(step_match_rows(&[], None, true, 10), None);
+    }
+
+    #[test]
+    fn collapsing_the_selected_file_moves_the_selection() {
+        let results = [file("a.rs", 2), file("b.rs", 1), file("c.rs", 1)];
+        // Свернули b.rs: выбор уходит на первое совпадение ниже — в c.rs.
+        let collapsed = HashSet::from([PathBuf::from("b.rs")]);
+        let rows = flatten(&results, &collapsed);
+        assert_eq!(fallback_row(&rows, 1), row_of(&rows, 2, 0));
+        // Свернули последний файл: ниже ничего — на последнее совпадение выше.
+        let collapsed = HashSet::from([PathBuf::from("c.rs")]);
+        let rows = flatten(&results, &collapsed);
+        assert_eq!(fallback_row(&rows, 2), row_of(&rows, 1, 0));
+        // Свёрнуто всё — выбора нет.
+        let collapsed: HashSet<_> = ["a.rs", "b.rs", "c.rs"].map(PathBuf::from).into();
+        let rows = flatten(&results, &collapsed);
+        assert_eq!(fallback_row(&rows, 0), None);
+        assert_eq!(row_of(&rows, 0, 0), None);
+    }
+
+    #[test]
+    fn preview_marks_every_match_and_the_selected_one() {
+        let mut found = file("a.rs", 0);
+        found.lines = vec![
+            line(3, "foo foo", &[span(0, 3), span(4, 7)]),
+            LineMatch {
+                line: 9,
+                text: "foo".into(),
+                column_offset: 100,
+                ranges: vec![span(0, 3)],
+            },
+        ];
+        let (matches, active) = preview_matches(&found, 1);
+        assert_eq!(
+            matches,
+            [(3, span(0, 3)), (3, span(4, 7)), (9, span(100, 103))]
+        );
+        assert_eq!(active, Some(2));
+        // Текущее — первое вхождение выбранной строки.
+        assert_eq!(preview_matches(&found, 0).1, Some(0));
+    }
+
+    #[test]
+    fn ordinal_counts_matches_before_the_line() {
+        let mut first = file("a.rs", 0);
+        first.lines = vec![
+            line(0, "aa", &[span(0, 1), span(1, 2)]),
+            line(5, "a", &[span(0, 1)]),
+        ];
+        let results = [first, file("b.rs", 3)];
+        assert_eq!(match_ordinal(&results, 0, 0), 1);
+        assert_eq!(match_ordinal(&results, 0, 1), 3);
+        assert_eq!(match_ordinal(&results, 1, 2), 6);
     }
 
     #[test]
@@ -870,6 +1575,16 @@ mod tests {
         let (message, is_error) = status_text(&Status::Error("unclosed group".into()), (0, 0));
         assert_eq!((message.as_ref(), is_error), ("unclosed group", true));
         assert!(!status_text(&Status::NoRoot, (0, 0)).1);
+    }
+
+    #[test]
+    fn long_queries_are_shortened_for_messages() {
+        assert_eq!(single_line_label("fn render"), "fn render");
+        assert_eq!(single_line_label("a\nb"), "a");
+        let long = "x".repeat(80);
+        let short = single_line_label(&long);
+        assert_eq!(short.chars().count(), 60);
+        assert!(short.ends_with('…'));
     }
 
     #[test]

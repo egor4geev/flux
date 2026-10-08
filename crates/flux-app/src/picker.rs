@@ -12,16 +12,21 @@ use gpui::{
     Subscription, UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 
+use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
+use crate::ui::{self, RADIUS_MD};
 
 /// Высота строки списка.
-pub const ROW_HEIGHT: f32 = 26.;
+const ROW_HEIGHT: f32 = 34.;
 /// Сколько строк видно без прокрутки.
-const MAX_VISIBLE_ROWS: usize = 12;
-const PICKER_WIDTH: f32 = 560.;
-/// Кегль строк списка.
-const LIST_TEXT_SIZE: f32 = 13.;
+const MAX_VISIBLE_ROWS: usize = 10;
+const PICKER_WIDTH: f32 = 640.;
+/// Шапка с запросом и подвал с подсказками.
+const HEADER_HEIGHT: f32 = 50.;
+const FOOTER_HEIGHT: f32 = 36.;
+/// Отступ строк от краёв панели и списка от шапки и подвала.
+const LIST_INSET: f32 = 6.;
 
 actions!(
     picker,
@@ -77,7 +82,7 @@ pub trait PickerDelegate: Sized + 'static {
         cx: &mut Context<Picker<Self>>,
     ) -> AnyElement;
 
-    /// Строка под списком: например, «1234 files · indexing…».
+    /// Левая часть подвала: например, «1234 files · indexing…».
     fn render_footer(
         &self,
         _window: &mut Window,
@@ -89,6 +94,11 @@ pub trait PickerDelegate: Sized + 'static {
     /// Текст вместо пустого списка.
     fn empty_message(&self) -> SharedString {
         "No matches".into()
+    }
+
+    /// Что делает Enter — подпись в подсказке подвала («open», «run»).
+    fn confirm_label(&self) -> &'static str {
+        "open"
     }
 }
 
@@ -104,7 +114,11 @@ impl<D: PickerDelegate> EventEmitter<DismissEvent> for Picker<D> {}
 
 impl<D: PickerDelegate> Picker<D> {
     pub fn new(mut delegate: D, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| TextInput::new(delegate.placeholder(), cx));
+        let query = cx.new(|cx| {
+            TextInput::new(delegate.placeholder(), cx)
+                .borderless()
+                .large()
+        });
         let subscription = cx.subscribe_in(&query, window, Self::on_query_event);
         delegate.update_matches("", window, cx);
         Self {
@@ -191,21 +205,30 @@ impl<D: PickerDelegate> Picker<D> {
     ) -> AnyElement {
         let ui = Theme::ui(cx);
         let selected = index == self.selected;
+        // Внешний блок — полная ширина списка (по нему uniform_list меряет высоту строки),
+        // внутренний — скруглённая подложка с отступом от краёв панели.
         div()
-            .id(index)
             .w_full()
             .h(px(ROW_HEIGHT))
-            .px_3()
-            .flex()
-            .items_center()
-            .overflow_hidden()
-            .when(selected, |row| row.bg(ui.list_selected))
-            .when(!selected, |row| row.hover(|style| style.bg(ui.list_hover)))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.selected = index;
-                this.confirm(&Confirm, window, cx);
-            }))
-            .child(self.delegate.render_match(index, selected, window, cx))
+            .px(px(LIST_INSET))
+            .child(
+                div()
+                    .id(index)
+                    .size_full()
+                    .px_2p5()
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .rounded(px(RADIUS_MD))
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(ui.list_selected))
+                    .when(!selected, |row| row.hover(|style| style.bg(ui.hover)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.selected = index;
+                        this.confirm(&Confirm, window, cx);
+                    }))
+                    .child(self.delegate.render_match(index, selected, window, cx)),
+            )
             .into_any_element()
     }
 }
@@ -223,9 +246,13 @@ impl<D: PickerDelegate> Render for Picker<D> {
         let count = self.delegate.match_count();
         let list = if count == 0 {
             div()
-                .px_3()
-                .py_2()
+                .h(px(ROW_HEIGHT * 2.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
                 .text_color(ui.dim)
+                .child(icon(IconName::Search, ui.dim).size(px(14.)))
                 .child(self.delegate.empty_message())
                 .into_any_element()
         } else {
@@ -244,42 +271,52 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .into_any_element()
         };
         let footer = self.delegate.render_footer(window, cx);
-        div()
+        ui::popover(ui)
             .key_context("Picker")
             .w(px(PICKER_WIDTH))
             .flex()
             .flex_col()
-            .bg(ui.panel)
-            .border_1()
-            .border_color(ui.border)
-            .rounded_lg()
-            .shadow_lg()
-            .overflow_hidden()
-            .text_size(px(LIST_TEXT_SIZE))
-            .text_color(ui.foreground)
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_next_page))
             .on_action(cx.listener(Self::select_previous_page))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(|_, _: &Dismiss, _, cx| cx.emit(DismissEvent)))
-            .child(div().p_2().child(self.query.clone()))
             .child(
                 div()
-                    .border_t_1()
-                    .border_color(ui.border)
-                    .py_1()
-                    .child(list),
+                    .flex_none()
+                    .h(px(HEADER_HEIGHT))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(icon(IconName::Search, ui.text_muted))
+                    .child(div().flex_1().min_w_0().child(self.query.clone())),
             )
-            .children(footer.map(|footer| {
+            .child(ui::divider(ui))
+            .child(div().py(px(LIST_INSET)).child(list))
+            .child(ui::divider(ui))
+            .child(
                 div()
-                    .px_3()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(ui.border)
+                    .flex_none()
+                    .h(px(FOOTER_HEIGHT))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .text_size(px(theme::TEXT_SM))
                     .text_color(ui.dim)
-                    .child(footer)
-            }))
+                    .child(div().min_w_0().truncate().children(footer))
+                    .child(ui::hint_bar(
+                        &[
+                            ("↑↓", "navigate"),
+                            ("↵", self.delegate.confirm_label()),
+                            ("esc", "close"),
+                        ],
+                        ui,
+                    )),
+            )
     }
 }
 

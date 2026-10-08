@@ -8,12 +8,17 @@ mod file_tree;
 mod find_bar;
 mod go_to_line;
 mod highlighter;
+mod icons;
 mod input;
+mod launchpad;
 mod picker;
 mod project_search;
+mod recent;
 #[cfg(feature = "scenario")]
 mod scenario;
+mod start_screen;
 mod theme;
+mod ui;
 mod workspace;
 
 use std::path::{PathBuf, absolute};
@@ -21,7 +26,8 @@ use std::path::{PathBuf, absolute};
 use flux_search::find_vcs_root;
 
 use gpui::{
-    App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+    App, AppContext, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, point, px, size,
 };
 
 use theme::Theme;
@@ -36,51 +42,57 @@ fn main() {
         .map(|path| absolute(&path).unwrap_or(path))
         .collect();
     let (dirs, paths): (Vec<_>, Vec<_>) = args.into_iter().partition(|path| path.is_dir());
-    // Только каталог (`flux .`) — пустое окно проекта, без безымянного документа.
-    let untitled = dirs.is_empty();
     let root = project_root(dirs);
 
-    Application::new().run(move |cx: &mut App| {
-        cx.set_global(Theme::github_dark());
-        editor::bind_keys(cx);
-        workspace::init(cx);
-        input::init(cx);
-        picker::init(cx);
-        command_palette::init(cx);
-        context_menu::init(cx);
-        file_finder::init(cx);
-        file_tree::init(cx);
-        find_bar::init(cx);
-        go_to_line::init(cx);
-        project_search::init(cx);
+    Application::new()
+        .with_assets(icons::Assets)
+        .run(move |cx: &mut App| {
+            cx.set_global(Theme::flux_night());
+            theme::init_fonts(cx);
+            editor::bind_keys(cx);
+            workspace::init(cx);
+            input::init(cx);
+            picker::init(cx);
+            command_palette::init(cx);
+            context_menu::init(cx);
+            file_finder::init(cx);
+            file_tree::init(cx);
+            find_bar::init(cx);
+            go_to_line::init(cx);
+            project_search::init(cx);
 
-        let bounds = Bounds::centered(None, size(px(1100.), px(750.)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("flux".into()),
+            let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
+            // Своя шапка на стеклянной рамке: системный заголовок прозрачен, светофор — по
+            // центру шапки, за окном — размытый рабочий стол.
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("flux".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(16.), px(13.))),
+                }),
+                window_background: WindowBackgroundAppearance::Blurred,
+                window_min_size: Some(size(px(720.), px(480.))),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
-        #[cfg(feature = "scenario")]
-        let options = scenario::window_options(options);
-        let _window = cx
-            .open_window(options, |window, cx| {
-                cx.new(|cx| Workspace::new(root, paths, untitled, window, cx))
-            })
-            .expect("failed to open window");
-        #[cfg(feature = "scenario")]
-        scenario::run(_window.into(), cx);
+            };
+            #[cfg(feature = "scenario")]
+            let options = scenario::window_options(options);
+            let _window = cx
+                .open_window(options, |window, cx| {
+                    cx.new(|cx| Workspace::new(root, paths, window, cx))
+                })
+                .expect("failed to open window");
+            #[cfg(feature = "scenario")]
+            scenario::run(_window.into(), cx);
 
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-        cx.activate(true);
-    });
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            cx.activate(true);
+        });
 }
 
 /// Корень проекта: каталог из аргументов; без него — ближайший предок текущего каталога
@@ -97,7 +109,10 @@ fn project_root(dirs: Vec<PathBuf>) -> Option<PathBuf> {
         }
     };
     for extra in dirs {
-        eprintln!("flux: {}: one project folder per window, skipped", extra.display());
+        eprintln!(
+            "flux: {}: one project folder per window, skipped",
+            extra.display()
+        );
     }
     Some(std::fs::canonicalize(&root).unwrap_or(root))
 }

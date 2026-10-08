@@ -8,25 +8,37 @@ use flux_core::Document;
 use flux_fs::remap;
 use gpui::{
     Action, AnyView, App, AsyncApp, AsyncWindowContext, ClickEvent, Context, DismissEvent, Entity,
-    FocusHandle, Focusable, Global, Hsla, KeyBinding, ManagedView, MouseButton, MouseDownEvent,
-    MouseUpEvent, PathPromptOptions, PromptLevel, Render, ScrollHandle, SharedString, Subscription,
-    Task, WeakEntity, Window, WindowHandle, actions, div, prelude::*, px,
+    FocusHandle, Focusable, FontWeight, Global, KeyBinding, ManagedView, MouseButton,
+    MouseDownEvent, MouseUpEvent, PathPromptOptions, PromptLevel, Render, ScrollHandle,
+    SharedString, Subscription, Task, WeakEntity, Window, WindowHandle, actions, div, prelude::*,
+    px, relative,
 };
 
 use crate::editor::{self, Editor};
 use crate::file_tree::{self, FileTreeEvent, FileTreePanel};
 use crate::find_bar::{self, FindBar};
+use crate::icons::{IconName, file_icon, icon};
+use crate::launchpad::{self, Tool};
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
+use crate::start_screen::{self, StartScreen};
 use crate::theme::{self, Theme, UiColors};
-use crate::{command_palette, file_finder, go_to_line};
+use crate::ui::{self, GAP, RADIUS_MD, RADIUS_SM, STATUS_BAR_HEIGHT, TITLE_BAR_HEIGHT};
+use crate::{command_palette, file_finder, go_to_line, recent};
 
-/// Высота полосы вкладок — примерно как у статус-бара.
-const TAB_BAR_HEIGHT: f32 = 28.;
-const TAB_TEXT_SIZE: f32 = 12.;
+/// Полоса вкладок внутри острова редактора и сами вкладки.
+const TAB_BAR_HEIGHT: f32 = 40.;
+const TAB_HEIGHT: f32 = 30.;
 /// Длинные имена файлов и каталогов на вкладке сокращаются посередине.
 const TAB_LABEL_MAX_CHARS: usize = 32;
 /// Отступ всплывающего окна (палитра, поиск файла) от верха окна.
-const MODAL_TOP: f32 = TAB_BAR_HEIGHT + 24.;
+const MODAL_TOP: f32 = TITLE_BAR_HEIGHT + 32.;
+/// Место под светофор macOS в шапке (кнопки ставит `main` — `traffic_light_position`).
+const TRAFFIC_LIGHTS_WIDTH: f32 = 84.;
+/// Поиск по проекту — окно поверх: доля ширины окна и предел.
+const SEARCH_WIDTH: f32 = 0.84;
+const SEARCH_MAX_WIDTH: f32 = 1080.;
+/// Уже этого окна строка поиска файла в шапке не показывается: не влезет между кнопками.
+const TITLE_SEARCH_MIN_WINDOW: f32 = 920.;
 
 actions!(
     workspace,
@@ -46,6 +58,11 @@ actions!(
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = workspace, no_json)]
 pub struct ActivateTab(pub usize);
+
+/// Сделать каталог корнем проекта окна (недавний проект на начальном экране).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = workspace, no_json)]
+pub struct OpenProject(pub PathBuf);
 
 pub fn init(cx: &mut App) {
     bind_keys(cx);
@@ -116,6 +133,10 @@ pub struct Workspace {
     tree_open: bool,
     /// Файл, последним показанный в дереве: дерево следует за активной вкладкой.
     revealed: Option<PathBuf>,
+    /// Ветка git корня проекта — в шапке; перечитывается при активации окна.
+    branch: Option<SharedString>,
+    /// Недавние проекты для начального экрана, последние — первыми.
+    recent: Vec<PathBuf>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -155,13 +176,11 @@ struct OpenError {
 }
 
 impl Workspace {
-    /// Окно проекта `root` с файлами из командной строки (читаются в фоне). `untitled` —
-    /// без файлов начать с безымянного документа (`flux` без аргументов); `flux .` открывает
-    /// пустое окно проекта.
+    /// Окно проекта `root` с файлами из командной строки (читаются в фоне). Без файлов —
+    /// начальный экран.
     pub fn new(
         root: Option<PathBuf>,
         paths: Vec<PathBuf>,
-        untitled: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -178,6 +197,12 @@ impl Workspace {
         let file_tree = root.clone().map(|root| Self::build_tree(root, window, cx));
         // Панели открываются и закрываются сами (Esc, ×) — тогда меняется и раскладка окна.
         let subscriptions = vec![
+            // Ветку могли переключить в терминале, пока окно было неактивно.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.refresh_branch(cx);
+                }
+            }),
             cx.observe(&find_bar, |_, _, cx| cx.notify()),
             cx.observe(&project_search, |_, _, cx| cx.notify()),
             cx.subscribe_in(
@@ -191,6 +216,11 @@ impl Workspace {
                 },
             ),
         ];
+        let branch = root.as_deref().and_then(read_branch);
+        let recent = match &root {
+            Some(root) => recent::record(root),
+            None => recent::load(),
+        };
         let mut workspace = Self {
             root,
             tabs: Vec::new(),
@@ -208,9 +238,11 @@ impl Workspace {
             file_tree,
             tree_open: true,
             revealed: None,
+            branch,
+            recent,
             _subscriptions: subscriptions,
         };
-        if untitled || !paths.is_empty() {
+        if !paths.is_empty() {
             workspace.open_paths(paths, Source::CommandLine, window, cx);
         }
         workspace
@@ -227,10 +259,21 @@ impl Workspace {
             .update(cx, |search, cx| search.set_root(Some(root.clone()), cx));
         self.file_tree = Some(Self::build_tree(root.clone(), window, cx));
         self.revealed = None;
+        self.branch = read_branch(&root);
+        self.recent = recent::record(&root);
         self.show_message(format!("Project: {}", tilde(&root)).into(), cx);
         self.root = Some(root);
         self.reveal_active(cx);
         cx.notify();
+    }
+
+    /// Перечитывает ветку git (`.git/HEAD`); перерисовка — только если она сменилась.
+    fn refresh_branch(&mut self, cx: &mut Context<Self>) {
+        let branch = self.root.as_deref().and_then(read_branch);
+        if branch != self.branch {
+            self.branch = branch;
+            cx.notify();
+        }
     }
 
     fn editors(&self) -> Vec<Entity<Editor>> {
@@ -515,7 +558,7 @@ impl Workspace {
             }
         }
         match source {
-            Source::CommandLine => self.report_startup(errors, window, cx),
+            Source::CommandLine => self.report_startup(errors),
             Source::Dialog => self.report_dialog(errors, cx),
         }
     }
@@ -530,18 +573,10 @@ impl Workspace {
         self.add_document(document, window, cx);
     }
 
-    /// Ошибки командной строки — в stderr. Если не открылось ничего — безымянная вкладка.
-    fn report_startup(
-        &mut self,
-        errors: Vec<OpenError>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Ошибки командной строки — в stderr; если не открылось ничего, остаётся начальный экран.
+    fn report_startup(&mut self, errors: Vec<OpenError>) {
         for error in errors {
             eprintln!("flux: {}: {}", error.path.display(), error.reason);
-        }
-        if self.tabs.is_empty() {
-            self.add_document(Document::from_text(""), window, cx);
         }
     }
 
@@ -680,6 +715,14 @@ impl Workspace {
         }
     }
 
+    /// Открыто ли окно инструмента лаунчпада — его кнопка подсвечивается.
+    pub(crate) fn tool_open(&self, tool: Tool, cx: &App) -> bool {
+        match tool {
+            Tool::Project => self.tree_open && self.file_tree.is_some(),
+            Tool::FindInFiles => self.project_search.read(cx).is_open(),
+        }
+    }
+
     fn tree_panel(&self) -> Option<Entity<FileTreePanel>> {
         self.file_tree.as_ref().map(|tree| tree.panel.clone())
     }
@@ -806,6 +849,17 @@ impl Workspace {
         {
             return self.dismiss_modal(window, cx);
         }
+        // Поиск по проекту — тоже окно поверх: уступает место без возврата фокуса.
+        if self.project_search.read(cx).is_open() {
+            self.project_search.update(cx, |search, cx| search.hide(cx));
+            if self
+                .project_search
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+            {
+                self.focus_active(window, cx);
+            }
+        }
         let previous_focus = match self.modal.take() {
             Some(modal) => modal.previous_focus,
             None => window.focused(cx),
@@ -866,6 +920,46 @@ impl Workspace {
         )
     }
 
+    /// Поиск по проекту — окно поверх островов; щелчок мимо закрывает его.
+    fn render_project_search(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+        if !self.project_search.read(cx).is_open() {
+            return None;
+        }
+        Some(
+            div()
+                .absolute()
+                .top(px(TITLE_BAR_HEIGHT + GAP))
+                .bottom(px(STATUS_BAR_HEIGHT + GAP))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w(relative(SEARCH_WIDTH))
+                        .max_w(px(SEARCH_MAX_WIDTH))
+                        .h_full()
+                        .on_mouse_down_out(
+                            cx.listener(|this, _, window, cx| this.hide_project_search(window, cx)),
+                        )
+                        .child(self.project_search.clone()),
+                ),
+        )
+    }
+
+    /// Прячет поиск по проекту (щелчок мимо): фокус возвращается в редактор, только если
+    /// он оставался в поиске — иначе он уже там, куда щёлкнули.
+    fn hide_project_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let inside = self
+            .project_search
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        self.project_search.update(cx, |search, cx| search.hide(cx));
+        if inside || window.focused(cx).is_none() {
+            self.focus_active(window, cx);
+        }
+    }
+
     // --- Отображение ---
 
     /// Заголовок окна «● имя — проект» по активной вкладке (без проекта — «— flux») и точка
@@ -895,6 +989,232 @@ impl Workspace {
         }
     }
 
+    /// Шапка окна на рамке: место под светофор, проект и ветка, строка поиска файла
+    /// посередине, кнопки справа. Двойной щелчок — как по заголовку окна macOS.
+    fn render_title_bar(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let ui = Theme::ui(cx);
+        let leading = if window.is_fullscreen() {
+            GAP + 4.
+        } else {
+            TRAFFIC_LIGHTS_WIDTH
+        };
+        let project = self.root.as_deref().map(|root| {
+            let name = root
+                .file_name()
+                .map_or_else(|| tilde(root), |name| name.to_string_lossy().into_owned());
+            div()
+                .id("title-project")
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h(px(26.))
+                .px_2()
+                .rounded(px(RADIUS_SM))
+                .cursor_pointer()
+                .hover(move |style| style.bg(ui.hover))
+                .tooltip(ui::tooltip(tilde(root), ui::shortcut_for(&Open, window)))
+                .on_click(|_, window, cx| window.dispatch_action(Open.boxed_clone(), cx))
+                .child(icon(IconName::Folder, ui.folder).size(px(14.)))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ui.foreground)
+                        .child(name),
+                )
+        });
+        let open_folder = self.root.is_none().then(|| {
+            div()
+                .id("title-open-folder")
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h(px(26.))
+                .px_2()
+                .rounded(px(RADIUS_SM))
+                .cursor_pointer()
+                .text_color(ui.text_muted)
+                .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
+                .tooltip(ui::tooltip("Open Folder…", ui::shortcut_for(&Open, window)))
+                .on_click(|_, window, cx| window.dispatch_action(Open.boxed_clone(), cx))
+                .child(icon(IconName::FolderPlus, ui.folder).size(px(14.)))
+                .child("Open Folder…")
+        });
+        let branch = self.branch.clone().map(|branch| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(px(22.))
+                .px_2()
+                .rounded(px(11.))
+                .bg(UiColors::tint(ui.violet, 0.12))
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.violet)
+                .child(icon(IconName::Branch, ui.violet).size(px(12.)))
+                .child(branch)
+        });
+        let search =
+            (f32::from(window.viewport_size().width) >= TITLE_SEARCH_MIN_WINDOW).then(|| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("title-search")
+                            .w(px(340.))
+                            .h(px(26.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded(px(RADIUS_MD))
+                            .bg(ui.input_background)
+                            .border_1()
+                            .border_color(ui.input_border)
+                            .cursor_pointer()
+                            .text_color(ui.dim)
+                            .hover(move |style| {
+                                style
+                                    .border_color(ui.elevated_border)
+                                    .text_color(ui.text_muted)
+                            })
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(file_finder::Toggle.boxed_clone(), cx)
+                            })
+                            .child(icon(IconName::Search, ui.dim).size(px(13.)))
+                            .child(div().flex_1().child("Search files"))
+                            .children(
+                                ui::shortcut_for(&file_finder::Toggle, window)
+                                    .map(|keys| ui::keys(&keys, ui)),
+                            ),
+                    )
+            });
+        let button =
+            |id: &'static str, name: IconName, label: &'static str, action: Box<dyn Action>| {
+                let keys = ui::shortcut_for(action.as_ref(), window);
+                ui::icon_button(id, name, ui)
+                    .tooltip(ui::tooltip(label, keys))
+                    .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+            };
+        div()
+            .id("title-bar")
+            .relative()
+            .flex_none()
+            .h(px(TITLE_BAR_HEIGHT))
+            .pl(px(leading))
+            .pr(px(GAP + 2.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .on_click(|event, window, _| {
+                if event.click_count() == 2 {
+                    window.titlebar_double_click();
+                }
+            })
+            .children(search)
+            .children(project)
+            .children(open_folder)
+            .children(branch)
+            .child(div().flex_1())
+            .child(button(
+                "title-find-in-files",
+                IconName::FindInFiles,
+                "Find in Files",
+                project_search::Toggle.boxed_clone(),
+            ))
+            .child(button(
+                "title-commands",
+                IconName::Command,
+                "Command Palette",
+                command_palette::Toggle.boxed_clone(),
+            ))
+    }
+
+    /// Статус-бар на рамке окна: сообщение слева; справа позиция, курсоры, язык, переводы строк.
+    /// Статус-бар на рамке окна: слева сообщение или путь активного файла; справа позиция,
+    /// курсоры, язык цветной плашкой (цвет типа файла), переводы строк.
+    fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let ui = Theme::ui(cx);
+        let bar = div()
+            .flex_none()
+            .h(px(STATUS_BAR_HEIGHT))
+            .px(px(GAP + 6.))
+            .flex()
+            .items_center()
+            .gap_3()
+            .text_size(px(theme::TEXT_SM))
+            .text_color(ui.text_muted);
+        let Some(editor) = self.active_editor() else {
+            return bar.child(div().text_color(ui.dim).child(match &self.root {
+                Some(root) => tilde(root),
+                None => "No project — open a folder with ⌘O".into(),
+            }));
+        };
+        let editor = editor.read(cx);
+        let status = editor.status_info();
+        let path = editor.document.path();
+        let file = file_icon(&editor.document.display_name(), &ui);
+        let left = match status.message {
+            Some(message) => div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .min_w_0()
+                .text_color(ui.foreground)
+                .child(icon(IconName::Info, ui.info).size(px(13.)))
+                .child(div().truncate().child(message)),
+            None => div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .min_w_0()
+                .child(file.render().size(px(13.)))
+                .child(div().truncate().child(match path {
+                    Some(path) => self.display_path(path),
+                    None => "Untitled".into(),
+                })),
+        };
+        let item = |text: String| div().flex_none().whitespace_nowrap().child(text);
+        bar.child(div().flex_1().min_w_0().flex().child(left))
+            .child(item(format!("Ln {}, Col {}", status.line, status.column)))
+            .when(status.cursors > 1, |bar| {
+                bar.child(ui::badge(
+                    format!("{} cursors", status.cursors),
+                    ui.accent_text,
+                ))
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(20.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .rounded(px(10.))
+                    .bg(UiColors::tint(file.color, 0.12))
+                    .text_color(file.color)
+                    .child(div().size(px(6.)).rounded(px(3.)).bg(file.color))
+                    .child(item(status.language)),
+            )
+            .child(item(status.line_ending.to_string()).text_color(ui.dim))
+    }
+
+    /// Путь для показа: относительно корня проекта, вне его — с `~`.
+    fn display_path(&self, path: &Path) -> String {
+        match self
+            .root
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+        {
+            Some(relative) => relative.display().to_string(),
+            None => tilde(path),
+        }
+    }
+
     fn render_tab_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let paths: Vec<Option<PathBuf>> = self
@@ -913,23 +1233,24 @@ impl Workspace {
             .relative()
             .flex_none()
             .h(px(TAB_BAR_HEIGHT))
-            .bg(ui.tab_bar)
-            .text_size(px(TAB_TEXT_SIZE))
-            // Линия под вкладками; активная вкладка перекрывает её и сливается с текстом.
+            // Линия под вкладками — от края до края острова, с отступом от скруглений.
             .child(
                 div()
                     .absolute()
-                    .left_0()
-                    .right_0()
+                    .left(px(GAP))
+                    .right(px(GAP))
                     .bottom_0()
                     .h(px(1.))
-                    .bg(ui.border),
+                    .bg(ui.divider),
             )
             .child(
                 div()
                     .id("tabs")
                     .size_full()
+                    .px_1p5()
                     .flex()
+                    .items_center()
+                    .gap_1()
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll)
                     .children(tabs),
@@ -947,24 +1268,30 @@ impl Workspace {
         let document = &tab.editor.read(cx).document;
         let active = index == self.active;
         let (activate, close) = (tab.editor.clone(), tab.editor.clone());
+        let name = document.display_name();
+        let file = file_icon(&name, &ui);
         div()
             .id(("tab", tab.editor.entity_id()))
             .group("tab")
             .relative()
             .flex_none()
-            .h_full()
-            .px_3()
+            .h(px(TAB_HEIGHT))
+            .pl_2p5()
+            .pr_1p5()
             .flex()
             .items_center()
             .gap_2()
-            .border_r_1()
-            .border_color(ui.border)
-            .text_color(if active { ui.foreground } else { ui.dim })
+            .rounded(px(RADIUS_MD))
+            .border_1()
+            .text_color(if active { ui.foreground } else { ui.text_muted })
             .when(active, |el| {
-                el.bg(ui.background).child(accent_line(ui.tab_accent))
+                el.bg(ui.pressed)
+                    .border_color(ui.island_border)
+                    .font_weight(FontWeight::MEDIUM)
             })
             .when(!active, |el| {
-                el.hover(|style| style.text_color(ui.foreground))
+                el.border_color(gpui::transparent_black())
+                    .hover(|style| style.bg(ui.hover).text_color(ui.foreground))
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -978,7 +1305,8 @@ impl Workspace {
                     this.close_tab(close.clone(), window, cx)
                 }),
             )
-            .child(label(&document.display_name()))
+            .child(file.render().size(px(14.)))
+            .child(label(&name))
             .children(detail.map(|detail| label(&detail).text_color(ui.dim)))
             .child(close_button(
                 tab.editor.clone(),
@@ -988,31 +1316,19 @@ impl Workspace {
             ))
     }
 
-    fn render_empty(&self, ui: UiColors) -> impl IntoElement {
+    fn render_start(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let screen = StartScreen {
+            root: self.root.as_deref(),
+            branch: self.branch.as_ref().map(|branch| branch.as_ref()),
+            recent: &self.recent,
+            notice: self.notice.as_ref(),
+            loading: self.loading > 0,
+        };
         div()
             .track_focus(&self.focus_handle)
             .flex_1()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .text_color(ui.dim)
-            // Пока читаются файлы из командной строки, подсказку не показываем.
-            .when(self.loading == 0, |empty| {
-                empty
-                    .child("⌘P find file · ⌘⇧F search · ⌘⇧E files · ⌘O open · ⌘N new")
-                    .children(
-                        self.root
-                            .as_deref()
-                            .map(|root| div().text_size(px(TAB_TEXT_SIZE)).child(tilde(root))),
-                    )
-            })
-            .children(
-                self.notice
-                    .clone()
-                    .map(|notice| div().text_color(ui.error).child(notice)),
-            )
+            .min_h_0()
+            .child(start_screen::render(screen, window, cx))
     }
 }
 
@@ -1026,17 +1342,25 @@ impl Render for Workspace {
             .size_full()
             .flex()
             .flex_col()
-            .bg(ui.background)
+            .bg(ui.frame)
             .text_color(ui.foreground)
-            .font_family(theme::FONT_FAMILY)
-            .text_size(px(theme::FONT_SIZE))
+            .font_family(theme::UI_FONT)
+            .text_size(px(theme::TEXT_MD))
             .on_action(cx.listener(Self::open))
+            .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
+                // Каталог из списка недавних мог исчезнуть после запуска.
+                if !action.0.is_dir() {
+                    let message = format!("Folder not found: {}", tilde(&action.0));
+                    return this.show_message(message.into(), cx);
+                }
+                this.set_root(action.0.clone(), window, cx)
+            }))
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 this.add_document(Document::from_text(""), window, cx)
             }))
             // Esc в редакторе: открытая строка поиска закрывается раньше, чем редактор снимет
-            // выделение; когда снимать нечего (редактор пропускает Esc дальше) — панель поиска
-            // по проекту.
+            // выделение; когда снимать нечего (редактор пропускает Esc дальше) — поиск по
+            // проекту.
             .capture_action(cx.listener(|this, _: &editor::Cancel, window, cx| {
                 if this.find_bar.read(cx).is_open() {
                     this.find_bar.update(cx, |bar, cx| bar.close(window, cx));
@@ -1098,16 +1422,18 @@ impl Render for Workspace {
                 this.toggle_tree_focus(window, cx)
             }))
             .on_action(cx.listener(|this, _: &project_search::Toggle, window, cx| {
+                // Поиск по проекту и другие окна поверх не открыты одновременно.
+                this.dismiss_modal(window, cx);
                 let seed = this
                     .active_editor()
                     .and_then(|editor| editor.read(cx).search_seed());
                 this.project_search
                     .update(cx, |search, cx| search.toggle(seed, window, cx))
             }));
-        // Слева — дерево файлов; справа сверху вниз: вкладки, строка поиска, текст, панель
-        // поиска по проекту. Под ними во всю ширину — статус-бар.
+        // Рамка окна: шапка, лаунчпад и острова (дерево слева; справа — вкладки, строка поиска
+        // и текст или начальный экран), статус-бар. Поверх — поиск по проекту и всплывающие окна.
         let active = self.active_editor();
-        let main = div().flex_1().min_w_0().h_full().flex().flex_col();
+        let main = ui::island(ui).flex_1().min_w_0().h_full().flex().flex_col();
         let main = match &active {
             Some(editor) => {
                 self.retry_tab_scroll(window, cx);
@@ -1115,25 +1441,40 @@ impl Render for Workspace {
                     .when(self.find_bar.read(cx).is_open(), |main| {
                         main.child(self.find_bar.clone())
                     })
-                    .child(div().flex_1().min_h_0().child(editor.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .pt_1p5()
+                            .pb_2()
+                            .child(editor.clone()),
+                    )
             }
-            None => main.child(self.render_empty(ui)),
+            None => main.child(self.render_start(window, cx)),
         };
-        let main = main.when(self.project_search.read(cx).is_open(), |main| {
-            main.child(self.project_search.clone())
-        });
-        let tree = self.tree_panel().filter(|_| self.tree_open);
-        root.child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_row()
-                .children(tree)
-                .child(main),
-        )
-        .children(active.map(|editor| editor.read(cx).render_status_bar(ui)))
-        .children(self.render_modal(cx))
+        let tree = self
+            .tree_panel()
+            .filter(|_| self.tree_open)
+            .map(|panel| ui::island(ui).flex_none().h_full().child(panel));
+        // Слева — лаунчпад (полоса инструментов) на рамке, за ним острова.
+        root.child(ui::frame_glow(ui))
+            .child(self.render_title_bar(window, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .pl(px(2.))
+                    .pr(px(GAP))
+                    .flex()
+                    .flex_row()
+                    .gap(px(GAP))
+                    .child(launchpad::render(self, window, cx))
+                    .children(tree)
+                    .child(main),
+            )
+            .child(self.render_status_bar(cx))
+            .children(self.render_project_search(cx))
+            .children(self.render_modal(cx))
     }
 }
 
@@ -1356,17 +1697,6 @@ fn shorten(text: &str, max_chars: usize) -> String {
     short
 }
 
-/// Цветная полоска сверху активной вкладки.
-fn accent_line(color: Hsla) -> impl IntoElement {
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .h(px(2.))
-        .bg(color)
-}
-
 /// Правый край вкладки: «●» у изменённой, «×» — при наведении (у активной без изменений — всегда).
 fn close_button(
     editor: Entity<Editor>,
@@ -1377,13 +1707,15 @@ fn close_button(
     let ui = Theme::ui(cx);
     let close = div()
         .id("close")
+        .group("tab-close")
         .absolute()
         .inset_0()
         .flex()
         .items_center()
         .justify_center()
-        .rounded_sm()
-        .hover(move |style| style.bg(ui.border).text_color(ui.foreground))
+        .rounded(px(ui::RADIUS_XS))
+        .text_color(ui.dim)
+        .hover(move |style| style.bg(ui.pressed).text_color(ui.foreground))
         .when(modified || !active, |close| {
             close
                 .invisible()
@@ -1394,7 +1726,11 @@ fn close_button(
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.close_tab(editor.clone(), window, cx)
         }))
-        .child("×");
+        .child(
+            icon(IconName::Close, ui.dim)
+                .size(px(12.))
+                .group_hover("tab-close", move |style| style.text_color(ui.foreground)),
+        );
     let dot = modified.then(|| {
         div()
             .absolute()
@@ -1403,14 +1739,42 @@ fn close_button(
             .items_center()
             .justify_center()
             .group_hover("tab", |style| style.invisible())
-            .child("●")
+            .child(div().size(px(7.)).rounded(px(4.)).bg(ui.modified))
     });
     div()
         .relative()
         .flex_none()
-        .size(px(16.))
+        .size(px(18.))
         .children(dot)
         .child(close)
+}
+
+/// Ветка git каталога: `ref: refs/heads/main` → «main», отделённый HEAD — первые 7
+/// знаков хеша. Рабочее дерево-ссылка (`.git` — файл с `gitdir:`) тоже читается.
+fn read_branch(root: &Path) -> Option<SharedString> {
+    let git = root.join(".git");
+    let dir = if git.is_file() {
+        let link = fs::read_to_string(&git).ok()?;
+        let target = link.strip_prefix("gitdir:")?.trim();
+        root.join(target)
+    } else {
+        git
+    };
+    let head = fs::read_to_string(dir.join("HEAD")).ok()?;
+    branch_from_head(&head)
+}
+
+fn branch_from_head(head: &str) -> Option<SharedString> {
+    let head = head.trim();
+    match head.strip_prefix("ref:") {
+        Some(reference) => {
+            let reference = reference.trim();
+            let name = reference.strip_prefix("refs/heads/").unwrap_or(reference);
+            Some(name.to_string().into())
+        }
+        None if head.len() >= 7 => Some(head[..7].to_string().into()),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -1456,6 +1820,29 @@ mod tests {
         assert_eq!(tilde(&home), "~");
         assert_eq!(tilde(&home.join("dev/flux")), "~/dev/flux");
         assert_eq!(tilde(Path::new("/opt/x")), "/opt/x");
+    }
+
+    #[test]
+    fn branch_comes_from_head() {
+        assert_eq!(
+            branch_from_head("ref: refs/heads/main\n")
+                .as_ref()
+                .map(|b| b.as_ref()),
+            Some("main")
+        );
+        assert_eq!(
+            branch_from_head("ref: refs/heads/feature/x")
+                .as_ref()
+                .map(|b| b.as_ref()),
+            Some("feature/x")
+        );
+        assert_eq!(
+            branch_from_head("4d7de13a9f00c0ffee\n")
+                .as_ref()
+                .map(|b| b.as_ref()),
+            Some("4d7de13")
+        );
+        assert_eq!(branch_from_head(""), None);
     }
 
     #[test]

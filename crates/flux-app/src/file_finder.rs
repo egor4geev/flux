@@ -16,11 +16,12 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, AppContext, Context, DismissEvent, KeyBinding, SharedString, Task, WeakEntity,
-    Window, actions, div, prelude::*,
+    Window, actions, div, prelude::*, px,
 };
 
+use crate::icons::file_icon;
 use crate::picker::{Picker, PickerDelegate, highlighted_text};
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
 use crate::workspace::Workspace;
 
 actions!(file_finder, [Toggle]);
@@ -120,7 +121,7 @@ impl Drop for FileFinder {
 
 impl PickerDelegate for FileFinder {
     fn placeholder(&self) -> SharedString {
-        "Go to file…".into()
+        "Search files by name…".into()
     }
 
     fn match_count(&self) -> usize {
@@ -158,12 +159,14 @@ impl PickerDelegate for FileFinder {
             return div().into_any_element();
         };
         let row = PathRow::new(&found);
+        let file = file_icon(&row.name, &ui);
         div()
             .w_full()
             .flex()
             .items_center()
-            .gap_2()
+            .gap_2p5()
             .whitespace_nowrap()
+            .child(file.render())
             .child(div().flex_none().child(highlighted_text(
                 row.name,
                 &row.name_positions,
@@ -174,6 +177,7 @@ impl PickerDelegate for FileFinder {
                     div()
                         .min_w_0()
                         .overflow_hidden()
+                        .text_size(px(theme::TEXT_SM))
                         .text_color(ui.dim)
                         .child(highlighted_text(row.dir, &row.dir_positions, ui.match_text)),
                 )
