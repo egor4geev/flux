@@ -1,0 +1,32 @@
+# The manifest: who the plugin is and what it adds to Flux (docs/plugins.md, «Manifest»).
+id = "example.hello"
+name = "Hello"
+version = "0.1.0"
+api = "0.1"
+authors = ["Your Name"]
+description = "A plugin to start from: a command with a notification, a tool window with the open documents, a setting."
+icon = "icons/hello.svg"
+# Where cargo puts the component; Flux builds a plugin under development itself.
+wasm = "target/wasm32-wasip2/release/hello_plugin.wasm"
+
+[[commands]]
+id = "hello"
+title = "Say Hello"
+category = "Hello"
+
+[[commands]]
+id = "show-documents"
+title = "Show Open Documents"
+category = "Hello"
+
+[[tool-windows]]
+id = "documents"
+title = "Documents"
+icon = "icons/hello.svg"
+
+[[settings]]
+key = "greeting"
+title = "Greeting"
+description = "What Say Hello says."
+type = "string"
+default = "Hello from a plugin!"

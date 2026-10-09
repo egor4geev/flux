@@ -19,6 +19,7 @@ flux-core.workspace = true
 flux-fs.workspace = true
 flux-git.workspace = true
 flux-lsp.workspace = true
+flux-plugin.workspace = true
 flux-search.workspace = true
 flux-syntax.workspace = true
 flux-term.workspace = true

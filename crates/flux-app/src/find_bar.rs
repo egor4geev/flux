@@ -324,7 +324,7 @@ impl FindBar {
                     self.search(mode, cx);
                 }
             }
-            EditorEvent::SaveFailed(_) => {}
+            EditorEvent::SelectionsChanged | EditorEvent::Saved | EditorEvent::SaveFailed(_) => {}
         }
     }
 

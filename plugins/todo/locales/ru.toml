@@ -1,0 +1,29 @@
+# The Russian interface of the TODO plugin: English text = translation. Flux translates the
+# manifest's strings with this table too (the palette, Settings).
+
+# The manifest
+"TODO and FIXME comments of the project in a tool window, as in JetBrains IDEs: grouped by file, with a jump to the place." = "Комментарии TODO и FIXME проекта в окне инструмента, как в IDE JetBrains: по файлам, с переходом к месту."
+"Refresh TODO" = "Обновить TODO"
+"Patterns" = "Шаблоны"
+"Regular expressions that mark a TODO item, one per row." = "Регулярные выражения, которыми отмечены TODO, по одному в строке."
+"Case-sensitive patterns" = "Учитывать регистр"
+"Without it, TODO, Todo and todo are all found." = "Без этого находятся и TODO, и Todo, и todo."
+
+# The window
+"Refresh" = "Обновить"
+"Expand All" = "Развернуть все"
+"Collapse All" = "Свернуть все"
+"Project" = "Проект"
+"Current File" = "Текущий файл"
+"Searching…" = "Поиск…"
+"TODO: {0} · files: {1}" = "TODO: {0} · файлов: {1}"
+"Showing the first {0}" = "показаны первые {0}"
+"line {0}" = "строка {0}"
+"No TODO items" = "TODO не найдено"
+"No TODO items in this file" = "В этом файле TODO нет"
+"No file is open" = "Нет открытого файла"
+"The file is not in the project" = "Файл не входит в проект"
+"Open a folder to see its TODO items" = "Откройте папку, чтобы увидеть её TODO"
+"No patterns: add them in Settings → TODO" = "Нет шаблонов: добавьте их в Настройках → TODO"
+"Invalid pattern: {0}" = "Ошибка в шаблоне: {0}"
+"Couldn't open {0}" = "Не удалось открыть {0}"

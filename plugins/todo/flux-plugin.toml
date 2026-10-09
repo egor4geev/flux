@@ -1,0 +1,40 @@
+id = "flux.todo"
+name = "TODO"
+version = "0.1.0"
+api = "0.1"
+authors = ["Egor Ageev"]
+description = "TODO and FIXME comments of the project in a tool window, as in JetBrains IDEs: grouped by file, with a jump to the place."
+repository = "https://github.com/egor4geev/flux"
+icon = "icons/todo.svg"
+# Where cargo puts the component when the folder is built as a plugin under development; Flux
+# embeds the bundled plugin's component under the same path.
+wasm = "target/wasm32-wasip2/release/flux_todo.wasm"
+
+# The search's results are the project's text: reading it is a permission.
+[permissions]
+project = "read"
+
+[[commands]]
+id = "refresh"
+title = "Refresh TODO"
+category = "TODO"
+
+# No default key: JetBrains IDEs have none for TODO (⌘6 is Problems there).
+[[tool-windows]]
+id = "todo"
+title = "TODO"
+icon = "icons/todo.svg"
+
+[[settings]]
+key = "patterns"
+title = "Patterns"
+description = "Regular expressions that mark a TODO item, one per row."
+type = "string-list"
+default = ["\\bTODO\\b", "\\bFIXME\\b"]
+
+[[settings]]
+key = "case-sensitive"
+title = "Case-sensitive patterns"
+description = "Without it, TODO, Todo and todo are all found."
+type = "bool"
+default = false

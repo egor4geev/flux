@@ -268,6 +268,37 @@ pub fn toggle_button(
         .child(icon(name, ui.accent_text).size(px(15.)))
 }
 
+/// [`icon_button`] with an icon by its asset path: a plugin's SVG (stage 8).
+pub fn icon_button_at(
+    id: impl Into<ElementId>,
+    path: impl Into<SharedString>,
+    ui: UiColors,
+) -> Stateful<Div> {
+    button_base(id, ui)
+        .hover(move |style| style.bg(ui.hover))
+        .child(
+            crate::icons::icon_at(path, ui.text_muted)
+                .size(px(15.))
+                .group_hover(BUTTON_GROUP, move |style| style.text_color(ui.foreground)),
+        )
+}
+
+/// [`toggle_button`] with an icon by its asset path: a plugin's tool window in the launchpad.
+pub fn toggle_button_at(
+    id: impl Into<ElementId>,
+    path: impl Into<SharedString>,
+    on: bool,
+    ui: UiColors,
+) -> Stateful<Div> {
+    if !on {
+        return icon_button_at(id, path, ui);
+    }
+    button_base(id, ui)
+        .bg(ui.accent_soft)
+        .hover(move |style| style.bg(UiColors::tint(ui.accent, 0.26)))
+        .child(crate::icons::icon_at(path, ui.accent_text).size(px(15.)))
+}
+
 /// A button with a text label (Update, Delete in Settings): quiet, with a border; `danger` — the
 /// label in the error color.
 pub fn text_button(

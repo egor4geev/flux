@@ -1,12 +1,15 @@
 //! The launchpad is the tool strip on the left of the window frame. An icon opens and closes the
 //! window of its tool (an island or an overlay window); the open one is highlighted. A new tool is
-//! a [`Tool`] variant with its icon, label, and action, plus an entry in [`Tool::ALL`].
+//! a [`Tool`] variant with its icon, label, and action, plus an entry in [`Tool::ALL`]. Plugins'
+//! tool windows (stage 8) come from the window's plugins and sit above Notifications: they live in
+//! the same island on the right.
 
 use gpui::{Action, Context, IntoElement, Window, div, prelude::*, px};
 
 use crate::i18n::tr;
 use crate::icons::IconName;
-use crate::theme::Theme;
+use crate::plugins::{ToggleToolWindow, ToolWindow};
+use crate::theme::{Theme, UiColors};
 use crate::ui;
 use crate::workspace::Workspace;
 use crate::{file_tree, git, notifications_panel, project_search, terminal_panel};
@@ -105,8 +108,17 @@ pub fn render(
                 .map(|tool| tool_button(workspace, tool, window, cx)),
         )
         // Settings: at the bottom of the strip, apart from the tools; above them, the windows of the
-        // right island.
+        // right island: the plugins', then Notifications.
         .child(div().flex_1())
+        .children(
+            workspace
+                .plugins
+                .read(cx)
+                .tool_windows()
+                .iter()
+                .map(|tool| plugin_tool_button(workspace, tool, window, cx))
+                .collect::<Vec<_>>(),
+        )
         .children(
             Tool::BOTTOM
                 .into_iter()
@@ -145,9 +157,7 @@ fn tool_button(
                 .size(px(BUTTON_SIZE))
                 .rounded(px(ui::RADIUS_MD))
                 .tooltip(ui::tooltip(tool.label(), keys))
-                .on_click(move |_, window, cx| {
-                    window.dispatch_action(action.boxed_clone(), cx)
-                }),
+                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)),
         )
         // A count in the corner: changes waiting for a commit, unread notifications.
         .children(badge.map(|count| {
@@ -172,17 +182,48 @@ fn tool_button(
                     count.to_string()
                 })
         }))
-        // Marker of the open window: at the edge of the strip, like an IDE tool tab.
-        .when(open, |button| {
-            button.child(
-                div()
-                    .absolute()
-                    .left(px(-(WIDTH - BUTTON_SIZE) / 2. - 1.))
-                    .top(px(BUTTON_SIZE / 2. - 7.))
-                    .w(px(3.))
-                    .h(px(14.))
-                    .rounded(px(2.))
-                    .bg(ui.accent),
-            )
-        })
+        .when(open, |button| button.child(open_marker(ui)))
+}
+
+/// A plugin's tool window: its icon from the manifest (a puzzle piece without one), its title and
+/// keys in the tooltip.
+fn plugin_tool_button(
+    workspace: &Workspace,
+    tool: &ToolWindow,
+    window: &Window,
+    cx: &Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let ui = Theme::ui(cx);
+    let open = workspace.plugin_tool_open(tool.key);
+    let action = ToggleToolWindow {
+        plugin: tool.plugin.clone(),
+        window: tool.id.clone(),
+    };
+    let keys = ui::shortcut_for(&action, window);
+    let path = tool
+        .icon
+        .clone()
+        .unwrap_or_else(|| IconName::Puzzle.path().into());
+    div()
+        .relative()
+        .child(
+            ui::toggle_button_at(("plugin-tool", tool.key.0 as usize), path, open, ui)
+                .size(px(BUTTON_SIZE))
+                .rounded(px(ui::RADIUS_MD))
+                .tooltip(ui::tooltip(tool.title.clone(), keys))
+                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)),
+        )
+        .when(open, |button| button.child(open_marker(ui)))
+}
+
+/// Marker of the open window: at the edge of the strip, like an IDE tool tab.
+fn open_marker(ui: UiColors) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(-(WIDTH - BUTTON_SIZE) / 2. - 1.))
+        .top(px(BUTTON_SIZE / 2. - 7.))
+        .w(px(3.))
+        .h(px(14.))
+        .rounded(px(2.))
+        .bg(ui.accent)
 }

@@ -2,6 +2,7 @@ mod app_menu;
 mod blame;
 mod branch_dialogs;
 mod branches_popup;
+mod bundled;
 mod command_palette;
 mod commit_details;
 mod commit_panel;
@@ -42,6 +43,10 @@ mod notification_center;
 mod notifications;
 mod notifications_panel;
 mod picker;
+mod plugin_manager;
+mod plugin_settings;
+mod plugin_view;
+mod plugins;
 mod popup;
 mod project_search;
 mod push_dialog;
@@ -78,6 +83,17 @@ use theme::Theme;
 use workspace::Workspace;
 
 fn main() {
+    // A UI scenario doesn't touch the user's plugins, their data and logs (as it doesn't touch
+    // the settings): unless given, they live in a fresh temporary folder.
+    #[cfg(feature = "scenario")]
+    if std::env::var_os("FLUX_SCENARIO").is_some()
+        && std::env::var_os("FLUX_PLUGINS_HOME").is_none()
+    {
+        let home =
+            std::env::temp_dir().join(format!("flux-scenario-plugins-{}", std::process::id()));
+        // SAFETY: nothing else runs yet: no thread reads the environment.
+        unsafe { std::env::set_var("FLUX_PLUGINS_HOME", home) };
+    }
     // `flux [paths...]`: a directory among the arguments is the project root; files go into tabs.
     // Paths are absolute: tabs are compared by path, and files with the same name are told apart by
     // path.
@@ -138,6 +154,10 @@ fn main() {
             git_window::init(cx);
             notifications_panel::init(cx);
             rebase_dialog::init(cx);
+            plugins::init(cx);
+            plugin_view::init(cx);
+            plugin_manager::init(cx);
+            plugin_settings::init(cx);
 
             let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
             // A custom title bar on a glass window frame: the system title bar is transparent, the

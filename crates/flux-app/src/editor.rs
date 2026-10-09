@@ -121,6 +121,10 @@ pub fn bind_keys(cx: &mut App) {
 pub enum EditorEvent {
     /// The document text changed: an edit, paste, IME, undo, redo.
     Edited,
+    /// The selections or the cursors moved (plugins hear of it; an edit moves them too).
+    SelectionsChanged,
+    /// The document was written to disk.
+    Saved,
     /// Saving failed: the reason (the window tells it in a notification).
     SaveFailed(SharedString),
 }
@@ -326,6 +330,7 @@ impl Editor {
         let position = position.min(self.document.text().len_chars());
         self.document.set_selection(Selection::point(position));
         self.autoscroll = Some(Autoscroll::Middle);
+        cx.emit(EditorEvent::SelectionsChanged);
         cx.notify();
     }
 
@@ -335,6 +340,7 @@ impl Editor {
         self.status = None;
         self.autoscroll = Some(Autoscroll::Fit);
         self.pause_blink(cx);
+        cx.emit(EditorEvent::SelectionsChanged);
         cx.notify();
     }
 
@@ -355,6 +361,7 @@ impl Editor {
         if let Some(change) = self.document.apply(tx, kind) {
             self.text_changed(&[change], cx);
         }
+        cx.emit(EditorEvent::SelectionsChanged);
         self.status = None;
         self.autoscroll = Some(Autoscroll::Fit);
         self.pause_blink(cx);
@@ -372,6 +379,7 @@ impl Editor {
         }
         if let Some(changes) = step(&mut self.document) {
             self.text_changed(&changes, cx);
+            cx.emit(EditorEvent::SelectionsChanged);
             self.marked_range = None;
             self.autoscroll = Some(Autoscroll::Fit);
             self.pause_blink(cx);
@@ -651,6 +659,7 @@ impl Editor {
                 self.disk_mtime = self.document.path().and_then(file_mtime);
                 crate::lsp::saved(self);
                 self.status = Some(tr("Saved").into());
+                cx.emit(EditorEvent::Saved);
                 true
             }
             Err(err) => {

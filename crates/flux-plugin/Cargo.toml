@@ -1,0 +1,31 @@
+[package]
+name = "flux-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The plugin's stdout and stderr: the stream types of `wasmtime-wasi` (already in its tree).
+bytes = "1"
+flux-search.workspace = true
+# Channels from the plugins' threads to the window's UI tasks.
+futures = "0.3.34"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Only the `AsyncWrite` trait of the stdout and stderr streams (`wasmtime-wasi` runs on tokio).
+tokio = { version = "1", default-features = false }
+toml = "1"
+# The plugins' runtime: WebAssembly components (ADR-029). Only what Flux needs: the component
+# model compiled by Cranelift; no WAT, GC, threads, profiling or the async component model.
+wasmtime = { version = "49.0.2", default-features = false, features = [
+    "anyhow",
+    "backtrace",
+    "component-model",
+    "cranelift",
+    "parallel-compilation",
+    "runtime",
+    "std",
+] }
+# WASI 0.2 for the plugins: the file system (the project, the plugin's folder), clocks, random,
+# stdout and stderr into the plugin's log.
+wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p2"] }

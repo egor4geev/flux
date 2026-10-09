@@ -1,0 +1,11 @@
+[package]
+name = "flux-plugin-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Rust SDK for Flux plugins: bindings to the flux:plugin API, the plugin trait, a builder of tool window content."
+
+[dependencies]
+serde = "1"
+serde_json = "1"
+wit-bindgen = "0.62"

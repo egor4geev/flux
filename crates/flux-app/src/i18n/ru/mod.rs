@@ -32,6 +32,9 @@ mod messages;
 mod notification_center;
 mod notifications_panel;
 mod popups;
+mod plugins;
+mod plugin_view;
+mod plugin_manager;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
 pub(super) const STRINGS: &[&[(&str, &str)]] = &[
@@ -67,6 +70,9 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     notification_center::STRINGS,
     notifications_panel::STRINGS,
     popups::STRINGS,
+    plugins::STRINGS,
+    plugin_view::STRINGS,
+    plugin_manager::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -82,4 +88,7 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     log_actions::PLURALS,
     rebase::PLURALS,
     blame::PLURALS,
+    plugins::PLURALS,
+    plugin_view::PLURALS,
+    plugin_manager::PLURALS,
 ];

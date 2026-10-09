@@ -1,2 +1,7 @@
 /target
 .DS_Store
+# Plugins built in their own folders, as plugins under development (the bundled ones are built
+# into target/plugins).
+/plugins/*/target
+/templates/*/target
+/templates/*/Cargo.lock

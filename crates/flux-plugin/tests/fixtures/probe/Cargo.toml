@@ -1,0 +1,20 @@
+# A plugin for the runtime's tests (`crates/flux-plugin/src/tests.rs`): each command exercises one
+# part of the API. Built by the tests for wasm32-wasip2.
+[package]
+name = "flux-plugin-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+flux-plugin-api = { path = "../../../../flux-plugin-api" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+
+[workspace]

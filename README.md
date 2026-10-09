@@ -51,6 +51,11 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   source and the actions, unread ones counted on the bell. Choose per source how much you see: a card
   that fades, one that stays, only the journal, or nothing; or turn on Do Not Disturb. Questions come in
   Flux's own dialogs, with the keys you expect from macOS.
+- **Plugins that can't break your editor.** Each plugin runs in its own WebAssembly sandbox: it can't
+  crash or freeze Flux, and it reaches only what you allowed when you installed it. Plugins add commands
+  with shortcuts, tool windows, status bar items and settings pages, and look like the rest of Flux.
+  Turn them on and off without a restart in Settings → Plugins, install one from a folder or an archive.
+  A TODO window comes built in. Write your own in Rust — see [Writing plugins](docs/plugins.md).
 - **Keyboard first.** Every command is in the command palette with its shortcut; familiar keys if
   you come from JetBrains IDEs.
 - **Speaks your language.** English or Russian, following your system settings.
@@ -96,6 +101,14 @@ and keeps everything you need one shortcut away — no setup, no clutter.
     <td align="center"><sub><b>Notifications</b></sub></td>
     <td align="center"><sub><b>Flux's own dialogs</b></sub></td>
   </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/plugins.png" alt="Settings → Plugins: plugins under development and built-in ones with their switches, and the details of the TODO plugin"></td>
+    <td width="50%"><img src="docs/images/todo.png" alt="The TODO window on the right: TODO and FIXME comments of the project grouped by file"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Plugins</b></sub></td>
+    <td align="center"><sub><b>The TODO window, a built-in plugin</b></sub></td>
+  </tr>
 </table>
 
 ## Get started
@@ -107,8 +120,9 @@ scripts/bundle-macos.sh
 open target/release/Flux.app
 ```
 
-You will need [Rust](https://rustup.rs). Open a folder with <kbd>⌘</kbd><kbd>O</kbd> or pick a
-recent project on the start screen.
+You will need [Rust](https://rustup.rs) with the WebAssembly target for the built-in plugins:
+`rustup target add wasm32-wasip2` (without it Flux still builds, just without them). Open a folder
+with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen.
 
 ## Shortcuts
 
@@ -139,7 +153,8 @@ recent project on the start screen.
 - [x] Git: branches, stash, conflicts
 - [x] Git: history and blame
 - [x] Notification center and unified dialogs
-- [ ] Plugins
+- [x] Plugins: sandboxed plugins, the plugin manager, a TODO window
+- [ ] Plugins: a catalog, themes, file icons and languages as plugins
 - [ ] Claude Code integration — the first plugin
 - [ ] Public beta
 

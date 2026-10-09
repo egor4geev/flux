@@ -6,6 +6,8 @@
 //!   merge, rebase, or ask every time (the question's "Don't show again" sets it).
 //! - Notifications: Do Not Disturb, and for every group (plugins' too) how its notifications show —
 //!   a card, a sticky card, the journal only, or nothing (JetBrains: Settings → Notifications).
+//! - Plugins: the plugin manager ([`crate::plugin_manager`]); under it, a page of every plugin that
+//!   is on and has settings ([`crate::plugin_settings`]).
 //! - About: the version, the license, the developer, the source code. «About Flux» in the app menu
 //!   ([`About`]) opens Settings on this section.
 
@@ -17,15 +19,19 @@ use flux_lsp::install::{self, Source};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, BoxShadow, Context, DismissEvent, Div, EventEmitter, FocusHandle, Focusable,
-    FontWeight, KeyBinding, Render, SharedString, Task, WeakEntity, Window, actions, div, img,
-    linear_color_stop, linear_gradient, point, prelude::*, px,
+    AnyElement, App, AppContext as _, BoxShadow, Context, DismissEvent, Div, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, KeyBinding, Render, SharedString, Subscription, Task,
+    WeakEntity, Window, actions, div, img, linear_color_stop, linear_gradient, point, prelude::*,
+    px,
 };
 
 use crate::i18n::{tr, trf};
 use crate::icons::{self, IconName, file_icon, icon};
 use crate::lsp::LspStore;
 use crate::notification_center::{self, Display};
+use crate::plugin_manager::{PluginManager, PluginManagerEvent};
+use crate::plugin_settings::PluginSettingsPage;
+use crate::plugins::{PluginStatus, PluginStore};
 use crate::settings::{self, UpdatePreference};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
@@ -33,8 +39,12 @@ use crate::workspace::{Workspace, tilde};
 
 actions!(settings, [Toggle, Dismiss, About]);
 
-const WIDTH: f32 = 760.;
-const HEIGHT: f32 = 520.;
+/// The window's size; a small Flux window gets a smaller one, with a margin around it.
+const WIDTH: f32 = 880.;
+const HEIGHT: f32 = 600.;
+/// The margin between Settings and the edges of a small window; the top is under the title bar.
+const WINDOW_MARGIN: f32 = 16.;
+const WINDOW_TOP: f32 = ui::TITLE_BAR_HEIGHT + 32.;
 const SIDEBAR_WIDTH: f32 = 180.;
 /// About: the logo tile and the column of row labels.
 const ABOUT_LOGO_SIZE: f32 = 64.;
@@ -55,47 +65,67 @@ pub fn init(cx: &mut App) {
 }
 
 /// A section of Settings, listed on the left.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Section {
     LanguageServers,
     VersionControl,
     Notifications,
+    /// The plugin manager.
+    Plugins,
+    /// A plugin's settings, by its id: listed under Plugins while the plugin is on.
+    Plugin(SharedString),
     About,
 }
 
 impl Section {
-    const ALL: [Section; 4] = [
+    /// The sections above the plugins' pages; About goes after them.
+    const BUILT_IN: [Section; 4] = [
         Section::LanguageServers,
         Section::VersionControl,
         Section::Notifications,
-        Section::About,
+        Section::Plugins,
     ];
 
-    fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             Section::LanguageServers => tr("Language Servers"),
             Section::VersionControl => tr("Version Control"),
             Section::Notifications => tr("Notifications"),
+            Section::Plugins | Section::Plugin(_) => tr("Plugins"),
             Section::About => tr("About"),
         }
     }
 
-    fn icon(self) -> IconName {
+    fn icon(&self) -> IconName {
         match self {
             Section::LanguageServers => IconName::Command,
             Section::VersionControl => IconName::Branch,
             Section::Notifications => IconName::Bell,
+            Section::Plugins | Section::Plugin(_) => IconName::Puzzle,
             Section::About => IconName::Info,
+        }
+    }
+
+    /// A stable key: the element ids of the sidebar.
+    fn key(&self) -> SharedString {
+        match self {
+            Section::LanguageServers => "language-servers".into(),
+            Section::VersionControl => "version-control".into(),
+            Section::Notifications => "notifications".into(),
+            Section::Plugins => "plugins".into(),
+            Section::Plugin(id) => format!("plugin-{id}").into(),
+            Section::About => "about".into(),
         }
     }
 }
 
 /// Opens Settings, or closes them if open (the gear, ⌘,).
 pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let store = workspace.lsp.downgrade();
-    workspace.toggle_dialog(window, cx, move |_, cx| {
-        SettingsView::new(store, Section::LanguageServers, cx)
-    });
+    #[cfg(feature = "scenario")]
+    let section = scenario_section().unwrap_or(Section::LanguageServers);
+    #[cfg(not(feature = "scenario"))]
+    let section = Section::LanguageServers;
+    show(workspace, section, None, window, cx, false);
 }
 
 /// Opens Settings on a section; open ones are replaced.
@@ -105,13 +135,62 @@ pub fn open(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if is_open(workspace) {
+    show(workspace, section, None, window, cx, true);
+}
+
+/// Opens Settings on Plugins with the plugin `id` selected: after it is installed, from a
+/// notification about it.
+pub fn open_plugin(
+    workspace: &mut Workspace,
+    id: SharedString,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    show(workspace, Section::Plugins, Some(id), window, cx, true);
+}
+
+/// Opens Settings (replacing open ones when `replace`, toggling them otherwise).
+fn show(
+    workspace: &mut Workspace,
+    section: Section,
+    plugin: Option<SharedString>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    replace: bool,
+) {
+    if replace && is_open(workspace) {
         workspace.dismiss_modal(window, cx);
     }
-    let store = workspace.lsp.downgrade();
-    workspace.toggle_dialog(window, cx, move |_, cx| {
-        SettingsView::new(store, section, cx)
+    let handles = Handles {
+        lsp: workspace.lsp.downgrade(),
+        workspace: cx.weak_entity(),
+        plugins: workspace.plugins.clone(),
+    };
+    workspace.toggle_dialog(window, cx, move |window, cx| {
+        SettingsView::new(handles, section, plugin, window, cx)
     });
+}
+
+/// What Settings work with: the window's language servers and plugins, and the window itself
+/// (the plugin manager's install flow).
+struct Handles {
+    lsp: WeakEntity<LspStore>,
+    workspace: WeakEntity<Workspace>,
+    plugins: Entity<PluginStore>,
+}
+
+/// With the `scenario` feature, `FLUX_SCENARIO_SETTINGS=plugins` (or `plugin:<id>`) opens Settings
+/// on that section: a scenario can't click the sidebar.
+#[cfg(feature = "scenario")]
+fn scenario_section() -> Option<Section> {
+    let section = std::env::var("FLUX_SCENARIO_SETTINGS").ok()?;
+    Some(match section.as_str() {
+        "plugins" => Section::Plugins,
+        "notifications" => Section::Notifications,
+        "version-control" => Section::VersionControl,
+        "about" => Section::About,
+        other => Section::Plugin(other.strip_prefix("plugin:")?.to_string().into()),
+    })
 }
 
 /// «About Flux» with Settings closed (or without focus in them): the active window opens them on
@@ -140,10 +219,20 @@ pub struct SettingsView {
     section: Section,
     /// The window's language servers: restarted after an install or update, stopped on delete.
     store: WeakEntity<LspStore>,
+    /// The window's plugins: the manager and the plugins' pages follow them.
+    plugins: Entity<PluginStore>,
+    workspace: WeakEntity<Workspace>,
+    /// The Plugins page, made when first shown.
+    manager: Option<Entity<PluginManager>>,
+    /// The plugin selected on the Plugins page when it is first shown.
+    initial_plugin: Option<SharedString>,
+    /// The pages of the plugins' settings, made when first shown, by plugin id.
+    plugin_pages: HashMap<SharedString, Entity<PluginSettingsPage>>,
     servers: Vec<ServerRow>,
     /// Operations in progress or failed, by server name.
     jobs: HashMap<String, Job>,
     _tasks: Vec<Task<()>>,
+    _subscriptions: Vec<Subscription>,
 }
 
 struct ServerRow {
@@ -179,7 +268,13 @@ impl Focusable for SettingsView {
 }
 
 impl SettingsView {
-    fn new(store: WeakEntity<LspStore>, section: Section, cx: &mut Context<Self>) -> Self {
+    fn new(
+        handles: Handles,
+        section: Section,
+        plugin: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let servers = config::default_servers()
             .into_iter()
             .map(|config| ServerRow {
@@ -188,15 +283,31 @@ impl SettingsView {
                 installable: Ok(()),
             })
             .collect();
+        // A plugin turned off takes its page with it.
+        let subscriptions = vec![cx.observe(&handles.plugins, |this, _, cx| {
+            if let Section::Plugin(id) = &this.section
+                && !this.plugin_pages_listed(cx).contains(id)
+            {
+                this.section = Section::Plugins;
+            }
+            cx.notify()
+        })];
         let mut view = Self {
             focus_handle: cx.focus_handle(),
-            section,
-            store,
+            section: Section::LanguageServers,
+            store: handles.lsp,
+            plugins: handles.plugins,
+            workspace: handles.workspace,
+            manager: None,
+            initial_plugin: plugin,
+            plugin_pages: HashMap::new(),
             servers,
             jobs: HashMap::new(),
             _tasks: Vec::new(),
+            _subscriptions: subscriptions,
         };
         view.refresh(cx);
+        view.select(section, window, cx);
         view
     }
 
@@ -430,22 +541,103 @@ impl SettingsView {
 }
 
 impl SettingsView {
-    fn select(&mut self, section: Section, cx: &mut Context<Self>) {
+    /// Shows a section; the Plugins page and the plugins' pages are made when first shown. The
+    /// Plugins page puts the focus into its search field, as JetBrains IDEs do.
+    fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        match &section {
+            Section::Plugins => {
+                let manager = self.manager(window, cx);
+                if let Some(id) = self.initial_plugin.take() {
+                    manager.update(cx, |manager, cx| manager.reveal(id, cx));
+                }
+                // The window's modal layer focuses Settings once they are made: the search takes
+                // the focus after that.
+                let manager = manager.downgrade();
+                window.defer(cx, move |window, cx| {
+                    manager
+                        .update(cx, |manager, cx| manager.focus_search(window, cx))
+                        .ok();
+                });
+            }
+            Section::Plugin(id) => {
+                if !self.plugin_pages.contains_key(id) {
+                    let plugins = self.plugins.clone();
+                    let id = id.clone();
+                    let page = cx.new(|cx| PluginSettingsPage::new(id.clone(), plugins, window, cx));
+                    self.plugin_pages.insert(id, page);
+                }
+                window.focus(&self.focus_handle);
+            }
+            _ => {
+                // The focus leaves a field of the page that goes away (Esc must still close).
+                if !self.focus_handle.is_focused(window) {
+                    window.focus(&self.focus_handle);
+                }
+            }
+        }
         if self.section != section {
             self.section = section;
             cx.notify();
         }
     }
 
-    /// The list of sections on the left; the open one is highlighted.
+    /// The Plugins page: made once, then kept with its search and selection.
+    fn manager(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<PluginManager> {
+        if let Some(manager) = &self.manager {
+            return manager.clone();
+        }
+        let plugins = self.plugins.clone();
+        let workspace = self.workspace.clone();
+        let manager = cx.new(|cx| PluginManager::new(plugins, workspace, window, cx));
+        cx.subscribe_in(&manager, window, |this, _, event, window, cx| match event {
+            PluginManagerEvent::OpenSettings(id) => {
+                this.select(Section::Plugin(id.clone()), window, cx)
+            }
+        })
+        .detach();
+        self.manager = Some(manager.clone());
+        manager
+    }
+
+    /// The plugins with a page under Plugins: on, and with settings in the manifest.
+    fn plugin_pages_listed(&self, cx: &App) -> Vec<SharedString> {
+        self.plugins
+            .read(cx)
+            .plugins()
+            .iter()
+            .filter(|plugin| !plugin.entry.manifest.settings.is_empty())
+            .filter(|plugin| {
+                !matches!(
+                    plugin.status,
+                    PluginStatus::Disabled | PluginStatus::Unavailable(_)
+                )
+            })
+            .map(|plugin| SharedString::from(plugin.id().to_string()))
+            .collect()
+    }
+
+    /// The list of sections on the left; the open one is highlighted. The plugins' pages are
+    /// indented under Plugins, as the settings tree of JetBrains IDEs.
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
-        let rows = Section::ALL.into_iter().map(|section| {
+        let store = self.plugins.read(cx);
+        let plugin_pages: Vec<(Section, SharedString)> = self
+            .plugin_pages_listed(cx)
+            .into_iter()
+            .filter_map(|id| {
+                let plugin = store.plugin(&id)?;
+                let name = plugin.tr(&plugin.entry.manifest.name).to_string();
+                Some((Section::Plugin(id), SharedString::from(name)))
+            })
+            .collect();
+        let row = |section: Section, label: SharedString, nested: bool, cx: &mut Context<Self>| {
             let selected = section == self.section;
+            let icon_name = section.icon();
             div()
-                .id(("settings-section", section as usize))
+                .id(SharedString::from(format!("settings-section-{}", section.key())))
                 .h(px(30.))
                 .px_2()
+                .when(nested, |row| row.pl(px(30.)))
                 .flex()
                 .items_center()
                 .gap_2()
@@ -460,16 +652,32 @@ impl SettingsView {
                 .when(!selected, |row| {
                     row.hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
                 })
-                .on_click(cx.listener(move |this, _, _, cx| this.select(section, cx)))
-                .child(
-                    icon(
-                        section.icon(),
-                        if selected { ui.accent_text } else { ui.dim },
-                    )
-                    .size(px(14.)),
+                .on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.select(section.clone(), window, cx)
+                    }),
                 )
-                .child(section.label())
-        });
+                .when(!nested, |row| {
+                    row.child(
+                        icon(icon_name, if selected { ui.accent_text } else { ui.dim })
+                            .size(px(14.)),
+                    )
+                })
+                .child(div().min_w_0().truncate().child(label))
+        };
+        let mut rows: Vec<AnyElement> = Section::BUILT_IN
+            .into_iter()
+            .map(|section| {
+                let label = SharedString::from(section.label());
+                row(section, label, false, cx).into_any_element()
+            })
+            .collect();
+        rows.extend(
+            plugin_pages
+                .into_iter()
+                .map(|(section, label)| row(section, label, true, cx).into_any_element()),
+        );
+        rows.push(row(Section::About, tr("About").into(), false, cx).into_any_element());
         div()
             .flex_none()
             .w(px(SIDEBAR_WIDTH))
@@ -896,21 +1104,50 @@ fn plain(text: impl Into<SharedString>, ui: UiColors) -> AnyElement {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        let content = match self.section {
-            Section::LanguageServers => self.render_language_servers(cx),
-            Section::VersionControl => self.render_version_control(cx),
-            Section::Notifications => self.render_notifications(cx),
-            Section::About => self.render_about(cx),
+        // The Plugins page scrolls its list and its details apart: it takes the whole height.
+        let content = match self.section.clone() {
+            Section::LanguageServers => Some(self.render_language_servers(cx).into_any_element()),
+            Section::VersionControl => Some(self.render_version_control(cx).into_any_element()),
+            Section::Notifications => Some(self.render_notifications(cx).into_any_element()),
+            Section::Plugins => None,
+            Section::Plugin(id) => Some(match self.plugin_pages.get(&id) {
+                Some(page) => page.clone().into_any_element(),
+                None => div().into_any_element(),
+            }),
+            Section::About => Some(self.render_about(cx).into_any_element()),
         };
+        let content = match content {
+            Some(content) => div()
+                .id("settings-content")
+                .flex_1()
+                .min_w_0()
+                .overflow_y_scroll()
+                .p_4()
+                .child(content)
+                .into_any_element(),
+            None => div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .children(self.manager.clone())
+                .into_any_element(),
+        };
+        let viewport = window.viewport_size();
+        let width = WIDTH.min(f32::from(viewport.width) - 2. * WINDOW_MARGIN);
+        let height = HEIGHT.min(f32::from(viewport.height) - WINDOW_TOP - WINDOW_MARGIN);
         ui::popover(ui)
             .key_context("Settings")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &Dismiss, _, cx| cx.emit(DismissEvent)))
-            .on_action(cx.listener(|this, _: &About, _, cx| this.select(Section::About, cx)))
-            .w(px(WIDTH))
-            .h(px(HEIGHT))
+            .on_action(
+                cx.listener(|this, _: &About, window, cx| this.select(Section::About, window, cx)),
+            )
+            .w(px(width))
+            .h(px(height))
             .flex()
             .flex_col()
             .text_size(px(theme::TEXT_MD))
@@ -944,15 +1181,7 @@ impl Render for SettingsView {
                     .min_h_0()
                     .flex()
                     .child(self.render_sidebar(cx))
-                    .child(
-                        div()
-                            .id("settings-content")
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_y_scroll()
-                            .p_4()
-                            .child(content),
-                    ),
+                    .child(content),
             )
     }
 }

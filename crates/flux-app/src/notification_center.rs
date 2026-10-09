@@ -35,20 +35,22 @@ pub enum NotificationGroup {
     Terminal,
     Files,
     Editor,
-    #[allow(dead_code)] // The plugin API (stage 8) and the progress of background tasks use it.
+    /// The plugins themselves: one stopped, a plugin under development rebuilt or reloaded.
+    Plugins,
     /// A plugin, by its id.
     Plugin(SharedString),
 }
 
 impl NotificationGroup {
     /// The built-in groups, in the order of the settings page.
-    pub const BUILT_IN: [NotificationGroup; 6] = [
+    pub const BUILT_IN: [NotificationGroup; 7] = [
         NotificationGroup::General,
         NotificationGroup::Git,
         NotificationGroup::LanguageServers,
         NotificationGroup::Terminal,
         NotificationGroup::Files,
         NotificationGroup::Editor,
+        NotificationGroup::Plugins,
     ];
 
     /// The key in `settings.json` ("git", "plugin:claude").
@@ -60,6 +62,7 @@ impl NotificationGroup {
             NotificationGroup::Terminal => "terminal".into(),
             NotificationGroup::Files => "files".into(),
             NotificationGroup::Editor => "editor".into(),
+            NotificationGroup::Plugins => "plugins".into(),
             NotificationGroup::Plugin(id) => format!("plugin:{id}").into(),
         }
     }
@@ -83,6 +86,7 @@ impl NotificationGroup {
             NotificationGroup::Terminal => tr("Terminal").into(),
             NotificationGroup::Files => tr("Files").into(),
             NotificationGroup::Editor => tr("Editor").into(),
+            NotificationGroup::Plugins => tr("Plugins").into(),
             NotificationGroup::Plugin(id) => id.clone(),
         }
     }
@@ -148,7 +152,6 @@ struct PluginGroups(Vec<GroupInfo>);
 
 impl Global for PluginGroups {}
 
-#[allow(dead_code)] // The plugin API (stage 8) and the progress of background tasks use it.
 /// Registers a plugin's group (again — replaces it): its notifications get a title, a default
 /// display, and a row in Settings → Notifications.
 pub fn register_group(info: GroupInfo, cx: &mut App) {
@@ -330,7 +333,6 @@ impl NotificationCenter {
         });
     }
 
-    #[allow(dead_code)] // The plugin API (stage 8) and the progress of background tasks use it.
     /// Changes a notification in place (a plugin's progress, a new body); a card on screen shows
     /// the change. A card that was closed doesn't come back, unless a task is done (its progress
     /// cleared): the result is news.
@@ -355,7 +357,6 @@ impl NotificationCenter {
         self.changed(cx);
     }
 
-    #[allow(dead_code)] // The plugin API (stage 8) and the progress of background tasks use it.
     /// Sets or clears (`None` — the task is done) a notification's progress.
     pub fn set_progress(
         &mut self,
@@ -366,7 +367,6 @@ impl NotificationCenter {
         self.update(id, |notification| notification.progress = progress, cx);
     }
 
-    #[allow(dead_code)] // The plugin API (stage 8) and the progress of background tasks use it.
     /// The notification's actions no longer apply: its card closes, the journal shows it without
     /// them.
     pub fn expire(&mut self, id: NotificationId, cx: &mut Context<Self>) {

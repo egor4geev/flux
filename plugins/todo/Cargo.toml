@@ -1,0 +1,26 @@
+[package]
+name = "flux-todo"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "The TODO tool window of Flux: a plugin bundled into the editor."
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+flux-plugin-api = { path = "../../crates/flux-plugin-api" }
+
+# Plugins are small: the component is embedded into Flux and compiled when it loads.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# A plugin is a project of its own, not a member of the editor's workspace: it is built for
+# wasm32-wasip2 (by `crates/flux-app/build.rs`, or by Flux itself when the folder is installed as a
+# plugin under development).
+[workspace]

@@ -1,0 +1,24 @@
+[package]
+name = "hello-plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The SDK. Inside the Flux repository the path works as is; in a copy elsewhere, point it at your
+# checkout of Flux, or use the repository:
+# flux-plugin-api = { git = "https://github.com/egor4geev/flux" }
+flux-plugin-api = { path = "../../crates/flux-plugin-api" }
+
+# A plugin is small: Flux compiles its component when it loads it.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# A plugin is a project of its own: `cargo build --release --target wasm32-wasip2`.
+[workspace]

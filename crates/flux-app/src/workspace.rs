@@ -34,6 +34,7 @@ use crate::notification_center::NotificationCenter;
 use crate::notification_center::NotificationGroup;
 use crate::notifications::{self, Notification};
 use crate::notifications_panel::{self, NotificationsPanel};
+use crate::plugins::{self, PluginStore, PluginStoreEvent, ToolKey};
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
 use crate::start_screen::{self, StartScreen};
 use crate::terminal_group::{DraggedTerminal, TerminalGroup, TerminalGroupEvent};
@@ -211,14 +212,18 @@ pub struct Workspace {
     right_tool: Option<RightTool>,
     /// The Notifications window (the journal of the notification center).
     notifications_panel: Entity<NotificationsPanel>,
+    /// The window's plugins: their commands, tool windows (in the island on the right), status
+    /// bar items; they learn what happens in the window.
+    pub(crate) plugins: Entity<PluginStore>,
     _subscriptions: Vec<Subscription>,
 }
 
-/// A tool window of the island on the right. Plugins' windows will take the same slot (the Claude
-/// window of stage 9).
+/// A tool window of the island on the right: Notifications, or a plugin's window (the Claude window
+/// of stage 9 takes the same slot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RightTool {
     Notifications,
+    Plugin(ToolKey),
 }
 
 /// The commit window and the subscription to its events; recreated with the git hub.
@@ -396,8 +401,13 @@ impl Workspace {
             cx.new(|cx| TerminalPanel::new(root.clone(), bottom_height.clone(), window, cx));
         let notification_center = cx.new(NotificationCenter::new);
         // The width of the right island: its tool windows share one cell (`ui::RightIslandWidth`).
+        let right_width = ui::RightIslandWidth::new();
         let notifications_panel = cx.new(|cx| {
-            NotificationsPanel::new(notification_center.clone(), ui::RightIslandWidth::new(), cx)
+            NotificationsPanel::new(notification_center.clone(), right_width.clone(), cx)
+        });
+        let plugins = cx.new(|cx| PluginStore::new(root.clone(), right_width, cx));
+        plugins.update(cx, |store, _| {
+            store.set_notification_center(notification_center.downgrade())
         });
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
@@ -415,6 +425,8 @@ impl Workspace {
             cx.observe(&terminal_panel, |_, _, cx| cx.notify()),
             cx.observe(&notification_center, |_, _, cx| cx.notify()),
             cx.observe(&notifications_panel, |_, _, cx| cx.notify()),
+            cx.observe(&plugins, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&plugins, window, Self::on_plugin_store_event),
             cx.subscribe_in(&terminal_panel, window, Self::on_terminal_panel_event),
             cx.subscribe_in(
                 &project_search,
@@ -469,6 +481,7 @@ impl Workspace {
             notification_center,
             right_tool: None,
             notifications_panel,
+            plugins,
             _subscriptions: subscriptions,
         };
         if !paths.is_empty() {
@@ -508,7 +521,9 @@ impl Workspace {
         self.root = Some(root.clone());
         self.terminal_panel
             .update(cx, |panel, _| panel.set_root(Some(root.clone())));
-        self.lsp = Self::build_lsp(Some(root), cx);
+        self.lsp = Self::build_lsp(Some(root.clone()), cx);
+        self.plugins
+            .update(cx, |store, cx| store.set_root(Some(root), cx));
         for editor in self.editors(cx) {
             self.lsp.update(cx, |store, cx| store.register(&editor, cx));
             self.git.update(cx, |store, cx| store.register(&editor, cx));
@@ -682,6 +697,8 @@ impl Workspace {
         }
         // A terminal tab has no find bar: it searches its output itself.
         let editor = item.editor().cloned();
+        self.plugins
+            .update(cx, |store, cx| store.set_active_editor(editor.as_ref(), cx));
         self.find_bar
             .update(cx, |bar, cx| bar.set_active_editor(editor, window, cx));
         self.reveal_active(cx);
@@ -745,6 +762,8 @@ impl Workspace {
         let editor = cx.new(|cx| Editor::new(document, window, cx));
         self.lsp.update(cx, |store, cx| store.register(&editor, cx));
         self.git.update(cx, |store, cx| store.register(&editor, cx));
+        self.plugins
+            .update(cx, |store, cx| store.register(&editor, cx));
         editor
     }
 
@@ -832,6 +851,8 @@ impl Workspace {
         if self.tabs.is_empty() {
             self.active = 0;
             window.focus(&self.focus_handle);
+            self.plugins
+                .update(cx, |store, cx| store.set_active_editor(None, cx));
             self.find_bar
                 .update(cx, |bar, cx| bar.set_active_editor(None, window, cx));
             return cx.notify();
@@ -1761,7 +1782,76 @@ impl Workspace {
         self.show_right(RightTool::Notifications, window, cx);
     }
 
+    /// A plugin's tool window: its launchpad icon, its keys, the palette — shows it focused, or
+    /// hides it.
+    pub(crate) fn toggle_plugin_tool(
+        &mut self,
+        key: ToolKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.right_tool == Some(RightTool::Plugin(key)) {
+            return self.hide_right(window, cx);
+        }
+        self.show_right(RightTool::Plugin(key), window, cx);
+    }
+
+    /// Whether a plugin's tool window is shown: its launchpad icon is highlighted.
+    pub(crate) fn plugin_tool_open(&self, key: ToolKey) -> bool {
+        self.right_tool == Some(RightTool::Plugin(key))
+    }
+
+    fn plugin_tool_view(
+        &self,
+        key: ToolKey,
+        cx: &App,
+    ) -> Option<Entity<crate::plugin_view::PluginView>> {
+        self.plugins
+            .read(cx)
+            .tool_window(key)
+            .map(|tool| tool.view.clone())
+    }
+
+    /// What the plugins hub tells the window.
+    fn on_plugin_store_event(
+        &mut self,
+        _: &Entity<PluginStore>,
+        event: &PluginStoreEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            PluginStoreEvent::Changed => {
+                // A plugin that went away takes its tool window with it.
+                if let Some(RightTool::Plugin(key)) = self.right_tool
+                    && self.plugin_tool_view(key, cx).is_none()
+                {
+                    self.right_tool = None;
+                    self.focus_active(window, cx);
+                }
+                cx.notify();
+            }
+            PluginStoreEvent::ShowToolWindow(key) => {
+                if self.right_tool != Some(RightTool::Plugin(*key)) {
+                    self.show_right(RightTool::Plugin(*key), window, cx);
+                }
+            }
+            PluginStoreEvent::HideToolWindow(key) => {
+                if self.right_tool == Some(RightTool::Plugin(*key)) {
+                    self.hide_right(window, cx);
+                }
+            }
+            PluginStoreEvent::Call { plugin, call } => {
+                plugins::handle_call(self, plugin, call, window, cx)
+            }
+        }
+    }
+
     fn show_right(&mut self, tool: RightTool, window: &mut Window, cx: &mut Context<Self>) {
+        // One window at a time in the island: the one shown before goes.
+        if self.right_tool.is_some_and(|shown| shown != tool) {
+            self.hide_right(window, cx);
+        }
         self.right_tool = Some(tool);
         match tool {
             RightTool::Notifications => {
@@ -1770,6 +1860,16 @@ impl Workspace {
                 self.notifications_panel
                     .update(cx, |panel, cx| panel.set_visible(true, cx));
                 window.focus(&self.notifications_panel.focus_handle(cx));
+            }
+            RightTool::Plugin(key) => {
+                let Some(view) = self.plugin_tool_view(key, cx) else {
+                    self.right_tool = None;
+                    return;
+                };
+                view.update(cx, |view, cx| view.set_visible(true, cx));
+                window.focus(&view.focus_handle(cx));
+                self.plugins
+                    .update(cx, |store, _| store.tool_window_visibility(key, true));
             }
         }
         cx.notify();
@@ -1792,6 +1892,18 @@ impl Workspace {
                 self.notifications_panel
                     .update(cx, |panel, cx| panel.set_visible(false, cx));
                 focused
+            }
+            RightTool::Plugin(key) => {
+                self.plugins
+                    .update(cx, |store, _| store.tool_window_visibility(key, false));
+                match self.plugin_tool_view(key, cx) {
+                    Some(view) => {
+                        let focused = view.read(cx).contains_focus(window, cx);
+                        view.update(cx, |view, cx| view.set_visible(false, cx));
+                        focused
+                    }
+                    None => false,
+                }
             }
         };
         if focused || window.focused(cx).is_none() {
@@ -2549,7 +2661,16 @@ impl Workspace {
                 None => self.focus_active(window, cx),
             }
         }
+        // A plugin's question that waited for the overlay window comes now.
+        cx.defer_in(window, |this, window, cx| {
+            plugins::ask_pending(this, window, cx)
+        });
         cx.notify();
+    }
+
+    /// An overlay window (a popup or a dialog) is open.
+    pub(crate) fn modal_open(&self) -> bool {
+        self.modal.is_some()
     }
 
     fn render_modal(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -2975,6 +3096,7 @@ impl Workspace {
                 Some(editor_id),
                 ui,
             ))
+            .children(plugins::status_bar_items(self, cx))
             .child(item(status.line_ending.to_string()).text_color(ui.dim))
     }
 
@@ -3018,6 +3140,7 @@ impl Workspace {
                 )
                 .children(directory.map(|directory| div().truncate().child(directory))),
         )
+        .children(plugins::status_bar_items(self, cx))
     }
 
     /// Display path: relative to the project root, or with `~` outside it.
@@ -3494,6 +3617,7 @@ impl Render for Workspace {
             .map(|root| crate::log_actions::workspace_actions(root, cx))
             .map(|root| crate::rebase_dialog::workspace_actions(root, cx))
             .map(|root| crate::blame::workspace_actions(root, cx))
+            .map(|root| crate::plugins::workspace_actions(root, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
                 // A directory from the recent list may have disappeared since launch.
                 if !action.0.is_dir() {
@@ -3604,6 +3728,20 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &notifications_panel::Toggle, window, cx| {
                     this.toggle_notifications(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &plugins::ToggleToolWindow, window, cx| {
+                    let key = this
+                        .plugins
+                        .read(cx)
+                        .tool_windows()
+                        .iter()
+                        .find(|tool| tool.plugin == action.plugin && tool.id == action.window)
+                        .map(|tool| tool.key);
+                    if let Some(key) = key {
+                        this.toggle_plugin_tool(key, window, cx)
+                    }
                 }),
             )
             .on_action(cx.listener(|this, _: &file_tree::ToggleFocus, window, cx| {
@@ -3760,6 +3898,10 @@ impl Render for Workspace {
         let right = self.right_tool.map(|tool| {
             let content = match tool {
                 RightTool::Notifications => self.notifications_panel.clone().into_any_element(),
+                RightTool::Plugin(key) => match self.plugin_tool_view(key, cx) {
+                    Some(view) => view.into_any_element(),
+                    None => div().into_any_element(),
+                },
             };
             ui::island(ui)
                 .flex_none()
@@ -3820,7 +3962,6 @@ impl Render for Workspace {
     }
 }
 
-/// Unread error notifications: the counters take the error color.
 // --- Prompts about unsaved documents ---
 
 async fn ask_each(

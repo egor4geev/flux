@@ -1,4 +1,5 @@
-//! Command palette (cmd-shift-p): all actions available where focus was, by name.
+//! Command palette (cmd-shift-p): all actions available where focus was, by name, and the commands
+//! and tool windows of the running plugins.
 //!
 //! The list is built when the palette opens, before focus moves into the palette's input field:
 //! gpui knows which actions are handled along the path from the focused element to the root. Making
@@ -12,6 +13,7 @@ use gpui::{
 
 use crate::i18n::{tr, trn};
 use crate::picker::{Picker, PickerDelegate, highlighted_text};
+use crate::plugins::{PaletteCommand, PaletteToolWindow};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_SM};
 use crate::workspace::Workspace;
@@ -26,8 +28,11 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let plugins = workspace.plugins.read(cx);
+    let plugin_commands = plugins.palette_commands();
+    let plugin_windows = plugins.palette_tool_windows();
     workspace.toggle_modal(window, cx, |window, cx| {
-        let palette = CommandPalette::new(window, cx);
+        let palette = CommandPalette::new(plugin_commands, plugin_windows, window, cx);
         Picker::new(palette, window, cx)
     });
 }
@@ -43,6 +48,8 @@ struct Command {
     /// Key binding in macOS symbols, if there is one.
     keys: Option<SharedString>,
     action: Box<dyn Action>,
+    /// A plugin grayed the command out: it is shown dimmed and doesn't run.
+    enabled: bool,
 }
 
 pub struct CommandPalette {
@@ -56,29 +63,21 @@ pub struct CommandPalette {
 }
 
 impl CommandPalette {
-    /// Call before moving focus into the palette.
-    fn new(window: &mut Window, cx: &mut App) -> Self {
+    /// Call before moving focus into the palette. The plugins' commands and tool windows come
+    /// translated from their hub.
+    fn new(
+        plugin_commands: Vec<PaletteCommand>,
+        plugin_windows: Vec<PaletteToolWindow>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
         let previous_focus = window.focused(cx);
         let mut commands: Vec<Command> = window
             .available_actions(cx)
             .into_iter()
             .filter(|action| action.name() != Toggle.name())
             .map(|action| {
-                let bindings = match &previous_focus {
-                    Some(focus) => window.bindings_for_action_in(action.as_ref(), focus),
-                    None => window.bindings_for_action(action.as_ref()),
-                };
-                // Our primary binding is registered first, with the alternates (`home` for
-                // cmd-left, `shift-backspace` for backspace) after it.
-                let keys = bindings.first().map(|binding| {
-                    binding
-                        .keystrokes()
-                        .iter()
-                        .map(|k| keystroke_label(k.modifiers(), k.key()))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .into()
-                });
+                let keys = keys_label(action.as_ref(), previous_focus.as_ref(), window);
                 let humanized = humanize_action_name(action.name());
                 let (namespace, title) = humanized.split_once(": ").unwrap_or(("", &humanized));
                 // The chip and the title are looked up as «Editor» and «Move Word Left».
@@ -95,9 +94,33 @@ impl CommandPalette {
                     label,
                     keys,
                     action,
+                    enabled: true,
                 }
             })
             .collect();
+        let plugin_command = |category: String, title: String, action: Box<dyn Action>| Command {
+            namespace_chars: category.chars().count(),
+            label: format!("{category}: {title}"),
+            namespace: PLUGIN_NAMESPACE.to_string(),
+            keys: keys_label(action.as_ref(), previous_focus.as_ref(), window),
+            action,
+            enabled: true,
+        };
+        for command in plugin_commands {
+            let enabled = command.enabled;
+            let action = Box::new(command.action);
+            commands.push(Command {
+                enabled,
+                ..plugin_command(command.category, command.title, action)
+            });
+        }
+        for tool in plugin_windows {
+            commands.push(plugin_command(
+                tool.category,
+                tool.title,
+                Box::new(tool.action),
+            ));
+        }
         commands.sort_by_cached_key(|command| command.label.to_lowercase());
         Self {
             commands,
@@ -127,6 +150,9 @@ impl PickerDelegate for CommandPalette {
         let Some(found) = self.matches.get(index) else {
             return;
         };
+        if !self.commands[found.index].enabled {
+            return;
+        }
         let action = self.commands[found.index].action.boxed_clone();
         // `dispatch_action` takes focus at the moment of the call, so restore focus to its place
         // first.
@@ -193,7 +219,16 @@ impl PickerDelegate for CommandPalette {
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .child(highlighted_text(title, &title_positions, ui.match_text)),
+                    .when(!command.enabled, |title| title.text_color(ui.dim))
+                    .child(highlighted_text(
+                        title,
+                        &title_positions,
+                        if command.enabled {
+                            ui.match_text
+                        } else {
+                            ui.dim
+                        },
+                    )),
             )
             .children(command.keys.as_ref().map(|keys| ui::keys(keys, ui)))
             .into_any_element()
@@ -220,6 +255,32 @@ impl PickerDelegate for CommandPalette {
     fn confirm_label(&self) -> &'static str {
         tr("run")
     }
+}
+
+/// The chip's namespace of the plugins' commands: one color for all of them.
+const PLUGIN_NAMESPACE: &str = "plugin";
+
+/// The first key binding of an action where focus was, in macOS symbols. Our primary binding is
+/// registered first, with the alternates (`home` for cmd-left, `shift-backspace` for backspace)
+/// after it.
+fn keys_label(
+    action: &dyn Action,
+    focus: Option<&FocusHandle>,
+    window: &Window,
+) -> Option<SharedString> {
+    let bindings = match focus {
+        Some(focus) => window.bindings_for_action_in(action, focus),
+        None => window.bindings_for_action(action),
+    };
+    bindings.first().map(|binding| {
+        binding
+            .keystrokes()
+            .iter()
+            .map(|k| keystroke_label(k.modifiers(), k.key()))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .into()
+    })
 }
 
 /// A label split into the namespace (chip) and the name; match positions are in characters of each
@@ -268,6 +329,7 @@ fn namespace_color(namespace: &str, ui: &UiColors) -> Hsla {
         "find bar" => ui.amber,
         "project search" => ui.orange,
         "command palette" | "file finder" | "go to line" | "picker" => ui.teal,
+        PLUGIN_NAMESPACE | "plugins" => ui.pink,
         _ => ui.indigo,
     }
 }

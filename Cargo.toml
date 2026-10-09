@@ -12,6 +12,7 @@ flux-core = { path = "crates/flux-core" }
 flux-fs = { path = "crates/flux-fs" }
 flux-git = { path = "crates/flux-git" }
 flux-lsp = { path = "crates/flux-lsp" }
+flux-plugin = { path = "crates/flux-plugin" }
 flux-syntax = { path = "crates/flux-syntax" }
 flux-search = { path = "crates/flux-search" }
 flux-term = { path = "crates/flux-term" }
@@ -90,4 +91,17 @@ opt-level = 3
 [profile.dev.package.vte]
 opt-level = 3
 [profile.dev.package.flux-term]
+opt-level = 3
+# Plugins (flux-plugin): Cranelift compiles a plugin's component when it is loaded the first time
+# (then it comes from the cache). Without optimizations a debug build compiles a component several
+# times slower; the code it generates is the same.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+[profile.dev.package.wasmparser]
 opt-level = 3

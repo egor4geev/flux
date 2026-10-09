@@ -2,7 +2,7 @@
 //! (`FLUX_SETTINGS_FILE` — another file; in a scenario without it, nothing is read or written).
 //! Edited in the Settings window ([`crate::settings_view`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,13 @@ pub struct Settings {
     /// Ask before terminating a command that runs in a terminal being closed ("Don't ask again"
     /// turns it off).
     pub confirm_terminate: bool,
+    /// Plugins the user turned off, by id (`plugins.disabled`); the rest are on.
+    pub disabled_plugins: BTreeSet<String>,
+    /// Folders of plugins under development (`plugins.dev`).
+    pub dev_plugins: Vec<PathBuf>,
+    /// The values of plugins' settings the user changed, by plugin id (`plugins.settings`); the
+    /// rest have the manifest's defaults.
+    pub plugin_values: BTreeMap<String, serde_json::Map<String, Value>>,
     /// Where the settings are saved; `None` — kept in memory only.
     path: Option<PathBuf>,
 }
@@ -67,6 +74,9 @@ impl Default for Settings {
             do_not_disturb: false,
             notification_displays: BTreeMap::new(),
             confirm_terminate: true,
+            disabled_plugins: BTreeSet::new(),
+            dev_plugins: Vec::new(),
+            plugin_values: BTreeMap::new(),
             path: None,
         }
     }
@@ -149,6 +159,66 @@ pub fn set_confirm_terminate(on: bool, cx: &mut App) {
     save(settings);
 }
 
+pub fn plugin_enabled(id: &str, cx: &App) -> bool {
+    cx.try_global::<Settings>()
+        .is_none_or(|settings| !settings.disabled_plugins.contains(id))
+}
+
+pub fn set_plugin_enabled(id: &str, on: bool, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    if on {
+        settings.disabled_plugins.remove(id);
+    } else {
+        settings.disabled_plugins.insert(id.to_string());
+    }
+    save(settings);
+}
+
+pub fn dev_plugins(cx: &App) -> Vec<PathBuf> {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.dev_plugins.clone())
+        .unwrap_or_default()
+}
+
+pub fn add_dev_plugin(dir: PathBuf, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    if !settings.dev_plugins.contains(&dir) {
+        settings.dev_plugins.push(dir);
+        save(settings);
+    }
+}
+
+pub fn remove_dev_plugin(dir: &Path, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    settings.dev_plugins.retain(|known| known != dir);
+    save(settings);
+}
+
+/// The values the user gave a plugin's settings, by key (the rest are the manifest's defaults).
+pub fn plugin_values(id: &str, cx: &App) -> serde_json::Map<String, Value> {
+    cx.try_global::<Settings>()
+        .and_then(|settings| settings.plugin_values.get(id).cloned())
+        .unwrap_or_default()
+}
+
+/// Sets a plugin's setting; `None` — back to the manifest's default.
+pub fn set_plugin_value(id: &str, key: &str, value: Option<Value>, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    let values = settings.plugin_values.entry(id.to_string()).or_default();
+    match value {
+        Some(value) => {
+            values.insert(key.to_string(), value);
+        }
+        None => {
+            values.remove(key);
+        }
+    }
+    if values.is_empty() {
+        settings.plugin_values.remove(id);
+    }
+    save(settings);
+}
+
 fn save(settings: &Settings) {
     if let Some(path) = &settings.path
         && let Err(err) = write(path, &to_json(settings))
@@ -200,6 +270,31 @@ fn parse(text: &str) -> Settings {
         confirm_terminate: value["terminal"]["confirm_terminate"]
             .as_bool()
             .unwrap_or(defaults.confirm_terminate),
+        disabled_plugins: value["plugins"]["disabled"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| Some(id.as_str()?.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        dev_plugins: value["plugins"]["dev"]
+            .as_array()
+            .map(|dirs| {
+                dirs.iter()
+                    .filter_map(|dir| Some(PathBuf::from(dir.as_str()?)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        plugin_values: value["plugins"]["settings"]
+            .as_object()
+            .map(|plugins| {
+                plugins
+                    .iter()
+                    .filter_map(|(id, values)| Some((id.clone(), values.as_object()?.clone())))
+                    .collect()
+            })
+            .unwrap_or_default(),
         ..defaults
     }
 }
@@ -217,6 +312,15 @@ fn to_json(settings: &Settings) -> String {
                 .collect::<serde_json::Map<_, _>>(),
         },
         "terminal": { "confirm_terminate": settings.confirm_terminate },
+        "plugins": {
+            "disabled": settings.disabled_plugins.iter().collect::<Vec<_>>(),
+            "dev": settings
+                .dev_plugins
+                .iter()
+                .map(|dir| dir.to_string_lossy())
+                .collect::<Vec<_>>(),
+            "settings": settings.plugin_values,
+        },
     });
     serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
 }
@@ -248,6 +352,12 @@ mod tests {
                 ("plugin:claude".to_string(), Display::Hidden),
             ]),
             confirm_terminate: false,
+            disabled_plugins: BTreeSet::from(["flux.todo".to_string()]),
+            dev_plugins: vec![PathBuf::from("/Users/me/dev/hello")],
+            plugin_values: BTreeMap::from([(
+                "flux.todo".to_string(),
+                serde_json::Map::from_iter([("patterns".to_string(), json!(["TODO"]))]),
+            )]),
             path: None,
         };
         assert_eq!(parse(&to_json(&off)), off);

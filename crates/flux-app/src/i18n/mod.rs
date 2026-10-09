@@ -38,6 +38,14 @@ pub fn lang() -> Lang {
     LANG.get().copied().unwrap_or(Lang::En)
 }
 
+/// The interface language as a code: "en", "ru" (plugins' translations are keyed by it).
+pub fn lang_code() -> &'static str {
+    match lang() {
+        Lang::En => "en",
+        Lang::Ru => "ru",
+    }
+}
+
 /// `FLUX_LANG` wins; otherwise the first preferred language we speak; otherwise English.
 fn choose(override_lang: Option<&str>, preferred: &[String]) -> Lang {
     override_lang

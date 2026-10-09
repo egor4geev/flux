@@ -1,0 +1,13 @@
+# Russian: English text = translation. Flux translates the manifest's strings with it too.
+"A plugin to start from: a command with a notification, a tool window with the open documents, a setting." = "Плагин, с которого можно начать: команда с уведомлением, окно с открытыми документами, настройка."
+"Say Hello" = "Поздороваться"
+"Show Open Documents" = "Показать открытые документы"
+"Documents" = "Документы"
+"Greeting" = "Приветствие"
+"What Say Hello says." = "Что говорит команда «Поздороваться»."
+"Hello from a plugin!" = "Привет от плагина!"
+"Refresh" = "Обновить"
+"No open documents" = "Нет открытых документов"
+"Untitled" = "Без имени"
+"Documents: {0}" = "Документов: {0}"
+"modified" = "изменён"
