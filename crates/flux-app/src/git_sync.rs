@@ -76,7 +76,7 @@ pub fn update_project(
         UpdatePreference::Rebase => UpdateMethod::Rebase,
         UpdatePreference::Ask => {
             let this = cx.weak_entity();
-            workspace.toggle_modal(window, cx, move |_, cx| UpdateDialog::new(this, repos, cx));
+            workspace.toggle_dialog(window, cx, move |_, cx| UpdateDialog::new(this, repos, cx));
             return;
         }
     };
@@ -475,7 +475,7 @@ fn open_pull(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Wo
     let active = workspace.active_path(cx);
     let repo = git.read(cx).current_repo(active.as_deref()).unwrap_or(0);
     let this = cx.weak_entity();
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         PullDialog::new(this, git, repo, window, cx)
     });
 }

@@ -62,6 +62,36 @@ impl Default for LeftIslandWidth {
     }
 }
 
+/// The width of the island on the right, shared by its tool windows (Notifications; plugins' windows
+/// later): switching between them doesn't move the editor.
+#[derive(Clone)]
+pub struct RightIslandWidth(std::rc::Rc<std::cell::Cell<f32>>);
+
+impl RightIslandWidth {
+    pub const DEFAULT: f32 = 340.;
+    pub const MIN: f32 = 260.;
+    pub const MAX: f32 = 720.;
+
+    pub fn new() -> Self {
+        Self(std::rc::Rc::new(std::cell::Cell::new(Self::DEFAULT)))
+    }
+
+    pub fn get(&self) -> f32 {
+        self.0.get()
+    }
+
+    /// Sets the width, kept within the limits.
+    pub fn set(&self, width: f32) {
+        self.0.set(width.clamp(Self::MIN, Self::MAX));
+    }
+}
+
+impl Default for RightIslandWidth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The height of the island under the editor. The terminal panel and the Git window take turns in
 /// it and share it: switching between them (⌥F12, ⌘9) doesn't move the editor.
 #[derive(Clone)]
@@ -121,6 +151,12 @@ pub fn popover(ui: UiColors) -> Div {
         .text_size(px(theme::TEXT_MD))
         .text_color(ui.foreground)
         .child(sheen(ui, RADIUS_XL))
+}
+
+/// The backdrop of a modal dialog: a light shade over the window that takes its clicks (the dialog
+/// is modal, as in JetBrains IDEs). No blur and no animation: the dialog simply appears.
+pub fn modal_backdrop(ui: UiColors) -> Div {
+    div().occlude().bg(UiColors::tint(ui.shadow, 0.18))
 }
 
 /// Glass highlight: a light line along the top edge that fades out toward the corners. `inset` is

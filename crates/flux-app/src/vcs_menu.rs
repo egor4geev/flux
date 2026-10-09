@@ -6,7 +6,7 @@
 //! doesn't apply right now is dimmed.
 
 use flux_git::RepoState;
-use gpui::{App, Context, Div, InteractiveElement, Pixels, Point, Window, actions, point, px};
+use gpui::{Context, Div, InteractiveElement, Window, actions};
 
 use crate::commit_panel::confirm_rollback;
 use crate::context_menu::{self, ContextMenu};
@@ -20,8 +20,7 @@ actions!(git, [RollbackFile]);
 /// Opens the menu (or closes it, when open). Like JetBrains' quick lists, it shows where the work
 /// is: under the caret when an editor has focus, otherwise in the middle of the window.
 pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let anchor = caret_anchor(workspace, window, cx)
-        .unwrap_or_else(|| window_middle(window, context_menu::MENU_MIN_WIDTH));
+    let anchor = crate::popup::where_the_work_is(workspace, context_menu::MENU_MIN_WIDTH, window, cx);
     let git = workspace.git().read(cx);
     let has_repo = !git.repos().is_empty();
     let has_changes = !git.changes().is_empty();
@@ -135,33 +134,6 @@ pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Wor
     });
     // A second ⌃V closed the menu: then there is nothing to place.
     workspace.anchor_modal(anchor);
-}
-
-/// Under the caret of the focused editor, if it is on screen: where JetBrains puts its quick lists
-/// (this menu, the branches popup).
-pub(crate) fn caret_anchor(
-    workspace: &Workspace,
-    window: &Window,
-    cx: &App,
-) -> Option<Point<Pixels>> {
-    let editor = workspace.active_editor()?;
-    let editor = editor.read(cx);
-    if !editor.focus_handle.is_focused(window) {
-        return None;
-    }
-    let head = editor.document.selection().primary().head;
-    let anchor = crate::popup::anchor(editor, head)?;
-    Some(point(
-        anchor.x,
-        anchor.line_bottom + px(crate::popup::POPUP_GAP),
-    ))
-}
-
-/// The middle of the window for a popup `width` wide, a third of the way down: where a menu
-/// without a caret reads best.
-pub(crate) fn window_middle(window: &Window, width: f32) -> Point<Pixels> {
-    let size = window.viewport_size();
-    point(size.width / 2. - px(width / 2.), size.height / 3.)
 }
 
 /// The menu's own actions, handled by the window.

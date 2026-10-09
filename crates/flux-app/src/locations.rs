@@ -236,7 +236,8 @@ fn shorten(text: &str, max_chars: usize) -> String {
     short
 }
 
-/// Shows the rows as a list over the window; Enter jumps to the chosen place.
+/// Shows the rows as a list; Enter jumps to the chosen place. Like JetBrains' Show Usages, the list
+/// opens under the caret it is about (if the editor still has focus), otherwise at the top center.
 pub(crate) fn open(
     workspace: &mut Workspace,
     kind: ListKind,
@@ -245,10 +246,14 @@ pub(crate) fn open(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let anchor = crate::popup::caret_point(workspace, window, cx);
     let weak = cx.entity().downgrade();
     workspace.toggle_modal(window, cx, move |window, cx| {
         Picker::new(LocationList::new(kind, rows, weak, origin), window, cx)
     });
+    if let Some(anchor) = anchor {
+        workspace.anchor_modal(anchor);
+    }
 }
 
 pub(crate) struct LocationList {

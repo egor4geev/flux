@@ -2,6 +2,7 @@
 //! (`FLUX_SETTINGS_FILE` — another file; in a scenario without it, nothing is read or written).
 //! Edited in the Settings window ([`crate::settings_view`]).
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,12 +10,22 @@ use std::path::{Path, PathBuf};
 use gpui::{App, Global};
 use serde_json::{Value, json};
 
+use crate::notification_center::Display;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     /// Install a missing language server when a file needs it.
     pub auto_install_servers: bool,
     /// How Update Project brings the incoming commits into the current branch.
     pub update_method: UpdatePreference,
+    /// Notifications: cards off for every group (the journal still gets everything).
+    pub do_not_disturb: bool,
+    /// How each notification group is shown, by group key ("git", "plugin:claude"); a group not
+    /// here has its default.
+    pub notification_displays: BTreeMap<String, Display>,
+    /// Ask before terminating a command that runs in a terminal being closed ("Don't ask again"
+    /// turns it off).
+    pub confirm_terminate: bool,
     /// Where the settings are saved; `None` — kept in memory only.
     path: Option<PathBuf>,
 }
@@ -53,6 +64,9 @@ impl Default for Settings {
         Self {
             auto_install_servers: true,
             update_method: UpdatePreference::default(),
+            do_not_disturb: false,
+            notification_displays: BTreeMap::new(),
+            confirm_terminate: true,
             path: None,
         }
     }
@@ -99,6 +113,42 @@ pub fn set_update_method(method: UpdatePreference, cx: &mut App) {
     save(settings);
 }
 
+pub fn do_not_disturb(cx: &App) -> bool {
+    cx.try_global::<Settings>()
+        .is_some_and(|settings| settings.do_not_disturb)
+}
+
+pub fn set_do_not_disturb(on: bool, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    settings.do_not_disturb = on;
+    save(settings);
+}
+
+/// How the notifications of the group with `key` are shown, if the user chose it.
+pub fn notification_display(key: &str, cx: &App) -> Option<Display> {
+    cx.try_global::<Settings>()
+        .and_then(|settings| settings.notification_displays.get(key).copied())
+}
+
+pub fn set_notification_display(key: &str, display: Display, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    settings
+        .notification_displays
+        .insert(key.to_string(), display);
+    save(settings);
+}
+
+pub fn confirm_terminate(cx: &App) -> bool {
+    cx.try_global::<Settings>()
+        .is_none_or(|settings| settings.confirm_terminate)
+}
+
+pub fn set_confirm_terminate(on: bool, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    settings.confirm_terminate = on;
+    save(settings);
+}
+
 fn save(settings: &Settings) {
     if let Some(path) = &settings.path
         && let Err(err) = write(path, &to_json(settings))
@@ -133,6 +183,23 @@ fn parse(text: &str) -> Settings {
             .as_str()
             .and_then(UpdatePreference::from_key)
             .unwrap_or(defaults.update_method),
+        do_not_disturb: value["notifications"]["do_not_disturb"]
+            .as_bool()
+            .unwrap_or(defaults.do_not_disturb),
+        notification_displays: value["notifications"]["groups"]
+            .as_object()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|(key, display)| {
+                        Some((key.clone(), Display::from_key(display.as_str()?)?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        confirm_terminate: value["terminal"]["confirm_terminate"]
+            .as_bool()
+            .unwrap_or(defaults.confirm_terminate),
         ..defaults
     }
 }
@@ -141,6 +208,15 @@ fn to_json(settings: &Settings) -> String {
     let value = json!({
         "language_servers": { "auto_install": settings.auto_install_servers },
         "git": { "update_method": settings.update_method.key() },
+        "notifications": {
+            "do_not_disturb": settings.do_not_disturb,
+            "groups": settings
+                .notification_displays
+                .iter()
+                .map(|(key, display)| (key.clone(), Value::from(display.key())))
+                .collect::<serde_json::Map<_, _>>(),
+        },
+        "terminal": { "confirm_terminate": settings.confirm_terminate },
     });
     serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
 }
@@ -166,6 +242,12 @@ mod tests {
         let off = Settings {
             auto_install_servers: false,
             update_method: UpdatePreference::Rebase,
+            do_not_disturb: true,
+            notification_displays: BTreeMap::from([
+                ("git".to_string(), Display::StickyBalloon),
+                ("plugin:claude".to_string(), Display::Hidden),
+            ]),
+            confirm_terminate: false,
             path: None,
         };
         assert_eq!(parse(&to_json(&off)), off);
@@ -179,6 +261,15 @@ mod tests {
         assert_eq!(
             parse(r#"{"language_servers": {"auto_install": "no"}}"#),
             Settings::default()
+        );
+        // An unknown display or a wrong type drops only that entry.
+        let parsed = parse(
+            r#"{"notifications": {"do_not_disturb": 1, "groups": {"git": "log", "files": "loud", "terminal": 3}}}"#,
+        );
+        assert!(!parsed.do_not_disturb);
+        assert_eq!(
+            parsed.notification_displays,
+            BTreeMap::from([("git".to_string(), Display::LogOnly)])
         );
     }
 

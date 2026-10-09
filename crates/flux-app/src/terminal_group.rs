@@ -11,10 +11,11 @@ use std::path::PathBuf;
 
 use gpui::{
     AnyElement, App, AppContext, Axis, Context, CursorStyle, DragMoveEvent, ElementId, Entity,
-    EntityId, EventEmitter, FocusHandle, Focusable, KeyBinding, PromptLevel, Render, SharedString,
-    Subscription, Task, Window, actions, div, prelude::*, px, relative,
+    EntityId, EventEmitter, FocusHandle, Focusable, KeyBinding, Render, SharedString, Subscription,
+    Task, Window, actions, div, prelude::*, px, relative,
 };
 
+use crate::dialog::Dialog;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
 use crate::terminal_view::{TerminalLink, TerminalView, TerminalViewEvent};
@@ -63,6 +64,8 @@ pub enum TerminalGroupEvent {
     OpenLink(TerminalLink),
     /// The last pane is gone (its shell exited, or it was closed): the tab goes away.
     Empty,
+    /// A new pane's shell didn't start: the reason (also shown in the group).
+    ShellFailed(SharedString),
 }
 
 /// A node of the pane tree: a terminal (generic only for the tests), or a split.
@@ -328,26 +331,13 @@ impl TerminalGroup {
         if running.is_empty() {
             return Task::ready(true);
         }
-        let answer = match running.as_slice() {
-            [name] => window.prompt(
-                PromptLevel::Warning,
-                &trf("Terminate “{0}”?", &[name]),
-                Some(tr("The process is still running in this terminal.")),
-                &[tr("Terminate"), tr("Cancel")],
-                cx,
-            ),
-            names => {
-                let detail = trf("Still running in this tab: {0}.", &[&names.join(", ")]);
-                window.prompt(
-                    PromptLevel::Warning,
-                    tr("Terminate running processes?"),
-                    Some(detail.as_str()),
-                    &[tr("Terminate"), tr("Cancel")],
-                    cx,
-                )
-            }
+        let dialog = match running.as_slice() {
+            [name] => Dialog::warning(trf("Terminate “{0}”?", &[name]))
+                .message(tr("The process is still running in this terminal.")),
+            names => Dialog::warning(tr("Terminate running processes?"))
+                .message(trf("Still running in this tab: {0}.", &[&names.join(", ")])),
         };
-        cx.spawn(async move |_| answer.await == Ok(0))
+        confirm_terminate(dialog, window, cx)
     }
 
     /// Splits the active pane: a new terminal to its right or below it, in its directory.
@@ -358,6 +348,7 @@ impl TerminalGroup {
             Ok(view) => view,
             Err(err) => {
                 self.error = Some(trf("Couldn't start the shell: {0}", &[&err]).into());
+                cx.emit(TerminalGroupEvent::ShellFailed(err.to_string().into()));
                 return cx.notify();
             }
         };
@@ -386,16 +377,15 @@ impl TerminalGroup {
         let Some(name) = view.read(cx).running_process() else {
             return self.remove_pane(view, window, cx);
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &trf("Terminate “{0}”?", &[&name]),
-            Some(tr("The process is still running in this terminal.")),
-            &[tr("Terminate"), tr("Cancel")],
+        let answer = confirm_terminate(
+            Dialog::warning(trf("Terminate “{0}”?", &[&name]))
+                .message(tr("The process is still running in this terminal.")),
+            window,
             cx,
         );
         let view = view.clone();
         cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Ok(0) {
+            if answer.await {
                 this.update_in(cx, |this, window, cx| this.remove_pane(&view, window, cx))
                     .ok();
             }
@@ -718,6 +708,32 @@ impl Render for DraggedTerminal {
             .child(icon(IconName::Terminal, ui.green).size(px(14.)))
             .child(self.title.clone())
     }
+}
+
+/// Asks whether to terminate what runs in a terminal being closed (`dialog` — the question): Terminate
+/// or Cancel, with "Don't ask again" (Settings: `terminal.confirm_terminate`). `true` — terminate.
+pub(crate) fn confirm_terminate(dialog: Dialog, window: &mut Window, cx: &mut App) -> Task<bool> {
+    if !crate::settings::confirm_terminate(cx) {
+        return Task::ready(true);
+    }
+    let answer = crate::dialog::ask(
+        dialog
+            .danger(tr("Terminate"))
+            .cancel(tr("Cancel"))
+            .dont_ask_again(),
+        window,
+        cx,
+    );
+    cx.spawn(async move |cx| {
+        let Some(answer) = answer.await.filter(|answer| answer.button == 0) else {
+            return false;
+        };
+        if answer.dont_ask_again {
+            cx.update(|cx| crate::settings::set_confirm_terminate(false, cx))
+                .ok();
+        }
+        true
+    })
 }
 
 #[cfg(test)]

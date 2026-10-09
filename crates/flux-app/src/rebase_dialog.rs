@@ -19,10 +19,11 @@ use flux_core::Rope;
 use flux_git::{GitError, Operation, Outcome, RebaseAction, RebaseEntry, RepoState};
 use gpui::{
     App, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, KeyBinding, PromptButton, PromptLevel, Render, ScrollHandle,
-    SharedString, Subscription, WeakEntity, Window, actions, div, prelude::*, px,
+    Focusable, FontWeight, KeyBinding, Render, ScrollHandle, SharedString, Subscription,
+    WeakEntity, Window, actions, div, prelude::*, px,
 };
 
+use crate::dialog::Dialog;
 use crate::editor::{Editor, EditorEvent};
 use crate::git;
 use crate::i18n::{tr, trf, trn};
@@ -101,23 +102,22 @@ pub fn init(cx: &mut App) {
 /// The window-level actions: `InteractiveRebase`, `EditCommitMessage`, `MeldCommits`,
 /// `DropCommits`.
 pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
-    root
-        .on_action(
-            cx.listener(|this, action: &git::InteractiveRebase, window, cx| {
-                open_interactive(this, action.repo, action.oid.clone(), window, cx)
-            }),
-        )
-        .on_action(
-            cx.listener(|this, action: &git::EditCommitMessage, window, cx| {
-                edit_message(this, action.repo, action.oid.clone(), window, cx)
-            }),
-        )
-        .on_action(cx.listener(|this, action: &git::MeldCommits, window, cx| {
-            meld(this, action.clone(), window, cx)
-        }))
-        .on_action(cx.listener(|this, action: &git::DropCommits, window, cx| {
-            drop_commits(this, action.repo, action.oids.clone(), window, cx)
-        }))
+    root.on_action(
+        cx.listener(|this, action: &git::InteractiveRebase, window, cx| {
+            open_interactive(this, action.repo, action.oid.clone(), window, cx)
+        }),
+    )
+    .on_action(
+        cx.listener(|this, action: &git::EditCommitMessage, window, cx| {
+            edit_message(this, action.repo, action.oid.clone(), window, cx)
+        }),
+    )
+    .on_action(cx.listener(|this, action: &git::MeldCommits, window, cx| {
+        meld(this, action.clone(), window, cx)
+    }))
+    .on_action(cx.listener(|this, action: &git::DropCommits, window, cx| {
+        drop_commits(this, action.repo, action.oids.clone(), window, cx)
+    }))
 }
 
 // --- The plan: rows of the dialog (newest first) ---
@@ -491,22 +491,17 @@ fn rewrite(
         let pushed = pushed.await.unwrap_or(false);
         if pushed {
             let Ok(answer) = this.update_in(cx, |_, window, cx| {
-                window.prompt(
-                    PromptLevel::Warning,
-                    tr("These commits are already pushed"),
-                    Some(tr(
+                Dialog::warning(tr("These commits are already pushed"))
+                    .message(tr(
                         "Rewriting them changes the history others may have. The branch will need a force push.",
-                    )),
-                    &[
-                        PromptButton::new(tr("Rewrite Anyway")),
-                        PromptButton::cancel(tr("Cancel")),
-                    ],
-                    cx,
-                )
+                    ))
+                    .danger(tr("Rewrite Anyway"))
+                    .cancel(tr("Cancel"))
+                    .show(window, cx)
             }) else {
                 return;
             };
-            if answer.await != Ok(0) {
+            if answer.await != Some(0) {
                 return;
             }
         }
@@ -627,7 +622,7 @@ fn open_interactive(
             Err(error) => notify_error(this, tr("Can't rebase from this commit"), &error, cx),
             Ok(loaded) => {
                 let workspace = cx.entity().downgrade();
-                this.toggle_modal(window, cx, move |window, cx| {
+                this.toggle_dialog(window, cx, move |window, cx| {
                     RebaseDialog::new(workspace, repo, branch, loaded, window, cx)
                 });
             }
@@ -664,7 +659,7 @@ fn edit_message(
             };
             let subtitle = format!("{} · {}", short(&oid), details.commit.summary);
             let workspace = cx.entity().downgrade();
-            this.toggle_modal(window, cx, move |window, cx| {
+            this.toggle_dialog(window, cx, move |window, cx| {
                 MessageDialog::new(
                     tr("Edit Commit Message"),
                     subtitle,
@@ -808,7 +803,7 @@ fn meld(
                 .join("\n\n");
             let subtitle = trf("Into {0}", &[&short(&target)]);
             let workspace = cx.entity().downgrade();
-            this.toggle_modal(window, cx, move |window, cx| {
+            this.toggle_dialog(window, cx, move |window, cx| {
                 MessageDialog::new(
                     trn(count + 1, "Squash {n} Commit", "Squash {n} Commits"),
                     subtitle,
@@ -869,16 +864,11 @@ fn drop_commits(
                 detail.push('\n');
                 detail.push_str(&trf("and {0} more", &[&(oids.len() - LISTED_COMMITS)]));
             }
-            let answer = window.prompt(
-                PromptLevel::Warning,
-                &trn(oids.len(), "Drop {n} commit?", "Drop {n} commits?"),
-                Some(&detail),
-                &[
-                    PromptButton::new(tr("Drop")),
-                    PromptButton::cancel(tr("Cancel")),
-                ],
-                cx,
-            );
+            let answer = Dialog::warning(trn(oids.len(), "Drop {n} commit?", "Drop {n} commits?"))
+                .details(detail)
+                .danger(tr("Drop"))
+                .cancel(tr("Cancel"))
+                .show(window, cx);
             Some((answer, plan, onto))
         }) else {
             return;
@@ -886,7 +876,7 @@ fn drop_commits(
         let Some((answer, plan, onto)) = answer else {
             return;
         };
-        if answer.await != Ok(0) {
+        if answer.await != Some(0) {
             return;
         }
         this.update_in(cx, |this, window, cx| {

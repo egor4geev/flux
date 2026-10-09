@@ -28,7 +28,6 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Здесь появятся изменения файлов проекта",
     ),
     ("“{0}” is deleted", "«{0}» удалён"),
-    ("Committed {0}: {1}", "Закоммичено {0}: {1}"),
     ("Commit canceled", "Коммит отменён"),
     (
         "Commit canceled: a document couldn't be saved",
@@ -51,7 +50,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Rollback and Delete Added",
         "Откатить и удалить добавленные",
     ),
-    ("Rollback failed: {0}", "Откат не удался: {0}"),
+    ("Rollback failed", "Откат не удался"),
     ("Rolled back: {0}", "Откачено: {0}"),
     ("Rolled back {0}", "Откачено {0}"),
     // The push dialog.

@@ -44,6 +44,7 @@ use gpui::{
 use crate::editor::Editor;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::notification_center::NotificationGroup;
 use crate::notifications::Notification;
 use crate::theme::UiColors;
 use crate::workspace::Workspace;
@@ -406,14 +407,9 @@ pub fn init(cx: &mut App) {
 /// What changed, for those who watch the store.
 #[derive(Debug, Clone)]
 pub enum GitEvent {
-    /// A message for the status bar ("Committed 3 files").
+    /// A hint for the status bar about the action at hand ("Enter a commit message"); what
+    /// happened goes to [`GitEvent::Notify`].
     Message(SharedString),
-    /// An operation failed: a short message and git's whole output (hook output, a rejected push)
-    /// for a dialog.
-    Error {
-        message: SharedString,
-        details: Option<String>,
-    },
     /// A notification in the corner of the window (an operation's result, with actions).
     Notify(Notification),
     /// An operation of the store changed files of a repository's working tree (checkout, merge,
@@ -1347,30 +1343,15 @@ impl GitStore {
         cx.emit(event);
     }
 
-    /// A notification in the corner of the window.
+    /// A notification of the Git group: the journal and, by the group's setting, a card.
     pub fn notify(&mut self, notification: Notification, cx: &mut Context<Self>) {
-        cx.emit(GitEvent::Notify(notification));
+        cx.emit(GitEvent::Notify(notification.group(NotificationGroup::Git)));
     }
 
     /// An error notification: `title` ("Checkout failed"), git's first line, and git's whole output
     /// behind "Details" when there is more to it.
     pub fn notify_error(&mut self, title: &str, error: &GitError, cx: &mut Context<Self>) {
-        let mut notification = Notification::error(title.to_string()).body(error.to_string());
-        if let Some(details) = error.details()
-            && details
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count()
-                > 1
-        {
-            notification = notification.action(
-                tr("Details"),
-                ShowGitOutput {
-                    title: title.to_string(),
-                    output: details.to_string(),
-                },
-            );
-        }
+        let notification = error_notification(title, &error.to_string(), error.details());
         self.notify(notification, cx);
     }
 
@@ -2446,13 +2427,12 @@ pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
     )
     .on_action(cx.listener(|_, action: &ShowGitOutput, window, cx| {
         // The answer doesn't matter: the dialog only shows git's output.
-        drop(window.prompt(
-            gpui::PromptLevel::Info,
-            &action.title,
-            Some(&action.output),
-            &[tr("OK")],
-            cx,
-        ));
+        drop(
+            crate::dialog::Dialog::info(action.title.clone())
+                .details(action.output.clone())
+                .primary(tr("OK"))
+                .show(window, cx),
+        );
     }))
     .on_action(cx.listener(|this, action: &OpenCompareDiff, window, cx| {
         this.open_compare(
@@ -2464,6 +2444,31 @@ pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
             cx,
         )
     }))
+}
+
+/// An error card: `title` ("Checkout failed"), a line under it, and git's whole output behind
+/// "Details" when there is more to it than one line.
+pub(crate) fn error_notification(title: &str, body: &str, details: Option<&str>) -> Notification {
+    let mut notification = Notification::error(title.to_string()).group(NotificationGroup::Git);
+    if !body.is_empty() {
+        notification = notification.body(body.to_string());
+    }
+    if let Some(details) = details
+        && details
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+            > 1
+    {
+        notification = notification.action(
+            tr("Details"),
+            ShowGitOutput {
+                title: title.to_string(),
+                output: details.to_string(),
+            },
+        );
+    }
+    notification
 }
 
 /// The git branch of a directory, straight from `.git/HEAD` (before the first status): `ref:

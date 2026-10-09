@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 use gpui::{
     Action, AnyElement, App, Axis, ClickEvent, Context, CursorStyle, DismissEvent, DragMoveEvent,
     Entity, EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton,
-    MouseDownEvent, MouseUpEvent, Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString,
-    Subscription, Window, actions, div, prelude::*, px,
+    MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, SharedString, Subscription,
+    Window, actions, div, prelude::*, px,
 };
 
 use crate::context_menu::ContextMenu;
+use crate::dialog::Dialog;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
 use crate::terminal_group::{
@@ -79,6 +80,8 @@ pub enum TerminalPanelEvent {
         group: Entity<TerminalGroup>,
         index: usize,
     },
+    /// A new terminal's shell didn't start: the reason (also shown in the panel).
+    ShellFailed(SharedString),
 }
 
 struct PanelTab {
@@ -176,6 +179,7 @@ impl TerminalPanel {
             }
             Err(err) => {
                 self.error = Some(trf("Couldn't start the shell: {0}", &[&err]).into());
+                cx.emit(TerminalPanelEvent::ShellFailed(err.to_string().into()));
                 cx.notify();
             }
         }
@@ -293,18 +297,18 @@ impl TerminalPanel {
             .flat_map(|group| group.read(cx).running_processes(cx))
             .collect();
         let confirm = (!running.is_empty()).then(|| {
-            let detail = trf("Still running in other tabs: {0}.", &[&running.join(", ")]);
-            window.prompt(
-                PromptLevel::Warning,
-                tr("Terminate running processes?"),
-                Some(detail.as_str()),
-                &[tr("Terminate"), tr("Cancel")],
+            crate::terminal_group::confirm_terminate(
+                Dialog::warning(tr("Terminate running processes?")).message(trf(
+                    "Still running in other tabs: {0}.",
+                    &[&running.join(", ")],
+                )),
+                window,
                 cx,
             )
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Some(answer) = confirm
-                && answer.await != Ok(0)
+                && !answer.await
             {
                 return;
             }
@@ -352,6 +356,9 @@ impl TerminalPanel {
                 cx.emit(TerminalPanelEvent::OpenLink(link.clone()))
             }
             TerminalGroupEvent::Empty => self.discard(group, window, cx),
+            TerminalGroupEvent::ShellFailed(reason) => {
+                cx.emit(TerminalPanelEvent::ShellFailed(reason.clone()))
+            }
         }
     }
 

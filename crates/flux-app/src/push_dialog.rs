@@ -17,10 +17,11 @@ use flux_git::{
 };
 use gpui::{
     App, AsyncWindowContext, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, KeyBinding, PromptLevel, Render, SharedString, Subscription, Task,
-    Window, actions, div, prelude::*, px,
+    Focusable, FontWeight, KeyBinding, Render, SharedString, Subscription, Task, Window, actions,
+    div, prelude::*, px,
 };
 
+use crate::dialog::Dialog;
 use crate::git::{self, CheckState, GitEvent, GitStore};
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, file_icon, icon};
@@ -65,7 +66,7 @@ pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Wor
             git.report(GitEvent::Message(message.into()), cx)
         });
     }
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         PushDialog::new(git, None, window, cx)
     });
 }
@@ -83,7 +84,7 @@ pub fn open_for_branch(
     if git.read(cx).repos().get(repo).is_none() {
         return;
     }
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         PushDialog::new(git, Some((repo, branch)), window, cx)
     });
 }
@@ -489,19 +490,14 @@ impl PushDialog {
                     )
                 })
                 .collect();
-            let answer = window.prompt(
-                PromptLevel::Warning,
-                tr("Force push?"),
-                Some(&format!(
-                    "{}\n\n{}",
-                    names.join("\n"),
-                    tr("The remote branch is overwritten with yours, unless someone pushed to it since your last fetch (--force-with-lease).")
-                )),
-                &[tr("Force Push"), tr("Cancel")],
-                cx,
-            );
+            let answer = Dialog::warning(tr("Force push?"))
+                .message(tr("The remote branch is overwritten with yours, unless someone pushed to it since your last fetch (--force-with-lease)."))
+                .details(names.join("\n"))
+                .danger(tr("Force Push"))
+                .cancel(tr("Cancel"))
+                .show(window, cx);
             cx.spawn_in(window, async move |this, cx| {
-                if answer.await == Ok(0) {
+                if answer.await == Some(0) {
                     this.update_in(cx, |this, window, cx| this.start(requests, window, cx))
                         .ok();
                 }
@@ -967,20 +963,19 @@ async fn ask_update(
         UpdateMethod::Merge => tr("Merge and Push"),
         UpdateMethod::Rebase => tr("Rebase and Push"),
     };
-    let answer = cx
-        .prompt(
-            PromptLevel::Warning,
-            &trf("Push of {0} was rejected", &[&request.local_branch]),
-            Some(&trf(
-                "{0}/{1} has commits that {2} doesn't have (someone pushed first). Update {2} — rebase your commits on top of them or merge them in — and Flux pushes again.",
-                &[&request.remote, &request.remote_branch, &request.local_branch],
-            )),
-            &[label(first), label(second), tr("Cancel")],
-        )
+    let answer = Dialog::warning(trf("Push of {0} was rejected", &[&request.local_branch]))
+        .message(trf(
+            "{0}/{1} has commits that {2} doesn't have (someone pushed first). Update {2} — rebase your commits on top of them or merge them in — and Flux pushes again.",
+            &[&request.remote, &request.remote_branch, &request.local_branch],
+        ))
+        .primary(label(first))
+        .normal(label(second))
+        .cancel(tr("Cancel"))
+        .show_async(cx)
         .await;
     match answer {
-        Ok(0) => Some(first),
-        Ok(1) => Some(second),
+        Some(0) => Some(first),
+        Some(1) => Some(second),
         _ => None,
     }
 }

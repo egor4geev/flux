@@ -27,6 +27,8 @@ use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::navigation::{Request, canonical, error_message, server_edits, word_at};
+use crate::notification_center::NotificationGroup;
+use crate::notifications::Notification;
 use crate::theme::{self, Theme};
 use crate::ui;
 use crate::workspace::Workspace;
@@ -255,13 +257,23 @@ pub(crate) fn apply_workspace_edit(
             })
             .collect();
         let message = summary(in_editors + changed.len(), &written);
+        let failed = written.iter().any(|(_, result)| result.is_err());
         // The server reads files it doesn't have open from disk: they changed under it.
         if !changed.is_empty() {
             server
                 .notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams { changes: changed });
         }
-        this.update(cx, |this, cx| this.show_message(message.into(), cx))
-            .ok();
+        // Files that couldn't be written are a problem to come back to: a notification.
+        this.update(cx, |this, cx| {
+            if failed {
+                let notification =
+                    Notification::warning(message).group(NotificationGroup::LanguageServers);
+                this.notify(notification, cx)
+            } else {
+                this.show_message(message.into(), cx)
+            }
+        })
+        .ok();
     })
     .detach();
     Ok(())

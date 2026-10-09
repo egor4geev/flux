@@ -12,13 +12,14 @@ use gpui::{
     Action, AnyElement, AnyView, App, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, Context,
     DismissEvent, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Global,
     KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    Point, PromptLevel, Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
+    Point, Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
     WindowHandle, actions, anchored, deferred, div, prelude::*, px, relative,
 };
 
 use crate::commit_panel::{CommitPanel, CommitPanelEvent};
+use crate::dialog::Dialog;
 use crate::diff_view::{DiffSide, DiffView, DiffViewEvent};
-use crate::editor::{self, Editor};
+use crate::editor::{self, Editor, EditorEvent};
 use crate::file_tree::{self, FileTreeEvent, FileTreePanel};
 use crate::find_bar::{self, FindBar};
 use crate::git::{GitEvent, GitStore};
@@ -29,7 +30,10 @@ use crate::icons::{IconName, file_icon, icon};
 use crate::launchpad::{self, Tool};
 use crate::lsp::LspStore;
 use crate::merge_view::{MergeView, MergeViewEvent};
-use crate::notifications::{self, Notifications};
+use crate::notification_center::NotificationCenter;
+use crate::notification_center::NotificationGroup;
+use crate::notifications::{self, Notification};
+use crate::notifications_panel::{self, NotificationsPanel};
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
 use crate::start_screen::{self, StartScreen};
 use crate::terminal_group::{DraggedTerminal, TerminalGroup, TerminalGroupEvent};
@@ -200,9 +204,21 @@ pub struct Workspace {
     /// hub.
     git_window: Option<GitWindowHandle>,
     git_open: bool,
-    /// Notifications in the bottom right corner (results of git operations).
-    notifications: Entity<Notifications>,
+    /// The notification center: the journal (the Notifications window) and the cards in the bottom
+    /// right corner.
+    notification_center: Entity<NotificationCenter>,
+    /// The island on the right: the tool window shown in it, if any.
+    right_tool: Option<RightTool>,
+    /// The Notifications window (the journal of the notification center).
+    notifications_panel: Entity<NotificationsPanel>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A tool window of the island on the right. Plugins' windows will take the same slot (the Claude
+/// window of stage 9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RightTool {
+    Notifications,
 }
 
 /// The commit window and the subscription to its events; recreated with the git hub.
@@ -307,16 +323,31 @@ struct DraggedEditorTab {
     name: SharedString,
 }
 
-/// Overlay window. It closes by itself (`DismissEvent`: Esc, making a choice), on a click outside
-/// it, when the same window is invoked again, or when focus has left it (for example, cmd-n opened
-/// a tab); focus returns to where it was before opening.
+/// Overlay window. It closes by itself (`DismissEvent`: Esc, making a choice) or when the same
+/// window is invoked again; focus returns to where it was before opening. How else it goes depends
+/// on its [`ModalKind`].
 struct Modal {
     view: AnyView,
+    kind: ModalKind,
     focus_handle: FocusHandle,
     previous_focus: Option<FocusHandle>,
     /// Shown at this window point (rename, under its symbol) instead of the top center.
     anchor: Option<Point<Pixels>>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: Vec<Subscription>,
+}
+
+/// The two kinds of overlay windows (wiki: "Design System", popups).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModalKind {
+    /// A light popup — a search list (palette, file search), a quick list or a menu (⌃V, branches,
+    /// usages), an inline field (rename): a click outside closes it, and so does focus leaving it
+    /// (for example, ⌘N opened a tab).
+    Popup,
+    /// A dialog with data entered or chosen (Push, New Branch, Settings): modal, as in JetBrains
+    /// IDEs. The window behind it doesn't take clicks, a click outside doesn't close it, and
+    /// shortcuts don't replace it with a popup; focus leaving it (a question on top of it) doesn't
+    /// close it either.
+    Dialog,
 }
 
 /// Where the paths came from: this determines where errors are reported.
@@ -363,7 +394,11 @@ impl Workspace {
         let bottom_height = ui::BottomIslandHeight::new();
         let terminal_panel =
             cx.new(|cx| TerminalPanel::new(root.clone(), bottom_height.clone(), window, cx));
-        let notifications = cx.new(|_| Notifications::new());
+        let notification_center = cx.new(NotificationCenter::new);
+        // The width of the right island: its tool windows share one cell (`ui::RightIslandWidth`).
+        let notifications_panel = cx.new(|cx| {
+            NotificationsPanel::new(notification_center.clone(), ui::RightIslandWidth::new(), cx)
+        });
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
         let subscriptions = vec![
@@ -378,7 +413,8 @@ impl Workspace {
             cx.observe(&find_bar, |_, _, cx| cx.notify()),
             cx.observe(&project_search, |_, _, cx| cx.notify()),
             cx.observe(&terminal_panel, |_, _, cx| cx.notify()),
-            cx.observe(&notifications, |_, _, cx| cx.notify()),
+            cx.observe(&notification_center, |_, _, cx| cx.notify()),
+            cx.observe(&notifications_panel, |_, _, cx| cx.notify()),
             cx.subscribe_in(&terminal_panel, window, Self::on_terminal_panel_event),
             cx.subscribe_in(
                 &project_search,
@@ -430,7 +466,9 @@ impl Workspace {
             bottom_height,
             git_window: None,
             git_open: false,
-            notifications,
+            notification_center,
+            right_tool: None,
+            notifications_panel,
             _subscriptions: subscriptions,
         };
         if !paths.is_empty() {
@@ -479,14 +517,19 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Language servers for a project root; the status bar follows their status.
+    /// Language servers for a project root; the status bar follows their status, notifications
+    /// tell what happened to them.
     fn build_lsp(root: Option<PathBuf>, cx: &mut Context<Self>) -> Entity<LspStore> {
         let lsp = cx.new(|cx| LspStore::new(root, cx));
         cx.observe(&lsp, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&lsp, |this, _, event, cx| match event {
+            crate::lsp::LspEvent::Notify(notification) => this.notify(notification.clone(), cx),
+        })
+        .detach();
         lsp
     }
 
-    /// Git of a project root; its messages and errors go to the status bar and dialogs.
+    /// Git of a project root; its hints go to the status bar, what happened — to notifications.
     fn build_git(
         root: Option<PathBuf>,
         window: &mut Window,
@@ -501,8 +544,8 @@ impl Workspace {
                 git.repos_in_progress().is_empty() && git.conflicts().is_empty()
             };
             if idle {
-                this.notifications.update(cx, |notifications, cx| {
-                    notifications.retain(|card| !card.offers(OPERATION_ACTIONS), cx)
+                this.notification_center.update(cx, |center, cx| {
+                    center.expire_where(|card| card.offers(OPERATION_ACTIONS), cx)
                 });
             }
             cx.notify()
@@ -521,19 +564,6 @@ impl Workspace {
     fn on_git_event(&mut self, event: &GitEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             GitEvent::Message(message) => self.show_message(message.clone(), cx),
-            GitEvent::Error { message, details } => {
-                self.show_message(message.clone(), cx);
-                if let Some(details) = details {
-                    // The answer doesn't matter: the dialog only shows git's output.
-                    drop(window.prompt(
-                        PromptLevel::Critical,
-                        message,
-                        Some(details),
-                        &[tr("OK")],
-                        cx,
-                    ));
-                }
-            }
             GitEvent::Notify(notification) => self.notify(notification.clone(), cx),
             GitEvent::WorkTreeChanged(repo) => self.work_tree_changed(*repo, window, cx),
         }
@@ -541,19 +571,19 @@ impl Workspace {
 
     /// Closes the notifications that offer one of the actions named (the user did it another way).
     pub(crate) fn dismiss_notifications(&mut self, actions: &[&str], cx: &mut Context<Self>) {
-        self.notifications.update(cx, |notifications, cx| {
-            notifications.retain(|card| !card.offers(actions), cx)
+        self.notification_center.update(cx, |center, cx| {
+            center.expire_where(|card| card.offers(actions), cx)
         });
     }
 
-    /// A notification in the bottom right corner.
+    /// A notification: to the journal and, as its group's display says, a card in the corner.
     pub(crate) fn notify(
         &mut self,
         notification: crate::notifications::Notification,
         cx: &mut Context<Self>,
     ) {
-        self.notifications
-            .update(cx, |notifications, cx| notifications.push(notification, cx));
+        self.notification_center
+            .update(cx, |center, cx| center.notify(notification, cx));
     }
 
     /// A git operation changed files of a repository (checkout, merge, stash…): open documents
@@ -730,7 +760,16 @@ impl Workspace {
             this.reveal_active(cx);
             cx.notify()
         });
-        self.insert_tab(TabItem::Editor(editor), vec![observer], None, window, cx);
+        let events = cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
+            if let EditorEvent::SaveFailed(reason) = event {
+                let name = editor.read(cx).document.display_name();
+                let notification = Notification::error(trf("Couldn't save {0}", &[&name]))
+                    .body(reason.clone())
+                    .group(NotificationGroup::Files);
+                this.notify(notification, cx)
+            }
+        });
+        self.insert_tab(TabItem::Editor(editor), vec![observer, events], None, window, cx);
     }
 
     /// Adds a terminal tab (moved from the panel) at `index`, by default to the right of the
@@ -1012,17 +1051,13 @@ impl Workspace {
         if errors.is_empty() {
             return;
         }
-        let message = errors
-            .iter()
-            .map(|error| {
-                trf(
-                    "Cannot open {0}: {1}",
-                    &[&file_name(&error.path), &tr(&error.reason)],
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        self.show_message(message.into(), cx);
+        for error in errors {
+            let notification =
+                Notification::error(trf("Cannot open {0}", &[&file_name(&error.path)]))
+                    .body(tr(&error.reason).to_string())
+                    .group(NotificationGroup::Files);
+            self.notify(notification, cx);
+        }
     }
 
     /// A message to the user: in the active editor's status bar; under a terminal tab, in the
@@ -1567,15 +1602,13 @@ impl Workspace {
         };
         self.closing = true;
         window.activate_window();
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            tr("Terminate running processes?"),
-            Some(&detail),
-            &[tr("Terminate"), tr("Cancel")],
-            cx,
-        );
+        let answer = Dialog::warning(tr("Terminate running processes?"))
+            .message(detail)
+            .danger(tr("Terminate"))
+            .cancel(tr("Cancel"))
+            .show(window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            let terminate = matches!(answer.await, Ok(0));
+            let terminate = answer.await == Some(0);
             this.update(cx, |this, _| this.closing = false).ok();
             if !terminate {
                 return false;
@@ -1677,7 +1710,12 @@ impl Workspace {
             FileTreeEvent::FocusEditor => self.focus_active(window, cx),
             FileTreeEvent::Moved { from, to } => self.documents_moved(from, to, cx),
             FileTreeEvent::Removed { paths } => self.documents_removed(paths, window, cx),
-            FileTreeEvent::Message(message) => self.show_message(message.clone(), cx),
+            FileTreeEvent::Error { title, body } => {
+                let notification = Notification::error(title.clone())
+                    .body(body.clone())
+                    .group(NotificationGroup::Files);
+                self.notify(notification, cx)
+            }
             FileTreeEvent::DiskChanged(paths) => self.sync_documents(paths.clone(), cx),
         }
     }
@@ -1690,6 +1728,7 @@ impl Workspace {
             Tool::FindInFiles => self.project_search.read(cx).is_open(),
             Tool::Terminal => self.terminal_open && !self.git_open,
             Tool::Git => self.git_open,
+            Tool::Notifications => self.right_tool == Some(RightTool::Notifications),
         }
     }
 
@@ -1697,8 +1736,68 @@ impl Workspace {
     pub(crate) fn tool_badge(&self, tool: Tool, cx: &App) -> Option<usize> {
         match tool {
             Tool::Commit => Some(self.git.read(cx).change_count()).filter(|count| *count > 0),
+            Tool::Notifications => {
+                Some(self.notification_center.read(cx).unread_count()).filter(|count| *count > 0)
+            }
             _ => None,
         }
+    }
+
+    /// The badge of a tool is an alarm (the error color): unread error notifications.
+    pub(crate) fn tool_badge_alarm(&self, tool: Tool, cx: &App) -> bool {
+        tool == Tool::Notifications
+            && self.notification_center.read(cx).unread_kind()
+                == Some(crate::notifications::NotificationKind::Error)
+    }
+
+    // --- The island on the right ---
+
+    /// The launchpad, the bell, the palette: shows the window focused, or hides it (with no shortcut,
+    /// it is reached by the mouse — a second click hides, whatever has the focus).
+    fn toggle_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.right_tool == Some(RightTool::Notifications) {
+            return self.hide_right(window, cx);
+        }
+        self.show_right(RightTool::Notifications, window, cx);
+    }
+
+    fn show_right(&mut self, tool: RightTool, window: &mut Window, cx: &mut Context<Self>) {
+        self.right_tool = Some(tool);
+        match tool {
+            RightTool::Notifications => {
+                self.notification_center
+                    .update(cx, |center, cx| center.set_journal_in_sight(true, cx));
+                self.notifications_panel
+                    .update(cx, |panel, cx| panel.set_visible(true, cx));
+                window.focus(&self.notifications_panel.focus_handle(cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// ⇧Esc in the window, its hide button, a second click: the island goes, and the focus, if it
+    /// was there, goes to the editor.
+    fn hide_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tool) = self.right_tool.take() else {
+            return;
+        };
+        let focused = match tool {
+            RightTool::Notifications => {
+                self.notification_center
+                    .update(cx, |center, cx| center.set_journal_in_sight(false, cx));
+                let focused = self
+                    .notifications_panel
+                    .read(cx)
+                    .contains_focus(window, cx);
+                self.notifications_panel
+                    .update(cx, |panel, cx| panel.set_visible(false, cx));
+                focused
+            }
+        };
+        if focused || window.focused(cx).is_none() {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
     }
 
     fn tree_panel(&self) -> Option<Entity<FileTreePanel>> {
@@ -1828,11 +1927,11 @@ impl Workspace {
                     }
                     if modified {
                         let name = editor.read(cx).document.display_name();
-                        let message = trf(
-                            "“{0}” changed on disk; your unsaved changes are kept",
-                            &[&name],
-                        );
-                        this.show_message(message.into(), cx);
+                        let notification =
+                            Notification::warning(trf("“{0}” changed on disk", &[&name]))
+                                .body(tr("Your unsaved changes are kept"))
+                                .group(NotificationGroup::Files);
+                        this.notify(notification, cx);
                         continue;
                     }
                     editor.update(cx, |editor, cx| editor.reload(&content, cx));
@@ -1891,10 +1990,11 @@ impl Workspace {
         }
         restore_focus(keep_focus, window);
         if kept {
-            self.show_message(
-                tr("Deleted files with unsaved changes stay open — save to restore them").into(),
-                cx,
-            );
+            let notification = Notification::info(tr(
+                "Deleted files with unsaved changes stay open — save to restore them",
+            ))
+            .group(NotificationGroup::Files);
+            self.notify(notification, cx);
         }
     }
 
@@ -2187,7 +2287,16 @@ impl Workspace {
             TerminalPanelEvent::MoveToPanel { group, index } => {
                 self.move_terminal_to_panel(group.clone(), Some(*index), window, cx)
             }
+            TerminalPanelEvent::ShellFailed(reason) => self.shell_failed(reason, cx),
         }
+    }
+
+    /// A terminal's shell didn't start (a broken `$SHELL`): an error notification.
+    fn shell_failed(&mut self, reason: &SharedString, cx: &mut Context<Self>) {
+        let notification = Notification::error(tr("Couldn't start the shell"))
+            .body(reason.clone())
+            .group(NotificationGroup::Terminal);
+        self.notify(notification, cx)
     }
 
     /// Events of a terminal tab in the editor area.
@@ -2214,6 +2323,7 @@ impl Workspace {
                 cx.notify();
             }
             TerminalGroupEvent::OpenLink(link) => self.open_terminal_link(link, window, cx),
+            TerminalGroupEvent::ShellFailed(reason) => self.shell_failed(reason, cx),
         }
     }
 
@@ -2335,10 +2445,36 @@ impl Workspace {
         cx: &mut Context<Self>,
         build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
     ) {
+        self.open_modal(ModalKind::Popup, window, cx, build)
+    }
+
+    /// [`Self::toggle_modal`] for a dialog ([`ModalKind::Dialog`]): modal to the window, centered
+    /// under the title bar.
+    pub fn toggle_dialog<V: ManagedView>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+    ) {
+        self.open_modal(ModalKind::Dialog, window, cx, build)
+    }
+
+    fn open_modal<V: ManagedView>(
+        &mut self,
+        kind: ModalKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+    ) {
         if let Some(modal) = &self.modal
             && modal.view.clone().downcast::<V>().is_ok()
         {
             return self.dismiss_modal(window, cx);
+        }
+        // Behind a dialog, the window's shortcuts don't open popups (as behind a modal dialog of
+        // JetBrains IDEs); a dialog may give way to the next dialog of a flow.
+        if kind == ModalKind::Popup && self.dialog_open() {
+            return;
         }
         // Project search is also an overlay window: it gives way without restoring focus.
         if self.project_search.read(cx).is_open() {
@@ -2357,23 +2493,33 @@ impl Workspace {
         };
         let view = cx.new(|cx| build(window, cx));
         let focus_handle = view.focus_handle(cx);
-        let subscriptions = [
-            cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
+        let mut subscriptions = vec![cx.subscribe_in(
+            &view,
+            window,
+            |this, _, _: &DismissEvent, window, cx| this.dismiss_modal(window, cx),
+        )];
+        if kind == ModalKind::Popup {
+            subscriptions.push(cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
                 this.dismiss_modal(window, cx)
-            }),
-            cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
-                this.dismiss_modal(window, cx)
-            }),
-        ];
+            }));
+        }
         window.focus(&focus_handle);
         self.modal = Some(Modal {
             view: view.into(),
+            kind,
             focus_handle,
             previous_focus,
             anchor: None,
             _subscriptions: subscriptions,
         });
         cx.notify();
+    }
+
+    /// A dialog ([`ModalKind::Dialog`]) is open: the window behind it waits.
+    pub(crate) fn dialog_open(&self) -> bool {
+        self.modal
+            .as_ref()
+            .is_some_and(|modal| modal.kind == ModalKind::Dialog)
     }
 
     /// The open overlay window is a `V` (the launchpad highlights the gear for Settings).
@@ -2409,8 +2555,30 @@ impl Workspace {
     fn render_modal(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let modal = self.modal.as_ref()?;
         let view = div()
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)))
+            .when(modal.kind == ModalKind::Popup, |view| {
+                view.on_mouse_down_out(
+                    cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)),
+                )
+            })
             .child(modal.view.clone());
+        if modal.kind == ModalKind::Dialog {
+            // Over a backdrop that takes the clicks meant for the window behind; the title bar
+            // stays free, so the window can still be moved.
+            return Some(
+                ui::modal_backdrop(Theme::ui(cx))
+                    .id("dialog-backdrop")
+                    .absolute()
+                    .top(px(TITLE_BAR_HEIGHT))
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .pt(px(MODAL_TOP - TITLE_BAR_HEIGHT))
+                    .child(view)
+                    .into_any_element(),
+            );
+        }
         Some(match modal.anchor {
             Some(anchor) => deferred(
                 anchored()
@@ -2648,6 +2816,63 @@ impl Workspace {
     /// endings on the right. Status bar on the window frame: on the left, a message or the path of
     /// the active file; on the right, the position, cursors, language as a colored badge (the file
     /// type color), and line endings.
+    /// The bell at the right end of the status bar: the unread count (red with unread errors); a
+    /// click shows or hides the Notifications window.
+    fn render_bell(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let ui = Theme::ui(cx);
+        let center = self.notification_center.read(cx);
+        let unread = center.unread_count();
+        let color = if center.unread_kind() == Some(notifications::NotificationKind::Error) {
+            ui.error
+        } else {
+            ui.accent_text
+        };
+        let open = self.right_tool == Some(RightTool::Notifications);
+        div().flex_none().pr(px(GAP + 2.)).child(
+            div()
+                .id("status-bell")
+                .h(px(20.))
+                .px_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .rounded(px(RADIUS_SM))
+                .cursor_pointer()
+                .when(open, |bell| bell.bg(ui.accent_soft))
+                .when(!open, |bell| bell.hover(move |style| style.bg(ui.hover)))
+                .tooltip(ui::tooltip(tr("Notifications"), None))
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(notifications_panel::Toggle), cx)
+                })
+                .child(
+                    icon(
+                        IconName::Bell,
+                        if open {
+                            ui.accent_text
+                        } else if unread > 0 {
+                            color
+                        } else {
+                            ui.text_muted
+                        },
+                    )
+                    .size(px(13.)),
+                )
+                .when(unread > 0, |bell| {
+                    bell.child(
+                        div()
+                            .text_size(px(theme::TEXT_XS))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(color)
+                            .child(if unread > 99 {
+                                "99+".to_string()
+                            } else {
+                                unread.to_string()
+                            }),
+                    )
+                }),
+        )
+    }
+
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let bar = div()
@@ -3273,7 +3498,8 @@ impl Render for Workspace {
                 // A directory from the recent list may have disappeared since launch.
                 if !action.0.is_dir() {
                     let message = trf("Folder not found: {0}", &[&tilde(&action.0)]);
-                    return this.show_message(message.into(), cx);
+                    let notification = Notification::warning(message);
+                    return this.notify(notification, cx);
                 }
                 this.set_root(action.0.clone(), window, cx)
             }))
@@ -3375,11 +3601,20 @@ impl Render for Workspace {
                     }
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &notifications_panel::Toggle, window, cx| {
+                    this.toggle_notifications(window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &file_tree::ToggleFocus, window, cx| {
                 this.toggle_tree_focus(window, cx)
             }))
             .on_action(cx.listener(|this, _: &project_search::Toggle, window, cx| {
-                // Project search and other overlay windows are never open at the same time.
+                // Project search and other overlay windows are never open at the same time; behind
+                // a dialog, it doesn't open.
+                if this.dialog_open() {
+                    return;
+                }
                 this.dismiss_modal(window, cx);
                 let seed = this
                     .active_editor()
@@ -3387,6 +3622,13 @@ impl Render for Workspace {
                 this.project_search
                     .update(cx, |search, cx| search.toggle(seed, window, cx))
             }));
+        #[cfg(feature = "scenario")]
+        let root = root.on_action(cx.listener(
+            |this, _: &notifications_panel::demo::FillDemo, _, cx| {
+                this.notification_center
+                    .update(cx, notifications_panel::demo::fill)
+            },
+        ));
         // The window frame: the title bar, the launchpad and the islands (the tree on the left; on
         // the right, the tabs, the find bar, and the text, a terminal tab, or the start screen; under
         // them, the terminal panel), the status bar. On top: project search and overlay windows.
@@ -3514,6 +3756,39 @@ impl Render for Workspace {
             .child(main)
             .children(terminal)
             .children(git_island);
+        // The island on the right: a tool window (Notifications), full height like the tree.
+        let right = self.right_tool.map(|tool| {
+            let content = match tool {
+                RightTool::Notifications => self.notifications_panel.clone().into_any_element(),
+            };
+            ui::island(ui)
+                .flex_none()
+                .h_full()
+                .on_action(cx.listener(|this, _: &notifications_panel::Hide, window, cx| {
+                    this.hide_right(window, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &notifications_panel::FocusEditor, window, cx| {
+                        this.focus_active(window, cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &notifications_panel::OpenSettings, window, cx| {
+                        crate::settings_view::open(
+                            this,
+                            crate::settings_view::Section::Notifications,
+                            window,
+                            cx,
+                        )
+                    }),
+                )
+                .child(content)
+        });
+        // The cards in the corner, unless the journal is in sight (then they go there, as in
+        // JetBrains).
+        let cards = (self.right_tool != Some(RightTool::Notifications))
+            .then(|| notifications::overlay(self.notification_center.read(cx).cards(), cx))
+            .flatten();
         // On the left, the launchpad (the tool strip) on the frame, followed by the islands.
         root.child(ui::frame_glow(ui))
             .child(self.render_title_bar(window, cx))
@@ -3528,15 +3803,24 @@ impl Render for Workspace {
                     .gap(px(GAP))
                     .child(launchpad::render(self, window, cx))
                     .children(tree)
-                    .child(main),
+                    .child(main)
+                    .children(right),
             )
-            .child(self.render_status_bar(cx))
-            .children(notifications::overlay(&self.notifications, cx))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().child(self.render_status_bar(cx)))
+                    .child(self.render_bell(cx)),
+            )
+            .children(cards)
             .children(self.render_project_search(cx))
             .children(self.render_modal(cx))
     }
 }
 
+/// Unread error notifications: the counters take the error color.
 // --- Prompts about unsaved documents ---
 
 async fn ask_each(
@@ -3572,18 +3856,19 @@ async fn ask_to_save(
     if shown.is_err() {
         return false;
     }
-    let answer = cx.prompt(
-        PromptLevel::Warning,
-        &trf("Save changes to {0}?", &[&name]),
-        Some(tr("Your changes will be lost if you don’t save them.")),
-        &[tr("Save"), tr("Don’t Save"), tr("Cancel")],
-    );
-    match answer.await {
-        Ok(0) => match editor.update(cx, |editor, cx| editor.save(cx)) {
+    let answer = Dialog::warning(trf("Save changes to {0}?", &[&name]))
+        .message(tr("Your changes will be lost if you don’t save them."))
+        .primary(tr("Save"))
+        .danger(tr("Don’t Save"))
+        .cancel(tr("Cancel"))
+        .show_async(cx)
+        .await;
+    match answer {
+        Some(0) => match editor.update(cx, |editor, cx| editor.save(cx)) {
             Ok(saving) => saving.await,
             Err(_) => false,
         },
-        Ok(1) => true,
+        Some(1) => true,
         _ => false,
     }
 }

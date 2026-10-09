@@ -87,6 +87,9 @@ ICONS = {
   # The Git window: the log's graph — a branch leaving the main line and merging back.
   "git-log": (S, '<circle cx="5" cy="3.5" r="1.75"/><circle cx="5" cy="12.5" r="1.75"/><circle cx="11" cy="8" r="1.75"/><path d="M5 5.25v5.5M6.5 4.4c2 .6 3.4 1.6 3.9 2.1M10.4 9.5c-.5.5-1.9 1.5-3.9 2.1"/>'),
   "history": (S, '<path d="M2.6 8a5.4 5.4 0 1 0 5.4-5.4 5.85 5.85 0 0 0-4.04 1.64L2.6 5.6M2.6 2.6v3h3M8 5v3l2.4 1.2"/>'),
+  # Notifications (stage 7): the bell of the tool window, "Mark All as Read".
+  "bell": (S, '<path d="M4.25 6.5a3.75 3.75 0 0 1 7.5 0c0 2.6.75 4 1.5 4.75H2.75c.75-.75 1.5-2.15 1.5-4.75z"/><path d="M6.5 13.25a1.6 1.6 0 0 0 3 0"/>'),
+  "check-all": (S, '<path d="M1.75 8.5 4.75 11.5l6-6.75M8.25 11 8.75 11.5l5.5-6.25"/>'),
   "check": (S, '<path d="M3.25 8.5 6.5 11.75l6.25-7"/>'),
   "minus": (S, '<path d="M3.75 8h8.5"/>'),
   "arrow-left": (S, '<path d="M13.25 8H2.75M7 3.75 2.75 8 7 12.25"/>'),

@@ -22,11 +22,12 @@ use flux_git::{FileChange, FileStatus, GitError, Outcome, Stash, StashRequest};
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, ClickEvent, Context, DismissEvent, Div, Entity,
     EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent,
-    Pixels, Point, PromptLevel, Render, ScrollStrategy, SharedString, Subscription,
-    UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
+    Pixels, Point, Render, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle,
+    Window, actions, div, prelude::*, px, uniform_list,
 };
 
 use crate::context_menu::ContextMenu;
+use crate::dialog::Dialog;
 use crate::diff_view::DiffSide;
 use crate::git::{self, GitStore};
 use crate::i18n::{tr, trf, trn};
@@ -760,16 +761,14 @@ impl StashPanel {
             "{n} stash will be deleted. This can't be undone.",
             "{n} stashes will be deleted. This can't be undone.",
         );
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &question,
-            Some(&detail),
-            &[tr("Clear"), tr("Cancel")],
-            cx,
-        );
+        let answer = Dialog::warning(question)
+            .message(detail)
+            .danger(tr("Clear"))
+            .cancel(tr("Cancel"))
+            .show(window, cx);
         let git = self.git.clone();
         cx.spawn(async move |_, cx| {
-            if answer.await != Ok(0) {
+            if answer.await != Some(0) {
                 return;
             }
             let Ok(task) = git.update(cx, |git, cx| git.clear_stashes(repo, cx)) else {
@@ -1464,19 +1463,17 @@ pub(crate) fn confirm_drop(
     cx: &mut App,
 ) {
     let name = stash_name(&stash);
-    let answer = window.prompt(
-        PromptLevel::Warning,
-        &trf("Drop {0}?", &[&name]),
-        Some(&format!(
+    let answer = Dialog::warning(trf("Drop {0}?", &[&name]))
+        .message(format!(
             "{}\n\n{}",
             stash_title(&stash),
             tr("The stashed changes will be deleted. This can't be undone.")
-        )),
-        &[tr("Drop"), tr("Cancel")],
-        cx,
-    );
+        ))
+        .danger(tr("Drop"))
+        .cancel(tr("Cancel"))
+        .show(window, cx);
     cx.spawn(async move |cx| {
-        if answer.await != Ok(0) {
+        if answer.await != Some(0) {
             return;
         }
         let Ok(task) = git.update(cx, |git, cx| git.drop_stash(repo, &stash.oid, cx)) else {
@@ -1542,7 +1539,7 @@ fn unstash_to_branch(
     };
     let refs = git.read(cx).refs(repo);
     let subtitle = trf("from {0}", &[&stash_label(&stash)]);
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         let validate_refs = refs.clone();
         InputDialog::new(tr("Unstash as Branch"), tr("Branch name"), window, cx)
             .subtitle(subtitle)
@@ -1951,7 +1948,7 @@ fn open_dialog(
             git.report(git::GitEvent::Message(message.into()), cx)
         });
     };
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         StashDialog::new(git, repo, paths, include_untracked, window, cx)
     });
 }

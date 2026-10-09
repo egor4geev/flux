@@ -13,10 +13,11 @@ use std::collections::HashSet;
 use flux_git::{GitError, Outcome, RefKind};
 use gpui::{
     Action, App, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, InteractiveElement, KeyBinding, PromptButton, PromptLevel, Render,
-    SharedString, Subscription, Task, WeakEntity, Window, actions, div, prelude::*, px,
+    Focusable, FontWeight, InteractiveElement, KeyBinding, Render, SharedString, Subscription,
+    Task, WeakEntity, Window, actions, div, prelude::*, px,
 };
 
+use crate::dialog::Dialog;
 use crate::git::{self, CheckoutDone, CheckoutMode, CheckoutTarget, GitStore};
 use crate::i18n::{tr, trf};
 use crate::input::{InputEvent, TextInput};
@@ -429,31 +430,22 @@ fn ask_smart_checkout(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let detail = format!(
-        "{}\n\n{}",
-        listed(&files),
-        tr(
-            "Smart Checkout stashes them, checks out and brings them back. Force Checkout throws them away."
-        )
-    );
-    let answer = window.prompt(
-        PromptLevel::Warning,
-        &trf(
-            "Your local changes would be overwritten by checkout of '{0}'",
-            &[&target.name()],
-        ),
-        Some(&detail),
-        &[
-            PromptButton::new(tr("Smart Checkout")),
-            PromptButton::new(tr("Force Checkout")),
-            PromptButton::cancel(tr("Don’t Checkout")),
-        ],
-        cx,
-    );
+    let answer = Dialog::warning(trf(
+        "Your local changes would be overwritten by checkout of '{0}'",
+        &[&target.name()],
+    ))
+    .message(tr(
+        "Smart Checkout stashes them, checks out and brings them back. Force Checkout throws them away.",
+    ))
+    .details(listed(&files))
+    .primary(tr("Smart Checkout"))
+    .danger(tr("Force Checkout"))
+    .cancel(tr("Don’t Checkout"))
+    .show(window, cx);
     cx.spawn_in(window, async move |this, cx| {
         let mode = match answer.await {
-            Ok(0) => CheckoutMode::Smart,
-            Ok(1) => CheckoutMode::Force,
+            Some(0) => CheckoutMode::Smart,
+            Some(1) => CheckoutMode::Force,
             _ => return,
         };
         this.update_in(cx, |this, window, cx| {
@@ -466,19 +458,14 @@ fn ask_smart_checkout(
 
 /// Untracked files that a checkout or a merge would overwrite: git won't, and neither will Flux.
 fn untracked_in_the_way(files: &[String], window: &mut Window, cx: &mut Context<Workspace>) {
-    let detail = format!(
-        "{}\n\n{}",
-        listed(files),
-        tr("Move or delete them, then try again.")
-    );
     // The answer doesn't matter: the dialog only tells.
-    drop(window.prompt(
-        PromptLevel::Warning,
-        tr("Untracked files would be overwritten"),
-        Some(&detail),
-        &[PromptButton::ok(tr("OK"))],
-        cx,
-    ));
+    drop(
+        Dialog::warning(tr("Untracked files would be overwritten"))
+            .message(tr("Move or delete them, then try again."))
+            .details(listed(files))
+            .primary(tr("OK"))
+            .show(window, cx),
+    );
 }
 
 fn checked_out(
@@ -773,7 +760,7 @@ fn new_branch(
         }
     });
     let weak = cx.weak_entity();
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         NewBranchDialog::new(weak, git, repo, start, &initial, window, cx)
     });
 }
@@ -1203,7 +1190,7 @@ fn rename(
         .map(|branch| branch.name.clone())
         .collect();
     let weak = cx.weak_entity();
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         let title = trf("Rename '{0}'", &[&old]);
         let mut dialog = InputDialog::new(title, tr("New name"), window, cx)
             .text(&old, cx)
@@ -1264,7 +1251,7 @@ fn checkout_revision(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
         return;
     };
     let weak = cx.weak_entity();
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         InputDialog::new(
             tr("Checkout Tag or Revision"),
             tr("A tag, a branch or a commit hash"),
@@ -1441,29 +1428,22 @@ fn ask_force_delete(
             if commits.len() > LISTED_COMMITS {
                 lines.push(trf("and {0} more", &[&(commits.len() - LISTED_COMMITS)]));
             }
-            let detail = format!(
-                "{}\n\n{}",
-                lines.join("\n"),
-                tr("Deleting it loses these commits (Restore brings the branch back).")
-            );
-            window.prompt(
-                PromptLevel::Warning,
-                &trf(
-                    "Branch '{0}' is not fully merged into '{1}'",
-                    &[&name, &into],
-                ),
-                Some(&detail),
-                &[
-                    PromptButton::new(tr("Delete")),
-                    PromptButton::cancel(tr("Cancel")),
-                ],
-                cx,
-            )
+            Dialog::warning(trf(
+                "Branch '{0}' is not fully merged into '{1}'",
+                &[&name, &into],
+            ))
+            .message(tr(
+                "Deleting it loses these commits (Restore brings the branch back).",
+            ))
+            .details(lines.join("\n"))
+            .danger(tr("Delete"))
+            .cancel(tr("Cancel"))
+            .show(window, cx)
         });
         let Ok(answer) = answer else {
             return;
         };
-        if answer.await == Ok(0) {
+        if answer.await == Some(0) {
             this.update_in(cx, |this, window, cx| {
                 delete_branch(this, repo, name, true, window, cx)
             })
@@ -1486,20 +1466,15 @@ fn ask_delete_remote(
         .refs(repo)
         .remote(&name)
         .map(|branch| branch.oid.clone());
-    let answer = window.prompt(
-        PromptLevel::Warning,
-        &trf("Delete remote branch '{0}'?", &[&name]),
-        Some(tr(
+    let answer = Dialog::warning(trf("Delete remote branch '{0}'?", &[&name]))
+        .message(tr(
             "The branch is deleted on the server, for everyone who works with it.",
-        )),
-        &[
-            PromptButton::new(tr("Delete")),
-            PromptButton::cancel(tr("Cancel")),
-        ],
-        cx,
-    );
+        ))
+        .danger(tr("Delete"))
+        .cancel(tr("Cancel"))
+        .show(window, cx);
     cx.spawn_in(window, async move |this, cx| {
-        if answer.await != Ok(0) {
+        if answer.await != Some(0) {
             return;
         }
         let task = this.update(cx, |this, cx| {

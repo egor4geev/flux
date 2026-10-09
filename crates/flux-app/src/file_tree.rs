@@ -28,12 +28,13 @@ use futures::channel::mpsc;
 use gpui::{
     Action, AnyElement, App, ClickEvent, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
     DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton,
-    MouseDownEvent, Pixels, Point, PromptLevel, Render, ScrollStrategy, SharedString, Stateful,
-    Subscription, Task, UniformListScrollHandle, Window, actions, deferred, div, prelude::*, px,
-    relative, uniform_list,
+    MouseDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString, Stateful, Subscription,
+    Task, UniformListScrollHandle, Window, actions, deferred, div, prelude::*, px, relative,
+    uniform_list,
 };
 
 use crate::context_menu::ContextMenu;
+use crate::dialog::Dialog;
 use crate::i18n::{tr, trf};
 use crate::icons::{FileIcon, ICON_SIZE, IconName, file_icon, folder_icon, icon};
 use crate::input::{InputEvent, TextInput};
@@ -169,8 +170,12 @@ pub enum FileTreeEvent {
     /// Files and directories were deleted to the Trash: tabs of documents inside them are closed
     /// (modified ones stay open).
     Removed { paths: Vec<PathBuf> },
-    /// A message for the user (an operation error), shown in the status bar.
-    Message(SharedString),
+    /// An operation failed (or the project can't be watched): an error notification — `title`
+    /// says what, `body` why.
+    Error {
+        title: SharedString,
+        body: SharedString,
+    },
     /// Files changed on disk (`None`: events were lost, anything may have): open documents follow.
     DiskChanged(Option<Vec<PathBuf>>),
 }
@@ -374,8 +379,10 @@ impl FileTreePanel {
             // If the re-read fails, the previous listing stays.
             Err(_) if self.tree.is_loaded(&dir) => return self.changed(cx),
             Err(err) => {
-                let message = trf("Cannot read {0}: {1}", &[&display_name(&dir), &err]);
-                cx.emit(FileTreeEvent::Message(message.into()));
+                cx.emit(FileTreeEvent::Error {
+                    title: trf("Cannot read {0}", &[&display_name(&dir)]).into(),
+                    body: err.to_string().into(),
+                });
                 Vec::new()
             }
         };
@@ -418,9 +425,11 @@ impl FileTreePanel {
             let watcher = match started.await {
                 Ok(watcher) => watcher,
                 Err(err) => {
-                    let message = trf("Not watching the project for changes: {0}", &[&err]);
-                    this.update(cx, |_, cx| cx.emit(FileTreeEvent::Message(message.into())))
-                        .ok();
+                    let event = FileTreeEvent::Error {
+                        title: tr("Not watching the project for changes").into(),
+                        body: err.to_string().into(),
+                    };
+                    this.update(cx, |_, cx| cx.emit(event)).ok();
                     return;
                 }
             };
@@ -756,7 +765,13 @@ impl FileTreePanel {
                         edit.pending = false;
                         edit.error = Some(err.to_string().into());
                     }
-                    _ => cx.emit(FileTreeEvent::Message(err.to_string().into())),
+                    _ => cx.emit(FileTreeEvent::Error {
+                        title: match target {
+                            EditTarget::Rename { .. } => tr("Couldn't rename").into(),
+                            _ => tr("Couldn't create").into(),
+                        },
+                        body: err.to_string().into(),
+                    }),
                 }
                 return cx.notify();
             }
@@ -833,15 +848,13 @@ impl FileTreePanel {
         } else {
             tr("You can restore it from the Trash.")
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &trf("Move “{0}” to Trash?", &[&name]),
-            Some(detail),
-            &[tr("Move to Trash"), tr("Cancel")],
-            cx,
-        );
+        let answer = Dialog::warning(trf("Move “{0}” to Trash?", &[&name]))
+            .message(detail)
+            .danger(tr("Move to Trash"))
+            .cancel(tr("Cancel"))
+            .show(window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
+            if answer.await != Some(0) {
                 return;
             }
             this.update_in(cx, |this, window, cx| {
@@ -860,7 +873,10 @@ impl FileTreePanel {
 
     fn finish_trash(&mut self, path: PathBuf, result: io::Result<()>, cx: &mut Context<Self>) {
         if let Err(err) = result {
-            return cx.emit(FileTreeEvent::Message(err.to_string().into()));
+            return cx.emit(FileTreeEvent::Error {
+                title: tr("Couldn't move to Trash").into(),
+                body: err.to_string().into(),
+            });
         }
         // The selection moves to a neighbor: the next row, or the previous one for the last row.
         let index = self.row_index(&path);
@@ -929,7 +945,10 @@ impl FileTreePanel {
                     this.moved(&from, &to, cx);
                     this.changed(cx);
                 }
-                Err(err) => cx.emit(FileTreeEvent::Message(err.to_string().into())),
+                Err(err) => cx.emit(FileTreeEvent::Error {
+                    title: tr("Couldn't move").into(),
+                    body: err.to_string().into(),
+                }),
             },
         );
     }
@@ -957,7 +976,10 @@ impl FileTreePanel {
                         this.rename_when_shown(copy, window, cx);
                     }
                 }
-                Err(err) => cx.emit(FileTreeEvent::Message(err.to_string().into())),
+                Err(err) => cx.emit(FileTreeEvent::Error {
+                    title: tr("Couldn't copy").into(),
+                    body: err.to_string().into(),
+                }),
             },
         );
     }

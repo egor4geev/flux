@@ -13,11 +13,12 @@ use std::path::PathBuf;
 use flux_git::{GitError, Outcome, RepoState, ResetMode};
 use gpui::{
     Action, App, ClickEvent, ClipboardItem, Context, DismissEvent, Div, EventEmitter, FocusHandle,
-    Focusable, FontWeight, KeyBinding, PromptButton, PromptLevel, Render, Task, WeakEntity, Window,
-    actions, div, prelude::*, px,
+    Focusable, FontWeight, KeyBinding, Render, Task, WeakEntity, Window, actions, div, prelude::*,
+    px,
 };
 
 use crate::context_menu::ContextMenu;
+use crate::dialog::Dialog;
 use crate::git::{self, GitStore};
 use crate::git_log::LogSelection;
 use crate::i18n::{tr, trf, trn};
@@ -575,7 +576,7 @@ fn new_tag(
     }
     let weak: WeakEntity<Workspace> = cx.weak_entity();
     let validate_git = git.clone();
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         InputDialog::new(tr("New Tag"), tr("Tag name"), window, cx)
             .subtitle(trf("at {0}", &[&short(&oid)]))
             .checkbox(tr("Overwrite existing tag"), false)
@@ -658,23 +659,18 @@ fn undo_commit(
         };
         if pushed {
             let answer = this.update_in(cx, |_, window, cx| {
-                window.prompt(
-                    PromptLevel::Warning,
-                    tr("The commit is already pushed"),
-                    Some(tr(
+                Dialog::warning(tr("The commit is already pushed"))
+                    .message(tr(
                         "Undoing it rewrites history others may have: the branch will need a force push.",
-                    )),
-                    &[
-                        PromptButton::new(tr("Undo Commit")),
-                        PromptButton::cancel(tr("Cancel")),
-                    ],
-                    cx,
-                )
+                    ))
+                    .danger(tr("Undo Commit"))
+                    .cancel(tr("Cancel"))
+                    .show(window, cx)
             });
             let Ok(answer) = answer else {
                 return;
             };
-            if answer.await != Ok(0) {
+            if answer.await != Some(0) {
                 return;
             }
         }
@@ -759,7 +755,7 @@ fn open_reset(
         .current_branch(repo)
         .unwrap_or_else(|| tr("HEAD").to_string());
     let weak = cx.weak_entity();
-    workspace.toggle_modal(window, cx, move |_, cx| ResetDialog {
+    workspace.toggle_dialog(window, cx, move |_, cx| ResetDialog {
         workspace: weak,
         repo,
         oid,

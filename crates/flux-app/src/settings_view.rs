@@ -4,6 +4,8 @@
 //!   comes from; those Flux installed can be updated and deleted, missing ones installed.
 //! - Version Control: how Update Project (⌘T) brings incoming commits into the current branch —
 //!   merge, rebase, or ask every time (the question's "Don't show again" sets it).
+//! - Notifications: Do Not Disturb, and for every group (plugins' too) how its notifications show —
+//!   a card, a sticky card, the journal only, or nothing (JetBrains: Settings → Notifications).
 //! - About: the version, the license, the developer, the source code. «About Flux» in the app menu
 //!   ([`About`]) opens Settings on this section.
 
@@ -23,6 +25,7 @@ use gpui::{
 use crate::i18n::{tr, trf};
 use crate::icons::{self, IconName, file_icon, icon};
 use crate::lsp::LspStore;
+use crate::notification_center::{self, Display};
 use crate::settings::{self, UpdatePreference};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
@@ -56,13 +59,15 @@ pub fn init(cx: &mut App) {
 pub enum Section {
     LanguageServers,
     VersionControl,
+    Notifications,
     About,
 }
 
 impl Section {
-    const ALL: [Section; 3] = [
+    const ALL: [Section; 4] = [
         Section::LanguageServers,
         Section::VersionControl,
+        Section::Notifications,
         Section::About,
     ];
 
@@ -70,6 +75,7 @@ impl Section {
         match self {
             Section::LanguageServers => tr("Language Servers"),
             Section::VersionControl => tr("Version Control"),
+            Section::Notifications => tr("Notifications"),
             Section::About => tr("About"),
         }
     }
@@ -78,6 +84,7 @@ impl Section {
         match self {
             Section::LanguageServers => IconName::Command,
             Section::VersionControl => IconName::Branch,
+            Section::Notifications => IconName::Bell,
             Section::About => IconName::Info,
         }
     }
@@ -86,7 +93,7 @@ impl Section {
 /// Opens Settings, or closes them if open (the gear, ⌘,).
 pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let store = workspace.lsp.downgrade();
-    workspace.toggle_modal(window, cx, move |_, cx| {
+    workspace.toggle_dialog(window, cx, move |_, cx| {
         SettingsView::new(store, Section::LanguageServers, cx)
     });
 }
@@ -102,7 +109,7 @@ pub fn open(
         workspace.dismiss_modal(window, cx);
     }
     let store = workspace.lsp.downgrade();
-    workspace.toggle_modal(window, cx, move |_, cx| {
+    workspace.toggle_dialog(window, cx, move |_, cx| {
         SettingsView::new(store, section, cx)
     });
 }
@@ -625,6 +632,132 @@ impl SettingsView {
             )
     }
 
+    /// Notifications: Do Not Disturb, then a row per group with its display.
+    fn render_notifications(&self, cx: &mut Context<Self>) -> Div {
+        let ui = Theme::ui(cx);
+        let quiet = settings::do_not_disturb(cx);
+        let rows: Vec<_> = notification_center::groups(cx)
+            .into_iter()
+            .enumerate()
+            .map(|(index, info)| {
+                let key = info.group.key();
+                let current = notification_center::display_of(&info.group, cx);
+                let choices = Display::ALL.into_iter().map(|display| {
+                    let key = key.clone();
+                    let selected = display == current;
+                    div()
+                        .id(SharedString::from(format!("display-{index}-{}", display.key())))
+                        .px_2()
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(ui::RADIUS_SM))
+                        .text_size(px(theme::TEXT_SM))
+                        .cursor_pointer()
+                        .when(selected, |choice| {
+                            choice.bg(ui.list_selected).text_color(ui.foreground)
+                        })
+                        .when(!selected, |choice| {
+                            choice
+                                .text_color(ui.text_muted)
+                                .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            settings::set_notification_display(&key, display, cx);
+                            cx.notify();
+                        }))
+                        .child(display.label())
+                });
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_1p5()
+                    .rounded(px(ui::RADIUS_MD))
+                    .hover(move |style| style.bg(ui.hover))
+                    .child(div().flex_1().min_w_0().truncate().child(info.title))
+                    // A segmented choice: one of four, the chosen one highlighted.
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .gap_0p5()
+                            .p_0p5()
+                            .rounded(px(ui::RADIUS_MD))
+                            .bg(ui.input_background)
+                            .border_1()
+                            .border_color(ui.input_border)
+                            .children(choices),
+                    )
+            })
+            .collect();
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_header(
+                tr("Notifications"),
+                tr(
+                    "Results of operations, errors and background tasks go to the Notifications window; a card in the corner shows them as they happen. Choose how each group shows.",
+                ),
+                ui,
+            ))
+            .child(
+                div()
+                    .id("do-not-disturb")
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .p_3()
+                    .rounded(px(ui::RADIUS_MD))
+                    .border_1()
+                    .border_color(ui.island_border)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        settings::set_do_not_disturb(!quiet, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(tr("Do not disturb"))
+                            .child(
+                                div()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.dim)
+                                    .child(tr(
+                                        "No cards in the corner; notifications still go to the Notifications window.",
+                                    )),
+                            ),
+                    )
+                    .child(ui::switch("do-not-disturb-switch", quiet, ui)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .p_1()
+                    .rounded(px(ui::RADIUS_MD))
+                    .border_1()
+                    .border_color(ui.island_border)
+                    .when(quiet, |groups| groups.opacity(0.6))
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .pb_1()
+                            .child(ui::section_label(tr("Groups"), ui)),
+                    )
+                    .children(rows),
+            )
+    }
+
     /// About: the logo with the name, version, and description; then the facts in rows.
     fn render_about(&self, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
@@ -768,6 +901,7 @@ impl Render for SettingsView {
         let content = match self.section {
             Section::LanguageServers => self.render_language_servers(cx),
             Section::VersionControl => self.render_version_control(cx),
+            Section::Notifications => self.render_notifications(cx),
             Section::About => self.render_about(cx),
         };
         ui::popover(ui)

@@ -27,6 +27,11 @@ mod terminal_panel;
 mod terminal_search;
 mod tree;
 mod workspace;
+mod dialog;
+mod messages;
+mod notification_center;
+mod notifications_panel;
+mod popups;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
 pub(super) const STRINGS: &[&[(&str, &str)]] = &[
@@ -57,6 +62,11 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     log_actions::STRINGS,
     rebase::STRINGS,
     blame::STRINGS,
+    dialog::STRINGS,
+    messages::STRINGS,
+    notification_center::STRINGS,
+    notifications_panel::STRINGS,
+    popups::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per

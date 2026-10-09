@@ -8,12 +8,15 @@
 //!   - `cmd-s`, `enter`, `space`, `left` — a keystroke in gpui keymap syntax;
 //!   - `type:text` — type the text character by character (a space is a separate `space` step);
 //!   - `wait:500` — a pause in ms;
+//!   - `action:notifications_panel::Toggle` — dispatch an action (one without data) by name on the
+//!     focused element, as the command palette does;
 //!   - `shot:name` — print `SHOT name` and wait for the window to be captured from outside.
 //!
 //!   `END` is printed after the last step.
-//! - `FLUX_ANSWERS=0,1` — system dialogs are replaced by an auto-responder: button numbers in
-//!   order; when the answers run out, the last button (usually Cancel). Each dialog prints `PROMPT
-//!   question -> answer` and a `SHOT prompt-N` marker.
+//! - `FLUX_ANSWERS=0,1` — dialogs answer by themselves: button numbers in order (the index in
+//!   `Dialog::buttons`); when the answers run out, the last button (usually Cancel). Each dialog
+//!   prints `PROMPT question -> answer` and a `SHOT prompt-N` marker, and stays on screen with the
+//!   chosen button focused for the screenshot.
 //!
 //! File picker dialogs (Cmd+O, "Save As") are system panels, and the auto-responder doesn't replace
 //! them. The screenshot harness is `scripts/ui-scenario.sh`.
@@ -28,9 +31,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gpui::{
-    AnyWindowHandle, App, AsyncApp, Context, EventEmitter, FocusHandle, Focusable, Keystroke,
-    Modifiers, PromptButton, PromptHandle, PromptLevel, PromptResponse, Render,
-    RenderablePromptHandle, Window, WindowKind, WindowOptions, div, prelude::*, rgb,
+    AnyWindowHandle, App, AsyncApp, Keystroke, Modifiers, PromptButton, PromptHandle, PromptLevel,
+    RenderablePromptHandle, Window, WindowKind, WindowOptions,
 };
 
 /// Before the first step: the window has opened and the files from the command line have been read.
@@ -86,6 +88,22 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
     if let Some(ms) = step.strip_prefix("wait:") {
         return Duration::from_millis(ms.parse().unwrap_or(0));
     }
+    if let Some(name) = step.strip_prefix("action:") {
+        let dispatched = window
+            .update(cx, |_, window, cx| match cx.build_action(name, None) {
+                Ok(action) => {
+                    window.dispatch_action(action, cx);
+                    true
+                }
+                Err(_) => false,
+            })
+            .unwrap_or(false);
+        println!(
+            "ACTION {name} -> {}",
+            if dispatched { "dispatched" } else { "unknown" }
+        );
+        return STEP_PAUSE;
+    }
     let keystrokes = match step.strip_prefix("type:") {
         Some(text) => text.chars().map(typed).collect(),
         None => match Keystroke::parse(step) {
@@ -118,72 +136,42 @@ fn typed(c: char) -> Keystroke {
     }
 }
 
-/// A banner in place of the system dialog: the screenshot shows the question and the chosen answer.
-struct AutoPrompt {
-    focus_handle: FocusHandle,
-    text: String,
-}
-
-impl EventEmitter<PromptResponse> for AutoPrompt {}
-
-impl Focusable for AutoPrompt {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for AutoPrompt {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .track_focus(&self.focus_handle)
-                    .p_4()
-                    .bg(rgb(0x30363d))
-                    .text_color(rgb(0xffffff))
-                    .child(self.text.clone()),
-            )
-    }
-}
-
+/// The Flux dialog, answered by itself: the screenshot shows the question with the chosen button
+/// focused.
 fn auto_prompt(
-    _: PromptLevel,
+    level: PromptLevel,
     message: &str,
-    _: Option<&str>,
+    detail: Option<&str>,
     buttons: &[PromptButton],
     handle: PromptHandle,
     window: &mut Window,
     cx: &mut App,
 ) -> RenderablePromptHandle {
-    let last = buttons.len().saturating_sub(1);
-    let answer = ANSWERS
-        .lock()
-        .unwrap()
-        .pop_front()
-        .unwrap_or(last)
-        .min(last);
-    let label = buttons
-        .get(answer)
-        .map_or("?", |button| button.label().as_ref());
-    let number = PROMPTS.fetch_add(1, Ordering::Relaxed) + 1;
-    println!("PROMPT {message} -> {label}");
-    println!("SHOT prompt-{number}");
-    let text = format!("{message} → {label}");
-    let view = cx.new(|cx| {
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SHOT_PAUSE).await;
-            this.update(cx, |_, cx| cx.emit(PromptResponse(answer)))
-                .ok();
-        })
-        .detach();
-        AutoPrompt {
-            focus_handle: cx.focus_handle(),
-            text,
-        }
-    });
-    handle.with_view(view, window, cx)
+    let mut choose = |dialog: &crate::dialog::Dialog| {
+        let last = dialog.buttons.len().saturating_sub(1);
+        let answer = ANSWERS
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(last)
+            .min(last);
+        let label = dialog
+            .buttons
+            .get(answer)
+            .map_or("?", |button| button.label.as_ref());
+        let number = PROMPTS.fetch_add(1, Ordering::Relaxed) + 1;
+        println!("PROMPT {} -> {label}", dialog.title);
+        println!("SHOT prompt-{number}");
+        (answer, SHOT_PAUSE)
+    };
+    crate::dialog::build_with(
+        level,
+        message,
+        detail,
+        buttons,
+        handle,
+        Some(&mut choose),
+        window,
+        cx,
+    )
 }

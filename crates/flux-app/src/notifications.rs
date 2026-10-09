@@ -3,17 +3,22 @@
 //! links ("Restore", "Resolve…", "Details"): an action is a gpui action dispatched on the window,
 //! so whoever handles it (the workspace, mostly) needs no reference to the card.
 //!
-//! Cards go away by themselves after a few seconds (longer with actions); errors stay until
-//! closed. At most [`MAX_SHOWN`] are shown: a new card pushes the oldest out.
+//! The cards show what the window's [`NotificationCenter`](crate::notification_center) decides:
+//! every card is a journal entry with the same id. How long a card stays is its [`CardLife`] — a
+//! few seconds (longer with actions), or until closed (errors, a task in progress, sticky groups).
+//! At most [`MAX_SHOWN`] are shown: a new card pushes the oldest out. Closing a card with × or
+//! running one of its actions tells the center ([`CardEvent`]): the entry becomes read; a card that
+//! times out leaves it unread.
 
 use std::time::Duration;
 
 use gpui::{
-    Action, App, ClickEvent, Context, Entity, FontWeight, Hsla, IntoElement, Render, SharedString,
-    Task, Window, div, prelude::*, px,
+    Action, App, ClickEvent, Context, Entity, EventEmitter, FontWeight, Hsla, IntoElement, Render,
+    SharedString, Task, Window, div, prelude::*, px, relative,
 };
 
 use crate::icons::{IconName, icon};
+use crate::notification_center::{NotificationGroup, NotificationId};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, GAP, RADIUS_LG, RADIUS_SM, STATUS_BAR_HEIGHT};
 
@@ -22,8 +27,10 @@ pub const WIDTH: f32 = 360.;
 /// How many cards are shown at most.
 const MAX_SHOWN: usize = 4;
 /// How long a card without actions stays, and one with actions.
-const SHORT: Duration = Duration::from_secs(6);
-const LONG: Duration = Duration::from_secs(14);
+pub const SHORT: Duration = Duration::from_secs(6);
+pub const LONG: Duration = Duration::from_secs(14);
+/// Height of the progress bar of a task in progress.
+const PROGRESS_HEIGHT: f32 = 4.;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationKind {
@@ -31,6 +38,15 @@ pub enum NotificationKind {
     Success,
     Warning,
     Error,
+}
+
+#[allow(dead_code)] // The plugin API (stage 8) and the progress of background tasks use it.
+/// A background task's progress: unknown ("Indexing…") or a fraction of the work done.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Progress {
+    Indeterminate,
+    /// 0.0 to 1.0.
+    Fraction(f32),
 }
 
 /// A notification: a title, an optional body, links that dispatch actions.
@@ -42,6 +58,10 @@ pub struct Notification {
     /// Stays until closed (errors are sticky by default; a warning about something the window
     /// shows anyway — conflicts in their dialog — goes away like the rest).
     pub sticky: bool,
+    /// Who tells: the group's display setting decides where the notification shows.
+    pub group: NotificationGroup,
+    /// A task in progress: its card stays until the progress is cleared (`None`).
+    pub progress: Option<Progress>,
 }
 
 impl Notification {
@@ -52,6 +72,8 @@ impl Notification {
             body: None,
             actions: Vec::new(),
             sticky: kind == NotificationKind::Error,
+            group: NotificationGroup::General,
+            progress: None,
         }
     }
 
@@ -83,6 +105,18 @@ impl Notification {
         self
     }
 
+    pub fn group(mut self, group: NotificationGroup) -> Self {
+        self.group = group;
+        self
+    }
+
+    #[allow(dead_code)] // The plugin API (stage 8) and the progress of background tasks use it.
+    /// A task in progress (see [`Progress`]).
+    pub fn progress(mut self, progress: Progress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
     /// Goes away by itself.
     pub fn transient(mut self) -> Self {
         self.sticky = false;
@@ -109,6 +143,8 @@ impl Clone for Notification {
                 .map(|(label, action)| (label.clone(), action.boxed_clone()))
                 .collect(),
             sticky: self.sticky,
+            group: self.group.clone(),
+            progress: self.progress,
         }
     }
 }
@@ -119,6 +155,8 @@ impl std::fmt::Debug for Notification {
             .field("kind", &self.kind)
             .field("title", &self.title)
             .field("body", &self.body)
+            .field("group", &self.group)
+            .field("progress", &self.progress)
             .field(
                 "actions",
                 &self
@@ -131,9 +169,30 @@ impl std::fmt::Debug for Notification {
     }
 }
 
+/// How long a card stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardLife {
+    /// Closes by itself after this long.
+    Timed(Duration),
+    /// Stays until closed (or until its notification changes its life).
+    Sticky,
+}
+
+/// What the user did to a card; the center marks the entry read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardEvent {
+    /// Closed with ×.
+    Closed(NotificationId),
+    /// One of its actions was run (the card closed).
+    ActionRun(NotificationId),
+}
+
 struct Shown {
-    id: u64,
+    id: NotificationId,
     notification: Notification,
+    /// The group's name over the title (a plugin's cards say whose they are).
+    source: Option<SharedString>,
+    life: CardLife,
     _timer: Option<Task<()>>,
 }
 
@@ -141,43 +200,70 @@ struct Shown {
 #[derive(Default)]
 pub struct Notifications {
     shown: Vec<Shown>,
-    next_id: u64,
 }
+
+impl EventEmitter<CardEvent> for Notifications {}
 
 impl Notifications {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Shows a card; a transient one closes by itself.
-    pub fn push(&mut self, notification: Notification, cx: &mut Context<Self>) {
-        let id = self.next_id;
-        self.next_id += 1;
-        let timer = (!notification.sticky).then(|| {
-            let delay = if notification.actions.is_empty() {
-                SHORT
-            } else {
-                LONG
-            };
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(delay).await;
-                this.update(cx, |this, cx| this.dismiss(id, cx)).ok();
-            })
-        });
-        self.shown.push(Shown {
-            id,
-            notification,
-            _timer: timer,
-        });
-        if self.shown.len() > MAX_SHOWN {
-            self.shown.remove(0);
+    /// Shows the card of journal entry `id`, or replaces it in place if it is shown.
+    pub fn show(
+        &mut self,
+        id: NotificationId,
+        notification: Notification,
+        source: Option<SharedString>,
+        life: CardLife,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.shown.iter().position(|shown| shown.id == id) {
+            let restart = self.shown[index].life != life;
+            let shown = &mut self.shown[index];
+            shown.notification = notification;
+            shown.source = source;
+            if restart {
+                shown.life = life;
+                shown._timer = Self::timer(id, life, cx);
+            }
+        } else {
+            self.shown.push(Shown {
+                id,
+                notification,
+                source,
+                life,
+                _timer: Self::timer(id, life, cx),
+            });
+            if self.shown.len() > MAX_SHOWN {
+                self.shown.remove(0);
+            }
         }
         cx.notify();
     }
 
-    pub fn dismiss(&mut self, id: u64, cx: &mut Context<Self>) {
+    fn timer(id: NotificationId, life: CardLife, cx: &mut Context<Self>) -> Option<Task<()>> {
+        let CardLife::Timed(delay) = life else {
+            return None;
+        };
+        Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| this.dismiss(id, cx)).ok();
+        }))
+    }
+
+    /// Whether the card of entry `id` is on screen.
+    pub fn is_shown(&self, id: NotificationId) -> bool {
+        self.shown.iter().any(|shown| shown.id == id)
+    }
+
+    /// Closes the card of entry `id` (the entry stays in the journal).
+    pub fn dismiss(&mut self, id: NotificationId, cx: &mut Context<Self>) {
+        let before = self.shown.len();
         self.shown.retain(|shown| shown.id != id);
-        cx.notify();
+        if self.shown.len() != before {
+            cx.notify();
+        }
     }
 
     /// Keeps only the cards `keep` says yes to (stale ones go: "Continue Rebase" after the rebase
@@ -186,6 +272,14 @@ impl Notifications {
         let before = self.shown.len();
         self.shown.retain(|shown| keep(&shown.notification));
         if self.shown.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// Closes every card (Do Not Disturb turned on).
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        if !self.shown.is_empty() {
+            self.shown.clear();
             cx.notify();
         }
     }
@@ -215,6 +309,7 @@ impl Notifications {
                     .hover(move |style| style.bg(ui.hover))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.dismiss(id, cx);
+                        cx.emit(CardEvent::ActionRun(id));
                         window.dispatch_action(action.boxed_clone(), cx);
                     }))
                     .child(label.clone())
@@ -253,6 +348,14 @@ impl Notifications {
                     .flex()
                     .flex_col()
                     .gap_1()
+                    .children(shown.source.clone().map(|source| {
+                        div()
+                            .pr_5()
+                            .text_size(px(theme::TEXT_XS))
+                            .text_color(ui.dim)
+                            .truncate()
+                            .child(source)
+                    }))
                     .child(
                         div()
                             .pr_5()
@@ -265,6 +368,7 @@ impl Notifications {
                             .text_color(ui.text_muted)
                             .child(body)
                     }))
+                    .children(notification.progress.map(|progress| progress_bar(progress, ui)))
                     .when(!actions.is_empty(), |column| {
                         column.child(
                             div()
@@ -289,7 +393,8 @@ impl Notifications {
                         ui::icon_button(("notification-close", id as usize), IconName::Close, ui)
                             .on_click(
                                 cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.dismiss(id, cx)
+                                    this.dismiss(id, cx);
+                                    cx.emit(CardEvent::Closed(id));
                                 }),
                             ),
                     ),
@@ -297,7 +402,34 @@ impl Notifications {
     }
 }
 
-fn kind_icon(kind: NotificationKind, ui: UiColors) -> (IconName, Hsla) {
+/// A thin bar: the done part in the accent color; an unknown amount is the whole bar, dimmer (no
+/// animation — the design system has none).
+pub fn progress_bar(progress: Progress, ui: UiColors) -> impl IntoElement + use<> {
+    let track = div()
+        .mt_1()
+        .w_full()
+        .h(px(PROGRESS_HEIGHT))
+        .rounded(px(PROGRESS_HEIGHT / 2.))
+        .overflow_hidden()
+        .bg(ui.input_border);
+    match progress {
+        Progress::Indeterminate => track.child(
+            div()
+                .size_full()
+                .rounded(px(PROGRESS_HEIGHT / 2.))
+                .bg(UiColors::tint(ui.accent, 0.45)),
+        ),
+        Progress::Fraction(done) => track.child(
+            div()
+                .h_full()
+                .w(relative(done.clamp(0., 1.)))
+                .rounded(px(PROGRESS_HEIGHT / 2.))
+                .bg(ui.accent),
+        ),
+    }
+}
+
+pub fn kind_icon(kind: NotificationKind, ui: UiColors) -> (IconName, Hsla) {
     match kind {
         NotificationKind::Info => (IconName::Info, ui.info),
         NotificationKind::Success => (IconName::CheckCircle, ui.success),

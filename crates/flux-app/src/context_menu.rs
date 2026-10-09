@@ -15,8 +15,9 @@ use gpui::{
 };
 
 use crate::command_palette::keystroke_label;
-use crate::theme::{self, Theme};
-use crate::ui::{self, RADIUS_LG, RADIUS_SM};
+use crate::popup;
+use crate::theme::Theme;
+use crate::ui::{self, RADIUS_SM};
 
 pub const MENU_MIN_WIDTH: f32 = 240.;
 const ITEM_HEIGHT: f32 = 28.;
@@ -106,12 +107,12 @@ impl ContextMenu {
     }
 
     /// The menu over the window at the point `position` (window coordinates); near the window edge
-    /// it is shifted inward.
+    /// it is shifted inward, keeping the margin every popup keeps.
     pub fn overlay(menu: &Entity<Self>, position: Point<Pixels>) -> AnyElement {
         deferred(
             anchored()
                 .position(position)
-                .snap_to_window()
+                .snap_to_window_with_margin(px(popup::WINDOW_MARGIN))
                 .child(menu.clone()),
         )
         .with_priority(1)
@@ -244,28 +245,18 @@ impl Render for ContextMenu {
                 }
             })
             .collect();
-        div()
+        popup::panel(ui)
             .key_context("ContextMenu")
             .track_focus(&self.focus_handle)
-            .relative()
             .min_w(px(MENU_MIN_WIDTH))
             .p(px(MENU_PADDING))
             .flex()
             .flex_col()
-            .rounded(px(RADIUS_LG))
-            .bg(ui.elevated)
-            .border_1()
-            .border_color(ui.elevated_border)
-            .shadow(ui::popover_shadow(ui))
-            .font_family(theme::UI_FONT)
-            .text_size(px(theme::TEXT_MD))
-            .text_color(ui.foreground)
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(|_, _: &Cancel, _, cx| cx.emit(DismissEvent)))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
-            .child(ui::sheen(ui, RADIUS_LG))
             .children(self.title.clone().map(|title| {
                 div()
                     .px_2p5()

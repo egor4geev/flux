@@ -35,10 +35,11 @@ use flux_core::{Assoc, ChangeSet, Document, Rope, TextChange};
 use flux_git::{Chunk, ChunkKind, ConflictKind, ConflictSide, ConflictVersions, RepoState};
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Hsla, KeyBinding, PathBuilder, Pixels, Point, PromptLevel, Render, ScrollWheelEvent,
-    SharedString, Subscription, Task, Window, actions, canvas, div, point, prelude::*, px,
+    Hsla, KeyBinding, PathBuilder, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    Subscription, Task, Window, actions, canvas, div, point, prelude::*, px,
 };
 
+use crate::dialog::Dialog;
 use crate::diff_view::Decorations;
 use crate::editor::{self, Editor, EditorEvent};
 use crate::git::GitStore;
@@ -759,16 +760,14 @@ impl MergeView {
         if !self.modified {
             return Task::ready(true);
         }
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            tr("Discard the merge result?"),
-            Some(tr(
+        let answer = Dialog::warning(tr("Discard the merge result?"))
+            .message(tr(
                 "What you did in the merge tool is lost; the file stays conflicted.",
-            )),
-            &[tr("Discard"), tr("Cancel")],
-            cx,
-        );
-        cx.spawn(async move |_, _| matches!(answer.await, Ok(0)))
+            ))
+            .danger(tr("Discard"))
+            .cancel(tr("Cancel"))
+            .show(window, cx);
+        cx.spawn(async move |_, _| answer.await == Some(0))
     }
 
     /// The conflict kind of the file, from the status; `None` — it isn't conflicted.
@@ -1172,19 +1171,17 @@ impl MergeView {
         if unresolved == 0 {
             return self.write(window, cx);
         }
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &trn(
-                unresolved,
-                "{n} conflict is unresolved",
-                "{n} conflicts are unresolved",
-            ),
-            Some(tr("Save the result and mark the file resolved anyway?")),
-            &[tr("Apply"), tr("Continue Merging")],
-            cx,
-        );
+        let answer = Dialog::warning(trn(
+            unresolved,
+            "{n} conflict is unresolved",
+            "{n} conflicts are unresolved",
+        ))
+        .message(tr("Save the result and mark the file resolved anyway?"))
+        .normal(tr("Apply"))
+        .cancel(tr("Continue Merging"))
+        .show(window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            if matches!(answer.await, Ok(0)) {
+            if answer.await == Some(0) {
                 this.update_in(cx, |this, window, cx| this.write(window, cx))
                     .ok();
             }

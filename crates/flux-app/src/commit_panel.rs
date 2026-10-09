@@ -39,15 +39,18 @@ use flux_git::{
 use gpui::{
     Action, AnyElement, App, AsyncApp, ClickEvent, ClipboardItem, Context, CursorStyle,
     DismissEvent, Div, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyBinding, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, Render, ScrollStrategy,
-    SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*,
-    px, uniform_list,
+    KeyBinding, MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString,
+    Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
+    uniform_list,
 };
 
 use crate::context_menu::ContextMenu;
+use crate::dialog::Dialog;
 use crate::editor::{self, Editor};
 use crate::git::{self, Change, CheckState, GitEvent, GitStore};
 use crate::i18n::{tr, trf, trn};
+use crate::notification_center::NotificationGroup;
+use crate::notifications::Notification;
 use crate::icons::{IconName, file_icon, folder_icon, icon};
 use crate::rename::difference;
 use crate::stash_panel::{StashPanel, StashPanelEvent, StashSelected};
@@ -993,15 +996,13 @@ impl CommitPanel {
                 &[&trn(paths.len(), "{n} file", "{n} files")],
             ),
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &question,
-            Some(tr("You can restore it from the Trash.")),
-            &[tr("Move to Trash"), tr("Cancel")],
-            cx,
-        );
+        let answer = Dialog::warning(question)
+            .message(tr("You can restore it from the Trash."))
+            .danger(tr("Move to Trash"))
+            .cancel(tr("Cancel"))
+            .show(window, cx);
         cx.spawn(async move |this, cx| {
-            if answer.await != Ok(0) {
+            if answer.await != Some(0) {
                 return;
             }
             let trashed = paths.clone();
@@ -1013,7 +1014,12 @@ impl CommitPanel {
                     this.git.update(cx, |git, cx| git.refresh(cx));
                     cx.emit(CommitPanelEvent::Removed(paths));
                 }
-                Err(err) => this.report(GitEvent::Message(err.to_string().into()), cx),
+                Err(err) => {
+                    let notification = Notification::error(tr("Couldn't move to Trash"))
+                        .body(err.to_string())
+                        .group(NotificationGroup::Files);
+                    this.git.update(cx, |git, cx| git.notify(notification, cx))
+                }
             })
             .ok();
         })
@@ -1066,12 +1072,14 @@ impl CommitPanel {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                let message = match result {
-                    Ok(()) => trf("Added to .gitignore: {0}", &[&name]),
-                    Err(err) => err,
+                let notification = match result {
+                    Ok(()) => Notification::success(trf("Added to .gitignore: {0}", &[&name])),
+                    Err(err) => Notification::error(tr("Couldn't add to .gitignore")).body(err),
                 };
-                this.git.update(cx, |git, cx| git.refresh(cx));
-                this.report(GitEvent::Message(message.into()), cx);
+                this.git.update(cx, |git, cx| {
+                    git.refresh(cx);
+                    git.notify(notification, cx)
+                });
             })
             .ok();
         })
@@ -1135,7 +1143,7 @@ impl CommitPanel {
                         ConflictSide::Ours => trf("Resolved {0}: kept yours", &[&what]),
                         ConflictSide::Theirs => trf("Resolved {0}: took theirs", &[&what]),
                     };
-                    git.report(GitEvent::Message(message.into()), cx)
+                    git.notify(Notification::success(message), cx)
                 }
                 Err(err) => git.notify_error(tr("Couldn't resolve the conflict"), &err, cx),
             })
@@ -1588,11 +1596,17 @@ impl CommitPanel {
                         this.amend_message = None;
                         this.merge_message = None;
                         let files = trn(count, "{n} file", "{n} files");
-                        let message = trf("Committed {0}: {1}", &[&files, &summary]);
-                        this.report(GitEvent::Message(message.into()), cx);
+                        let title = trf("Committed {0}", &[&files]);
+                        let notification = Notification::success(title).body(summary);
+                        this.git.update(cx, |git, cx| git.notify(notification, cx));
                         if push {
                             cx.emit(CommitPanelEvent::Push);
                         }
+                    }
+                    // A commit that didn't happen is an outcome, not a hint: a card.
+                    Err(GitEvent::Message(message)) => {
+                        let notification = Notification::warning(message);
+                        this.git.update(cx, |git, cx| git.notify(notification, cx))
                     }
                     Err(event) => this.report(event, cx),
                 }
@@ -2374,10 +2388,10 @@ async fn run_commit(
         match task.await {
             Ok(result) => summary = result.summary,
             Err(err) => {
-                return Err(GitEvent::Error {
-                    message: trf("Commit failed: {0}", &[&err]).into(),
-                    details: err.details().map(str::to_string),
-                });
+                let title = tr("Commit failed");
+                let notification =
+                    crate::git::error_notification(title, &err.to_string(), err.details());
+                return Err(GitEvent::Notify(notification));
             }
         }
     }
@@ -2411,44 +2425,35 @@ pub(crate) fn confirm_rollback(
             &[&trn(changes.len(), "in {n} file", "in {n} files")],
         ),
     };
-    let mut detail = changes
+    let mut files = changes
         .iter()
         .take(LISTED_FILES)
         .map(|change| change.relative.clone())
         .collect::<Vec<_>>()
         .join("\n");
     if changes.len() > LISTED_FILES {
-        detail.push('\n');
-        detail.push_str(&trf("and {0} more", &[&(changes.len() - LISTED_FILES)]));
+        files.push('\n');
+        files.push_str(&trf("and {0} more", &[&(changes.len() - LISTED_FILES)]));
     }
-    detail.push_str("\n\n");
-    detail.push_str(tr("The files return to their last committed state."));
+    let mut message = tr("The files return to their last committed state.").to_string();
     if added {
-        detail.push(' ');
-        detail.push_str(tr(
+        message.push(' ');
+        message.push_str(tr(
             "Added files stay on disk as unversioned, unless you delete them too.",
         ));
     }
-    let buttons: Vec<&str> = if added {
-        vec![
-            tr("Rollback"),
-            tr("Rollback and Delete Added"),
-            tr("Cancel"),
-        ]
-    } else {
-        vec![tr("Rollback"), tr("Cancel")]
-    };
-    let answer = window.prompt(
-        PromptLevel::Warning,
-        &question,
-        Some(&detail),
-        buttons.as_slice(),
-        cx,
-    );
+    let mut dialog = Dialog::warning(question)
+        .message(message)
+        .details(files)
+        .danger(tr("Rollback"));
+    if added {
+        dialog = dialog.danger(tr("Rollback and Delete Added"));
+    }
+    let answer = dialog.cancel(tr("Cancel")).show(window, cx);
     cx.spawn(async move |cx: &mut AsyncApp| {
         let delete_added = match answer.await {
-            Ok(0) => false,
-            Ok(1) if added => true,
+            Some(0) => false,
+            Some(1) if added => true,
             _ => return,
         };
         let Ok(task) = git.update(cx, |git, cx| {
@@ -2459,11 +2464,7 @@ pub(crate) fn confirm_rollback(
         let result = task.await;
         cx.update(|cx| {
             if let Err(err) = result {
-                let event = GitEvent::Error {
-                    message: trf("Rollback failed: {0}", &[&err]).into(),
-                    details: err.details().map(str::to_string),
-                };
-                return git.update(cx, |git, cx| git.report(event, cx));
+                return git.update(cx, |git, cx| git.notify_error(tr("Rollback failed"), &err, cx));
             }
             let removed = follow_rollback(&git, &changes, cx);
             let message = match changes.as_slice() {
@@ -2473,9 +2474,7 @@ pub(crate) fn confirm_rollback(
                     &[&trn(changes.len(), "{n} file", "{n} files")],
                 ),
             };
-            git.update(cx, |git, cx| {
-                git.report(GitEvent::Message(message.into()), cx)
-            });
+            git.update(cx, |git, cx| git.notify(Notification::success(message), cx));
             if !removed.is_empty() {
                 on_removed(removed, cx);
             }

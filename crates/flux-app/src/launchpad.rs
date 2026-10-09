@@ -9,7 +9,7 @@ use crate::icons::IconName;
 use crate::theme::Theme;
 use crate::ui;
 use crate::workspace::Workspace;
-use crate::{file_tree, git, project_search, terminal_panel};
+use crate::{file_tree, git, notifications_panel, project_search, terminal_panel};
 
 /// Width of the strip; the buttons are centered.
 pub const WIDTH: f32 = 40.;
@@ -29,9 +29,15 @@ pub enum Tool {
     Terminal,
     /// The Git window (the log): the island under the editor, in place of the terminals.
     Git,
+    /// The Notifications window: the island on the right. At the bottom of the strip, apart from
+    /// the tools of the left and the bottom.
+    Notifications,
 }
 
 impl Tool {
+    /// The tools at the bottom of the strip, above Settings: the windows of the right island.
+    pub const BOTTOM: [Tool; 1] = [Tool::Notifications];
+
     /// Order in the strip, top to bottom.
     pub const ALL: [Tool; 5] = [
         Tool::Project,
@@ -48,6 +54,7 @@ impl Tool {
             Tool::FindInFiles => IconName::FindInFiles,
             Tool::Terminal => IconName::Terminal,
             Tool::Git => IconName::GitLog,
+            Tool::Notifications => IconName::Bell,
         }
     }
 
@@ -58,6 +65,7 @@ impl Tool {
             Tool::FindInFiles => tr("Find in Files"),
             Tool::Terminal => tr("Terminal"),
             Tool::Git => tr("Git"),
+            Tool::Notifications => tr("Notifications"),
         }
     }
 
@@ -69,6 +77,7 @@ impl Tool {
             Tool::FindInFiles => Box::new(project_search::Toggle),
             Tool::Terminal => Box::new(terminal_panel::TogglePanel),
             Tool::Git => Box::new(git::ToggleGitWindow),
+            Tool::Notifications => Box::new(notifications_panel::Toggle),
         }
     }
 }
@@ -90,61 +99,19 @@ pub fn render(
         .items_center()
         .gap_1p5()
         .pb(px(ui::GAP))
-        .children(Tool::ALL.into_iter().map(|tool| {
-            let open = workspace.tool_open(tool, cx);
-            let badge = workspace.tool_badge(tool, cx);
-            let action = tool.action();
-            let keys = ui::shortcut_for(action.as_ref(), window);
-            div()
-                .relative()
-                .child(
-                    ui::toggle_button(("tool", tool as usize), tool.icon(), open, ui)
-                        .size(px(BUTTON_SIZE))
-                        .rounded(px(ui::RADIUS_MD))
-                        .tooltip(ui::tooltip(tool.label(), keys))
-                        .on_click(move |_, window, cx| {
-                            window.dispatch_action(action.boxed_clone(), cx)
-                        }),
-                )
-                // A count in the corner: the changes waiting for a commit.
-                .children(badge.map(|count| {
-                    div()
-                        .absolute()
-                        .top(px(-3.))
-                        .right(px(-5.))
-                        .min_w(px(15.))
-                        .h(px(15.))
-                        .px(px(3.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(8.))
-                        .bg(ui.accent)
-                        .text_size(px(crate::theme::TEXT_XS - 2.))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(ui.frame)
-                        .child(if count > 99 {
-                            "99+".to_string()
-                        } else {
-                            count.to_string()
-                        })
-                }))
-                // Marker of the open window: at the edge of the strip, like an IDE tool tab.
-                .when(open, |button| {
-                    button.child(
-                        div()
-                            .absolute()
-                            .left(px(-(WIDTH - BUTTON_SIZE) / 2. - 1.))
-                            .top(px(BUTTON_SIZE / 2. - 7.))
-                            .w(px(3.))
-                            .h(px(14.))
-                            .rounded(px(2.))
-                            .bg(ui.accent),
-                    )
-                })
-        }))
-        // Settings: at the bottom of the strip, apart from the tools.
+        .children(
+            Tool::ALL
+                .into_iter()
+                .map(|tool| tool_button(workspace, tool, window, cx)),
+        )
+        // Settings: at the bottom of the strip, apart from the tools; above them, the windows of the
+        // right island.
         .child(div().flex_1())
+        .children(
+            Tool::BOTTOM
+                .into_iter()
+                .map(|tool| tool_button(workspace, tool, window, cx)),
+        )
         .child({
             let open = crate::settings_view::is_open(workspace);
             let keys = ui::shortcut_for(&crate::settings_view::Toggle, window);
@@ -155,5 +122,67 @@ pub fn render(
                 .on_click(|_, window, cx| {
                     window.dispatch_action(Box::new(crate::settings_view::Toggle), cx)
                 })
+        })
+}
+
+/// A tool button: the icon, highlighted when the tool's window is open, a count in the corner.
+fn tool_button(
+    workspace: &Workspace,
+    tool: Tool,
+    window: &Window,
+    cx: &Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let ui = Theme::ui(cx);
+    let open = workspace.tool_open(tool, cx);
+    let badge = workspace.tool_badge(tool, cx);
+    let alarm = workspace.tool_badge_alarm(tool, cx);
+    let action = tool.action();
+    let keys = ui::shortcut_for(action.as_ref(), window);
+    div()
+        .relative()
+        .child(
+            ui::toggle_button(("tool", tool as usize), tool.icon(), open, ui)
+                .size(px(BUTTON_SIZE))
+                .rounded(px(ui::RADIUS_MD))
+                .tooltip(ui::tooltip(tool.label(), keys))
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(action.boxed_clone(), cx)
+                }),
+        )
+        // A count in the corner: changes waiting for a commit, unread notifications.
+        .children(badge.map(|count| {
+            div()
+                .absolute()
+                .top(px(-3.))
+                .right(px(-5.))
+                .min_w(px(15.))
+                .h(px(15.))
+                .px(px(3.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .bg(if alarm { ui.error } else { ui.accent })
+                .text_size(px(crate::theme::TEXT_XS - 2.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(ui.frame)
+                .child(if count > 99 {
+                    "99+".to_string()
+                } else {
+                    count.to_string()
+                })
+        }))
+        // Marker of the open window: at the edge of the strip, like an IDE tool tab.
+        .when(open, |button| {
+            button.child(
+                div()
+                    .absolute()
+                    .left(px(-(WIDTH - BUTTON_SIZE) / 2. - 1.))
+                    .top(px(BUTTON_SIZE / 2. - 7.))
+                    .w(px(3.))
+                    .h(px(14.))
+                    .rounded(px(2.))
+                    .bg(ui.accent),
+            )
         })
 }

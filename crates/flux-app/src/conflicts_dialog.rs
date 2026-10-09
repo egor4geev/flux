@@ -20,10 +20,11 @@ use std::path::PathBuf;
 use flux_git::{ConflictKind, ConflictSide, Outcome, RepoState};
 use gpui::{
     App, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, InteractiveElement, KeyBinding, PromptLevel, Render, SharedString, Subscription,
-    WeakEntity, Window, actions, div, prelude::*, px,
+    FontWeight, InteractiveElement, KeyBinding, Render, SharedString, Subscription, WeakEntity,
+    Window, actions, div, prelude::*, px,
 };
 
+use crate::dialog::Dialog;
 use crate::git::{self, Change, GitStore};
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, file_icon, icon};
@@ -78,7 +79,7 @@ pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Wor
         }
     }
     let this = cx.weak_entity();
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         ConflictsDialog::new(git, this, window, cx)
     });
     workspace.dismiss_notifications(&["git::ResolveConflicts"], cx);
@@ -92,7 +93,7 @@ pub fn show_conflicts(workspace: &mut Workspace, window: &mut Window, cx: &mut C
     }
     let git = workspace.git().clone();
     let this = cx.weak_entity();
-    workspace.toggle_modal(window, cx, move |window, cx| {
+    workspace.toggle_dialog(window, cx, move |window, cx| {
         ConflictsDialog::new(git, this, window, cx)
     });
 }
@@ -464,15 +465,13 @@ pub fn abort_operation(
         }
     };
     let detail = format!("{}\n\n{detail}", describe(git.read(cx), repo));
-    let answer = window.prompt(
-        PromptLevel::Warning,
-        question,
-        Some(&detail),
-        &[tr("Abort"), tr("Cancel")],
-        cx,
-    );
+    let answer = Dialog::warning(question)
+        .message(detail)
+        .danger(tr("Abort"))
+        .cancel(tr("Cancel"))
+        .show(window, cx);
     cx.spawn_in(window, async move |this, cx| {
-        if !matches!(answer.await, Ok(0)) {
+        if answer.await != Some(0) {
             return;
         }
         let Ok(task) = this.update(cx, |this, cx| {
@@ -508,17 +507,15 @@ pub fn skip_commit(
         .as_deref()
         .map(|oid| oid.chars().take(7).collect::<String>())
         .unwrap_or_default();
-    let answer = window.prompt(
-        PromptLevel::Warning,
-        &trf("Skip the commit {0}?", &[&commit]),
-        Some(tr("Its changes are left out of the rebased branch.")),
-        &[tr("Skip"), tr("Cancel")],
-        cx,
-    );
+    let answer = Dialog::warning(trf("Skip the commit {0}?", &[&commit]))
+        .message(tr("Its changes are left out of the rebased branch."))
+        .danger(tr("Skip"))
+        .cancel(tr("Cancel"))
+        .show(window, cx);
     let (onto, _) = git.read(cx).conflict_sides(repo);
     let branch = operation.rebase_branch.clone();
     cx.spawn_in(window, async move |this, cx| {
-        if !matches!(answer.await, Ok(0)) {
+        if answer.await != Some(0) {
             return;
         }
         let Ok(task) = this.update(cx, |this, cx| {

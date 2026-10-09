@@ -1,10 +1,12 @@
 //! Popups at a text position in the editor (the completion menu, hover): where the position is on
-//! screen, which side of its line a popup goes to, and the popup surface itself.
+//! screen, which side of its line a popup goes to, and the popup surface itself. Also where a quick
+//! list of the window goes ([`where_the_work_is`]: the ⌃V menu, branches, usages).
 
 use flux_core::text::line_start;
-use gpui::{Div, Pixels, div, prelude::*, px};
+use gpui::{App, Div, Pixels, Point, Window, div, point, prelude::*, px};
 
 use crate::editor::Editor;
+use crate::workspace::Workspace;
 use crate::theme::{self, UiColors};
 use crate::ui::{self, RADIUS_LG};
 
@@ -91,6 +93,38 @@ pub fn side(
         preferred
     };
     (side, room(side))
+}
+
+/// Under the caret of the focused editor, if it is on screen: where JetBrains puts its quick lists
+/// (`showInBestPositionFor`).
+pub fn caret_point(workspace: &Workspace, window: &Window, cx: &App) -> Option<Point<Pixels>> {
+    let editor = workspace.active_editor()?;
+    let editor = editor.read(cx);
+    if !editor.focus_handle.is_focused(window) {
+        return None;
+    }
+    let head = editor.document.selection().primary().head;
+    let anchor = anchor(editor, head)?;
+    Some(point(anchor.x, anchor.line_bottom + px(POPUP_GAP)))
+}
+
+/// The middle of the window for a popup `width` wide, a third of the way down: where a menu
+/// without a caret reads best.
+pub fn window_middle(window: &Window, width: f32) -> Point<Pixels> {
+    let size = window.viewport_size();
+    point(size.width / 2. - px(width / 2.), size.height / 3.)
+}
+
+/// Where a quick list `width` wide opens from the keyboard: under the caret when an editor has
+/// focus, otherwise in the middle of the window. (From the mouse, it opens at the element clicked
+/// or at the pointer.)
+pub fn where_the_work_is(
+    workspace: &Workspace,
+    width: f32,
+    window: &Window,
+    cx: &App,
+) -> Point<Pixels> {
+    caret_point(workspace, window, cx).unwrap_or_else(|| window_middle(window, width))
 }
 
 /// The popup surface: an elevated panel of the design system, as the context menu (a popover's

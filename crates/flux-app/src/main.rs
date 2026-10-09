@@ -10,6 +10,7 @@ mod completion;
 mod conflicts_dialog;
 mod context_menu;
 mod diagnostics;
+mod dialog;
 mod diff_view;
 mod display;
 mod editor;
@@ -37,7 +38,9 @@ mod lsp;
 mod markdown;
 mod merge_view;
 mod navigation;
+mod notification_center;
 mod notifications;
+mod notifications_panel;
 mod picker;
 mod popup;
 mod project_search;
@@ -105,6 +108,7 @@ fn main() {
             go_to_line::init(cx);
             project_search::init(cx);
             settings::init(cx);
+            dialog::init(cx);
             settings_view::init(cx);
             app_menu::init(cx);
             lsp::init(cx);
@@ -132,6 +136,7 @@ fn main() {
             merge_view::init(cx);
             git_log::init(cx);
             git_window::init(cx);
+            notifications_panel::init(cx);
             rebase_dialog::init(cx);
 
             let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);

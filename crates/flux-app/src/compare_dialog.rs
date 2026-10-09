@@ -83,7 +83,7 @@ fn open(
     if git.read(cx).repos().get(repo).is_none() {
         return;
     }
-    workspace.toggle_modal(window, cx, move |_, cx| {
+    workspace.toggle_dialog(window, cx, move |_, cx| {
         CompareDialog::new(git, repo, target, with_current, cx)
     });
 }

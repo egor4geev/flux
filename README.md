@@ -46,6 +46,11 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   of every commit; cherry-pick, revert, reset and an interactive rebase right from it; the history of a
   file or of selected lines; who changed each line in the gutter. Works with all the repositories in your
   folder.
+- **Never lose a message.** Results of Git operations, errors with their full output, language servers
+  installed or stopped, files changed on disk — all in one Notifications window with the time, the
+  source and the actions, unread ones counted on the bell. Choose per source how much you see: a card
+  that fades, one that stays, only the journal, or nothing; or turn on Do Not Disturb. Questions come in
+  Flux's own dialogs, with the keys you expect from macOS.
 - **Keyboard first.** Every command is in the command palette with its shortcut; familiar keys if
   you come from JetBrains IDEs.
 - **Speaks your language.** English or Russian, following your system settings.
@@ -82,6 +87,14 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   <tr>
     <td align="center"><sub><b>Log with a graph of branches</b></sub></td>
     <td align="center"><sub><b>Who changed each line</b></sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/notifications.png" alt="The Notifications window on the right: results and errors with their source, time and actions"></td>
+    <td width="50%"><img src="docs/images/dialog.png" alt="A Flux dialog asking to save changes, with Don't Save, Cancel and Save"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Notifications</b></sub></td>
+    <td align="center"><sub><b>Flux's own dialogs</b></sub></td>
   </tr>
 </table>
 
@@ -125,7 +138,7 @@ recent project on the start screen.
 - [x] Git: changes, diff, commit and push
 - [x] Git: branches, stash, conflicts
 - [x] Git: history and blame
-- [ ] Notification center and unified dialogs
+- [x] Notification center and unified dialogs
 - [ ] Plugins
 - [ ] Claude Code integration — the first plugin
 - [ ] Public beta

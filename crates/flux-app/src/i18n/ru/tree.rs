@@ -12,9 +12,4 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "You can restore it from the Trash.",
         "Его можно будет восстановить из Корзины.",
     ),
-    ("Cannot read {0}: {1}", "Не удалось прочитать {0}: {1}"),
-    (
-        "Not watching the project for changes: {0}",
-        "Изменения в проекте не отслеживаются: {0}",
-    ),
 ];

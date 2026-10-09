@@ -31,6 +31,8 @@ use gpui::{
 use crate::editor::Editor;
 use crate::i18n::{tr, trf};
 use crate::locations::{self, ListKind, NavTarget};
+use crate::notification_center::NotificationGroup;
+use crate::notifications::Notification;
 use crate::rename;
 use crate::theme;
 use crate::workspace::Workspace;
@@ -305,7 +307,22 @@ fn report(
     server: &LanguageServer,
     cx: &mut Context<Workspace>,
 ) {
-    if let Some(message) = error_message(template, error, server) {
+    let Some(message) = error_message(template, error, server) else {
+        return;
+    };
+    // The server failed the request: an error of its own, kept in the journal. "Starting", "doesn't
+    // support this" and "has stopped" (told when it stopped) are hints at the action.
+    let failed = match error {
+        RequestError::Server { code, .. } => *code != METHOD_NOT_FOUND,
+        RequestError::Decode(_) => true,
+        _ => false,
+    };
+    if failed {
+        let notification = Notification::error(message)
+            .body(server.name().to_string())
+            .group(NotificationGroup::LanguageServers);
+        workspace.notify(notification, cx);
+    } else {
         workspace.show_message(message.into(), cx);
     }
 }

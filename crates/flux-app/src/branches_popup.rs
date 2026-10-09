@@ -31,7 +31,7 @@ use crate::icons::{IconName, folder_icon, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::picker::highlighted_text;
 use crate::theme::{self, Theme, UiColors};
-use crate::ui::{self, RADIUS_LG, RADIUS_SM};
+use crate::ui::{self, RADIUS_SM};
 use crate::workspace::Workspace;
 
 actions!(
@@ -103,10 +103,8 @@ pub fn open(
     cx: &mut Context<Workspace>,
 ) {
     let git = workspace.git().clone();
-    let anchor = anchor.unwrap_or_else(|| {
-        crate::vcs_menu::caret_anchor(workspace, window, cx)
-            .unwrap_or_else(|| crate::vcs_menu::window_middle(window, WIDTH))
-    });
+    let anchor =
+        anchor.unwrap_or_else(|| crate::popup::where_the_work_is(workspace, WIDTH, window, cx));
     let active = workspace.active_path(cx);
     let current_repo = git.read(cx).current_repo(active.as_deref());
     workspace.toggle_modal(window, cx, move |window, cx| {
@@ -1786,26 +1784,19 @@ impl BranchesPopup {
             .collect();
         Some(
             div().mt(top).child(
-                div()
+                crate::popup::panel(ui)
                     .id("branch-submenu")
                     .on_hover(
                         cx.listener(|this, hovered: &bool, _, _| this.hover_submenu(*hovered)),
                     )
-                    .relative()
                     .min_w(px(SUBMENU_MIN_WIDTH))
                     .p(px(SUBMENU_PADDING))
                     .flex()
                     .flex_col()
-                    .rounded(px(RADIUS_LG))
-                    .bg(ui.elevated)
-                    .border_1()
-                    .border_color(ui.elevated_border)
-                    .shadow(ui::popover_shadow(ui))
                     // A click inside doesn't reach the list behind it.
                     .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
                         cx.stop_propagation()
                     })
-                    .child(ui::sheen(ui, RADIUS_LG))
                     .children(items),
             ),
         )

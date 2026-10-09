@@ -116,11 +116,13 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// Editor events, for those who observe the editor from outside (the find bar).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Editor events, for those who observe the editor from outside (the find bar, the window).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorEvent {
     /// The document text changed: an edit, paste, IME, undo, redo.
     Edited,
+    /// Saving failed: the reason (the window tells it in a notification).
+    SaveFailed(SharedString),
 }
 
 /// How to scroll to the primary cursor on the next render.
@@ -653,6 +655,7 @@ impl Editor {
             }
             Err(err) => {
                 self.status = Some(trf("Save failed: {0}", &[&err]).into());
+                cx.emit(EditorEvent::SaveFailed(err.to_string().into()));
                 false
             }
         };

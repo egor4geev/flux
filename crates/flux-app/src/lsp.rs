@@ -41,7 +41,8 @@ use flux_lsp::{LanguageServer, ServerEvent, install, position, sync};
 use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use gpui::{
-    App, AppContext, AsyncApp, Context, Div, Entity, EntityId, InteractiveElement, IntoElement,
+    App, AppContext, AsyncApp, Context, Div, Entity, EntityId, EventEmitter, InteractiveElement,
+    IntoElement,
     ParentElement, Stateful, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
     actions, div, px,
 };
@@ -50,11 +51,29 @@ use crate::diagnostics;
 use crate::editor::Editor;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::notification_center::NotificationGroup;
+use crate::notifications::Notification;
 use crate::theme::UiColors;
 use crate::ui;
 use crate::workspace::Workspace;
 
-actions!(language_server, [Restart]);
+actions!(
+    language_server,
+    [
+        Restart,
+        /// The stopped servers, and those that failed to install, start again (a notification's
+        /// "Restart").
+        RestartStopped
+    ]
+);
+
+/// What the window tells the user about the servers: installed, failed to install, stopped, an
+/// error the server showed.
+pub enum LspEvent {
+    Notify(Notification),
+}
+
+impl EventEmitter<LspEvent> for LspStore {}
 
 /// How long an error or warning from a server (`window/showMessage`) stays in the status bar.
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -332,7 +351,7 @@ impl LspStore {
 
     /// The stopped servers, and those that failed to install, start again (a click on the status
     /// bar).
-    fn restart_failed(&mut self, cx: &mut Context<Self>) {
+    pub fn restart_failed(&mut self, cx: &mut Context<Self>) {
         let failed: Vec<ServerKey> = self
             .servers
             .iter()
@@ -519,8 +538,24 @@ impl LspStore {
 
     fn set_status(&mut self, id: u64, status: Status, cx: &mut Context<Self>) {
         if let Some(server) = self.server_mut(id) {
+            if let Status::InstallFailed(reason) = &status {
+                let notification =
+                    Notification::error(trf("Couldn't install {0}", &[&server.key.name]))
+                        .body(install_reason(reason))
+                        .action(tr("Restart"), RestartStopped);
+                cx.emit(LspEvent::Notify(notification.group(NotificationGroup::LanguageServers)));
+            }
             server.status = status;
             cx.notify();
+        }
+    }
+
+    /// A server Flux installed (its version, if the installer knows it, is in Settings).
+    fn installed(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(server) = self.server_mut(id) {
+            let notification = Notification::success(trf("Installed {0}", &[&server.key.name]))
+                .group(NotificationGroup::LanguageServers);
+            cx.emit(LspEvent::Notify(notification));
         }
     }
 
@@ -616,6 +651,19 @@ impl LspStore {
                 let Some(server) = self.server_mut(id) else {
                     return;
                 };
+                // An error the server shows is an event of its own (a broken project file); a
+                // repeat of the one on screen is not.
+                let repeat = server
+                    .message
+                    .as_ref()
+                    .is_some_and(|(_, shown)| *shown == text);
+                if kind == MessageType::ERROR && !repeat {
+                    let notification = Notification::error(server.key.name.clone())
+                        .body(text.clone())
+                        .group(NotificationGroup::LanguageServers);
+                    cx.emit(LspEvent::Notify(notification));
+                }
+                let server = self.server_mut(id).expect("checked above");
                 server.message = Some((kind, text));
                 server.message_timer = Some(timer);
                 cx.notify();
@@ -629,6 +677,10 @@ impl LspStore {
         let Some(server) = self.server_mut(id) else {
             return;
         };
+        let notification = Notification::error(trf("{0} stopped", &[&server.key.name]))
+            .body(reason.clone())
+            .action(tr("Restart"), RestartStopped)
+            .group(NotificationGroup::LanguageServers);
         server.status = Status::Failed(reason);
         server.handle = None;
         server.progress.clear();
@@ -645,6 +697,7 @@ impl LspStore {
                 cx.notify();
             });
         }
+        cx.emit(LspEvent::Notify(notification));
         cx.notify();
     }
 
@@ -990,7 +1043,10 @@ async fn install_server(
         }
     }
     match installed.await {
-        Ok(()) => true,
+        Ok(()) => {
+            this.update(cx, |this, cx| this.installed(id, cx)).ok();
+            true
+        }
         Err(reason) => {
             this.update(cx, |this, cx| {
                 this.set_status(id, Status::InstallFailed(reason), cx)
@@ -1171,7 +1227,12 @@ pub fn path_changed(editor: &mut Editor, cx: &mut Context<Editor>) {
 /// The language server actions of a window: "Restart" (from the command palette, wherever the
 /// focus is) restarts the server of the active document, or all of them without one.
 pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
-    root.on_action(cx.listener(|workspace, _: &Restart, _, cx| {
+    root.on_action(cx.listener(|workspace, _: &RestartStopped, _, cx| {
+        workspace
+            .lsp
+            .update(cx, |store, cx| store.restart_failed(cx))
+    }))
+    .on_action(cx.listener(|workspace, _: &Restart, _, cx| {
         let editor = workspace.active_editor();
         workspace.lsp.update(cx, |store, cx| match &editor {
             Some(editor) => store.restart(editor, cx),
