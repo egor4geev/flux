@@ -22,108 +22,133 @@ and keeps everything you need one shortcut away — no setup, no clutter.
 > [!NOTE]
 > Flux is in early development. It runs on macOS today; more platforms will follow.
 
-## Why Flux
+## Features
 
-- **Fast.** Typing, scrolling and searching never wait — even in files with tens of thousands of lines.
-- **Calm and clear.** Your project and your code live in separate panels on a soft glass window.
-  Colour is used for meaning: every file type has its own icon.
-- **Find anything.** Jump to a file by a few letters, search the whole project with a live preview,
-  find and replace inside a file.
-- **Understands your code.** Errors as you type, completion, documentation on hover, go to
-  definition, find usages, rename and reformat — with the language servers you already have
-  (rust-analyzer, gopls and others), started automatically.
-- **A terminal built in.** Your own shell with its prompt and colours, in a panel under the editor or as
-  a tab next to your files. Split it, search its output, and ⌘-click a `file:line` from a compiler or a
-  test run to jump right there.
-- **Your project at a glance.** A file tree that hides what Git ignores, updates as files change on
-  disk and keeps your open tabs in sync when you rename or move files. Open files pick up changes made
-  outside Flux.
-- **Git, the way JetBrains IDEs do it.** Changed lines marked as you type, with rollback in one click; a
-  diff you can edit; a commit window with checkboxes for files and even single changes, amend and
-  commit-and-push; push with a preview of what goes. Branches in one popup — search, favorites, every
-  operation a click away, checkout that keeps your changes; update, pull and fetch; stash and unstash;
-  conflicts resolved in a three-way merge tool. The log with a graph of branches, filters and the details
-  of every commit; cherry-pick, revert, reset and an interactive rebase right from it; the history of a
-  file or of selected lines; who changed each line in the gutter. Works with all the repositories in your
-  folder.
-- **Never lose a message.** Results of Git operations, errors with their full output, language servers
-  installed or stopped, files changed on disk — all in one Notifications window with the time, the
-  source and the actions, unread ones counted on the bell. Choose per source how much you see: a card
-  that fades, one that stays, only the journal, or nothing; or turn on Do Not Disturb. Questions come in
-  Flux's own dialogs, with the keys you expect from macOS.
-- **Plugins that can't break your editor.** Each plugin runs in its own WebAssembly sandbox: it can't
-  crash or freeze Flux, and it reaches only what you allowed when you installed it. Plugins add commands
-  with shortcuts, tool windows, status bar items and settings pages, and look like the rest of Flux.
-  Turn them on and off without a restart in Settings → Plugins, install one from a folder or an archive.
-  A TODO window comes built in. Write your own in Rust — see [Writing plugins](docs/plugins.md).
-- **Claude Code, built in.** Talk to Claude in a window on the right, or in a tab next to your files. The
-  answer streams in, with every file Claude reads and every command it runs shown as it happens.
-  Claude asks before it changes anything: each edit opens as a diff you can trim or edit before you
-  accept it. Answer Claude's questions and approve its plans with a click or a key, pick the model and the
-  mode, mention files with `@`, and keep an eye on your subscription's limits in the status bar. Flux runs
-  your own `claude` command with your Claude subscription — no API key.
-- **Keyboard first.** Every command is in the command palette with its shortcut; familiar keys if
-  you come from JetBrains IDEs.
-- **Speaks your language.** English or Russian, following your system settings.
+### Fast and calm
 
-<table>
-  <tr>
-    <td width="50%"><img src="docs/images/start-screen.png" alt="Start screen with quick actions and recent projects"></td>
-    <td width="50%"><img src="docs/images/find-in-files.png" alt="Find in Files with results and a live preview"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>Start screen</b></sub></td>
-    <td align="center"><sub><b>Find in Files</b></sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/images/commit.png" alt="The commit window with checkboxes, changed lines in the gutter and the previous text of a change"></td>
-    <td width="50%"><img src="docs/images/diff.png" alt="A side-by-side diff with connectors, changed words and checkboxes for single changes"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>Commit window and changed lines</b></sub></td>
-    <td align="center"><sub><b>Diff with checkboxes for single changes</b></sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/images/branches.png" alt="The branches popup with search, recent and local branches, favorites and a branch's actions"></td>
-    <td width="50%"><img src="docs/images/merge.png" alt="The three-way merge tool: yours, the result and theirs, with arrows that take a side"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>Branches</b></sub></td>
-    <td align="center"><sub><b>Merge tool for conflicts</b></sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/images/log.png" alt="The Git window: the log with a graph of branches, filters and the details of the selected commit"></td>
-    <td width="50%"><img src="docs/images/blame.png" alt="Annotations in the gutter: the date and the author of the last change of every line"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>Log with a graph of branches</b></sub></td>
-    <td align="center"><sub><b>Who changed each line</b></sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/images/notifications.png" alt="The Notifications window on the right: results and errors with their source, time and actions"></td>
-    <td width="50%"><img src="docs/images/dialog.png" alt="A Flux dialog asking to save changes, with Don't Save, Cancel and Save"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>Notifications</b></sub></td>
-    <td align="center"><sub><b>Flux's own dialogs</b></sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/images/plugins.png" alt="Settings → Plugins: plugins under development and built-in ones with their switches, and the details of the TODO plugin"></td>
-    <td width="50%"><img src="docs/images/todo.png" alt="The TODO window on the right: TODO and FIXME comments of the project grouped by file"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>Plugins</b></sub></td>
-    <td align="center"><sub><b>The TODO window, a built-in plugin</b></sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/images/claude.png" alt="Claude Code in the window on the right: the conversation, an edit waiting for an answer, and the proposed change opened as a diff"></td>
-    <td width="50%"><img src="docs/images/claude-question.png" alt="Claude asks a question with options to choose from, right in the chat"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>Claude Code: every edit as a diff</b></sub></td>
-    <td align="center"><sub><b>Claude's questions in the chat</b></sub></td>
-  </tr>
-</table>
+Typing, scrolling and searching never wait — even in files with tens of thousands of lines. Your
+project and your code live in separate islands on a soft glass window, and colour is used for meaning:
+every file type has its own icon, every change its own shade. The start screen keeps your recent
+projects and the actions you need first, each with its shortcut.
+
+<img src="docs/images/start-screen.png" alt="Start screen with quick actions and recent projects" width="100%">
+
+### Find anything
+
+Jump to a file by a few letters of its name (<kbd>⌘</kbd><kbd>P</kbd>). Search the whole project with a
+live preview of every match, grouped by file, and open the one you need without leaving the keyboard
+(<kbd>⇧</kbd><kbd>⌘</kbd><kbd>F</kbd>). Inside a file, find and replace with case, whole-word and
+regular-expression options — and turn every match into a cursor to edit them all at once.
+
+<img src="docs/images/find-in-files.png" alt="Find in Files with results and a live preview" width="100%">
+
+### Understands your code
+
+Errors as you type, completion with documentation, documentation on hover, go to definition, find
+usages, rename across the project and reformat — for Rust, Go, Python, TypeScript and JavaScript, TOML,
+YAML, JSON, Bash and Markdown. Flux uses the language servers you already have and quietly installs the
+missing ones in the background.
+
+### A terminal built in
+
+Your own shell with its prompt and colours, in a panel under the editor or as a tab next to your
+files. Split it, search its output, and ⌘-click a `file:line` from a compiler or a test run to jump
+right there. Closing a terminal that still runs something asks first.
+
+### Your project at a glance
+
+A file tree that hides what Git ignores, follows the file you are editing and updates as files change
+on disk. Create, rename, move and delete files right in it — open tabs keep up with renamed and moved
+files, and open files pick up changes made outside Flux.
+
+### Git, the way JetBrains IDEs do it
+
+Everything around Git is one shortcut away, and it works with all the repositories in your folder.
+
+**Changes and commit.** Changed lines are marked in the gutter as you type, with a rollback in one
+click. The commit window lists your changes with checkboxes for files and even single changes,
+remembers your previous messages, amends, and commits and pushes in one go; push shows what is about
+to leave.
+
+<img src="docs/images/commit.png" alt="The commit window with checkboxes, changed lines in the gutter and the previous text of a change" width="100%">
+
+**A diff you can edit.** Side by side or unified, with changed words highlighted. The right side is
+your file: fix it right there, roll back a change with an arrow, tick single changes for the commit.
+
+<img src="docs/images/diff.png" alt="A side-by-side diff with connectors, changed words and checkboxes for single changes" width="100%">
+
+**Branches in one popup.** Search, recent and favorite branches, local and remote ones grouped by
+prefix, tags — and every operation a click away: a checkout that keeps your changes, a new branch,
+merge, rebase, compare, push and pull. Update the whole project, fetch, stash and unstash.
+
+<img src="docs/images/branches.png" alt="The branches popup with search, recent and local branches, favorites and a branch's actions" width="100%">
+
+**Conflicts.** A merge, a rebase or an unstash that conflicts opens a three-way merge tool: yours, the
+result and theirs. The changes that don't conflict are already applied; take a side with an arrow, or
+let the magic wand merge what it can.
+
+<img src="docs/images/merge.png" alt="The three-way merge tool: yours, the result and theirs, with arrows that take a side" width="100%">
+
+**History.** The log draws your branches as a graph, filters by branch, author, date, path or text and
+shows the details of every commit. Cherry-pick, revert, reset and an interactive rebase are right
+there, and so is the history of a file or of the lines you selected.
+
+<img src="docs/images/log.png" alt="The Git window: the log with a graph of branches, filters and the details of the selected commit" width="100%">
+
+**Who changed each line.** Turn on annotations (<kbd>⌥</kbd><kbd>⌘</kbd><kbd>A</kbd>) to see the
+author and the date of the last change of every line; hover for the commit, click to find it in the
+log.
+
+<img src="docs/images/blame.png" alt="Annotations in the gutter: the date and the author of the last change of every line" width="100%">
+
+### Never lose a message
+
+Results of Git operations, errors with their full output, language servers installed or stopped, files
+changed on disk — all land in one Notifications window with the time, the source and the actions;
+unread ones are counted on the bell. Choose per source how much you see: a card that fades, one that
+stays, only the journal, or nothing — or turn on Do Not Disturb.
+
+<img src="docs/images/notifications.png" alt="The Notifications window on the right: results and errors with their source, time and actions" width="100%">
+
+Questions come in Flux's own dialogs that look like the rest of the editor, with the keys you expect
+from macOS.
+
+<img src="docs/images/dialog.png" alt="A Flux dialog asking to save changes, with Don't Save, Cancel and Save" width="100%">
+
+### Plugins that can't break your editor
+
+Each plugin runs in its own WebAssembly sandbox: it can't crash or freeze Flux, and it reaches only
+what you allowed when you installed it. Turn plugins on and off without a restart, install one from a
+folder or an archive, read its log — all in Settings → Plugins.
+
+<img src="docs/images/plugins.png" alt="Settings → Plugins: plugins under development and built-in ones with their switches, and the details of the TODO plugin" width="100%">
+
+Plugins add commands with shortcuts, tool windows, status bar items and settings pages, and look like
+the rest of Flux. A TODO window comes built in; write your own in Rust — see
+[Writing plugins](docs/plugins.md).
+
+<img src="docs/images/todo.png" alt="The TODO window on the right: TODO and FIXME comments of the project grouped by file" width="100%">
+
+### Claude Code, built in
+
+Talk to Claude in a window on the right (<kbd>⌘</kbd><kbd>Esc</kbd>), or move the chat to a tab next
+to your files. The answer streams in, with every file Claude reads and every command it runs shown as
+it happens. Claude asks before it changes anything: each edit opens as a diff you can trim or edit
+before you accept it — and Claude learns what you changed.
+
+<img src="docs/images/claude.png" alt="Claude Code in the window on the right: the conversation, an edit waiting for an answer, and the proposed change opened as a diff" width="100%">
+
+Answer Claude's questions and approve its plans with a click or a key. Mention files with `@` or send
+your selection (<kbd>⌥</kbd><kbd>⌘</kbd><kbd>K</kbd>), paste screenshots, pick the model, the effort
+and the mode, and keep an eye on your subscription's limits in the status bar. Flux runs your own
+`claude` command with your Claude subscription — no API key.
+
+<img src="docs/images/claude-question.png" alt="Claude asks a question with options to choose from, right in the chat" width="100%">
+
+### Keyboard first, in your language
+
+Every command is in the command palette with its shortcut, and the keys are familiar if you come from
+JetBrains IDEs. The interface speaks English or Russian, following your system settings.
 
 ## Get started
 
