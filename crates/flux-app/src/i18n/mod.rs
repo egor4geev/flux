@@ -98,11 +98,30 @@ pub fn trf(template: &str, args: &[&dyn Display]) -> String {
     fill(tr(template), args)
 }
 
+/// One pass over the template: an argument that itself contains `{1}` (`stash@{1}`) is inserted
+/// as it is, not filled in by a later placeholder.
 fn fill(template: &str, args: &[&dyn Display]) -> String {
-    let mut text = template.to_string();
-    for (index, arg) in args.iter().enumerate() {
-        text = text.replace(&format!("{{{index}}}"), &arg.to_string());
+    let mut text = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        text.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let placeholder = after.find('}').and_then(|close| {
+            let index: usize = after[..close].parse().ok()?;
+            Some((index, close))
+        });
+        match placeholder {
+            Some((index, close)) if index < args.len() => {
+                text.push_str(&args[index].to_string());
+                rest = &after[close + 1..];
+            }
+            _ => {
+                text.push('{');
+                rest = after;
+            }
+        }
     }
+    text.push_str(rest);
     text
 }
 
@@ -148,7 +167,12 @@ fn ru_strings() -> &'static HashMap<&'static str, &'static str> {
 
 fn ru_plurals() -> &'static HashMap<&'static str, [&'static str; 3]> {
     static PLURALS: OnceLock<HashMap<&'static str, [&'static str; 3]>> = OnceLock::new();
-    PLURALS.get_or_init(|| ru::PLURALS.iter().copied().collect())
+    PLURALS.get_or_init(|| {
+        ru::PLURALS
+            .iter()
+            .flat_map(|table| table.iter().copied())
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -181,6 +205,12 @@ mod tests {
     fn templates_are_filled_by_position() {
         assert_eq!(fill("{0} of {1} files", &[&3, &12]), "3 of 12 files");
         assert_eq!(fill("{1} / {0}", &[&"a", &"b"]), "b / a");
+        // An argument with braces in it stays as it is.
+        assert_eq!(
+            fill("Applied {0}: {1}", &[&"stash@{1}", &"WIP"]),
+            "Applied stash@{1}: WIP"
+        );
+        assert_eq!(fill("{x} {9} {0}", &[&"a"]), "{x} {9} a");
     }
 
     #[test]
@@ -205,7 +235,10 @@ mod tests {
                 assert_eq!(previous, *ru, "conflicting translations of {en:?}");
             }
         }
-        let plurals: HashMap<&str, [&str; 3]> = ru::PLURALS.iter().copied().collect();
+        let plurals: HashMap<&str, [&str; 3]> = ru::PLURALS
+            .iter()
+            .flat_map(|table| table.iter().copied())
+            .collect();
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut missing = Vec::new();
         // The localization module itself only holds examples and the scanner.

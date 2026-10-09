@@ -12,7 +12,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Click to retry", "Щёлкните, чтобы повторить"),
     // Why a server can't be installed (the installer's messages).
     ("Needs Go", "Нужен Go"),
-    ("Can't be installed on this system", "Не устанавливается в этой системе"),
+    (
+        "Can't be installed on this system",
+        "Не устанавливается в этой системе",
+    ),
     ("Flux can't install it", "Flux не умеет его устанавливать"),
     ("Installation canceled", "Установка отменена"),
     (

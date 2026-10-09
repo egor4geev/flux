@@ -23,4 +23,11 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Contents can't be compared: a binary or too large file",
         "Содержимое не сравнить: двоичный или слишком большой файл",
     ),
+    // Comparisons of revisions.
+    ("The file doesn't exist in {0}", "В {0} этого файла нет"),
+    (
+        "The file doesn't exist in the working tree",
+        "В рабочей копии этого файла нет",
+    ),
+    ("stash", "stash"),
 ];

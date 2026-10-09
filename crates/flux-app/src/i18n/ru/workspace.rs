@@ -26,7 +26,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Plain Text", "Обычный текст"),
     ("{0} (no highlighting)", "{0} (без подсветки)"),
     // Terminals in the window: closing and quitting with running commands.
-    ("Terminate running processes?", "Завершить запущенные процессы?"),
+    (
+        "Terminate running processes?",
+        "Завершить запущенные процессы?",
+    ),
     (
         "“{0}” is still running in a terminal.",
         "«{0}» ещё работает в терминале.",

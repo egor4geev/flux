@@ -6,11 +6,19 @@
 //! runs on it (hooks, signing and the user's config apply as usual), and then the real index takes
 //! the committed versions of those paths (`git reset -- <paths>`), so that they don't show up as
 //! staged reverts.
+//!
+//! A merge in progress is concluded differently: its result is the real index (git put the merged
+//! files there, the resolved conflicts were added), so the checked files go into the real index and
+//! `git commit` makes the merge commit from it — with both parents, and with the local changes a
+//! `merge --autostash` put away coming back after it. A merge is committed whole: partial content
+//! and amending are refused, and so is a commit while conflicts are left.
 
 use std::path::PathBuf;
 
 use crate::cli::{Cancel, GitError};
+use crate::ops::has_unmerged;
 use crate::repo::Repo;
+use crate::status::{RepoState, repo_state};
 
 /// A file to commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +60,9 @@ pub fn commit(
     request: &CommitRequest,
     cancel: &Cancel,
 ) -> Result<CommitResult, GitError> {
+    if repo_state(&repo.git_dir) == RepoState::Merging {
+        return commit_merge(repo, request, cancel);
+    }
     let index = TempIndex::new(repo);
     let with_index = |command: crate::cli::GitCommand| command.env("GIT_INDEX_FILE", &index.path);
     let has_head = repo
@@ -126,6 +137,58 @@ pub fn commit(
         reset = reset.arg(path);
     }
     reset.output().ok();
+    committed(repo, request)
+}
+
+/// Concludes a merge in progress: the checked files go into the real index, which holds the merge
+/// result, and `git commit` makes the merge commit (MERGE_HEAD is its second parent).
+fn commit_merge(
+    repo: &Repo,
+    request: &CommitRequest,
+    cancel: &Cancel,
+) -> Result<CommitResult, GitError> {
+    let refuse = |message: &str| GitError::Failed {
+        command: "git commit".into(),
+        message: message.into(),
+    };
+    if request
+        .files
+        .iter()
+        .any(|file| matches!(file.content, CommitContent::Partial(_)))
+    {
+        return Err(refuse(
+            "A merge is committed whole: include all the changes of every file",
+        ));
+    }
+    if request.amend {
+        return Err(refuse("A merge in progress can't amend the last commit"));
+    }
+    if has_unmerged(repo) {
+        return Err(refuse("Resolve the conflicts before committing the merge"));
+    }
+    if !request.files.is_empty() {
+        let mut paths = Vec::new();
+        for file in &request.files {
+            paths.extend_from_slice(file.path.as_bytes());
+            paths.push(0);
+        }
+        repo.git()
+            .args(["update-index", "--add", "--remove", "-z", "--stdin"])
+            .stdin(paths)
+            .output()?;
+    }
+    let mut command = repo.git().args(["commit", "-q", "-F", "-"]);
+    if let Some(author) = &request.author {
+        command = command.arg(format!("--author={author}"));
+    }
+    command
+        .stdin(request.message.clone())
+        .run(Some(cancel), |_| {})?;
+    committed(repo, request)
+}
+
+/// The commit just made: its hash and the message's first line.
+fn committed(repo: &Repo, request: &CommitRequest) -> Result<CommitResult, GitError> {
     let oid = repo
         .git()
         .read_only()
@@ -262,6 +325,65 @@ mod tests {
             Some("Second\n\nBody")
         );
         assert_eq!(recent_messages(&repo, 5).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_merge_is_concluded_with_both_parents_and_its_autostash() {
+        use crate::testing::{Sandbox, commit_all, git, read, write};
+        let sandbox = Sandbox::new();
+        let repo = sandbox.repo("r");
+        write(&repo, "a.txt", "one\ntwo\nthree\n");
+        write(&repo, "b.txt", "b\n");
+        commit_all(&repo, "Base");
+        git(&repo, &["switch", "-q", "-c", "theirs"]);
+        write(&repo, "a.txt", "one\ntheirs\nthree\n");
+        write(&repo, "t.txt", "t\n");
+        commit_all(&repo, "Theirs");
+        git(&repo, &["switch", "-q", "main"]);
+        write(&repo, "a.txt", "one\nours\nthree\n");
+        commit_all(&repo, "Ours");
+        // A local change the merge stashes away and brings back after its commit.
+        write(&repo, "b.txt", "b local\n");
+        assert_eq!(
+            crate::branch::merge(&repo, "theirs", true).unwrap(),
+            crate::Outcome::Conflicts
+        );
+        let message = crate::operation(&repo).message.unwrap();
+        let request = |content| CommitRequest {
+            message: message.clone(),
+            amend: false,
+            files: vec![CommitFile {
+                path: "a.txt".into(),
+                content,
+            }],
+            author: None,
+        };
+        let error = commit(&repo, &request(CommitContent::WorkTree), &Cancel::new()).unwrap_err();
+        assert!(
+            error.to_string().contains("Resolve the conflicts"),
+            "{error}"
+        );
+        write(&repo, "a.txt", "one\nours and theirs\nthree\n");
+        let partial = CommitContent::Partial(b"x".to_vec());
+        assert!(commit(&repo, &request(partial), &Cancel::new()).is_err());
+        crate::conflict::mark_resolved(&repo, "a.txt", None).unwrap();
+        let done = commit(&repo, &request(CommitContent::WorkTree), &Cancel::new()).unwrap();
+        assert_eq!(done.summary, "Merge branch 'theirs'");
+        let parents = git(&repo, &["rev-list", "--parents", "-n1", "HEAD"]);
+        assert_eq!(parents.split_whitespace().count(), 3);
+        assert_eq!(crate::operation(&repo).state, crate::RepoState::Normal);
+        assert_eq!(
+            git(&repo, &["show", "HEAD:t.txt"]),
+            "t\n",
+            "the merged file is in"
+        );
+        assert_eq!(read(&repo, "b.txt"), "b local\n", "the autostash is back");
+        let left = status(&repo).unwrap().entries;
+        assert_eq!(left.len(), 1);
+        assert_eq!(
+            (left[0].path.as_str(), left[0].status),
+            ("b.txt", FileStatus::Modified)
+        );
     }
 
     #[test]

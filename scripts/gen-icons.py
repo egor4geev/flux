@@ -92,6 +92,16 @@ ICONS = {
   "unified": (S, '<rect x="1.75" y="2.75" width="12.5" height="10.5" rx="2"/><path d="M4.75 6h6.5M4.75 8.5h6.5M4.75 11h3.5"/>'),
   "pencil": (S, '<path d="M11 2.75 13.25 5 6 12.25l-3.25.75.75-3.25zM9.5 4.25l2.25 2.25"/>'),
   "more": (F, '<circle cx="3.5" cy="8" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="12.5" cy="8" r="1.25"/>'),
+  # Git, part 6.2: branches, sync, stash, conflicts, notifications.
+  "check-circle": (S, '<circle cx="8" cy="8" r="6.25"/><path d="M5.25 8.25 7.1 10.1l3.65-4"/>'),
+  "star": (S, '<path d="M8 1.75 9.56 5.86 13.94 6.07 10.52 8.82 11.67 13.06 8 10.65 4.33 13.06 5.48 8.82 2.06 6.07 6.44 5.86z"/>'),
+  "star-filled": (F, '<path d="M8 1.25 9.83 5.47 14.4 5.8 10.93 8.8 12.04 13.25 8 10.84 3.96 13.25 5.07 8.8 1.6 5.8 6.17 5.47z"/>'),
+  "tag": (S, '<path d="M2.75 2.75h5.1l5.4 5.4a1.2 1.2 0 0 1 0 1.7l-3.4 3.4a1.2 1.2 0 0 1-1.7 0l-5.4-5.4z"/><circle cx="5.6" cy="5.6" r=".9" fill="#000"/>'),
+  "stash": (S, '<path d="M2.25 9.25v3a1 1 0 0 0 1 1h9.5a1 1 0 0 0 1-1v-3"/><path d="M2.25 9.25h3l1 1.5h3.5l1-1.5h3"/><path d="M8 2.25v5M5.75 5 8 7.25 10.25 5"/>'),
+  "merge": (S, '<circle cx="4.75" cy="3.75" r="1.5"/><circle cx="4.75" cy="12.25" r="1.5"/><circle cx="11.25" cy="10.25" r="1.5"/><path d="M4.75 5.25v5.5M11.25 8.75c0-2.5-6.5-1.5-6.5-3.5"/>'),
+  "update": (S, '<path d="M12.25 3.75 4.5 11.5M4.25 6.25v5.5h5.5"/>'),
+  "pull": (S, '<path d="M8 2.75v8M4.75 7.75 8 11l3.25-3.25M3.25 13.75h9.5"/>'),
+  "trash": (S, '<path d="M2.75 4.25h10.5M6.25 4.25V3a.75.75 0 0 1 .75-.75h2a.75.75 0 0 1 .75.75v1.25M4.25 4.25l.6 8.6a1 1 0 0 0 1 .9h4.3a1 1 0 0 0 1-.9l.6-8.6M6.75 6.75v4.5M9.25 6.75v4.5"/>'),
   "terminal": (S, '<rect x="1.75" y="2.75" width="12.5" height="10.5" rx="2"/><path d="M4.75 6.25 6.75 8l-2 1.75M8.5 10h2.75"/>'),
   # The flux mark: a flow of three lines converging into the stem of an "f".
   "logo": (F, spark_silhouette()),

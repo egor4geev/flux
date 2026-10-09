@@ -9,6 +9,12 @@
 //! a checkout, a reset — here or in a terminal) drops the HEAD versions read so far, and the
 //! registered editors get their new base.
 //!
+//! Branches, tags and stashes of each repository are read in the background and kept here (the
+//! branches popup, the title bar's incoming / outgoing counts, the Stash tab), re-read when refs
+//! change. The operations of part 6.2 — checkout, branches, merge, rebase, fetch, pull, update,
+//! stash, conflicts — run here in the background, one at a time per repository; they return their
+//! result and leave the reporting (notifications, questions) to the flows of the window.
+//!
 //! What the commit includes (the checkboxes of the commit window and of the diff viewer) lives here:
 //! by default every tracked change is included and untracked files are not, as in JetBrains IDEs;
 //! the user's choices are kept per file and, for a partial commit, per hunk (by its line range in
@@ -21,19 +27,24 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use flux_git::{
-    BlobReader, CommitRequest, CommitResult, FileStatus, GitError, Hunk, PushProgress, PushRequest,
-    PushResult, Repo, RepoEvent, RepoStatus, RepoWatcher, RollbackFile,
+    BlobReader, CommitInfo, CommitRequest, CommitResult, ConflictKind, ConflictSide,
+    ConflictVersions, DeletedBranch, FetchResult, FileChange, FileStatus, GitError, Hunk,
+    Operation, Outcome, PullMode, PushProgress, PushRequest, PushResult, RefKind, Refs, Repo,
+    RepoEvent, RepoState, RepoStatus, RepoWatcher, RollbackFile, Stash, StashRequest, UpdateMethod,
+    UpdateResult,
 };
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    App, AppContext, Context, Div, Entity, EventEmitter, Hsla, InteractiveElement, IntoElement,
-    KeyBinding, NoAction, ParentElement, SharedString, Styled, Task, WeakEntity, actions, div, px,
+    Action, App, AppContext, Context, Div, Entity, EventEmitter, Hsla, InteractiveElement,
+    IntoElement, KeyBinding, NoAction, ParentElement, SharedString, StatefulInteractiveElement,
+    Styled, Task, WeakEntity, actions, div, px,
 };
 
 use crate::editor::Editor;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::notifications::Notification;
 use crate::theme::UiColors;
 use crate::workspace::Workspace;
 
@@ -52,8 +63,203 @@ actions!(
         ShowDiff,
         /// Re-read the status of every repository.
         Refresh,
+        /// ⇧⌘B: the branches popup.
+        Branches,
+        /// ⌘T outside a terminal: the current branches from their upstreams (merge or rebase).
+        UpdateProject,
+        /// The Pull dialog: a remote branch into the current one.
+        Pull,
+        /// Fetch every remote of every repository.
+        Fetch,
+        /// New Branch… from the current one.
+        NewBranch,
+        /// Checkout Tag or Revision…
+        CheckoutRevision,
+        /// The Stash Changes dialog.
+        StashChanges,
+        /// The Stash tab of the commit window.
+        UnstashChanges,
+        /// The Conflicts dialog: the conflicted files, Accept Yours / Theirs, Merge….
+        ResolveConflicts,
+        /// The operation in progress (a rebase, a cherry-pick…) goes on after the conflicts are
+        /// resolved.
+        ContinueOperation,
+        /// The operation in progress is undone.
+        AbortOperation,
+        /// A rebase skips the commit it stopped on.
+        SkipCommit,
     ]
 );
+
+// --- Actions with data: the branches popup, notifications and banners dispatch them; the window
+// handles them (`workspace_actions` of the module that owns the flow). Not in the palette. ---
+
+/// Checkout of a branch, a remote branch (a new local one tracking it, or the existing one) or a
+/// tag.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct CheckoutRef {
+    pub repo: usize,
+    pub name: String,
+    pub kind: RefKind,
+}
+
+/// New Branch… from `start` (a branch, a tag, a commit).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct NewBranchFrom {
+    pub repo: usize,
+    pub start: String,
+}
+
+/// Rename… of a local branch.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct RenameBranch {
+    pub repo: usize,
+    pub name: String,
+}
+
+/// Delete of a branch (local or remote) or a tag, with the questions it needs.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct DeleteRef {
+    pub repo: usize,
+    pub name: String,
+    pub kind: RefKind,
+}
+
+/// Restore of a deleted branch (or tag) at its commit: the notification after a delete.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct RestoreRef {
+    pub repo: usize,
+    pub name: String,
+    pub oid: String,
+    pub kind: RefKind,
+}
+
+/// Merge `name` into the current branch.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct MergeRef {
+    pub repo: usize,
+    pub name: String,
+}
+
+/// Rebase the current branch onto `onto`.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct RebaseOnto {
+    pub repo: usize,
+    pub onto: String,
+}
+
+/// Checkout `branch` and rebase it onto `onto` (the current branch).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct CheckoutAndRebase {
+    pub repo: usize,
+    pub branch: String,
+    pub onto: String,
+}
+
+/// Pull a remote branch ("origin/feature/x") into the current one.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct PullRef {
+    pub repo: usize,
+    pub name: String,
+    pub rebase: bool,
+}
+
+/// Update of a local branch: the current one — Update Project for its repository; another one — a
+/// fast-forward from its upstream.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct UpdateBranch {
+    pub repo: usize,
+    pub name: String,
+}
+
+/// Push… of a local branch (the push dialog for it).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct PushBranch {
+    pub repo: usize,
+    pub name: String,
+}
+
+/// Compare with Current: the commits and the files that differ from the current branch.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct CompareWithCurrent {
+    pub repo: usize,
+    pub name: String,
+}
+
+/// Show Diff with Working Tree: the files that differ from a revision.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct DiffWithWorkingTree {
+    pub repo: usize,
+    pub name: String,
+}
+
+/// Continue / abort / skip in one repository (the commit window's banner).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct ContinueRepoOperation {
+    pub repo: usize,
+}
+
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct AbortRepoOperation {
+    pub repo: usize,
+}
+
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct SkipRepoCommit {
+    pub repo: usize,
+}
+
+/// The merge tool for a conflicted file.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct OpenMerge {
+    pub repo: usize,
+    pub path: PathBuf,
+}
+
+/// Drop a stash (the notification after an unstash that conflicted).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct DropStash {
+    pub repo: usize,
+    pub oid: String,
+}
+
+/// A diff tab comparing a file at two revisions (or a revision and the working copy): stash
+/// files, Compare with Current, Show Diff with Working Tree.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct OpenCompareDiff {
+    pub repo: usize,
+    /// The file (absolute) as the working tree has it.
+    pub path: PathBuf,
+    pub left: crate::diff_view::DiffSide,
+    pub right: crate::diff_view::DiffSide,
+}
+
+/// git's whole output in a dialog (an error notification's "Details").
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct ShowGitOutput {
+    pub title: String,
+    pub output: String,
+}
 
 /// Watcher events are coalesced for at least this long before `git status` runs; a repository whose
 /// status is slow waits twice its last run, up to the maximum.
@@ -74,13 +280,17 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-k", Push, workspace),
         KeyBinding::new("cmd-0", ToggleCommitWindow, workspace),
         KeyBinding::new("ctrl-v", VcsOperations, workspace),
+        // The author's own key: JetBrains has none for the branches popup on macOS.
+        KeyBinding::new("cmd-shift-b", Branches, workspace),
+        // In a terminal, ⌘T is a new terminal (`terminal_panel`), as in JetBrains IDEs.
+        KeyBinding::new("cmd-t", UpdateProject, workspace),
         // Programs in a terminal need ⌃V (vim's visual block, a literal next character).
         KeyBinding::new("ctrl-v", NoAction, Some("Terminal")),
     ]);
 }
 
 /// What changed, for those who watch the store.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum GitEvent {
     /// A message for the status bar ("Committed 3 files").
     Message(SharedString),
@@ -90,6 +300,11 @@ pub enum GitEvent {
         message: SharedString,
         details: Option<String>,
     },
+    /// A notification in the corner of the window (an operation's result, with actions).
+    Notify(Notification),
+    /// An operation of the store changed files of a repository's working tree (checkout, merge,
+    /// stash…): open documents take the new content, those whose files are gone close.
+    WorkTreeChanged(usize),
 }
 
 /// A changed file of one of the repositories.
@@ -103,6 +318,8 @@ pub struct Change {
     /// The path before a rename.
     pub orig_path: Option<PathBuf>,
     pub status: FileStatus,
+    /// How a conflicted file conflicts.
+    pub conflict: Option<ConflictKind>,
 }
 
 /// A file's checkbox: in the commit wholly, partly (some of its hunks), or not at all.
@@ -231,6 +448,17 @@ pub struct GitRepo {
     idle_refreshes: u32,
     /// Wholly untracked directories (absolute).
     untracked_dirs: Arc<Vec<PathBuf>>,
+    /// The operation in progress (merge, rebase…), read with every status.
+    pub operation: Arc<Operation>,
+    /// Branches, tags, remotes and recent branches; empty until the first read.
+    pub refs: Arc<Refs>,
+    refs_reading: bool,
+    refs_stale: bool,
+    /// The stashes, once someone asked for them (the Stash tab); re-read when refs change.
+    stashes: Option<Arc<Vec<Stash>>>,
+    stashes_reading: bool,
+    /// An operation of the store runs in the repository: another one waits for it to end.
+    busy: bool,
     _watcher: Option<RepoWatcher>,
     _watch_task: Task<()>,
 }
@@ -298,6 +526,7 @@ impl StatusIndex {
                     relative: change.path.clone(),
                     orig_path: change.orig_path.as_deref().map(|orig| repo.absolute(orig)),
                     status: change.status,
+                    conflict: change.conflict,
                 });
             }
             index.untracked_dirs.extend(untracked_dirs.iter().cloned());
@@ -323,6 +552,8 @@ pub struct GitStore {
     inclusion: Inclusion,
     /// The operation in progress, for the status bar: "Committing…", "Pushing 45%".
     activity: Option<SharedString>,
+    /// Favorite branches of the repositories (the branches popup's stars).
+    favorites: Favorites,
 }
 
 impl EventEmitter<GitEvent> for GitStore {}
@@ -340,6 +571,7 @@ impl GitStore {
             registered: HashSet::new(),
             inclusion: Inclusion::default(),
             activity: None,
+            favorites: Favorites::load(),
         };
         if let Some(root) = root {
             store.discover(root, cx);
@@ -409,11 +641,19 @@ impl GitStore {
             ignored_read_at: None,
             idle_refreshes: 0,
             untracked_dirs: Arc::default(),
+            operation: Arc::default(),
+            refs: Arc::default(),
+            refs_reading: false,
+            refs_stale: false,
+            stashes: None,
+            stashes_reading: false,
+            busy: false,
             _watcher: watcher,
             _watch_task: watch_task,
         });
         self.read_ignored(index, cx);
         self.refresh_repo(index, cx);
+        self.reload_refs(index, cx);
     }
 
     pub fn repos(&self) -> &[GitRepo] {
@@ -466,10 +706,14 @@ impl GitStore {
         };
         let mut refresh = false;
         let mut rules = false;
+        let mut refs = false;
         let mut skipped = 0;
         for event in &batch {
             match event {
-                RepoEvent::Git | RepoEvent::Rescan => refresh = true,
+                RepoEvent::Git | RepoEvent::Rescan => {
+                    refresh = true;
+                    refs = true;
+                }
                 RepoEvent::WorkTree(paths) => {
                     for path in paths {
                         if path
@@ -495,6 +739,9 @@ impl GitStore {
         }
         if refresh {
             self.refresh_repo(index, cx);
+        }
+        if refs {
+            self.reload_refs(index, cx);
         }
     }
 
@@ -547,6 +794,7 @@ impl GitStore {
         let read = cx.background_spawn(async move {
             let started = Instant::now();
             let status = flux_git::status(&repo)?;
+            let operation = flux_git::operation(&repo);
             let untracked = |status: &RepoStatus| -> Vec<String> {
                 status
                     .entries
@@ -562,7 +810,7 @@ impl GitStore {
                 let dirs = flux_git::untracked_dirs(&repo).unwrap_or_default();
                 Arc::new(dirs.iter().map(|dir| repo.absolute(dir)).collect())
             };
-            Ok::<_, GitError>((status, dirs, started.elapsed()))
+            Ok::<_, GitError>((status, dirs, operation, started.elapsed()))
         });
         cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -572,7 +820,7 @@ impl GitStore {
                 };
                 entry.refreshing = false;
                 let (changed, head_moved) = match result {
-                    Ok((status, dirs, took)) => {
+                    Ok((status, dirs, operation, took)) => {
                         log(|| {
                             format!(
                                 "status of {}: {} ms, {} entries",
@@ -583,7 +831,13 @@ impl GitStore {
                         });
                         entry.last_duration = took;
                         let head_moved = entry.bases_head != status.branch.oid;
-                        let changed = *entry.status != status || entry.untracked_dirs != dirs;
+                        let operation_changed = *entry.operation != operation;
+                        if operation_changed {
+                            entry.operation = Arc::new(operation);
+                        }
+                        let changed = *entry.status != status
+                            || entry.untracked_dirs != dirs
+                            || operation_changed;
                         if changed {
                             entry.status = Arc::new(status);
                             entry.untracked_dirs = dirs;
@@ -978,6 +1232,984 @@ impl GitStore {
     pub fn report(&mut self, event: GitEvent, cx: &mut Context<Self>) {
         cx.emit(event);
     }
+
+    /// A notification in the corner of the window.
+    pub fn notify(&mut self, notification: Notification, cx: &mut Context<Self>) {
+        cx.emit(GitEvent::Notify(notification));
+    }
+
+    /// An error notification: `title` ("Checkout failed"), git's first line, and git's whole output
+    /// behind "Details" when there is more to it.
+    pub fn notify_error(&mut self, title: &str, error: &GitError, cx: &mut Context<Self>) {
+        let mut notification = Notification::error(title.to_string()).body(error.to_string());
+        if let Some(details) = error.details()
+            && details
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+                > 1
+        {
+            notification = notification.action(
+                tr("Details"),
+                ShowGitOutput {
+                    title: title.to_string(),
+                    output: details.to_string(),
+                },
+            );
+        }
+        self.notify(notification, cx);
+    }
+
+    // --- Repositories by name ---
+
+    /// The folder name of a repository ("flux"): it tells repositories apart in lists.
+    pub fn repo_name(&self, repo: usize) -> String {
+        self.repos
+            .get(repo)
+            .and_then(|entry| entry.repo.work_dir.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// The repository the window works with now: the active file's, otherwise the one containing
+    /// the project root, otherwise the first (as the title bar's branch).
+    pub fn current_repo(&self, path: Option<&Path>) -> Option<usize> {
+        path.and_then(|path| self.repo_index(path))
+            .or_else(|| self.root.as_deref().and_then(|root| self.repo_index(root)))
+            .or((!self.repos.is_empty()).then_some(0))
+    }
+
+    /// The current branch of a repository; `None` — detached HEAD (or not read yet).
+    pub fn current_branch(&self, repo: usize) -> Option<String> {
+        self.repos.get(repo)?.status.branch.head.clone()
+    }
+
+    // --- Branches, tags, stashes ---
+
+    /// The branches and tags of a repository (empty until read).
+    pub fn refs(&self, repo: usize) -> Arc<Refs> {
+        self.repos
+            .get(repo)
+            .map(|entry| entry.refs.clone())
+            .unwrap_or_default()
+    }
+
+    /// Re-reads the branches and tags (and the stashes, if they were asked for) in the background.
+    pub fn reload_refs(&mut self, repo: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.repos.get_mut(repo) else {
+            return;
+        };
+        if entry.stashes.is_some() {
+            self.reload_stashes(repo, cx);
+        }
+        let entry = &mut self.repos[repo];
+        if entry.refs_reading {
+            entry.refs_stale = true;
+            return;
+        }
+        entry.refs_reading = true;
+        entry.refs_stale = false;
+        let git_repo = entry.repo.clone();
+        let read = cx.background_spawn(async move { flux_git::branch::refs(&git_repo) });
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                let Some(entry) = this.repos.get_mut(repo) else {
+                    return;
+                };
+                entry.refs_reading = false;
+                match result {
+                    Ok(refs) => {
+                        if *entry.refs != refs {
+                            entry.refs = Arc::new(refs);
+                            cx.notify();
+                        }
+                    }
+                    Err(err) => log(|| format!("refs: {err}")),
+                }
+                if entry.refs_stale {
+                    this.reload_refs(repo, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The operation in progress in a repository.
+    pub fn operation(&self, repo: usize) -> Arc<Operation> {
+        self.repos
+            .get(repo)
+            .map(|entry| entry.operation.clone())
+            .unwrap_or_default()
+    }
+
+    /// Repositories in the middle of a merge, rebase, cherry-pick or revert.
+    pub fn repos_in_progress(&self) -> Vec<usize> {
+        self.repos
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                !matches!(
+                    entry.operation.state,
+                    RepoState::Normal | RepoState::Bisecting
+                )
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The stashes of a repository; `None` — not read yet (the first call starts reading them, and
+    /// from then on they follow refs changes).
+    pub fn stashes(&mut self, repo: usize, cx: &mut Context<Self>) -> Option<Arc<Vec<Stash>>> {
+        let entry = self.repos.get(repo)?;
+        if entry.stashes.is_none() && !entry.stashes_reading {
+            self.reload_stashes(repo, cx);
+        }
+        self.repos.get(repo)?.stashes.clone()
+    }
+
+    /// Re-reads the stashes of a repository in the background.
+    pub fn reload_stashes(&mut self, repo: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.repos.get_mut(repo) else {
+            return;
+        };
+        if entry.stashes_reading {
+            return;
+        }
+        entry.stashes_reading = true;
+        let git_repo = entry.repo.clone();
+        let read = cx.background_spawn(async move { flux_git::stashes(&git_repo) });
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                let Some(entry) = this.repos.get_mut(repo) else {
+                    return;
+                };
+                entry.stashes_reading = false;
+                let stashes = result.unwrap_or_else(|err| {
+                    log(|| format!("stashes: {err}"));
+                    Vec::new()
+                });
+                if entry.stashes.as_deref() != Some(&stashes) {
+                    entry.stashes = Some(Arc::new(stashes));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Whether a branch ("main", "origin/main") is a favorite of its repository.
+    pub fn is_favorite(&self, repo: usize, name: &str) -> bool {
+        self.repos
+            .get(repo)
+            .is_some_and(|entry| self.favorites.contains(&entry.repo.common_dir, name))
+    }
+
+    /// Stars or unstars a branch; the choice is saved.
+    pub fn toggle_favorite(&mut self, repo: usize, name: &str, cx: &mut Context<Self>) {
+        let Some(entry) = self.repos.get(repo) else {
+            return;
+        };
+        let key = entry.repo.common_dir.clone();
+        self.favorites.toggle(&key, name);
+        cx.notify();
+    }
+
+    // --- Reading revisions ---
+
+    /// The commit a revision names; `None` — no such commit.
+    pub fn resolve_rev(
+        &self,
+        repo: usize,
+        rev: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<String>, GitError>> {
+        self.read(repo, cx, {
+            let rev = rev.to_string();
+            move |repo| flux_git::branch::resolve(repo, &rev)
+        })
+    }
+
+    /// Commits in `a` and not in `b`, and in `b` and not in `a` (Compare with Current).
+    pub fn compare_commits(
+        &self,
+        repo: usize,
+        a: &str,
+        b: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CommitsBothWays, GitError>> {
+        let (a, b) = (a.to_string(), b.to_string());
+        self.read(repo, cx, move |repo| {
+            flux_git::compare_commits(repo, &a, &b, COMPARE_LIMIT)
+        })
+    }
+
+    /// The files that differ between two revisions (`to: None` — the working tree), a renamed
+    /// file with its old path (the left side of its diff).
+    pub fn diff_changes(
+        &self,
+        repo: usize,
+        from: &str,
+        to: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<FileChange>, GitError>> {
+        let from = from.to_string();
+        let to = to.map(str::to_string);
+        self.read(repo, cx, move |repo| {
+            flux_git::diff_changes(repo, &from, to.as_deref())
+        })
+    }
+
+    /// The files of a stash with the old path of a renamed file.
+    pub fn stash_changes(
+        &self,
+        repo: usize,
+        oid: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<FileChange>, GitError>> {
+        let oid = oid.to_string();
+        self.read(repo, cx, move |repo| flux_git::stash_changes(repo, &oid))
+    }
+
+    /// The commits of `branch` that aren't in `into` (what deleting it would lose).
+    pub fn unmerged_commits(
+        &self,
+        repo: usize,
+        branch: &str,
+        into: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<CommitInfo>, GitError>> {
+        let (branch, into) = (branch.to_string(), into.to_string());
+        self.read(repo, cx, move |repo| {
+            flux_git::unmerged_commits(repo, &branch, &into, UNMERGED_LIMIT)
+        })
+    }
+
+    /// The three versions of a conflicted file (relative path).
+    pub fn conflict_versions(
+        &self,
+        repo: usize,
+        relative: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ConflictVersions, GitError>> {
+        let Some(entry) = self.repos.get(repo) else {
+            return Task::ready(Err(GitError::Canceled));
+        };
+        let blobs = entry.blobs.clone();
+        let relative = relative.to_string();
+        cx.background_spawn(async move { flux_git::conflict_versions(&blobs, &relative) })
+    }
+
+    /// The conflicted files of every repository.
+    pub fn conflicts(&self) -> Vec<Change> {
+        self.index
+            .changes
+            .iter()
+            .filter(|change| change.status == FileStatus::Conflicted)
+            .cloned()
+            .collect()
+    }
+
+    /// What the two sides of a conflict are, for captions: (ours, theirs) — "main" and "feature/x"
+    /// in a merge, the branch onto which a rebase goes and the commit it replays, the current branch
+    /// and "Stash" after an unstash.
+    pub fn conflict_sides(&self, repo: usize) -> (String, String) {
+        let Some(entry) = self.repos.get(repo) else {
+            return (tr("Yours").into(), tr("Theirs").into());
+        };
+        let op = &entry.operation;
+        let refs = &entry.refs;
+        let short = |oid: &str| oid.chars().take(7).collect::<String>();
+        let name = |oid: &Option<String>| -> Option<String> {
+            let oid = oid.as_deref()?;
+            Some(
+                refs.name_of(oid)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| short(oid)),
+            )
+        };
+        let current = entry
+            .status
+            .branch
+            .label()
+            .unwrap_or_else(|| tr("HEAD").to_string());
+        match op.state {
+            RepoState::Merging => (
+                current,
+                op.incoming_name
+                    .clone()
+                    .or_else(|| name(&op.incoming))
+                    .unwrap_or_default(),
+            ),
+            RepoState::Rebasing => (
+                name(&op.rebase_onto).unwrap_or_else(|| tr("Upstream").into()),
+                op.stopped_at.as_deref().map(short).map_or_else(
+                    || op.rebase_branch.clone().unwrap_or_default(),
+                    |commit| match &op.rebase_branch {
+                        Some(branch) => format!("{branch} · {commit}"),
+                        None => commit,
+                    },
+                ),
+            ),
+            RepoState::CherryPicking | RepoState::Reverting => {
+                (current, name(&op.incoming).unwrap_or_default())
+            }
+            RepoState::Normal | RepoState::Bisecting => (current, tr("Stash").into()),
+        }
+    }
+
+    /// Runs a read-only git job of a repository in the background (an `impl GitStore` block of a
+    /// flow's module may use it for a read of its own).
+    pub(crate) fn read<T: Send + 'static>(
+        &self,
+        repo: usize,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(&Repo) -> Result<T, GitError> + Send + 'static,
+    ) -> Task<Result<T, GitError>> {
+        let Some(entry) = self.repos.get(repo) else {
+            return Task::ready(Err(GitError::Canceled));
+        };
+        let git_repo = entry.repo.clone();
+        cx.background_spawn(async move { job(&git_repo) })
+    }
+
+    // --- Operations of 6.2: they return their result; the flows report it ---
+
+    /// Runs an operation that changes a repository, in the background, one at a time per
+    /// repository: `activity` is in the status bar meanwhile; after it the status, the refs and the
+    /// open documents are brought up to date. (An `impl GitStore` block in a flow's module may add an
+    /// operation through it.)
+    pub(crate) fn run<T: Send + 'static>(
+        &mut self,
+        repo: usize,
+        activity: &str,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(&Repo) -> Result<T, GitError> + Send + 'static,
+    ) -> Task<Result<T, GitError>> {
+        self.run_with_progress(repo, activity, None, cx, move |repo, _| job(repo))
+    }
+
+    /// [`Self::run`] for a job that reports progress (fetch, pull): `progress` is the status bar
+    /// text with a percent ("Fetching… {0}%").
+    pub(crate) fn run_with_progress<T: Send + 'static>(
+        &mut self,
+        repo: usize,
+        activity: &str,
+        progress: Option<&'static str>,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(&Repo, &(dyn Fn(PushProgress) + Sync)) -> Result<T, GitError> + Send + 'static,
+    ) -> Task<Result<T, GitError>> {
+        let Some(entry) = self.repos.get_mut(repo) else {
+            return Task::ready(Err(GitError::Canceled));
+        };
+        if entry.busy {
+            return Task::ready(Err(GitError::Failed {
+                command: entry.repo.work_dir.display().to_string(),
+                message: tr("Another Git operation is running in this repository").into(),
+            }));
+        }
+        entry.busy = true;
+        let git_repo = entry.repo.clone();
+        self.set_activity(Some(activity.to_string().into()), cx);
+        let (sender, mut steps) = mpsc::unbounded::<PushProgress>();
+        let run = cx.background_spawn(async move {
+            let report = move |step: PushProgress| {
+                sender.unbounded_send(step).ok();
+            };
+            job(&git_repo, &report)
+        });
+        let activity = activity.to_string();
+        let watch = cx.spawn(async move |this, cx| {
+            while let Some(step) = steps.next().await {
+                let (Some(template), Some(percent)) = (progress, step.percent) else {
+                    continue;
+                };
+                let text = trf(template, &[&percent]);
+                if this
+                    .update(cx, |this, cx| this.set_activity(Some(text.into()), cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = run.await;
+            drop(watch);
+            drop(activity);
+            this.update(cx, |this, cx| {
+                if let Some(entry) = this.repos.get_mut(repo) {
+                    entry.busy = false;
+                }
+                this.set_activity(None, cx);
+                this.refresh_repo(repo, cx);
+                this.reload_refs(repo, cx);
+                cx.emit(GitEvent::WorkTreeChanged(repo));
+            })
+            .ok();
+            result
+        })
+    }
+
+    /// Checks out a branch, a remote branch or a revision. `Smart`: local changes are stashed first
+    /// and come back after (`unstash` in the result says how); `Force`: they are thrown away.
+    pub fn checkout(
+        &mut self,
+        repo: usize,
+        target: CheckoutTarget,
+        mode: CheckoutMode,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CheckoutDone, GitError>> {
+        self.run(repo, tr("Checking out…"), cx, move |repo| {
+            let force = mode == CheckoutMode::Force;
+            // The stash this checkout makes, popped exactly (not "the top one": another stash may
+            // come meanwhile).
+            let stashed = match mode {
+                CheckoutMode::Smart => flux_git::stash::stash_push_oid(
+                    repo,
+                    &StashRequest {
+                        message: format!(
+                            "Flux: uncommitted changes before checkout of {}",
+                            target.name()
+                        ),
+                        ..Default::default()
+                    },
+                )?,
+                _ => None,
+            };
+            let done = match &target {
+                CheckoutTarget::Local(name) | CheckoutTarget::Revision(name) => {
+                    flux_git::branch::checkout(repo, name, force)
+                }
+                CheckoutTarget::Remote {
+                    remote_branch,
+                    local,
+                } => flux_git::branch::checkout_remote(repo, remote_branch, local, force),
+            };
+            if let Err(err) = done {
+                // The checkout didn't happen: the stashed changes go back where they were.
+                if let Some(oid) = &stashed {
+                    flux_git::stash::stash_apply(repo, oid, true, true)?;
+                }
+                return Err(err);
+            }
+            let unstash = match stashed {
+                Some(oid) => Some((flux_git::stash::stash_apply(repo, &oid, true, false)?, oid)),
+                None => None,
+            };
+            Ok(CheckoutDone { unstash })
+        })
+    }
+
+    /// A new branch at `start`; `checkout` switches to it, `overwrite` resets an existing one.
+    pub fn create_branch(
+        &mut self,
+        repo: usize,
+        name: &str,
+        start: &str,
+        checkout: bool,
+        overwrite: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), GitError>> {
+        let (name, start) = (name.to_string(), start.to_string());
+        self.run(repo, tr("Creating the branch…"), cx, move |repo| {
+            flux_git::branch::create_branch(repo, &name, &start, checkout, overwrite)
+        })
+    }
+
+    pub fn rename_branch(
+        &mut self,
+        repo: usize,
+        old: &str,
+        new: &str,
+        unset_upstream: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), GitError>> {
+        let (old, new) = (old.to_string(), new.to_string());
+        self.run(repo, tr("Renaming the branch…"), cx, move |repo| {
+            flux_git::branch::rename_branch(repo, &old, &new, unset_upstream)
+        })
+    }
+
+    /// Deletes a local branch (`force` — even if it isn't merged).
+    pub fn delete_branch(
+        &mut self,
+        repo: usize,
+        name: &str,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<DeletedBranch, GitError>> {
+        let name = name.to_string();
+        self.run(repo, tr("Deleting the branch…"), cx, move |repo| {
+            flux_git::branch::delete_branch(repo, &name, force)
+        })
+    }
+
+    /// Brings a deleted branch back at its commit.
+    pub fn restore_branch(
+        &mut self,
+        repo: usize,
+        name: &str,
+        oid: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), GitError>> {
+        let (name, oid) = (name.to_string(), oid.to_string());
+        self.run(repo, tr("Restoring the branch…"), cx, move |repo| {
+            flux_git::branch::restore_branch(repo, &name, &oid)
+        })
+    }
+
+    /// Deletes a branch on its remote ("origin/feature/x").
+    pub fn delete_remote_branch(
+        &mut self,
+        repo: usize,
+        remote_branch: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), GitError>> {
+        let remote_branch = remote_branch.to_string();
+        self.run_with_progress(
+            repo,
+            tr("Deleting the remote branch…"),
+            None,
+            cx,
+            move |repo, progress| {
+                let remotes = flux_git::remotes(repo)?;
+                let (remote, branch) = remotes
+                    .iter()
+                    .find_map(|remote| {
+                        let branch = remote_branch
+                            .strip_prefix(remote.name.as_str())?
+                            .strip_prefix('/')?;
+                        Some((remote.name.clone(), branch.to_string()))
+                    })
+                    .ok_or_else(|| GitError::Failed {
+                        command: "git push --delete".into(),
+                        message: format!("No remote for {remote_branch}"),
+                    })?;
+                flux_git::branch::delete_remote_branch(
+                    repo,
+                    &remote,
+                    &branch,
+                    progress,
+                    &flux_git::Cancel::new(),
+                )
+            },
+        )
+    }
+
+    /// Brings a deleted tag back exactly as it was (`target` — what [`Self::delete_tag`] returned).
+    pub fn restore_tag(
+        &mut self,
+        repo: usize,
+        name: &str,
+        target: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), GitError>> {
+        let (name, target) = (name.to_string(), target.to_string());
+        self.run(repo, tr("Restoring the tag…"), cx, move |repo| {
+            flux_git::branch::restore_tag(repo, &name, &target)
+        })
+    }
+
+    /// Deletes a tag; returns what it pointed to (the tag object of an annotated tag), for
+    /// [`Self::restore_tag`].
+    pub fn delete_tag(
+        &mut self,
+        repo: usize,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<String, GitError>> {
+        let name = name.to_string();
+        self.run(repo, tr("Deleting the tag…"), cx, move |repo| {
+            flux_git::branch::delete_tag(repo, &name)
+        })
+    }
+
+    /// Merges `rev` into the current branch; local changes are stashed around it.
+    pub fn merge(
+        &mut self,
+        repo: usize,
+        rev: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Outcome, GitError>> {
+        let rev = rev.to_string();
+        self.run(repo, tr("Merging…"), cx, move |repo| {
+            flux_git::branch::merge(repo, &rev, true)
+        })
+    }
+
+    /// Rebases the current branch (or first checks out `branch`) onto `onto`; local changes are
+    /// stashed around it.
+    pub fn rebase(
+        &mut self,
+        repo: usize,
+        onto: &str,
+        branch: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Outcome, GitError>> {
+        let onto = onto.to_string();
+        self.run(repo, tr("Rebasing…"), cx, move |repo| {
+            flux_git::branch::rebase(repo, &onto, branch.as_deref(), true)
+        })
+    }
+
+    /// Fetches every remote of a repository.
+    pub fn fetch(
+        &mut self,
+        repo: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<FetchResult, GitError>> {
+        self.run_with_progress(
+            repo,
+            tr("Fetching…"),
+            Some("Fetching… {0}%"),
+            cx,
+            |repo, progress| flux_git::sync::fetch(repo, None, progress, &flux_git::Cancel::new()),
+        )
+    }
+
+    /// Pulls a remote branch into the current one.
+    pub fn pull(
+        &mut self,
+        repo: usize,
+        remote: &str,
+        branch: &str,
+        mode: PullMode,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Outcome, GitError>> {
+        let (remote, branch) = (remote.to_string(), branch.to_string());
+        self.run_with_progress(
+            repo,
+            tr("Pulling…"),
+            Some("Pulling… {0}%"),
+            cx,
+            move |repo, progress| {
+                flux_git::sync::pull(
+                    repo,
+                    &remote,
+                    &branch,
+                    mode,
+                    progress,
+                    &flux_git::Cancel::new(),
+                )
+            },
+        )
+    }
+
+    /// Update Project for one repository: its current branch from its upstream.
+    pub fn update(
+        &mut self,
+        repo: usize,
+        method: UpdateMethod,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<UpdateResult, GitError>> {
+        self.run_with_progress(
+            repo,
+            tr("Updating…"),
+            Some("Updating… {0}%"),
+            cx,
+            move |repo, progress| {
+                flux_git::sync::update(repo, method, progress, &flux_git::Cancel::new())
+            },
+        )
+    }
+
+    /// Update of a branch that isn't checked out: a fast-forward from its upstream.
+    pub fn fast_forward(
+        &mut self,
+        repo: usize,
+        local: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Outcome, GitError>> {
+        let local = local.to_string();
+        self.run_with_progress(
+            repo,
+            tr("Updating…"),
+            Some("Updating… {0}%"),
+            cx,
+            move |repo, progress| {
+                flux_git::sync::fast_forward(repo, &local, progress, &flux_git::Cancel::new())
+            },
+        )
+    }
+
+    /// Stashes local changes; `false` — there were none.
+    pub fn stash(
+        &mut self,
+        repo: usize,
+        request: StashRequest,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<bool, GitError>> {
+        self.run(repo, tr("Stashing…"), cx, move |repo| {
+            flux_git::stash::stash_push(repo, &request)
+        })
+    }
+
+    /// Applies (`pop` — and drops) a stash.
+    pub fn unstash(
+        &mut self,
+        repo: usize,
+        oid: &str,
+        pop: bool,
+        reinstate_index: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Outcome, GitError>> {
+        let oid = oid.to_string();
+        self.run(repo, tr("Unstashing…"), cx, move |repo| {
+            flux_git::stash::stash_apply(repo, &oid, pop, reinstate_index)
+        })
+    }
+
+    /// A new branch from a stash (its base commit, the stash applied and dropped).
+    pub fn stash_branch(
+        &mut self,
+        repo: usize,
+        oid: &str,
+        branch: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Outcome, GitError>> {
+        let (oid, branch) = (oid.to_string(), branch.to_string());
+        self.run(repo, tr("Unstashing…"), cx, move |repo| {
+            flux_git::stash::stash_branch(repo, &oid, &branch)
+        })
+    }
+
+    pub fn drop_stash(
+        &mut self,
+        repo: usize,
+        oid: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), GitError>> {
+        let oid = oid.to_string();
+        self.run(repo, tr("Dropping the stash…"), cx, move |repo| {
+            flux_git::stash::stash_drop(repo, &oid)
+        })
+    }
+
+    pub fn clear_stashes(
+        &mut self,
+        repo: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), GitError>> {
+        self.run(
+            repo,
+            tr("Clearing stashes…"),
+            cx,
+            flux_git::stash::stash_clear,
+        )
+    }
+
+    /// Resolves conflicted files by taking one side whole.
+    pub fn accept_side(
+        &mut self,
+        repo: usize,
+        paths: Vec<String>,
+        side: ConflictSide,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), GitError>> {
+        self.run(repo, tr("Resolving…"), cx, move |repo| {
+            flux_git::conflict::accept_side(repo, &paths, side)
+        })
+    }
+
+    /// Marks a conflicted file resolved, writing the merge tool's result first.
+    pub fn mark_resolved(
+        &mut self,
+        repo: usize,
+        relative: &str,
+        content: Option<Vec<u8>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), GitError>> {
+        let relative = relative.to_string();
+        self.run(repo, tr("Resolving…"), cx, move |repo| {
+            flux_git::conflict::mark_resolved(repo, &relative, content.as_deref())
+        })
+    }
+
+    /// Continues the operation in progress (rebase, cherry-pick, revert).
+    pub fn continue_operation(
+        &mut self,
+        repo: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Outcome, GitError>> {
+        let state = self.operation(repo).state;
+        self.run(repo, tr("Continuing…"), cx, move |repo| {
+            flux_git::ops::continue_operation(repo, state)
+        })
+    }
+
+    /// Aborts the operation in progress.
+    pub fn abort_operation(
+        &mut self,
+        repo: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), GitError>> {
+        let state = self.operation(repo).state;
+        self.run(repo, tr("Aborting…"), cx, move |repo| {
+            flux_git::ops::abort_operation(repo, state)
+        })
+    }
+
+    /// A rebase skips the commit it stopped on.
+    pub fn skip_commit(
+        &mut self,
+        repo: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Outcome, GitError>> {
+        self.run(
+            repo,
+            tr("Skipping the commit…"),
+            cx,
+            flux_git::ops::skip_commit,
+        )
+    }
+}
+
+/// The commits of `a` that aren't in `b`, and of `b` that aren't in `a`.
+pub type CommitsBothWays = (Vec<CommitInfo>, Vec<CommitInfo>);
+
+/// How many commits Compare with Current lists each way.
+const COMPARE_LIMIT: usize = 1000;
+/// How many unmerged commits a delete question names.
+const UNMERGED_LIMIT: usize = 20;
+
+/// What to check out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutTarget {
+    /// A local branch.
+    Local(String),
+    /// A remote branch ("origin/feature/x") as a new local branch `local` tracking it.
+    Remote {
+        remote_branch: String,
+        local: String,
+    },
+    /// A tag or a commit: HEAD is detached.
+    Revision(String),
+}
+
+impl CheckoutTarget {
+    /// The name the user picked, for messages.
+    pub fn name(&self) -> &str {
+        match self {
+            CheckoutTarget::Local(name) | CheckoutTarget::Revision(name) => name,
+            CheckoutTarget::Remote { remote_branch, .. } => remote_branch,
+        }
+    }
+}
+
+/// What to do with local changes that are in the way of a checkout (JetBrains' question).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckoutMode {
+    /// Plain checkout: changes that don't conflict come along, others make it fail.
+    Normal,
+    /// Smart Checkout: stash, checkout, unstash.
+    Smart,
+    /// Force Checkout: the local changes in the way are lost.
+    Force,
+}
+
+/// A finished checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutDone {
+    /// After a smart checkout: how the stashed changes came back (`Conflicts` — files to resolve,
+    /// the stash is kept), and the stash's commit.
+    pub unstash: Option<(Outcome, String)>,
+}
+
+/// Favorite branches per repository (by its common git directory), saved in
+/// `~/Library/Application Support/flux/git-favorites.json` (`FLUX_GIT_FAVORITES_FILE` — another
+/// file; in a scenario without it — in memory). A repository nobody starred anything in has
+/// `main`, `master` and their `origin/` branches as favorites, as JetBrains IDEs do.
+#[derive(Debug, Default)]
+struct Favorites {
+    by_repo: HashMap<String, Vec<String>>,
+    path: Option<PathBuf>,
+}
+
+const DEFAULT_FAVORITES: [&str; 4] = ["main", "master", "origin/main", "origin/master"];
+
+impl Favorites {
+    fn load() -> Self {
+        let explicit = std::env::var_os("FLUX_GIT_FAVORITES_FILE").filter(|file| !file.is_empty());
+        let path = match explicit {
+            Some(file) => Some(PathBuf::from(file)),
+            None if std::env::var_os("FLUX_SCENARIO").is_some() => None,
+            None => std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home).join("Library/Application Support/flux/git-favorites.json")
+            }),
+        };
+        let by_repo = path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| value.as_object().cloned())
+            .map(|repos| {
+                repos
+                    .into_iter()
+                    .map(|(repo, names)| {
+                        let names = names
+                            .as_array()
+                            .map(|names| {
+                                names
+                                    .iter()
+                                    .filter_map(|name| name.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (repo, names)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { by_repo, path }
+    }
+
+    fn contains(&self, repo: &Path, name: &str) -> bool {
+        match self.by_repo.get(&repo.to_string_lossy().into_owned()) {
+            Some(names) => names.iter().any(|favorite| favorite == name),
+            None => DEFAULT_FAVORITES.contains(&name),
+        }
+    }
+
+    fn toggle(&mut self, repo: &Path, name: &str) {
+        let key = repo.to_string_lossy().into_owned();
+        let names = self.by_repo.entry(key).or_insert_with(|| {
+            DEFAULT_FAVORITES
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
+        });
+        match names.iter().position(|favorite| favorite == name) {
+            Some(at) => {
+                names.remove(at);
+            }
+            None => names.push(name.to_string()),
+        }
+        self.save();
+    }
+
+    fn save(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let value = serde_json::Value::Object(
+            self.by_repo
+                .iter()
+                .map(|(repo, names)| (repo.clone(), serde_json::json!(names)))
+                .collect(),
+        );
+        let text = serde_json::to_string_pretty(&value).unwrap_or_default() + "\n";
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        let temp = path.with_extension("json.flux-tmp");
+        if std::fs::write(&temp, text).is_ok() && std::fs::rename(&temp, path).is_err() {
+            std::fs::remove_file(&temp).ok();
+        }
+    }
 }
 
 /// `FLUX_GIT_LOG=1`: refresh timings and skipped events go to stderr.
@@ -1008,17 +2240,71 @@ pub fn file_color(git: &Entity<GitStore>, path: &Path, ui: &UiColors, cx: &App) 
         .map(|status| status_color(status, ui))
 }
 
-/// The operation in progress, in the status bar.
-pub fn status_item(git: &GitStore, ui: UiColors) -> Option<impl IntoElement + use<>> {
-    let activity = git.activity()?.clone();
+/// The operation in progress, in the status bar: a running one ("Pushing… 45%"), otherwise the
+/// state a repository is left in ("Merging · 2 conflicts", "Rebasing 2/5") — a click shows the
+/// conflicts, or the commit window that concludes the operation.
+pub fn status_item(git: &GitStore, ui: UiColors) -> Option<gpui::AnyElement> {
+    if let Some(activity) = git.activity() {
+        return Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .child(icon(IconName::Branch, ui.violet).size(px(13.)))
+                .child(activity.clone())
+                .into_any_element(),
+        );
+    }
+    let conflicts = git.conflicts().len();
+    let counted = crate::i18n::trn(conflicts, "{n} conflict", "{n} conflicts");
+    let state = git.repos_in_progress().first().and_then(|&repo| {
+        let operation = git.operation(repo);
+        Some(match operation.state {
+            RepoState::Merging => tr("Merging").to_string(),
+            RepoState::Rebasing => match operation.step {
+                Some((step, total)) => trf("Rebasing {0}/{1}", &[&step, &total]),
+                None => tr("Rebasing").to_string(),
+            },
+            RepoState::CherryPicking => tr("Cherry-picking").to_string(),
+            RepoState::Reverting => tr("Reverting").to_string(),
+            RepoState::Normal | RepoState::Bisecting => return None,
+        })
+    });
+    // Conflicts without an operation: an unstash that conflicted.
+    let text = match (state, conflicts) {
+        (Some(state), 0) => state,
+        (Some(state), _) => format!("{state} · {counted}"),
+        (None, 0) => return None,
+        (None, _) => counted,
+    };
+    let color = if conflicts > 0 {
+        ui.vcs_conflict
+    } else {
+        ui.warning
+    };
     Some(
         div()
+            .id("git-operation")
             .flex_none()
             .flex()
             .items_center()
             .gap_1p5()
-            .child(icon(IconName::Branch, ui.violet).size(px(13.)))
-            .child(activity),
+            .px_1p5()
+            .rounded(px(crate::ui::RADIUS_SM))
+            .cursor_pointer()
+            .text_color(color)
+            .hover(move |style| style.bg(ui.hover))
+            .on_click(move |_, window, cx| {
+                if conflicts > 0 {
+                    window.dispatch_action(Box::new(ResolveConflicts), cx)
+                } else {
+                    window.dispatch_action(Box::new(Commit), cx)
+                }
+            })
+            .child(icon(IconName::Merge, color).size(px(13.)))
+            .child(text)
+            .into_any_element(),
     )
 }
 
@@ -1044,6 +2330,26 @@ pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
     .on_action(
         cx.listener(|this, _: &Refresh, _, cx| this.git().update(cx, |git, cx| git.refresh(cx))),
     )
+    .on_action(cx.listener(|_, action: &ShowGitOutput, window, cx| {
+        // The answer doesn't matter: the dialog only shows git's output.
+        drop(window.prompt(
+            gpui::PromptLevel::Info,
+            &action.title,
+            Some(&action.output),
+            &[tr("OK")],
+            cx,
+        ));
+    }))
+    .on_action(cx.listener(|this, action: &OpenCompareDiff, window, cx| {
+        this.open_compare(
+            action.path.clone(),
+            action.repo,
+            action.left.clone(),
+            action.right.clone(),
+            window,
+            cx,
+        )
+    }))
 }
 
 /// The git branch of a directory, straight from `.git/HEAD` (before the first status): `ref:
@@ -1141,6 +2447,7 @@ mod tests {
             status,
             staged: false,
             unstaged: true,
+            conflict: None,
         };
         let status = RepoStatus {
             entries: vec![

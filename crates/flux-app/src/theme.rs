@@ -151,6 +151,12 @@ pub struct UiColors {
     pub diff_added_word: Hsla,
     pub diff_modified_word: Hsla,
     pub diff_deleted_word: Hsla,
+    /// The merge tool: a conflict (red, as in JetBrains IDEs), and a change already taken into the
+    /// result (quieter than an open one).
+    pub diff_conflict: Hsla,
+    pub diff_conflict_bg: Hsla,
+    pub diff_conflict_word: Hsla,
+    pub diff_resolved_bg: Hsla,
 
     // --- Shade palette: meaning, not decoration (file types, categories, counters). ---
     pub blue: Hsla,
@@ -365,6 +371,10 @@ impl Theme {
                 diff_added_word: rgba(0x3fb95052).into(),
                 diff_modified_word: rgba(0x5aa9ff4d).into(),
                 diff_deleted_word: rgba(0x8b949e4d).into(),
+                diff_conflict: rgb(0xff6b6b).into(),
+                diff_conflict_bg: rgba(0xff6b6b24).into(),
+                diff_conflict_word: rgba(0xff6b6b52).into(),
+                diff_resolved_bg: rgba(0x8b949e14).into(),
 
                 blue: rgb(0x5aa9ff).into(),
                 indigo: rgb(INDIGO).into(),

@@ -4,7 +4,11 @@
 
 use crate::cli::{Cancel, GitError};
 use crate::repo::Repo;
-use crate::status::FileStatus;
+use crate::status::{FileStatus, parse_name_status};
+
+/// `git log --format` of a [`CommitInfo`]: hash, short hash, subject, author, commit time, each
+/// followed by NUL ([`parse_commits`]).
+pub(crate) const COMMIT_FORMAT: &str = "--format=%H%x00%h%x00%s%x00%an%x00%ct%x00";
 
 /// A remote: `origin` and where it points.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,10 +100,7 @@ pub fn outgoing(
         .args(["rev-parse", "--verify", "-q", &target])
         .output()
         .is_ok();
-    let mut command =
-        repo.git()
-            .read_only()
-            .args(["log", "--format=%H%x00%h%x00%s%x00%an%x00%ct%x00", "HEAD"]);
+    let mut command = repo.git().read_only().args(["log", COMMIT_FORMAT, "HEAD"]);
     command = if exists {
         command.arg(format!("^{target}"))
     } else {
@@ -114,7 +115,7 @@ pub fn outgoing(
 }
 
 /// `%H %h %s %an %ct`, each followed by NUL.
-fn parse_commits(output: &str) -> Vec<CommitInfo> {
+pub(crate) fn parse_commits(output: &str) -> Vec<CommitInfo> {
     let fields: Vec<&str> = output.split('\0').collect();
     fields
         .chunks(5)
@@ -146,26 +147,10 @@ pub fn commit_files(repo: &Repo, oid: &str) -> Result<Vec<(FileStatus, String)>,
             oid,
         ])
         .output_string()?;
-    let mut files = Vec::new();
-    let mut fields = output.split('\0').filter(|field| !field.is_empty());
-    while let Some(code) = fields.next() {
-        let status = match code.as_bytes().first() {
-            Some(b'A') => FileStatus::Added,
-            Some(b'D') => FileStatus::Deleted,
-            Some(b'R') => FileStatus::Renamed,
-            Some(b'C') => FileStatus::Added,
-            Some(b'T') => FileStatus::TypeChanged,
-            _ => FileStatus::Modified,
-        };
-        // A rename or copy has the old path first, then the new one.
-        if matches!(code.as_bytes().first(), Some(b'R' | b'C')) {
-            fields.next();
-        }
-        if let Some(path) = fields.next() {
-            files.push((status, path.to_string()));
-        }
-    }
-    Ok(files)
+    Ok(parse_name_status(&output)
+        .into_iter()
+        .map(|file| (file.status, file.path))
+        .collect())
 }
 
 /// Pushes. `on_progress` gets the phases as git reports them; `cancel` stops the push.
@@ -190,18 +175,40 @@ pub fn push(
         request.local_branch, request.remote_branch
     );
     command = command.args([&request.remote, &refspec]);
-    let mut pending = String::new();
-    let output = command.run(Some(cancel), |chunk| {
-        pending.push_str(&String::from_utf8_lossy(chunk));
-        // Progress lines end with `\r` while they update, with `\n` when done.
-        while let Some(end) = pending.find(['\r', '\n']) {
-            let line: String = pending.drain(..=end).collect();
-            if let Some(progress) = parse_progress(line.trim()) {
-                on_progress(progress);
-            }
-        }
-    })?;
+    let name = command.display_name();
+    let output = command.run_unchecked(Some(cancel), progress_reader(&mut on_progress))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.success {
+        // `--porcelain` reports a rejected ref on stdout ("!\trefs/heads/main:…\t[rejected]
+        // (fetch first)"); git's hints on stderr may be turned off (`advice.pushUpdateRejected`).
+        // The rejection lines come first: the window recognizes a rejected push by them.
+        let rejected: Vec<&str> = stdout
+            .lines()
+            .filter(|line| line.starts_with('!'))
+            .map(|line| line.rsplit('\t').next().unwrap_or(line))
+            .collect();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let mut message = rejected
+            .iter()
+            .map(|reason| {
+                format!(
+                    "! {} → {}/{} {reason}",
+                    request.local_branch, request.remote, request.remote_branch
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !stderr.is_empty() {
+            if !message.is_empty() {
+                message.push('\n');
+            }
+            message.push_str(&stderr);
+        }
+        return Err(GitError::Failed {
+            command: name,
+            message,
+        });
+    }
     let up_to_date = stdout.lines().any(|line| line.starts_with('='));
     let summary = if up_to_date {
         "Everything up-to-date".to_string()
@@ -217,8 +224,26 @@ pub fn push(
     })
 }
 
+/// Reads git's stderr as it comes and reports its progress lines (push, fetch, pull: "Writing
+/// objects:  45% (9/20)", "Receiving objects: …").
+pub(crate) fn progress_reader(
+    mut on_progress: impl FnMut(PushProgress) + Send,
+) -> impl FnMut(&[u8]) + Send {
+    let mut pending = String::new();
+    move |chunk| {
+        pending.push_str(&String::from_utf8_lossy(chunk));
+        // Progress lines end with `\r` while they update, with `\n` when done.
+        while let Some(end) = pending.find(['\r', '\n']) {
+            let line: String = pending.drain(..=end).collect();
+            if let Some(progress) = parse_progress(line.trim()) {
+                on_progress(progress);
+            }
+        }
+    }
+}
+
 /// "Writing objects:  45% (9/20)" → the phase and the percent.
-fn parse_progress(line: &str) -> Option<PushProgress> {
+pub(crate) fn parse_progress(line: &str) -> Option<PushProgress> {
     let line = line.strip_prefix("remote: ").unwrap_or(line);
     let (phase, rest) = line.split_once(':')?;
     if phase.is_empty() || phase.contains(' ') && !phase.chars().next()?.is_uppercase() {
@@ -254,6 +279,33 @@ mod tests {
             parse_progress("remote: Resolving deltas: 100% (3/3)").map(|p| p.percent),
             Some(Some(100))
         );
+    }
+
+    #[test]
+    fn a_rejected_push_says_why_without_git_hints() {
+        let sandbox = crate::testing::Sandbox::new();
+        let (repo, remote) = sandbox.with_remote();
+        let teammate = sandbox.clone(&remote, "teammate");
+        crate::testing::write(&teammate, "b.txt", "theirs\n");
+        crate::testing::commit_all(&teammate, "Theirs");
+        crate::testing::git(&teammate, &["push", "-q", "origin", "main"]);
+        crate::testing::write(&repo, "c.txt", "ours\n");
+        crate::testing::commit_all(&repo, "Ours");
+        // The hints on stderr are off: the reason must still be in the error.
+        crate::testing::git(&repo, &["config", "advice.pushUpdateRejected", "false"]);
+        let request = PushRequest {
+            remote: "origin".into(),
+            local_branch: "main".into(),
+            remote_branch: "main".into(),
+            set_upstream: false,
+            force_with_lease: false,
+            tags: false,
+        };
+        let error = push(&repo, &request, |_| {}, &Cancel::new()).unwrap_err();
+        let details = error.details().unwrap();
+        assert!(details.contains("[rejected]"), "{details}");
+        assert!(details.contains("fetch first"), "{details}");
+        assert!(error.to_string().contains("main → origin/main"), "{error}");
     }
 
     #[test]

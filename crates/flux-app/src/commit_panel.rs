@@ -13,8 +13,16 @@
 //! - The message (the code font, history of recent messages), Amend (the last commit's message comes
 //!   into an empty field), "Commit" (⌘↵) and "Commit and Push…" (⌥⇧⌘K: the push dialog after).
 //!
+//! - Two tabs, as in JetBrains IDEs: "Commit" and "Stash" (the stashes — [`crate::stash_panel`]);
+//!   each has its toolbar under the tabs.
+//! - "Merge Conflicts" first in a repository with conflicted files: no checkboxes (they can't be
+//!   committed until resolved), "Resolve" opens the Conflicts dialog, ↵ the merge tool; a banner
+//!   says what operation is in progress (merging, rebasing 2/5…) with Continue / Skip / Abort.
+//!
 //! A commit first saves the open documents it takes, then commits each repository: a file checked
 //! partly goes in as its HEAD version with only the checked changes applied (`flux_git::apply_hunks`).
+//! A merge in progress is committed as a whole (every change of its repository, nothing partly,
+//! no conflicts left; the message comes from git's MERGE_MSG) — the commit concludes the merge.
 //! A rollback asks first, then git puts the files back and the open documents follow (one undoable
 //! edit each, saved).
 
@@ -24,13 +32,16 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use flux_core::Rope;
-use flux_git::{CommitContent, CommitFile, CommitRequest, FileStatus, Hunk};
+use flux_git::{
+    CommitContent, CommitFile, CommitRequest, ConflictKind, ConflictSide, FileStatus, Hunk,
+    Operation, RepoState,
+};
 use gpui::{
     Action, AnyElement, App, AsyncApp, ClickEvent, ClipboardItem, Context, CursorStyle,
-    DismissEvent, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    DismissEvent, Div, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     KeyBinding, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, Render, ScrollStrategy,
-    Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
-    uniform_list,
+    SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*,
+    px, uniform_list,
 };
 
 use crate::context_menu::ContextMenu;
@@ -39,10 +50,13 @@ use crate::git::{self, Change, CheckState, GitEvent, GitStore};
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, folder_icon, icon};
 use crate::rename::difference;
+use crate::stash_panel::{StashPanel, StashPanelEvent, StashSelected};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 
 const HEADER_HEIGHT: f32 = 40.;
+/// The toolbar of the active tab, under the tabs.
+const TOOLBAR_HEIGHT: f32 = 30.;
 const ROW_HEIGHT: f32 = 26.;
 /// Rows are inset from the island's edges; the highlight is a rounded box inside the row.
 const ROW_INSET: f32 = 6.;
@@ -88,8 +102,19 @@ actions!(
         FocusMessage,
         Cancel,
         Refresh,
+        /// A conflicted file: the merge tool.
+        MergeFile,
+        /// A conflicted file: our side whole.
+        AcceptYours,
+        /// A conflicted file: their side whole.
+        AcceptTheirs,
+        /// The selected files into a stash (the Stash Changes dialog for them).
+        StashSelectedFiles,
     ]
 );
+
+// The tabs of the window.
+actions!(commit_panel, [ShowCommitTab, ShowStashTab]);
 
 // The whole window (context "CommitPanel"): also from the message field.
 actions!(commit_panel, [CommitChanges, CommitAndPush, ToggleAmend]);
@@ -144,16 +169,25 @@ pub enum CommitPanelEvent {
     Removed(Vec<PathBuf>),
 }
 
-/// The two groups of a repository's changes.
+/// The groups of a repository's changes, in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum GroupKind {
+    /// Conflicted files of a merge, rebase, cherry-pick or unstash.
+    Conflicts,
     Changes,
     Unversioned,
 }
 
 impl GroupKind {
+    const ALL: [GroupKind; 3] = [
+        GroupKind::Conflicts,
+        GroupKind::Changes,
+        GroupKind::Unversioned,
+    ];
+
     fn of(status: FileStatus) -> Self {
         match status {
+            FileStatus::Conflicted => GroupKind::Conflicts,
             FileStatus::Untracked => GroupKind::Unversioned,
             _ => GroupKind::Changes,
         }
@@ -161,10 +195,23 @@ impl GroupKind {
 
     fn label(self) -> &'static str {
         match self {
+            GroupKind::Conflicts => tr("Merge Conflicts"),
             GroupKind::Changes => tr("Changes"),
             GroupKind::Unversioned => tr("Unversioned Files"),
         }
     }
+}
+
+/// The tabs of the commit window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitTab {
+    Commit,
+    Stash,
+}
+
+/// Whether a change can be checked for a commit: a conflicted file can't, until it is resolved.
+fn checkable(change: &Change) -> bool {
+    change.status != FileStatus::Conflicted
 }
 
 /// What a row is, kept across refreshes: the selection and the collapsed nodes follow it.
@@ -257,7 +304,7 @@ pub(crate) fn build_rows(
             }
             depth = 1;
         }
-        for group in [GroupKind::Changes, GroupKind::Unversioned] {
+        for group in GroupKind::ALL {
             let files: Vec<usize> = in_repo
                 .iter()
                 .copied()
@@ -487,7 +534,13 @@ impl Render for DraggedCommitEdge {
 
 pub struct CommitPanel {
     git: Entity<GitStore>,
+    /// The tab shown: the commit or the stashes.
+    tab: CommitTab,
+    stash: Entity<StashPanel>,
     message: Entity<Editor>,
+    /// The message of a merge in progress (git's MERGE_MSG) put into an empty field: it goes away
+    /// with the merge, unless it was edited.
+    merge_message: Option<String>,
     amend: bool,
     /// The message Amend put into the field: turning Amend off takes it back, if it is unchanged.
     amend_message: Option<String>,
@@ -521,10 +574,21 @@ impl CommitPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let message = cx.new(|cx| Editor::message(tr("Commit Message"), window, cx));
-        let subscriptions = vec![cx.observe(&git, |this, _, cx| this.rebuild(cx))];
+        let stash = cx.new(|cx| StashPanel::new(git.clone(), window, cx));
+        let subscriptions = vec![
+            cx.observe(&git, |this, _, cx| this.rebuild(cx)),
+            // The stash tab's toolbar follows its selection.
+            cx.observe(&stash, |_, _, cx| cx.notify()),
+            cx.subscribe(&stash, |_, _, event: &StashPanelEvent, cx| match event {
+                StashPanelEvent::FocusEditor => cx.emit(CommitPanelEvent::FocusEditor),
+            }),
+        ];
         let mut panel = Self {
             git,
+            tab: CommitTab::Commit,
+            stash,
             message,
+            merge_message: None,
             amend: false,
             amend_message: None,
             group_by_directory: true,
@@ -545,17 +609,52 @@ impl CommitPanel {
         panel
     }
 
-    /// ⌘K: focus in the message.
+    /// ⌘K: the Commit tab, focus in the message.
     pub fn focus_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_tab(CommitTab::Commit, cx);
         window.focus(&self.message.focus_handle(cx));
     }
 
-    /// ⌘0: focus in the list of changes; the first row is selected if nothing is.
+    /// ⌘0: focus in the list of the tab shown (the changes, or the stashes); the first row is
+    /// selected if nothing is.
     pub fn focus_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == CommitTab::Stash {
+            return self.stash.update(cx, |stash, cx| stash.focus(window, cx));
+        }
         window.focus(&self.focus_handle);
         if self.selected_index().is_none() && !self.rows.is_empty() {
             self.select_row(0, ScrollStrategy::Top, cx);
         }
+    }
+
+    /// The Stash tab, focused (Unstash Changes…).
+    pub fn show_stash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_tab(CommitTab::Stash, cx);
+        self.stash.update(cx, |stash, cx| stash.focus(window, cx));
+    }
+
+    /// Switches the tab. Focus inside the hidden tab moves to the one shown (a hidden element that
+    /// keeps focus would take the window's keys away).
+    fn switch_tab(&mut self, tab: CommitTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == tab {
+            return;
+        }
+        let focused = self.contains_focus(window, cx);
+        self.set_tab(tab, cx);
+        if focused {
+            self.focus_changes(window, cx);
+        }
+    }
+
+    fn set_tab(&mut self, tab: CommitTab, cx: &mut Context<Self>) {
+        if self.tab == tab {
+            return;
+        }
+        self.tab = tab;
+        self.stash.update(cx, |stash, cx| {
+            stash.set_active(tab == CommitTab::Stash, cx)
+        });
+        cx.notify();
     }
 
     pub fn contains_focus(&self, window: &Window, cx: &App) -> bool {
@@ -565,6 +664,7 @@ impl CommitPanel {
                 .menu
                 .as_ref()
                 .is_some_and(|menu| menu.menu.focus_handle(cx).contains_focused(window, cx))
+            || self.stash.read(cx).contains_focus(window, cx)
     }
 
     // --- The tree ---
@@ -591,6 +691,7 @@ impl CommitPanel {
             self.group_by_directory,
             &self.collapsed,
         );
+        self.follow_merge(cx);
         // A selected file hidden in a collapsed node: the node is selected; one that went away
         // (committed, rolled back): nothing is.
         if self.selected_index().is_none() {
@@ -610,6 +711,53 @@ impl CommitPanel {
             };
         }
         cx.notify();
+    }
+
+    /// A merge in progress puts git's message into an empty field (and Amend can't go with it);
+    /// when the merge is over, an unedited message goes away.
+    fn follow_merge(&mut self, cx: &mut Context<Self>) {
+        let merge_message = {
+            let git = self.git.read(cx);
+            git.repos_in_progress().into_iter().find_map(|repo| {
+                let operation = git.operation(repo);
+                (operation.state == RepoState::Merging)
+                    .then(|| operation.message.clone().unwrap_or_default())
+            })
+        };
+        match merge_message {
+            Some(message) => {
+                if self.amend {
+                    self.amend = false;
+                    if self.amend_message.take().as_deref() == Some(self.message_text(cx).as_str())
+                    {
+                        self.set_message("", cx);
+                    }
+                }
+                if self.merge_message.is_none()
+                    && !message.is_empty()
+                    && self.message_text(cx).trim().is_empty()
+                {
+                    self.set_message(&message, cx);
+                    self.merge_message = Some(message);
+                }
+            }
+            None => {
+                if let Some(message) = self.merge_message.take()
+                    && self.message_text(cx) == message
+                {
+                    self.set_message("", cx);
+                }
+            }
+        }
+    }
+
+    /// Repositories in the middle of a merge: their commit concludes it.
+    fn merging_repos(&self, cx: &App) -> Vec<usize> {
+        let git = self.git.read(cx);
+        git.repos_in_progress()
+            .into_iter()
+            .filter(|&repo| git.operation(repo).state == RepoState::Merging)
+            .collect()
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -710,8 +858,17 @@ impl CommitPanel {
             row.files
                 .iter()
                 .filter_map(|&index| self.changes.get(index))
+                .filter(|change| checkable(change))
                 .map(|change| git.check_state(change)),
         )
+    }
+
+    /// Whether a row has a checkbox: something under it can go into a commit.
+    fn row_checkable(&self, row: &Row) -> bool {
+        row.files
+            .iter()
+            .filter_map(|&index| self.changes.get(index))
+            .any(checkable)
     }
 
     /// Clicking a checkbox: a checked node is unchecked, anything else is checked wholly.
@@ -724,6 +881,7 @@ impl CommitPanel {
             .files
             .iter()
             .filter_map(|&index| self.changes.get(index))
+            .filter(|change| checkable(change))
             .map(|change| change.path.clone())
             .collect();
         self.git.update(cx, |git, cx| {
@@ -754,6 +912,7 @@ impl CommitPanel {
                 let git = self.git.read(cx);
                 self.changes
                     .iter()
+                    .filter(|change| checkable(change))
                     .filter(|change| git.check_state(change) != CheckState::Unchecked)
                     .cloned()
                     .collect()
@@ -772,10 +931,14 @@ impl CommitPanel {
         }
     }
 
-    /// ↵ / ⌘D: the diff of the selected file; on a node, ↵ expands or collapses it.
-    fn show_diff(&mut self, _: &ShowDiff, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(change) = self.selected_file() {
-            return cx.emit(CommitPanelEvent::OpenDiff(change.path.clone()));
+    /// ↵ / ⌘D: the diff of the selected file (a conflicted one: the merge tool); on a node, ↵
+    /// expands or collapses it.
+    fn show_diff(&mut self, _: &ShowDiff, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(change) = self.selected_file().cloned() {
+            if change.status == FileStatus::Conflicted {
+                return open_conflict(&change, window, cx);
+            }
+            return cx.emit(CommitPanelEvent::OpenDiff(change.path));
         }
         if let Some(row) = self.selected_row().cloned()
             && row.expandable()
@@ -797,9 +960,13 @@ impl CommitPanel {
     }
 
     /// ⌥⌘Z: rolls back the selected changes (the checked ones, with nothing selected), after a
-    /// question.
+    /// question. Conflicted files are resolved, not rolled back.
     fn rollback(&mut self, _: &Rollback, window: &mut Window, cx: &mut Context<Self>) {
-        let changes = self.target_changes(cx);
+        let changes: Vec<Change> = self
+            .target_changes(cx)
+            .into_iter()
+            .filter(checkable)
+            .collect();
         let this = cx.weak_entity();
         confirm_rollback(self.git.clone(), changes, window, cx, move |removed, cx| {
             this.update(cx, |_, cx| cx.emit(CommitPanelEvent::Removed(removed)))
@@ -915,6 +1082,112 @@ impl CommitPanel {
         self.git.update(cx, |git, cx| git.report(event, cx));
     }
 
+    // --- Conflicts ---
+
+    /// The conflicted files under the selected row.
+    fn selected_conflicts(&self) -> Vec<Change> {
+        self.selected_row()
+            .map(|row| {
+                row.files
+                    .iter()
+                    .filter_map(|&index| self.changes.get(index))
+                    .filter(|change| change.status == FileStatus::Conflicted)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Merge…: the merge tool for the selected conflicted file.
+    fn merge_file(&mut self, _: &MergeFile, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(change) = self.selected_file().cloned()
+            && change.status == FileStatus::Conflicted
+        {
+            open_conflict(&change, window, cx);
+        }
+    }
+
+    /// Accept Yours / Accept Theirs: the selected conflicted files take one side whole.
+    fn accept(&mut self, side: ConflictSide, cx: &mut Context<Self>) {
+        let conflicts = self.selected_conflicts();
+        let Some(first) = conflicts.first() else {
+            return;
+        };
+        let repo = first.repo;
+        let paths: Vec<String> = conflicts
+            .iter()
+            .filter(|change| change.repo == repo)
+            .map(|change| change.relative.clone())
+            .collect();
+        let count = paths.len();
+        let name = file_name(&first.path);
+        let git = self.git.clone();
+        let task = git.update(cx, |git, cx| git.accept_side(repo, paths, side, cx));
+        cx.spawn(async move |_, cx| {
+            let result = task.await;
+            git.update(cx, |git, cx| match result {
+                Ok(()) => {
+                    let what = match count {
+                        1 => name,
+                        _ => trn(count, "{n} file", "{n} files"),
+                    };
+                    let message = match side {
+                        ConflictSide::Ours => trf("Resolved {0}: kept yours", &[&what]),
+                        ConflictSide::Theirs => trf("Resolved {0}: took theirs", &[&what]),
+                    };
+                    git.report(GitEvent::Message(message.into()), cx)
+                }
+                Err(err) => git.notify_error(tr("Couldn't resolve the conflict"), &err, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stash Selected Files…: the Stash Changes dialog for the files under the selected row.
+    fn stash_selected(
+        &mut self,
+        _: &StashSelectedFiles,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let changes: Vec<Change> = self
+            .target_changes(cx)
+            .into_iter()
+            .filter(checkable)
+            .collect();
+        let Some(first) = changes.first() else {
+            return;
+        };
+        let repo = first.repo;
+        let mut paths = Vec::new();
+        for change in changes.iter().filter(|change| change.repo == repo) {
+            paths.push(change.relative.clone());
+            // A rename takes its old path along.
+            if let Some(orig) = change.orig_path.as_deref()
+                && let Some(relative) = self
+                    .git
+                    .read(cx)
+                    .repos()
+                    .get(repo)
+                    .and_then(|entry| entry.repo.relative(orig))
+            {
+                paths.push(relative);
+            }
+        }
+        let untracked = changes
+            .iter()
+            .any(|change| change.repo == repo && change.status == FileStatus::Untracked);
+        window.dispatch_action(
+            Box::new(StashSelected {
+                repo,
+                paths,
+                untracked,
+            }),
+            cx,
+        );
+    }
+
     // --- Mouse and menus ---
 
     fn click_row(
@@ -932,8 +1205,12 @@ impl CommitPanel {
                 self.set_expanded(&row.key, !row.expanded, cx)
             }
             Some(_) if click_count == 2 => {
-                if let RowKey::File(path) = key {
-                    cx.emit(CommitPanelEvent::OpenDiff(path));
+                if let Some(change) = self.selected_file().cloned() {
+                    if change.status == FileStatus::Conflicted {
+                        open_conflict(&change, window, cx);
+                    } else {
+                        cx.emit(CommitPanelEvent::OpenDiff(change.path));
+                    }
                 }
             }
             _ => {}
@@ -953,10 +1230,15 @@ impl CommitPanel {
         self.selected = key;
         let file = self.selected_file().cloned();
         let row = self.selected_row().cloned();
+        let conflicts = self.selected_conflicts();
+        if !conflicts.is_empty() && row.as_ref().is_some_and(|row| !self.row_checkable(row)) {
+            return self.conflict_menu(file, conflicts, position, window, cx);
+        }
         let tracked = self
             .target_changes(cx)
             .iter()
-            .any(|change| change.status != FileStatus::Untracked);
+            .any(|change| change.status != FileStatus::Untracked && checkable(change));
+        let stashable = self.target_changes(cx).iter().any(checkable);
         let unversioned = row.as_ref().is_some_and(|row| {
             row.files
                 .iter()
@@ -980,11 +1262,61 @@ impl CommitPanel {
                 .entry_if(ignorable, tr("Add to .gitignore"), AddToGitignore)
                 .entry_if(unversioned, tr("Delete…"), Delete)
                 .separator()
+                .entry_if(
+                    stashable && row.is_some(),
+                    tr("Stash Selected Files…"),
+                    StashSelectedFiles,
+                )
+                .entry(tr("Stash Changes…"), git::StashChanges)
+                .separator()
                 .entry_if(row.is_some(), tr("Copy Path"), CopyPath)
                 .separator()
                 .entry(tr("Expand All"), ExpandAll)
                 .entry(tr("Collapse All"), CollapseAll)
                 .entry(tr("Refresh"), Refresh)
+        });
+        self.open_menu(menu, position, window, cx);
+        cx.notify();
+    }
+
+    /// The menu of conflicted files: Merge…, Accept Yours, Accept Theirs.
+    fn conflict_menu(
+        &mut self,
+        file: Option<Change>,
+        conflicts: Vec<Change>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mergeable = file
+            .as_ref()
+            .is_some_and(|file| file.conflict.is_none_or(ConflictKind::mergeable));
+        let on_disk = file.as_ref().is_some_and(|file| file.path.exists());
+        let several = conflicts.len() > 1;
+        let menu = cx.new(|cx| {
+            ContextMenu::new(window, cx)
+                .entry_if(mergeable, tr("Merge…"), MergeFile)
+                .entry(
+                    if several {
+                        tr("Accept Yours for All")
+                    } else {
+                        tr("Accept Yours")
+                    },
+                    AcceptYours,
+                )
+                .entry(
+                    if several {
+                        tr("Accept Theirs for All")
+                    } else {
+                        tr("Accept Theirs")
+                    },
+                    AcceptTheirs,
+                )
+                .separator()
+                .entry(tr("Resolve Conflicts…"), git::ResolveConflicts)
+                .separator()
+                .entry_if(on_disk, tr("Jump to Source"), JumpToSource)
+                .entry(tr("Copy Path"), CopyPath)
         });
         self.open_menu(menu, position, window, cx);
         cx.notify();
@@ -1100,11 +1432,19 @@ impl CommitPanel {
         self.message.read(cx).document.text().to_string()
     }
 
+    /// Puts a message into the field (Amend, the history, a merge's message): one undoable edit,
+    /// and the field shows its start (a long first line doesn't leave it scrolled to its end).
     fn set_message(&mut self, text: &str, cx: &mut Context<Self>) {
         self.message.update(cx, |editor, cx| {
             let new = Rope::from_str(text);
             if let Some((range, text)) = difference(editor.document.text(), &new) {
                 editor.replace_ranges(vec![(range, text)], cx);
+                editor
+                    .document
+                    .set_selection(flux_core::Selection::point(0));
+                editor.scroll = gpui::point(0., 0.);
+                editor.autoscroll = None;
+                cx.notify();
             }
         });
     }
@@ -1123,8 +1463,12 @@ impl CommitPanel {
     }
 
     /// Amend on: the last commit's message comes into an empty field. Off: it goes away again,
-    /// unless it was edited.
+    /// unless it was edited. Not while a merge is in progress: its commit concludes the merge.
     fn toggle_amend(&mut self, cx: &mut Context<Self>) {
+        if !self.amend && !self.merging_repos(cx).is_empty() {
+            let message = tr("A merge is in progress: commit it instead of amending");
+            return self.report(GitEvent::Message(message.into()), cx);
+        }
         self.amend = !self.amend;
         cx.notify();
         if !self.amend {
@@ -1168,11 +1512,25 @@ impl CommitPanel {
             self.report(GitEvent::Message(tr("Enter a commit message").into()), cx);
             return self.focus_message(window, cx);
         }
+        let merging = self.merging_repos(cx);
+        let problem = {
+            let git = self.git.read(cx);
+            let states: Vec<CheckState> = self
+                .changes
+                .iter()
+                .map(|change| git.check_state(change))
+                .collect();
+            merge_commit_problem(&self.changes, &states, &merging)
+        };
+        if let Some(problem) = problem {
+            return self.report(GitEvent::Message(problem.into()), cx);
+        }
         let (included, editors) = {
             let git = self.git.read(cx);
             let included: Vec<Included> = self
                 .changes
                 .iter()
+                .filter(|change| checkable(change))
                 .map(|change| (change, git.check_state(change)))
                 .filter(|(_, state)| *state != CheckState::Unchecked)
                 .map(|(change, state)| Included {
@@ -1187,7 +1545,8 @@ impl CommitPanel {
                 .collect();
             (included, git.editors())
         };
-        if included.is_empty() {
+        // A merge whose result is HEAD's tree still needs its commit.
+        if included.is_empty() && merging.is_empty() {
             return self.report(GitEvent::Message(tr("No changes are checked").into()), cx);
         }
         let paths: HashSet<PathBuf> = included
@@ -1216,9 +1575,10 @@ impl CommitPanel {
             .collect();
         self.committing = true;
         cx.notify();
-        let amend = self.amend;
+        let amend = self.amend && merging.is_empty();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome = run_commit(&this, included, saves, bases, message, amend, cx).await;
+            let outcome =
+                run_commit(&this, included, merging, saves, bases, message, amend, cx).await;
             this.update(cx, |this, cx| {
                 this.committing = false;
                 match outcome {
@@ -1226,6 +1586,7 @@ impl CommitPanel {
                         this.set_message("", cx);
                         this.amend = false;
                         this.amend_message = None;
+                        this.merge_message = None;
                         let files = trn(count, "{n} file", "{n} files");
                         let message = trf("Committed {0}: {1}", &[&files, &summary]);
                         this.report(GitEvent::Message(message.into()), cx);
@@ -1244,7 +1605,78 @@ impl CommitPanel {
 
     // --- Rendering ---
 
-    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// The tabs: "Commit" and "Stash", as the tool window tabs of JetBrains IDEs.
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let ui = Theme::ui(cx);
+        let tab =
+            |id: &'static str, label: &'static str, tab: CommitTab, cx: &mut Context<Self>| {
+                let active = self.tab == tab;
+                let group = SharedString::from(format!("{id}-group"));
+                div()
+                    .id(id)
+                    .group(group.clone())
+                    .relative()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(
+                        ui::section_label(label, ui)
+                            .when(active, |label| label.text_color(ui.foreground))
+                            .when(!active, |label| {
+                                label.group_hover(group.clone(), move |style| {
+                                    style.text_color(ui.text_muted)
+                                })
+                            }),
+                    )
+                    // The active tab is underlined with the accent.
+                    .when(active, |tab| {
+                        tab.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom(px(7.))
+                                .h(px(2.))
+                                .rounded(px(1.))
+                                .bg(ui.accent),
+                        )
+                    })
+                    // A click on a tab is a move into it: its list takes focus.
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.set_tab(tab, cx);
+                        this.focus_changes(window, cx);
+                    }))
+            };
+        div()
+            .flex_none()
+            .h(px(HEADER_HEIGHT))
+            .pl(px(ROW_INSET + ROW_PADDING + 2.))
+            .pr(px(ROW_INSET))
+            .flex()
+            .items_center()
+            .gap_4()
+            .child(tab(
+                "commit-tab-commit",
+                tr("Commit"),
+                CommitTab::Commit,
+                cx,
+            ))
+            .child(tab("commit-tab-stash", tr("Stash"), CommitTab::Stash, cx))
+    }
+
+    /// The toolbar of the tab shown, under the tabs.
+    fn render_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let bar = div()
+            .flex_none()
+            .h(px(TOOLBAR_HEIGHT))
+            .pl(px(ROW_INSET + 2.))
+            .pr(px(ROW_INSET))
+            .flex()
+            .items_center();
+        if self.tab == CommitTab::Stash {
+            return bar.child(self.stash.read(cx).toolbar(window, cx));
+        }
         let ui = Theme::ui(cx);
         let button = |id: &'static str,
                       name: IconName,
@@ -1264,20 +1696,7 @@ impl CommitPanel {
                     window.dispatch_action(action.boxed_clone(), cx)
                 })
         };
-        div()
-            .flex_none()
-            .h(px(HEADER_HEIGHT))
-            .pl(px(ROW_INSET + ROW_PADDING + 2.))
-            .pr(px(ROW_INSET))
-            .flex()
-            .items_center()
-            .gap_0p5()
-            .child(
-                ui::section_label(tr("Commit"), ui)
-                    .flex_1()
-                    .min_w_0()
-                    .truncate(),
-            )
+        bar.gap_0p5()
             .child(button(
                 "commit-refresh",
                 IconName::Refresh,
@@ -1299,6 +1718,7 @@ impl CommitPanel {
                 Box::new(ShowDiff),
                 None,
             ))
+            .child(div().w_1())
             .child(button(
                 "commit-group",
                 IconName::Folder,
@@ -1322,6 +1742,151 @@ impl CommitPanel {
             ))
     }
 
+    /// A banner per repository in the middle of an operation: what is going on (merging,
+    /// rebasing 2/5…), its conflicts, and Continue / Skip / Abort.
+    fn render_banners(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let ui = Theme::ui(cx);
+        let git = self.git.read(cx);
+        let several = git.repos().len() > 1;
+        let mut banners = Vec::new();
+        for repo in git.repos_in_progress() {
+            let operation = git.operation(repo);
+            let refs = git.refs(repo);
+            let current = git
+                .repos()
+                .get(repo)
+                .and_then(|entry| entry.status.branch.label())
+                .unwrap_or_else(|| tr("HEAD").to_string());
+            let Some((text, actions)) = banner_text(&operation, &current, |oid| {
+                refs.name_of(oid).map(str::to_string)
+            }) else {
+                continue;
+            };
+            let text = if several {
+                format!("{} · {text}", git.repo_name(repo))
+            } else {
+                text
+            };
+            let conflicts = self
+                .changes
+                .iter()
+                .filter(|change| change.repo == repo && change.status == FileStatus::Conflicted)
+                .count();
+            let color = if conflicts > 0 {
+                ui.vcs_conflict
+            } else {
+                ui.warning
+            };
+            let detail: AnyElement = if conflicts > 0 {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().text_color(ui.vcs_conflict).child(trn(
+                        conflicts,
+                        "{n} conflict",
+                        "{n} conflicts",
+                    )))
+                    .child(
+                        link(("banner-resolve", repo), tr("Resolve…"), ui.accent_text, ui)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(git::ResolveConflicts), cx)
+                            }),
+                    )
+                    .into_any_element()
+            } else if operation.state == RepoState::Merging {
+                div()
+                    .text_color(ui.text_muted)
+                    .child(tr("Commit to finish the merge"))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            };
+            let buttons = actions.into_iter().map(|action| {
+                let (label, id, color, enabled, dispatch): (&str, usize, _, bool, Box<dyn Action>) =
+                    match action {
+                        BannerAction::Continue => (
+                            tr("Continue"),
+                            0,
+                            ui.accent_text,
+                            conflicts == 0,
+                            Box::new(git::ContinueRepoOperation { repo }),
+                        ),
+                        BannerAction::Skip => (
+                            tr("Skip"),
+                            1,
+                            ui.text_muted,
+                            true,
+                            Box::new(git::SkipRepoCommit { repo }),
+                        ),
+                        BannerAction::Abort => (
+                            tr("Abort"),
+                            2,
+                            ui.text_muted,
+                            true,
+                            Box::new(git::AbortRepoOperation { repo }),
+                        ),
+                    };
+                link(("banner-action", repo * 4 + id), label, color, ui)
+                    .when(!enabled, |link| {
+                        link.opacity(0.45)
+                            .tooltip(ui::tooltip(tr("Resolve the conflicts first"), None))
+                    })
+                    .when(enabled, |link| {
+                        link.on_click(move |_, window, cx| {
+                            window.dispatch_action(dispatch.boxed_clone(), cx)
+                        })
+                    })
+            });
+            banners.push(
+                div()
+                    .flex_none()
+                    .mx(px(ROW_INSET))
+                    .mb_1p5()
+                    .px_2()
+                    .py_1p5()
+                    .flex()
+                    .gap_2()
+                    .rounded(px(RADIUS_MD))
+                    .bg(UiColors::tint(color, 0.10))
+                    .border_1()
+                    .border_color(UiColors::tint(color, 0.22))
+                    .text_size(px(theme::TEXT_SM))
+                    .child(
+                        div()
+                            .flex_none()
+                            .pt(px(1.))
+                            .child(icon(IconName::Merge, color).size(px(14.))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_color(ui.foreground)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(text),
+                            )
+                            .child(detail)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .ml(px(-4.))
+                                    .children(buttons),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        banners
+    }
+
     fn render_row(&self, index: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
         let Some(row) = self.rows.get(index) else {
@@ -1329,6 +1894,7 @@ impl CommitPanel {
         };
         let selected = self.selected.as_ref() == Some(&row.key);
         let state = self.row_state(row, cx);
+        let checkable = self.row_checkable(row);
         let (icon_element, name, name_color, detail, strike) = match &row.kind {
             RowKind::Repo { name, branch } => (
                 icon(IconName::Branch, ui.violet)
@@ -1344,7 +1910,11 @@ impl CommitPanel {
             RowKind::Group(group) => (
                 div().into_any_element(),
                 group.label().to_string(),
-                ui.foreground,
+                if *group == GroupKind::Conflicts {
+                    ui.vcs_conflict
+                } else {
+                    ui.foreground
+                },
                 Some(row.files.len().to_string()),
                 false,
             ),
@@ -1367,6 +1937,15 @@ impl CommitPanel {
             }
         };
         let group_row = matches!(row.kind, RowKind::Group(_) | RowKind::Repo { .. });
+        // The conflicts group offers the Conflicts dialog right on its row.
+        let resolve = matches!(row.kind, RowKind::Group(GroupKind::Conflicts)).then(|| {
+            link(("commit-resolve", index), tr("Resolve"), ui.accent_text, ui)
+                .flex_none()
+                .on_click(|_, window, cx| {
+                    cx.stop_propagation();
+                    window.dispatch_action(Box::new(git::ResolveConflicts), cx)
+                })
+        });
         let key = row.key.clone();
         let (click, secondary, toggle) = (key.clone(), key.clone(), key.clone());
         let body = div()
@@ -1383,15 +1962,18 @@ impl CommitPanel {
                 _ => body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover)),
             })
             .child(chevron(row.expandable(), row.expanded, ui))
-            .child(
-                ui::checkbox(("check", index), state, ui).on_click(cx.listener(
-                    move |this, _: &ClickEvent, window, cx| {
+            .child(if checkable {
+                ui::checkbox(("check", index), state, ui)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         window.focus(&this.focus_handle);
                         this.toggle_row(&toggle, cx);
                         cx.stop_propagation();
-                    },
-                )),
-            )
+                    }))
+                    .into_any_element()
+            } else {
+                // Conflicted files can't be checked: an empty column keeps the names aligned.
+                div().flex_none().w(px(14.)).into_any_element()
+            })
             .child(icon_element)
             .child(
                 div()
@@ -1410,7 +1992,8 @@ impl CommitPanel {
                     .text_size(px(theme::TEXT_SM))
                     .text_color(ui.dim)
                     .child(detail)
-            }));
+            }))
+            .children(resolve.map(|resolve| div().flex_1().flex().justify_end().child(resolve)));
         div()
             .id(index)
             .group(ROW_GROUP)
@@ -1507,7 +2090,9 @@ impl CommitPanel {
 
     fn render_footer(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
-        let can_commit = !self.committing && !self.changes.is_empty();
+        let merging = !self.merging_repos(cx).is_empty();
+        // A merge whose result is HEAD's tree has no changes, and still needs its commit.
+        let can_commit = !self.committing && (!self.changes.is_empty() || merging);
         let commit_keys = ui::shortcut_for(&CommitChanges, window);
         let push_keys = ui::shortcut_for(&CommitAndPush, window);
         div()
@@ -1533,6 +2118,12 @@ impl CommitPanel {
                             .text_size(px(theme::TEXT_SM))
                             .text_color(ui.text_muted)
                             .hover(move |style| style.text_color(ui.foreground))
+                            .when(merging, |amend| {
+                                amend.opacity(0.5).tooltip(ui::tooltip(
+                                    tr("A merge is in progress: commit it instead of amending"),
+                                    None,
+                                ))
+                            })
                             .on_click(
                                 cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_amend(cx)),
                             )
@@ -1584,6 +2175,102 @@ impl CommitPanel {
     }
 }
 
+/// Why the checked changes can't be committed while a merge is in progress: its commit concludes
+/// it, so it takes every change of its repository whole (`states` — the checkbox of each change),
+/// and no file may be conflicted. `None` — they can.
+pub(crate) fn merge_commit_problem(
+    changes: &[Change],
+    states: &[CheckState],
+    merging: &[usize],
+) -> Option<&'static str> {
+    let in_merge = |change: &&Change| merging.contains(&change.repo);
+    if changes
+        .iter()
+        .filter(in_merge)
+        .any(|change| change.status == FileStatus::Conflicted)
+    {
+        return Some(tr("Resolve the conflicts first"));
+    }
+    let partly = changes.iter().zip(states).any(|(change, state)| {
+        merging.contains(&change.repo)
+            && change.status != FileStatus::Untracked
+            && *state != CheckState::Checked
+    });
+    partly.then(|| tr("A merge is committed as a whole: check all its changes"))
+}
+
+/// A conflicted file: the merge tool when both sides have a text, otherwise the Conflicts dialog
+/// (a file one side deleted is resolved by taking a side).
+fn open_conflict(change: &Change, window: &mut Window, cx: &mut App) {
+    let action: Box<dyn Action> = if change.conflict.is_none_or(ConflictKind::mergeable) {
+        Box::new(git::OpenMerge {
+            repo: change.repo,
+            path: change.path.clone(),
+        })
+    } else {
+        Box::new(git::ResolveConflicts)
+    };
+    window.dispatch_action(action, cx);
+}
+
+/// What the banner of an operation in progress offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BannerAction {
+    Continue,
+    Skip,
+    Abort,
+}
+
+/// The banner of an operation in progress: what is going on ("Rebasing main onto origin/main ·
+/// 2/5") and what can be done. `current` — the current branch (or short hash); `name_of` names a
+/// commit by a branch or tag pointing at it. `None` — nothing in progress.
+pub(crate) fn banner_text(
+    operation: &Operation,
+    current: &str,
+    name_of: impl Fn(&str) -> Option<String>,
+) -> Option<(String, Vec<BannerAction>)> {
+    let short = |oid: &str| oid.chars().take(7).collect::<String>();
+    let commit = |oid: &Option<String>| -> String {
+        oid.as_deref()
+            .map(|oid| name_of(oid).unwrap_or_else(|| short(oid)))
+            .unwrap_or_default()
+    };
+    use BannerAction::*;
+    Some(match operation.state {
+        RepoState::Merging => {
+            let incoming = operation
+                .incoming_name
+                .clone()
+                .unwrap_or_else(|| commit(&operation.incoming));
+            (
+                trf("Merging {0} into {1}", &[&incoming, &current]),
+                vec![Abort],
+            )
+        }
+        RepoState::Rebasing => {
+            let branch = operation
+                .rebase_branch
+                .clone()
+                .unwrap_or_else(|| tr("detached HEAD").to_string());
+            let onto = commit(&operation.rebase_onto);
+            let mut text = trf("Rebasing {0} onto {1}", &[&branch, &onto]);
+            if let Some((step, total)) = operation.step {
+                text.push_str(&format!(" · {step}/{total}"));
+            }
+            (text, vec![Continue, Skip, Abort])
+        }
+        RepoState::CherryPicking => (
+            trf("Cherry-picking {0}", &[&commit(&operation.incoming)]),
+            vec![Continue, Abort],
+        ),
+        RepoState::Reverting => (
+            trf("Reverting {0}", &[&commit(&operation.incoming)]),
+            vec![Continue, Abort],
+        ),
+        RepoState::Normal | RepoState::Bisecting => return None,
+    })
+}
+
 /// A change the commit takes.
 struct Included {
     change: Change,
@@ -1595,9 +2282,11 @@ struct Included {
 
 /// Saves the documents, computes the partial contents, and commits each repository. `Ok` — how
 /// many files went in and the message's first line.
+#[allow(clippy::too_many_arguments)]
 async fn run_commit(
     this: &gpui::WeakEntity<CommitPanel>,
     included: Vec<Included>,
+    merging: Vec<usize>,
     saves: Vec<Task<bool>>,
     bases: Vec<(PathBuf, Task<Option<std::sync::Arc<str>>>)>,
     message: String,
@@ -1656,6 +2345,20 @@ async fn run_commit(
                     author: None,
                 },
             )),
+        }
+    }
+    // A merge in progress is concluded by its commit even when its result is HEAD's tree.
+    for repo in merging {
+        if !requests.iter().any(|(at, _)| *at == repo) {
+            requests.push((
+                repo,
+                CommitRequest {
+                    message: message.clone(),
+                    amend: false,
+                    files: Vec::new(),
+                    author: None,
+                },
+            ));
         }
     }
     let tasks = this
@@ -1844,6 +2547,23 @@ fn chevron(expandable: bool, expanded: bool, ui: UiColors) -> impl IntoElement {
         .children(glyph.map(|glyph| icon(glyph, ui.dim).size(px(CHEVRON_SIZE))))
 }
 
+/// A link-like button: colored text, a backdrop on hover (the banner's actions).
+fn link(
+    id: impl Into<gpui::ElementId>,
+    label: &str,
+    color: gpui::Hsla,
+    ui: UiColors,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_1()
+        .rounded(px(RADIUS_SM))
+        .cursor_pointer()
+        .text_color(color)
+        .hover(move |style| style.bg(ui.hover))
+        .child(label.to_string())
+}
+
 /// The island's right edge, in the gap between islands: an accent line on hover and while dragged.
 fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
     div()
@@ -1883,12 +2603,77 @@ impl Focusable for CommitPanel {
 impl Render for CommitPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
+        self.resizing &= cx.has_active_drag();
+        let root = div()
+            .key_context("CommitPanel")
+            .relative()
+            .flex_none()
+            .w(px(self.width.get()))
+            .h_full()
+            .flex()
+            .flex_col()
+            .font_family(theme::UI_FONT)
+            .text_size(px(theme::TEXT_MD))
+            .text_color(ui.foreground)
+            .on_action(cx.listener(|this, _: &CommitChanges, window, cx| {
+                if this.tab == CommitTab::Commit {
+                    this.commit(false, window, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CommitAndPush, window, cx| {
+                if this.tab == CommitTab::Commit {
+                    this.commit(true, window, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleAmend, _, cx| this.toggle_amend(cx)))
+            .on_action(cx.listener(|this, action: &UseMessage, _, cx| {
+                if let Some(message) = this.history.get(action.0).cloned() {
+                    this.set_message(&message, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ShowCommitTab, window, cx| {
+                this.switch_tab(CommitTab::Commit, window, cx);
+                this.focus_changes(window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &ShowStashTab, window, cx| this.show_stash(window, cx)),
+            )
+            // Esc in the message field, with nothing for the field to clear: back to the editor.
+            .on_action(
+                cx.listener(|_, _: &editor::Cancel, _, cx| cx.emit(CommitPanelEvent::FocusEditor)),
+            )
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedCommitEdge>, _, cx| {
+                    let width = f32::from(event.event.position.x - event.bounds.left())
+                        - RESIZE_HANDLE_OFFSET;
+                    this.width.set(width);
+                    this.resizing = true;
+                    cx.notify();
+                }),
+            )
+            .child(self.render_tabs(cx))
+            .child(self.render_toolbar(window, cx));
+        let root = match self.tab {
+            CommitTab::Commit => self.render_commit_tab(root, window, cx),
+            CommitTab::Stash => root.child(div().flex_1().min_h_0().child(self.stash.clone())),
+        };
+        root.child(resize_handle(self.resizing, ui)).children(
+            self.menu
+                .as_ref()
+                .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
+        )
+    }
+}
+
+impl CommitPanel {
+    /// The Commit tab: the banners of operations in progress, the changes, the message, Commit.
+    fn render_commit_tab(&mut self, root: Div, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let ui = Theme::ui(cx);
         let focused = self.focus_handle.contains_focused(window, cx)
             || self
                 .menu
                 .as_ref()
                 .is_some_and(|menu| menu.menu.focus_handle(cx).is_focused(window));
-        self.resizing &= cx.has_active_drag();
         let list = if self.rows.is_empty() {
             self.render_empty(cx).into_any_element()
         } else {
@@ -1914,43 +2699,8 @@ impl Render for CommitPanel {
                 .gap_3(),
             )
         });
-        div()
-            .key_context("CommitPanel")
-            .relative()
-            .flex_none()
-            .w(px(self.width.get()))
-            .h_full()
-            .flex()
-            .flex_col()
-            .font_family(theme::UI_FONT)
-            .text_size(px(theme::TEXT_MD))
-            .text_color(ui.foreground)
-            .on_action(
-                cx.listener(|this, _: &CommitChanges, window, cx| this.commit(false, window, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &CommitAndPush, window, cx| this.commit(true, window, cx)),
-            )
-            .on_action(cx.listener(|this, _: &ToggleAmend, _, cx| this.toggle_amend(cx)))
-            .on_action(cx.listener(|this, action: &UseMessage, _, cx| {
-                if let Some(message) = this.history.get(action.0).cloned() {
-                    this.set_message(&message, cx);
-                }
-            }))
-            // Esc in the message field, with nothing for the field to clear: back to the editor.
-            .on_action(
-                cx.listener(|_, _: &editor::Cancel, _, cx| cx.emit(CommitPanelEvent::FocusEditor)),
-            )
-            .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<DraggedCommitEdge>, _, cx| {
-                    let width = f32::from(event.event.position.x - event.bounds.left())
-                        - RESIZE_HANDLE_OFFSET;
-                    this.width.set(width);
-                    this.resizing = true;
-                    cx.notify();
-                }),
-            )
-            .child(self.render_header(window, cx))
+        let banners = self.render_banners(cx);
+        root.children(banners)
             .child(
                 div()
                     .key_context("CommitChanges")
@@ -1985,6 +2735,14 @@ impl Render for CommitPanel {
                     .on_action(cx.listener(Self::delete))
                     .on_action(cx.listener(Self::copy_path))
                     .on_action(cx.listener(Self::add_to_gitignore))
+                    .on_action(cx.listener(Self::merge_file))
+                    .on_action(cx.listener(|this, _: &AcceptYours, _, cx| {
+                        this.accept(ConflictSide::Ours, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &AcceptTheirs, _, cx| {
+                        this.accept(ConflictSide::Theirs, cx)
+                    }))
+                    .on_action(cx.listener(Self::stash_selected))
                     .on_action(
                         cx.listener(|this, _: &ExpandAll, _, cx| this.set_all_expanded(true, cx)),
                     )
@@ -2032,12 +2790,6 @@ impl Render for CommitPanel {
             .child(div().h_2())
             .child(self.render_message(window, cx))
             .child(self.render_footer(window, cx))
-            .child(resize_handle(self.resizing, ui))
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
     }
 }
 
@@ -2052,6 +2804,7 @@ mod tests {
             relative: relative.into(),
             orig_path: None,
             status,
+            conflict: None,
         }
     }
 
@@ -2060,6 +2813,7 @@ mod tests {
             .map(|row| {
                 let text = match &row.kind {
                     RowKind::Repo { name, .. } => format!("repo {name}"),
+                    RowKind::Group(GroupKind::Conflicts) => "Conflicts".into(),
                     RowKind::Group(GroupKind::Changes) => "Changes".into(),
                     RowKind::Group(GroupKind::Unversioned) => "Unversioned".into(),
                     RowKind::Dir { label } => format!("{label}/"),
@@ -2155,6 +2909,118 @@ mod tests {
         let collapsed: HashSet<RowKey> = [RowKey::Repo(0)].into();
         let rows = build_rows(&changes, &repos, true, &collapsed);
         assert_eq!(labels(&rows)[0..2], ["repo app", "repo core"]);
+    }
+
+    #[test]
+    fn conflicted_files_come_first_in_their_own_group() {
+        let changes = vec![
+            change(0, "src/main.rs", FileStatus::Modified),
+            change(0, "src/parser.rs", FileStatus::Conflicted),
+            change(0, "README.md", FileStatus::Conflicted),
+            change(0, "notes.md", FileStatus::Untracked),
+        ];
+        let rows = build_rows(&changes, &one_repo(), true, &HashSet::new());
+        assert_eq!(
+            labels(&rows),
+            vec![
+                "Conflicts",
+                "  src/",
+                "    parser.rs",
+                "  README.md",
+                "Changes",
+                "  src/",
+                "    main.rs",
+                "Unversioned",
+                "  notes.md",
+            ]
+        );
+        assert_eq!(rows[0].files.len(), 2);
+        assert!(!checkable(&changes[1]) && checkable(&changes[0]));
+    }
+
+    #[test]
+    fn a_merge_is_committed_whole_and_without_conflicts() {
+        use CheckState::*;
+        let changes = vec![
+            change(0, "a.rs", FileStatus::Modified),
+            change(0, "b.rs", FileStatus::Added),
+            change(0, "new.md", FileStatus::Untracked),
+            change(1, "c.rs", FileStatus::Modified),
+        ];
+        // Not merging: anything goes.
+        assert_eq!(
+            merge_commit_problem(&changes, &[Partial, Unchecked, Unchecked, Unchecked], &[]),
+            None
+        );
+        // Merging in repository 0: its tracked changes must be checked wholly; untracked files and
+        // other repositories don't matter.
+        assert_eq!(
+            merge_commit_problem(&changes, &[Checked, Checked, Unchecked, Unchecked], &[0]),
+            None
+        );
+        assert!(
+            merge_commit_problem(&changes, &[Checked, Partial, Unchecked, Checked], &[0]).is_some()
+        );
+        assert!(
+            merge_commit_problem(&changes, &[Unchecked, Checked, Checked, Checked], &[0]).is_some()
+        );
+        // A conflict left: resolve first.
+        let mut conflicted = changes.clone();
+        conflicted[3].status = FileStatus::Conflicted;
+        assert!(
+            merge_commit_problem(&conflicted, &[Checked, Checked, Unchecked, Checked], &[1])
+                .is_some()
+        );
+        assert_eq!(
+            merge_commit_problem(&conflicted, &[Checked, Checked, Unchecked, Checked], &[0]),
+            None
+        );
+    }
+
+    #[test]
+    fn banners_say_what_is_in_progress() {
+        let name_of = |oid: &str| (oid == "beef00001111").then(|| "origin/main".to_string());
+        let merging = Operation {
+            state: RepoState::Merging,
+            incoming: Some("abc1234567".into()),
+            incoming_name: Some("feature/x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            banner_text(&merging, "main", name_of),
+            Some((
+                "Merging feature/x into main".to_string(),
+                vec![BannerAction::Abort]
+            ))
+        );
+        let rebasing = Operation {
+            state: RepoState::Rebasing,
+            rebase_branch: Some("main".into()),
+            rebase_onto: Some("beef00001111".into()),
+            step: Some((2, 5)),
+            ..Default::default()
+        };
+        assert_eq!(
+            banner_text(&rebasing, "1a2b3c4", name_of),
+            Some((
+                "Rebasing main onto origin/main · 2/5".to_string(),
+                vec![
+                    BannerAction::Continue,
+                    BannerAction::Skip,
+                    BannerAction::Abort
+                ]
+            ))
+        );
+        let picking = Operation {
+            state: RepoState::CherryPicking,
+            incoming: Some("0123456789".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            banner_text(&picking, "main", name_of).map(|(text, _)| text),
+            Some("Cherry-picking 0123456".to_string())
+        );
+        assert_eq!(banner_text(&Operation::default(), "main", name_of), None);
     }
 
     #[test]

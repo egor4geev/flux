@@ -210,6 +210,9 @@ pub struct Editor {
     /// words): the host sets it before every render, the element takes it. An editor shown in its
     /// own tab gets none.
     pub(crate) frame_decorations: Option<std::rc::Rc<crate::diff_view::Decorations>>,
+    /// The text changes since the host last took them (`Some` — a host tracks positions through
+    /// edits: the merge tool keeps its blocks on the lines they moved to). `None` — nothing is kept.
+    pub(crate) recorded_changes: Option<Vec<TextChange>>,
     /// When the file was last written as far as this editor knows (opened, saved, reloaded): a
     /// newer time on disk means someone else changed it.
     pub(crate) disk_mtime: Option<std::time::SystemTime>,
@@ -301,6 +304,7 @@ impl Editor {
             message: None,
             git: Default::default(),
             frame_decorations: None,
+            recorded_changes: None,
             disk_mtime: None,
             _subscriptions: subscriptions,
         };
@@ -384,6 +388,9 @@ impl Editor {
         crate::completion::text_changed(self, changes);
         crate::hover::text_changed(self);
         crate::git_gutter::text_changed(self, changes, cx);
+        if let Some(recorded) = &mut self.recorded_changes {
+            recorded.extend(changes.iter().cloned());
+        }
         highlighter::parse(self, ParseMode::AfterEdit, cx);
         cx.emit(EditorEvent::Edited);
     }

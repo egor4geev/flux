@@ -943,10 +943,8 @@ async fn install_server(
         .update(cx, |_, cx| crate::settings::auto_install_servers(cx))
         .unwrap_or(false);
     if !automatic {
-        this.update(cx, |this, cx| {
-            this.set_status(id, Status::NotInstalled, cx)
-        })
-        .ok();
+        this.update(cx, |this, cx| this.set_status(id, Status::NotInstalled, cx))
+            .ok();
         return false;
     }
     let checked = cx

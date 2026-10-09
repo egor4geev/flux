@@ -5,6 +5,8 @@
 //! - `GIT_TERMINAL_PROMPT=0` and a new session (`setsid`): git, ssh and credential helpers can't
 //!   ask for a password on the terminal Flux was started from — the command fails instead of
 //!   hanging;
+//! - `LANGUAGE=en`: git's messages are English whatever the user's locale — the few errors Flux
+//!   reads (local changes in the way, a branch that isn't merged) are recognized by their words;
 //! - stdin closed unless the command gets input ([`GitCommand::stdin`]).
 //!
 //! Read-only commands ([`GitCommand::read_only`]) don't take optional locks
@@ -54,6 +56,8 @@ pub enum GitError {
         message: String,
     },
     Canceled,
+    /// The branch has no upstream to update from or pull (`main` without `origin/main`).
+    NoUpstream(String),
     Io(io::Error),
 }
 
@@ -81,6 +85,7 @@ impl fmt::Display for GitError {
                 write!(f, "{command}: {line}")
             }
             GitError::Canceled => write!(f, "Canceled"),
+            GitError::NoUpstream(branch) => write!(f, "No tracked branch for {branch}"),
             GitError::Io(err) => write!(f, "{err}"),
         }
     }
@@ -173,6 +178,21 @@ impl GitCommand {
         self
     }
 
+    /// Paths are taken as they are, not as patterns (`--literal-pathspecs`): a file named `a*b`
+    /// or `:x` is just that file.
+    pub fn literal_pathspecs(mut self) -> Self {
+        self.globals.push("--literal-pathspecs".into());
+        self
+    }
+
+    /// A command that would open an editor for a message (a merge commit, `rebase --continue`)
+    /// takes the prepared message as it is: there is no terminal to edit it in.
+    pub fn no_editor(self) -> Self {
+        self.env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true")
+            .env("GIT_MERGE_AUTOEDIT", "no")
+    }
+
     /// Bytes for the command's stdin (a commit message with `-F -`, paths, a blob).
     pub fn stdin(mut self, input: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(input.into());
@@ -207,16 +227,7 @@ impl GitCommand {
         on_stderr: impl FnMut(&[u8]) + Send,
     ) -> Result<Output, GitError> {
         let name = self.display_name();
-        let mut child = self.spawn()?;
-        let output = collect(&mut child, cancel, on_stderr);
-        let output = match output {
-            Ok(output) => output,
-            Err(err) => {
-                child.kill().ok();
-                child.wait().ok();
-                return Err(err);
-            }
-        };
+        let output = self.run_unchecked(cancel, on_stderr)?;
         if output.success {
             Ok(output)
         } else {
@@ -234,6 +245,24 @@ impl GitCommand {
         }
     }
 
+    /// [`Self::run`] that leaves a non-zero exit to the caller (`Output::success`): push reads
+    /// why refs were rejected from its stdout.
+    pub fn run_unchecked(
+        self,
+        cancel: Option<&Cancel>,
+        on_stderr: impl FnMut(&[u8]) + Send,
+    ) -> Result<Output, GitError> {
+        let mut child = self.spawn()?;
+        match collect(&mut child, cancel, on_stderr) {
+            Ok(output) => Ok(output),
+            Err(err) => {
+                child.kill().ok();
+                child.wait().ok();
+                Err(err)
+            }
+        }
+    }
+
     /// Starts the process with pipes for stdin (if there is input), stdout and stderr; the input is
     /// written by a separate thread so that a large stdout can't deadlock against it.
     pub fn spawn(self) -> Result<Child, GitError> {
@@ -247,6 +276,10 @@ impl GitCommand {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_PAGER", "cat")
             .env("PAGER", "cat")
+            // English messages whatever the locale: the errors Flux recognizes are matched by
+            // their words (gettext's LANGUAGE wins over LANG / LC_ALL, unless the locale is C,
+            // which is English anyway).
+            .env("LANGUAGE", "en")
             .stdin(if self.stdin.is_some() || self.interactive {
                 Stdio::piped()
             } else {
@@ -384,6 +417,17 @@ mod tests {
             .output()
             .unwrap_err();
         assert!(matches!(error, GitError::Failed { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn git_speaks_english() {
+        let dir = tempfile::tempdir().unwrap();
+        // An alias runs a shell with git's environment.
+        let language = GitCommand::new(dir.path())
+            .args(["-c", "alias.lang=!printf %s \"$LANGUAGE\"", "lang"])
+            .output_string()
+            .unwrap();
+        assert_eq!(language, "en");
     }
 
     #[test]

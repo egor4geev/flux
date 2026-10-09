@@ -40,7 +40,9 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   outside Flux.
 - **Git, the way JetBrains IDEs do it.** Changed lines marked as you type, with rollback in one click; a
   diff you can edit; a commit window with checkboxes for files and even single changes, amend and
-  commit-and-push; push with a preview of what goes. Works with all the repositories in your folder.
+  commit-and-push; push with a preview of what goes. Branches in one popup — search, favorites, every
+  operation a click away, checkout that keeps your changes; update, pull and fetch; stash and unstash;
+  conflicts resolved in a three-way merge tool. Works with all the repositories in your folder.
 - **Keyboard first.** Every command is in the command palette with its shortcut; familiar keys if
   you come from JetBrains IDEs.
 - **Speaks your language.** English or Russian, following your system settings.
@@ -61,6 +63,14 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   <tr>
     <td align="center"><sub><b>Commit window and changed lines</b></sub></td>
     <td align="center"><sub><b>Diff with checkboxes for single changes</b></sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/branches.png" alt="The branches popup with search, recent and local branches, favorites and a branch's actions"></td>
+    <td width="50%"><img src="docs/images/merge.png" alt="The three-way merge tool: yours, the result and theirs, with arrows that take a side"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Branches</b></sub></td>
+    <td align="center"><sub><b>Merge tool for conflicts</b></sub></td>
   </tr>
 </table>
 
@@ -89,6 +99,7 @@ recent project on the start screen.
 | <kbd>⌘</kbd><kbd>1</kbd> | Show or hide the project tree |
 | <kbd>⌥</kbd><kbd>F12</kbd> · <kbd>⌘</kbd><kbd>T</kbd> | Show or hide the terminal · new terminal |
 | <kbd>⌘</kbd><kbd>K</kbd> · <kbd>⇧</kbd><kbd>⌘</kbd><kbd>K</kbd> | Commit · push |
+| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>B</kbd> · <kbd>⌘</kbd><kbd>T</kbd> | Branches · update the project (in a terminal, ⌘T opens a new one) |
 | <kbd>⌘</kbd><kbd>0</kbd> · <kbd>⌃</kbd><kbd>V</kbd> | Show or hide the commit window · Git operations |
 
 ## Roadmap
@@ -100,7 +111,7 @@ recent project on the start screen.
 - [x] Code intelligence: errors, completion, go to definition
 - [x] Built-in terminal
 - [x] Git: changes, diff, commit and push
-- [ ] Git: branches, stash, conflicts
+- [x] Git: branches, stash, conflicts
 - [ ] Git: history and blame
 - [ ] Plugins
 - [ ] Claude Code integration — the first plugin

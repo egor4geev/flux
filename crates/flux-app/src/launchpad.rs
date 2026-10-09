@@ -31,7 +31,12 @@ pub enum Tool {
 
 impl Tool {
     /// Order in the strip, top to bottom.
-    pub const ALL: [Tool; 4] = [Tool::Project, Tool::Commit, Tool::FindInFiles, Tool::Terminal];
+    pub const ALL: [Tool; 4] = [
+        Tool::Project,
+        Tool::Commit,
+        Tool::FindInFiles,
+        Tool::Terminal,
+    ];
 
     fn icon(self) -> IconName {
         match self {
@@ -112,7 +117,11 @@ pub fn render(
                         .text_size(px(crate::theme::TEXT_XS - 2.))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(ui.frame)
-                        .child(if count > 99 { "99+".to_string() } else { count.to_string() })
+                        .child(if count > 99 {
+                            "99+".to_string()
+                        } else {
+                            count.to_string()
+                        })
                 }))
                 // Marker of the open window: at the edge of the strip, like an IDE tool tab.
                 .when(open, |button| {

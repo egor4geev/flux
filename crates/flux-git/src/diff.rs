@@ -77,6 +77,21 @@ pub fn diff_words(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>
     (merge_adjacent(removed), merge_adjacent(added))
 }
 
+/// The changed runs between two token sequences (Myers, as for words): `old` and `new` in tokens.
+pub(crate) fn diff_tokens(old: &[&str], new: &[&str]) -> Vec<Hunk> {
+    let mut input = InternedInput::default();
+    input.update_before(old.iter().copied());
+    input.update_after(new.iter().copied());
+    let mut diff = Diff::compute(Algorithm::Myers, &input);
+    diff.postprocess_no_heuristic(&input);
+    diff.hunks()
+        .map(|hunk| Hunk {
+            old: hunk.before,
+            new: hunk.after,
+        })
+        .collect()
+}
+
 /// The base text with only some hunks applied: the content of a partial commit (the checked
 /// changes of a file), or of a partial rollback (the base with the kept changes). `hunks` must come
 /// from `diff_lines(old, new)`.
@@ -111,7 +126,7 @@ pub fn apply_hunks(old: &str, new: &str, hunks: &[Hunk], apply: impl Fn(&Hunk) -
 }
 
 /// Byte ranges of the lines, each with its line break.
-fn line_ranges(text: &str) -> Vec<Range<usize>> {
+pub(crate) fn line_ranges(text: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
     for (at, byte) in text.bytes().enumerate() {
@@ -127,7 +142,8 @@ fn line_ranges(text: &str) -> Vec<Range<usize>> {
 }
 
 /// Word tokens: runs of letters, digits and `_`; runs of whitespace; single other characters.
-fn words(text: &str) -> Vec<Range<usize>> {
+/// Together they cover the whole text.
+pub(crate) fn words(text: &str) -> Vec<Range<usize>> {
     #[derive(PartialEq)]
     enum Class {
         Word,

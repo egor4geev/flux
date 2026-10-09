@@ -1,9 +1,11 @@
 //! Russian translations: English source string → Russian, one table per area of the UI.
 
+mod branches;
 mod commands;
+mod commit;
 mod common;
 mod completion;
-mod commit;
+mod conflicts;
 mod diff;
 mod git;
 mod git_gutter;
@@ -14,6 +16,8 @@ mod pickers;
 mod search;
 mod settings;
 mod start;
+mod stash;
+mod sync;
 mod terminal;
 mod terminal_panel;
 mod terminal_search;
@@ -41,7 +45,19 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     git_gutter::STRINGS,
     diff::STRINGS,
     commit::STRINGS,
+    branches::STRINGS,
+    sync::STRINGS,
+    stash::STRINGS,
+    conflicts::STRINGS,
 ];
 
-/// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов".
-pub(super) const PLURALS: &[(&str, [&str; 3])] = common::PLURALS;
+/// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
+/// area, as the strings.
+pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
+    common::PLURALS,
+    git::PLURALS,
+    branches::PLURALS,
+    sync::PLURALS,
+    stash::PLURALS,
+    conflicts::PLURALS,
+];

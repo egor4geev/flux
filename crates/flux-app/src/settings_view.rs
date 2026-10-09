@@ -2,6 +2,8 @@
 //! left.
 //! - Language Servers: automatic installation on or off, and every server Flux knows with where it
 //!   comes from; those Flux installed can be updated and deleted, missing ones installed.
+//! - Version Control: how Update Project (⌘T) brings incoming commits into the current branch —
+//!   merge, rebase, or ask every time (the question's "Don't show again" sets it).
 //! - About: the version, the license, the developer, the source code. «About Flux» in the app menu
 //!   ([`About`]) opens Settings on this section.
 
@@ -21,7 +23,7 @@ use gpui::{
 use crate::i18n::{tr, trf};
 use crate::icons::{self, IconName, file_icon, icon};
 use crate::lsp::LspStore;
-use crate::settings;
+use crate::settings::{self, UpdatePreference};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 use crate::workspace::{Workspace, tilde};
@@ -53,15 +55,21 @@ pub fn init(cx: &mut App) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     LanguageServers,
+    VersionControl,
     About,
 }
 
 impl Section {
-    const ALL: [Section; 2] = [Section::LanguageServers, Section::About];
+    const ALL: [Section; 3] = [
+        Section::LanguageServers,
+        Section::VersionControl,
+        Section::About,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Section::LanguageServers => tr("Language Servers"),
+            Section::VersionControl => tr("Version Control"),
             Section::About => tr("About"),
         }
     }
@@ -69,6 +77,7 @@ impl Section {
     fn icon(self) -> IconName {
         match self {
             Section::LanguageServers => IconName::Command,
+            Section::VersionControl => IconName::Branch,
             Section::About => IconName::Info,
         }
     }
@@ -93,7 +102,9 @@ pub fn open(
         workspace.dismiss_modal(window, cx);
     }
     let store = workspace.lsp.downgrade();
-    workspace.toggle_modal(window, cx, move |_, cx| SettingsView::new(store, section, cx));
+    workspace.toggle_modal(window, cx, move |_, cx| {
+        SettingsView::new(store, section, cx)
+    });
 }
 
 /// «About Flux» with Settings closed (or without focus in them): the active window opens them on
@@ -433,7 +444,11 @@ impl SettingsView {
                 .gap_2()
                 .rounded(px(ui::RADIUS_SM))
                 .cursor_pointer()
-                .text_color(if selected { ui.foreground } else { ui.text_muted })
+                .text_color(if selected {
+                    ui.foreground
+                } else {
+                    ui.text_muted
+                })
                 .when(selected, |row| row.bg(ui.list_selected))
                 .when(!selected, |row| {
                     row.hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
@@ -517,6 +532,97 @@ impl SettingsView {
             )
             .child(ui::divider(ui))
             .child(div().flex().flex_col().gap_0p5().children(rows))
+    }
+
+    /// Version Control: Update Project's method, as JetBrains IDEs' Settings → Git → Update.
+    fn render_version_control(&self, cx: &mut Context<Self>) -> Div {
+        let ui = Theme::ui(cx);
+        let current = settings::update_method(cx);
+        let options = [
+            (
+                UpdatePreference::Merge,
+                tr("Merge"),
+                tr("Incoming commits are merged into the current branch"),
+            ),
+            (
+                UpdatePreference::Rebase,
+                tr("Rebase"),
+                tr("Your local commits are replayed on top of the incoming ones"),
+            ),
+            (
+                UpdatePreference::Ask,
+                tr("Ask every time"),
+                tr("Update Project asks before it starts"),
+            ),
+        ];
+        let rows = options
+            .into_iter()
+            .enumerate()
+            .map(|(index, (method, title, detail))| {
+                let selected = current == method;
+                div()
+                    .id(("update-method", index))
+                    .flex()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(ui::RADIUS_MD))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(ui.hover))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        settings::set_update_method(method, cx);
+                        cx.notify();
+                    }))
+                    .child(div().pt(px(2.)).child(ui::radio(
+                        ("update-method-radio", index),
+                        selected,
+                        ui,
+                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(title)
+                            .child(
+                                div()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.dim)
+                                    .child(detail),
+                            ),
+                    )
+            });
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_header(
+                tr("Version Control"),
+                tr(
+                    "Git: how Update Project (⌘T) brings the commits of the upstream into the current branch. Local changes are stashed for the update and come back after it.",
+                ),
+                ui,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_1()
+                    .rounded(px(ui::RADIUS_MD))
+                    .border_1()
+                    .border_color(ui.island_border)
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .pb_1()
+                            .child(ui::section_label(tr("Update Project"), ui)),
+                    )
+                    .children(rows),
+            )
     }
 
     /// About: the logo with the name, version, and description; then the facts in rows.
@@ -661,6 +767,7 @@ impl Render for SettingsView {
         let ui = Theme::ui(cx);
         let content = match self.section {
             Section::LanguageServers => self.render_language_servers(cx),
+            Section::VersionControl => self.render_version_control(cx),
             Section::About => self.render_about(cx),
         };
         ui::popover(ui)

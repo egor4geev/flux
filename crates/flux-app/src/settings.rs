@@ -13,14 +13,46 @@ use serde_json::{Value, json};
 pub struct Settings {
     /// Install a missing language server when a file needs it.
     pub auto_install_servers: bool,
+    /// How Update Project brings the incoming commits into the current branch.
+    pub update_method: UpdatePreference,
     /// Where the settings are saved; `None` — kept in memory only.
     path: Option<PathBuf>,
+}
+
+/// Update Project's method: asked the first time (as JetBrains IDEs do), then remembered when the
+/// user says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpdatePreference {
+    #[default]
+    Ask,
+    Merge,
+    Rebase,
+}
+
+impl UpdatePreference {
+    fn key(self) -> &'static str {
+        match self {
+            UpdatePreference::Ask => "ask",
+            UpdatePreference::Merge => "merge",
+            UpdatePreference::Rebase => "rebase",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "ask" => Some(UpdatePreference::Ask),
+            "merge" => Some(UpdatePreference::Merge),
+            "rebase" => Some(UpdatePreference::Rebase),
+            _ => None,
+        }
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             auto_install_servers: true,
+            update_method: UpdatePreference::default(),
             path: None,
         }
     }
@@ -51,6 +83,23 @@ pub fn auto_install_servers(cx: &App) -> bool {
 pub fn set_auto_install_servers(on: bool, cx: &mut App) {
     let settings = cx.default_global::<Settings>();
     settings.auto_install_servers = on;
+    save(settings);
+}
+
+pub fn update_method(cx: &App) -> UpdatePreference {
+    cx.try_global::<Settings>()
+        .map_or(UpdatePreference::default(), |settings| {
+            settings.update_method
+        })
+}
+
+pub fn set_update_method(method: UpdatePreference, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    settings.update_method = method;
+    save(settings);
+}
+
+fn save(settings: &Settings) {
     if let Some(path) = &settings.path
         && let Err(err) = write(path, &to_json(settings))
     {
@@ -80,6 +129,10 @@ fn parse(text: &str) -> Settings {
         auto_install_servers: value["language_servers"]["auto_install"]
             .as_bool()
             .unwrap_or(defaults.auto_install_servers),
+        update_method: value["git"]["update_method"]
+            .as_str()
+            .and_then(UpdatePreference::from_key)
+            .unwrap_or(defaults.update_method),
         ..defaults
     }
 }
@@ -87,6 +140,7 @@ fn parse(text: &str) -> Settings {
 fn to_json(settings: &Settings) -> String {
     let value = json!({
         "language_servers": { "auto_install": settings.auto_install_servers },
+        "git": { "update_method": settings.update_method.key() },
     });
     serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
 }
@@ -111,6 +165,7 @@ mod tests {
     fn settings_round_trip_through_the_file() {
         let off = Settings {
             auto_install_servers: false,
+            update_method: UpdatePreference::Rebase,
             path: None,
         };
         assert_eq!(parse(&to_json(&off)), off);

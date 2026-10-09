@@ -284,18 +284,16 @@ impl Element for EditorElement {
             lines,
         };
 
-        let current_line = (selection.len() == 1
-            && primary.is_empty()
-            && editor.message.is_none())
-        .then(|| {
-            fill(
-                Bounds::new(
-                    point(bounds.left(), layout.line_top(head_line)),
-                    size(bounds.size.width, line_height),
-                ),
-                ui.current_line,
-            )
-        });
+        let current_line = (selection.len() == 1 && primary.is_empty() && editor.message.is_none())
+            .then(|| {
+                fill(
+                    Bounds::new(
+                        point(bounds.left(), layout.line_top(head_line)),
+                        size(bounds.size.width, line_height),
+                    ),
+                    ui.current_line,
+                )
+            });
 
         let mut highlights = Vec::new();
         let newline_width = em * 0.5;
@@ -392,16 +390,22 @@ impl Element for EditorElement {
             bounds.origin,
             point(bounds.left() + gutter_width, bounds.bottom()),
         );
-        let git =
-            crate::git_gutter::prepaint(&editor.git, &layout, last_line, gutter_bounds, em, &ui, window);
+        let git = crate::git_gutter::prepaint(
+            &editor.git,
+            &layout,
+            last_line,
+            gutter_bounds,
+            em,
+            &ui,
+            window,
+        );
         let placeholder = editor
             .message
             .as_ref()
             .filter(|_| text.len_chars() == 0)
             .map(|placeholder| {
                 let runs = [run(placeholder.len(), ui.dim)];
-                let shaped =
-                    text_system.shape_line(placeholder.clone(), font_size, &runs, None);
+                let shaped = text_system.shape_line(placeholder.clone(), font_size, &runs, None);
                 (shaped, layout.origin)
             });
 

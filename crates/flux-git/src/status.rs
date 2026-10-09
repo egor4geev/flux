@@ -38,6 +38,103 @@ pub struct StatusEntry {
     pub staged: bool,
     /// The working tree differs from the index.
     pub unstaged: bool,
+    /// How a conflicted file conflicts ([`FileStatus::Conflicted`] only).
+    pub conflict: Option<ConflictKind>,
+}
+
+/// How a file conflicts: the two letters of an unmerged entry in `git status` (ours, theirs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConflictKind {
+    /// `UU`: both sides changed the file.
+    BothModified,
+    /// `AA`: both sides added a file at this path.
+    BothAdded,
+    /// `AU`: added on our side only (the other side has no such file and no base).
+    AddedByUs,
+    /// `UA`: added on their side only.
+    AddedByThem,
+    /// `DU`: we deleted it, they changed it.
+    DeletedByUs,
+    /// `UD`: they deleted it, we changed it.
+    DeletedByThem,
+    /// `DD`: both deleted it (a rename on both sides).
+    BothDeleted,
+}
+
+impl ConflictKind {
+    /// `UU`, `AA`, … → the kind.
+    pub fn from_xy(xy: &str) -> Option<Self> {
+        Some(match xy {
+            "UU" => ConflictKind::BothModified,
+            "AA" => ConflictKind::BothAdded,
+            "AU" => ConflictKind::AddedByUs,
+            "UA" => ConflictKind::AddedByThem,
+            "DU" => ConflictKind::DeletedByUs,
+            "UD" => ConflictKind::DeletedByThem,
+            "DD" => ConflictKind::BothDeleted,
+            _ => return None,
+        })
+    }
+
+    /// Both sides have a text to merge: the merge tool applies. Otherwise one side is taken whole.
+    pub fn mergeable(self) -> bool {
+        matches!(self, ConflictKind::BothModified | ConflictKind::BothAdded)
+    }
+
+    /// Our side has the file.
+    pub fn ours_exists(self) -> bool {
+        !matches!(
+            self,
+            ConflictKind::DeletedByUs | ConflictKind::BothDeleted | ConflictKind::AddedByThem
+        )
+    }
+
+    /// Their side has the file.
+    pub fn theirs_exists(self) -> bool {
+        !matches!(
+            self,
+            ConflictKind::DeletedByThem | ConflictKind::BothDeleted | ConflictKind::AddedByUs
+        )
+    }
+}
+
+/// A file changed between two revisions (a commit's files, a branch comparison, a stash): its
+/// path (relative, `/`), the path before a rename or copy, and how it changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    pub status: FileStatus,
+    pub path: String,
+    pub orig_path: Option<String>,
+}
+
+/// Parses `--name-status -z` output (`git diff`, `git diff-tree`): a status letter (with a score
+/// for renames and copies), then the path — two paths, old then new, for a rename or a copy.
+pub(crate) fn parse_name_status(output: &str) -> Vec<FileChange> {
+    let mut files = Vec::new();
+    let mut fields = output.split('\0').filter(|field| !field.is_empty());
+    while let Some(code) = fields.next() {
+        let letter = code.trim().as_bytes().first().copied();
+        let status = match letter {
+            Some(b'A' | b'C') => FileStatus::Added,
+            Some(b'D') => FileStatus::Deleted,
+            Some(b'R') => FileStatus::Renamed,
+            Some(b'T') => FileStatus::TypeChanged,
+            Some(b'U') => FileStatus::Conflicted,
+            _ => FileStatus::Modified,
+        };
+        let orig_path = match letter {
+            Some(b'R' | b'C') => fields.next().map(str::to_string),
+            _ => None,
+        };
+        if let Some(path) = fields.next() {
+            files.push(FileChange {
+                status,
+                path: path.to_string(),
+                orig_path,
+            });
+        }
+    }
+    files
 }
 
 /// The current branch and its upstream.
@@ -180,6 +277,7 @@ pub fn parse(output: &[u8]) -> RepoStatus {
                     status: FileStatus::Conflicted,
                     staged: true,
                     unstaged: true,
+                    conflict: ConflictKind::from_xy(parts[1]),
                 })
             }
             Some(b'?') => field.get(2..).map(|path| StatusEntry {
@@ -188,6 +286,7 @@ pub fn parse(output: &[u8]) -> RepoStatus {
                 status: FileStatus::Untracked,
                 staged: false,
                 unstaged: true,
+                conflict: None,
             }),
             _ => None,
         };
@@ -233,6 +332,7 @@ fn ordinary(xy: &str, path: &str, orig_path: Option<String>) -> StatusEntry {
         status,
         staged: x != '.',
         unstaged: y != '.',
+        conflict: None,
     }
 }
 
@@ -299,6 +399,7 @@ mod tests {
             ]
         );
         assert_eq!(status.entries[3].orig_path.as_deref(), Some("lib/old.rs"));
+        assert_eq!(status.entries[4].conflict, Some(ConflictKind::BothModified));
         assert!(status.entries[0].unstaged && !status.entries[0].staged);
         assert!(status.entries[1].staged && !status.entries[1].unstaged);
     }

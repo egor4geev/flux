@@ -76,7 +76,11 @@ pub(super) const PLURALS: &[(&str, [&str; 3])] = &[
     // Language server navigation.
     (
         "{n} usage",
-        ["{n} использование", "{n} использования", "{n} использований"],
+        [
+            "{n} использование",
+            "{n} использования",
+            "{n} использований",
+        ],
     ),
     (
         "{n} definition",

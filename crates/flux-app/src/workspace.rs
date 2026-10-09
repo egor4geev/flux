@@ -12,20 +12,22 @@ use gpui::{
     Action, AnyElement, AnyView, App, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, Context,
     DismissEvent, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Global,
     KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    Point, PromptLevel, Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity,
-    Window, WindowHandle, actions, anchored, deferred, div, prelude::*, px, relative,
+    Point, PromptLevel, Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
+    WindowHandle, actions, anchored, deferred, div, prelude::*, px, relative,
 };
 
 use crate::commit_panel::{CommitPanel, CommitPanelEvent};
-use crate::diff_view::{DiffView, DiffViewEvent};
+use crate::diff_view::{DiffSide, DiffView, DiffViewEvent};
 use crate::editor::{self, Editor};
 use crate::file_tree::{self, FileTreeEvent, FileTreePanel};
-use crate::git::{GitEvent, GitStore};
 use crate::find_bar::{self, FindBar};
+use crate::git::{GitEvent, GitStore};
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
 use crate::launchpad::{self, Tool};
 use crate::lsp::LspStore;
+use crate::merge_view::{MergeView, MergeViewEvent};
+use crate::notifications::{self, Notifications};
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
 use crate::start_screen::{self, StartScreen};
 use crate::terminal_group::{DraggedTerminal, TerminalGroup, TerminalGroupEvent};
@@ -51,6 +53,17 @@ const SEARCH_MAX_WIDTH: f32 = 1080.;
 /// In a window narrower than this, the file search bar is not shown in the title bar: it would not
 /// fit between the buttons.
 const TITLE_SEARCH_MIN_WINDOW: f32 = 920.;
+/// Actions that only make sense while an operation is in progress or something conflicts: the
+/// notifications offering them close when that is over.
+const OPERATION_ACTIONS: &[&str] = &[
+    "git::ResolveConflicts",
+    "git::ContinueOperation",
+    "git::AbortOperation",
+    "git::SkipCommit",
+    "git::ContinueRepoOperation",
+    "git::AbortRepoOperation",
+    "git::SkipRepoCommit",
+];
 /// How long a status bar message stays while a terminal tab is active (an editor keeps its own until
 /// the next edit).
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
@@ -179,6 +192,8 @@ pub struct Workspace {
     /// Terminals: an island under the editor (⌥F12).
     terminal_panel: Entity<TerminalPanel>,
     terminal_open: bool,
+    /// Notifications in the bottom right corner (results of git operations).
+    notifications: Entity<Notifications>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -202,12 +217,14 @@ struct Tab {
     _subscriptions: Vec<Subscription>,
 }
 
-/// What a tab shows: a document, a terminal tab brought over from the panel, or a diff.
+/// What a tab shows: a document, a terminal tab brought over from the panel, a diff, or the merge
+/// tool of a conflicted file.
 #[derive(Clone, PartialEq)]
 enum TabItem {
     Editor(Entity<Editor>),
     Terminal(Entity<TerminalGroup>),
     Diff(Entity<DiffView>),
+    Merge(Entity<MergeView>),
 }
 
 impl TabItem {
@@ -232,11 +249,19 @@ impl TabItem {
         }
     }
 
+    fn merge(&self) -> Option<&Entity<MergeView>> {
+        match self {
+            TabItem::Merge(view) => Some(view),
+            _ => None,
+        }
+    }
+
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
             TabItem::Editor(editor) => editor.focus_handle(cx),
             TabItem::Terminal(group) => group.focus_handle(cx),
             TabItem::Diff(view) => view.focus_handle(cx),
+            TabItem::Merge(view) => view.focus_handle(cx),
         }
     }
 
@@ -245,6 +270,7 @@ impl TabItem {
         match self {
             TabItem::Editor(editor) => is_modified(editor, cx),
             TabItem::Diff(view) => owned_editor(view, cx).is_some_and(|e| is_modified(&e, cx)),
+            TabItem::Merge(view) => view.read(cx).is_modified(cx),
             TabItem::Terminal(_) => false,
         }
     }
@@ -311,6 +337,7 @@ impl Workspace {
             tree
         });
         let terminal_panel = cx.new(|cx| TerminalPanel::new(root.clone(), window, cx));
+        let notifications = cx.new(|_| Notifications::new());
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
         let subscriptions = vec![
@@ -325,6 +352,7 @@ impl Workspace {
             cx.observe(&find_bar, |_, _, cx| cx.notify()),
             cx.observe(&project_search, |_, _, cx| cx.notify()),
             cx.observe(&terminal_panel, |_, _, cx| cx.notify()),
+            cx.observe(&notifications, |_, _, cx| cx.notify()),
             cx.subscribe_in(&terminal_panel, window, Self::on_terminal_panel_event),
             cx.subscribe_in(
                 &project_search,
@@ -373,6 +401,7 @@ impl Workspace {
             lsp,
             terminal_panel,
             terminal_open: false,
+            notifications,
             _subscriptions: subscriptions,
         };
         if !paths.is_empty() {
@@ -408,10 +437,8 @@ impl Workspace {
             .update(cx, |panel, _| panel.set_root(Some(root.clone())));
         self.lsp = Self::build_lsp(Some(root), cx);
         for editor in self.editors(cx) {
-            self.lsp
-                .update(cx, |store, cx| store.register(&editor, cx));
-            self.git
-                .update(cx, |store, cx| store.register(&editor, cx));
+            self.lsp.update(cx, |store, cx| store.register(&editor, cx));
+            self.git.update(cx, |store, cx| store.register(&editor, cx));
         }
         self.reveal_active(cx);
         cx.notify();
@@ -431,7 +458,21 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> (Entity<GitStore>, Subscription) {
         let git = cx.new(|cx| GitStore::new(root, cx));
-        cx.observe(&git, |_, _, cx| cx.notify()).detach();
+        cx.observe(&git, |this, git, cx| {
+            // A card that offers the next step of a merge or a rebase ("Resolve…", "Continue
+            // Rebase", "Abort") is stale once nothing is in progress and nothing conflicts.
+            let idle = {
+                let git = git.read(cx);
+                git.repos_in_progress().is_empty() && git.conflicts().is_empty()
+            };
+            if idle {
+                this.notifications.update(cx, |notifications, cx| {
+                    notifications.retain(|card| !card.offers(OPERATION_ACTIONS), cx)
+                });
+            }
+            cx.notify()
+        })
+        .detach();
         let subscription = cx.subscribe_in(&git, window, |this, _, event, window, cx| {
             this.on_git_event(event, window, cx)
         });
@@ -458,6 +499,50 @@ impl Workspace {
                     ));
                 }
             }
+            GitEvent::Notify(notification) => self.notify(notification.clone(), cx),
+            GitEvent::WorkTreeChanged(repo) => self.work_tree_changed(*repo, window, cx),
+        }
+    }
+
+    /// Closes the notifications that offer one of the actions named (the user did it another way).
+    pub(crate) fn dismiss_notifications(&mut self, actions: &[&str], cx: &mut Context<Self>) {
+        self.notifications.update(cx, |notifications, cx| {
+            notifications.retain(|card| !card.offers(actions), cx)
+        });
+    }
+
+    /// A notification in the bottom right corner.
+    pub(crate) fn notify(
+        &mut self,
+        notification: crate::notifications::Notification,
+        cx: &mut Context<Self>,
+    ) {
+        self.notifications
+            .update(cx, |notifications, cx| notifications.push(notification, cx));
+    }
+
+    /// A git operation changed files of a repository (checkout, merge, stash…): open documents
+    /// take what is on disk now; unmodified ones whose files are gone close (a modified one stays,
+    /// saving brings the file back).
+    fn work_tree_changed(&mut self, repo: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_documents(None, cx);
+        let Some(work_dir) = self
+            .git
+            .read(cx)
+            .repos()
+            .get(repo)
+            .map(|entry| entry.repo.work_dir.clone())
+        else {
+            return;
+        };
+        let gone: Vec<PathBuf> = self
+            .editors(cx)
+            .iter()
+            .filter_map(|editor| editor.read(cx).document.path().map(Path::to_path_buf))
+            .filter(|path| path.starts_with(&work_dir) && !path.exists())
+            .collect();
+        if !gone.is_empty() {
+            self.documents_removed(&gone, window, cx);
         }
     }
 
@@ -468,7 +553,7 @@ impl Workspace {
             let editor = match &tab.item {
                 TabItem::Editor(editor) => Some(editor.clone()),
                 TabItem::Diff(view) => owned_editor(view, cx),
-                TabItem::Terminal(_) => None,
+                TabItem::Terminal(_) | TabItem::Merge(_) => None,
             };
             if let Some(editor) = editor
                 && !editors.contains(&editor)
@@ -484,20 +569,19 @@ impl Workspace {
         match self.active_item()? {
             TabItem::Editor(editor) => editor.read(cx).document.path().map(Path::to_path_buf),
             TabItem::Diff(view) => Some(view.read(cx).path().to_path_buf()),
+            TabItem::Merge(view) => Some(view.read(cx).path().to_path_buf()),
             TabItem::Terminal(_) => None,
         }
     }
 
     /// The active tab, if it is a document.
     pub(crate) fn active_editor(&self) -> Option<Entity<Editor>> {
-        self.active_item()
-            .and_then(|item| item.editor().cloned())
+        self.active_item().and_then(|item| item.editor().cloned())
     }
 
     /// The active tab, if it is a terminal tab.
     fn active_terminal(&self) -> Option<Entity<TerminalGroup>> {
-        self.active_item()
-            .and_then(|item| item.terminal().cloned())
+        self.active_item().and_then(|item| item.terminal().cloned())
     }
 
     fn active_item(&self) -> Option<TabItem> {
@@ -594,10 +678,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Entity<Editor> {
         let editor = cx.new(|cx| Editor::new(document, window, cx));
-        self.lsp
-            .update(cx, |store, cx| store.register(&editor, cx));
-        self.git
-            .update(cx, |store, cx| store.register(&editor, cx));
+        self.lsp.update(cx, |store, cx| store.register(&editor, cx));
+        self.git.update(cx, |store, cx| store.register(&editor, cx));
         editor
     }
 
@@ -641,7 +723,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let index = index
-            .unwrap_or(if self.tabs.is_empty() { 0 } else { self.active + 1 })
+            .unwrap_or(if self.tabs.is_empty() {
+                0
+            } else {
+                self.active + 1
+            })
             .min(self.tabs.len());
         self.tabs.insert(
             index,
@@ -908,7 +994,7 @@ impl Workspace {
     /// window's status bar for a few seconds; in an empty window, under the hint.
     pub(crate) fn show_message(&mut self, message: SharedString, cx: &mut Context<Self>) {
         let editor = match self.active_item() {
-            Some(TabItem::Diff(view)) => view.read(cx).working().cloned(),
+            Some(TabItem::Diff(view)) => view.read(cx).working_copy().cloned(),
             _ => None,
         };
         if let Some(editor) = editor {
@@ -918,7 +1004,7 @@ impl Workspace {
             Some(TabItem::Editor(editor)) => {
                 editor.update(cx, |editor, cx| editor.show_status(message, cx))
             }
-            Some(TabItem::Terminal(_) | TabItem::Diff(_)) => {
+            Some(TabItem::Terminal(_) | TabItem::Diff(_) | TabItem::Merge(_)) => {
                 self.status_message = Some(message);
                 self.status_message_task = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor()
@@ -956,18 +1042,28 @@ impl Workspace {
             TabItem::Editor(editor) => self.close_tab(editor, window, cx),
             TabItem::Terminal(group) => self.close_terminal_tab(group, window, cx),
             TabItem::Diff(view) => self.close_diff_tab(view, window, cx),
+            TabItem::Merge(view) => self.close_merge_tab(view, window, cx),
         }
     }
 
     /// Closes a diff; the working copy it opened without a tab is asked about if it has unsaved
     /// changes.
-    fn close_diff_tab(&mut self, view: Entity<DiffView>, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_diff_tab(
+        &mut self,
+        view: Entity<DiffView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.closing {
             return;
         }
         let owned = owned_editor(&view, cx).filter(|editor| is_modified(editor, cx));
         let remove = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-            if let Some(index) = this.tabs.iter().position(|tab| tab.item.diff() == Some(&view)) {
+            if let Some(index) = this
+                .tabs
+                .iter()
+                .position(|tab| tab.item.diff() == Some(&view))
+            {
                 this.remove_tab_at(index, window, cx);
             }
         };
@@ -992,9 +1088,11 @@ impl Workspace {
     pub fn open_diff(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let target = canonical(&path);
         let open = self.tabs.iter().position(|tab| {
-            tab.item
-                .diff()
-                .is_some_and(|view| canonical(view.read(cx).path()) == target)
+            tab.item.diff().is_some_and(|view| {
+                let view = view.read(cx);
+                // A comparison of the same file (a branch, a stash) is another tab.
+                view.compares().is_none() && canonical(view.path()) == target
+            })
         });
         if let Some(index) = open {
             return self.activate(index, window, cx);
@@ -1051,6 +1149,179 @@ impl Workspace {
             }),
         ];
         self.insert_tab(TabItem::Diff(view), subscriptions, None, window, cx);
+    }
+
+    /// Opens a comparison of a file at two revisions (or a revision and the working copy) in a
+    /// diff tab, or activates the one that is open.
+    pub fn open_compare(
+        &mut self,
+        path: PathBuf,
+        repo: usize,
+        left: DiffSide,
+        right: DiffSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = canonical(&path);
+        let open = self.tabs.iter().position(|tab| {
+            tab.item.diff().is_some_and(|view| {
+                let view = view.read(cx);
+                canonical(view.path()) == target && view.compares() == Some((&left, &right))
+            })
+        });
+        if let Some(index) = open {
+            return self.activate(index, window, cx);
+        }
+        let working = (right == DiffSide::WorkingCopy)
+            .then(|| {
+                self.tabs.iter().find_map(|tab| {
+                    let editor = tab.item.editor()?;
+                    let path = editor.read(cx).document.path().map(canonical)?;
+                    (path == target).then(|| editor.clone())
+                })
+            })
+            .flatten();
+        let needs_editor = right == DiffSide::WorkingCopy && working.is_none() && path.exists();
+        if !needs_editor {
+            return self.add_compare_tab(path, repo, left, right, working, false, window, cx);
+        }
+        self.loading += 1;
+        let read = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { read_document(path) }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = read.await;
+            this.update_in(cx, |this, window, cx| {
+                this.loading -= 1;
+                match result {
+                    Ok(document) => {
+                        let editor = this.new_editor(document, window, cx);
+                        this.add_compare_tab(
+                            path,
+                            repo,
+                            left,
+                            right,
+                            Some(editor),
+                            true,
+                            window,
+                            cx,
+                        )
+                    }
+                    Err(error) => this.report_dialog(vec![error], cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_compare_tab(
+        &mut self,
+        path: PathBuf,
+        repo: usize,
+        left: DiffSide,
+        right: DiffSide,
+        working: Option<Entity<Editor>>,
+        owns_working: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git = self.git.clone();
+        let view = cx.new(|cx| {
+            let mut view = DiffView::compare(path, repo, left, right, git, working, window, cx);
+            view.set_owns_working(owns_working);
+            view
+        });
+        let subscriptions = vec![
+            cx.observe(&view, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+                DiffViewEvent::OpenFile(location) => {
+                    this.open_location(location.clone(), true, window, cx)
+                }
+            }),
+        ];
+        self.insert_tab(TabItem::Diff(view), subscriptions, None, window, cx);
+    }
+
+    /// Opens the merge tool for a conflicted file (or activates its tab).
+    pub fn open_merge(
+        &mut self,
+        repo: usize,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = canonical(&path);
+        let open = self.tabs.iter().position(|tab| {
+            tab.item
+                .merge()
+                .is_some_and(|view| canonical(view.read(cx).path()) == target)
+        });
+        if let Some(index) = open {
+            return self.activate(index, window, cx);
+        }
+        // The user is resolving now: cards that only point at the conflicts go.
+        self.dismiss_notifications(&["git::ResolveConflicts"], cx);
+        let git = self.git.clone();
+        let view = cx.new(|cx| MergeView::new(repo, path, git, window, cx));
+        let subscriptions = vec![
+            cx.observe(&view, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
+                MergeViewEvent::Close => {
+                    if let Some(index) = this
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.item.merge() == Some(view))
+                    {
+                        this.remove_tab_at(index, window, cx);
+                    }
+                }
+                MergeViewEvent::OpenFile(location) => {
+                    this.open_location(location.clone(), true, window, cx)
+                }
+            }),
+        ];
+        self.insert_tab(TabItem::Merge(view), subscriptions, None, window, cx);
+    }
+
+    /// Closes the merge tool; an unapplied result is asked about first.
+    fn close_merge_tab(
+        &mut self,
+        view: Entity<MergeView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing {
+            return;
+        }
+        let confirm = view.update(cx, |view, cx| view.confirm_close(window, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            if confirm.await {
+                this.update_in(cx, |this, window, cx| {
+                    if let Some(index) = this
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.item.merge() == Some(&view))
+                    {
+                        this.remove_tab_at(index, window, cx);
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// The Stash tab of the commit window (Unstash Changes…).
+    pub fn show_stash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_commit_window(false, window, cx);
+        if let Some(handle) = &self.commit_panel {
+            handle
+                .panel
+                .update(cx, |panel, cx| panel.show_stash(window, cx));
+        }
     }
 
     /// ⌘K (`focus_message`) and ⌘0: shows the commit window in place of the tree.
@@ -1112,15 +1383,14 @@ impl Workspace {
         let git = self.git.clone();
         let width = self.left_width.clone();
         let panel = cx.new(|cx| CommitPanel::new(git, width, window, cx));
-        let subscription = cx.subscribe_in(&panel, window, |this, _, event, window, cx| {
-            match event {
+        let subscription =
+            cx.subscribe_in(&panel, window, |this, _, event, window, cx| match event {
                 CommitPanelEvent::OpenDiff(path) => this.open_diff(path.clone(), window, cx),
                 CommitPanelEvent::OpenFile(path) => this.open_file(path.clone(), true, window, cx),
                 CommitPanelEvent::FocusEditor => this.focus_active(window, cx),
                 CommitPanelEvent::Push => crate::push_dialog::open(this, window, cx),
                 CommitPanelEvent::Removed(paths) => this.documents_removed(paths, window, cx),
-            }
-        });
+            });
         self.commit_panel = Some(CommitPanelHandle {
             panel: panel.clone(),
             _subscription: subscription,
@@ -1199,9 +1469,51 @@ impl Workspace {
     }
 
     /// Before the window closes or the app quits: one question about the commands running in the
-    /// window's terminals (the panel's and the tabs'), then the unsaved documents one by one. `true`
-    /// means everything may go.
+    /// window's terminals (the panel's and the tabs'), then the unsaved documents one by one, then
+    /// the merge results not applied yet. `true` means everything may go.
     fn confirm_close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
+        let documents = self.confirm_close_documents(window, cx);
+        let merges: Vec<Entity<MergeView>> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.item.merge().cloned())
+            .filter(|view| view.read(cx).is_modified(cx))
+            .collect();
+        if merges.is_empty() {
+            return documents;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            if !documents.await {
+                return false;
+            }
+            for view in merges {
+                let shown = this.update_in(cx, |this, window, cx| {
+                    if let Some(index) = this
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.item.merge() == Some(&view))
+                    {
+                        this.activate(index, window, cx);
+                    }
+                    view.update(cx, |view, cx| view.confirm_close(window, cx))
+                });
+                let Ok(confirm) = shown else {
+                    return false;
+                };
+                if !confirm.await {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+
+    /// The running commands and the unsaved documents of [`Self::confirm_close_all`].
+    fn confirm_close_documents(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
         if self.closing {
             return Task::ready(false);
         }
@@ -1427,9 +1739,7 @@ impl Workspace {
             .into_iter()
             .filter_map(|editor| {
                 let path = editor.read(cx).document.path()?.to_path_buf();
-                let affected = paths
-                    .as_ref()
-                    .is_none_or(|paths| paths.contains(&path));
+                let affected = paths.as_ref().is_none_or(|paths| paths.contains(&path));
                 affected.then_some((editor, path))
             })
             .collect();
@@ -1691,7 +2001,12 @@ impl Workspace {
 
     /// ⌘-click on a link in a terminal: a file opens at its line and column, a directory is shown
     /// in the tree, a URL opens in the browser.
-    fn open_terminal_link(&mut self, link: &TerminalLink, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_terminal_link(
+        &mut self,
+        link: &TerminalLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match link {
             TerminalLink::File { path, line, column } => match line {
                 Some(line) => {
@@ -1888,6 +2203,9 @@ impl Workspace {
             Some(TabItem::Diff(view)) => {
                 trf("{0} (diff) — {1}", &[&view.read(cx).title(), &project])
             }
+            Some(TabItem::Merge(view)) => {
+                trf("{0} (merge) — {1}", &[&view.read(cx).title(), &project])
+            }
             None => project.clone(),
         };
         if title != self.title {
@@ -1955,22 +2273,7 @@ impl Workspace {
                 .child(icon(IconName::FolderPlus, ui.folder).size(px(14.)))
                 .child(tr("Open Folder…"))
         });
-        let active = self.active_path(cx);
-        let branch = self.git.read(cx).branch_label(active.as_deref());
-        let branch = branch.map(|branch| {
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .h(px(22.))
-                .px_2()
-                .rounded(px(11.))
-                .bg(UiColors::tint(ui.violet, 0.12))
-                .text_size(px(theme::TEXT_SM))
-                .text_color(ui.violet)
-                .child(icon(IconName::Branch, ui.violet).size(px(12.)))
-                .child(branch)
-        });
+        let branch = crate::branches_popup::branch_chip(self, window, cx);
         let search =
             (f32::from(window.viewport_size().width) >= TITLE_SEARCH_MIN_WINDOW).then(|| {
                 div()
@@ -2069,13 +2372,23 @@ impl Workspace {
         let editor = match self.active_item() {
             Some(TabItem::Editor(editor)) => editor,
             Some(TabItem::Terminal(group)) => return self.terminal_status(bar, &group, cx),
-            Some(TabItem::Diff(view)) => match view.read(cx).working().cloned() {
+            Some(TabItem::Diff(view)) => match view.read(cx).working_copy().cloned() {
                 Some(editor) => editor,
                 None => {
                     let path = self.display_path(view.read(cx).path());
                     return bar.child(div().flex_1().min_w_0().truncate().child(path));
                 }
             },
+            Some(TabItem::Merge(view)) => {
+                let path = self.display_path(view.read(cx).path());
+                let left = match &self.status_message {
+                    Some(message) => message.clone(),
+                    None => path.into(),
+                };
+                return bar
+                    .child(div().flex_1().min_w_0().truncate().child(left))
+                    .children(crate::git::status_item(self.git.read(cx), ui));
+            }
             None => {
                 return bar.child(div().text_color(ui.dim).child(match &self.root {
                     Some(root) => tilde(root),
@@ -2136,7 +2449,11 @@ impl Workspace {
             )
             .children(crate::diagnostics::status_item(editor, ui))
             .children(crate::git::status_item(self.git.read(cx), ui))
-            .children(crate::lsp::status_item(self.lsp.read(cx), Some(editor_id), ui))
+            .children(crate::lsp::status_item(
+                self.lsp.read(cx),
+                Some(editor_id),
+                ui,
+            ))
             .child(item(status.line_ending.to_string()).text_color(ui.dim))
     }
 
@@ -2172,7 +2489,12 @@ impl Workspace {
                 .items_center()
                 .gap_1p5()
                 .child(icon(IconName::Terminal, ui.green).size(px(13.)))
-                .child(div().flex_none().text_color(ui.foreground).child(view.label()))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(ui.foreground)
+                        .child(view.label()),
+                )
                 .children(directory.map(|directory| div().truncate().child(directory))),
         )
     }
@@ -2205,6 +2527,7 @@ impl Workspace {
                     .render_terminal_tab(index, group, detail, cx)
                     .into_any_element(),
                 TabItem::Diff(view) => self.render_diff_tab(index, view, cx).into_any_element(),
+                TabItem::Merge(view) => self.render_merge_tab(index, view, cx).into_any_element(),
             })
             .collect();
         // While a tab is dragged over the strip: a marker where it would land.
@@ -2212,7 +2535,12 @@ impl Workspace {
             let strip = self.tab_scroll.bounds();
             let x = match self.tab_scroll.bounds_for_item(index) {
                 Some(tab) => tab.left() - px(3.),
-                None => self.tab_scroll.bounds_for_item(index.checked_sub(1)?)?.right() + px(1.),
+                None => {
+                    self.tab_scroll
+                        .bounds_for_item(index.checked_sub(1)?)?
+                        .right()
+                        + px(1.)
+                }
             };
             Some(
                 div()
@@ -2340,7 +2668,12 @@ impl Workspace {
                 None => label(&title),
             })
             .children(detail.map(|detail| label(&detail).text_color(ui.dim)))
-            .child(close_button(TabItem::Editor(editor.clone()), active, dot, cx))
+            .child(close_button(
+                TabItem::Editor(editor.clone()),
+                active,
+                dot,
+                cx,
+            ))
     }
 
     /// A diff tab: the diff icon, the file name, "diff"; a dot while the working copy it opened
@@ -2383,6 +2716,43 @@ impl Workspace {
             .child(close_button(TabItem::Diff(view.clone()), active, dot, cx))
     }
 
+    /// The merge tool's tab: the file name, "merge", a dot while the result isn't applied.
+    fn render_merge_tab(
+        &self,
+        index: usize,
+        view: &Entity<MergeView>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        let active = index == self.active;
+        let title = view.read(cx).title();
+        let dot = view.read(cx).is_modified(cx).then_some(ui.modified);
+        let (activate, close) = (view.clone(), view.clone());
+        tab_shell(view.entity_id(), active, ui)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    let index = this
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.item.merge() == Some(&activate));
+                    if let Some(index) = index {
+                        this.activate(index, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    this.close_merge_tab(close.clone(), window, cx)
+                }),
+            )
+            .child(icon(IconName::Merge, ui.vcs_conflict).size(px(14.)))
+            .child(label(&title))
+            .child(label(tr("merge")).text_color(ui.dim))
+            .child(close_button(TabItem::Merge(view.clone()), active, dot, cx))
+    }
+
     /// A terminal tab: the process of its active terminal, a mark when the bell rang while it was
     /// in the background.
     fn render_terminal_tab(
@@ -2420,7 +2790,12 @@ impl Workspace {
             .child(icon(IconName::Terminal, ui.green).size(px(14.)))
             .child(label(&title))
             .children(detail.map(|detail| label(&detail).text_color(ui.dim)))
-            .child(close_button(TabItem::Terminal(group.clone()), active, dot, cx))
+            .child(close_button(
+                TabItem::Terminal(group.clone()),
+                active,
+                dot,
+                cx,
+            ))
     }
 
     // --- Dragging tabs ---
@@ -2525,12 +2900,20 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open))
             // Language server navigation and refactoring.
             .map(|root| crate::navigation::actions(root, cx))
-            .on_action(cx.listener(|this, _: &crate::settings_view::Toggle, window, cx| {
-                crate::settings_view::toggle(this, window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::settings_view::Toggle, window, cx| {
+                    crate::settings_view::toggle(this, window, cx)
+                }),
+            )
             .map(|root| crate::lsp::workspace_actions(root, cx))
             .map(|root| crate::git::workspace_actions(root, cx))
             .map(|root| crate::vcs_menu::workspace_actions(root, cx))
+            .map(|root| crate::branches_popup::workspace_actions(root, cx))
+            .map(|root| crate::branch_dialogs::workspace_actions(root, cx))
+            .map(|root| crate::git_sync::workspace_actions(root, cx))
+            .map(|root| crate::compare_dialog::workspace_actions(root, cx))
+            .map(|root| crate::stash_panel::workspace_actions(root, cx))
+            .map(|root| crate::conflicts_dialog::workspace_actions(root, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
                 // A directory from the recent list may have disappeared since launch.
                 if !action.0.is_dir() {
@@ -2601,19 +2984,24 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &file_tree::ToggleOpen, window, cx| {
                 this.toggle_tree(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &terminal_panel::TogglePanel, window, cx| {
-                this.toggle_terminal(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &terminal_panel::NewTerminal, window, cx| {
-                this.new_terminal(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &terminal_panel::TogglePanel, window, cx| {
+                    this.toggle_terminal(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &terminal_panel::NewTerminal, window, cx| {
+                    this.new_terminal(window, cx)
+                }),
+            )
             // ⇧Esc hides the panel only from one of its terminals.
-            .on_action(cx.listener(|this, _: &terminal_panel::HidePanel, window, cx| {
-                if this.terminal_panel.read(cx).contains_focus(window, cx) {
-                    this.hide_terminal(window, cx)
-                }
-            }))
-
+            .on_action(
+                cx.listener(|this, _: &terminal_panel::HidePanel, window, cx| {
+                    if this.terminal_panel.read(cx).contains_focus(window, cx) {
+                        this.hide_terminal(window, cx)
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &file_tree::ToggleFocus, window, cx| {
                 this.toggle_tree_focus(window, cx)
             }))
@@ -2663,6 +3051,7 @@ impl Render for Workspace {
                     TabItem::Editor(editor) => editor.clone().into_any_element(),
                     TabItem::Terminal(group) => group.clone().into_any_element(),
                     TabItem::Diff(view) => view.clone().into_any_element(),
+                    TabItem::Merge(view) => view.clone().into_any_element(),
                 };
                 main.child(self.render_tab_bar(cx))
                     .when(
@@ -2703,9 +3092,11 @@ impl Render for Workspace {
         let terminal = self.terminal_open.then(|| {
             ui::island(ui)
                 .flex_none()
-                .on_action(cx.listener(|this, _: &terminal_panel::MoveToEditor, window, cx| {
-                    this.move_to_editor(window, cx)
-                }))
+                .on_action(
+                    cx.listener(|this, _: &terminal_panel::MoveToEditor, window, cx| {
+                        this.move_to_editor(window, cx)
+                    }),
+                )
                 .child(self.terminal_panel.clone())
         });
         let main = div()
@@ -2734,6 +3125,7 @@ impl Render for Workspace {
                     .child(main),
             )
             .child(self.render_status_bar(cx))
+            .children(notifications::overlay(&self.notifications, cx))
             .children(self.render_project_search(cx))
             .children(self.render_modal(cx))
     }

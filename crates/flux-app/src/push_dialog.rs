@@ -2,23 +2,31 @@
 //! (`main → origin : main`; the target branch can be edited, a branch the remote doesn't have yet
 //! is marked New), the commits that would be pushed and the files of the selected one; "Push" (↵),
 //! "Force Push…" (with lease, after a question) and "Push tags". The push itself runs in the
-//! background: its progress and result are in the status bar, a rejection is shown with git's
-//! output.
+//! background: its progress is in the status bar, the result in a notification. A push rejected
+//! because the remote has commits the branch doesn't asks, as JetBrains' "Push Rejected" does,
+//! whether to rebase or merge them first — then the branch is updated and pushed again.
+//!
+//! From the branches popup the dialog pushes a chosen local branch (`open_for_branch`) instead of
+//! the current ones.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flux_git::{CommitInfo, FileStatus, PushRequest, Remote, Repo};
+use flux_git::{
+    CommitInfo, FileStatus, GitError, Outcome, PushRequest, Remote, Repo, UpdateMethod,
+};
 use gpui::{
-    App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, KeyBinding, PromptLevel, Render, SharedString, Subscription, Task, Window, actions,
-    div, prelude::*, px,
+    App, AsyncWindowContext, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, FontWeight, KeyBinding, PromptLevel, Render, SharedString, Subscription, Task,
+    Window, actions, div, prelude::*, px,
 };
 
 use crate::git::{self, CheckState, GitEvent, GitStore};
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, file_icon, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::notifications::Notification;
+use crate::settings::{self, UpdatePreference};
 use crate::theme::{self, Theme};
 use crate::ui::{self, RADIUS_SM};
 use crate::workspace::Workspace;
@@ -58,7 +66,25 @@ pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Wor
         });
     }
     workspace.toggle_modal(window, cx, move |window, cx| {
-        PushDialog::new(git, window, cx)
+        PushDialog::new(git, None, window, cx)
+    });
+}
+
+/// Push… of a chosen local branch of a repository (the branches popup): the dialog for that
+/// repository only, with `branch` — its upstream or a branch of the same name as the target.
+pub fn open_for_branch(
+    workspace: &mut Workspace,
+    repo: usize,
+    branch: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let git = workspace.git().clone();
+    if git.read(cx).repos().get(repo).is_none() {
+        return;
+    }
+    workspace.toggle_modal(window, cx, move |window, cx| {
+        PushDialog::new(git, Some((repo, branch)), window, cx)
     });
 }
 
@@ -70,6 +96,8 @@ struct PushRepo {
     name: String,
     /// The local branch; `None` — detached HEAD.
     branch: Option<String>,
+    /// What goes: `HEAD` for the current branch, `refs/heads/<branch>` for another one.
+    local_rev: String,
     /// `origin/main`, if the branch has one.
     upstream: Option<String>,
     remotes: Vec<Remote>,
@@ -101,6 +129,15 @@ impl PushRepo {
     }
 }
 
+/// What goes from a repository: its branch (and how to name it in `git log`) and the upstream.
+struct Pushed {
+    index: usize,
+    repo: Repo,
+    branch: Option<String>,
+    upstream: Option<String>,
+    local_rev: String,
+}
+
 /// What the dialog reads about a repository in the background.
 struct Loaded {
     remotes: Vec<Remote>,
@@ -126,23 +163,63 @@ pub struct PushDialog {
 impl EventEmitter<DismissEvent> for PushDialog {}
 
 impl PushDialog {
-    fn new(git: Entity<GitStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// The dialog for every repository's current branch, or (`only`) for one chosen branch.
+    fn new(
+        git: Entity<GitStore>,
+        only: Option<(usize, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut repos = Vec::new();
         let mut subscriptions = Vec::new();
-        let entries: Vec<(Repo, Option<String>, Option<String>)> = git
-            .read(cx)
+        let store = git.read(cx);
+        let entries: Vec<Pushed> = store
             .repos()
             .iter()
-            .map(|entry| {
-                let branch = &entry.status.branch;
-                (
-                    entry.repo.clone(),
-                    branch.head.clone(),
-                    branch.upstream.clone(),
-                )
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let status = &entry.status.branch;
+                match &only {
+                    None => Some(Pushed {
+                        index,
+                        repo: entry.repo.clone(),
+                        branch: status.head.clone(),
+                        upstream: status.upstream.clone(),
+                        local_rev: "HEAD".to_string(),
+                    }),
+                    Some((repo, branch)) if *repo == index => {
+                        let current = status.head.as_deref() == Some(branch.as_str());
+                        let upstream = match current {
+                            true => status.upstream.clone(),
+                            false => store
+                                .refs(index)
+                                .local(branch)
+                                .and_then(|local| local.upstream.clone()),
+                        };
+                        let local_rev = match current {
+                            true => "HEAD".to_string(),
+                            false => format!("refs/heads/{branch}"),
+                        };
+                        Some(Pushed {
+                            index,
+                            repo: entry.repo.clone(),
+                            branch: Some(branch.clone()),
+                            upstream,
+                            local_rev,
+                        })
+                    }
+                    Some(_) => None,
+                }
             })
             .collect();
-        for (index, (repo, branch, upstream)) in entries.into_iter().enumerate() {
+        for Pushed {
+            index,
+            repo,
+            branch,
+            upstream,
+            local_rev,
+        } in entries
+        {
             let name = repo
                 .work_dir
                 .file_name()
@@ -160,6 +237,7 @@ impl PushDialog {
                 repo,
                 name,
                 branch,
+                local_rev,
                 upstream,
                 remotes: Vec::new(),
                 remote: None,
@@ -207,10 +285,12 @@ impl PushDialog {
         let repo = item.repo.clone();
         let upstream = item.upstream.clone();
         let chosen = item.remote_name().map(str::to_string);
+        let local_rev = item.local_rev.clone();
         let read = cx.background_spawn(async move {
             read_repo(
                 &repo,
                 &branch,
+                &local_rev,
                 upstream.as_deref(),
                 chosen.as_deref(),
                 target,
@@ -274,8 +354,16 @@ impl PushDialog {
                 let repo = item.repo.clone();
                 let remote = item.remote_name().map(str::to_string);
                 let target = target.clone();
+                let local_rev = item.local_rev.clone();
                 let read = cx.background_spawn(async move {
-                    read_repo(&repo, &branch, None, remote.as_deref(), Some(target))
+                    read_repo(
+                        &repo,
+                        &branch,
+                        &local_rev,
+                        None,
+                        remote.as_deref(),
+                        Some(target),
+                    )
                 });
                 let reload = cx.spawn(async move |this, cx| {
                     let loaded = read.await;
@@ -414,35 +502,26 @@ impl PushDialog {
             );
             cx.spawn_in(window, async move |this, cx| {
                 if answer.await == Ok(0) {
-                    this.update(cx, |this, cx| this.start(requests, cx)).ok();
+                    this.update_in(cx, |this, window, cx| this.start(requests, window, cx))
+                        .ok();
                 }
             })
             .detach();
             return;
         }
-        self.start(requests, cx);
+        self.start(requests, window, cx);
     }
 
-    /// Hands the pushes to the git hub and closes: progress and the result go to the status bar.
-    fn start(&mut self, requests: Vec<(usize, PushRequest)>, cx: &mut Context<Self>) {
+    /// Hands the pushes to the git hub and closes: progress goes to the status bar, the result to a
+    /// notification.
+    fn start(
+        &mut self,
+        requests: Vec<(usize, PushRequest)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         for (repo, request) in requests {
-            let git = self.git.clone();
-            let task = git.update(cx, |git, cx| git.push(repo, request, cx));
-            cx.spawn(async move |_, cx| {
-                let result = task.await;
-                let event = match result {
-                    Ok(result) if result.up_to_date => {
-                        GitEvent::Message(tr("Everything is up to date").into())
-                    }
-                    Ok(result) => GitEvent::Message(trf("Pushed: {0}", &[&result.summary]).into()),
-                    Err(err) => GitEvent::Error {
-                        message: trf("Push failed: {0}", &[&err]).into(),
-                        details: err.details().map(str::to_string),
-                    },
-                };
-                git.update(cx, |git, cx| git.report(event, cx)).ok();
-            })
-            .detach();
+            push_and_report(self.git.clone(), repo, request, window, cx);
         }
         cx.emit(DismissEvent);
     }
@@ -664,7 +743,7 @@ impl PushDialog {
 }
 
 /// A quiet line of text in place of a list.
-fn note(text: impl Into<SharedString>, ui: crate::theme::UiColors) -> gpui::Div {
+pub(crate) fn note(text: impl Into<SharedString>, ui: crate::theme::UiColors) -> gpui::Div {
     div()
         .px_3()
         .py_1p5()
@@ -679,6 +758,7 @@ fn note(text: impl Into<SharedString>, ui: crate::theme::UiColors) -> gpui::Div 
 fn read_repo(
     repo: &Repo,
     branch: &str,
+    local_rev: &str,
     upstream: Option<&str>,
     chosen: Option<&str>,
     target: Option<String>,
@@ -732,7 +812,11 @@ fn read_repo(
         ])
         .output()
         .is_ok();
-    let (commits, error) = match flux_git::outgoing(repo, &name, target.trim()) {
+    let outgoing = match local_rev {
+        "HEAD" => flux_git::outgoing(repo, &name, target.trim()),
+        _ => outgoing_from(repo, local_rev, &name, target.trim()),
+    };
+    let (commits, error) = match outgoing {
         Ok(commits) => (commits, None),
         Err(err) => (Vec::new(), Some(err.to_string())),
     };
@@ -755,14 +839,193 @@ fn split_upstream(upstream: &str, remotes: &[Remote]) -> Option<(String, String)
     })
 }
 
-fn now_seconds() -> i64 {
+/// The commits a push of `local_rev` (a branch that isn't checked out) to `remote/remote_branch`
+/// would send, newest first — as `flux_git::outgoing` does for HEAD.
+fn outgoing_from(
+    repo: &Repo,
+    local_rev: &str,
+    remote: &str,
+    remote_branch: &str,
+) -> Result<Vec<CommitInfo>, GitError> {
+    let target = format!("refs/remotes/{remote}/{remote_branch}");
+    let exists = repo
+        .git()
+        .read_only()
+        .args(["rev-parse", "--verify", "-q", &target])
+        .output()
+        .is_ok();
+    let command = repo.git().read_only().args([
+        "log",
+        "--format=%H%x00%h%x00%s%x00%an%x00%ct%x00",
+        local_rev,
+    ]);
+    let command = if exists {
+        command.arg(format!("^{target}"))
+    } else {
+        command.args(["--not", &format!("--remotes={remote}")])
+    };
+    let output = command.output_string()?;
+    let fields: Vec<&str> = output.split('\0').collect();
+    Ok(fields
+        .chunks(5)
+        .filter(|chunk| chunk.len() == 5 && !chunk[0].trim().is_empty())
+        .map(|chunk| CommitInfo {
+            oid: chunk[0].trim().to_string(),
+            short: chunk[1].to_string(),
+            summary: chunk[2].to_string(),
+            author: chunk[3].to_string(),
+            time: chunk[4].trim().parse().unwrap_or(0),
+        })
+        .collect())
+}
+
+/// Pushes one repository in the background and tells how it went. A push rejected because the
+/// remote has commits the branch doesn't (someone pushed first) asks, as JetBrains' "Push
+/// Rejected", to rebase or merge them first; then the branch is updated and pushed again.
+fn push_and_report(
+    git: Entity<GitStore>,
+    repo: usize,
+    request: PushRequest,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let task = git.update(cx, |git, cx| git.push(repo, request.clone(), cx));
+    // The update can only help when the pushed branch is the current one and goes to its upstream.
+    let updatable = {
+        let entry = git.read(cx).repos().get(repo);
+        let branch = entry.map(|entry| &entry.status.branch);
+        branch.is_some_and(|branch| {
+            branch.head.as_deref() == Some(request.local_branch.as_str())
+                && branch.upstream.as_deref()
+                    == Some(format!("{}/{}", request.remote, request.remote_branch).as_str())
+        })
+    };
+    let preference = settings::update_method(cx);
+    window
+        .spawn(cx, async move |cx| {
+            let result = task.await;
+            let rejected = matches!(&result, Err(err) if is_rejected(err));
+            if !(rejected && updatable && !request.force_with_lease) {
+                return report_push(&git, &result, cx);
+            }
+            let Some(method) = ask_update(&request, preference, cx).await else {
+                return report_push(&git, &result, cx);
+            };
+            let update = git.update(cx, |git, cx| git.update(repo, method, cx));
+            let Ok(update) = update else {
+                return;
+            };
+            match update.await {
+                Ok(updated) if updated.outcome == Outcome::Conflicts => {
+                    git.update(cx, |git, cx| {
+                        git.notify(
+                            Notification::warning(tr("Update stopped on conflicts"))
+                                .body(tr("Resolve them, then push again"))
+                                .action(tr("Resolve…"), git::ResolveConflicts)
+                                .action(tr("Abort"), git::AbortOperation),
+                            cx,
+                        )
+                    })
+                    .ok();
+                    cx.update(|window, cx| {
+                        window.dispatch_action(Box::new(git::ResolveConflicts), cx)
+                    })
+                    .ok();
+                }
+                Ok(_) => {
+                    let again = git.update(cx, |git, cx| git.push(repo, request, cx));
+                    if let Ok(again) = again {
+                        let result = again.await;
+                        report_push(&git, &result, cx);
+                    }
+                }
+                Err(err) => {
+                    git.update(cx, |git, cx| {
+                        git.notify_error(tr("Update failed"), &err, cx)
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+}
+
+/// JetBrains' "Push Rejected" question: Rebase, Merge, or Cancel (`None`). The preferred method
+/// of Update Project is the first (default) button.
+async fn ask_update(
+    request: &PushRequest,
+    preference: UpdatePreference,
+    cx: &mut AsyncWindowContext,
+) -> Option<UpdateMethod> {
+    let (first, second) = match preference {
+        UpdatePreference::Rebase => (UpdateMethod::Rebase, UpdateMethod::Merge),
+        UpdatePreference::Merge | UpdatePreference::Ask => {
+            (UpdateMethod::Merge, UpdateMethod::Rebase)
+        }
+    };
+    let label = |method: UpdateMethod| match method {
+        UpdateMethod::Merge => tr("Merge and Push"),
+        UpdateMethod::Rebase => tr("Rebase and Push"),
+    };
+    let answer = cx
+        .prompt(
+            PromptLevel::Warning,
+            &trf("Push of {0} was rejected", &[&request.local_branch]),
+            Some(&trf(
+                "{0}/{1} has commits that {2} doesn't have (someone pushed first). Update {2} — rebase your commits on top of them or merge them in — and Flux pushes again.",
+                &[&request.remote, &request.remote_branch, &request.local_branch],
+            )),
+            &[label(first), label(second), tr("Cancel")],
+        )
+        .await;
+    match answer {
+        Ok(0) => Some(first),
+        Ok(1) => Some(second),
+        _ => None,
+    }
+}
+
+/// A push's result in a notification.
+fn report_push(
+    git: &Entity<GitStore>,
+    result: &Result<flux_git::PushResult, GitError>,
+    cx: &mut AsyncWindowContext,
+) {
+    git.update(cx, |git, cx| match result {
+        Ok(result) if result.up_to_date => {
+            git.notify(Notification::info(tr("Everything is up to date")), cx)
+        }
+        Ok(result) => git.notify(
+            Notification::success(trf("Pushed: {0}", &[&result.summary])),
+            cx,
+        ),
+        Err(err) => git.notify_error(tr("Push failed"), err, cx),
+    })
+    .ok();
+}
+
+/// A push the remote refused because it has commits the branch doesn't (not a permission or a
+/// hook problem): the crate puts the porcelain `[rejected] (fetch first)` line into the error, and
+/// git's hints from stderr follow ("Updates were rejected because the remote contains work…").
+fn is_rejected(error: &GitError) -> bool {
+    // Hints wrap: "…the tip of your current branch is behind\nhint: its remote counterpart."
+    let text = error.details().unwrap_or_default().replace("\nhint: ", " ");
+    let refused = text.contains("[rejected]") || text.contains("Updates were rejected");
+    refused
+        && (text.contains("fetch first")
+            || text.contains("non-fast-forward")
+            || text.contains("remote contains work")
+            || text.contains("behind its remote"))
+}
+
+pub(crate) fn now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs() as i64)
 }
 
 /// How long ago, shortly: "just now", "5 min", "3 h", "2 d".
-fn age(now: i64, time: i64) -> String {
+pub(crate) fn age(now: i64, time: i64) -> String {
     let seconds = (now - time).max(0);
     match seconds {
         0..60 => tr("just now").to_string(),
@@ -922,6 +1185,31 @@ mod tests {
             Some(("my-fork".into(), "main".into()))
         );
         assert_eq!(split_upstream("gone/main", &remotes), None);
+    }
+
+    #[test]
+    fn rejected_pushes_are_told_from_other_failures() {
+        let error = |message: &str| GitError::Failed {
+            command: "git push".into(),
+            message: message.into(),
+        };
+        assert!(is_rejected(&error(
+            "To ../remote.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs"
+        )));
+        assert!(is_rejected(&error(
+            " ! [rejected]        main -> main (non-fast-forward)"
+        )));
+        // git push --porcelain: the hints of stderr.
+        assert!(is_rejected(&error(
+            "error: failed to push some refs to '../remote.git'\nhint: Updates were rejected because the remote contains work that you do not\nhint: have locally."
+        )));
+        assert!(is_rejected(&error(
+            "hint: Updates were rejected because the tip of your current branch is behind\nhint: its remote counterpart."
+        )));
+        assert!(!is_rejected(&error(
+            " ! [remote rejected] main -> main (pre-receive hook declined)"
+        )));
+        assert!(!is_rejected(&error("fatal: Authentication failed")));
     }
 
     #[test]

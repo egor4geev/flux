@@ -16,7 +16,13 @@
 //!
 //! The viewer diffs the texts itself, in the background, whenever the working copy changes or HEAD
 //! moves (the git hub reports it): with the same algorithm and the same line endings as the gutter
-//! and the commit, so a block here is the block the commit checkboxes know. The editors draw the
+//! and the commit, so a block here is the block the commit checkboxes know.
+//!
+//! **Comparisons** ([`DiffView::compare`]) show a file at two revisions (Compare with Current, the
+//! files of a stash), or at a revision and the working copy (Show Diff with Working Tree): the
+//! revisions are read once, when the tab opens; a working copy side is the file's editor, as in the
+//! HEAD diff, and its blocks can be reverted to the revision's; commit checkboxes are only in the
+//! HEAD diff. The editors draw the
 //! colors: before each frame the viewer hands each of them its [`Decorations`]
 //! (`Editor::frame_decorations`), which the element takes; the same editor shown in its own tab gets
 //! none.
@@ -479,6 +485,22 @@ enum Side {
     Right,
 }
 
+/// One side of a comparison (Compare with Current, Show Diff with Working Tree, stash files): a
+/// file at a revision, or the working copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffSide {
+    /// `rev:path` of the repository: a commit, a branch, `stash@{0}^1`, an index stage (`:2`);
+    /// `path` is relative to the working tree (another path than the file's after a rename);
+    /// `label` is the caption ("main", "Stash · WIP on main").
+    Revision {
+        rev: String,
+        path: String,
+        label: String,
+    },
+    /// The file in the working tree: its editor, editable.
+    WorkingCopy,
+}
+
 /// What the diff viewer asks the workspace to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffViewEvent {
@@ -516,8 +538,73 @@ pub struct DiffView {
     driver: Side,
     /// The scroll offsets of both sides as of the last frame: the one that moved alone leads.
     synced: Option<(Point<f32>, Point<f32>)>,
+    /// A comparison of two revisions (or a revision and the working copy) instead of HEAD and the
+    /// working copy.
+    compare: Option<Compare>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+/// What a comparison compares, and how its right side is doing.
+struct Compare {
+    repo: usize,
+    left: DiffSide,
+    right: DiffSide,
+    right_state: RightState,
+}
+
+/// The right side of a comparison: a revision is read in the background; a working copy is there
+/// from the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RightState {
+    Ready,
+    Loading,
+    /// The revision has no such file.
+    Missing,
+    /// Binary or too large.
+    Unreadable,
+}
+
+/// A file at a revision, as a side of a comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RevisionText {
+    Text(Arc<str>),
+    /// No such file there.
+    Missing,
+    /// Binary or too large to compare.
+    Unreadable,
+}
+
+/// Larger files aren't compared (as the HEAD diff's limit).
+const MAX_COMPARED_BYTES: usize = 4 * 1024 * 1024;
+
+impl GitStore {
+    /// A file's content at a revision of a repository, read once (one `git cat-file`): text, or why
+    /// there is none.
+    fn read_revision(
+        &self,
+        repo: usize,
+        rev: &str,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<RevisionText> {
+        let (rev, path) = (rev.to_string(), path.to_string());
+        let read = self.read(repo, cx, move |repo| {
+            flux_git::BlobReader::new(repo).read(&rev, &path)
+        });
+        cx.background_spawn(async move { revision_text(read.await.ok().flatten()) })
+    }
+}
+
+/// What a read of `rev:path` gives a comparison.
+fn revision_text(content: Option<Vec<u8>>) -> RevisionText {
+    match content {
+        None => RevisionText::Missing,
+        Some(content) if content.len() > MAX_COMPARED_BYTES || flux_git::is_binary(&content) => {
+            RevisionText::Unreadable
+        }
+        Some(content) => RevisionText::Text(String::from_utf8_lossy(&content).as_ref().into()),
+    }
 }
 
 impl EventEmitter<DiffViewEvent> for DiffView {}
@@ -531,10 +618,56 @@ impl DiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut view = Self::build(path, git, working, owns_working, None, window, cx);
+        view.reload_base(window, cx);
+        view
+    }
+
+    /// A comparison of two revisions, or of a revision and the working copy (`working` — the file's
+    /// editor, for a working copy side). The HEAD diff is [`Self::new`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn compare(
+        path: PathBuf,
+        repo: usize,
+        left: DiffSide,
+        right: DiffSide,
+        git: Entity<GitStore>,
+        working: Option<Entity<Editor>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let on_working_copy = right == DiffSide::WorkingCopy;
+        let compare = Compare {
+            repo,
+            left,
+            right,
+            right_state: if on_working_copy {
+                RightState::Ready
+            } else {
+                RightState::Loading
+            },
+        };
+        let working = working.filter(|_| on_working_copy);
+        let mut view = Self::build(path, git, working, false, Some(compare), window, cx);
+        view.load_comparison(window, cx);
+        view
+    }
+
+    fn build(
+        path: PathBuf,
+        git: Entity<GitStore>,
+        working: Option<Entity<Editor>>,
+        owns_working: bool,
+        compare: Option<Compare>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // A commit, a checkout or the first status (a new file is known by it) may change the HEAD
-        // side.
+        // side. A comparison's revisions are read once.
         let mut subscriptions = vec![cx.observe_in(&git, window, |this, _, window, cx| {
-            this.reload_base(window, cx)
+            if this.compare.is_none() {
+                this.reload_base(window, cx)
+            }
         })];
         let mut binary = false;
         if let Some(editor) = &working {
@@ -551,7 +684,7 @@ impl DiffView {
                 .take(BINARY_PROBE)
                 .any(|c| c == '\0');
         }
-        let mut view = Self {
+        Self {
             key: canonical(&path),
             path,
             git,
@@ -569,20 +702,38 @@ impl DiffView {
             unified_text: None,
             driver: Side::Right,
             synced: None,
+            compare,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
-        };
-        view.reload_base(window, cx);
-        view
+        }
+    }
+
+    /// The sides of a comparison; `None` — the HEAD diff.
+    pub fn compares(&self) -> Option<(&DiffSide, &DiffSide)> {
+        self.compare
+            .as_ref()
+            .map(|compare| (&compare.left, &compare.right))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// The working copy's editor.
+    /// The working copy's editor — in a comparison of two revisions, the right side's read-only
+    /// one.
     pub fn working(&self) -> Option<&Entity<Editor>> {
         self.working.as_ref()
+    }
+
+    /// The editor of the file in the working tree, if a side shows it: the status bar shows its
+    /// position; a comparison of two revisions has none (its right side is a pathless read-only
+    /// editor).
+    pub fn working_copy(&self) -> Option<&Entity<Editor>> {
+        let on_working_copy = self
+            .compare
+            .as_ref()
+            .is_none_or(|compare| compare.right == DiffSide::WorkingCopy);
+        self.working.as_ref().filter(|_| on_working_copy)
     }
 
     /// Whether closing the viewer must take care of the working copy's unsaved changes.
@@ -594,13 +745,144 @@ impl DiffView {
         self.owns_working = owns;
     }
 
-    /// The tab's label: the file name.
+    /// The tab's label: the file name; a comparison adds what it compares ("main.rs (main ↔
+    /// feature/x)"; with the working copy only the revision: "main.rs (feature/x)").
     pub fn title(&self) -> SharedString {
-        self.path
+        let name = self
+            .path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
-            .into()
+            .unwrap_or_default();
+        match &self.compare {
+            Some(compare) if compare.right == DiffSide::WorkingCopy => {
+                format!("{name} ({})", short_label(&compare.left, 20)).into()
+            }
+            // A stash's file against the commit the stash was made on: the captions tell the rest.
+            Some(compare) if is_stash_pair(&compare.left, &compare.right) => {
+                format!("{name} ({})", tr("stash")).into()
+            }
+            Some(compare) => format!(
+                "{name} ({} ↔ {})",
+                short_label(&compare.left, 14),
+                short_label(&compare.right, 14)
+            )
+            .into(),
+            None => name.into(),
+        }
+    }
+
+    // --- A comparison's sides ---
+
+    /// Reads the revisions of a comparison in the background.
+    fn load_comparison(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(compare) = &self.compare else {
+            return;
+        };
+        let repo = compare.repo;
+        let left = self.read_side(repo, &compare.left.clone(), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let text = left.await;
+            this.update_in(cx, |this, window, cx| this.set_left(text, window, cx))
+                .ok();
+        })
+        .detach();
+        if let Some(compare) = &self.compare
+            && compare.right != DiffSide::WorkingCopy
+        {
+            let right = self.read_side(repo, &compare.right.clone(), cx);
+            cx.spawn_in(window, async move |this, cx| {
+                let text = right.await;
+                this.update_in(cx, |this, window, cx| this.set_right(text, window, cx))
+                    .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// A side's content: a revision from git, the working copy from disk (a left side only).
+    fn read_side(
+        &self,
+        repo: usize,
+        side: &DiffSide,
+        cx: &mut Context<Self>,
+    ) -> Task<RevisionText> {
+        match side {
+            DiffSide::Revision { rev, path, .. } => self
+                .git
+                .update(cx, |git, cx| git.read_revision(repo, rev, path, cx)),
+            DiffSide::WorkingCopy => {
+                let path = self.path.clone();
+                cx.background_spawn(async move { revision_text(std::fs::read(&path).ok()) })
+            }
+        }
+    }
+
+    /// The left side of a comparison arrived.
+    fn set_left(&mut self, text: RevisionText, window: &mut Window, cx: &mut Context<Self>) {
+        let (base, new_file) = match text {
+            RevisionText::Text(text) if text.contains('\r') => {
+                (Base::Text(normalize(&text).into()), false)
+            }
+            RevisionText::Text(text) => (Base::Text(text), false),
+            // The file isn't there: everything on the right is new.
+            RevisionText::Missing => (Base::Text("".into()), true),
+            RevisionText::Unreadable => (Base::Unreadable, false),
+        };
+        self.apply_base(base, new_file, window, cx);
+    }
+
+    /// The right side of a comparison (a revision) arrived: a read-only editor with its text.
+    fn set_right(&mut self, text: RevisionText, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(compare) = &mut self.compare else {
+            return;
+        };
+        compare.right_state = match &text {
+            RevisionText::Text(_) => RightState::Ready,
+            RevisionText::Missing => RightState::Missing,
+            RevisionText::Unreadable => RightState::Unreadable,
+        };
+        if let RevisionText::Text(text) = text {
+            let path = self.path.clone();
+            self.working = Some(cx.new(|cx| {
+                let mut editor = Editor::new(Document::from_text(&text), window, cx);
+                editor.set_highlight_path(&path, cx);
+                editor.read_only = true;
+                editor
+            }));
+            self.synced = None;
+        }
+        self.recompute(cx);
+        cx.notify();
+    }
+
+    /// The caption of a side.
+    fn side_caption(side: &DiffSide) -> String {
+        match side {
+            DiffSide::Revision { label, .. } => label.clone(),
+            DiffSide::WorkingCopy => tr("Working copy").to_string(),
+        }
+    }
+
+    /// Whether F4 has a file to open: the working copy is on the right, or the file exists in the
+    /// working tree (a comparison of revisions opens the file as it is now).
+    fn can_jump(&self) -> bool {
+        match &self.compare {
+            None => self.working.is_some(),
+            Some(compare) if compare.right == DiffSide::WorkingCopy => self.working.is_some(),
+            Some(_) => self.path.exists(),
+        }
+    }
+
+    /// Whether the blocks get revert arrows: the right side is the working copy.
+    fn can_revert(&self) -> bool {
+        self.working_copy().is_some()
+    }
+
+    /// The right side of a comparison is still being read.
+    fn right_loading(&self) -> bool {
+        self.compare
+            .as_ref()
+            .is_some_and(|compare| compare.right_state == RightState::Loading)
     }
 
     // --- The HEAD side ---
@@ -634,6 +916,17 @@ impl DiffView {
                 None => (Base::Unreadable, false),
             },
         };
+        self.apply_base(base, new_file, window, cx);
+    }
+
+    /// The left side changed: its read-only editor follows, and the blocks are computed again.
+    fn apply_base(
+        &mut self,
+        base: Base,
+        new_file: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let same = match (&self.base, &base) {
             (Base::Text(old), Base::Text(new)) => Arc::ptr_eq(old, new) || old == new,
             (Base::Loading, Base::Loading)
@@ -675,6 +968,9 @@ impl DiffView {
 
     /// Diffs the texts in the background; the latest result is drawn.
     fn recompute(&mut self, cx: &mut Context<Self>) {
+        if self.right_loading() {
+            return;
+        }
         let Base::Text(base) = &self.base else {
             self.model = None;
             return;
@@ -803,7 +1099,7 @@ impl DiffView {
     /// F4: the file in its own tab, at the cursor's line (a HEAD line — where it is in the working
     /// copy).
     fn jump_to_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.working.is_none() {
+        if !self.can_jump() {
             return;
         }
         let model = self.model.clone();
@@ -919,6 +1215,9 @@ impl DiffView {
 
     /// The arrow of a block: its HEAD lines replace its working copy lines (one undo step).
     fn revert(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.can_revert() {
+            return;
+        }
         let (Some(model), Some(working)) = (self.fresh_model(), self.working.clone()) else {
             return;
         };
@@ -944,6 +1243,9 @@ impl DiffView {
 
     /// ⌃⌘→: reverts the block under the cursor of the focused side (side by side).
     fn revert_at_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_revert() {
+            return;
+        }
         let Some(model) = self.fresh_model() else {
             return;
         };
@@ -971,7 +1273,8 @@ impl DiffView {
     /// Whether the blocks get commit checkboxes: a changed tracked file (a new or a deleted one is
     /// committed whole).
     fn has_checkboxes(&self, cx: &App) -> bool {
-        self.working.is_some()
+        self.compare.is_none()
+            && self.working.is_some()
             && !self.new_file
             && matches!(
                 self.git.read(cx).status_of(&self.key),
@@ -1256,7 +1559,7 @@ impl DiffView {
                         })),
                 )
             })
-            .when(self.working.is_some(), |bar| {
+            .when(self.can_jump(), |bar| {
                 bar.child(
                     ui::icon_button("diff-jump", IconName::Pencil, ui)
                         .tooltip(ui::tooltip(tr("Jump to Source"), keys(&JumpToSource)))
@@ -1267,19 +1570,28 @@ impl DiffView {
             })
     }
 
-    /// The captions over the sides: "HEAD · 4d7de13" and "Working copy".
+    /// The captions over the sides: "HEAD · 4d7de13" and "Working copy" — or a comparison's labels.
     fn render_captions(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
-        let head = self
-            .git
-            .read(cx)
-            .repo_for(&self.key)
-            .and_then(|repo| repo.status.branch.oid.clone())
-            .map(|oid| trf("HEAD · {0}", &[&oid.chars().take(7).collect::<String>()]))
-            .unwrap_or_else(|| tr("HEAD").to_string());
-        let working = match &self.working {
-            Some(_) => tr("Working copy"),
-            None => tr("Deleted"),
+        let (head, working) = match &self.compare {
+            Some(compare) => (
+                Self::side_caption(&compare.left),
+                Self::side_caption(&compare.right),
+            ),
+            None => {
+                let head = self
+                    .git
+                    .read(cx)
+                    .repo_for(&self.key)
+                    .and_then(|repo| repo.status.branch.oid.clone())
+                    .map(|oid| trf("HEAD · {0}", &[&oid.chars().take(7).collect::<String>()]))
+                    .unwrap_or_else(|| tr("HEAD").to_string());
+                let working = match &self.working {
+                    Some(_) => tr("Working copy"),
+                    None => tr("Deleted"),
+                };
+                (head, working.to_string())
+            }
         };
         let caption = |text: String| {
             div()
@@ -1301,7 +1613,7 @@ impl DiffView {
         } else {
             row.child(caption(head))
                 .child(div().flex_none().w(px(DIVIDER_WIDTH)))
-                .child(caption(working.to_string()))
+                .child(caption(working))
         }
     }
 
@@ -1310,13 +1622,23 @@ impl DiffView {
         let left = match &self.base_editor {
             Some(editor) => editor.clone().into_any_element(),
             None if self.new_file => {
-                note(IconName::Info, tr("The file is new"), ui).into_any_element()
+                let text = match &self.compare {
+                    Some(compare) => missing_note(&compare.left),
+                    None => tr("The file is new").to_string(),
+                };
+                note(IconName::Info, &text, ui).into_any_element()
             }
             None => div().into_any_element(),
         };
         let right = match &self.working {
             Some(editor) => editor.clone().into_any_element(),
-            None => note(IconName::Info, tr("The file is deleted"), ui).into_any_element(),
+            None => {
+                let text = match &self.compare {
+                    Some(compare) => missing_note(&compare.right),
+                    None => tr("The file is deleted").to_string(),
+                };
+                note(IconName::Info, &text, ui).into_any_element()
+            }
         };
         let pane = |side: Side| {
             div()
@@ -1391,6 +1713,7 @@ impl DiffView {
         let ly = left.read(cx).scroll.y;
         let ry = right.read(cx).scroll.y;
         let checkboxes = self.has_checkboxes(cx);
+        let arrows = self.can_revert();
         let git = self.git.read(cx);
         let mut buttons = Vec::new();
         for (index, hunk) in model.hunks.iter().enumerate() {
@@ -1402,26 +1725,28 @@ impl DiffView {
                 continue;
             }
             let arrow_top = geometry.button_top(true);
-            buttons.push(
-                div()
-                    .id(("diff-revert", index))
-                    .absolute()
-                    .top(px(arrow_top))
-                    .left(px(2.))
-                    .size(px(DIVIDER_BUTTON))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(ui::RADIUS_XS))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(ui.hover))
-                    .tooltip(ui::tooltip(tr("Revert"), None))
-                    .on_click(
-                        cx.listener(move |this, _: &ClickEvent, _, cx| this.revert(index, cx)),
-                    )
-                    .child(icon(IconName::ArrowRight, ui.text_muted).size(px(11.)))
-                    .into_any_element(),
-            );
+            if arrows {
+                buttons.push(
+                    div()
+                        .id(("diff-revert", index))
+                        .absolute()
+                        .top(px(arrow_top))
+                        .left(px(2.))
+                        .size(px(DIVIDER_BUTTON))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(ui::RADIUS_XS))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(ui.hover))
+                        .tooltip(ui::tooltip(tr("Revert"), None))
+                        .on_click(
+                            cx.listener(move |this, _: &ClickEvent, _, cx| this.revert(index, cx)),
+                        )
+                        .child(icon(IconName::ArrowRight, ui.text_muted).size(px(11.)))
+                        .into_any_element(),
+                );
+            }
             if checkboxes {
                 let included = git.is_hunk_included(&self.key, hunk);
                 buttons.push(
@@ -1634,9 +1959,16 @@ impl Focusable for DiffView {
 impl Render for DiffView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
+        let right_unreadable = self
+            .compare
+            .as_ref()
+            .is_some_and(|compare| compare.right_state == RightState::Unreadable);
         let note_text = match (&self.base, self.binary) {
             (_, true) => Some(tr("Binary files differ")),
             (Base::Unreadable, _) => {
+                Some(tr("Contents can't be compared: a binary or too large file"))
+            }
+            _ if right_unreadable => {
                 Some(tr("Contents can't be compared: a binary or too large file"))
             }
             (Base::NoRepository, _) => Some(tr("Not in a Git repository")),
@@ -1644,7 +1976,9 @@ impl Render for DiffView {
         };
         let body = match note_text {
             Some(text) => note(IconName::Info, text, ui).into_any_element(),
-            None if matches!(self.base, Base::Loading) => div().flex_1().into_any_element(),
+            None if matches!(self.base, Base::Loading) || self.right_loading() => {
+                div().flex_1().into_any_element()
+            }
             None if self.unified => self.render_unified(window, cx),
             None => {
                 self.sync_scroll(cx);
@@ -1695,6 +2029,40 @@ fn note(icon_name: IconName, text: &str, ui: UiColors) -> gpui::Div {
         .text_color(ui.dim)
         .child(icon(icon_name, ui.dim).size(px(14.)))
         .child(text.to_string())
+}
+
+/// The note in place of a side whose file isn't there: "The file doesn't exist in main".
+fn missing_note(side: &DiffSide) -> String {
+    match side {
+        DiffSide::Revision { label, .. } => trf("The file doesn't exist in {0}", &[label]),
+        DiffSide::WorkingCopy => tr("The file doesn't exist in the working tree").to_string(),
+    }
+}
+
+/// A side for the tab's title: its label, at most `max_chars` long.
+/// `<stash>^1` against `<stash>` (or its untracked files, `<stash>^3`).
+fn is_stash_pair(left: &DiffSide, right: &DiffSide) -> bool {
+    let (DiffSide::Revision { rev: base, .. }, DiffSide::Revision { rev, .. }) = (left, right)
+    else {
+        return false;
+    };
+    let Some(stash) = base.strip_suffix("^1") else {
+        return false;
+    };
+    rev == stash || rev.strip_suffix("^3") == Some(stash)
+}
+
+fn short_label(side: &DiffSide, max_chars: usize) -> String {
+    let label = match side {
+        DiffSide::Revision { label, .. } => label.as_str(),
+        DiffSide::WorkingCopy => tr("Working copy"),
+    };
+    if label.chars().count() <= max_chars {
+        return label.to_string();
+    }
+    let mut short: String = label.chars().take(max_chars - 1).collect();
+    short.push('…');
+    short
 }
 
 /// Character ranges of a block's changed words in a document, the block starting at line `first`.

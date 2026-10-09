@@ -631,5 +631,4 @@ mod tests {
         assert_eq!(step_index(9, 4, true), Some(2));
         assert_eq!(step_index(0, 0, true), None);
     }
-
 }

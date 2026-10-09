@@ -4,9 +4,9 @@
 //! `p_2` = 8 px, `gap_3` = 12 px).
 
 use gpui::{
-    Action, AnyView, App, BoxShadow, Context, Div, ElementId, FocusHandle, FontWeight, Hsla, IntoElement,
-    KeyBinding, Render, SharedString, Stateful, Window, div, linear_color_stop, linear_gradient,
-    point, prelude::*, px,
+    Action, AnyView, App, BoxShadow, Context, Div, ElementId, FocusHandle, FontWeight, Hsla,
+    IntoElement, KeyBinding, Render, SharedString, Stateful, Window, div, linear_color_stop,
+    linear_gradient, point, prelude::*, px,
 };
 
 use crate::command_palette::keystroke_label;
@@ -276,7 +276,11 @@ pub enum CheckState {
 
 impl CheckState {
     pub fn from_bool(on: bool) -> Self {
-        if on { CheckState::Checked } else { CheckState::Unchecked }
+        if on {
+            CheckState::Checked
+        } else {
+            CheckState::Unchecked
+        }
     }
 }
 
@@ -284,11 +288,7 @@ impl CheckState {
 const CHECKBOX_SIZE: f32 = 14.;
 
 /// A checkbox: empty, checked (accent with a check), or partly checked (accent with a dash).
-pub fn checkbox(
-    id: impl Into<gpui::ElementId>,
-    state: CheckState,
-    ui: UiColors,
-) -> Stateful<Div> {
+pub fn checkbox(id: impl Into<gpui::ElementId>, state: CheckState, ui: UiColors) -> Stateful<Div> {
     let on = state != CheckState::Unchecked;
     div()
         .id(id)
@@ -310,6 +310,29 @@ pub fn checkbox(
             CheckState::Checked => Some(icon(IconName::Check, ui.foreground).size(px(11.))),
             CheckState::Partial => Some(icon(IconName::Minus, ui.foreground).size(px(11.))),
             CheckState::Unchecked => None,
+        })
+}
+
+/// A radio button: a ring, with an accent dot when selected (Update Project's Merge / Rebase).
+pub fn radio(id: impl Into<gpui::ElementId>, selected: bool, ui: UiColors) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(CHECKBOX_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(CHECKBOX_SIZE / 2.))
+        .border_1()
+        .cursor_pointer()
+        .when(selected, |radio| radio.border_color(ui.accent))
+        .when(!selected, move |radio| {
+            radio
+                .border_color(ui.text_muted)
+                .hover(move |style| style.border_color(ui.foreground))
+        })
+        .when(selected, |radio| {
+            radio.child(div().size(px(6.)).rounded(px(3.)).bg(ui.accent))
         })
 }
 
