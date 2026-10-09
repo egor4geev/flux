@@ -35,6 +35,10 @@ mod popups;
 mod plugins;
 mod plugin_view;
 mod plugin_manager;
+mod claude;
+mod claude_transcript;
+mod claude_composer;
+mod claude_cards;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
 pub(super) const STRINGS: &[&[(&str, &str)]] = &[
@@ -73,6 +77,10 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     plugins::STRINGS,
     plugin_view::STRINGS,
     plugin_manager::STRINGS,
+    claude::STRINGS,
+    claude_transcript::STRINGS,
+    claude_composer::STRINGS,
+    claude_cards::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -91,4 +99,8 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     plugins::PLURALS,
     plugin_view::PLURALS,
     plugin_manager::PLURALS,
+    claude::PLURALS,
+    claude_transcript::PLURALS,
+    claude_composer::PLURALS,
+    claude_cards::PLURALS,
 ];

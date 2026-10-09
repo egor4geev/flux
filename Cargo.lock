@@ -1963,6 +1963,7 @@ dependencies = [
  "anyhow",
  "core-foundation 0.10.0",
  "core-foundation-sys",
+ "flux-claude",
  "flux-core",
  "flux-fs",
  "flux-git",
@@ -1974,6 +1975,16 @@ dependencies = [
  "futures",
  "gpui",
  "serde_json",
+]
+
+[[package]]
+name = "flux-claude"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "futures",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

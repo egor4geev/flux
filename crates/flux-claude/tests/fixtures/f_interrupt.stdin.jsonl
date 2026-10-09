@@ -1,0 +1,4 @@
+{"type": "control_request", "request_id": "host-1", "request": {"subtype": "initialize"}}
+{"type": "user", "message": {"role": "user", "content": "Write a 600-word story about a lighthouse keeper. No preamble."}, "parent_tool_use_id": null, "session_id": "", "uuid": "308f1bba-46b6-4114-bea5-d8d1ab51f561"}
+{"type": "control_request", "request_id": "host-2", "request": {"subtype": "interrupt"}}
+{"type": "user", "message": {"role": "user", "content": "Reply with just: OK"}, "parent_tool_use_id": null, "session_id": "", "uuid": "8c15bd41-6616-4ae1-8906-26b096c8c74d"}

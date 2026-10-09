@@ -8,6 +8,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+flux-claude = { path = "crates/flux-claude" }
 flux-core = { path = "crates/flux-core" }
 flux-fs = { path = "crates/flux-fs" }
 flux-git = { path = "crates/flux-git" }

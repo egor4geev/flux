@@ -5,6 +5,9 @@
 //!
 //! Code blocks are highlighted with flux-syntax ([`highlight`]) off the UI thread: by the fence's
 //! language, otherwise by the document's.
+//!
+//! The Claude chat (stage 9) draws Claude's answers with it too: GitHub-style tables, and code
+//! blocks with a copy button ([`render_copyable`]).
 
 use std::path::Path;
 
@@ -14,7 +17,8 @@ use flux_syntax::{
     HighlightMap, HighlightSpan, Language, Syntax, language_by_name, language_for_path,
 };
 use gpui::{
-    AnyElement, App, FontStyle, FontWeight, Hsla, StyledText, TextRun, div, font, prelude::*, px,
+    AnyElement, App, ClipboardItem, ElementId, FontStyle, FontWeight, Hsla, StyledText, TextRun,
+    div, font, prelude::*, px,
 };
 
 use crate::display::{display_line, text_runs};
@@ -34,6 +38,24 @@ pub enum Block {
     Quote(Vec<Span>),
     Code(CodeBlock),
     Rule,
+    /// A GitHub-style table: `| a | b |`, a `|---|:---:|` row, then rows.
+    Table(Table),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Table {
+    pub header: Vec<Vec<Span>>,
+    pub align: Vec<Align>,
+    pub rows: Vec<Vec<Vec<Span>>>,
+}
+
+/// A table column's alignment, from the colons of its separator (`:---`, `:---:`, `---:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Align {
+    #[default]
+    Left,
+    Center,
+    Right,
 }
 
 /// A piece of text with one style; a paragraph is a sequence of them.
@@ -65,11 +87,35 @@ pub struct CodeBlock {
 /// Parses Markdown into blocks.
 pub fn parse(markdown: &str) -> Vec<Block> {
     let mut parser = BlockParser::default();
-    let mut lines = markdown.lines();
+    let mut lines = markdown.lines().peekable();
     while let Some(line) = lines.next() {
         let trimmed = line.trim_start();
         let indent = indent_width(line);
-        if let Some((fence, info)) = fence_start(trimmed) {
+        if let Some(align) = lines
+            .peek()
+            .filter(|_| trimmed.contains('|'))
+            .and_then(|next| table_separator(next))
+            .filter(|align| align.len() == table_cells(trimmed).len())
+        {
+            parser.close();
+            lines.next();
+            let header = table_cells(trimmed);
+            let mut rows = Vec::new();
+            while let Some(row) = lines.peek().map(|line| line.trim()) {
+                if row.is_empty() || !row.contains('|') {
+                    break;
+                }
+                let mut cells = table_cells(row);
+                cells.resize(align.len(), String::new());
+                rows.push(cells.iter().map(|cell| parse_inline(cell)).collect());
+                lines.next();
+            }
+            parser.blocks.push(Block::Table(Table {
+                header: header.iter().map(|cell| parse_inline(cell)).collect(),
+                align,
+                rows,
+            }));
+        } else if let Some((fence, info)) = fence_start(trimmed) {
             parser.close();
             let mut code = Vec::new();
             for line in lines.by_ref() {
@@ -323,6 +369,55 @@ fn is_fence_end(line: &str, fence: &str) -> bool {
     let marker = fence.chars().next().unwrap_or('`');
     let len = line.chars().take_while(|c| *c == marker).count();
     len >= fence.len() && line[len..].trim().is_empty()
+}
+
+/// The cells of a table row: `| a | b |` → ["a", "b"] (the outer pipes are optional, `\|` is a
+/// pipe inside a cell).
+fn table_cells(line: &str) -> Vec<String> {
+    let line = line.trim();
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line
+        .strip_suffix('|')
+        .filter(|_| !line.ends_with("\\|"))
+        .unwrap_or(line);
+    let mut cells = vec![String::new()];
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                cells.last_mut().unwrap().push('|');
+                chars.next();
+            }
+            '|' => cells.push(String::new()),
+            c => cells.last_mut().unwrap().push(c),
+        }
+    }
+    cells
+        .into_iter()
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+/// A table's separator row (`|---|:---:|---:|`): the columns' alignment.
+fn table_separator(line: &str) -> Option<Vec<Align>> {
+    let cells = table_cells(line);
+    if cells.is_empty() || !line.contains('-') {
+        return None;
+    }
+    cells
+        .iter()
+        .map(|cell| {
+            let dashes = cell.trim_matches(':');
+            if dashes.len() < 3 || !dashes.chars().all(|c| c == '-') {
+                return None;
+            }
+            Some(match (cell.starts_with(':'), cell.ends_with(':')) {
+                (true, true) => Align::Center,
+                (false, true) => Align::Right,
+                _ => Align::Left,
+            })
+        })
+        .collect()
 }
 
 /// `---`, `***`, `___` (spaces allowed between).
@@ -681,12 +776,32 @@ fn entity(chars: &[char], start: usize) -> Option<(char, usize)> {
 /// The blocks as a column of elements: prose in the UI font, code in the code font with syntax
 /// colors. `color` is the color of regular text.
 pub fn render(blocks: &[Block], color: Hsla, theme: &Theme) -> AnyElement {
+    render_blocks(blocks, color, theme, None)
+}
+
+/// As [`render`], with a copy button on each code block (shown while the pointer is over it). `id`
+/// keeps the buttons' ids apart from those of other blocks in the window.
+pub fn render_copyable(
+    blocks: &[Block],
+    color: Hsla,
+    theme: &Theme,
+    id: impl Into<gpui::SharedString>,
+) -> AnyElement {
+    render_blocks(blocks, color, theme, Some(id.into()))
+}
+
+fn render_blocks(
+    blocks: &[Block],
+    color: Hsla,
+    theme: &Theme,
+    copy: Option<gpui::SharedString>,
+) -> AnyElement {
     let ui = theme.ui;
     div()
         .flex()
         .flex_col()
         .gap_2()
-        .children(blocks.iter().map(|block| {
+        .children(blocks.iter().enumerate().map(|(index, block)| {
             match block {
                 Block::Paragraph(spans) => div().child(styled(spans, color, ui)).into_any_element(),
                 Block::Heading(spans) => div()
@@ -709,10 +824,93 @@ pub fn render(blocks: &[Block], color: Hsla, theme: &Theme) -> AnyElement {
                     .border_color(ui.divider)
                     .child(styled(spans, ui.text_muted, ui))
                     .into_any_element(),
-                Block::Code(code) => code_block(code, theme),
+                Block::Code(code) => match &copy {
+                    Some(prefix) => copyable_code_block(
+                        code,
+                        theme,
+                        ElementId::NamedInteger(prefix.clone(), index as u64),
+                    ),
+                    None => code_block(code, theme),
+                },
                 Block::Rule => ui::divider(ui).into_any_element(),
+                Block::Table(table) => render_table(table, color, ui),
             }
         }))
+        .into_any_element()
+}
+
+/// A table: a header row on a tinted background, rows between thin lines, columns of equal share
+/// (cells wrap).
+fn render_table(table: &Table, color: Hsla, ui: UiColors) -> AnyElement {
+    let row = |cells: &[Vec<Span>], header: bool| {
+        div()
+            .flex()
+            .when(header, |row| row.bg(UiColors::tint(ui.foreground, 0.05)))
+            .children(cells.iter().enumerate().map(|(column, spans)| {
+                let align = table.align.get(column).copied().unwrap_or_default();
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px_2()
+                    .py_1()
+                    .when(column > 0, |cell| {
+                        cell.border_l_1().border_color(ui.divider)
+                    })
+                    .flex()
+                    .map(|cell| match align {
+                        Align::Left => cell.justify_start(),
+                        Align::Center => cell.justify_center(),
+                        Align::Right => cell.justify_end(),
+                    })
+                    .child(if header {
+                        styled_with(spans, color, ui, FontWeight::SEMIBOLD)
+                    } else {
+                        styled(spans, color, ui)
+                    })
+            }))
+    };
+    div()
+        .flex()
+        .flex_col()
+        .rounded(px(RADIUS_SM))
+        .border_1()
+        .border_color(ui.divider)
+        .overflow_hidden()
+        .child(row(&table.header, true))
+        .children(
+            table
+                .rows
+                .iter()
+                .map(|cells| row(cells, false).border_t_1().border_color(ui.divider)),
+        )
+        .into_any_element()
+}
+
+/// A code block with a copy button in its top right corner, shown while the pointer is over it.
+fn copyable_code_block(code: &CodeBlock, theme: &Theme, id: ElementId) -> AnyElement {
+    let ui = theme.ui;
+    let text = code.text.clone();
+    let group: gpui::SharedString = format!("code-{id}").into();
+    div()
+        .relative()
+        .group(group.clone())
+        .child(code_block(code, theme))
+        .child(
+            div()
+                .absolute()
+                .top(px(4.))
+                .right(px(4.))
+                .invisible()
+                .group_hover(group, |style| style.visible())
+                .child(
+                    ui::icon_button(id, crate::icons::IconName::Copy, ui)
+                        .bg(ui.elevated)
+                        .tooltip(ui::tooltip(crate::i18n::tr("Copy"), None))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+                        }),
+                ),
+        )
         .into_any_element()
 }
 
@@ -974,6 +1172,25 @@ mod tests {
         assert_eq!(name("golang"), Some("go"));
         assert_eq!(name("sh"), Some("bash"));
         assert_eq!(name("text"), None);
+    }
+
+    #[test]
+    fn tables_with_alignment_and_ragged_rows() {
+        let blocks = parse(
+            "Intro\n| Name | Count | Note |\n|:-----|------:|:----:|\n| a | 1 | x \\| y |\n| b |\n\nAfter",
+        );
+        assert_eq!(blocks.len(), 3, "{blocks:#?}");
+        let Block::Table(table) = &blocks[1] else {
+            panic!("{blocks:#?}");
+        };
+        assert_eq!(table.align, [Align::Left, Align::Right, Align::Center]);
+        assert_eq!(text(&table.header[1]), "Count");
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(text(&table.rows[0][2]), "x | y");
+        // A short row gets empty cells.
+        assert_eq!(table.rows[1].len(), 3);
+        // A pipe in prose without a separator row is not a table.
+        assert!(matches!(&parse("a | b\nc")[0], Block::Paragraph(_)));
     }
 
     #[test]

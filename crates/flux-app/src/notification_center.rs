@@ -37,13 +37,15 @@ pub enum NotificationGroup {
     Editor,
     /// The plugins themselves: one stopped, a plugin under development rebuilt or reloaded.
     Plugins,
+    /// Claude Code: it waits for the user, finished, failed (stage 9).
+    Claude,
     /// A plugin, by its id.
     Plugin(SharedString),
 }
 
 impl NotificationGroup {
     /// The built-in groups, in the order of the settings page.
-    pub const BUILT_IN: [NotificationGroup; 7] = [
+    pub const BUILT_IN: [NotificationGroup; 8] = [
         NotificationGroup::General,
         NotificationGroup::Git,
         NotificationGroup::LanguageServers,
@@ -51,6 +53,7 @@ impl NotificationGroup {
         NotificationGroup::Files,
         NotificationGroup::Editor,
         NotificationGroup::Plugins,
+        NotificationGroup::Claude,
     ];
 
     /// The key in `settings.json` ("git", "plugin:claude").
@@ -63,6 +66,7 @@ impl NotificationGroup {
             NotificationGroup::Files => "files".into(),
             NotificationGroup::Editor => "editor".into(),
             NotificationGroup::Plugins => "plugins".into(),
+            NotificationGroup::Claude => "claude".into(),
             NotificationGroup::Plugin(id) => format!("plugin:{id}").into(),
         }
     }
@@ -87,6 +91,7 @@ impl NotificationGroup {
             NotificationGroup::Files => tr("Files").into(),
             NotificationGroup::Editor => tr("Editor").into(),
             NotificationGroup::Plugins => tr("Plugins").into(),
+            NotificationGroup::Claude => tr("Claude Code").into(),
             NotificationGroup::Plugin(id) => id.clone(),
         }
     }

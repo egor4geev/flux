@@ -1,0 +1,5 @@
+{"type": "control_request", "request_id": "host-1", "request": {"subtype": "initialize"}}
+{"type": "user", "message": {"role": "user", "content": "Use the Bash tool to run `touch flux_a.txt`, then (as a separate Bash call) run `pwd`. Then reply 'done'."}, "parent_tool_use_id": null, "session_id": "", "uuid": "330a0a4f-1904-4368-bb58-5c89b452741a"}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "28d4aa54-c1eb-4402-848b-26d89da8cf62", "response": {"behavior": "allow", "updatedInput": {"command": "touch flux_a.txt", "description": "Create the file flux_a.txt"}, "updatedPermissions": [{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "touch:*"}], "behavior": "allow", "destination": "session"}]}}}
+{"type": "control_request", "request_id": "host-2", "request": {"subtype": "list_permission_rules"}}
+{"type": "user", "message": {"role": "user", "content": "Now use the Bash tool to run `touch flux_b.txt`. Then reply 'ok'."}, "parent_tool_use_id": null, "session_id": "", "uuid": "a718c84d-bea3-4d8b-b613-4c5ff50a87f1"}

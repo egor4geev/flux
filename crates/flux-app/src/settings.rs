@@ -33,8 +33,52 @@ pub struct Settings {
     /// The values of plugins' settings the user changed, by plugin id (`plugins.settings`); the
     /// rest have the manifest's defaults.
     pub plugin_values: BTreeMap<String, serde_json::Map<String, Value>>,
+    /// Claude Code (`claude`): the chat's defaults.
+    pub claude: ClaudeSettings,
     /// Where the settings are saved; `None` — kept in memory only.
     path: Option<PathBuf>,
+}
+
+/// Claude Code (stage 9): the chat's defaults, edited in Settings → Claude Code. A new session
+/// starts with them; the chat's own pickers change only that session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaudeSettings {
+    /// Claude Code is on: the launchpad icon, ⌘Esc, the commands.
+    pub enabled: bool,
+    /// The `claude` executable the user chose; `None` — found on the PATH and in the usual places.
+    pub path: Option<PathBuf>,
+    /// The model of new sessions: an alias ("opus", "sonnet") or a full name; `None` — the CLI's
+    /// default.
+    pub model: Option<String>,
+    /// The effort of new sessions ("low" … "max"); `None` — the CLI's default.
+    pub effort: Option<String>,
+    /// The permission mode of new sessions ("default", "acceptEdits", "plan"…); `None` — the CLI's
+    /// default.
+    pub permission_mode: Option<String>,
+    /// An edit Claude asks about opens in a diff tab as well, not only as a card in the chat.
+    pub diff_tabs: bool,
+    /// The editor's selection goes along with a message (a chip above the field).
+    pub share_selection: bool,
+    /// The subscription's limits (5 hours, 7 days) in the status bar.
+    pub show_limits: bool,
+    /// More arguments for `claude`, as the user typed them.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for ClaudeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            diff_tabs: true,
+            share_selection: true,
+            show_limits: true,
+            extra_args: Vec::new(),
+        }
+    }
 }
 
 /// Update Project's method: asked the first time (as JetBrains IDEs do), then remembered when the
@@ -77,6 +121,7 @@ impl Default for Settings {
             disabled_plugins: BTreeSet::new(),
             dev_plugins: Vec::new(),
             plugin_values: BTreeMap::new(),
+            claude: ClaudeSettings::default(),
             path: None,
         }
     }
@@ -219,6 +264,20 @@ pub fn set_plugin_value(id: &str, key: &str, value: Option<Value>, cx: &mut App)
     save(settings);
 }
 
+/// Claude Code's settings.
+pub fn claude(cx: &App) -> ClaudeSettings {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.claude.clone())
+        .unwrap_or_default()
+}
+
+/// Changes Claude Code's settings and saves them.
+pub fn update_claude(cx: &mut App, change: impl FnOnce(&mut ClaudeSettings)) {
+    let settings = cx.default_global::<Settings>();
+    change(&mut settings.claude);
+    save(settings);
+}
+
 fn save(settings: &Settings) {
     if let Some(path) = &settings.path
         && let Err(err) = write(path, &to_json(settings))
@@ -295,7 +354,40 @@ fn parse(text: &str) -> Settings {
                     .collect()
             })
             .unwrap_or_default(),
+        claude: parse_claude(&value["claude"]),
         ..defaults
+    }
+}
+
+fn parse_claude(value: &Value) -> ClaudeSettings {
+    let defaults = ClaudeSettings::default();
+    let text = |key: &str| {
+        value[key]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    ClaudeSettings {
+        enabled: value["enabled"].as_bool().unwrap_or(defaults.enabled),
+        path: text("path").map(PathBuf::from),
+        model: text("model"),
+        effort: text("effort"),
+        permission_mode: text("permission_mode"),
+        diff_tabs: value["diff_tabs"].as_bool().unwrap_or(defaults.diff_tabs),
+        share_selection: value["share_selection"]
+            .as_bool()
+            .unwrap_or(defaults.share_selection),
+        show_limits: value["show_limits"]
+            .as_bool()
+            .unwrap_or(defaults.show_limits),
+        extra_args: value["extra_args"]
+            .as_array()
+            .map(|args| {
+                args.iter()
+                    .filter_map(|arg| Some(arg.as_str()?.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -320,6 +412,17 @@ fn to_json(settings: &Settings) -> String {
                 .map(|dir| dir.to_string_lossy())
                 .collect::<Vec<_>>(),
             "settings": settings.plugin_values,
+        },
+        "claude": {
+            "enabled": settings.claude.enabled,
+            "path": settings.claude.path.as_ref().map(|path| path.to_string_lossy()),
+            "model": settings.claude.model,
+            "effort": settings.claude.effort,
+            "permission_mode": settings.claude.permission_mode,
+            "diff_tabs": settings.claude.diff_tabs,
+            "share_selection": settings.claude.share_selection,
+            "show_limits": settings.claude.show_limits,
+            "extra_args": settings.claude.extra_args,
         },
     });
     serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
@@ -358,6 +461,17 @@ mod tests {
                 "flux.todo".to_string(),
                 serde_json::Map::from_iter([("patterns".to_string(), json!(["TODO"]))]),
             )]),
+            claude: ClaudeSettings {
+                enabled: false,
+                path: Some(PathBuf::from("/opt/homebrew/bin/claude")),
+                model: Some("opus".to_string()),
+                effort: Some("high".to_string()),
+                permission_mode: Some("acceptEdits".to_string()),
+                diff_tabs: false,
+                share_selection: false,
+                show_limits: false,
+                extra_args: vec!["--verbose".to_string()],
+            },
             path: None,
         };
         assert_eq!(parse(&to_json(&off)), off);

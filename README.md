@@ -56,6 +56,12 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   with shortcuts, tool windows, status bar items and settings pages, and look like the rest of Flux.
   Turn them on and off without a restart in Settings → Plugins, install one from a folder or an archive.
   A TODO window comes built in. Write your own in Rust — see [Writing plugins](docs/plugins.md).
+- **Claude Code, built in.** Talk to Claude in a window on the right, or in a tab next to your files. The
+  answer streams in, with every file Claude reads and every command it runs shown as it happens.
+  Claude asks before it changes anything: each edit opens as a diff you can trim or edit before you
+  accept it. Answer Claude's questions and approve its plans with a click or a key, pick the model and the
+  mode, mention files with `@`, and keep an eye on your subscription's limits in the status bar. Flux runs
+  your own `claude` command with your Claude subscription — no API key.
 - **Keyboard first.** Every command is in the command palette with its shortcut; familiar keys if
   you come from JetBrains IDEs.
 - **Speaks your language.** English or Russian, following your system settings.
@@ -109,6 +115,14 @@ and keeps everything you need one shortcut away — no setup, no clutter.
     <td align="center"><sub><b>Plugins</b></sub></td>
     <td align="center"><sub><b>The TODO window, a built-in plugin</b></sub></td>
   </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/claude.png" alt="Claude Code in the window on the right: the conversation, an edit waiting for an answer, and the proposed change opened as a diff"></td>
+    <td width="50%"><img src="docs/images/claude-question.png" alt="Claude asks a question with options to choose from, right in the chat"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Claude Code: every edit as a diff</b></sub></td>
+    <td align="center"><sub><b>Claude's questions in the chat</b></sub></td>
+  </tr>
 </table>
 
 ## Get started
@@ -122,7 +136,8 @@ open target/release/Flux.app
 
 You will need [Rust](https://rustup.rs) with the WebAssembly target for the built-in plugins:
 `rustup target add wasm32-wasip2` (without it Flux still builds, just without them). Open a folder
-with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen.
+with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. For Claude, install
+[Claude Code](https://code.claude.com) and sign in once; <kbd>⌘</kbd><kbd>Esc</kbd> opens the chat.
 
 ## Shortcuts
 
@@ -140,6 +155,7 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen.
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>B</kbd> · <kbd>⌘</kbd><kbd>T</kbd> | Branches · update the project (in a terminal, ⌘T opens a new one) |
 | <kbd>⌘</kbd><kbd>0</kbd> · <kbd>⌃</kbd><kbd>V</kbd> | Show or hide the commit window · Git operations |
 | <kbd>⌘</kbd><kbd>9</kbd> · <kbd>⌥</kbd><kbd>⌘</kbd><kbd>A</kbd> | Show or hide the Git log · who changed each line |
+| <kbd>⌘</kbd><kbd>Esc</kbd> · <kbd>⌥</kbd><kbd>⌘</kbd><kbd>K</kbd> | Claude · mention the selection in Claude's message |
 
 ## Roadmap
 
@@ -154,8 +170,9 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen.
 - [x] Git: history and blame
 - [x] Notification center and unified dialogs
 - [x] Plugins: sandboxed plugins, the plugin manager, a TODO window
-- [ ] Plugins: a catalog, themes, file icons and languages as plugins
-- [ ] Claude Code integration — the first plugin
+- [x] Claude Code: a chat that runs your `claude`, with every edit as a diff
+- [ ] Claude Code: a review of Claude's changes, session history, the editor's menu
+- [ ] Plugins: an API for more integrations; a catalog, themes, file icons and languages as plugins
 - [ ] Public beta
 
 ## License

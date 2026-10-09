@@ -1,0 +1,6 @@
+{"type": "control_request", "request_id": "host-1", "request": {"subtype": "initialize", "promptSuggestions": true}}
+{"type": "user", "message": {"role": "user", "content": "Count from 1 to 40, one number per line, no other text."}, "parent_tool_use_id": null, "session_id": "", "uuid": "ad69a38c-06ee-4db9-ba06-50a39d654271"}
+{"type": "user", "message": {"role": "user", "content": "Also: what is 2+2? Answer with just the number."}, "parent_tool_use_id": null, "session_id": "", "uuid": "0f3ddff7-cf27-4fef-8b67-5c1ec86bd8a2"}
+{"type": "user", "message": {"role": "user", "content": "This message will be cancelled before it runs."}, "parent_tool_use_id": null, "session_id": "", "uuid": "03733a5d-1c40-4264-9b55-a03fc70551f2"}
+{"type": "control_request", "request_id": "host-2", "request": {"subtype": "cancel_async_message", "message_uuid": "03733a5d-1c40-4264-9b55-a03fc70551f2"}}
+{"type": "user", "message": {"role": "user", "content": "Stop counting. Say only: PRIORITY NOW"}, "parent_tool_use_id": null, "session_id": "", "uuid": "d7824227-0469-427c-aacc-ddc957a4e7d5", "priority": "now"}

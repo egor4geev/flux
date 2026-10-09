@@ -330,6 +330,7 @@ fn namespace_color(namespace: &str, ui: &UiColors) -> Hsla {
         "project search" => ui.orange,
         "command palette" | "file finder" | "go to line" | "picker" => ui.teal,
         PLUGIN_NAMESPACE | "plugins" => ui.pink,
+        "claude" | "claude composer" | "claude panel" => ui.orange,
         _ => ui.indigo,
     }
 }

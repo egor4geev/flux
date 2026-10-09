@@ -8,6 +8,8 @@
 //!   a card, a sticky card, the journal only, or nothing (JetBrains: Settings → Notifications).
 //! - Plugins: the plugin manager ([`crate::plugin_manager`]); under it, a page of every plugin that
 //!   is on and has settings ([`crate::plugin_settings`]).
+//! - Claude Code: on or off, the `claude` executable (found or chosen), its version and account,
+//!   the defaults of new sessions, the chat's switches, more arguments for the CLI.
 //! - About: the version, the license, the developer, the source code. «About Flux» in the app menu
 //!   ([`About`]) opens Settings on this section.
 
@@ -20,13 +22,15 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, AppContext as _, BoxShadow, Context, DismissEvent, Div, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, KeyBinding, Render, SharedString, Subscription, Task,
-    WeakEntity, Window, actions, div, img, linear_color_stop, linear_gradient, point, prelude::*,
-    px,
+    FocusHandle, Focusable, FontWeight, KeyBinding, PathPromptOptions, Render, SharedString,
+    Subscription, Task, WeakEntity, Window, actions, div, img, linear_color_stop, linear_gradient,
+    point, prelude::*, px,
 };
 
+use crate::claude::{self, ClaudeStore, CliState};
 use crate::i18n::{tr, trf};
 use crate::icons::{self, IconName, file_icon, icon};
+use crate::input::{InputEvent, TextInput};
 use crate::lsp::LspStore;
 use crate::notification_center::{self, Display};
 use crate::plugin_manager::{PluginManager, PluginManagerEvent};
@@ -49,6 +53,8 @@ const SIDEBAR_WIDTH: f32 = 180.;
 /// About: the logo tile and the column of row labels.
 const ABOUT_LOGO_SIZE: f32 = 64.;
 const ABOUT_LABEL_WIDTH: f32 = 120.;
+/// Claude Code: the column of the CLI's facts (Executable, Version, Account).
+const CLAUDE_LABEL_WIDTH: f32 = 150.;
 
 /// The developer and the repository, for About.
 const DEVELOPER: &str = "Egor Ageev";
@@ -74,15 +80,18 @@ pub enum Section {
     Plugins,
     /// A plugin's settings, by its id: listed under Plugins while the plugin is on.
     Plugin(SharedString),
+    /// Claude Code: the chat and the CLI.
+    Claude,
     About,
 }
 
 impl Section {
     /// The sections above the plugins' pages; About goes after them.
-    const BUILT_IN: [Section; 4] = [
+    const BUILT_IN: [Section; 5] = [
         Section::LanguageServers,
         Section::VersionControl,
         Section::Notifications,
+        Section::Claude,
         Section::Plugins,
     ];
 
@@ -92,6 +101,7 @@ impl Section {
             Section::VersionControl => tr("Version Control"),
             Section::Notifications => tr("Notifications"),
             Section::Plugins | Section::Plugin(_) => tr("Plugins"),
+            Section::Claude => tr("Claude Code"),
             Section::About => tr("About"),
         }
     }
@@ -102,6 +112,7 @@ impl Section {
             Section::VersionControl => IconName::Branch,
             Section::Notifications => IconName::Bell,
             Section::Plugins | Section::Plugin(_) => IconName::Puzzle,
+            Section::Claude => IconName::Claude,
             Section::About => IconName::Info,
         }
     }
@@ -114,6 +125,7 @@ impl Section {
             Section::Notifications => "notifications".into(),
             Section::Plugins => "plugins".into(),
             Section::Plugin(id) => format!("plugin-{id}").into(),
+            Section::Claude => "claude".into(),
             Section::About => "about".into(),
         }
     }
@@ -165,6 +177,7 @@ fn show(
         lsp: workspace.lsp.downgrade(),
         workspace: cx.weak_entity(),
         plugins: workspace.plugins.clone(),
+        claude: workspace.claude.clone(),
     };
     workspace.toggle_dialog(window, cx, move |window, cx| {
         SettingsView::new(handles, section, plugin, window, cx)
@@ -177,6 +190,8 @@ struct Handles {
     lsp: WeakEntity<LspStore>,
     workspace: WeakEntity<Workspace>,
     plugins: Entity<PluginStore>,
+    /// The window's Claude Code: the CLI found, its version and account.
+    claude: Entity<ClaudeStore>,
 }
 
 /// With the `scenario` feature, `FLUX_SCENARIO_SETTINGS=plugins` (or `plugin:<id>`) opens Settings
@@ -188,6 +203,7 @@ fn scenario_section() -> Option<Section> {
         "plugins" => Section::Plugins,
         "notifications" => Section::Notifications,
         "version-control" => Section::VersionControl,
+        "claude" => Section::Claude,
         "about" => Section::About,
         other => Section::Plugin(other.strip_prefix("plugin:")?.to_string().into()),
     })
@@ -231,6 +247,10 @@ pub struct SettingsView {
     servers: Vec<ServerRow>,
     /// Operations in progress or failed, by server name.
     jobs: HashMap<String, Job>,
+    /// The window's Claude Code.
+    claude: Entity<ClaudeStore>,
+    /// Claude Code's additional arguments, as the user types them.
+    claude_args: Entity<TextInput>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -283,15 +303,29 @@ impl SettingsView {
                 installable: Ok(()),
             })
             .collect();
+        let claude_args = cx.new(|cx| {
+            let mut input = TextInput::new("--add-dir ../shared", cx).code();
+            input.set_text(&settings::claude(cx).extra_args.join(" "), cx);
+            input
+        });
         // A plugin turned off takes its page with it.
-        let subscriptions = vec![cx.observe(&handles.plugins, |this, _, cx| {
-            if let Section::Plugin(id) = &this.section
-                && !this.plugin_pages_listed(cx).contains(id)
-            {
-                this.section = Section::Plugins;
-            }
-            cx.notify()
-        })];
+        let subscriptions = vec![
+            cx.observe(&handles.plugins, |this, _, cx| {
+                if let Section::Plugin(id) = &this.section
+                    && !this.plugin_pages_listed(cx).contains(id)
+                {
+                    this.section = Section::Plugins;
+                }
+                cx.notify()
+            }),
+            cx.observe(&handles.claude, |_, _, cx| cx.notify()),
+            cx.subscribe(&claude_args, |this, input, _: &InputEvent, cx| {
+                let args = input.read(cx).text();
+                let args: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+                settings::update_claude(cx, |claude| claude.extra_args = args);
+                this.claude.update(cx, |_, cx| cx.notify());
+            }),
+        ];
         let mut view = Self {
             focus_handle: cx.focus_handle(),
             section: Section::LanguageServers,
@@ -303,6 +337,8 @@ impl SettingsView {
             plugin_pages: HashMap::new(),
             servers,
             jobs: HashMap::new(),
+            claude: handles.claude,
+            claude_args,
             _tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -966,6 +1002,387 @@ impl SettingsView {
             )
     }
 
+    /// Claude Code: on or off, the CLI, the defaults of new sessions, the chat's switches, more
+    /// arguments for the CLI.
+    fn render_claude(&self, cx: &mut Context<Self>) -> Div {
+        let ui = Theme::ui(cx);
+        let current = settings::claude(cx);
+        let store = self.claude.read(cx);
+        let state = store.cli().clone();
+        let switch_row = |id: &'static str,
+                          title: &'static str,
+                          detail: &'static str,
+                          on: bool,
+                          change: fn(&mut settings::ClaudeSettings, bool),
+                          cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded(px(ui::RADIUS_MD))
+                .cursor_pointer()
+                .hover(move |style| style.bg(ui.hover))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    settings::update_claude(cx, |claude| change(claude, !on));
+                    this.claude.update(cx, |_, cx| cx.notify());
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(title)
+                        .child(
+                            div()
+                                .text_size(px(theme::TEXT_SM))
+                                .text_color(ui.dim)
+                                .child(detail),
+                        ),
+                )
+                .child(ui::switch(SharedString::from(format!("{id}-switch")), on, ui))
+        };
+        let card = |label: &'static str| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .p_1()
+                .rounded(px(ui::RADIUS_MD))
+                .border_1()
+                .border_color(ui.island_border)
+                .child(div().px_3().pt_2().pb_1().child(ui::section_label(label, ui)))
+        };
+        // A row with a label on the left and a value (text, buttons) on the right.
+        let fact = |label: &'static str, value: AnyElement| {
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_1p5()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(CLAUDE_LABEL_WIDTH))
+                        .text_color(ui.text_muted)
+                        .child(label),
+                )
+                .child(div().flex_1().min_w_0().flex().items_center().gap_2().child(value))
+        };
+        // The CLI: where it is, its version and account.
+        // A long path is shortened in the middle: the file name stays.
+        let path_label = |path: &std::path::Path| crate::claude_panel::shorten(&tilde(path), 56);
+        let (path_text, path_color) = match (&current.path, state.cli()) {
+            (Some(path), _) => (path_label(path), ui.foreground),
+            (None, Some(cli)) => (path_label(&cli.path), ui.foreground),
+            (None, None) if state == CliState::Checking => (tr("Looking…").to_string(), ui.dim),
+            (None, None) => (tr("Not found").to_string(), ui.warning),
+        };
+        let custom = current.path.is_some();
+        let path_value = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(theme::code_font())
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(path_color)
+                    .child(path_text),
+            )
+            .when(!custom && state.cli().is_some(), |row| {
+                row.child(ui::badge(tr("found"), ui.dim))
+            })
+            .child(
+                ui::text_button("claude-path-choose", tr("Choose…"), false, ui)
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_claude(window, cx))),
+            )
+            .when(custom, |row| {
+                row.child(
+                    ui::text_button("claude-path-reset", tr("Reset"), false, ui).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            settings::update_claude(cx, |claude| claude.path = None);
+                            this.claude.update(cx, |store, cx| store.check(cx));
+                        }),
+                    ),
+                )
+            })
+            .into_any_element();
+        let (version, account): (SharedString, SharedString) = match &state {
+            CliState::Checking => (tr("Checking…").into(), "".into()),
+            CliState::Missing => ("—".into(), "—".into()),
+            CliState::SignedOut { version, .. } => (
+                version.clone().unwrap_or_else(|| "—".to_string()).into(),
+                tr("Signed out").into(),
+            ),
+            CliState::Ready {
+                version, account, ..
+            } => (
+                version.clone().into(),
+                account
+                    .clone()
+                    .unwrap_or_else(|| tr("Signed in").to_string())
+                    .into(),
+            ),
+            CliState::Failed(error) => (error.clone().into(), "—".into()),
+        };
+        let signed_out = matches!(state, CliState::SignedOut { .. });
+        let account_value = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().min_w_0().truncate().child(account))
+            .when(signed_out, |row| {
+                row.child(
+                    ui::text_button("claude-sign-in", tr("Sign In"), false, ui).on_click(
+                        |_, window, cx| window.dispatch_action(Box::new(claude::SignIn), cx),
+                    ),
+                )
+            })
+            .into_any_element();
+        let cli_card = card(tr("Command Line Tool"))
+            .child(fact(tr("Executable"), path_value))
+            .child(fact(
+                tr("Version"),
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .child(version)
+                    .into_any_element(),
+            ))
+            .child(fact(tr("Account"), account_value))
+            .child(
+                div().px_3().pt_1().pb_2().flex().child(
+                    ui::text_button("claude-check-again", tr("Check Again"), false, ui).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.claude.update(cx, |store, cx| store.check(cx))
+                        }),
+                    ),
+                ),
+            );
+        // The defaults of new sessions: segmented choices.
+        let choice_row = |id: &'static str,
+                          label: &'static str,
+                          options: Vec<(Option<&'static str>, &'static str)>,
+                          selected: Option<String>,
+                          set: fn(&mut settings::ClaudeSettings, Option<String>),
+                          cx: &mut Context<Self>| {
+            let choices = options.into_iter().enumerate().map(|(index, (value, title))| {
+                let chosen = selected.as_deref() == value;
+                div()
+                    .id(SharedString::from(format!("{id}-{index}")))
+                    .px_2()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(ui::RADIUS_SM))
+                    .text_size(px(theme::TEXT_SM))
+                    .cursor_pointer()
+                    .when(chosen, |choice| choice.bg(ui.list_selected).text_color(ui.foreground))
+                    .when(!chosen, |choice| {
+                        choice
+                            .text_color(ui.text_muted)
+                            .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        settings::update_claude(cx, |claude| set(claude, value.map(str::to_string)));
+                        cx.notify();
+                    }))
+                    .child(title)
+            });
+            div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap_1p5()
+                .px_3()
+                .py_1p5()
+                .child(div().text_color(ui.text_muted).child(label))
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .gap_0p5()
+                        .p_0p5()
+                        .rounded(px(ui::RADIUS_MD))
+                        .bg(ui.input_background)
+                        .border_1()
+                        .border_color(ui.input_border)
+                        .children(choices),
+                )
+        };
+        let defaults_card = card(tr("New Sessions"))
+            .child(choice_row(
+                "claude-model",
+                tr("Model"),
+                vec![
+                    (None, tr("Default")),
+                    (Some("opus"), "Opus"),
+                    (Some("sonnet"), "Sonnet"),
+                    (Some("haiku"), "Haiku"),
+                    (Some("fable"), "Fable"),
+                ],
+                current.model.clone(),
+                |claude, value| claude.model = value,
+                cx,
+            ))
+            .child(choice_row(
+                "claude-effort",
+                tr("Effort"),
+                vec![
+                    (None, tr("Default")),
+                    (Some("low"), tr("Low")),
+                    (Some("medium"), tr("Medium")),
+                    (Some("high"), tr("High")),
+                    (Some("xhigh"), tr("Extra high")),
+                    (Some("max"), tr("Max")),
+                ],
+                current.effort.clone(),
+                |claude, value| claude.effort = value,
+                cx,
+            ))
+            .child(choice_row(
+                "claude-mode",
+                tr("Permissions"),
+                vec![
+                    (None, tr("Ask Before Edits")),
+                    (Some("acceptEdits"), tr("Accept Edits")),
+                    (Some("plan"), tr("Plan")),
+                    (Some("auto"), tr("Auto")),
+                ],
+                current.permission_mode.clone(),
+                |claude, value| claude.permission_mode = value,
+                cx,
+            ))
+            .child(
+                div()
+                    .px_3()
+                    .pt_0p5()
+                    .pb_2()
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(ui.dim)
+                    .child(tr(
+                        "A session can change them in the chat; these are what a new one starts with.",
+                    )),
+            );
+        let chat_card = card(tr("Chat"))
+            .child(switch_row(
+                "claude-diff-tabs",
+                tr("Show proposed edits in a diff tab"),
+                tr("An edit Claude asks about also opens next to your tabs, where hunks can be taken one by one."),
+                current.diff_tabs,
+                |claude, on| claude.diff_tabs = on,
+                cx,
+            ))
+            .child(switch_row(
+                "claude-share-selection",
+                tr("Share the editor's selection"),
+                tr("The file and the selected lines go along with a message as a mention."),
+                current.share_selection,
+                |claude, on| claude.share_selection = on,
+                cx,
+            ))
+            .child(switch_row(
+                "claude-show-limits",
+                tr("Show subscription limits in the status bar"),
+                tr("How much of the 5-hour and the weekly limits is used."),
+                current.show_limits,
+                |claude, on| claude.show_limits = on,
+                cx,
+            ));
+        let args_card = card(tr("Additional Arguments")).child(
+            div()
+                .px_3()
+                .pb_2()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(self.claude_args.clone())
+                .child(
+                    div()
+                        .text_size(px(theme::TEXT_SM))
+                        .text_color(ui.dim)
+                        .child(tr(
+                            "Given to claude when a session starts, after the ones Flux uses: --add-dir, --mcp-config, --settings…",
+                        )),
+                ),
+        );
+        let enabled = current.enabled;
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_header(
+                tr("Claude Code"),
+                tr(
+                    "The chat of Claude Code in the window on the right (⌘Esc). Flux runs your claude command line tool, signed in with your Claude subscription.",
+                ),
+                ui,
+            ))
+            .child(
+                div()
+                    .rounded(px(ui::RADIUS_MD))
+                    .border_1()
+                    .border_color(ui.island_border)
+                    .p_1()
+                    .child(switch_row(
+                        "claude-enabled",
+                        tr("Enable Claude Code"),
+                        tr("The Claude window in the launchpad, ⌘Esc and ⌥⌘K."),
+                        enabled,
+                        |claude, on| claude.enabled = on,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .when(!enabled, |cards| cards.opacity(0.6))
+                    .child(cli_card)
+                    .child(defaults_card)
+                    .child(chat_card)
+                    .child(args_card),
+            )
+    }
+
+    /// "Choose…": the `claude` executable from a file panel; Flux looks for it again.
+    fn choose_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(tr("Choose").into()),
+        });
+        let store = self.claude.downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let Ok(Ok(Some(paths))) = paths.await else {
+                    return;
+                };
+                let Some(path) = paths.into_iter().next() else {
+                    return;
+                };
+                cx.update(|_, cx| {
+                    settings::update_claude(cx, |claude| claude.path = Some(path));
+                    store.update(cx, |store, cx| store.check(cx)).ok();
+                })
+                .ok();
+            })
+            .detach();
+    }
+
     /// About: the logo with the name, version, and description; then the facts in rows.
     fn render_about(&self, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
@@ -1111,6 +1528,7 @@ impl Render for SettingsView {
             Section::LanguageServers => Some(self.render_language_servers(cx).into_any_element()),
             Section::VersionControl => Some(self.render_version_control(cx).into_any_element()),
             Section::Notifications => Some(self.render_notifications(cx).into_any_element()),
+            Section::Claude => Some(self.render_claude(cx).into_any_element()),
             Section::Plugins => None,
             Section::Plugin(id) => Some(match self.plugin_pages.get(&id) {
                 Some(page) => page.clone().into_any_element(),

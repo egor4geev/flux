@@ -32,6 +32,8 @@ pub enum Tool {
     Terminal,
     /// The Git window (the log): the island under the editor, in place of the terminals.
     Git,
+    /// The Claude window: the island on the right (stage 9).
+    Claude,
     /// The Notifications window: the island on the right. At the bottom of the strip, apart from
     /// the tools of the left and the bottom.
     Notifications,
@@ -39,7 +41,7 @@ pub enum Tool {
 
 impl Tool {
     /// The tools at the bottom of the strip, above Settings: the windows of the right island.
-    pub const BOTTOM: [Tool; 1] = [Tool::Notifications];
+    pub const BOTTOM: [Tool; 2] = [Tool::Claude, Tool::Notifications];
 
     /// Order in the strip, top to bottom.
     pub const ALL: [Tool; 5] = [
@@ -57,6 +59,7 @@ impl Tool {
             Tool::FindInFiles => IconName::FindInFiles,
             Tool::Terminal => IconName::Terminal,
             Tool::Git => IconName::GitLog,
+            Tool::Claude => IconName::Claude,
             Tool::Notifications => IconName::Bell,
         }
     }
@@ -68,6 +71,7 @@ impl Tool {
             Tool::FindInFiles => tr("Find in Files"),
             Tool::Terminal => tr("Terminal"),
             Tool::Git => tr("Git"),
+            Tool::Claude => tr("Claude"),
             Tool::Notifications => tr("Notifications"),
         }
     }
@@ -80,6 +84,7 @@ impl Tool {
             Tool::FindInFiles => Box::new(project_search::Toggle),
             Tool::Terminal => Box::new(terminal_panel::TogglePanel),
             Tool::Git => Box::new(git::ToggleGitWindow),
+            Tool::Claude => Box::new(crate::claude::ToggleClaude),
             Tool::Notifications => Box::new(notifications_panel::Toggle),
         }
     }
@@ -122,6 +127,7 @@ pub fn render(
         .children(
             Tool::BOTTOM
                 .into_iter()
+                .filter(|tool| workspace.tool_visible(*tool, cx))
                 .map(|tool| tool_button(workspace, tool, window, cx)),
         )
         .child({
@@ -148,6 +154,7 @@ fn tool_button(
     let open = workspace.tool_open(tool, cx);
     let badge = workspace.tool_badge(tool, cx);
     let alarm = workspace.tool_badge_alarm(tool, cx);
+    let dot = workspace.tool_dot(tool, cx);
     let action = tool.action();
     let keys = ui::shortcut_for(action.as_ref(), window);
     div()
@@ -181,6 +188,18 @@ fn tool_button(
                 } else {
                     count.to_string()
                 })
+        }))
+        // A dot in the corner: Claude working or waiting for the user.
+        .children(dot.filter(|_| badge.is_none()).map(|color| {
+            div()
+                .absolute()
+                .top(px(2.))
+                .right(px(2.))
+                .size(px(8.))
+                .rounded(px(4.))
+                .bg(color)
+                .border_1()
+                .border_color(ui.frame)
         }))
         .when(open, |button| button.child(open_marker(ui)))
 }

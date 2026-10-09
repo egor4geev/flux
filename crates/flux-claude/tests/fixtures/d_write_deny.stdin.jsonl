@@ -1,0 +1,3 @@
+{"type": "control_request", "request_id": "host-1", "request": {"subtype": "initialize"}}
+{"type": "user", "message": {"role": "user", "content": "Create a file hello.txt containing the text 'hi' using the Write tool. Then reply 'done'."}, "parent_tool_use_id": null, "session_id": "", "uuid": "8d744eed-8459-45d4-a9f5-80628deb7768"}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "b5a9a3d8-3908-4fb7-91de-ef12660ed280", "response": {"behavior": "deny", "message": "The user declined this file creation: do not create files in this folder."}}}

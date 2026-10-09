@@ -1,0 +1,4 @@
+{"type": "control_request", "request_id": "host-1", "request": {"subtype": "initialize", "hooks": {"PreToolUse": [{"matcher": "Bash", "hookCallbackIds": ["hook_0"]}], "PostToolUse": [{"matcher": "Bash", "hookCallbackIds": ["hook_1"]}]}}}
+{"type": "user", "message": {"role": "user", "content": "Run `echo hook-test > hook.txt` with the Bash tool, then reply 'ok'."}, "parent_tool_use_id": null, "session_id": "", "uuid": "de13f0a2-e5e9-46c5-bb63-1bfe04d7ce35"}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "4272a3c3-aead-4944-8a41-93c37ff36609", "response": {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "Auto-approved by Flux hook"}}}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "7e6aec1b-f30f-4c6f-b7b0-620856e9987d", "response": {}}}

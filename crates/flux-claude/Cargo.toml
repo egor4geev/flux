@@ -1,0 +1,16 @@
+[package]
+name = "flux-claude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Pictures in the user's messages go to the CLI as base64.
+base64 = "0.22"
+# Channels from the CLI's reader thread to the window's UI tasks: futures, no async runtime (as
+# flux-lsp, ADR-019).
+futures = "0.3.34"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

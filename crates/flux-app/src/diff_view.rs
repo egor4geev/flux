@@ -26,6 +26,12 @@
 //! colors: before each frame the viewer hands each of them its [`Decorations`]
 //! (`Editor::frame_decorations`), which the element takes; the same editor shown in its own tab gets
 //! none.
+//!
+//! **Claude's proposals** ([`DiffView::proposal`], stage 9): an edit Claude asks permission for — the
+//! file as it is on the left, the proposed text on the right in an editor of its own (editable,
+//! never saved: the answer carries it). A block's arrow puts the file's lines back on the right,
+//! which rejects that change; a banner accepts (⌘↵) or rejects the proposal, and the tab closes once
+//! the question is answered here, in the chat, or withdrawn.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -42,7 +48,8 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::editor::{Editor, EditorEvent};
+use crate::claude_session::{ClaudeSession, SessionEvent};
+use crate::editor::{self, Editor, EditorEvent};
 use crate::element::LayoutCache;
 use crate::git::GitStore;
 use crate::i18n::{tr, trf};
@@ -64,6 +71,10 @@ actions!(
         RevertChange,
         /// Side by side ↔ unified.
         ToggleUnified,
+        /// ⌘↵ on a Claude proposal: the right side is the answer.
+        AcceptProposal,
+        /// A Claude proposal is refused.
+        RejectProposal,
     ]
 );
 
@@ -76,6 +87,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("f4", JumpToSource, context),
         // "Accept Left Side": the HEAD block replaces the working copy's.
         KeyBinding::new("cmd-ctrl-right", RevertChange, context),
+        KeyBinding::new("cmd-enter", AcceptProposal, context),
     ]);
 }
 
@@ -506,6 +518,8 @@ pub enum DiffSide {
 pub enum DiffViewEvent {
     /// Jump to Source (F4): the file at a location, in its own tab.
     OpenFile(Location),
+    /// The view is done (an answered Claude proposal): its tab closes.
+    Close,
 }
 
 /// The diff of one file: HEAD ↔ working copy.
@@ -541,9 +555,25 @@ pub struct DiffView {
     /// A comparison of two revisions (or a revision and the working copy) instead of HEAD and the
     /// working copy.
     compare: Option<Compare>,
+    /// An edit Claude proposes instead of HEAD and the working copy.
+    proposal: Option<Proposal>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
+
+/// An edit Claude asks permission for: whose question it is, and the text Claude proposed (an
+/// untouched right side allows the call as it is).
+struct Proposal {
+    session: Entity<ClaudeSession>,
+    request: String,
+    proposed: String,
+    /// The answer went (or the question did): the tab is closing.
+    done: bool,
+}
+
+/// What Claude is told when the user rejects a proposal in its diff: the turn stops.
+const REJECTED: &str =
+    "The user rejected this edit. Stop and wait for the user to tell you how to proceed.";
 
 /// What a comparison compares, and how its right side is doing.
 struct Compare {
@@ -665,7 +695,7 @@ impl DiffView {
         // A commit, a checkout or the first status (a new file is known by it) may change the HEAD
         // side. A comparison's revisions are read once.
         let mut subscriptions = vec![cx.observe_in(&git, window, |this, _, window, cx| {
-            if this.compare.is_none() {
+            if this.compare.is_none() && this.proposal.is_none() {
                 this.reload_base(window, cx)
             }
         })];
@@ -703,8 +733,124 @@ impl DiffView {
             driver: Side::Right,
             synced: None,
             compare,
+            proposal: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// An edit Claude proposes (`request` of `session`): `original` — the file now (`None` — it
+    /// doesn't exist yet), `proposed` — the text after the edit, on the right in an editor of its own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn proposal(
+        path: PathBuf,
+        original: Option<String>,
+        proposed: String,
+        session: Entity<ClaudeSession>,
+        request: String,
+        git: Entity<GitStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let right = cx.new(|cx| {
+            let mut editor = Editor::new(Document::from_text(&proposed), window, cx);
+            editor.set_highlight_path(&path, cx);
+            editor
+        });
+        let mut view = Self::build(path, git, Some(right), false, None, window, cx);
+        let subscription = cx.subscribe(&session, {
+            let request = request.clone();
+            move |this, _, event: &SessionEvent, cx| {
+                let gone = match event {
+                    SessionEvent::PendingRemoved(id) => *id == request,
+                    SessionEvent::Exited => true,
+                    _ => false,
+                };
+                if gone {
+                    this.close_proposal(cx);
+                }
+            }
+        });
+        view._subscriptions.push(subscription);
+        view.proposal = Some(Proposal {
+            session,
+            request,
+            proposed,
+            done: false,
+        });
+        let base = match original.as_deref() {
+            Some(text) if text.contains('\r') => normalize(text),
+            Some(text) => text.to_string(),
+            None => String::new(),
+        };
+        view.apply_base(Base::Text(base.into()), original.is_none(), window, cx);
+        view
+    }
+
+    /// Whether this is a Claude proposal (not a diff of the file's changes: ⌘D opens its own tab).
+    pub fn is_proposal(&self) -> bool {
+        self.proposal.is_some()
+    }
+
+    /// Whether this is the proposal of the question `request` of `session`.
+    pub fn is_proposal_of(&self, session: &Entity<ClaudeSession>, request: &str) -> bool {
+        self.proposal
+            .as_ref()
+            .is_some_and(|proposal| &proposal.session == session && proposal.request == request)
+    }
+
+    /// Accept: the right side — the proposal as it is, or as the user changed it — answers the
+    /// question.
+    fn accept_proposal(&mut self, cx: &mut Context<Self>) {
+        let (Some(proposal), Some(right)) = (&self.proposal, &self.working) else {
+            return;
+        };
+        if proposal.done {
+            return;
+        }
+        let text = right.read(cx).document.text().to_string();
+        let answer = if text == proposal.proposed {
+            flux_claude::Answer::Allow {
+                remember: Vec::new(),
+            }
+        } else {
+            flux_claude::Answer::Edit {
+                text,
+                remember: Vec::new(),
+            }
+        };
+        self.answer_proposal(answer, cx);
+    }
+
+    fn reject_proposal(&mut self, cx: &mut Context<Self>) {
+        self.answer_proposal(
+            flux_claude::Answer::Deny {
+                message: REJECTED.to_string(),
+                interrupt: true,
+            },
+            cx,
+        );
+    }
+
+    fn answer_proposal(&mut self, answer: flux_claude::Answer, cx: &mut Context<Self>) {
+        let Some(proposal) = &self.proposal else {
+            return;
+        };
+        if proposal.done {
+            return;
+        }
+        let (session, request) = (proposal.session.clone(), proposal.request.clone());
+        session.update(cx, |session, cx| session.answer(&request, answer, cx));
+        self.close_proposal(cx);
+    }
+
+    /// The question is over: the tab closes (once).
+    fn close_proposal(&mut self, cx: &mut Context<Self>) {
+        if let Some(proposal) = &mut self.proposal
+            && !proposal.done
+        {
+            proposal.done = true;
+            cx.emit(DiffViewEvent::Close);
         }
     }
 
@@ -733,7 +879,10 @@ impl DiffView {
             .compare
             .as_ref()
             .is_none_or(|compare| compare.right == DiffSide::WorkingCopy);
-        self.working.as_ref().filter(|_| on_working_copy)
+        // A proposal's right side is Claude's text, not the file.
+        self.working
+            .as_ref()
+            .filter(|_| on_working_copy && self.proposal.is_none())
     }
 
     /// Whether closing the viewer must take care of the working copy's unsaved changes.
@@ -753,6 +902,9 @@ impl DiffView {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
+        if self.proposal.is_some() {
+            return trf("{0} — Claude", &[&name]).into();
+        }
         match &self.compare {
             Some(compare) if compare.right == DiffSide::WorkingCopy => {
                 format!("{name} ({})", short_label(&compare.left, 20)).into()
@@ -866,6 +1018,9 @@ impl DiffView {
     /// Whether F4 has a file to open: the working copy is on the right, or the file exists in the
     /// working tree (a comparison of revisions opens the file as it is now).
     fn can_jump(&self) -> bool {
+        if self.proposal.is_some() {
+            return self.path.exists();
+        }
         match &self.compare {
             None => self.working.is_some(),
             Some(compare) if compare.right == DiffSide::WorkingCopy => self.working.is_some(),
@@ -873,9 +1028,10 @@ impl DiffView {
         }
     }
 
-    /// Whether the blocks get revert arrows: the right side is the working copy.
+    /// Whether the blocks get revert arrows: the right side is the working copy, or a proposal
+    /// (the arrow rejects that change).
     fn can_revert(&self) -> bool {
-        self.working_copy().is_some()
+        self.working_copy().is_some() || (self.is_proposal() && self.working.is_some())
     }
 
     /// The right side of a comparison is still being read.
@@ -1104,6 +1260,26 @@ impl DiffView {
         }
         let model = self.model.clone();
         let hunks: &[Hunk] = model.as_ref().map_or(&[], |model| &model.hunks);
+        // A proposal: the file is the left side; a line of the proposal goes where it would be in
+        // the file.
+        if self.proposal.is_some() && !self.unified {
+            let line = match (&self.base_editor, &self.working) {
+                (Some(base), _) if base.focus_handle(cx).is_focused(window) => {
+                    cursor_line(base, cx)
+                }
+                (_, Some(right)) => {
+                    map_line(hunks, cursor_line(right, cx) as f32, false).floor() as usize
+                }
+                _ => 0,
+            };
+            cx.emit(DiffViewEvent::OpenFile(Location {
+                path: self.path.clone(),
+                line,
+                start: 0,
+                end: 0,
+            }));
+            return;
+        }
         let (line, column) = if self.unified {
             match (&self.unified_editor, &self.unified_text) {
                 (Some(editor), Some((_, unified))) => (
@@ -1274,6 +1450,7 @@ impl DiffView {
     /// committed whole).
     fn has_checkboxes(&self, cx: &App) -> bool {
         self.compare.is_none()
+            && self.proposal.is_none()
             && self.working.is_some()
             && !self.new_file
             && matches!(
@@ -1481,6 +1658,76 @@ impl DiffView {
 
     // --- Rendering ---
 
+    /// The banner of a Claude proposal: what it is, Reject, Accept (⌘↵).
+    fn render_proposal_banner(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let proposal = self.proposal.as_ref()?;
+        let ui = Theme::ui(cx);
+        let name = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let changed = self
+            .working
+            .as_ref()
+            .is_some_and(|right| *right.read(cx).document.text() != proposal.proposed);
+        let accept_keys = ui::shortcut_in(&AcceptProposal, &self.focus_handle, window);
+        Some(
+            div()
+                .flex_none()
+                .mx(px(ui::GAP))
+                .mt(px(ui::GAP))
+                .px(px(10.))
+                .py(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .rounded(px(ui::RADIUS_MD))
+                .bg(UiColors::tint(ui.accent, 0.12))
+                .border_1()
+                .border_color(UiColors::tint(ui.accent, 0.35))
+                .child(icon(IconName::Claude, ui.accent_text).size(px(15.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .truncate()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(trf("Claude proposes changes to {0}", &[&name])),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::TEXT_SM))
+                                .text_color(ui.text_muted)
+                                .child(if changed {
+                                    tr("Accept applies your version of the right side")
+                                } else {
+                                    tr("Edit the right side or reject changes with the arrows")
+                                }),
+                        ),
+                )
+                .child(
+                    ui::text_button("proposal-reject", tr("Reject"), true, ui)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.reject_proposal(cx))),
+                )
+                .child(
+                    ui::primary_button("proposal-accept", tr("Accept"), true, ui)
+                        .when_some(accept_keys, |button, keys| {
+                            button.tooltip(ui::tooltip(tr("Accept"), Some(keys)))
+                        })
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.accept_proposal(cx))),
+                ),
+        )
+    }
+
     fn render_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let keys = |action: &dyn gpui::Action| ui::shortcut_in(action, &self.focus_handle, window);
@@ -1577,6 +1824,10 @@ impl DiffView {
             Some(compare) => (
                 Self::side_caption(&compare.left),
                 Self::side_caption(&compare.right),
+            ),
+            None if self.proposal.is_some() => (
+                tr("Current version").to_string(),
+                tr("Proposed by Claude").to_string(),
             ),
             None => {
                 let head = self
@@ -1739,7 +1990,14 @@ impl DiffView {
                         .rounded(px(ui::RADIUS_XS))
                         .cursor_pointer()
                         .hover(move |style| style.bg(ui.hover))
-                        .tooltip(ui::tooltip(tr("Revert"), None))
+                        .tooltip(ui::tooltip(
+                            if self.proposal.is_some() {
+                                tr("Reject This Change")
+                            } else {
+                                tr("Revert")
+                            },
+                            None,
+                        ))
                         .on_click(
                             cx.listener(move |this, _: &ClickEvent, _, cx| this.revert(index, cx)),
                         )
@@ -2008,6 +2266,13 @@ impl Render for DiffView {
             .on_action(
                 cx.listener(|this, _: &JumpToSource, window, cx| this.jump_to_source(window, cx)),
             )
+            .when(self.proposal.is_some(), |view| {
+                view.on_action(cx.listener(|this, _: &AcceptProposal, _, cx| this.accept_proposal(cx)))
+                    .on_action(cx.listener(|this, _: &RejectProposal, _, cx| this.reject_proposal(cx)))
+                    // The proposal isn't a file of its own: ⌘S must not ask where to save it.
+                    .capture_action(cx.listener(|_, _: &editor::Save, _, cx| cx.stop_propagation()))
+            })
+            .children(self.render_proposal_banner(window, cx))
             .child(self.render_toolbar(window, cx))
             .child(ui::divider(ui).mx(px(ui::GAP)))
             .when(comparable, |view| view.child(self.render_captions(cx)))

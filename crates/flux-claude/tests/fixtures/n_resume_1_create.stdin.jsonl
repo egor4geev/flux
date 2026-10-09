@@ -1,0 +1,2 @@
+{"type": "control_request", "request_id": "host-1", "request": {"subtype": "initialize"}}
+{"type": "user", "message": {"role": "user", "content": "Remember the code word 'pineapple'. Reply with just: OK"}, "parent_tool_use_id": null, "session_id": "", "uuid": "cfbb3a75-ddae-46b2-b2f8-e0ba07a84ae2"}

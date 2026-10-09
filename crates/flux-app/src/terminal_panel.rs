@@ -64,6 +64,8 @@ const TAB_LABEL_MAX_CHARS: usize = 28;
 /// border (1 px) for the height of the gap. Its middle is that much above the panel's top.
 const RESIZE_HANDLE_HEIGHT: f32 = GAP;
 const RESIZE_HANDLE_OFFSET: f32 = 1. + RESIZE_HANDLE_HEIGHT / 2.;
+/// How long a new shell gets to start before text is typed into it.
+const SHELL_START: std::time::Duration = std::time::Duration::from_millis(700);
 /// Hover groups: a pill (its × shows) and the resize handle (its line lights up).
 const TAB_GROUP: &str = "terminal-tab";
 const RESIZE_GROUP: &str = "terminal-panel-resize";
@@ -183,6 +185,34 @@ impl TerminalPanel {
                 cx.notify();
             }
         }
+    }
+
+    /// A new terminal tab with `text` typed at the prompt once the shell has started; `run` also
+    /// presses Enter. Claude Code's sign-in runs this way; an install command is only typed, for
+    /// the user to read and run.
+    pub fn new_terminal_typing(
+        &mut self,
+        text: String,
+        run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_terminal(window, cx);
+        let Some(group) = self.active_group() else {
+            return;
+        };
+        let view = group.read(cx).active_view();
+        let mut bytes = text.into_bytes();
+        if run {
+            bytes.push(b'\r');
+        }
+        // Typed after the shell's start-up: a profile that reads the terminal (a prompt theme)
+        // would take typeahead for itself.
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(SHELL_START).await;
+            view.update(cx, |view, _| view.terminal.input(bytes)).ok();
+        })
+        .detach();
     }
 
     /// Adds a tab (a new one, or one moved from the editor area) at `index` (by default, after the

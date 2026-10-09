@@ -1,0 +1,2 @@
+{"type": "control_request", "request_id": "host-1", "request": {"subtype": "initialize"}}
+{"type": "user", "message": {"role": "user", "content": "First, create a todo list with exactly 3 short items for the task 'make tea' using your todo/task tracking tool, then mark the first item as completed. Don't do anything else. Reply 'ok'."}, "parent_tool_use_id": null, "session_id": "", "uuid": "1479cb37-3b12-4ba5-b744-12ccc527f7ac"}

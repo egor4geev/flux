@@ -1,0 +1,2 @@
+{"type": "control_request", "request_id": "host-1", "request": {"subtype": "initialize"}}
+{"type": "user", "message": {"role": "user", "content": "Create a file hello.txt containing 'hi' using the Write tool. If that fails, reply 'failed'."}, "parent_tool_use_id": null, "session_id": "", "uuid": "d6ec7205-aaf7-4096-817f-36292ed1ab95"}

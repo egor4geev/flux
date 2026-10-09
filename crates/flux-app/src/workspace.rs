@@ -2,6 +2,7 @@
 //! opening files, closing tabs and the window, and quitting, with prompts about unsaved changes and
 //! running commands.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,6 +17,10 @@ use gpui::{
     WindowHandle, actions, anchored, deferred, div, prelude::*, px, relative,
 };
 
+use crate::claude::{self, ClaudeStore, ClaudeStoreEvent};
+use crate::claude_chat::{ClaudeChat, ClaudeChatEvent};
+use crate::claude_composer::EditorContext;
+use crate::claude_panel::{ClaudePanel, ClaudePanelEvent, DraggedClaudeChat};
 use crate::commit_panel::{CommitPanel, CommitPanelEvent};
 use crate::dialog::Dialog;
 use crate::diff_view::{DiffSide, DiffView, DiffViewEvent};
@@ -215,14 +220,29 @@ pub struct Workspace {
     /// The window's plugins: their commands, tool windows (in the island on the right), status
     /// bar items; they learn what happens in the window.
     pub(crate) plugins: Entity<PluginStore>,
+    /// Claude Code: the window's sessions (stage 9).
+    pub(crate) claude: Entity<ClaudeStore>,
+    /// The Claude window in the island on the right: the sessions' tabs and the active chat.
+    claude_panel: Entity<ClaudePanel>,
+    /// The chats' events, by chat (a chat goes with its session).
+    claude_chat_subscriptions: Vec<(Entity<ClaudeChat>, Subscription)>,
+    /// ⌥⌘K without a chat: the mention waits for the session being started.
+    claude_pending_mention: Option<String>,
+    /// The tab that was active before ⌘Esc went to a chat tab: ⌘Esc there goes back to it.
+    claude_return: Option<TabItem>,
+    /// The document last active in the editor: the chats mention its file and selection.
+    claude_last_editor: Option<WeakEntity<Editor>>,
+    /// The cards that ask the user about a session's question, by session and the CLI's request:
+    /// they expire once it is answered.
+    claude_attention: HashMap<(EntityId, String), crate::notification_center::NotificationId>,
     _subscriptions: Vec<Subscription>,
 }
 
-/// A tool window of the island on the right: Notifications, or a plugin's window (the Claude window
-/// of stage 9 takes the same slot).
+/// A tool window of the island on the right: Notifications, Claude, or a plugin's window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RightTool {
     Notifications,
+    Claude,
     Plugin(ToolKey),
 }
 
@@ -262,6 +282,8 @@ enum TabItem {
     Merge(Entity<MergeView>),
     /// A tab of the Git window (the log, a history) brought over from it.
     Log(Entity<GitLogView>),
+    /// A Claude chat brought over from the Claude window.
+    Claude(Entity<ClaudeChat>),
 }
 
 impl TabItem {
@@ -300,9 +322,17 @@ impl TabItem {
         }
     }
 
+    fn claude(&self) -> Option<&Entity<ClaudeChat>> {
+        match self {
+            TabItem::Claude(chat) => Some(chat),
+            _ => None,
+        }
+    }
+
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
             TabItem::Log(view) => view.focus_handle(cx),
+            TabItem::Claude(chat) => chat.focus_handle(cx),
             TabItem::Editor(editor) => editor.focus_handle(cx),
             TabItem::Terminal(group) => group.focus_handle(cx),
             TabItem::Diff(view) => view.focus_handle(cx),
@@ -316,7 +346,7 @@ impl TabItem {
             TabItem::Editor(editor) => is_modified(editor, cx),
             TabItem::Diff(view) => owned_editor(view, cx).is_some_and(|e| is_modified(&e, cx)),
             TabItem::Merge(view) => view.read(cx).is_modified(cx),
-            TabItem::Terminal(_) | TabItem::Log(_) => false,
+            TabItem::Terminal(_) | TabItem::Log(_) | TabItem::Claude(_) => false,
         }
     }
 }
@@ -405,6 +435,9 @@ impl Workspace {
         let notifications_panel = cx.new(|cx| {
             NotificationsPanel::new(notification_center.clone(), right_width.clone(), cx)
         });
+        let claude = cx.new(|cx| ClaudeStore::new(root.clone(), cx));
+        let claude_panel =
+            cx.new(|cx| ClaudePanel::new(claude.clone(), right_width.clone(), window, cx));
         let plugins = cx.new(|cx| PluginStore::new(root.clone(), right_width, cx));
         plugins.update(cx, |store, _| {
             store.set_notification_center(notification_center.downgrade())
@@ -427,6 +460,9 @@ impl Workspace {
             cx.observe(&notifications_panel, |_, _, cx| cx.notify()),
             cx.observe(&plugins, |_, _, cx| cx.notify()),
             cx.subscribe_in(&plugins, window, Self::on_plugin_store_event),
+            cx.observe(&claude_panel, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&claude, window, Self::on_claude_event),
+            cx.subscribe_in(&claude_panel, window, Self::on_claude_panel_event),
             cx.subscribe_in(&terminal_panel, window, Self::on_terminal_panel_event),
             cx.subscribe_in(
                 &project_search,
@@ -482,6 +518,13 @@ impl Workspace {
             right_tool: None,
             notifications_panel,
             plugins,
+            claude,
+            claude_panel,
+            claude_chat_subscriptions: Vec::new(),
+            claude_pending_mention: None,
+            claude_return: None,
+            claude_last_editor: None,
+            claude_attention: HashMap::new(),
             _subscriptions: subscriptions,
         };
         if !paths.is_empty() {
@@ -497,6 +540,8 @@ impl Workspace {
     /// A new project root (cmd-o with a directory).
     fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let root = fs::canonicalize(&root).unwrap_or(root);
+        self.claude
+            .update(cx, |store, cx| store.set_root(Some(root.clone()), cx));
         self.project_search
             .update(cx, |search, cx| search.set_root(Some(root.clone()), cx));
         let (git, git_subscription) = Self::build_git(Some(root.clone()), window, cx);
@@ -633,7 +678,7 @@ impl Workspace {
             let editor = match &tab.item {
                 TabItem::Editor(editor) => Some(editor.clone()),
                 TabItem::Diff(view) => owned_editor(view, cx),
-                TabItem::Terminal(_) | TabItem::Merge(_) | TabItem::Log(_) => None,
+                TabItem::Terminal(_) | TabItem::Merge(_) | TabItem::Log(_) | TabItem::Claude(_) => None,
             };
             if let Some(editor) = editor
                 && !editors.contains(&editor)
@@ -650,7 +695,7 @@ impl Workspace {
             TabItem::Editor(editor) => editor.read(cx).document.path().map(Path::to_path_buf),
             TabItem::Diff(view) => Some(view.read(cx).path().to_path_buf()),
             TabItem::Merge(view) => Some(view.read(cx).path().to_path_buf()),
-            TabItem::Terminal(_) | TabItem::Log(_) => None,
+            TabItem::Terminal(_) | TabItem::Log(_) | TabItem::Claude(_) => None,
         }
     }
 
@@ -702,6 +747,7 @@ impl Workspace {
         self.find_bar
             .update(cx, |bar, cx| bar.set_active_editor(editor, window, cx));
         self.reveal_active(cx);
+        self.update_claude_context(cx);
         cx.notify();
     }
 
@@ -780,6 +826,11 @@ impl Workspace {
             cx.notify()
         });
         let events = cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
+            if matches!(event, EditorEvent::SelectionsChanged)
+                && this.active_editor().as_ref() == Some(&editor)
+            {
+                this.update_claude_context(cx);
+            }
             if let EditorEvent::SaveFailed(reason) = event {
                 let name = editor.read(cx).document.display_name();
                 let notification = Notification::error(trf("Couldn't save {0}", &[&name]))
@@ -855,6 +906,7 @@ impl Workspace {
                 .update(cx, |store, cx| store.set_active_editor(None, cx));
             self.find_bar
                 .update(cx, |bar, cx| bar.set_active_editor(None, window, cx));
+            self.update_claude_context(cx);
             return cx.notify();
         }
         let active = if index < self.active {
@@ -1095,7 +1147,13 @@ impl Workspace {
             Some(TabItem::Editor(editor)) => {
                 editor.update(cx, |editor, cx| editor.show_status(message, cx))
             }
-            Some(TabItem::Terminal(_) | TabItem::Diff(_) | TabItem::Merge(_) | TabItem::Log(_)) => {
+            Some(
+                TabItem::Terminal(_)
+                | TabItem::Diff(_)
+                | TabItem::Merge(_)
+                | TabItem::Log(_)
+                | TabItem::Claude(_),
+            ) => {
                 self.status_message = Some(message);
                 self.status_message_task = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor()
@@ -1139,6 +1197,7 @@ impl Workspace {
                     self.remove_tab_at(index, window, cx);
                 }
             }
+            TabItem::Claude(chat) => self.close_claude_tab(chat, window, cx),
         }
     }
 
@@ -1186,8 +1245,9 @@ impl Workspace {
         let open = self.tabs.iter().position(|tab| {
             tab.item.diff().is_some_and(|view| {
                 let view = view.read(cx);
-                // A comparison of the same file (a branch, a stash) is another tab.
-                view.compares().is_none() && canonical(view.path()) == target
+                // A comparison of the same file (a branch, a stash) and a Claude proposal of it
+                // are other tabs.
+                view.compares().is_none() && !view.is_proposal() && canonical(view.path()) == target
             })
         });
         if let Some(index) = open {
@@ -1238,13 +1298,60 @@ impl Workspace {
         let view = cx.new(|cx| DiffView::new(path, git, working, owns_working, window, cx));
         let subscriptions = vec![
             cx.observe(&view, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+            cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
                 DiffViewEvent::OpenFile(location) => {
                     this.open_location(location.clone(), true, window, cx)
                 }
+                DiffViewEvent::Close => this.close_diff_tab(view.clone(), window, cx),
             }),
         ];
         self.insert_tab(TabItem::Diff(view), subscriptions, None, window, cx);
+    }
+
+    /// A diff made elsewhere (a Claude proposal, `crate::claude_diff`) in a tab next to the active
+    /// one; it closes itself with [`DiffViewEvent::Close`].
+    pub(crate) fn add_diff_view_tab(
+        &mut self,
+        view: Entity<DiffView>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Without `focus` the keyboard stays where it was (the Claude chat answering a card).
+        let focused = (!focus).then(|| window.focused(cx)).flatten();
+        let subscriptions = vec![
+            cx.observe(&view, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
+                DiffViewEvent::OpenFile(location) => {
+                    this.open_location(location.clone(), true, window, cx)
+                }
+                DiffViewEvent::Close => this.close_diff_tab(view.clone(), window, cx),
+            }),
+        ];
+        self.insert_tab(TabItem::Diff(view), subscriptions, None, window, cx);
+        if let Some(focused) = focused {
+            window.focus(&focused);
+        }
+    }
+
+    /// The diff tabs of the window.
+    pub(crate) fn diff_views(&self) -> Vec<Entity<DiffView>> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| tab.item.diff().cloned())
+            .collect()
+    }
+
+    /// Goes to a diff's tab.
+    pub(crate) fn activate_diff_view(
+        &mut self,
+        view: &Entity<DiffView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.tabs.iter().position(|tab| tab.item.diff() == Some(view)) {
+            self.activate(index, window, cx);
+        }
     }
 
     /// Opens a comparison of a file at two revisions (or a revision and the working copy) in a
@@ -1332,10 +1439,11 @@ impl Workspace {
         });
         let subscriptions = vec![
             cx.observe(&view, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+            cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
                 DiffViewEvent::OpenFile(location) => {
                     this.open_location(location.clone(), true, window, cx)
                 }
+                DiffViewEvent::Close => this.close_diff_tab(view.clone(), window, cx),
             }),
         ];
         self.insert_tab(TabItem::Diff(view), subscriptions, None, window, cx);
@@ -1554,6 +1662,7 @@ impl Workspace {
             return false;
         }
         if self.running_processes(cx).is_empty()
+            && self.claude.read(cx).working_sessions(cx).is_empty()
             && !self.tabs.iter().any(|tab| tab.item.is_modified(cx))
         {
             return true;
@@ -1618,14 +1727,24 @@ impl Workspace {
             return Task::ready(false);
         }
         let editors = self.editors(cx);
-        let Some(detail) = running_processes_detail(&self.running_processes(cx)) else {
-            return self.confirm(editors, window, cx);
+        let terminals = running_processes_detail(&self.running_processes(cx));
+        let claude = self.claude_working_detail(cx);
+        // Claude alone is stopped; with terminals, everything is terminated.
+        let (title, button) = if terminals.is_none() {
+            (tr("Stop Claude?"), tr("Stop"))
+        } else {
+            (tr("Terminate running processes?"), tr("Terminate"))
+        };
+        let detail = match (terminals, claude) {
+            (None, None) => return self.confirm(editors, window, cx),
+            (Some(detail), None) | (None, Some(detail)) => detail,
+            (Some(terminals), Some(claude)) => format!("{terminals}\n{claude}"),
         };
         self.closing = true;
         window.activate_window();
-        let answer = Dialog::warning(tr("Terminate running processes?"))
+        let answer = Dialog::warning(title)
             .message(detail)
-            .danger(tr("Terminate"))
+            .danger(button)
             .cancel(tr("Cancel"))
             .show(window, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -1749,6 +1868,7 @@ impl Workspace {
             Tool::FindInFiles => self.project_search.read(cx).is_open(),
             Tool::Terminal => self.terminal_open && !self.git_open,
             Tool::Git => self.git_open,
+            Tool::Claude => self.right_tool == Some(RightTool::Claude),
             Tool::Notifications => self.right_tool == Some(RightTool::Notifications),
         }
     }
@@ -1762,6 +1882,25 @@ impl Workspace {
             }
             _ => None,
         }
+    }
+
+    /// A dot on a launchpad tool instead of a count: Claude working (the accent) or waiting for
+    /// the user (the warning color).
+    pub(crate) fn tool_dot(&self, tool: Tool, cx: &App) -> Option<gpui::Hsla> {
+        let ui = Theme::ui(cx);
+        match tool {
+            Tool::Claude => match self.claude.read(cx).activity(cx) {
+                claude::Activity::Working => Some(ui.accent),
+                claude::Activity::Waiting => Some(ui.warning),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether a launchpad tool is there: Claude only while it is on in the settings.
+    pub(crate) fn tool_visible(&self, tool: Tool, cx: &App) -> bool {
+        tool != Tool::Claude || claude::enabled(cx)
     }
 
     /// The badge of a tool is an alarm (the error color): unread error notifications.
@@ -1861,6 +2000,11 @@ impl Workspace {
                     .update(cx, |panel, cx| panel.set_visible(true, cx));
                 window.focus(&self.notifications_panel.focus_handle(cx));
             }
+            RightTool::Claude => {
+                self.claude_panel
+                    .update(cx, |panel, cx| panel.set_visible(true, cx));
+                self.claude_panel.read(cx).focus(window, cx);
+            }
             RightTool::Plugin(key) => {
                 let Some(view) = self.plugin_tool_view(key, cx) else {
                     self.right_tool = None;
@@ -1890,6 +2034,12 @@ impl Workspace {
                     .read(cx)
                     .contains_focus(window, cx);
                 self.notifications_panel
+                    .update(cx, |panel, cx| panel.set_visible(false, cx));
+                focused
+            }
+            RightTool::Claude => {
+                let focused = self.claude_panel.read(cx).contains_focus(window, cx);
+                self.claude_panel
                     .update(cx, |panel, cx| panel.set_visible(false, cx));
                 focused
             }
@@ -2785,6 +2935,9 @@ impl Workspace {
                 trf("{0} (merge) — {1}", &[&view.read(cx).title(), &project])
             }
             Some(TabItem::Log(view)) => format!("{} — {project}", view.read(cx).title()),
+            Some(TabItem::Claude(chat)) => {
+                format!("{} — {project}", chat.read(cx).session().read(cx).title())
+            }
             None => project.clone(),
         };
         if title != self.title {
@@ -3015,7 +3168,7 @@ impl Workspace {
                     return bar.child(div().flex_1().min_w_0().truncate().child(path));
                 }
             },
-            Some(TabItem::Log(_)) => {
+            Some(TabItem::Log(_) | TabItem::Claude(_)) => {
                 let left: SharedString = self.status_message.clone().unwrap_or_default();
                 return bar
                     .child(div().flex_1().min_w_0().truncate().child(left))
@@ -3173,6 +3326,7 @@ impl Workspace {
                 TabItem::Diff(view) => self.render_diff_tab(index, view, cx).into_any_element(),
                 TabItem::Merge(view) => self.render_merge_tab(index, view, cx).into_any_element(),
                 TabItem::Log(view) => self.render_log_tab(index, view, cx).into_any_element(),
+                TabItem::Claude(chat) => self.render_claude_tab(index, chat, cx).into_any_element(),
             })
             .collect();
         // While a tab is dragged over the strip: a marker where it would land.
@@ -3225,6 +3379,14 @@ impl Workspace {
             )
             .on_drop(cx.listener(|this, dragged: &DraggedLogTab, window, cx| {
                 this.drop_log(dragged.view.clone(), window, cx)
+            }))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedClaudeChat>, _, cx| {
+                    this.drag_over_tabs(event.event.position, event.bounds, cx)
+                }),
+            )
+            .on_drop(cx.listener(|this, dragged: &DraggedClaudeChat, window, cx| {
+                this.drop_claude(dragged.chat.clone(), window, cx)
             }))
             // The line under the tabs runs from edge to edge of the island, inset from the rounded
             // corners.
@@ -3340,6 +3502,8 @@ impl Workspace {
         let ui = Theme::ui(cx);
         let active = index == self.active;
         let title = view.read(cx).title();
+        // A Claude proposal reads "main.rs — Claude", with Claude's mark.
+        let proposal = view.read(cx).is_proposal();
         let dot = TabItem::Diff(view.clone())
             .is_modified(cx)
             .then_some(ui.modified);
@@ -3363,9 +3527,13 @@ impl Workspace {
                     this.close_diff_tab(close.clone(), window, cx)
                 }),
             )
-            .child(icon(IconName::Diff, ui.vcs_modified).size(px(14.)))
+            .child(if proposal {
+                icon(IconName::Claude, ui.accent_text).size(px(14.))
+            } else {
+                icon(IconName::Diff, ui.vcs_modified).size(px(14.))
+            })
             .child(label(&title))
-            .child(label(tr("diff")).text_color(ui.dim))
+            .when(!proposal, |tab| tab.child(label(tr("diff")).text_color(ui.dim)))
             .child(close_button(TabItem::Diff(view.clone()), active, dot, cx))
     }
 
@@ -3587,6 +3755,9 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_title(window, cx);
         let ui = Theme::ui(cx);
+        // The session actions of Claude are offered while a chat is current.
+        let claude_chat = self.current_claude_chat(window, cx).is_some();
+        let claude_in_tab = matches!(self.active_item(), Some(TabItem::Claude(_)));
         let root = div()
             .key_context("Workspace")
             .relative()
@@ -3618,6 +3789,7 @@ impl Render for Workspace {
             .map(|root| crate::rebase_dialog::workspace_actions(root, cx))
             .map(|root| crate::blame::workspace_actions(root, cx))
             .map(|root| crate::plugins::workspace_actions(root, cx))
+            .map(|root| Self::claude_actions(root, claude_chat, claude_in_tab, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
                 // A directory from the recent list may have disappeared since launch.
                 if !action.0.is_dir() {
@@ -3794,12 +3966,22 @@ impl Render for Workspace {
                 this.move_log_to_editor(dragged.view.clone(), None, window, cx)
             }
         });
+        let drop_claude = cx.listener(|this, dragged: &DraggedClaudeChat, window, cx| {
+            if !this
+                .tabs
+                .iter()
+                .any(|tab| tab.item.claude() == Some(&dragged.chat))
+            {
+                this.move_chat_to_editor(dragged.chat.clone(), None, window, cx)
+            }
+        });
         let body = move |content: AnyElement| {
             div()
                 .flex_1()
                 .min_h_0()
                 .on_drop(drop_terminal)
                 .on_drop(drop_log)
+                .on_drop(drop_claude)
                 .child(content)
         };
         let main = match self.active_item() {
@@ -3812,6 +3994,7 @@ impl Render for Workspace {
                     TabItem::Diff(view) => view.clone().into_any_element(),
                     TabItem::Merge(view) => view.clone().into_any_element(),
                     TabItem::Log(view) => view.clone().into_any_element(),
+                    TabItem::Claude(chat) => chat.clone().into_any_element(),
                 };
                 main.child(self.render_tab_bar(cx))
                     .when(
@@ -3898,6 +4081,7 @@ impl Render for Workspace {
         let right = self.right_tool.map(|tool| {
             let content = match tool {
                 RightTool::Notifications => self.notifications_panel.clone().into_any_element(),
+                RightTool::Claude => self.claude_panel.clone().into_any_element(),
                 RightTool::Plugin(key) => match self.plugin_tool_view(key, cx) {
                     Some(view) => view.into_any_element(),
                     None => div().into_any_element(),
@@ -3954,6 +4138,7 @@ impl Render for Workspace {
                     .flex()
                     .items_center()
                     .child(div().flex_1().min_w_0().child(self.render_status_bar(cx)))
+                    .children(self.render_claude_status(cx))
                     .child(self.render_bell(cx)),
             )
             .children(cards)
@@ -4375,6 +4560,868 @@ impl Render for DraggedEditorTab {
             .text_color(ui.foreground)
             .child(file.render().size(px(14.)))
             .child(self.name.clone())
+    }
+}
+
+// --- Claude Code (stage 9) ---
+
+impl Workspace {
+    /// The Claude actions of the window. Those of a session are there only while one is current
+    /// (the palette lists what can run); with Claude Code off in the settings, none are.
+    fn claude_actions(
+        root: gpui::Div,
+        has_chat: bool,
+        chat_in_tab: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        if !claude::enabled(cx) {
+            return root;
+        }
+        root.on_action(cx.listener(|this, _: &claude::ToggleClaude, window, cx| {
+            this.toggle_claude(window, cx)
+        }))
+        .on_action(cx.listener(|this, _: &claude::NewSession, window, cx| {
+            this.new_claude_session(window, cx)
+        }))
+        .on_action(cx.listener(|this, _: &claude::CheckAgain, _, cx| {
+            this.claude.update(cx, |store, cx| store.check(cx))
+        }))
+        .on_action(cx.listener(|this, _: &claude::SignIn, window, cx| {
+            this.claude_sign_in(window, cx)
+        }))
+        .on_action(cx.listener(|this, _: &claude::OpenSettings, window, cx| {
+            crate::settings_view::open(this, crate::settings_view::Section::Claude, window, cx)
+        }))
+        .on_action(cx.listener(|this, _: &claude::AddSelectionToClaude, window, cx| {
+            this.add_selection_to_claude(window, cx)
+        }))
+        .on_action(cx.listener(|this, action: &claude::ShowSession, window, cx| {
+            this.show_claude_session(action.0, window, cx)
+        }))
+        .on_action(cx.listener(|this, action: &claude::TypeInTerminal, window, cx| {
+            this.type_in_terminal(action.0.clone(), false, window, cx)
+        }))
+        .on_action(cx.listener(|_, action: &claude::ShowExitDetails, window, cx| {
+            // The answer doesn't matter: the dialog only shows the output.
+            drop(
+                Dialog::info(action.title.clone())
+                    .details(action.output.clone())
+                    .primary(tr("OK"))
+                    .show(window, cx),
+            );
+        }))
+        .when(has_chat, |root| {
+            root.on_action(cx.listener(|this, _: &claude::Interrupt, window, cx| {
+                if let Some(chat) = this.current_claude_chat(window, cx) {
+                    let session = chat.read(cx).session().clone();
+                    session.update(cx, |session, cx| session.interrupt(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &claude::OpenInTerminal, window, cx| {
+                this.open_claude_in_terminal(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &claude::RenameSession, window, cx| {
+                this.rename_claude_session(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &claude::CloseSession, window, cx| {
+                if let Some(chat) = this.current_claude_chat(window, cx) {
+                    this.close_claude_chat(chat, window, cx)
+                }
+            }))
+        })
+        .when(has_chat && !chat_in_tab, |root| {
+            root.on_action(cx.listener(|this, _: &claude::MoveToEditor, window, cx| {
+                this.move_claude_to_editor(None, window, cx)
+            }))
+        })
+        .when(chat_in_tab, |root| {
+            root.on_action(cx.listener(|this, _: &claude::MoveToPanel, window, cx| {
+                this.move_claude_to_panel(window, cx)
+            }))
+        })
+    }
+
+    /// Every chat of the window: those of the Claude window, then those in the editor's tabs.
+    fn claude_chats(&self, cx: &App) -> Vec<Entity<ClaudeChat>> {
+        let mut chats = self.claude_panel.read(cx).chats().to_vec();
+        chats.extend(self.tabs.iter().filter_map(|tab| tab.item.claude().cloned()));
+        chats
+    }
+
+    /// The chat of a session: in the Claude window or in the editor's tabs.
+    fn claude_chat(
+        &self,
+        session: &Entity<crate::claude_session::ClaudeSession>,
+        cx: &App,
+    ) -> Option<Entity<ClaudeChat>> {
+        self.claude_chats(cx)
+            .into_iter()
+            .find(|chat| chat.read(cx).session() == session)
+    }
+
+    /// The chat the session actions act on: the one with the focus; else the Claude window's when
+    /// the focus is there; else the active tab's; else the shown window's.
+    fn current_claude_chat(&self, window: &Window, cx: &App) -> Option<Entity<ClaudeChat>> {
+        let in_tabs = self.tabs.iter().filter_map(|tab| tab.item.claude());
+        if let Some(chat) = in_tabs
+            .clone()
+            .find(|chat| chat.read(cx).contains_focus(window, cx))
+        {
+            return Some(chat.clone());
+        }
+        let panel = self.claude_panel.read(cx);
+        let shown = self.right_tool == Some(RightTool::Claude);
+        if shown && panel.contains_focus(window, cx) {
+            return panel.active_chat().cloned();
+        }
+        if let Some(TabItem::Claude(chat)) = self.active_item() {
+            return Some(chat);
+        }
+        shown.then(|| panel.active_chat().cloned()).flatten()
+    }
+
+    /// The chat is on the screen and the window is active: no notification about it is needed.
+    fn claude_chat_in_sight(&self, chat: &Entity<ClaudeChat>, window: &Window, cx: &App) -> bool {
+        if !window.is_window_active() {
+            return false;
+        }
+        if self.right_tool == Some(RightTool::Claude) && self.claude_panel.read(cx).shows(chat) {
+            return true;
+        }
+        matches!(self.active_item(), Some(TabItem::Claude(active)) if &active == chat)
+    }
+
+    /// ⌘Esc: from a chat — back to where the user was; otherwise to the chat (the editor tab it
+    /// lives in, or the Claude window; a ready CLI without sessions starts one).
+    fn toggle_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(chat) = self.current_claude_chat(window, cx)
+            && chat.read(cx).contains_focus(window, cx)
+        {
+            return self.leave_claude(&chat, window, cx);
+        }
+        let panel_empty = self.claude_panel.read(cx).chats().is_empty();
+        if panel_empty
+            && let Some(index) = self.tabs.iter().position(|tab| tab.item.claude().is_some())
+        {
+            self.claude_return = self.active_item();
+            self.activate(index, window, cx);
+            if let Some(TabItem::Claude(chat)) = self.active_item() {
+                chat.read(cx).focus_composer(window, cx);
+            }
+            return;
+        }
+        if panel_empty && self.claude.read(cx).is_ready() {
+            // The new session's chat shows the window ([`ClaudeStoreEvent::SessionAdded`]).
+            self.claude.update(cx, |store, cx| {
+                store.new_session(cx);
+            });
+            return;
+        }
+        self.show_right(RightTool::Claude, window, cx);
+    }
+
+    /// ⌘Esc in a chat: a chat in a tab gives the tab back to the one active before (or the nearest
+    /// document); the Claude window stays and the focus goes to the editor.
+    fn leave_claude(&mut self, chat: &Entity<ClaudeChat>, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.active_item(), Some(TabItem::Claude(active)) if &active == chat) {
+            let back = self
+                .claude_return
+                .take()
+                .and_then(|item| self.tabs.iter().position(|tab| tab.item == item))
+                .or_else(|| self.tabs.iter().rposition(|tab| tab.item.editor().is_some()));
+            if let Some(index) = back {
+                self.activate(index, window, cx);
+            }
+            return;
+        }
+        self.focus_active(window, cx);
+    }
+
+    /// "+", "New Session": a session in the Claude window; while `claude` isn't ready, the window
+    /// says why.
+    fn new_claude_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let started = self.claude.update(cx, |store, cx| store.new_session(cx));
+        if started.is_none() {
+            self.show_right(RightTool::Claude, window, cx);
+        }
+    }
+
+    /// A notification's "Show": the session's chat, wherever it is.
+    fn show_claude_session(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.claude.read(cx).session(id).cloned() else {
+            return;
+        };
+        let Some(chat) = self.claude_chat(&session, cx) else {
+            return;
+        };
+        window.activate_window();
+        if self.claude_panel.read(cx).chats().contains(&chat) {
+            self.claude_panel
+                .update(cx, |panel, cx| panel.activate_chat(&chat, window, cx));
+            self.show_right(RightTool::Claude, window, cx);
+        } else if let Some(index) = self.tabs.iter().position(|tab| tab.item.claude() == Some(&chat))
+        {
+            self.activate(index, window, cx);
+            chat.read(cx).focus_composer(window, cx);
+        }
+    }
+
+    fn on_claude_event(
+        &mut self,
+        _: &Entity<ClaudeStore>,
+        event: &ClaudeStoreEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ClaudeStoreEvent::SessionAdded(session) => {
+                let chat = cx.new(|cx| ClaudeChat::new(session.clone(), window, cx));
+                let subscription = cx.subscribe_in(&chat, window, Self::on_claude_chat_event);
+                self.claude_chat_subscriptions
+                    .push((chat.clone(), subscription));
+                self.claude_panel
+                    .update(cx, |panel, cx| panel.add_chat(chat.clone(), None, cx));
+                self.show_right(RightTool::Claude, window, cx);
+                self.update_claude_context(cx);
+                if let Some(mention) = self.claude_pending_mention.take() {
+                    chat.update(cx, |chat, cx| chat.insert(&mention, window, cx));
+                }
+            }
+            ClaudeStoreEvent::SessionRemoved(session) => {
+                self.forget_claude_notifications(session.entity_id(), cx);
+                let chat = self
+                    .claude_chats(cx)
+                    .into_iter()
+                    .find(|chat| chat.read(cx).session() == session);
+                if let Some(chat) = chat {
+                    self.claude_chat_subscriptions
+                        .retain(|(known, _)| *known != chat);
+                    let removed = self
+                        .claude_panel
+                        .update(cx, |panel, cx| panel.remove_chat(&chat, cx));
+                    if removed {
+                        if self.right_tool == Some(RightTool::Claude) {
+                            self.claude_panel.read(cx).focus(window, cx);
+                        }
+                    } else if let Some(index) = self
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.item.claude() == Some(&chat))
+                    {
+                        self.remove_tab_at(index, window, cx);
+                    }
+                }
+            }
+            ClaudeStoreEvent::Attention { session, request } => {
+                let Some(pending) = session.read(cx).model().pending(request).cloned() else {
+                    return;
+                };
+                let is_edit = matches!(pending.kind, flux_claude::PendingKind::Edit(_));
+                if is_edit && crate::settings::claude(cx).diff_tabs {
+                    crate::claude_diff::open(self, session.clone(), request.clone(), false, window, cx);
+                }
+                let Some(chat) = self.claude_chat(session, cx) else {
+                    return;
+                };
+                if self.claude_chat_in_sight(&chat, window, cx) {
+                    return;
+                }
+                self.claude_panel
+                    .update(cx, |panel, cx| panel.mark_unseen(&chat, cx));
+                let title = session.read(cx).title();
+                let body = match &pending.kind {
+                    flux_claude::PendingKind::Questions(questions) => questions
+                        .first()
+                        .map(|question| question.question.clone())
+                        .unwrap_or_default(),
+                    flux_claude::PendingKind::Plan { .. } => String::new(),
+                    _ => match &pending.description {
+                        Some(description) => format!("{}: {description}", pending.display_name),
+                        None => pending.display_name.clone(),
+                    },
+                };
+                let body = if body.is_empty() {
+                    title.to_string()
+                } else {
+                    format!("{title} · {body}")
+                };
+                let mut notification = Notification::info(claude::attention_title(&pending.kind))
+                    .body(body)
+                    .action(tr("Show"), claude::ShowSession(session.entity_id()))
+                    .group(NotificationGroup::Claude);
+                // Claude waits until the user answers: the card waits too.
+                notification.sticky = true;
+                let id = self
+                    .notification_center
+                    .update(cx, |center, cx| center.notify(notification, cx));
+                self.claude_attention
+                    .insert((session.entity_id(), request.clone()), id);
+            }
+            ClaudeStoreEvent::Resolved { session, request } => {
+                if let Some(id) = self
+                    .claude_attention
+                    .remove(&(session.entity_id(), request.clone()))
+                {
+                    self.notification_center
+                        .update(cx, |center, cx| center.expire(id, cx));
+                }
+            }
+            ClaudeStoreEvent::Finished { session, is_error } => {
+                let Some(chat) = self.claude_chat(session, cx) else {
+                    return;
+                };
+                if self.claude_chat_in_sight(&chat, window, cx) {
+                    return;
+                }
+                self.claude_panel
+                    .update(cx, |panel, cx| panel.mark_unseen(&chat, cx));
+                let title = session.read(cx).title();
+                let notification = if *is_error {
+                    Notification::warning(trf("Claude stopped with an error: {0}", &[&title]))
+                        .transient()
+                } else {
+                    Notification::success(trf("Claude finished: {0}", &[&title]))
+                }
+                .action(tr("Show"), claude::ShowSession(session.entity_id()))
+                .group(NotificationGroup::Claude);
+                self.notify(notification, cx);
+            }
+            ClaudeStoreEvent::Failed {
+                session,
+                code,
+                stderr,
+            } => {
+                let in_sight = self
+                    .claude_chat(session, cx)
+                    .is_some_and(|chat| self.claude_chat_in_sight(&chat, window, cx));
+                if in_sight {
+                    return;
+                }
+                let title = trf("Claude stopped: {0}", &[&session.read(cx).title()]);
+                let body = stderr.last().cloned().unwrap_or_else(|| match code {
+                    Some(code) => trf("The process exited with code {0}.", &[code]),
+                    None => tr("The process ended unexpectedly.").to_string(),
+                });
+                let mut notification = Notification::error(title.clone())
+                    .body(body)
+                    .group(NotificationGroup::Claude);
+                if stderr.len() > 1 {
+                    notification = notification.action(
+                        tr("Details"),
+                        claude::ShowExitDetails {
+                            title,
+                            output: stderr.join("\n"),
+                        },
+                    );
+                }
+                notification =
+                    notification.action(tr("Show"), claude::ShowSession(session.entity_id()));
+                self.notify(notification, cx);
+            }
+            ClaudeStoreEvent::FilesChanged(paths) => self.sync_documents(Some(paths.clone()), cx),
+            ClaudeStoreEvent::Changed => cx.notify(),
+        }
+    }
+
+    /// A session goes: the cards that ask about it expire.
+    fn forget_claude_notifications(&mut self, session: EntityId, cx: &mut Context<Self>) {
+        let ids: Vec<_> = self
+            .claude_attention
+            .iter()
+            .filter(|((owner, _), _)| *owner == session)
+            .map(|(key, id)| (key.clone(), *id))
+            .collect();
+        for (key, id) in ids {
+            self.claude_attention.remove(&key);
+            self.notification_center
+                .update(cx, |center, cx| center.expire(id, cx));
+        }
+    }
+
+    fn on_claude_chat_event(
+        &mut self,
+        chat: &Entity<ClaudeChat>,
+        event: &ClaudeChatEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ClaudeChatEvent::OpenProposal(request) => {
+                let session = chat.read(cx).session().clone();
+                crate::claude_diff::open(self, session, request.clone(), true, window, cx);
+            }
+            ClaudeChatEvent::OpenLocation(location) => {
+                self.open_location(location.clone(), true, window, cx)
+            }
+        }
+    }
+
+    fn on_claude_panel_event(
+        &mut self,
+        _: &Entity<ClaudePanel>,
+        event: &ClaudePanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ClaudePanelEvent::MoveToPanel { chat, index } => {
+                self.move_chat_to_panel(chat.clone(), Some(*index), window, cx)
+            }
+            ClaudePanelEvent::CloseChat(chat) => self.close_claude_chat(chat.clone(), window, cx),
+        }
+    }
+
+    // --- The editor and the chats ---
+
+    /// What the chats mention along with a message: the file and the selected lines of the
+    /// document last active in the editor (while a chat tab is active, the one before it).
+    fn claude_editor_context(&self, cx: &App) -> Option<EditorContext> {
+        let editor = self.claude_last_editor.as_ref()?.upgrade()?;
+        if !self.tabs.iter().any(|tab| tab.item.editor() == Some(&editor)) {
+            return None;
+        }
+        self.editor_context_of(&editor, cx)
+    }
+
+    fn editor_context_of(&self, editor: &Entity<Editor>, cx: &App) -> Option<EditorContext> {
+        let editor = editor.read(cx);
+        let path = editor.document.path()?;
+        let relative = self
+            .root
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        let selection = editor.document.selection().primary();
+        let (start, end) = (selection.from(), selection.to());
+        let lines = (start != end).then(|| {
+            let text = editor.document.text();
+            let first = text.char_to_line(start) + 1;
+            // A selection that ends at the start of a line doesn't take that line.
+            let last = text.char_to_line(end.saturating_sub(1).max(start)) + 1;
+            (first, last)
+        });
+        Some(EditorContext {
+            path: relative,
+            lines,
+        })
+    }
+
+    /// The active tab changed or a document's selection moved: every chat's message field shows
+    /// the file and lines it will mention (when sharing the selection is on).
+    fn update_claude_context(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_editor() {
+            self.claude_last_editor = Some(editor.downgrade());
+        }
+        let context = crate::settings::claude(cx)
+            .share_selection
+            .then(|| self.claude_editor_context(cx))
+            .flatten();
+        for chat in self.claude_chats(cx) {
+            let composer = chat.read(cx).composer().clone();
+            let context = context.clone();
+            composer.update(cx, |composer, cx| composer.set_editor_context(context, cx));
+        }
+    }
+
+    /// ⌥⌘K: the active document's file and selected lines go into a chat's message as a mention
+    /// (`@src/main.rs#L10-20`): the current chat, else the Claude window's, else one in a tab;
+    /// without any, a new session takes it once it starts.
+    fn add_selection_to_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor() else {
+            return;
+        };
+        let Some(context) = self.editor_context_of(&editor, cx) else {
+            return;
+        };
+        let mention = format!("{} ", claude::mention(&context.path, context.lines));
+        let chat = self
+            .current_claude_chat(window, cx)
+            .or_else(|| self.claude_panel.read(cx).active_chat().cloned())
+            .or_else(|| self.tabs.iter().find_map(|tab| tab.item.claude().cloned()));
+        let Some(chat) = chat else {
+            if self.claude.read(cx).is_ready() {
+                self.claude_pending_mention = Some(mention);
+            }
+            return self.toggle_claude(window, cx);
+        };
+        if self.claude_panel.read(cx).chats().contains(&chat) {
+            self.claude_panel
+                .update(cx, |panel, cx| panel.activate_chat(&chat, window, cx));
+            self.show_right(RightTool::Claude, window, cx);
+        } else if let Some(index) = self.tabs.iter().position(|tab| tab.item.claude() == Some(&chat))
+        {
+            self.claude_return = self.active_item();
+            self.activate(index, window, cx);
+        }
+        chat.update(cx, |chat, cx| chat.insert(&mention, window, cx));
+    }
+
+    // --- Moving chats ---
+
+    /// The current chat of the Claude window moves to the editor's tabs.
+    fn move_claude_to_editor(
+        &mut self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let chat = self
+            .current_claude_chat(window, cx)
+            .or_else(|| self.claude_panel.read(cx).active_chat().cloned());
+        if let Some(chat) = chat {
+            self.move_chat_to_editor(chat, index, window, cx);
+        }
+    }
+
+    fn move_chat_to_editor(
+        &mut self,
+        chat: Entity<ClaudeChat>,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .claude_panel
+            .update(cx, |panel, cx| panel.remove_chat(&chat, cx))
+        {
+            return;
+        }
+        if self.claude_panel.read(cx).chats().is_empty()
+            && self.right_tool == Some(RightTool::Claude)
+        {
+            self.hide_right(window, cx);
+        }
+        let subscriptions = vec![cx.observe(&chat, |_, _, cx| cx.notify())];
+        self.insert_tab(TabItem::Claude(chat.clone()), subscriptions, index, window, cx);
+        chat.read(cx).focus_composer(window, cx);
+    }
+
+    /// The active tab's chat goes back to the Claude window.
+    fn move_claude_to_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(TabItem::Claude(chat)) = self.active_item() {
+            self.move_chat_to_panel(chat, None, window, cx);
+        }
+    }
+
+    fn move_chat_to_panel(
+        &mut self,
+        chat: Entity<ClaudeChat>,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.item.claude() == Some(&chat))
+        else {
+            return;
+        };
+        self.remove_tab_at(tab, window, cx);
+        self.claude_panel
+            .update(cx, |panel, cx| panel.add_chat(chat, index, cx));
+        self.show_right(RightTool::Claude, window, cx);
+    }
+
+    /// A chat dropped on the tab strip: one of the tabs moves along it, one from the Claude window
+    /// joins the tabs where the marker shows.
+    fn drop_claude(&mut self, chat: Entity<ClaudeChat>, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        match self.tabs.iter().position(|tab| tab.item.claude() == Some(&chat)) {
+            Some(from) => self.move_tab(from, index, window, cx),
+            None => self.move_chat_to_editor(chat, Some(index), window, cx),
+        }
+    }
+
+    // --- Sessions ---
+
+    /// Closing a chat (its pill's ×, its tab, Close Session) ends its session; one that works is
+    /// asked about first.
+    fn close_claude_chat(&mut self, chat: Entity<ClaudeChat>, window: &mut Window, cx: &mut Context<Self>) {
+        let session = chat.read(cx).session().clone();
+        if !session.read(cx).model().is_working() {
+            return self
+                .claude
+                .update(cx, |store, cx| store.close_session(&session, cx));
+        }
+        let title = session.read(cx).title();
+        let answer = Dialog::warning(trf("Stop “{0}”?", &[&title]))
+            .message(tr(
+                "Claude is working in this session. Closing the session stops Claude. Its changes stay.",
+            ))
+            .danger(tr("Stop and Close"))
+            .cancel(tr("Cancel"))
+            .show(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Some(0) {
+                this.update(cx, |this, cx| {
+                    this.claude
+                        .update(cx, |store, cx| store.close_session(&session, cx))
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Closing a chat's tab: as closing the chat.
+    fn close_claude_tab(
+        &mut self,
+        chat: Entity<ClaudeChat>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_claude_chat(chat, window, cx)
+    }
+
+    /// Rename…: the session's title, as `/rename` sets it.
+    fn rename_claude_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.current_claude_chat(window, cx) else {
+            return;
+        };
+        let session = chat.read(cx).session().clone();
+        let old = session.read(cx).title().to_string();
+        self.toggle_dialog(window, cx, move |window, cx| {
+            crate::input_dialog::InputDialog::new(tr("Rename Session"), tr("Session name"), window, cx)
+                .text(&old, cx)
+                .confirm_label(tr("Rename"))
+                .validate(
+                    |name, _, _| {
+                        if name.trim().is_empty() {
+                            Err(tr("Enter a name").into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    cx,
+                )
+                .on_confirm(move |name, _, _, cx| {
+                    session.update(cx, |session, cx| session.rename(name, cx));
+                })
+        });
+    }
+
+    /// "Open in Terminal": the session goes on in the terminal CLI (`claude --resume <id>`) for
+    /// what only the terminal does; its process here stops (writing in the chat resumes it).
+    fn open_claude_in_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.current_claude_chat(window, cx) else {
+            return;
+        };
+        let Some(cli) = self.claude.read(cx).cli().cli().cloned() else {
+            return;
+        };
+        let session = chat.read(cx).session().clone();
+        let id = session.read(cx).session_id().map(str::to_string);
+        session.update(cx, |session, cx| {
+            session.shutdown();
+            cx.notify();
+        });
+        self.claude.update(cx, |_, cx| cx.notify());
+        let command = claude::resume_command(&cli, id.as_deref());
+        self.type_in_terminal(command, true, window, cx);
+    }
+
+    /// "Sign In": `claude auth login` in a new terminal (it opens the browser); Flux checks the
+    /// sign-in until it is there.
+    fn claude_sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cli) = self.claude.read(cx).cli().cli().cloned() else {
+            return self.claude.update(cx, |store, cx| store.check(cx));
+        };
+        let command = format!(
+            "{} auth login",
+            claude::shell_quote(&cli.path.to_string_lossy())
+        );
+        self.type_in_terminal(command, true, window, cx);
+        self.claude.update(cx, |store, cx| store.watch_sign_in(cx));
+    }
+
+    /// A new terminal in the panel with `text` typed at its prompt (`run` — and run).
+    fn type_in_terminal(
+        &mut self,
+        text: String,
+        run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_open = true;
+        self.git_open = false;
+        self.terminal_panel
+            .update(cx, |panel, cx| panel.new_terminal_typing(text, run, window, cx));
+        cx.notify();
+    }
+
+    /// Closing the window: what Claude does in its sessions (`None` — nothing).
+    fn claude_working_detail(&self, cx: &App) -> Option<String> {
+        let working = self.claude.read(cx).working_sessions(cx);
+        match working.as_slice() {
+            [] => None,
+            [session] => Some(trf(
+                "Claude is working in “{0}”.",
+                &[&session.read(cx).title()],
+            )),
+            sessions => Some(trn(
+                sessions.len(),
+                "Claude is working in {n} session.",
+                "Claude is working in {n} sessions.",
+            )),
+        }
+    }
+
+    // --- Drawing ---
+
+    /// A Claude chat in the editor's tabs: ✳, the session's title, its status dot in place of ×.
+    fn render_claude_tab(
+        &self,
+        index: usize,
+        chat: &Entity<ClaudeChat>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        let active = index == self.active;
+        let session = chat.read(cx).session().read(cx);
+        let title = session.title();
+        let status = session.model().status.clone();
+        let dot = claude::status_color(&status, &ui);
+        let tooltip: SharedString = format!("{title} — {}", claude::status_label(&status)).into();
+        let dragged = DraggedClaudeChat {
+            chat: chat.clone(),
+            title: title.clone(),
+        };
+        let (activate, close) = (chat.clone(), chat.clone());
+        tab_shell(chat.entity_id(), active, ui)
+            .tooltip(ui::tooltip(tooltip, None))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    let index = this
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.item.claude() == Some(&activate));
+                    if let Some(index) = index {
+                        this.activate(index, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    this.close_claude_chat(close.clone(), window, cx)
+                }),
+            )
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .child(icon(IconName::Claude, ui.accent_text).size(px(14.)))
+            .child(label(&title))
+            .child(close_button(TabItem::Claude(chat.clone()), active, dot, cx))
+    }
+
+    /// The status bar's Claude item: what the sessions do (working, waiting for you) and the
+    /// subscription's limits; a click shows the session that needs the user (or works).
+    fn render_claude_status(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+        if !claude::enabled(cx) {
+            return None;
+        }
+        let ui = Theme::ui(cx);
+        let store = self.claude.read(cx);
+        let activity = store.activity(cx);
+        let limits = store
+            .limits()
+            .filter(|_| crate::settings::claude(cx).show_limits)
+            .cloned();
+        let state = match activity {
+            claude::Activity::Working => Some((tr("Working…"), ui.accent_text)),
+            claude::Activity::Waiting => Some((tr("Waiting for you"), ui.warning)),
+            _ => None,
+        };
+        if state.is_none() && limits.is_none() {
+            return None;
+        }
+        // The session to show: the one that waits, else one that works.
+        let target = store
+            .sessions()
+            .iter()
+            .find(|session| session.read(cx).model().status == flux_claude::Status::WaitingForUser)
+            .or_else(|| {
+                store
+                    .sessions()
+                    .iter()
+                    .find(|session| session.read(cx).model().is_working())
+            })
+            .map(|session| session.entity_id());
+        let now = std::time::SystemTime::now();
+        let level_color = |utilization: f32| match claude::limit_level(utilization) {
+            claude::LimitLevel::Normal => ui.text_muted,
+            claude::LimitLevel::Warning => ui.warning,
+            claude::LimitLevel::Critical => ui.error,
+        };
+        let mut tooltip = String::from(tr("Claude Code"));
+        if let Some((label, _)) = &state {
+            tooltip.push_str(" — ");
+            tooltip.push_str(label);
+        }
+        let mut windows: Vec<AnyElement> = Vec::new();
+        if let Some(limits) = &limits {
+            for (short, long, window) in [
+                ("5h", tr("5-hour limit"), limits.five_hour),
+                ("7d", tr("Weekly limit"), limits.seven_day),
+            ] {
+                let Some(window) = window else {
+                    continue;
+                };
+                tooltip.push('\n');
+                tooltip.push_str(&trf(
+                    "{0}: {1}%, resets {2}",
+                    &[
+                        &long,
+                        &claude::percent(window.utilization),
+                        &claude::resets_in(window.resets_at, now),
+                    ],
+                ));
+                windows.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(div().text_color(ui.dim).child(short))
+                        .child(
+                            div()
+                                .text_color(level_color(window.utilization))
+                                .child(format!("{}%", claude::percent(window.utilization))),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        Some(
+            div().flex_none().pr_1().child(
+                div()
+                    .id("status-claude")
+                    .h(px(20.))
+                    .px_1p5()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(RADIUS_SM))
+                    .cursor_pointer()
+                    .text_size(px(theme::TEXT_SM))
+                    .hover(move |style| style.bg(ui.hover))
+                    .tooltip(ui::tooltip(tooltip, None))
+                    .on_click(move |_, window, cx| match target {
+                        Some(id) => window.dispatch_action(Box::new(claude::ShowSession(id)), cx),
+                        None => window.dispatch_action(Box::new(claude::ToggleClaude), cx),
+                    })
+                    .child(
+                        icon(
+                            IconName::Claude,
+                            state.as_ref().map_or(ui.text_muted, |(_, color)| *color),
+                        )
+                        .size(px(13.)),
+                    )
+                    .children(state.map(|(label, color)| div().text_color(color).child(label)))
+                    .children(windows),
+            ),
+        )
     }
 }
 
