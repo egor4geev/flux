@@ -84,6 +84,8 @@ ICONS = {
   "rollback": (S, '<path d="M5.75 3.75 2.75 6.75l3 3M2.75 6.75h6.75a3.25 3.25 0 0 1 0 6.5H7"/>'),
   "diff": (S, '<path d="M2.75 5.25h10.5M10.5 2.5l2.75 2.75L10.5 8M13.25 10.75H2.75M5.5 8l-2.75 2.75L5.5 13.5"/>'),
   "refresh": (S, '<path d="M13.4 8a5.4 5.4 0 1 1-5.4-5.4c1.51 0 2.96.6 4.04 1.64L13.4 5.6M13.4 2.6v3h-3"/>'),
+  # The Git window: the log's graph — a branch leaving the main line and merging back.
+  "git-log": (S, '<circle cx="5" cy="3.5" r="1.75"/><circle cx="5" cy="12.5" r="1.75"/><circle cx="11" cy="8" r="1.75"/><path d="M5 5.25v5.5M6.5 4.4c2 .6 3.4 1.6 3.9 2.1M10.4 9.5c-.5.5-1.9 1.5-3.9 2.1"/>'),
   "history": (S, '<path d="M2.6 8a5.4 5.4 0 1 0 5.4-5.4 5.85 5.85 0 0 0-4.04 1.64L2.6 5.6M2.6 2.6v3h3M8 5v3l2.4 1.2"/>'),
   "check": (S, '<path d="M3.25 8.5 6.5 11.75l6.25-7"/>'),
   "minus": (S, '<path d="M3.75 8h8.5"/>'),

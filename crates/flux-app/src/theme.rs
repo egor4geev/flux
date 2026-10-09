@@ -158,6 +158,13 @@ pub struct UiColors {
     pub diff_conflict_word: Hsla,
     pub diff_resolved_bg: Hsla,
 
+    // --- Git history (stage 6.3) ---
+    /// The commit graph of the log: a lane's color by its number (wraps around).
+    pub graph_lanes: [Hsla; 8],
+    /// Annotations (blame): the gutter column's background for the newest commit of the file; older
+    /// ones fade towards nothing.
+    pub blame_recent: Hsla,
+
     // --- Shade palette: meaning, not decoration (file types, categories, counters). ---
     pub blue: Hsla,
     pub indigo: Hsla,
@@ -375,6 +382,17 @@ impl Theme {
                 diff_conflict_bg: rgba(0xff6b6b24).into(),
                 diff_conflict_word: rgba(0xff6b6b52).into(),
                 diff_resolved_bg: rgba(0x8b949e14).into(),
+                graph_lanes: [
+                    rgb(0x5aa9ff).into(),
+                    rgb(0x4fd18b).into(),
+                    rgb(0xb48cff).into(),
+                    rgb(0xff9c5b).into(),
+                    rgb(0x5ccfff).into(),
+                    rgb(0xff7eb6).into(),
+                    rgb(0xffc560).into(),
+                    rgb(0x3cd3c4).into(),
+                ],
+                blame_recent: rgba(0x8590ff38).into(),
 
                 blue: rgb(0x5aa9ff).into(),
                 indigo: rgb(INDIGO).into(),

@@ -117,6 +117,8 @@ pub struct PrepaintState {
     diagnostics: crate::diagnostics::DiagnosticsPaint,
     /// Git change markers in the gutter.
     git: crate::git_gutter::GutterPaint,
+    /// Annotations (blame): a column left of the line numbers.
+    blame: crate::blame::BlamePaint,
     /// A host view's decorations (the diff viewer): line backgrounds under everything, changed
     /// words under the text.
     decorations: crate::diff_view::DecorationsPaint,
@@ -186,10 +188,11 @@ impl Element for EditorElement {
         let total_lines = text.len_lines();
         let digits = total_lines.to_string().len().max(3);
         // A commit message field has no gutter.
+        let blame_width = crate::blame::column_width(&editor.blame, em);
         let gutter_width = if editor.message.is_some() {
             px(0.)
         } else {
-            em * (digits + 2) as f32
+            em * (digits + 2) as f32 + blame_width
         };
         let text_bounds = Bounds::from_corners(
             point(bounds.left() + gutter_width, bounds.top()),
@@ -399,6 +402,9 @@ impl Element for EditorElement {
             &ui,
             window,
         );
+        let blame_column = Bounds::new(bounds.origin, size(blame_width, bounds.size.height));
+        let blame =
+            crate::blame::prepaint(&editor.blame, &layout, last_line, blame_column, &ui, window);
         let placeholder = editor
             .message
             .as_ref()
@@ -427,6 +433,7 @@ impl Element for EditorElement {
         let decorations = self.editor.update(cx, |editor, _| {
             editor.scroll = scroll;
             editor.autoscroll = None;
+            editor.blame.column = (blame_width > px(0.)).then_some(blame_column);
             editor.frame_decorations.take()
         });
         let decorations = crate::diff_view::prepaint_decorations(
@@ -446,6 +453,7 @@ impl Element for EditorElement {
             cursors,
             diagnostics,
             git,
+            blame,
             decorations,
             placeholder,
         }
@@ -485,6 +493,7 @@ impl Element for EditorElement {
             number.paint(*origin, line_height, window, cx).ok();
         }
         state.git.paint(window);
+        state.blame.paint(line_height, window, cx);
 
         let mask = ContentMask {
             bounds: layout.text_bounds,

@@ -16,21 +16,29 @@
 //!   in the way;
 //! - [`conflict`] — conflicted files: their three versions, taking a side, marking resolved;
 //! - [`merge3`] — three-way merge of texts (the merge tool);
+//! - [`log`] — history: the log with filters, a commit in detail, the history of a file and of lines;
+//! - [`history`] — operations on commits: cherry-pick, revert, reset, tags;
+//! - [`rebase`] — rewriting history: interactive rebase, reword, squash, drop;
+//! - [`blame`] — which commit last changed each line;
 //! - [`ignore`] — adding paths to `.gitignore`;
 //! - [`watch`] — changes in the working tree and in the git directory (HEAD, index, refs).
 //!
 //! Everything here blocks: call it from the background (gpui's `background_spawn`).
 
+pub mod blame;
 pub mod blob;
 pub mod branch;
 pub mod cli;
 pub mod commit;
 pub mod conflict;
 pub mod diff;
+pub mod history;
 pub mod ignore;
+pub mod log;
 pub mod merge3;
 pub mod ops;
 pub mod push;
+pub mod rebase;
 pub mod repo;
 pub mod rollback;
 pub mod stash;
@@ -40,6 +48,7 @@ pub mod sync;
 mod testing;
 pub mod watch;
 
+pub use blame::{Blame, BlameCommit, blame};
 pub use blob::{BlobReader, is_binary};
 pub use branch::{
     DeletedBranch, Ref, RefKind, Refs, check_branch_name, compare_commits, diff_changes,
@@ -51,12 +60,18 @@ pub use commit::{
 };
 pub use conflict::{ConflictSide, ConflictVersions, conflict_versions};
 pub use diff::{Hunk, HunkKind, apply_hunks, diff_lines, diff_words};
+pub use history::{ResetMode, cherry_pick, create_tag, reset, revert};
 pub use ignore::add_to_gitignore;
+pub use log::{
+    CommitDetails, FileRevision, LogCommit, LogFilter, branches_containing, commit_details,
+    file_history, is_pushed, line_history, log,
+};
 pub use merge3::{Chunk, ChunkKind, initial_result, merge3, resolve_simple};
 pub use ops::{Blocked, Operation, Outcome, blocked_by, operation};
 pub use push::{
     CommitInfo, PushProgress, PushRequest, PushResult, Remote, commit_files, outgoing, remotes,
 };
+pub use rebase::{RebaseAction, RebaseEntry, interactive_rebase, rebase_plan, reword};
 pub use repo::{Repo, find_repos, repo_for};
 pub use rollback::{RollbackFile, rollback};
 pub use stash::{Stash, StashRequest, stash_changes, stash_files, stashes};

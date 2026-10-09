@@ -1054,6 +1054,14 @@ impl FileTreePanel {
         self.selected = path.clone();
         self.reveal_target = None;
         let can_paste = self.clipboard.is_some();
+        // Git: the history of a file or a directory of a repository (not of an untracked one).
+        let history = path.clone().filter(|path| {
+            self.git.as_ref().is_some_and(|git| {
+                let git = git.read(cx);
+                git.repo_index(path).is_some()
+                    && git.status_of(path) != Some(flux_git::FileStatus::Untracked)
+            })
+        });
         let menu = cx.new(|cx| {
             let menu = ContextMenu::new(window, cx)
                 .entry(tr("New File"), NewFile)
@@ -1076,6 +1084,16 @@ impl FileTreePanel {
                     .entry(tr("Collapse All"), CollapseAll)
                     .separator()
                     .entry(tr("Copy Path"), CopyPath),
+            };
+            let menu = match history {
+                Some(path) => menu
+                    .separator()
+                    .entry(
+                        tr("Show History"),
+                        crate::git::ShowHistory { path, lines: None },
+                    )
+                    .separator(),
+                None => menu,
             };
             menu.entry(tr("Reveal in Finder"), RevealInFinder)
         });

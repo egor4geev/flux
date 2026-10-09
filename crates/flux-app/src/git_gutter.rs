@@ -139,6 +139,7 @@ pub fn set_base(editor: &mut Editor, base: Option<Arc<str>>, cx: &mut Context<Ed
         false => base,
     });
     editor.git.popup = None;
+    crate::blame::head_moved(editor, cx);
     if editor.git.base.is_none() {
         editor.git.hunks.clear();
         editor.git.task = None;

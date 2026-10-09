@@ -62,6 +62,38 @@ impl Default for LeftIslandWidth {
     }
 }
 
+/// The height of the island under the editor. The terminal panel and the Git window take turns in
+/// it and share it: switching between them (⌥F12, ⌘9) doesn't move the editor.
+#[derive(Clone)]
+pub struct BottomIslandHeight(std::rc::Rc<std::cell::Cell<f32>>);
+
+impl BottomIslandHeight {
+    pub const DEFAULT: f32 = 300.;
+    pub const MIN: f32 = 120.;
+    /// The island takes at most this share of the window's height.
+    pub const MAX_SHARE: f32 = 0.7;
+
+    pub fn new() -> Self {
+        Self(std::rc::Rc::new(std::cell::Cell::new(Self::DEFAULT)))
+    }
+
+    /// The height, within the limits for a window allowing `max` (it may have shrunk).
+    pub fn get_within(&self, max: f32) -> f32 {
+        self.0.get().min(max).max(Self::MIN)
+    }
+
+    /// Sets the height, kept within the limits.
+    pub fn set_within(&self, height: f32, max: f32) {
+        self.0.set(height.clamp(Self::MIN, max.max(Self::MIN)));
+    }
+}
+
+impl Default for BottomIslandHeight {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Island: a standalone panel on the window's glass frame (tree, editor). The corner rounding
 /// doesn't clip children: their backgrounds must keep away from the edge at the corners.
 pub fn island(ui: UiColors) -> Div {

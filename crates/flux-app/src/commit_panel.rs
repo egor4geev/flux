@@ -1434,7 +1434,7 @@ impl CommitPanel {
 
     /// Puts a message into the field (Amend, the history, a merge's message): one undoable edit,
     /// and the field shows its start (a long first line doesn't leave it scrolled to its end).
-    fn set_message(&mut self, text: &str, cx: &mut Context<Self>) {
+    pub(crate) fn set_message(&mut self, text: &str, cx: &mut Context<Self>) {
         self.message.update(cx, |editor, cx| {
             let new = Rope::from_str(text);
             if let Some((range, text)) = difference(editor.document.text(), &new) {

@@ -76,7 +76,9 @@ pub fn operation(repo: &Repo) -> Operation {
             op.stopped_at = file("stopped-sha").or_else(|| file("original-commit"));
             let number = |name: &str| file(name).and_then(|value| value.parse::<u32>().ok());
             op.step = match base {
-                "rebase-merge" => number("msgnum").zip(number("end")),
+                "rebase-merge" => {
+                    commit_steps(&dir.join(base)).or_else(|| number("msgnum").zip(number("end")))
+                }
                 _ => number("next").zip(number("last")),
             };
         }
@@ -98,6 +100,30 @@ pub fn operation(repo: &Repo) -> Operation {
         op.message = (!message.is_empty()).then_some(message);
     }
     op
+}
+
+/// The step of an interactive rebase counted in commits: the `exec` lines Flux adds (new messages)
+/// are no steps for the user. From the `done` and `git-rebase-todo` lists of `rebase-merge`.
+fn commit_steps(dir: &Path) -> Option<(u32, u32)> {
+    let count = |name: &str| -> Option<u32> {
+        let text = fs::read_to_string(dir.join(name)).ok()?;
+        Some(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .filter(|line| {
+                    let command = line.split_whitespace().next().unwrap_or("");
+                    !matches!(
+                        command,
+                        "exec" | "x" | "break" | "b" | "label" | "l" | "reset" | "t"
+                    )
+                })
+                .count() as u32,
+        )
+    };
+    let done = count("done")?;
+    let todo = count("git-rebase-todo").unwrap_or(0);
+    (done > 0).then_some((done, done + todo))
 }
 
 /// "Merge branch 'feature/x'", "Merge remote-tracking branch 'origin/main' into dev" →
@@ -139,6 +165,7 @@ pub fn continue_operation(repo: &Repo, state: RepoState) -> Result<Outcome, GitE
         .args([command, "--continue"])
         .output()
         .map(drop);
+    crate::rebase::clean_up_finished(repo);
     step_outcome(repo, result)
 }
 
@@ -152,7 +179,9 @@ pub fn abort_operation(repo: &Repo, state: RepoState) -> Result<(), GitError> {
         RepoState::Reverting => "revert",
         RepoState::Normal | RepoState::Bisecting => return Err(nothing_in_progress("abort")),
     };
-    repo.git().args([command, "--abort"]).output().map(drop)
+    let result = repo.git().args([command, "--abort"]).output().map(drop);
+    crate::rebase::clean_up_finished(repo);
+    result
 }
 
 /// Rebase: skips the commit that stopped (`rebase --skip`).
@@ -163,6 +192,7 @@ pub fn skip_commit(repo: &Repo) -> Result<Outcome, GitError> {
         .args(["rebase", "--skip"])
         .output()
         .map(drop);
+    crate::rebase::clean_up_finished(repo);
     step_outcome(repo, result)
 }
 

@@ -27,15 +27,18 @@ pub enum Tool {
     FindInFiles,
     /// Terminals: an island under the editor.
     Terminal,
+    /// The Git window (the log): the island under the editor, in place of the terminals.
+    Git,
 }
 
 impl Tool {
     /// Order in the strip, top to bottom.
-    pub const ALL: [Tool; 4] = [
+    pub const ALL: [Tool; 5] = [
         Tool::Project,
         Tool::Commit,
         Tool::FindInFiles,
         Tool::Terminal,
+        Tool::Git,
     ];
 
     fn icon(self) -> IconName {
@@ -44,6 +47,7 @@ impl Tool {
             Tool::Commit => IconName::Commit,
             Tool::FindInFiles => IconName::FindInFiles,
             Tool::Terminal => IconName::Terminal,
+            Tool::Git => IconName::GitLog,
         }
     }
 
@@ -53,6 +57,7 @@ impl Tool {
             Tool::Commit => tr("Commit"),
             Tool::FindInFiles => tr("Find in Files"),
             Tool::Terminal => tr("Terminal"),
+            Tool::Git => tr("Git"),
         }
     }
 
@@ -63,6 +68,7 @@ impl Tool {
             Tool::Commit => Box::new(git::ToggleCommitWindow),
             Tool::FindInFiles => Box::new(project_search::Toggle),
             Tool::Terminal => Box::new(terminal_panel::TogglePanel),
+            Tool::Git => Box::new(git::ToggleGitWindow),
         }
     }
 }

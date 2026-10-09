@@ -16,6 +16,10 @@
 #   origin/feature/remote-only — exists only on the remote (checkout creates a tracking branch)
 #   tag v0.1        — on main's 2nd commit
 #   stash@{0}       — "Experiment with the parser" (src/parser.rs) + an untracked file (notes/idea.md)
+#   history         — before all that, ~300 older commits (2025) by three authors in docs/: feature
+#                     branches merged with merge commits, tags v0.0.1…, docs/notes.md renamed to
+#                     docs/journal.md, and two branches left unmerged (experiment/graph, release/0.0)
+#                     — for the Git window's log, graph, filters and file history (stage 6.3)
 #   working tree    — src/main.rs modified on the greeting line (checkout of feature/conflict needs Smart Checkout),
 #                     src/util.rs modified elsewhere
 set -e
@@ -38,6 +42,60 @@ c() { # c "message" — commit everything with a fixed, increasing date
   GIT_AUTHOR_DATE="2026-10-0${N}T10:00:00" GIT_COMMITTER_DATE="2026-10-0${N}T10:00:00" \
     git commit -q -m "$1"
 }
+
+# Older history for the log (stage 6.3): commits of three authors, an hour apart, with branches merged
+# back, tags, a rename. Only docs/ is touched: the files of the 6.2 states come after it.
+h() { # h "message" author — commit everything an hour after the previous one (2025)
+  H=$((${H:-0} + 1))
+  WHEN=$(date -j -v+"$H"H -f "%Y-%m-%d %H:%M:%S" "2025-01-01 09:00:00" "+%Y-%m-%dT%H:%M:%S")
+  GIT_AUTHOR_NAME="$2" GIT_AUTHOR_EMAIL="$(echo "$2" | tr 'A-Z ' 'a-z.')@flux.dev" \
+    GIT_AUTHOR_DATE="$WHEN" GIT_COMMITTER_DATE="$WHEN" git commit -q -m "$1"
+}
+AUTHORS="Alice Brown|Bob Stone|Carol White"
+author() { echo "$AUTHORS" | cut -d'|' -f$(($1 % 3 + 1)); }
+mkdir -p docs
+printf '# Notes\n' > docs/notes.md
+git add -A && h "Start the notes" "Alice Brown"
+for round in $(seq 1 40); do
+  for step in 1 2 3 4; do
+    printf 'Round %s, step %s.\n' "$round" "$step" >> docs/notes.md
+    git add -A && h "Notes: round $round, step $step" "$(author $((round + step)))"
+  done
+  if [ $((round % 3)) -eq 0 ]; then
+    git switch -q -c "topic/round-$round"
+    for step in 1 2 3; do
+      printf 'Topic %s, part %s.\n' "$round" "$step" >> "docs/topic-$round.md"
+      git add -A && h "Topic $round: part $step" "$(author $((round + step + 1)))"
+    done
+    git switch -q main
+    printf 'Main while topic %s.\n' "$round" >> docs/main.md
+    git add -A && h "Main work during topic $round" "$(author "$round")"
+    H=$((H + 1))
+    WHEN=$(date -j -v+"$H"H -f "%Y-%m-%d %H:%M:%S" "2025-01-01 09:00:00" "+%Y-%m-%dT%H:%M:%S")
+    GIT_AUTHOR_DATE="$WHEN" GIT_COMMITTER_DATE="$WHEN" \
+      git merge -q --no-ff -m "Merge topic/round-$round" "topic/round-$round"
+    git branch -q -d "topic/round-$round"
+  fi
+  if [ $((round % 5)) -eq 0 ]; then git tag "v0.0.$((round / 5))"; fi
+  if [ "$round" -eq 12 ]; then git mv docs/notes.md docs/journal.md && h "Rename notes to journal" "Bob Stone"; fi
+  if [ "$round" -eq 15 ]; then
+    git switch -q -c release/0.0
+    printf 'Release notes.\n' > docs/release.md
+    git add -A && h "Release notes for 0.0" "Carol White"
+    git switch -q main
+  fi
+  if [ "$round" -eq 22 ]; then
+    git switch -q -c experiment/graph
+    for step in 1 2 3 4 5; do
+      printf 'Experiment %s.\n' "$step" >> docs/experiment.md
+      git add -A && h "Experiment step $step" "Alice Brown"
+    done
+    git switch -q main
+  fi
+  if [ -f docs/notes.md ]; then NOTES=docs/notes.md; else NOTES=docs/journal.md; fi
+  sed -i '' "1s/.*/# Notes (round $round)/" "$NOTES"
+  git add -A && h "Retitle the notes for round $round" "$(author "$round")"
+done
 
 mkdir -p src
 cat > src/main.rs <<'EOF'
@@ -134,6 +192,7 @@ git switch -q main
 sed -i '' 's/let greeting = "Hello";/let greeting = "Good morning";/' src/main.rs
 git add -A && c "Morning greeting"
 git push -q -u origin main 2>/dev/null
+git push -q origin release/0.0 experiment/graph --tags 2>/dev/null
 
 # Another clone pushes to main and creates a remote-only branch.
 git clone -q "$DIR/remote.git" "$DIR/other" 2>/dev/null
@@ -172,6 +231,6 @@ git stash push -q -u -m "Experiment with the parser"
 sed -i '' 's/let greeting = "Good morning";/let greeting = "Good evening";/' src/main.rs
 sed -i '' 's/- {word}/• {word}/' src/util.rs
 echo "sandbox: $DIR/repo"
-git -C "$DIR/repo" log --oneline --all --graph | head -20
+git -C "$DIR/repo" log --oneline --all --graph | head -30
 git -C "$DIR/repo" status --short
 git -C "$DIR/repo" stash list

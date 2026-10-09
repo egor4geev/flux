@@ -88,6 +88,14 @@ actions!(
         AbortOperation,
         /// A rebase skips the commit it stopped on.
         SkipCommit,
+        /// ⌘9: show or hide the Git window (the log) under the editor.
+        ToggleGitWindow,
+        /// ⌥⌘A: annotations (blame) of the active file in the gutter, on or off.
+        Annotate,
+        /// The history of the active file: a tab of the Git window.
+        ShowFileHistory,
+        /// The history of the selected lines of the active file.
+        ShowSelectionHistory,
     ]
 );
 
@@ -253,6 +261,109 @@ pub struct OpenCompareDiff {
     pub right: crate::diff_view::DiffSide,
 }
 
+// --- Actions of part 6.3: the log, the commit pane, operations on commits, rewriting history,
+// annotations. `oids` of several commits are newest first, as the log shows them. ---
+
+/// The Git window with the log, the commit selected in it (annotations, notifications).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct ShowCommitInLog {
+    pub repo: usize,
+    pub oid: String,
+}
+
+/// The history of a file (absolute path), or of its lines `start..=end` (1-based): a tab of the
+/// Git window.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct ShowHistory {
+    pub path: PathBuf,
+    pub lines: Option<(u32, u32)>,
+}
+
+/// Checkout of a commit: a detached HEAD, with a warning.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct CheckoutCommit {
+    pub repo: usize,
+    pub oid: String,
+}
+
+/// New Tag… at a commit.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct NewTagAt {
+    pub repo: usize,
+    pub oid: String,
+}
+
+/// Cherry-pick commits onto the current branch.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct CherryPick {
+    pub repo: usize,
+    pub oids: Vec<String>,
+}
+
+/// Revert commits.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct RevertCommits {
+    pub repo: usize,
+    pub oids: Vec<String>,
+}
+
+/// Reset Current Branch to Here…: the dialog with soft / mixed / hard / keep.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct ResetToCommit {
+    pub repo: usize,
+    pub oid: String,
+}
+
+/// Undo Commit: the last commit goes back to the changes (not pushed yet).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct UndoCommit {
+    pub repo: usize,
+    pub oid: String,
+}
+
+/// Edit Commit Message…
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct EditCommitMessage {
+    pub repo: usize,
+    pub oid: String,
+}
+
+/// Fixup… / Squash Into…: `oids` meld into `target` (fixup keeps its message, squash asks for
+/// one).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct MeldCommits {
+    pub repo: usize,
+    pub target: String,
+    pub oids: Vec<String>,
+    pub squash: bool,
+}
+
+/// Drop Commits.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct DropCommits {
+    pub repo: usize,
+    pub oids: Vec<String>,
+}
+
+/// Interactively Rebase from Here…: the plan dialog from this commit up to HEAD.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = git, no_json)]
+pub struct InteractiveRebase {
+    pub repo: usize,
+    pub oid: String,
+}
+
 /// git's whole output in a dialog (an error notification's "Details").
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = git, no_json)]
@@ -284,6 +395,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-b", Branches, workspace),
         // In a terminal, ⌘T is a new terminal (`terminal_panel`), as in JetBrains IDEs.
         KeyBinding::new("cmd-t", UpdateProject, workspace),
+        KeyBinding::new("cmd-9", ToggleGitWindow, workspace),
+        // The author's own key: JetBrains has none for Annotate on macOS.
+        KeyBinding::new("alt-cmd-a", Annotate, workspace),
         // Programs in a terminal need ⌃V (vim's visual block, a literal next character).
         KeyBinding::new("ctrl-v", NoAction, Some("Terminal")),
     ]);

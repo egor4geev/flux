@@ -1,5 +1,6 @@
 //! Russian translations: English source string → Russian, one table per area of the UI.
 
+mod blame;
 mod branches;
 mod commands;
 mod commit;
@@ -9,10 +10,13 @@ mod conflicts;
 mod diff;
 mod git;
 mod git_gutter;
+mod git_log;
+mod log_actions;
 mod lsp;
 mod menu;
 mod navigation;
 mod pickers;
+mod rebase;
 mod search;
 mod settings;
 mod start;
@@ -49,6 +53,10 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     sync::STRINGS,
     stash::STRINGS,
     conflicts::STRINGS,
+    git_log::STRINGS,
+    log_actions::STRINGS,
+    rebase::STRINGS,
+    blame::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -60,4 +68,8 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     sync::PLURALS,
     stash::PLURALS,
     conflicts::PLURALS,
+    git_log::PLURALS,
+    log_actions::PLURALS,
+    rebase::PLURALS,
+    blame::PLURALS,
 ];

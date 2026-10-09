@@ -1,7 +1,8 @@
 //! The menu of version control operations (⌃V), as the VCS Operations popup of JetBrains IDEs, in
 //! its order: Commit, Push, Update Project, Pull, Fetch; Branches, New Branch, Checkout Tag or
 //! Revision; Stash, Unstash; what concludes or undoes an operation in progress (Resolve Conflicts,
-//! Continue / Skip / Abort); Show Diff and Rollback of the active file; Show Changes, Refresh — what
+//! Continue / Skip / Abort); Show Diff, Rollback, Show History (of the file, of the selection) and
+//! Annotate of the active file; Show Changes, Refresh — what
 //! doesn't apply right now is dimmed.
 
 use flux_git::RepoState;
@@ -38,6 +39,19 @@ pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Wor
     let file_status = active.as_deref().and_then(|path| git.status_of(path));
     let file_changed = file_status.is_some();
     let file_tracked = file_status.is_some_and(|status| status != flux_git::FileStatus::Untracked);
+    // History and annotations: a file of a repository that isn't new.
+    let in_repo = active
+        .as_deref()
+        .is_some_and(|path| git.repo_index(path).is_some());
+    let has_history = in_repo
+        && !matches!(
+            file_status,
+            Some(flux_git::FileStatus::Untracked | flux_git::FileStatus::Added)
+        );
+    let editor = workspace.active_editor().map(|editor| editor.read(cx));
+    let annotated = editor.is_some_and(|editor| editor.blame.is_on());
+    let has_selection =
+        editor.is_some_and(|editor| !editor.document.selection().primary().is_empty());
     workspace.toggle_modal(window, cx, move |window, cx| {
         let mut menu = ContextMenu::new(window, cx)
             .title(tr("Git"))
@@ -97,10 +111,21 @@ pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Wor
                     .entry(tr("Abort Revert"), git::AbortOperation);
             }
         }
-        menu.separator()
+        menu = menu
+            .separator()
             .entry_if(file_changed, tr("Show Diff"), git::ShowDiff)
             .entry_if(file_tracked, tr("Rollback…"), RollbackFile)
-            .separator()
+            .entry_if(has_history, tr("Show History"), git::ShowFileHistory)
+            .entry_if(
+                has_history && has_selection,
+                tr("Show History for Selection"),
+                git::ShowSelectionHistory,
+            );
+        menu = match annotated {
+            true => menu.entry(tr("Close Annotations"), crate::blame::CloseAnnotations),
+            false => menu.entry_if(has_history, tr("Annotate with Git Blame"), git::Annotate),
+        };
+        menu.separator()
             .entry_if(
                 has_repo && has_changes,
                 tr("Show Changes"),

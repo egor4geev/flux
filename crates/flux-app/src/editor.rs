@@ -206,6 +206,8 @@ pub struct Editor {
     pub(crate) message: Option<SharedString>,
     /// Git: the HEAD version of the document and the changed blocks against it (gutter markers).
     pub(crate) git: crate::git_gutter::GitState,
+    /// Annotations (blame) in the gutter and the gutter's menu.
+    pub(crate) blame: crate::blame::BlameState,
     /// What a host view draws over this editor for one frame (the diff viewer: changed blocks and
     /// words): the host sets it before every render, the element takes it. An editor shown in its
     /// own tab gets none.
@@ -303,6 +305,7 @@ impl Editor {
             read_only: false,
             message: None,
             git: Default::default(),
+            blame: Default::default(),
             frame_decorations: None,
             recorded_changes: None,
             disk_mtime: None,
@@ -388,6 +391,7 @@ impl Editor {
         crate::completion::text_changed(self, changes);
         crate::hover::text_changed(self);
         crate::git_gutter::text_changed(self, changes, cx);
+        crate::blame::text_changed(self, changes, cx);
         if let Some(recorded) = &mut self.recorded_changes {
             recorded.extend(changes.iter().cloned());
         }
@@ -685,6 +689,7 @@ impl Editor {
         self.document.set_path(path);
         crate::lsp::path_changed(self, cx);
         crate::git_gutter::path_changed(self, cx);
+        crate::blame::path_changed(self, cx);
         cx.notify();
     }
 
@@ -781,6 +786,7 @@ impl Editor {
         window.focus(&self.focus_handle);
         if crate::navigation::cmd_click(self, event, window, cx)
             || crate::git_gutter::mouse_down(self, event, window, cx)
+            || crate::blame::mouse_down(self, event, window, cx)
         {
             return;
         }
@@ -817,6 +823,7 @@ impl Editor {
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         crate::hover::mouse_moved(self, event, cx);
+        crate::blame::mouse_moved(self, event, cx);
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
             self.selecting = false;
             return;
@@ -1175,6 +1182,7 @@ impl Render for Editor {
             .map(|root| crate::completion::actions(root, self, cx))
             .map(|root| crate::hover::actions(root, self, cx))
             .map(|root| crate::git_gutter::actions(root, self, cx))
+            .map(|root| crate::blame::actions(root, self, cx))
             .child(
                 div()
                     .flex_1()
@@ -1183,6 +1191,12 @@ impl Render for Editor {
                     .when(!self.preview, |area| {
                         area.cursor(CursorStyle::IBeam)
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, event, window, cx| {
+                                    crate::blame::secondary_click(this, event, window, cx)
+                                }),
+                            )
                             .on_mouse_move(cx.listener(Self::on_mouse_move))
                             .on_mouse_up(
                                 MouseButton::Left,
@@ -1195,6 +1209,7 @@ impl Render for Editor {
             .children(crate::completion::render(self, window, cx))
             .children(crate::hover::render(self, window, cx))
             .children(crate::git_gutter::render(self, window, cx))
+            .children(crate::blame::render(self, window, cx))
     }
 }
 

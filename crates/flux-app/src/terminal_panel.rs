@@ -54,11 +54,6 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// Height of the panel when it first opens, and the limits of dragging it.
-const DEFAULT_HEIGHT: f32 = 300.;
-const MIN_HEIGHT: f32 = 120.;
-/// The panel takes at most this share of the window's height.
-const MAX_HEIGHT_SHARE: f32 = 0.7;
 /// The tab strip at the top of the panel, and its pills.
 const HEADER_HEIGHT: f32 = 38.;
 const TAB_HEIGHT: f32 = 26.;
@@ -114,7 +109,8 @@ pub struct TerminalPanel {
     active: usize,
     /// New terminals start here (the project root).
     root: Option<PathBuf>,
-    height: f32,
+    /// Shared with the Git window: they take turns in the island under the editor.
+    height: ui::BottomIslandHeight,
     /// The top edge is being dragged: the handle's line stays lit.
     resizing: bool,
     /// Focus of the empty panel.
@@ -130,12 +126,17 @@ pub struct TerminalPanel {
 impl EventEmitter<TerminalPanelEvent> for TerminalPanel {}
 
 impl TerminalPanel {
-    pub fn new(root: Option<PathBuf>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        root: Option<PathBuf>,
+        height: ui::BottomIslandHeight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             tabs: Vec::new(),
             active: 0,
             root,
-            height: DEFAULT_HEIGHT,
+            height,
             resizing: false,
             focus_handle: cx.focus_handle(),
             error: None,
@@ -889,8 +890,9 @@ impl Render for TerminalPanel {
         let ui = Theme::ui(cx);
         self.resizing &= cx.has_active_drag();
         // The window may have shrunk since the height was set.
-        let max_height = f32::from(window.viewport_size().height) * MAX_HEIGHT_SHARE;
-        let height = self.height.min(max_height).max(MIN_HEIGHT);
+        let max_height =
+            f32::from(window.viewport_size().height) * ui::BottomIslandHeight::MAX_SHARE;
+        let height = self.height.get_within(max_height);
         let body = match self.active_group() {
             Some(group) => div()
                 .flex_1()
@@ -927,7 +929,7 @@ impl Render for TerminalPanel {
                     // without jumping.
                     let height = f32::from(event.bounds.bottom() - event.event.position.y)
                         - RESIZE_HANDLE_OFFSET;
-                    this.height = height.clamp(MIN_HEIGHT, max_height.max(MIN_HEIGHT));
+                    this.height.set_within(height, max_height);
                     this.resizing = true;
                     cx.notify();
                 }),

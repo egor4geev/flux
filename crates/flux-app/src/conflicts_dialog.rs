@@ -309,7 +309,33 @@ pub fn continue_operation(
         let result = task.await;
         this.update_in(cx, |this, window, cx| {
             let git = this.git().clone();
+            // Without conflicts, a rebase still in progress stopped at the next `edit`.
+            let now = git
+                .read(cx)
+                .repos()
+                .get(repo)
+                .map(|entry| flux_git::operation(&entry.repo));
             match result {
+                Ok(outcome)
+                    if outcome != Outcome::Conflicts
+                        && state == RepoState::Rebasing
+                        && now
+                            .as_ref()
+                            .is_some_and(|op| op.state == RepoState::Rebasing) =>
+                {
+                    let at: String = now
+                        .and_then(|op| op.stopped_at)
+                        .map(|oid| oid.chars().take(8).collect())
+                        .unwrap_or_default();
+                    let notification =
+                        Notification::info(trf("Stopped at {0} for editing", &[&at]))
+                            .body(tr(
+                                "Amend the commit as you need, then continue the rebase.",
+                            ))
+                            .action(tr("Continue Rebase"), git::ContinueRepoOperation { repo })
+                            .action(tr("Abort Rebase"), git::AbortRepoOperation { repo });
+                    git.update(cx, |git, cx| git.notify(notification, cx));
+                }
                 Ok(Outcome::Conflicts) => {
                     show_conflicts(this, window, cx);
                     stopped_on_conflicts(&git, repo, state, cx);

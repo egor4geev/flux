@@ -1,7 +1,9 @@
 mod app_menu;
+mod blame;
 mod branch_dialogs;
 mod branches_popup;
 mod command_palette;
+mod commit_details;
 mod commit_panel;
 mod compare_dialog;
 mod completion;
@@ -16,8 +18,11 @@ mod file_finder;
 mod file_tree;
 mod find_bar;
 mod git;
+mod git_graph;
 mod git_gutter;
+mod git_log;
 mod git_sync;
+mod git_window;
 mod go_to_line;
 mod highlighter;
 mod hover;
@@ -27,6 +32,7 @@ mod input;
 mod input_dialog;
 mod launchpad;
 mod locations;
+mod log_actions;
 mod lsp;
 mod markdown;
 mod merge_view;
@@ -36,6 +42,7 @@ mod picker;
 mod popup;
 mod project_search;
 mod push_dialog;
+mod rebase_dialog;
 mod recent;
 mod rename;
 #[cfg(feature = "scenario")]
@@ -118,9 +125,14 @@ fn main() {
             branch_dialogs::init(cx);
             git_sync::init(cx);
             compare_dialog::init(cx);
+            commit_details::init(cx);
+            log_actions::init(cx);
             stash_panel::init(cx);
             conflicts_dialog::init(cx);
             merge_view::init(cx);
+            git_log::init(cx);
+            git_window::init(cx);
+            rebase_dialog::init(cx);
 
             let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
             // A custom title bar on a glass window frame: the system title bar is transparent, the

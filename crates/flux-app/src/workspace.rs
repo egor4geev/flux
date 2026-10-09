@@ -22,6 +22,8 @@ use crate::editor::{self, Editor};
 use crate::file_tree::{self, FileTreeEvent, FileTreePanel};
 use crate::find_bar::{self, FindBar};
 use crate::git::{GitEvent, GitStore};
+use crate::git_log::GitLogView;
+use crate::git_window::{self, DraggedLogTab, GitWindow, GitWindowEvent};
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
 use crate::launchpad::{self, Tool};
@@ -192,6 +194,12 @@ pub struct Workspace {
     /// Terminals: an island under the editor (⌥F12).
     terminal_panel: Entity<TerminalPanel>,
     terminal_open: bool,
+    /// The island under the editor shows the terminals or the Git window; they share its height.
+    bottom_height: ui::BottomIslandHeight,
+    /// The Git window (⌘9): the log and histories; made when first shown, recreated with the git
+    /// hub.
+    git_window: Option<GitWindowHandle>,
+    git_open: bool,
     /// Notifications in the bottom right corner (results of git operations).
     notifications: Entity<Notifications>,
     _subscriptions: Vec<Subscription>,
@@ -201,6 +209,12 @@ pub struct Workspace {
 struct CommitPanelHandle {
     panel: Entity<CommitPanel>,
     _subscription: Subscription,
+}
+
+/// The Git window and the subscriptions to it.
+struct GitWindowHandle {
+    window: Entity<GitWindow>,
+    _subscriptions: [Subscription; 2],
 }
 
 /// The file tree and the subscription to its events; recreated whenever the project root changes.
@@ -225,6 +239,8 @@ enum TabItem {
     Terminal(Entity<TerminalGroup>),
     Diff(Entity<DiffView>),
     Merge(Entity<MergeView>),
+    /// A tab of the Git window (the log, a history) brought over from it.
+    Log(Entity<GitLogView>),
 }
 
 impl TabItem {
@@ -256,8 +272,16 @@ impl TabItem {
         }
     }
 
+    fn log(&self) -> Option<&Entity<GitLogView>> {
+        match self {
+            TabItem::Log(view) => Some(view),
+            _ => None,
+        }
+    }
+
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
+            TabItem::Log(view) => view.focus_handle(cx),
             TabItem::Editor(editor) => editor.focus_handle(cx),
             TabItem::Terminal(group) => group.focus_handle(cx),
             TabItem::Diff(view) => view.focus_handle(cx),
@@ -271,7 +295,7 @@ impl TabItem {
             TabItem::Editor(editor) => is_modified(editor, cx),
             TabItem::Diff(view) => owned_editor(view, cx).is_some_and(|e| is_modified(&e, cx)),
             TabItem::Merge(view) => view.read(cx).is_modified(cx),
-            TabItem::Terminal(_) => false,
+            TabItem::Terminal(_) | TabItem::Log(_) => false,
         }
     }
 }
@@ -336,7 +360,9 @@ impl Workspace {
                 .update(cx, |panel, cx| panel.set_git(git.clone(), cx));
             tree
         });
-        let terminal_panel = cx.new(|cx| TerminalPanel::new(root.clone(), window, cx));
+        let bottom_height = ui::BottomIslandHeight::new();
+        let terminal_panel =
+            cx.new(|cx| TerminalPanel::new(root.clone(), bottom_height.clone(), window, cx));
         let notifications = cx.new(|_| Notifications::new());
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
@@ -401,6 +427,9 @@ impl Workspace {
             lsp,
             terminal_panel,
             terminal_open: false,
+            bottom_height,
+            git_window: None,
+            git_open: false,
             notifications,
             _subscriptions: subscriptions,
         };
@@ -424,6 +453,12 @@ impl Workspace {
         self._git_subscription = git_subscription;
         self.commit_panel = None;
         self.commit_open = false;
+        // The Git window and its tabs in the editor area belong to the old hub.
+        self.git_window = None;
+        self.git_open = false;
+        while let Some(index) = self.tabs.iter().position(|tab| tab.item.log().is_some()) {
+            self.remove_tab_at(index, window, cx);
+        }
         let tree = Self::build_tree(root.clone(), self.left_width.clone(), window, cx);
         tree.panel
             .update(cx, |panel, cx| panel.set_git(self.git.clone(), cx));
@@ -553,7 +588,7 @@ impl Workspace {
             let editor = match &tab.item {
                 TabItem::Editor(editor) => Some(editor.clone()),
                 TabItem::Diff(view) => owned_editor(view, cx),
-                TabItem::Terminal(_) | TabItem::Merge(_) => None,
+                TabItem::Terminal(_) | TabItem::Merge(_) | TabItem::Log(_) => None,
             };
             if let Some(editor) = editor
                 && !editors.contains(&editor)
@@ -570,7 +605,7 @@ impl Workspace {
             TabItem::Editor(editor) => editor.read(cx).document.path().map(Path::to_path_buf),
             TabItem::Diff(view) => Some(view.read(cx).path().to_path_buf()),
             TabItem::Merge(view) => Some(view.read(cx).path().to_path_buf()),
-            TabItem::Terminal(_) => None,
+            TabItem::Terminal(_) | TabItem::Log(_) => None,
         }
     }
 
@@ -1004,7 +1039,7 @@ impl Workspace {
             Some(TabItem::Editor(editor)) => {
                 editor.update(cx, |editor, cx| editor.show_status(message, cx))
             }
-            Some(TabItem::Terminal(_) | TabItem::Diff(_) | TabItem::Merge(_)) => {
+            Some(TabItem::Terminal(_) | TabItem::Diff(_) | TabItem::Merge(_) | TabItem::Log(_)) => {
                 self.status_message = Some(message);
                 self.status_message_task = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor()
@@ -1043,6 +1078,11 @@ impl Workspace {
             TabItem::Terminal(group) => self.close_terminal_tab(group, window, cx),
             TabItem::Diff(view) => self.close_diff_tab(view, window, cx),
             TabItem::Merge(view) => self.close_merge_tab(view, window, cx),
+            TabItem::Log(view) => {
+                if let Some(index) = self.index_of_log(&view) {
+                    self.remove_tab_at(index, window, cx);
+                }
+            }
         }
     }
 
@@ -1376,7 +1416,11 @@ impl Workspace {
     }
 
     /// The commit window, made on first use.
-    fn commit_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<CommitPanel> {
+    pub(crate) fn commit_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<CommitPanel> {
         if let Some(handle) = &self.commit_panel {
             return handle.panel.clone();
         }
@@ -1644,7 +1688,8 @@ impl Workspace {
             Tool::Project => self.tree_open && self.file_tree.is_some(),
             Tool::Commit => self.commit_open,
             Tool::FindInFiles => self.project_search.read(cx).is_open(),
-            Tool::Terminal => self.terminal_open,
+            Tool::Terminal => self.terminal_open && !self.git_open,
+            Tool::Git => self.git_open,
         }
     }
 
@@ -1853,6 +1898,248 @@ impl Workspace {
         }
     }
 
+    // --- Git window ---
+
+    /// The Git window, made on first use.
+    fn git_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<GitWindow> {
+        if let Some(handle) = &self.git_window {
+            return handle.window.clone();
+        }
+        let git = self.git.clone();
+        let height = self.bottom_height.clone();
+        let git_window = cx.new(|cx| GitWindow::new(git, height, window, cx));
+        let subscriptions = [
+            cx.observe(&git_window, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&git_window, window, Self::on_git_window_event),
+        ];
+        self.git_window = Some(GitWindowHandle {
+            window: git_window.clone(),
+            _subscriptions: subscriptions,
+        });
+        git_window
+    }
+
+    fn on_git_window_event(
+        &mut self,
+        _: &Entity<GitWindow>,
+        event: &GitWindowEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            GitWindowEvent::Empty => self.hide_git_window(window, cx),
+            GitWindowEvent::MoveToPanel { view, index } => {
+                self.move_log_to_panel(view.clone(), Some(*index), window, cx)
+            }
+        }
+    }
+
+    /// The repository the log starts with: the active file's, or the first one.
+    fn log_repo(&self, cx: &App) -> Option<usize> {
+        let git = self.git.read(cx);
+        if git.repos().is_empty() {
+            return None;
+        }
+        Some(
+            self.active_path(cx)
+                .and_then(|path| git.repo_index(&path))
+                .unwrap_or(0),
+        )
+    }
+
+    /// The repository log's view: in the Git window, or a tab of the editor area; made (in the
+    /// window) if there is none.
+    fn log_view(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<GitLogView>> {
+        if let Some(view) = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.item.log())
+            .find(|view| *view.read(cx).scope() == crate::git_log::LogScope::All)
+        {
+            return Some(view.clone());
+        }
+        let git_window = self.git_window(window, cx);
+        if let Some(view) = git_window.read(cx).log_view(cx) {
+            return Some(view);
+        }
+        let repo = self.log_repo(cx)?;
+        Some(git_window.update(cx, |git_window, cx| git_window.new_log(repo, window, cx)))
+    }
+
+    /// Shows a view of the Git window: its tab in the editor area, or the window with it.
+    fn reveal_log(
+        &mut self,
+        view: &Entity<GitLogView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.index_of_log(view) {
+            return self.activate(index, window, cx);
+        }
+        let git_window = self.git_window(window, cx);
+        self.git_open = true;
+        git_window.update(cx, |git_window, cx| {
+            git_window.activate_view(view, window, cx)
+        });
+        cx.notify();
+    }
+
+    /// ⌘9, as the Git tool window of JetBrains IDEs: shows the window with the log focused; from
+    /// the window, hides it.
+    fn toggle_git_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = self
+            .git_window
+            .as_ref()
+            .is_some_and(|handle| handle.window.read(cx).contains_focus(window, cx));
+        if self.git_open && focused {
+            return self.hide_git_window(window, cx);
+        }
+        if self.git.read(cx).repos().is_empty() && self.git_window.is_none() {
+            return self.show_message(tr("No Git repository in the project").into(), cx);
+        }
+        let git_window = self.git_window(window, cx);
+        if git_window.read(cx).is_empty() {
+            match self.log_view(window, cx) {
+                // The log lives in the editor area: the window stays as it is, the tab comes forward.
+                Some(view) if self.index_of_log(&view).is_some() => {
+                    return self.reveal_log(&view, window, cx);
+                }
+                _ => {}
+            }
+        }
+        self.git_open = true;
+        git_window.update(cx, |git_window, cx| git_window.focus(window, cx));
+        cx.notify();
+    }
+
+    /// ⇧Esc in the Git window, or its last tab gone: the window hides, focus goes to the editor.
+    fn hide_git_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = self
+            .git_window
+            .as_ref()
+            .is_some_and(|handle| handle.window.read(cx).contains_focus(window, cx));
+        self.git_open = false;
+        if focused || window.focused(cx).is_none() {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Show Commit in Log: the log of the repository with the commit selected.
+    fn show_commit_in_log(
+        &mut self,
+        repo: usize,
+        oid: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.log_view(window, cx) else {
+            return;
+        };
+        self.reveal_log(&view, window, cx);
+        view.update(cx, |view, cx| {
+            if view.repo() != repo {
+                window.dispatch_action(Box::new(crate::git_log::SetRepo { repo }), cx);
+            }
+            view.show_commit(oid, window, cx)
+        });
+    }
+
+    /// The history of a file or of its lines: a tab of the Git window.
+    fn show_history(
+        &mut self,
+        path: &Path,
+        lines: Option<(u32, u32)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A history tab already in the editor area comes forward.
+        let git_window = self.git_window(window, cx);
+        let view = git_window.update(cx, |git_window, cx| {
+            git_window.show_history(path, lines, window, cx)
+        });
+        match view {
+            Some(_) => {
+                self.git_open = true;
+                cx.notify();
+            }
+            None => self.show_message(tr("The file isn’t in a Git repository").into(), cx),
+        }
+    }
+
+    fn index_of_log(&self, view: &Entity<GitLogView>) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.item.log() == Some(view))
+    }
+
+    /// A tab of the Git window moves to the editor area at `index` (by default, next to the active
+    /// tab) and gets focus. A window left empty hides.
+    fn move_log_to_editor(
+        &mut self,
+        view: Entity<GitLogView>,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = &self.git_window else {
+            return;
+        };
+        let git_window = handle.window.clone();
+        if !git_window.update(cx, |git_window, cx| git_window.remove_view(&view, cx)) {
+            return;
+        }
+        if git_window.read(cx).is_empty() {
+            self.git_open = false;
+        }
+        let subscriptions = vec![cx.observe(&view, |_, _, cx| cx.notify())];
+        self.insert_tab(TabItem::Log(view), subscriptions, index, window, cx);
+    }
+
+    /// "Move to Editor" in the Git window: its active tab.
+    fn move_log_tab_to_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = self
+            .git_window
+            .as_ref()
+            .and_then(|handle| handle.window.read(cx).active_view());
+        if let Some(view) = view {
+            self.move_log_to_editor(view, None, window, cx);
+        }
+    }
+
+    /// A tab of the editor area moves back to the Git window at `index` (by default, at the end).
+    fn move_log_to_panel(
+        &mut self,
+        view: Entity<GitLogView>,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.index_of_log(&view) else {
+            return;
+        };
+        self.remove_tab_at(tab, window, cx);
+        let git_window = self.git_window(window, cx);
+        self.git_open = true;
+        git_window.update(cx, |git_window, cx| {
+            git_window.add_view(view, index, window, cx)
+        });
+        cx.notify();
+    }
+
+    /// A Git window tab dropped on the tab strip: one already here moves along it.
+    fn drop_log(&mut self, view: Entity<GitLogView>, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        match self.index_of_log(&view) {
+            Some(from) => self.move_tab(from, index, window, cx),
+            None => self.move_log_to_editor(view, Some(index), window, cx),
+        }
+    }
+
     // --- Terminal ---
 
     /// ⌥F12, as the Terminal tool window in JetBrains IDEs: shows the panel and focuses the
@@ -1862,6 +2149,7 @@ impl Workspace {
             return self.hide_terminal(window, cx);
         }
         self.terminal_open = true;
+        self.git_open = false;
         self.terminal_panel
             .update(cx, |panel, cx| panel.focus(window, cx));
         cx.notify();
@@ -1880,6 +2168,7 @@ impl Workspace {
     /// ⌘T: a new terminal tab in the panel.
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal_open = true;
+        self.git_open = false;
         self.terminal_panel
             .update(cx, |panel, cx| panel.new_terminal(window, cx));
         cx.notify();
@@ -2206,6 +2495,7 @@ impl Workspace {
             Some(TabItem::Merge(view)) => {
                 trf("{0} (merge) — {1}", &[&view.read(cx).title(), &project])
             }
+            Some(TabItem::Log(view)) => format!("{} — {project}", view.read(cx).title()),
             None => project.clone(),
         };
         if title != self.title {
@@ -2379,6 +2669,12 @@ impl Workspace {
                     return bar.child(div().flex_1().min_w_0().truncate().child(path));
                 }
             },
+            Some(TabItem::Log(_)) => {
+                let left: SharedString = self.status_message.clone().unwrap_or_default();
+                return bar
+                    .child(div().flex_1().min_w_0().truncate().child(left))
+                    .children(crate::git::status_item(self.git.read(cx), ui));
+            }
             Some(TabItem::Merge(view)) => {
                 let path = self.display_path(view.read(cx).path());
                 let left = match &self.status_message {
@@ -2528,6 +2824,7 @@ impl Workspace {
                     .into_any_element(),
                 TabItem::Diff(view) => self.render_diff_tab(index, view, cx).into_any_element(),
                 TabItem::Merge(view) => self.render_merge_tab(index, view, cx).into_any_element(),
+                TabItem::Log(view) => self.render_log_tab(index, view, cx).into_any_element(),
             })
             .collect();
         // While a tab is dragged over the strip: a marker where it would land.
@@ -2572,6 +2869,14 @@ impl Workspace {
             }))
             .on_drop(cx.listener(|this, dragged: &DraggedEditorTab, window, cx| {
                 this.drop_editor_tab(dragged.editor.clone(), window, cx)
+            }))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedLogTab>, _, cx| {
+                    this.drag_over_tabs(event.event.position, event.bounds, cx)
+                }),
+            )
+            .on_drop(cx.listener(|this, dragged: &DraggedLogTab, window, cx| {
+                this.drop_log(dragged.view.clone(), window, cx)
             }))
             // The line under the tabs runs from edge to edge of the island, inset from the rounded
             // corners.
@@ -2714,6 +3019,53 @@ impl Workspace {
             .child(label(&title))
             .child(label(tr("diff")).text_color(ui.dim))
             .child(close_button(TabItem::Diff(view.clone()), active, dot, cx))
+    }
+
+    /// A tab of the Git window in the editor area: the log or a history; it can be dragged back.
+    fn render_log_tab(
+        &self,
+        index: usize,
+        view: &Entity<GitLogView>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        let active = index == self.active;
+        let title = view.read(cx).title();
+        let is_log = *view.read(cx).scope() == crate::git_log::LogScope::All;
+        let (activate, close) = (view.clone(), view.clone());
+        let dragged = DraggedLogTab {
+            view: view.clone(),
+            title: title.clone(),
+        };
+        tab_shell(view.entity_id(), active, ui)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    if let Some(index) = this.index_of_log(&activate) {
+                        this.activate(index, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    this.close_item(TabItem::Log(close.clone()), window, cx)
+                }),
+            )
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .child(
+                icon(
+                    if is_log {
+                        IconName::Commit
+                    } else {
+                        IconName::History
+                    },
+                    ui.accent,
+                )
+                .size(px(14.)),
+            )
+            .child(label(&title))
+            .child(close_button(TabItem::Log(view.clone()), active, None, cx))
     }
 
     /// The merge tool's tab: the file name, "merge", a dot while the result isn't applied.
@@ -2914,6 +3266,9 @@ impl Render for Workspace {
             .map(|root| crate::compare_dialog::workspace_actions(root, cx))
             .map(|root| crate::stash_panel::workspace_actions(root, cx))
             .map(|root| crate::conflicts_dialog::workspace_actions(root, cx))
+            .map(|root| crate::log_actions::workspace_actions(root, cx))
+            .map(|root| crate::rebase_dialog::workspace_actions(root, cx))
+            .map(|root| crate::blame::workspace_actions(root, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
                 // A directory from the recent list may have disappeared since launch.
                 if !action.0.is_dir() {
@@ -2985,6 +3340,24 @@ impl Render for Workspace {
                 this.toggle_tree(window, cx)
             }))
             .on_action(
+                cx.listener(|this, _: &crate::git::ToggleGitWindow, window, cx| {
+                    this.toggle_git_window(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &crate::git::ShowCommitInLog, window, cx| {
+                    this.show_commit_in_log(action.repo, &action.oid, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &crate::git::ShowHistory, window, cx| {
+                    this.show_history(&action.path, action.lines, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &git_window::HideWindow, window, cx| {
+                this.hide_git_window(window, cx)
+            }))
+            .on_action(
                 cx.listener(|this, _: &terminal_panel::TogglePanel, window, cx| {
                     this.toggle_terminal(window, cx)
                 }),
@@ -3036,11 +3409,17 @@ impl Render for Workspace {
                 this.move_terminal_to_editor(dragged.group.clone(), None, window, cx)
             }
         });
+        let drop_log = cx.listener(|this, dragged: &DraggedLogTab, window, cx| {
+            if this.index_of_log(&dragged.view).is_none() {
+                this.move_log_to_editor(dragged.view.clone(), None, window, cx)
+            }
+        });
         let body = move |content: AnyElement| {
             div()
                 .flex_1()
                 .min_h_0()
                 .on_drop(drop_terminal)
+                .on_drop(drop_log)
                 .child(content)
         };
         let main = match self.active_item() {
@@ -3052,6 +3431,7 @@ impl Render for Workspace {
                     TabItem::Terminal(group) => group.clone().into_any_element(),
                     TabItem::Diff(view) => view.clone().into_any_element(),
                     TabItem::Merge(view) => view.clone().into_any_element(),
+                    TabItem::Log(view) => view.clone().into_any_element(),
                 };
                 main.child(self.render_tab_bar(cx))
                     .when(
@@ -3065,6 +3445,17 @@ impl Render for Workspace {
                             .pb_2()
                             // Only a terminal of the editor area can move to the panel: the command
                             // is offered there.
+                            .when(item.log().is_some(), |area| {
+                                area.on_action(cx.listener(
+                                    |this, _: &git_window::MoveToPanel, window, cx| {
+                                        if let Some(view) =
+                                            this.active_item().and_then(|item| item.log().cloned())
+                                        {
+                                            this.move_log_to_panel(view, None, window, cx)
+                                        }
+                                    },
+                                ))
+                            })
                             .when(item.terminal().is_some(), |area| {
                                 area.on_action(cx.listener(
                                     |this, _: &terminal_panel::MoveToPanel, window, cx| {
@@ -3089,7 +3480,21 @@ impl Render for Workspace {
         let tree = left.map(|panel| ui::island(ui).flex_none().h_full().child(panel));
         // The editor island and, under it, the terminal panel; the tree stays full height. A panel
         // terminal can move to the editor area: the command is offered inside the panel.
-        let terminal = self.terminal_open.then(|| {
+        let git_island = self
+            .git_window
+            .as_ref()
+            .filter(|_| self.git_open)
+            .map(|handle| {
+                ui::island(ui)
+                    .flex_none()
+                    .on_action(
+                        cx.listener(|this, _: &git_window::MoveToEditor, window, cx| {
+                            this.move_log_tab_to_editor(window, cx)
+                        }),
+                    )
+                    .child(handle.window.clone())
+            });
+        let terminal = (self.terminal_open && git_island.is_none()).then(|| {
             ui::island(ui)
                 .flex_none()
                 .on_action(
@@ -3107,7 +3512,8 @@ impl Render for Workspace {
             .flex_col()
             .gap(px(GAP))
             .child(main)
-            .children(terminal);
+            .children(terminal)
+            .children(git_island);
         // On the left, the launchpad (the tool strip) on the frame, followed by the islands.
         root.child(ui::frame_glow(ui))
             .child(self.render_title_bar(window, cx))

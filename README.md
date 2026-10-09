@@ -42,7 +42,10 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   diff you can edit; a commit window with checkboxes for files and even single changes, amend and
   commit-and-push; push with a preview of what goes. Branches in one popup — search, favorites, every
   operation a click away, checkout that keeps your changes; update, pull and fetch; stash and unstash;
-  conflicts resolved in a three-way merge tool. Works with all the repositories in your folder.
+  conflicts resolved in a three-way merge tool. The log with a graph of branches, filters and the details
+  of every commit; cherry-pick, revert, reset and an interactive rebase right from it; the history of a
+  file or of selected lines; who changed each line in the gutter. Works with all the repositories in your
+  folder.
 - **Keyboard first.** Every command is in the command palette with its shortcut; familiar keys if
   you come from JetBrains IDEs.
 - **Speaks your language.** English or Russian, following your system settings.
@@ -71,6 +74,14 @@ and keeps everything you need one shortcut away — no setup, no clutter.
   <tr>
     <td align="center"><sub><b>Branches</b></sub></td>
     <td align="center"><sub><b>Merge tool for conflicts</b></sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/log.png" alt="The Git window: the log with a graph of branches, filters and the details of the selected commit"></td>
+    <td width="50%"><img src="docs/images/blame.png" alt="Annotations in the gutter: the date and the author of the last change of every line"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Log with a graph of branches</b></sub></td>
+    <td align="center"><sub><b>Who changed each line</b></sub></td>
   </tr>
 </table>
 
@@ -101,6 +112,7 @@ recent project on the start screen.
 | <kbd>⌘</kbd><kbd>K</kbd> · <kbd>⇧</kbd><kbd>⌘</kbd><kbd>K</kbd> | Commit · push |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>B</kbd> · <kbd>⌘</kbd><kbd>T</kbd> | Branches · update the project (in a terminal, ⌘T opens a new one) |
 | <kbd>⌘</kbd><kbd>0</kbd> · <kbd>⌃</kbd><kbd>V</kbd> | Show or hide the commit window · Git operations |
+| <kbd>⌘</kbd><kbd>9</kbd> · <kbd>⌥</kbd><kbd>⌘</kbd><kbd>A</kbd> | Show or hide the Git log · who changed each line |
 
 ## Roadmap
 
@@ -112,7 +124,7 @@ recent project on the start screen.
 - [x] Built-in terminal
 - [x] Git: changes, diff, commit and push
 - [x] Git: branches, stash, conflicts
-- [ ] Git: history and blame
+- [x] Git: history and blame
 - [ ] Notification center and unified dialogs
 - [ ] Plugins
 - [ ] Claude Code integration — the first plugin

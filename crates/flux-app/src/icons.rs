@@ -61,6 +61,7 @@ icons! {
     Folder => "folder",
     FolderOpen => "folder-open",
     FolderPlus => "folder-plus",
+    GitLog => "git-log",
     Hash => "hash",
     History => "history",
     Info => "info",

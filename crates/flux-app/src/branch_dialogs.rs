@@ -355,6 +355,26 @@ pub fn checkout(
     )
 }
 
+/// Checks out a commit (the log's Checkout Revision): HEAD is detached there, as a notification
+/// tells; local changes in the way — the Smart Checkout question.
+pub fn checkout_detached(
+    workspace: &mut Workspace,
+    repo: usize,
+    oid: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    run_checkout(
+        workspace,
+        repo,
+        CheckoutTarget::Revision(oid.clone()),
+        CheckoutMode::Normal,
+        Then::Detached(oid),
+        window,
+        cx,
+    )
+}
+
 fn run_checkout(
     workspace: &mut Workspace,
     repo: usize,
