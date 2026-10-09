@@ -40,7 +40,6 @@ use crate::icons::{FileIcon, ICON_SIZE, IconName, file_icon, folder_icon, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
-use crate::workspace::tilde;
 
 const ROW_HEIGHT: f32 = 26.;
 /// Title bar: the project label and icon buttons.
@@ -1251,13 +1250,11 @@ impl FileTreePanel {
 
     // --- Rendering ---
 
-    /// Title bar: the project label and the "new file", "new folder" and "collapse all" buttons.
+    /// Title bar: the "new file", "new folder" and "collapse all" buttons on the right (the project's
+    /// name is in the window's title bar, not repeated here). A drop on it moves into the root, a
+    /// right click opens the root's menu.
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
-        let name = self.root.file_name().map_or_else(
-            || tilde(&self.root),
-            |name| name.to_string_lossy().into_owned(),
-        );
         let dropping_root = self.drop_target.as_ref() == Some(&self.root);
         div()
             .id("file-tree-header")
@@ -1278,7 +1275,7 @@ impl FileTreePanel {
                     this.secondary_click(None, event.position, window, cx)
                 }),
             )
-            .child(ui::section_label(name, ui).flex_1().min_w_0().truncate())
+            .child(div().flex_1())
             .child(self.header_button(
                 ("new-file", IconName::FilePlus, tr("New File")),
                 &NewFile,
