@@ -102,6 +102,8 @@ recent project on the start screen.
 - [x] Git: changes, diff, commit and push
 - [ ] Git: branches, stash, conflicts
 - [ ] Git: history and blame
+- [ ] Plugins
+- [ ] Claude Code integration — the first plugin
 - [ ] Public beta
 
 ## License
