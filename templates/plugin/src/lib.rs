@@ -1,12 +1,15 @@
-//! A plugin to start from: a command that shows a notification with an action, a tool window that
-//! lists the open documents (and opens the one picked), a setting. Build it with
+//! A plugin to start from: a command that shows a notification with an action — in the palette and
+//! in the editor's context menu, where it knows the file — a tool window that lists the open
+//! documents (and opens the one picked), a setting. Build it with
 //! `cargo build --release --target wasm32-wasip2`; install the folder in Flux: Settings →
 //! Plugins → ⚙ → Install Plugin from Disk… — Flux rebuilds and reloads it as it changes.
 
 use flux_plugin_api::host::editors;
 use flux_plugin_api::notify::Notice;
 use flux_plugin_api::view::*;
-use flux_plugin_api::{Event, Plugin, UiEvent, log, register_plugin, setting, tr, trf};
+use flux_plugin_api::{
+    CommandContext, Event, Plugin, UiEvent, log, register_plugin, setting, tr, trf,
+};
 
 /// The tool window of the manifest.
 const WINDOW: &str = "documents";
@@ -25,12 +28,18 @@ impl Plugin for Hello {
         log::info("activated");
     }
 
-    fn run_command(&mut self, command: &str) {
+    fn run_command(&mut self, command: &str, context: &CommandContext) {
         match command {
             "hello" => {
                 let greeting: String =
                     setting("greeting").unwrap_or_else(|| tr("Hello from a plugin!"));
-                Notice::info(&greeting)
+                // The context says what the command acts on: run from the editor's menu (or the
+                // palette, with a document open), the document's file.
+                let title = match context.path().and_then(|path| path.rsplit('/').next()) {
+                    Some(file) => trf("{0} ({1})", &[&greeting, &file]),
+                    None => greeting,
+                };
+                Notice::info(&title)
                     .action(&tr("Show Open Documents"), "show-documents")
                     .send();
             }

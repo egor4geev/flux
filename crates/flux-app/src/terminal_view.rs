@@ -14,9 +14,14 @@
 //! selects (a double click — words, a triple click — lines, ⌥ — a rectangle, ⇧-click extends),
 //! dragging past the top or bottom edge scrolls, the wheel scrolls the scrollback (on the alternate
 //! screen of `less` or `man` it sends arrow keys), the right button opens a menu.
+//!
+//! A terminal runs the user's shell, or a command a plugin started ([`SpawnSpec`], part 8.2): then
+//! it may keep a title of its own and its pane when the command ends, with a line about how it
+//! ended, as the Run tool window of JetBrains IDEs.
 
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flux_term::keys::{self, Modifiers};
@@ -99,6 +104,9 @@ pub enum TerminalViewEvent {
     Bell,
     /// The shell exited: the pane goes away.
     Exited,
+    /// The program ended, with its exit code (none — a signal): a plugin that started it hears of
+    /// it. Comes before `Exited`; a pane that stays ([`SpawnSpec::keep_on_exit`]) gets only this.
+    ProcessEnded(Option<i32>),
     /// ⌘-click on a link in the output.
     OpenLink(TerminalLink),
     /// Focus came into this terminal: its group makes it the active pane.
@@ -110,6 +118,24 @@ struct Menu {
     menu: Entity<ContextMenu>,
     position: Point<Pixels>,
     _subscriptions: [Subscription; 2],
+}
+
+/// How a terminal starts: the user's shell by default; a plugin's terminal (part 8.2) also gets a
+/// command, more environment, a title, its pane kept after the end, and its owner.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnSpec {
+    /// The program and its arguments; none — the user's login shell.
+    pub command: Option<(String, Vec<String>)>,
+    pub cwd: Option<PathBuf>,
+    /// Added to the environment.
+    pub env: Vec<(String, String)>,
+    /// The tab's label instead of the foreground process.
+    pub title: Option<SharedString>,
+    /// The pane stays when its program ends, with a line about how it ended (a command's output is
+    /// what the user wants to read) instead of closing.
+    pub keep_on_exit: bool,
+    /// The plugin that opened it: it may type into it, show and close it, and hears when it ends.
+    pub plugin: Option<Arc<str>>,
 }
 
 /// One terminal session on screen.
@@ -125,6 +151,13 @@ pub struct TerminalView {
     pub(crate) cwd: Option<PathBuf>,
     /// The shell has exited (with its code, if it exited normally).
     pub(crate) exited: Option<Option<i32>>,
+    /// The plugin that opened the terminal (part 8.2); none for the user's own terminals and once
+    /// the plugin stops.
+    pub(crate) plugin: Option<Arc<str>>,
+    /// The pane stays when the program ends ([`SpawnSpec::keep_on_exit`]).
+    keep_on_exit: bool,
+    /// The tab's label set by whoever opened it, instead of the foreground process.
+    fixed_title: Option<SharedString>,
     /// The geometry of the last frame: the mouse and the IME map points to cells with it.
     pub(crate) layout: Option<TerminalLayout>,
     /// An IME composition in progress, drawn at the cursor until it is committed.
@@ -165,8 +198,33 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut App,
     ) -> std::io::Result<Entity<Self>> {
+        let spec = SpawnSpec {
+            cwd,
+            ..SpawnSpec::default()
+        };
+        Self::spawn_with(spec, root, window, cx)
+    }
+
+    /// Starts what `spec` says: the user's shell or a command, in its directory, with its
+    /// environment.
+    pub fn spawn_with(
+        spec: SpawnSpec,
+        root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> std::io::Result<Entity<Self>> {
+        let SpawnSpec {
+            command,
+            cwd,
+            env,
+            title,
+            keep_on_exit,
+            plugin,
+        } = spec;
         let options = TerminalOptions {
+            command,
             cwd: cwd.clone(),
+            env,
             palette: palette(Theme::get(cx)),
             ..TerminalOptions::default()
         };
@@ -206,6 +264,9 @@ impl TerminalView {
                 process_name: None,
                 cwd,
                 exited: None,
+                plugin,
+                keep_on_exit,
+                fixed_title: title,
                 layout: None,
                 marked_text: None,
                 cursor_visible: true,
@@ -227,8 +288,12 @@ impl TerminalView {
         }))
     }
 
-    /// The tab label: the foreground process, else the program's title, else "Terminal".
+    /// The tab label: the title it was opened with, else the foreground process, else the
+    /// program's title, else "Terminal".
     pub fn label(&self) -> SharedString {
+        if let Some(title) = &self.fixed_title {
+            return title.clone();
+        }
         self.process_name
             .clone()
             .or_else(|| self.title.clone())
@@ -268,10 +333,11 @@ impl TerminalView {
                 self.exited = Some(code);
                 self.blink_task = None;
                 self.autoscroll = None;
+                cx.emit(TerminalViewEvent::ProcessEnded(code));
                 let failed = code != Some(0);
-                // A failure right after the start leaves the pane with its output and a note;
-                // otherwise the pane closes.
-                if !(failed && self.started.elapsed() < EARLY_EXIT) {
+                // A pane kept for its output, or a failure right after the start, stays with a
+                // note; otherwise the pane closes.
+                if !self.keep_on_exit && !(failed && self.started.elapsed() < EARLY_EXIT) {
                     cx.emit(TerminalViewEvent::Exited);
                 }
                 cx.notify();
@@ -325,6 +391,16 @@ impl TerminalView {
             self.typed(cx);
             cx.stop_propagation();
         }
+    }
+
+    /// Types text as if the user did (a plugin's `send-text`); `false` once the program has ended.
+    pub(crate) fn send_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if self.exited.is_some() {
+            return false;
+        }
+        self.terminal.input(text.as_bytes().to_vec());
+        self.typed(cx);
+        true
     }
 
     /// After input: the cursor is shown at once and the selection is gone.
@@ -677,13 +753,37 @@ impl TerminalView {
     // --- Display ---
 
     /// Under the output of a shell that failed right after starting: why the pane stayed, and how
-    /// to close it.
+    /// to close it. A pane kept for a command's output says how the command ended, as JetBrains'
+    /// Run window does ("Process finished with exit code 0").
     fn render_exit_note(&self, window: &Window, cx: &Context<Self>) -> Option<impl IntoElement> {
         let code = self.exited?;
         let ui = Theme::ui(cx);
-        let message = match code {
-            Some(code) => trf("The shell exited with code {0}", &[&code]),
-            None => tr("The shell was terminated").to_string(),
+        let (message, tone, glyph) = match (self.keep_on_exit, code) {
+            (true, Some(0)) => (
+                trf("Process finished with exit code {0}", &[&0]),
+                ui.success,
+                IconName::CheckCircle,
+            ),
+            (true, Some(code)) => (
+                trf("Process finished with exit code {0}", &[&code]),
+                ui.warning,
+                IconName::Warning,
+            ),
+            (true, None) => (
+                tr("Process terminated").to_string(),
+                ui.warning,
+                IconName::Warning,
+            ),
+            (false, Some(code)) => (
+                trf("The shell exited with code {0}", &[&code]),
+                ui.warning,
+                IconName::Warning,
+            ),
+            (false, None) => (
+                tr("The shell was terminated").to_string(),
+                ui.warning,
+                IconName::Warning,
+            ),
         };
         let keys = ui::shortcut_in(
             &crate::terminal_group::ClosePane,
@@ -701,14 +801,11 @@ impl TerminalView {
                 .items_center()
                 .gap_2()
                 .rounded(px(ui::RADIUS_SM))
-                .bg(gpui::Hsla {
-                    a: 0.12,
-                    ..ui.warning
-                })
+                .bg(gpui::Hsla { a: 0.12, ..tone })
                 .font_family(theme::UI_FONT)
                 .text_size(px(theme::TEXT_SM))
                 .text_color(ui.foreground)
-                .child(icon(IconName::Warning, ui.warning).size(px(13.)))
+                .child(icon(glyph, tone).size(px(13.)))
                 .child(div().flex_1().min_w_0().truncate().child(message))
                 .children(keys.map(|keys| ui::hint_bar(&[(keys.as_ref(), tr("Close"))], ui))),
         )

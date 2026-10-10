@@ -6,7 +6,7 @@
 //! id = "flux.todo"
 //! name = "TODO"
 //! version = "0.1.0"
-//! api = "0.1"
+//! api = "0.2"
 //! authors = ["Egor Ageev"]
 //! description = "TODO and FIXME comments of the project in a tool window."
 //! icon = "icons/todo.svg"
@@ -14,6 +14,8 @@
 //!
 //! [permissions]
 //! project = "read"
+//! network = ["api.github.com"]
+//! processes = ["git"]
 //!
 //! [[commands]]
 //! id = "refresh"
@@ -25,6 +27,11 @@
 //! title = "TODO"
 //! icon = "icons/todo.svg"
 //!
+//! [[menus]]
+//! command = "refresh"
+//! location = "tree"
+//! when = "folder"
+//!
 //! [[settings]]
 //! key = "patterns"
 //! title = "Patterns"
@@ -34,6 +41,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -46,7 +54,7 @@ pub struct Manifest {
     pub id: String,
     pub name: String,
     pub version: String,
-    /// The plugin API version it is built for (`"0.1"`); Flux runs only the one it has.
+    /// The plugin API version it is built for (`"0.2"`); Flux runs only the one it has.
     pub api: String,
     pub authors: Vec<String>,
     pub description: String,
@@ -62,14 +70,115 @@ pub struct Manifest {
     pub tool_windows: Vec<ToolWindowSpec>,
     pub status_items: Vec<StatusItemSpec>,
     pub settings: Vec<SettingSpec>,
+    /// Items of the context menus that run the plugin's commands.
+    pub menus: Vec<MenuSpec>,
 }
 
 /// What a plugin may do beyond its own folder and the API's notifications, questions and windows.
-/// The install question lists them; the sandbox enforces them.
+/// The install question lists them; the sandbox and the API enforce them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Permissions {
-    /// The project's files through the file system.
+    /// The project's files through the file system, and what the API tells about them: the
+    /// search, Git, the problems, the answers to proposals.
     pub project: ProjectAccess,
+    /// The hosts the plugin may send requests to, lowercase: "api.example.com", "*.example.com"
+    /// (the domain and its subdomains), "localhost" (with 127.0.0.1 and ::1), "*" (any).
+    pub network: Vec<String>,
+    /// A server of its own on 127.0.0.1.
+    pub server: bool,
+    /// The programs the plugin may run, by name ("git"), or "*" — any.
+    pub processes: Vec<String>,
+    /// Terminal tabs the plugin may open and type into.
+    pub terminal: bool,
+    /// Folders outside the project, open to the plugin through the file system.
+    pub folders: Vec<FolderPermission>,
+}
+
+impl Permissions {
+    /// Nothing beyond what every plugin may do.
+    pub fn is_empty(&self) -> bool {
+        self.project == ProjectAccess::None
+            && self.network.is_empty()
+            && !self.server
+            && self.processes.is_empty()
+            && !self.terminal
+            && self.folders.is_empty()
+    }
+
+    /// Whether a request may go to `host`: a name or an IP address, without the port (IPv6 with
+    /// or without brackets).
+    pub fn allows_host(&self, host: &str) -> bool {
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        self.network.iter().any(|allowed| match allowed.as_str() {
+            "*" => true,
+            "localhost" => matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"),
+            pattern => match pattern.strip_prefix("*.") {
+                Some(domain) => {
+                    host == domain
+                        || host
+                            .strip_suffix(domain)
+                            .is_some_and(|sub| sub.ends_with('.'))
+                }
+                None => host == pattern,
+            },
+        })
+    }
+
+    /// Any host at all.
+    pub fn any_host(&self) -> bool {
+        self.network.iter().any(|host| host == "*")
+    }
+
+    /// Whether the plugin may run `program`: a name looked up in `PATH`, or a path — its file
+    /// name is what the manifest lists.
+    pub fn allows_program(&self, program: &str) -> bool {
+        let name = Path::new(program)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        !name.is_empty()
+            && self
+                .processes
+                .iter()
+                .any(|allowed| allowed == "*" || *allowed == name)
+    }
+
+    /// Any program at all.
+    pub fn any_program(&self) -> bool {
+        self.processes.iter().any(|program| program == "*")
+    }
+}
+
+/// A folder outside the project the plugin may read or write.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FolderPermission {
+    /// As the manifest says it: "~/.config/gh" (in the home folder) or an absolute path.
+    pub path: String,
+    #[serde(default)]
+    pub access: FolderAccess,
+}
+
+impl FolderPermission {
+    /// The folder's absolute path: "~" is the home folder.
+    pub fn resolve(&self, home: &Path) -> PathBuf {
+        match self.path.strip_prefix('~') {
+            Some(rest) => home.join(rest.trim_start_matches('/')),
+            None => PathBuf::from(&self.path),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FolderAccess {
+    #[default]
+    Read,
+    Write,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -120,6 +229,42 @@ pub struct ToolWindowSpec {
     pub icon: Option<String>,
     /// A default shortcut that opens and closes the window.
     pub keys: Option<String>,
+}
+
+/// An item of a context menu: runs one of the plugin's commands on what the menu was opened on
+/// (the command's context says what).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct MenuSpec {
+    /// One of the plugin's `[[commands]]`: its title is the item's label.
+    pub command: String,
+    pub location: MenuLocation,
+    /// Shown only then; always by default.
+    pub when: Option<MenuWhen>,
+}
+
+/// Which context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MenuLocation {
+    /// The editor's (the right button over the text, ⇧F10).
+    Editor,
+    /// The project tree's.
+    Tree,
+    /// A tab's.
+    Tab,
+}
+
+/// When a menu item shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MenuWhen {
+    /// The editor has a selection.
+    Selection,
+    /// The menu is on a file (the tree, a tab).
+    File,
+    /// The menu is on a folder (the tree).
+    Folder,
 }
 
 /// An item of the status bar; the plugin sets its text.
@@ -240,6 +385,8 @@ struct RawManifest {
     status_items: Vec<StatusItemSpec>,
     #[serde(default)]
     settings: Vec<RawSetting>,
+    #[serde(default)]
+    menus: Vec<MenuSpec>,
 }
 
 #[derive(Default, Deserialize)]
@@ -247,6 +394,65 @@ struct RawManifest {
 struct RawPermissions {
     #[serde(default)]
     project: ProjectAccess,
+    #[serde(default)]
+    network: Vec<String>,
+    #[serde(default)]
+    server: bool,
+    #[serde(default)]
+    processes: Vec<String>,
+    #[serde(default)]
+    terminal: bool,
+    #[serde(default)]
+    folders: Vec<FolderPermission>,
+}
+
+impl RawPermissions {
+    fn check(self) -> Result<Permissions, ManifestError> {
+        let error = |message: String| Err(ManifestError(message));
+        let mut network = Vec::new();
+        for host in self.network {
+            let host = host.trim().to_ascii_lowercase();
+            let name = host.strip_prefix("*.").unwrap_or(&host);
+            let valid = host == "*"
+                || (!name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')));
+            if !valid {
+                return error(format!(
+                    "permissions.network: \"{host}\" — a host, like \"api.example.com\" or \
+                     \"*.example.com\", without a scheme, a port or a path"
+                ));
+            }
+            network.push(host);
+        }
+        for program in &self.processes {
+            if program.is_empty() || program.contains('/') || program.contains(char::is_whitespace)
+            {
+                return error(format!(
+                    "permissions.processes: \"{program}\" — a program's name, like \"git\", or \"*\""
+                ));
+            }
+        }
+        for folder in &self.folders {
+            if !(folder.path.starts_with("~/") || folder.path == "~" || folder.path.starts_with('/'))
+            {
+                return error(format!(
+                    "permissions.folders: \"{}\" — an absolute path or one in the home folder \
+                     (\"~/.config/…\")",
+                    folder.path
+                ));
+            }
+        }
+        Ok(Permissions {
+            project: self.project,
+            network,
+            server: self.server,
+            processes: self.processes,
+            terminal: self.terminal,
+            folders: self.folders,
+        })
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -296,6 +502,28 @@ impl RawManifest {
             self.status_items.iter().map(|s| s.id.as_str()),
         )?;
         unique("setting", self.settings.iter().map(|s| s.key.as_str()))?;
+        for menu in &self.menus {
+            if !self.commands.iter().any(|command| command.id == menu.command) {
+                return error(format!(
+                    "menus: the command \"{}\" isn't in [[commands]]",
+                    menu.command
+                ));
+            }
+            let fits = match menu.when {
+                None => true,
+                Some(MenuWhen::Selection) => menu.location == MenuLocation::Editor,
+                Some(MenuWhen::File) => menu.location != MenuLocation::Editor,
+                Some(MenuWhen::Folder) => menu.location == MenuLocation::Tree,
+            };
+            if !fits {
+                return error(format!(
+                    "menus: \"{}\" — `when` doesn't fit the location (selection: editor; file: \
+                     tree, tab; folder: tree)",
+                    menu.command
+                ));
+            }
+        }
+        let permissions = self.permissions.check()?;
         let settings = self
             .settings
             .into_iter()
@@ -311,14 +539,13 @@ impl RawManifest {
             repository: self.repository,
             icon: self.icon,
             wasm: self.wasm,
-            permissions: Permissions {
-                project: self.permissions.project,
-            },
+            permissions,
             notifications: self.notifications.display,
             commands: self.commands,
             tool_windows: self.tool_windows,
             status_items: self.status_items,
             settings,
+            menus: self.menus,
         })
     }
 }
@@ -433,7 +660,7 @@ mod tests {
 id = "flux.todo"
 name = "TODO"
 version = "0.1.0"
-api = "0.1"
+api = "0.2"
 authors = ["Egor Ageev"]
 description = "TODO comments."
 wasm = "todo.wasm"
@@ -502,6 +729,54 @@ options = [{ value = "project", title = "Project" }, { value = "file", title = "
                 .0
                 .contains("patterns")
         );
+    }
+
+    #[test]
+    fn permissions() {
+        let text = TODO.replace(
+            "project = \"read\"",
+            "project = \"read\"\nnetwork = [\"api.github.com\", \"*.Yandex.ru\", \"localhost\"]\n\
+             processes = [\"git\"]\nserver = true\nfolders = [{ path = \"~/.config/gh\" }]",
+        );
+        let permissions = Manifest::parse(&text).unwrap().permissions;
+        assert!(permissions.allows_host("api.github.com"));
+        assert!(!permissions.allows_host("github.com"));
+        assert!(permissions.allows_host("yandex.ru"));
+        assert!(permissions.allows_host("api.tracker.YANDEX.ru"));
+        assert!(!permissions.allows_host("notyandex.ru"));
+        assert!(permissions.allows_host("127.0.0.1"));
+        assert!(permissions.allows_host("[::1]"));
+        assert!(!permissions.any_host());
+        assert!(permissions.allows_program("git"));
+        assert!(permissions.allows_program("/usr/bin/git"));
+        assert!(!permissions.allows_program("gh"));
+        assert!(permissions.server && !permissions.terminal);
+        assert_eq!(
+            permissions.folders[0].resolve(Path::new("/Users/me")),
+            Path::new("/Users/me/.config/gh")
+        );
+        assert_eq!(permissions.folders[0].access, FolderAccess::Read);
+        for wrong in [
+            "network = [\"https://api.github.com\"]",
+            "network = [\"api.github.com/v3\"]",
+            "processes = [\"/bin/sh\"]",
+            "folders = [{ path = \"relative\" }]",
+        ] {
+            let text = TODO.replace("project = \"read\"", wrong);
+            assert!(Manifest::parse(&text).is_err(), "{wrong}");
+        }
+        assert!(Manifest::parse(TODO).unwrap().permissions.network.is_empty());
+    }
+
+    #[test]
+    fn menus() {
+        let with = |menu: &str| Manifest::parse(&format!("{TODO}\n[[menus]]\n{menu}"));
+        let manifest = with("command = \"refresh\"\nlocation = \"tree\"\nwhen = \"folder\"").unwrap();
+        assert_eq!(manifest.menus[0].location, MenuLocation::Tree);
+        assert_eq!(manifest.menus[0].when, Some(MenuWhen::Folder));
+        assert!(with("command = \"nope\"\nlocation = \"editor\"").is_err());
+        assert!(with("command = \"refresh\"\nlocation = \"editor\"\nwhen = \"folder\"").is_err());
+        assert!(with("command = \"refresh\"\nlocation = \"tab\"\nwhen = \"selection\"").is_err());
     }
 
     #[test]

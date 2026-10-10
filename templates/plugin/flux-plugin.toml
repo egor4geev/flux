@@ -2,9 +2,9 @@
 id = "example.hello"
 name = "Hello"
 version = "0.1.0"
-api = "0.1"
+api = "0.2"
 authors = ["Your Name"]
-description = "A plugin to start from: a command with a notification, a tool window with the open documents, a setting."
+description = "A plugin to start from: a command with a notification (in the palette and the editor's menu), a tool window with the open documents, a setting."
 icon = "icons/hello.svg"
 # Where cargo puts the component; Flux builds a plugin under development itself.
 wasm = "target/wasm32-wasip2/release/hello_plugin.wasm"
@@ -18,6 +18,12 @@ category = "Hello"
 id = "show-documents"
 title = "Show Open Documents"
 category = "Hello"
+
+# Say Hello in the editor's context menu (the right button over the text): the command's context
+# has the document and its file.
+[[menus]]
+command = "hello"
+location = "editor"
 
 [[tool-windows]]
 id = "documents"

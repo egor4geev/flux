@@ -258,6 +258,8 @@ pub struct FileTreePanel {
     /// Git of the project: names are colored by their change (set by the workspace).
     git: Option<Entity<crate::git::GitStore>>,
     _git_subscription: Option<Subscription>,
+    /// The window's plugins: the context menu shows their items (part 8.2).
+    plugins: Option<Entity<crate::plugins::PluginStore>>,
 }
 
 impl EventEmitter<FileTreeEvent> for FileTreePanel {}
@@ -292,6 +294,7 @@ impl FileTreePanel {
             _watch_task: watch_task,
             git: None,
             _git_subscription: None,
+            plugins: None,
         };
         panel.changed(cx);
         panel
@@ -302,6 +305,11 @@ impl FileTreePanel {
         self._git_subscription = Some(cx.observe(&git, |_, _, cx| cx.notify()));
         self.git = Some(git);
         cx.notify();
+    }
+
+    /// The window's plugins: their items in the context menu.
+    pub fn set_plugins(&mut self, plugins: Entity<crate::plugins::PluginStore>) {
+        self.plugins = Some(plugins);
     }
 
     /// The active tab's file: expands the directories leading to it, selects it and scrolls to it.
@@ -1075,6 +1083,13 @@ impl FileTreePanel {
         self.selected = path.clone();
         self.reveal_target = None;
         let can_paste = self.clipboard.is_some();
+        // The plugins' items: for the row, or for the root on empty space (part 8.2).
+        let plugins = self.plugins.clone();
+        let target = crate::plugin_menus::MenuTarget {
+            location: flux_plugin::manifest::MenuLocation::Tree,
+            selection: false,
+            paths: vec![path.clone().unwrap_or_else(|| self.root.clone())],
+        };
         // Git: the history of a file or a directory of a repository (not of an untracked one).
         let history = path.clone().filter(|path| {
             self.git.as_ref().is_some_and(|git| {
@@ -1118,11 +1133,15 @@ impl FileTreePanel {
             };
             let menu = menu.entry(tr("Reveal in Finder"), RevealInFinder);
             // Claude: the file or the folder as a mention in the current chat's message.
-            match path.filter(|_| crate::claude_actions::offered(cx)) {
+            let menu = match path.filter(|_| crate::claude_actions::offered(cx)) {
                 Some(path) => menu.separator().entry(
                     tr("Send to Claude"),
                     crate::claude_actions::SendPathsToClaude(vec![path]),
                 ),
+                None => menu,
+            };
+            match &plugins {
+                Some(plugins) => crate::plugin_menus::append(menu, plugins, &target, cx),
                 None => menu,
             }
         });

@@ -10,11 +10,29 @@ bytes = "1"
 flux-search.workspace = true
 # Channels from the plugins' threads to the window's UI tasks.
 futures = "0.3.34"
+# The requests to the plugins' servers (`server`): the head of a request (already in Flux's tree).
+httparse = "1"
+# The plugins' programs (`process`): their process groups and signals.
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Only the `AsyncWrite` trait of the stdout and stderr streams (`wasmtime-wasi` runs on tokio).
 tokio = { version = "1", default-features = false }
 toml = "1"
+# The plugins' WebSocket connections to their server (`server`): frames over a socket Flux
+# accepts and upgrades itself; `handshake` only for the accept key (SHA-1).
+tungstenite = "0.30"
+# The plugins' requests (`http`): a synchronous client (no async runtime), TLS by rustls with ring
+# (both already in Flux's tree, through gpui) checked by the system's certificates (the platform
+# verifier: Security.framework on macOS, so a company's root certificates work); gzip bodies.
+ureq = { version = "3.4", default-features = false, features = [
+    "_ring",
+    "gzip",
+    "platform-verifier",
+    "rustls-no-provider",
+] }
+# Redirects (a relative `Location` against the request's URL) and the URLs of the plugins' requests.
+url = "2"
 # The plugins' runtime: WebAssembly components (ADR-029). Only what Flux needs: the component
 # model compiled by Cranelift; no WAT, GC, threads, profiling or the async component model.
 wasmtime = { version = "49.0.2", default-features = false, features = [
@@ -29,3 +47,8 @@ wasmtime = { version = "49.0.2", default-features = false, features = [
 # WASI 0.2 for the plugins: the file system (the project, the plugin's folder), clocks, random,
 # stdout and stderr into the plugin's log.
 wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p2"] }
+
+# The plugins' secrets (`secrets`): generic passwords in the macOS keychain (the crate is in the tree
+# already, through rustls).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", default-features = false }

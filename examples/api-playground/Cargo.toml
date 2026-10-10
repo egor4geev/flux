@@ -1,0 +1,26 @@
+[package]
+name = "flux-api-playground"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Every capability of the Flux plugin API behind a button: the manual check of the API and an example to copy from."
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+flux-plugin-api = { path = "../../crates/flux-plugin-api" }
+serde_json = "1"
+
+# Plugins are small: Flux compiles the component when it loads it.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# A plugin is a project of its own: `cargo build --release --target wasm32-wasip2`, or installed as
+# a plugin under development, Flux builds it.
+[workspace]

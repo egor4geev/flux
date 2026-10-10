@@ -1,9 +1,18 @@
 //! The plugin API on Flux's side: the functions of the WIT interfaces a plugin calls, run on the
-//! plugin's thread. What needs the window becomes a [`HostCall`] message (documents wait for the
-//! window's reply); the rest — the log, translations, the project search, storage, settings — is
-//! answered right here. Calls that name something the manifest doesn't declare (a command, a
-//! status bar item, a tool window) are skipped with a warning in the plugin's log: that's where
-//! the plugin's author looks.
+//! plugin's thread. What needs the window becomes a [`HostCall`] message (documents and
+//! [`window`]'s interfaces wait for the window's reply); the rest — the log, translations, the
+//! project search, storage, settings, and the background work of [`http`], [`server`],
+//! [`process`], [`timers`], [`secrets`] — is answered right here. Calls that name something the
+//! manifest doesn't declare (a command, a status bar item, a tool window) are skipped with a
+//! warning in the plugin's log: that's where the plugin's author looks. Calls the manifest's
+//! permissions don't allow fail with an error that names the permission.
+
+mod http;
+mod process;
+mod secrets;
+mod server;
+mod timers;
+mod window;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -25,9 +34,11 @@ use crate::api::bindings::flux::plugin::{
 };
 use crate::api::types::{EditorInfo, Range};
 use crate::log::{Level, PluginLog};
-use crate::manifest::ProjectAccess;
 use crate::registry::PluginEntry;
-use crate::runtime::{EditorCall, EditorReply, HostCall, MessageKind, PluginMessage, State};
+use crate::runtime::{
+    EditorCall, EditorReply, EventSender, HostCall, MessageKind, PluginMessage, State, WindowCall,
+    WindowReply,
+};
 
 /// How long the plugin waits for the window to answer about documents.
 const EDITOR_TIMEOUT: Duration = Duration::from_secs(5);
@@ -57,12 +68,26 @@ pub(crate) struct HostState {
     pub data_dir: PathBuf,
     /// Set when the instance is stopped: a search in progress gives up.
     pub cancel: Arc<AtomicBool>,
+    /// Posts events into the plugin's own queue: the background work of requests, the server,
+    /// programs and timers.
+    pub events: EventSender,
+    /// How long the current call has waited — for a response, a program, the window: not the
+    /// plugin's own time, so it doesn't count toward the time limit. The runtime resets it when a
+    /// call begins.
+    pub waited: Duration,
+    /// The plugin's started requests (`http.start`).
+    pub requests: http::Requests,
+    /// The plugin's server.
+    pub server: server::Server,
+    /// The plugin's started programs.
+    pub processes: process::Processes,
+    pub timers: timers::Timers,
 }
 
 impl HostState {
     /// A call for the window; dropped once the window has let the instance go (a document call
     /// then gets no reply at once).
-    fn call(&self, call: HostCall) {
+    pub(crate) fn call(&self, call: HostCall) {
         if self.cancel.load(Ordering::Relaxed) {
             return;
         }
@@ -72,25 +97,28 @@ impl HostState {
         });
     }
 
-    fn next_id(&mut self) -> u64 {
+    pub(crate) fn next_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
     }
 
-    fn warn(&self, message: &str) {
+    pub(crate) fn warn(&self, message: &str) {
         self.log.write(Level::Warn, message);
         self.signal.logged();
     }
 
     /// Asks the window about documents and waits for the reply; none if the window is gone or
     /// doesn't answer in time.
-    fn editor(&self, call: EditorCall) -> Option<EditorReply> {
+    fn editor(&mut self, call: EditorCall) -> Option<EditorReply> {
         let (reply, answer) = std::sync::mpsc::channel();
         self.call(HostCall::Editor { call, reply });
-        answer.recv_timeout(EDITOR_TIMEOUT).ok()
+        let started = Instant::now();
+        let answer = answer.recv_timeout(EDITOR_TIMEOUT).ok();
+        self.waited += started.elapsed();
+        answer
     }
 
-    fn done(&self, call: EditorCall) -> Result<(), String> {
+    fn done(&mut self, call: EditorCall) -> Result<(), String> {
         match self.editor(call) {
             Some(EditorReply::Done(result)) => result,
             _ => Err(no_answer()),
@@ -156,7 +184,7 @@ impl HostState {
     }
 }
 
-fn no_answer() -> String {
+pub(crate) fn no_answer() -> String {
     "Flux didn't answer".into()
 }
 
@@ -283,6 +311,13 @@ impl editors::Host for State {
     fn save(&mut self, editor: u64) -> Result<(), String> {
         self.host.done(EditorCall::Save(editor))
     }
+
+    fn close(&mut self, editor: u64) -> Result<(), String> {
+        match self.host.window(WindowCall::CloseEditor(editor)) {
+            Some(WindowReply::Done(result)) => result,
+            _ => Err(no_answer()),
+        }
+    }
 }
 
 impl project::Host for State {
@@ -298,14 +333,21 @@ impl project::Host for State {
         query: project::Query,
         max_matches: u32,
     ) -> Result<project::SearchResult, String> {
+        self.host.require_project()?;
+        let started = Instant::now();
+        let result = self.search_project(query, max_matches);
+        self.host.waited += started.elapsed();
+        result
+    }
+}
+
+impl State {
+    fn search_project(
+        &mut self,
+        query: project::Query,
+        max_matches: u32,
+    ) -> Result<project::SearchResult, String> {
         let host = &self.host;
-        if host.entry.manifest.permissions.project == ProjectAccess::None {
-            return Err(
-                "The plugin may not read the project: no `project` in the permissions of \
-                 flux-plugin.toml"
-                    .into(),
-            );
-        }
         let root = host
             .root
             .clone()

@@ -6,13 +6,20 @@
 //!
 //! A trap (a panic in the plugin), a call longer than [`CALL_LIMIT`] or more memory than
 //! [`MEMORY_LIMIT`] stops the instance: [`MessageKind::Stopped`] says why, and the window offers
-//! to restart it. Components are compiled by Cranelift once and cached in
-//! `paths::cache_dir()`.
+//! to restart it. The limit is on the plugin's own time: what a call waits for inside the API (a
+//! response, a program, the window — `HostState::waited`) is given back by the epoch's callback.
+//! Components are compiled by Cranelift once and cached in `paths::cache_dir()`.
 //!
-//! The sandbox is WASI 0.2: the project root (as the manifest's `project` permission says) and the
-//! plugin's data folder, each at its real absolute path; stdout and stderr go to the plugin's log.
-//! A plugin with access to the project is restarted (`deactivate`, `activate`) when the window's
-//! project root changes: its sandbox is opened on the root.
+//! The sandbox is WASI 0.2: the project root (as the manifest's `project` permission says), the
+//! folders outside the project its `folders` permission lists and the plugin's data folder, each at
+//! its real absolute path; stdout and stderr go to the plugin's log. A plugin with access to the
+//! project is restarted (`deactivate`, `activate`) when the window's project root changes: its
+//! sandbox is opened on the root.
+//!
+//! The API's background work — a started request, the plugin's server, a started program, a timer
+//! — tells the plugin about itself with events posted straight into its queue ([`EventSender`]),
+//! not through the window. Waiting inside a call (for a response, a program, the window) doesn't
+//! count toward the time limit.
 
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -25,20 +32,24 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc::UnboundedSender;
 use serde_json::{Map, Value};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap, UpdateDeadline};
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::api::bindings::Plugin;
+use crate::api::diagnostics::{Diagnostic, FileDiagnostics};
 use crate::api::dialogs::{Question, TextQuestion};
 use crate::api::editors::TextEdit;
 use crate::api::events::Event;
+use crate::api::git::{Change, Repository};
 use crate::api::notifications::{Notification, Progress};
+use crate::api::review::Proposal;
 use crate::api::status_bar::StatusItem;
-use crate::api::types::{EditorInfo, Range};
+use crate::api::terminal::TerminalOptions;
+use crate::api::types::{CommandContext, EditorInfo, Range};
 use crate::api::ui::View;
 use crate::host::{HostState, LogSignal, LogStream};
 use crate::log::{Level, PluginLog};
-use crate::manifest::ProjectAccess;
+use crate::manifest::{FolderAccess, ProjectAccess};
 use crate::registry::PluginEntry;
 
 /// The longest one call into a plugin may take; then the plugin is stopped.
@@ -74,7 +85,7 @@ pub struct Instance {
 
 /// A call posted to the plugin's thread.
 enum Call {
-    Command(String),
+    Command(String, CommandContext),
     Event(Event),
     Settings(Map<String, Value>),
     Root(Option<PathBuf>),
@@ -90,11 +101,12 @@ impl Instance {
         let (calls, inbox) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let messages = config.messages.clone();
+        let events = EventSender(calls.clone());
         let spawned = std::thread::Builder::new()
             .name(format!("plugin {id}"))
             .spawn({
                 let cancel = cancel.clone();
-                move || run(config, inbox, cancel)
+                move || run(config, inbox, events, cancel)
             });
         if let Err(err) = spawned {
             let _ = messages.unbounded_send(PluginMessage {
@@ -112,9 +124,9 @@ impl Instance {
         &self.id
     }
 
-    /// Runs one of the plugin's commands.
-    pub fn run_command(&self, command: &str) {
-        let _ = self.calls.send(Call::Command(command.to_string()));
+    /// Runs one of the plugin's commands: from where, and what it acts on.
+    pub fn run_command(&self, command: &str, context: CommandContext) {
+        let _ = self.calls.send(Call::Command(command.to_string(), context));
     }
 
     /// Delivers an event. Bursts of `editor-changed` and `selection-changed` of one document
@@ -224,6 +236,79 @@ pub enum HostCall {
         call: EditorCall,
         reply: Sender<EditorReply>,
     },
+    /// A call of the interfaces the window does the work of (terminals, proposals, Git, problems,
+    /// the browser, the clipboard, closing a tab). The plugin's thread waits for the reply to the
+    /// calls that return something; the others drop the receiver, and the window's reply goes
+    /// nowhere.
+    Window {
+        call: WindowCall,
+        reply: Sender<WindowReply>,
+    },
+}
+
+/// The calls the window does the work of. Ids of terminals are the window's (it opens them); ids
+/// of proposals are the plugin's own (as notifications'). The window checks that a terminal or a
+/// proposal is the plugin's own; paths are relative to the project root or absolute.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowCall {
+    /// `editors.close` → `Done`.
+    CloseEditor(u64),
+    /// `terminal.open` → `Opened`.
+    OpenTerminal(TerminalOptions),
+    /// `terminal.send-text` → `Done`.
+    SendText { terminal: u64, text: String },
+    /// `terminal.show` → `Done`.
+    ShowTerminal { terminal: u64, focus: bool },
+    /// `terminal.close`: no reply.
+    CloseTerminal(u64),
+    /// `review.propose` → `Done` (the tab opened, or why not); the answer comes later as
+    /// `proposal-answered`.
+    Propose { id: u64, proposal: Proposal },
+    /// `review.withdraw`: no reply.
+    Withdraw(u64),
+    /// `git.repositories` → `Repositories`.
+    Repositories,
+    /// `git.status` → `Changes`.
+    GitStatus,
+    /// `git.diff` → `Text`.
+    GitDiff(String),
+    /// `diagnostics.get` → `Diagnostics`.
+    Diagnostics(Option<String>),
+    /// `diagnostics.publish`: no reply.
+    PublishDiagnostics {
+        path: String,
+        diagnostics: Vec<Diagnostic>,
+    },
+    /// `diagnostics.clear`: no reply.
+    ClearDiagnostics,
+    /// `system.open-url` (the scheme is checked already): no reply.
+    OpenUrl(String),
+    /// `system.copy-text`: no reply.
+    CopyText(String),
+}
+
+/// The window's reply to a [`WindowCall`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowReply {
+    Done(Result<(), String>),
+    /// A terminal's id.
+    Opened(Result<u64, String>),
+    Repositories(Vec<Repository>),
+    Changes(Vec<Change>),
+    Text(Result<String, String>),
+    Diagnostics(Vec<FileDiagnostics>),
+}
+
+/// Posts events into a plugin's own queue: the API's background work (a started request, the
+/// plugin's server, a started program, a timer) tells the plugin about itself without the window.
+/// Coalescing applies as to the window's events. False once the plugin's thread is gone.
+#[derive(Clone)]
+pub(crate) struct EventSender(Sender<Call>);
+
+impl EventSender {
+    pub fn send(&self, event: Event) -> bool {
+        self.0.send(Call::Event(event)).is_ok()
+    }
 }
 
 /// The `editors` interface. Ids are the window's (`EditorInfo::id`).
@@ -396,7 +481,25 @@ pub(crate) struct State {
     wasi: WasiCtx,
     table: ResourceTable,
     limits: StoreLimits,
+    /// The clock of the call in progress.
+    clock: CallClock,
     pub(crate) host: HostState,
+}
+
+/// When the call in progress began, and its limit: the call's own time is the time since then
+/// less what it waited for inside the API (`HostState::waited`).
+struct CallClock {
+    started: Instant,
+    limit: Duration,
+}
+
+impl CallClock {
+    fn new(plugin: &str) -> Self {
+        CallClock {
+            started: Instant::now(),
+            limit: call_limit(plugin),
+        }
+    }
 }
 
 impl WasiView for State {
@@ -424,7 +527,12 @@ impl Stop {
 }
 
 /// The body of the plugin's thread: start, then the calls one by one until `Stop`.
-fn run(config: InstanceConfig, inbox: Receiver<Call>, cancel: Arc<AtomicBool>) {
+fn run(
+    config: InstanceConfig,
+    inbox: Receiver<Call>,
+    events: EventSender,
+    cancel: Arc<AtomicBool>,
+) {
     let id: Arc<str> = config.entry.id().into();
     let messages = config.messages.clone();
     let log = config.log.clone();
@@ -438,7 +546,7 @@ fn run(config: InstanceConfig, inbox: Receiver<Call>, cancel: Arc<AtomicBool>) {
             });
         }
     };
-    let mut runner = match Runner::start(config, cancel) {
+    let mut runner = match Runner::start(config, events, cancel) {
         Ok(runner) => runner,
         Err(stop) => {
             log.write(Level::Error, &format!("Couldn't start: {}", stop.error));
@@ -466,8 +574,8 @@ fn run(config: InstanceConfig, inbox: Receiver<Call>, cancel: Arc<AtomicBool>) {
             continue;
         };
         let result = match call {
-            Call::Command(command) => {
-                runner.call(|plugin, store| plugin.call_run_command(store, &command))
+            Call::Command(command, context) => {
+                runner.call(|plugin, store| plugin.call_run_command(store, &command, &context))
             }
             Call::Event(event) => runner.call(|plugin, store| plugin.call_on_event(store, &event)),
             Call::Settings(settings) => {
@@ -493,8 +601,8 @@ fn run(config: InstanceConfig, inbox: Receiver<Call>, cancel: Arc<AtomicBool>) {
     runner.deactivate();
 }
 
-/// Puts a call into the queue; a document's `editor-changed` or `selection-changed` already
-/// waiting there makes a new one unnecessary.
+/// Puts a call into the queue; a document's `editor-changed` or `selection-changed`, or a timer's
+/// tick, already waiting there makes a new one unnecessary.
 fn enqueue(queue: &mut VecDeque<Call>, call: Call) {
     let waiting = |event: &Event| {
         queue.iter().any(|queued| match queued {
@@ -502,7 +610,9 @@ fn enqueue(queue: &mut VecDeque<Call>, call: Call) {
             _ => false,
         })
     };
-    if let Call::Event(event @ (Event::EditorChanged(_) | Event::SelectionChanged(_))) = &call
+    if let Call::Event(
+        event @ (Event::EditorChanged(_) | Event::SelectionChanged(_) | Event::Timer(_)),
+    ) = &call
         && waiting(event)
     {
         return;
@@ -526,12 +636,17 @@ struct RunnerConfig {
     entry: Arc<PluginEntry>,
     language: String,
     messages: UnboundedSender<PluginMessage>,
+    events: EventSender,
     log: PluginLog,
     cancel: Arc<AtomicBool>,
 }
 
 impl Runner {
-    fn start(config: InstanceConfig, cancel: Arc<AtomicBool>) -> Result<Runner, Stop> {
+    fn start(
+        config: InstanceConfig,
+        events: EventSender,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Runner, Stop> {
         let id: Arc<str> = config.entry.id().into();
         let signal = Arc::new(LogSignal::new(id.clone(), config.messages.clone()));
         let stdout = LogStream::new(Level::Info, config.log.clone(), signal.clone());
@@ -540,6 +655,7 @@ impl Runner {
             entry: config.entry.clone(),
             language: config.language,
             messages: config.messages,
+            events,
             log: config.log,
             cancel,
         });
@@ -582,8 +698,7 @@ impl Runner {
             return Ok(());
         };
         let shared = shared().map_err(|err| Stop::new("Plugins can't run", err))?;
-        self.store
-            .set_epoch_deadline(deadline_ticks(self.config.entry.id()));
+        start_clock(&mut self.store, self.config.entry.id());
         let plugin = Plugin::instantiate(&mut self.store, component, &shared.linker)
             .map_err(|err| self.stop(&err, "Couldn't load"))?;
         self.plugin = Some(plugin);
@@ -599,8 +714,7 @@ impl Runner {
             return Ok(());
         };
         self.stderr.clear_recent();
-        self.store
-            .set_epoch_deadline(deadline_ticks(self.config.entry.id()));
+        start_clock(&mut self.store, self.config.entry.id());
         let result = f(plugin, &mut self.store);
         self.stdout.flush_partial();
         self.stderr.flush_partial();
@@ -679,8 +793,9 @@ impl Runner {
     }
 }
 
-/// A store with the sandbox: the project root as the permissions say, the plugin's data folder,
-/// stdout and stderr into the log; no environment, arguments or network.
+/// A store with the sandbox: the project root and the folders outside it as the permissions say,
+/// the plugin's data folder, stdout and stderr into the log; no environment, arguments or network
+/// (the API makes requests and runs programs, as the permissions say).
 fn new_store(
     config: &RunnerConfig,
     root: Option<PathBuf>,
@@ -717,6 +832,30 @@ fn new_store(
             &format!("Couldn't open the project {}: {err}", root.display()),
         );
     }
+    // The folders outside the project, each at its real path; one that isn't there (yet) is left
+    // out, not a reason to stop.
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    for folder in &config.entry.manifest.permissions.folders {
+        let path = folder.resolve(&home);
+        let perms = match folder.access {
+            FolderAccess::Read => FsPerms::ReadOnly,
+            FolderAccess::Write => FsPerms::ReadWrite,
+        };
+        let opened = if path.is_absolute() && path.is_dir() {
+            wasi.preopened_dir(&path, path.to_string_lossy(), perms)
+                .map_err(|err| err.to_string())
+        } else {
+            Err("there's no such folder".to_string())
+        };
+        if let Err(err) = opened {
+            config.log.write(
+                Level::Warn,
+                &format!("Couldn't open the folder {}: {err}", folder.path),
+            );
+        }
+    }
     wasi.preopened_dir(&data_dir, data_dir.to_string_lossy(), FsPerms::ReadWrite)
         .map_err(|err| Stop::new(format!("Couldn't open the plugin's folder: {err}"), ""))?;
     let host = HostState {
@@ -732,22 +871,58 @@ fn new_store(
         storage: None,
         data_dir,
         cancel: config.cancel.clone(),
+        events: config.events.clone(),
+        waited: Duration::ZERO,
+        requests: Default::default(),
+        server: Default::default(),
+        processes: Default::default(),
+        timers: Default::default(),
     };
+    // A plugin that runs programs needs the login shell's environment: it is read in the
+    // background now rather than when the first program starts.
+    if !config.entry.manifest.permissions.processes.is_empty() {
+        host.processes.prepare_environment();
+    }
     let state = State {
         wasi: wasi.build(),
         table: ResourceTable::new(),
         limits: StoreLimitsBuilder::new().memory_size(MEMORY_LIMIT).build(),
+        clock: CallClock::new(id),
         host,
     };
     let mut store = Store::new(&shared.engine, state);
     store.limiter(|state| &mut state.limits);
-    store.epoch_deadline_trap();
+    // The deadline comes when the call's whole limit has passed; what the call waited for inside
+    // the API (a response, a program, the window) is given back, and only its own time stops it.
+    store.epoch_deadline_callback(|store| {
+        let state = store.data();
+        let own = state
+            .clock
+            .started
+            .elapsed()
+            .saturating_sub(state.host.waited);
+        Ok(match state.clock.limit.checked_sub(own) {
+            Some(left) if !left.is_zero() => UpdateDeadline::Continue(ticks(left)),
+            _ => UpdateDeadline::Interrupt,
+        })
+    });
     Ok(store)
 }
 
-/// The plugin's time limit in ticks of the epoch.
-fn deadline_ticks(plugin: &str) -> u64 {
-    (call_limit(plugin).as_millis() / TICK.as_millis()).max(1) as u64
+/// A call into the plugin begins: its clock starts, it hasn't waited yet, and the deadline is the
+/// whole limit away (the epoch's callback moves it by what the call waits).
+fn start_clock(store: &mut Store<State>, plugin: &str) {
+    let clock = CallClock::new(plugin);
+    let ticks = ticks(clock.limit);
+    let state = store.data_mut();
+    state.clock = clock;
+    state.host.waited = Duration::ZERO;
+    store.set_epoch_deadline(ticks);
+}
+
+/// A duration in ticks of the epoch, at least one.
+fn ticks(duration: Duration) -> u64 {
+    (duration.as_millis() / TICK.as_millis()).max(1) as u64
 }
 
 /// "10 s", "300 ms".
@@ -813,7 +988,9 @@ mod tests {
         enqueue(&mut queue, Call::Event(Event::EditorChanged(2)));
         enqueue(&mut queue, Call::Event(Event::SettingsChanged));
         enqueue(&mut queue, Call::Event(Event::SettingsChanged));
-        assert_eq!(queue.len(), 5);
+        enqueue(&mut queue, Call::Event(Event::Timer(7)));
+        enqueue(&mut queue, Call::Event(Event::Timer(7)));
+        assert_eq!(queue.len(), 6);
     }
 
     #[test]

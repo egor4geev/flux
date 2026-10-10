@@ -23,6 +23,7 @@ pub use content::{
 };
 pub use links::{Link, LinkTarget};
 pub use search::{SearchError, SearchMatch, SearchOptions, SearchResults};
+pub use shell::login_shell;
 pub use terminal::{
     ProcessInfo, ScrollDelta, SelectionKind, Side, TermSize, Terminal, TerminalEvent,
     TerminalEvents, TerminalOptions,

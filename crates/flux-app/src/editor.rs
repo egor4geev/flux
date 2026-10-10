@@ -212,6 +212,9 @@ pub struct Editor {
     pub(crate) message: Option<SharedString>,
     /// Git: the HEAD version of the document and the changed blocks against it (gutter markers).
     pub(crate) git: crate::git_gutter::GitState,
+    /// The window's plugins, once they know of the document: the context menu shows their items
+    /// (part 8.2).
+    pub(crate) plugins: Option<gpui::WeakEntity<crate::plugins::PluginStore>>,
     /// Annotations (blame) in the gutter and the gutter's menu.
     pub(crate) blame: crate::blame::BlameState,
     /// The context menu over the text (the right button, ⇧F10).
@@ -313,6 +316,7 @@ impl Editor {
             read_only: false,
             message: None,
             git: Default::default(),
+            plugins: None,
             blame: Default::default(),
             menu: Default::default(),
             frame_decorations: None,

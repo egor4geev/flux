@@ -1,9 +1,14 @@
-// The API between Flux and its plugins, version 0.1. A plugin is a WebAssembly component of the
+// The API between Flux and its plugins, version 0.2. A plugin is a WebAssembly component of the
 // `plugin` world (target `wasm32-wasip2`); Flux is the host. Every function a plugin imports is
 // answered by Flux; the functions it exports are called by Flux on the plugin's own thread, one
 // call at a time. Documentation: docs/plugins.md.
+//
+// What a plugin may do beyond its own folder, its notifications, questions and windows is listed
+// in the manifest's `[permissions]`: the project's files, the network, a server on this Mac,
+// programs, terminals, folders outside the project. The install question shows them to the user;
+// a call they don't allow fails with an error that names the missing permission.
 
-package flux:plugin@0.1.0;
+package flux:plugin@0.2.0;
 
 /// Types shared by the interfaces.
 interface types {
@@ -32,6 +37,37 @@ interface types {
         /// Has unsaved changes.
         modified: bool,
     }
+
+    /// Where a command was run from.
+    enum command-source {
+        /// The command palette.
+        palette,
+        /// The command's keys.
+        keys,
+        /// The editor's context menu.
+        editor-menu,
+        /// The context menu of the project tree.
+        tree-menu,
+        /// The context menu of a tab.
+        tab-menu,
+        /// An action of one of the plugin's notifications.
+        notification,
+        /// One of the plugin's status bar items.
+        status-bar,
+    }
+
+    /// What a command acts on, as it was when the command was run.
+    record command-context {
+        source: command-source,
+        /// The document: the active one (the editor's menu, the palette, keys), or the tab's (a
+        /// tab's menu); none when it isn't a document.
+        editor: option<editor-info>,
+        /// The document's selections, the primary one first; an empty range is a cursor.
+        selections: list<range>,
+        /// The files and folders the command acts on, absolute: the rows selected in the tree, the
+        /// tab's file, the document's file.
+        paths: list<string>,
+    }
 }
 
 /// The plugin's log: Settings → Plugins → the plugin → Log, and a file on disk. What the plugin
@@ -57,9 +93,10 @@ interface i18n {
 }
 
 /// The plugin's commands, declared in the manifest (`[[commands]]`). They run from the command
-/// palette, their keys, notification actions and status bar items, and come to `run-command`.
+/// palette, their keys, the context menus (`[[menus]]`), notification actions and status bar
+/// items, and come to `run-command`.
 interface commands {
-    /// Grays a command out in the palette (it stops running) or brings it back.
+    /// Grays a command out in the palette and the menus (it stops running) or brings it back.
     set-enabled: func(command: string, enabled: bool);
 }
 
@@ -182,6 +219,9 @@ interface editors {
     open: func(path: string, selection: option<range>) -> result<u64, string>;
     /// Starts saving the document; the `editor-saved` event says when it is on disk.
     save: func(editor: u64) -> result<_, string>;
+    /// Closes the document's tab. A document with unsaved changes stays open (the changes are
+    /// the user's to decide about): the error says so.
+    close: func(editor: u64) -> result<_, string>;
 }
 
 /// The window's project.
@@ -221,7 +261,7 @@ interface project {
     /// The project root (absolute); none in a window without a project.
     root: func() -> option<string>;
     /// Searches the project's files by the rules of Find in Files (.gitignore, no binary or huge
-    /// files). Blocks the plugin, not Flux.
+    /// files). Blocks the plugin, not Flux. Needs the `project` permission.
     search: func(query: query, max-matches: u32) -> result<search-result, string>;
 }
 
@@ -372,9 +412,359 @@ interface ui {
     hide: func(window: string);
 }
 
-/// What happens in the window, and the answers to the plugin's questions.
+/// Requests to web services, as the manifest's `network` permission allows: a request goes only to
+/// the hosts it lists ("api.example.com"; "*.example.com" — the domain and its subdomains;
+/// "localhost"; "*" — any host), and so does every redirect. Flux makes the connection (HTTPS with
+/// the system's certificates) and keeps a line about every request in the plugin's log. Waiting
+/// for a response doesn't count toward the plugin's time limit.
+interface http {
+    record request {
+        /// "GET", "POST", "PROPFIND"…
+        method: string,
+        /// An absolute `http` or `https` URL.
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+        /// Gives up after this long: 30 s by default.
+        timeout-ms: option<u32>,
+        /// Follows redirects (up to 10), each to a host the manifest allows; without it a redirect
+        /// is the response.
+        follow-redirects: bool,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// The status and the headers of a started request (`start`), before its body.
+    record response-head {
+        request: u64,
+        status: u16,
+        headers: list<tuple<string, string>>,
+    }
+
+    variant http-error {
+        /// The manifest doesn't allow the host; the text names it.
+        denied(string),
+        /// Not a valid URL or request.
+        invalid(string),
+        /// No connection: the name isn't found, the connection is refused, TLS fails…
+        connection(string),
+        timed-out,
+        /// `cancel`, or the plugin stopped.
+        cancelled,
+        /// The body is larger than `fetch` takes (64 MB); `start` streams a body of any size.
+        too-large,
+    }
+
+    /// Makes a request and waits for the whole response. The plugin waits; Flux doesn't.
+    fetch: func(request: request) -> result<response, http-error>;
+
+    /// Starts a request in the background and returns its id at once. The response comes as
+    /// events: `http-response` (the status and the headers), `http-body` (chunks of the body as
+    /// they arrive: server-sent events, a download), then `http-done`; a request that fails
+    /// before the response gets only `http-done`. The plugin answers other calls meanwhile.
+    start: func(request: request) -> u64;
+    /// Stops a started request: `http-done` with `cancelled`.
+    cancel: func(request: u64);
+}
+
+/// The plugin's server on this Mac — on 127.0.0.1 only, as the manifest's `server` permission
+/// allows: for the sign-in of a web service (OAuth's redirect to `http://127.0.0.1:<port>/…`) and
+/// for programs that talk to the IDE over HTTP or WebSocket. Requests and WebSocket messages come
+/// as events.
+///
+/// Flux itself answers 403 to a request whose `Host` isn't the server's own (`127.0.0.1:<port>`,
+/// `localhost:<port>`): a web page can't reach the server through a name of its own.
+interface server {
+    record server-request {
+        /// Answer it with `respond` or `respond-stream`; one without an answer for 60 s gets 504.
+        id: u64,
+        method: string,
+        /// The path with the query: "/callback?code=…".
+        path: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    record server-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// A WebSocket connection opened: the upgrade is accepted (`ws-close` drops one the plugin
+    /// doesn't want, say without its token).
+    record ws-open {
+        connection: u64,
+        /// The path with the query.
+        path: string,
+        headers: list<tuple<string, string>>,
+    }
+
+    variant ws-message {
+        text(string),
+        binary(list<u8>),
+    }
+
+    /// Starts the plugin's server and returns its port: `port`, or a free one (none). A running
+    /// server is stopped first.
+    listen: func(port: option<u16>) -> result<u16, string>;
+    /// Stops the server and closes its connections.
+    stop: func();
+
+    /// Answers a request.
+    respond: func(request: u64, response: server-response);
+    /// Answers a request with a stream (server-sent events): the status and the headers now, the
+    /// body by `send-chunk`, the end by `end-stream`. A client that goes away comes as
+    /// `stream-closed`.
+    respond-stream: func(request: u64, status: u16, headers: list<tuple<string, string>>);
+    send-chunk: func(request: u64, chunk: list<u8>) -> result<_, string>;
+    end-stream: func(request: u64);
+
+    /// Sends a WebSocket message.
+    ws-send: func(connection: u64, message: ws-message) -> result<_, string>;
+    /// Closes a WebSocket connection.
+    ws-close: func(connection: u64);
+}
+
+/// Programs on this Mac, as the manifest's `processes` permission allows: the programs it lists by
+/// name ("git", "gh"), or any ("*"). They run with the user's rights and the environment of the
+/// user's login shell (its `PATH`), and end when the plugin stops.
+interface process {
+    record command {
+        /// A name looked up in `PATH` ("git") or an absolute path.
+        program: string,
+        args: list<string>,
+        /// The working folder: the project root by default.
+        cwd: option<string>,
+        /// Added to the environment.
+        env: list<tuple<string, string>>,
+    }
+
+    record output {
+        /// None — ended by a signal.
+        exit-code: option<s32>,
+        stdout: list<u8>,
+        stderr: list<u8>,
+    }
+
+    enum output-channel {
+        stdout,
+        stderr,
+    }
+
+    /// A piece of a started program's output.
+    record process-output {
+        process: u64,
+        channel: output-channel,
+        bytes: list<u8>,
+    }
+
+    /// Runs a program to its end and returns its output; `stdin` is its input. After `timeout-ms`
+    /// (60 s by default) the program is killed and the call fails. The plugin waits; Flux doesn't.
+    run: func(command: command, stdin: option<list<u8>>, timeout-ms: option<u32>) -> result<output, string>;
+
+    /// Starts a program and returns its id at once: its output comes as `process-output` events,
+    /// its end as `process-exited`.
+    spawn: func(command: command) -> result<u64, string>;
+    /// Writes to a started program's input.
+    write: func(process: u64, bytes: list<u8>) -> result<_, string>;
+    /// Closes its input: the end of input for the program.
+    close-stdin: func(process: u64);
+    /// Ends it: SIGTERM, then SIGKILL if it is still running 2 s later.
+    kill: func(process: u64);
+}
+
+/// The window's terminals, as the manifest's `terminal` permission allows: the plugin opens a tab
+/// with a command (or the user's shell), types into it, and hears when the command ends. The tab is
+/// the user's like any other: they read it, type into it, close it.
+interface terminal {
+    enum terminal-location {
+        /// The terminal panel at the bottom.
+        panel,
+        /// A tab among the editor's tabs.
+        editor,
+    }
+
+    record terminal-options {
+        /// The tab's title: the command's name by default.
+        title: option<string>,
+        /// The program and its arguments; none — the user's shell. The tab of a command stays
+        /// after the command ends, with its exit code.
+        command: option<list<string>>,
+        /// The project root by default.
+        cwd: option<string>,
+        /// Added to the environment.
+        env: list<tuple<string, string>>,
+        location: terminal-location,
+        /// The terminal takes the keyboard; without it the keyboard stays where the user is.
+        focus: bool,
+    }
+
+    /// Opens a terminal tab and returns its id.
+    open: func(options: terminal-options) -> result<u64, string>;
+    /// Types text as if the user did; "\r" presses Enter.
+    send-text: func(terminal: u64, text: string) -> result<_, string>;
+    /// Brings the terminal's tab forward; `focus` — it takes the keyboard.
+    show: func(terminal: u64, focus: bool) -> result<_, string>;
+    /// Closes the tab: what runs in it ends.
+    close: func(terminal: u64);
+}
+
+/// Edits the user reviews: the plugin proposes a file's new text, and Flux shows a diff tab — the
+/// file as it is on the left, the proposal on the right (editable; hunks can be rejected one by
+/// one), Accept (⌘↵) and Reject on a banner — as Claude's edits. The answer comes as
+/// `proposal-answered`. Needs the `project` permission (the answer carries the file's text).
+interface review {
+    record proposal {
+        /// The file: relative to the project root or absolute (in the project or a folder the
+        /// manifest allows); it may not exist yet.
+        path: string,
+        /// The whole new text of the file.
+        text: string,
+        /// The tab's title: the file's name by default.
+        title: option<string>,
+        /// On Accept Flux writes the accepted text itself: into the open document as one undo
+        /// step, saved, or into the file. Without it only the plugin hears the answer.
+        apply: bool,
+        /// The tab takes the keyboard; without it the tab opens next to the active one and the
+        /// keyboard stays where the user is.
+        focus: bool,
+    }
+
+    variant proposal-outcome {
+        /// Accepted: the text as the user left it (the proposal, or what they changed in it).
+        accepted(string),
+        rejected,
+        /// The tab was closed without an answer, or the plugin withdrew the proposal.
+        closed,
+    }
+
+    /// Opens the proposal's tab and returns its id.
+    propose: func(proposal: proposal) -> result<u64, string>;
+    /// Closes the proposal's tab without an answer.
+    withdraw: func(proposal: u64);
+}
+
+/// The project's Git repositories, read-only. Needs the `project` permission. A change of a
+/// status, a branch or a HEAD comes as the `git-changed` event.
+interface git {
+    record repository {
+        /// The root of the work tree, absolute.
+        root: string,
+        /// The current branch; none — a detached HEAD.
+        branch: option<string>,
+        /// The HEAD commit's hash; none before the first commit.
+        head: option<string>,
+        /// An operation in progress: "merge", "rebase", "cherry-pick", "revert"; none.
+        operation: option<string>,
+    }
+
+    enum change-kind {
+        added,
+        modified,
+        deleted,
+        renamed,
+        untracked,
+        conflicted,
+    }
+
+    record change {
+        /// Absolute.
+        path: string,
+        /// The path before a rename, absolute.
+        old-path: option<string>,
+        kind: change-kind,
+    }
+
+    /// The repositories of the project (a project may have several).
+    repositories: func() -> list<repository>;
+    /// The changes of the working copy against HEAD, in every repository.
+    status: func() -> list<change>;
+    /// A file's changes against HEAD as a unified diff (`git diff HEAD -- <file>`, the file as it
+    /// is on disk); empty when there are none. Relative paths are in the project.
+    diff: func(path: string) -> result<string, string>;
+}
+
+/// Problems in files: what the language servers report, and what plugins do — a linter publishes
+/// its own, and Flux shows them as the servers': underlines, F2, the counters of the status bar.
+/// Reading needs the `project` permission; publishing doesn't.
+interface diagnostics {
+    use types.{range};
+
+    enum severity {
+        error,
+        warning,
+        info,
+        hint,
+    }
+
+    record diagnostic {
+        range: range,
+        severity: severity,
+        message: string,
+        /// Who reports it: "rust-analyzer", "shellcheck". The plugin's name by default (publish).
+        source: option<string>,
+        /// The rule: "E0308", "SC2086".
+        code: option<string>,
+    }
+
+    record file-diagnostics {
+        /// Absolute.
+        path: string,
+        diagnostics: list<diagnostic>,
+    }
+
+    /// The problems Flux knows of: in a file (relative to the project root or absolute), or in
+    /// every file with problems (none).
+    get: func(path: option<string>) -> list<file-diagnostics>;
+    /// The plugin's own problems of a file, replacing those it published before; an empty list
+    /// clears them. Positions are in the file's text as it is now (the open document's).
+    publish: func(path: string, diagnostics: list<diagnostic>);
+    /// Clears every problem the plugin published.
+    clear: func();
+}
+
+/// The plugin's secrets — tokens, passwords — in the macOS keychain rather than in files: only
+/// this plugin reads them, and they go when it is uninstalled.
+interface secrets {
+    get: func(key: string) -> option<string>;
+    /// None removes the secret.
+    set: func(key: string, value: option<string>) -> result<_, string>;
+}
+
+/// Timers: the `timer` event after a delay or periodically, while the plugin runs. A periodic
+/// timer's tick that still waits in the plugin's queue doesn't add another.
+interface timers {
+    /// One `timer` event after `ms` milliseconds; returns the timer's id.
+    after: func(ms: u32) -> u64;
+    /// A `timer` event every `ms` milliseconds (at least 100); returns the timer's id.
+    every: func(ms: u32) -> u64;
+    cancel: func(timer: u64);
+}
+
+/// What is outside the window: the browser, the clipboard, the user's home folder.
+interface system {
+    /// Opens a link in the default browser: `http`, `https` or `mailto`.
+    open-url: func(url: string) -> result<_, string>;
+    /// Puts text on the clipboard.
+    copy-text: func(text: string);
+    /// The user's home folder, absolute: where the folders the manifest allows ("~/.config/gh")
+    /// are.
+    home-dir: func() -> string;
+}
+
+/// What happens in the window, the answers to the plugin's questions, and the news of its
+/// background work: timers, requests, the server, programs, terminals, proposals.
 interface events {
     use types.{editor-info};
+    use http.{response-head, http-error};
+    use server.{server-request, ws-open, ws-message};
+    use process.{process-output};
+    use review.{proposal-outcome};
 
     variant ui-event {
         /// A button was pressed.
@@ -420,11 +810,41 @@ interface events {
         /// The answer to `dialogs.ask-text`: the text; none — cancelled.
         text-answered(tuple<u64, option<string>>),
         ui(ui-input),
+        /// A timer fired.
+        timer(u64),
+        /// A started request's status and headers.
+        http-response(response-head),
+        /// A chunk of a started request's body.
+        http-body(tuple<u64, list<u8>>),
+        /// A started request ended: its whole body has come, or why not.
+        http-done(tuple<u64, result<_, http-error>>),
+        /// A request to the plugin's server.
+        server-request(server-request),
+        /// The client of a streamed answer went away (the request's id).
+        stream-closed(u64),
+        ws-opened(ws-open),
+        ws-message(tuple<u64, ws-message>),
+        ws-closed(u64),
+        /// Output of a started program.
+        process-output(process-output),
+        /// A started program ended: its exit code; none — a signal.
+        process-exited(tuple<u64, option<s32>>),
+        /// The command of a terminal ended (its tab stays): the exit code, when known.
+        terminal-exited(tuple<u64, option<s32>>),
+        /// A terminal's tab was closed.
+        terminal-closed(u64),
+        /// The answer to a proposal.
+        proposal-answered(tuple<u64, proposal-outcome>),
+        /// The status, a branch or a HEAD of a repository changed.
+        git-changed,
+        /// The problems of files changed: their paths, absolute.
+        diagnostics-changed(list<string>),
     }
 }
 
 /// A Flux plugin. Flux calls the exports on the plugin's own thread, one call at a time; a call
-/// longer than the time limit stops the plugin, and Flux tells the user.
+/// longer than the time limit stops the plugin, and Flux tells the user. Waiting inside a call —
+/// for a response, a program, the window — doesn't count toward the limit.
 world plugin {
     import types;
     import log;
@@ -438,14 +858,25 @@ world plugin {
     import settings;
     import status-bar;
     import ui;
+    import http;
+    import server;
+    import process;
+    import terminal;
+    import review;
+    import git;
+    import diagnostics;
+    import secrets;
+    import timers;
+    import system;
 
+    use types.{command-context};
     use events.{event};
 
     /// The plugin was loaded: the window opened, or the user turned the plugin on.
     export activate: func();
     /// The plugin is about to be unloaded: turned off, reloaded, the window is closing.
     export deactivate: func();
-    /// One of the plugin's commands was run.
-    export run-command: func(command: string);
+    /// One of the plugin's commands was run: from where, and what it acts on.
+    export run-command: func(command: string, context: command-context);
     export on-event: func(event: event);
 }

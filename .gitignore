@@ -5,3 +5,5 @@
 /plugins/*/target
 /templates/*/target
 /templates/*/Cargo.lock
+/examples/*/target
+/crates/*/tests/fixtures/*/target

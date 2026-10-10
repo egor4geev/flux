@@ -2,7 +2,12 @@
 //! (their titles are what the tests check).
 
 use flux_plugin_api::host::{editors, project, storage};
-use flux_plugin_api::{Event, Plugin, notify, register_plugin, setting, tr};
+use flux_plugin_api::{CommandContext, Event, Plugin, notify, register_plugin, setting, tr};
+
+/// Commands `net:…`: requests and the server (part 8.2).
+mod net;
+/// Commands `proc:…`: programs, timers, secrets, folders, the time limit (part 8.2).
+mod processes;
 
 struct Probe;
 
@@ -20,8 +25,20 @@ impl Plugin for Probe {
         println!("probe: deactivated");
     }
 
-    fn run_command(&mut self, command: &str) {
+    fn run_command(&mut self, command: &str, context: &CommandContext) {
+        if let Some(command) = command.strip_prefix("net:") {
+            return net::run(command);
+        }
+        if let Some(command) = command.strip_prefix("proc:") {
+            return processes::run(command);
+        }
         match command {
+            "context" => {
+                notify::info(&format!(
+                    "context: {:?} {:?}",
+                    context.source, context.paths
+                ));
+            }
             "hello" => {
                 notify::info("hello");
             }
@@ -104,6 +121,9 @@ impl Plugin for Probe {
     }
 
     fn on_event(&mut self, event: Event) {
+        if net::on_event(&event) || processes::on_event(&event) {
+            return;
+        }
         if let Event::SettingsChanged = event {
             notify::info("settings changed");
         }

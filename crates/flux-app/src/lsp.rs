@@ -87,6 +87,13 @@ pub enum LspEvent {
     },
 }
 
+/// The problems of these files changed: a server published, or one exited (part 8.2: the plugins'
+/// `diagnostics-changed`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagnosticsChanged(pub Vec<PathBuf>);
+
+impl EventEmitter<DiagnosticsChanged> for LspStore {}
+
 /// How many files may be open on servers without an editor ([`LspStore::open_background`]).
 const BACKGROUND_LIMIT: usize = 8;
 /// A file larger than this is not opened in the background (a server would chew on it).
@@ -304,10 +311,10 @@ impl LspStore {
         let path = editor.update(cx, |editor, cx| {
             editor.lsp_store = Some(store);
             // A document still open elsewhere (the store of a previous project root, a restart) is
-            // closed; the servers will publish their own diagnostics.
+            // closed; the servers will publish their own diagnostics (plugins' stay).
             if !editor.lsp.is_empty() {
                 close_documents(editor);
-                editor.diagnostics.clear();
+                editor.diagnostics.clear_servers();
                 cx.notify();
             }
             editor.document.path().map(Path::to_path_buf)
@@ -742,6 +749,8 @@ impl LspStore {
         server.status = Status::Failed(reason);
         server.handle = None;
         server.progress.clear();
+        let mut changed: Vec<PathBuf> = server.unopened.keys().cloned().collect();
+        changed.extend(server.published.keys().cloned());
         server.unopened.clear();
         server.published.clear();
         server.background.clear();
@@ -754,8 +763,14 @@ impl LspStore {
             editor.update(cx, |editor, cx| {
                 editor.lsp.retain(|doc| doc.server_id != id);
                 editor.diagnostics.clear_owner(id);
+                changed.extend(editor.document.path().map(Path::to_path_buf));
                 cx.notify();
             });
+        }
+        changed.sort();
+        changed.dedup();
+        if !changed.is_empty() {
+            cx.emit(DiagnosticsChanged(changed));
         }
         cx.emit(LspEvent::Notify(notification));
         cx.notify();
@@ -823,6 +838,7 @@ impl LspStore {
         } else {
             server.published.insert(path.clone(), params.diagnostics);
         }
+        cx.emit(DiagnosticsChanged(vec![path.clone()]));
         // Those waiting for this file learn that its diagnostics are fresh.
         let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
             .into_iter()

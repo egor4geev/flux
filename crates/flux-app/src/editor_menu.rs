@@ -1,7 +1,8 @@
 //! The editor's context menu (part 9.2): the right button over the text, ⇧F10 — the items of
 //! JetBrains IDEs in their order (Show Context Actions, the clipboard, Copy Path/Reference ▸, Find
 //! Usages, Refactor ▸, Go To ▸, Reformat Code, Claude ▸, Git ▸, Open In ▸), each with its
-//! shortcut. Over the gutter the right button keeps its own menu (Annotate, [`crate::blame`]).
+//! shortcut, then the plugins' items ([`crate::plugin_menus`], part 8.2). Over the gutter the right
+//! button keeps its own menu (Annotate, [`crate::blame`]).
 //!
 //! The right button moves the caret to the click unless it lands in the selection (the menu acts
 //! on the selection then), as in JetBrains IDEs. A commit message and other fields without a file
@@ -14,10 +15,13 @@ use gpui::{
     KeyBinding, MouseDownEvent, Pixels, Point, Subscription, Window, actions, point,
 };
 
+use flux_plugin::manifest::MenuLocation;
+
 use crate::claude_actions::{self, Ask};
 use crate::context_menu::ContextMenu;
 use crate::editor::{self, Editor};
 use crate::i18n::tr;
+use crate::plugin_menus::MenuTarget;
 use crate::workspace::Workspace;
 
 actions!(
@@ -285,7 +289,29 @@ fn show_at_caret(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
 
 fn open(editor: &mut Editor, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Editor>) {
     let facts = facts(editor, cx);
-    let menu = cx.new(|cx| build(ContextMenu::new(window, cx), &facts));
+    // The plugins' items, for a document with a file (not a commit message).
+    let plugins = editor
+        .plugins
+        .as_ref()
+        .and_then(|plugins| plugins.upgrade())
+        .filter(|_| facts.file && !facts.message);
+    let target = MenuTarget {
+        location: MenuLocation::Editor,
+        selection: facts.selection,
+        paths: editor
+            .document
+            .path()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect(),
+    };
+    let menu = cx.new(|cx| {
+        let menu = build(ContextMenu::new(window, cx), &facts);
+        match &plugins {
+            Some(plugins) => crate::plugin_menus::append(menu, plugins, &target, cx),
+            None => menu,
+        }
+    });
     let focus = menu.focus_handle(cx);
     let subscriptions = [
         cx.subscribe_in(

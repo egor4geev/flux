@@ -266,7 +266,7 @@ mod tests {
     }
 
     const BUNDLED_MANIFEST: &str = "id = \"flux.todo\"\nname = \"TODO\"\nversion = \"0.1.0\"\napi \
-                                    = \"0.1\"\nwasm = \"todo.wasm\"\n";
+                                    = \"0.2\"\nwasm = \"todo.wasm\"\n";
     const BUNDLED: Bundled = Bundled {
         files: &[
             ("flux-plugin.toml", BUNDLED_MANIFEST.as_bytes()),

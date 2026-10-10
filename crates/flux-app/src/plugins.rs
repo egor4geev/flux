@@ -11,12 +11,19 @@
 //!
 //! An instance runs on its own thread; its calls come back as messages to [`PluginStore`] and are
 //! carried out on the window's thread: those about the store's own state (views, status items,
-//! notifications) by the store, those that need the window (questions, documents) by
-//! [`handle_call`]. A plugin that stops by itself keeps its tool windows (they say it stopped and
+//! notifications) by the store, those that need the window (questions, documents, and the 0.2
+//! interfaces of [`crate::plugin_calls`]) by [`handle_call`].
+//!
+//! Part 8.2: a command gets its context (where it was run from, the active document and its
+//! selections, the files of a menu — [`CommandOrigin`]); the problems a plugin publishes (a linter)
+//! are kept here by plugin and file and put into the file's document under the plugin's own owner
+//! ([`crate::diagnostics::plugin_owner`]) — now, when the file is opened later, when the plugin
+//! stops (they go); `git-changed` and `diagnostics-changed` come from the window's Git and language
+//! servers ([`PluginStore::set_window_parts`]). A plugin that stops by itself keeps its tool windows (they say it stopped and
 //! offer a restart) and gets a notification with Restart, Disable and Details; a plugin under
 //! development is built with cargo before it starts and reloaded when its component changes.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -24,13 +31,16 @@ use std::time::{Duration, SystemTime};
 
 use flux_core::Rope;
 use flux_core::text::{line_len, line_start};
+use flux_plugin::api::diagnostics::Diagnostic as ApiDiagnostic;
 use flux_plugin::api::dialogs::{ButtonRole as ApiButtonRole, DialogLevel, Question, TextQuestion};
 use flux_plugin::api::editors::TextEdit;
 use flux_plugin::api::events::{Event, UiEvent};
 use flux_plugin::api::notifications::{
     Notification as ApiNotification, NotificationKind as ApiKind, Progress as ApiProgress,
 };
-use flux_plugin::api::types::{EditorInfo, Position, Range as ApiRange};
+use flux_plugin::api::types::{
+    CommandContext, CommandSource, EditorInfo, Position, Range as ApiRange,
+};
 use flux_plugin::api::ui::{ButtonSpec, Element, ElementKind, Span, Tone, View};
 use flux_plugin::install::{Candidate, CandidateKind};
 use flux_plugin::log::{Level, PluginLog};
@@ -63,12 +73,39 @@ use crate::ui::{self, RADIUS_SM};
 use crate::workspace::Workspace;
 use crate::{icons, settings};
 
-/// Runs a plugin's command: the palette, its keys, notification actions, status bar items.
+/// Runs a plugin's command: the palette, its keys, the context menus, notification actions,
+/// status bar items.
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = plugins, no_json)]
 pub struct RunCommand {
     pub plugin: SharedString,
     pub command: SharedString,
+    /// Where it was run from, and the files a menu was opened on; none — the command's keys.
+    pub origin: Option<CommandOrigin>,
+}
+
+/// Where a plugin's command was run from (part 8.2): the command's context
+/// ([`flux_plugin::api::types::CommandContext`]) is made from it when the command runs — the
+/// active document and its selections, and these paths.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CommandOrigin {
+    pub source: CommandSource,
+    /// The files and folders a menu was opened on: the rows selected in the tree, a tab's file.
+    /// Empty — the active document's file.
+    pub paths: Vec<PathBuf>,
+}
+
+impl CommandOrigin {
+    pub fn new(source: CommandSource) -> Self {
+        Self {
+            source,
+            paths: Vec::new(),
+        }
+    }
+
+    pub fn with_paths(source: CommandSource, paths: Vec<PathBuf>) -> Self {
+        Self { source, paths }
+    }
 }
 
 /// Opens or hides a plugin's tool window: its launchpad icon, its keys.
@@ -114,6 +151,12 @@ pub fn init(cx: &mut App) {
 const RESTART_ELEMENT: &str = "flux.restart";
 /// How often the components of the plugins under development are looked at.
 const DEV_WATCH: Duration = Duration::from_secs(1);
+/// The files whose problems changed are told to the plugins together, this long after the first:
+/// a check publishes many files in a burst.
+const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(150);
+/// The most problems a plugin publishes for one file; the rest are dropped (with a line in its
+/// log).
+const MAX_PUBLISHED: usize = 5000;
 
 /// A plugin tool window of the window: the key the right island and the launchpad know it by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -216,6 +259,9 @@ pub enum PluginStoreEvent {
     /// A plugin asks to show or to hide its tool window.
     ShowToolWindow(ToolKey),
     HideToolWindow(ToolKey),
+    /// A plugin stopped — turned off, reloaded, removed, or by itself: the window forgets its
+    /// terminals (their tabs stay, the user's) and closes its proposals (part 8.2).
+    PluginStopped(Arc<str>),
 }
 
 /// A plugin's question with a text field, waiting for the overlay window to free up.
@@ -258,6 +304,18 @@ pub struct PluginStore {
     stop_notifications: HashMap<Arc<str>, NotificationId>,
     /// The documents the plugins hear about.
     editors: HashMap<EntityId, [Subscription; 2]>,
+    /// The same documents by the API's id: a command's context reads the active one.
+    editor_handles: HashMap<u64, WeakEntity<Editor>>,
+    /// The problems the plugins published (part 8.2): by plugin and file (absolute, as published).
+    published: HashMap<Arc<str>, HashMap<PathBuf, Vec<ApiDiagnostic>>>,
+    /// Files whose problems changed since the plugins last heard ([`DIAGNOSTICS_DEBOUNCE`]).
+    changed_diagnostics: BTreeSet<PathBuf>,
+    diagnostics_flush: Option<Task<()>>,
+    /// The state of the repositories the plugins last heard of: `git-changed` comes when it
+    /// changes.
+    git_state: Option<u64>,
+    /// Subscriptions to the window's Git and language servers.
+    _window_parts: Vec<Subscription>,
     /// The document the plugins were last told is active.
     active_editor: Option<u64>,
     /// The component of each plugin under development as it was when it started: a newer one is
@@ -317,6 +375,12 @@ impl PluginStore {
             notification_ids: HashMap::new(),
             stop_notifications: HashMap::new(),
             editors: HashMap::new(),
+            editor_handles: HashMap::new(),
+            published: HashMap::new(),
+            changed_diagnostics: BTreeSet::new(),
+            diagnostics_flush: None,
+            git_state: None,
+            _window_parts: Vec::new(),
             active_editor: None,
             dev_components: HashMap::new(),
             building: HashSet::new(),
@@ -497,6 +561,8 @@ impl PluginStore {
                 EditorEvent::Edited => this.broadcast(Event::EditorChanged(id)),
                 EditorEvent::SelectionsChanged => this.broadcast(Event::SelectionChanged(id)),
                 EditorEvent::Saved => {
+                    // Save As moves the document: the plugins' problems follow its file.
+                    this.apply_published(&editor, cx);
                     let info = editor_info(&editor, cx);
                     this.broadcast(Event::EditorSaved(info))
                 }
@@ -505,12 +571,19 @@ impl PluginStore {
         );
         let release = cx.observe_release(editor, move |this, _, _| {
             this.editors.remove(&entity);
+            this.editor_handles.remove(&id);
             if this.active_editor == Some(id) {
                 this.active_editor = None;
             }
             this.broadcast(Event::EditorClosed(id));
         });
         self.editors.insert(entity, [events, release]);
+        self.editor_handles.insert(id, editor.downgrade());
+        // The editor's context menu shows the plugins' items.
+        let store = cx.weak_entity();
+        editor.update(cx, |editor, _| editor.plugins = Some(store));
+        // Problems the plugins published for the file before it was opened.
+        self.apply_published(editor, cx);
         let info = editor_info(editor, cx);
         self.broadcast(Event::EditorOpened(info));
     }
@@ -574,6 +647,7 @@ impl PluginStore {
                     action: RunCommand {
                         plugin: state.id().to_string().into(),
                         command: command.id.clone().into(),
+                        origin: Some(CommandOrigin::new(CommandSource::Palette)),
                     },
                     category: state.tr(category).to_string(),
                     title: state.tr(&command.title).to_string(),
@@ -604,9 +678,16 @@ impl PluginStore {
             .collect()
     }
 
-    /// Runs a plugin's command, unless the plugin isn't running or grayed the command out.
-    pub fn run_command(&mut self, plugin: &str, command: &str, cx: &mut Context<Self>) {
-        let _ = cx;
+    /// Runs a plugin's command, unless the plugin isn't running or grayed the command out:
+    /// `origin` says where from (none — its keys) and what on.
+    pub fn run_command(
+        &mut self,
+        plugin: &str,
+        command: &str,
+        origin: Option<&CommandOrigin>,
+        cx: &mut Context<Self>,
+    ) {
+        let context = self.command_context(origin, cx);
         let Some(instance) = self.instances.get(plugin) else {
             return;
         };
@@ -618,8 +699,238 @@ impl PluginStore {
                 .disabled_commands
                 .contains(&(Arc::from(plugin), command.to_string()))
         {
-            instance.run_command(command);
+            instance.run_command(command, context);
         }
+    }
+
+    /// What a command acts on, as of now: where it was run from, the active document (a tab's
+    /// menu activates its tab first) and its selections, the paths of the menu — or the
+    /// document's file. The tree's menu acts on its rows, not on a document.
+    fn command_context(&self, origin: Option<&CommandOrigin>, cx: &App) -> CommandContext {
+        let source = origin.map_or(CommandSource::Keys, |origin| origin.source);
+        let editor = match source {
+            CommandSource::TreeMenu => None,
+            _ => self
+                .active_editor
+                .and_then(|id| self.editor_handles.get(&id)?.upgrade()),
+        };
+        let info = editor.as_ref().map(|editor| editor_info(editor, cx));
+        let selections = editor
+            .as_ref()
+            .map(|editor| selections_of(editor.read(cx)))
+            .unwrap_or_default();
+        let mut paths: Vec<String> = origin
+            .map(|origin| origin.paths.iter().map(|path| path_text(path)).collect())
+            .unwrap_or_default();
+        if paths.is_empty()
+            && let Some(path) = info.as_ref().and_then(|info| info.path.clone())
+        {
+            paths.push(path);
+        }
+        CommandContext {
+            source,
+            editor: info,
+            selections,
+            paths,
+        }
+    }
+
+    /// Whether the plugin runs and hasn't grayed the command out: its menu items show then.
+    pub fn command_enabled(&self, plugin: &str, command: &str) -> bool {
+        self.instances.contains_key(plugin)
+            && !self
+                .disabled_commands
+                .contains(&(Arc::from(plugin), command.to_string()))
+    }
+
+    /// The window's Git and language servers (part 8.2): `git-changed` comes when a repository's
+    /// changes, branch, HEAD or operation do (the store notifies far more often), and
+    /// `diagnostics-changed` when a server publishes. Called again when the window makes new ones
+    /// (another project root).
+    pub(crate) fn set_window_parts(
+        &mut self,
+        git: Entity<crate::git::GitStore>,
+        lsp: Entity<crate::lsp::LspStore>,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_state = Some(crate::plugin_calls::git_state(git.read(cx)));
+        self._window_parts = vec![
+            cx.observe(&git, |this, git, cx| {
+                let state = crate::plugin_calls::git_state(git.read(cx));
+                if this.git_state != Some(state) {
+                    this.git_state = Some(state);
+                    this.broadcast(Event::GitChanged);
+                }
+            }),
+            cx.subscribe(
+                &lsp,
+                |this, _, event: &crate::lsp::DiagnosticsChanged, cx| {
+                    this.diagnostics_changed(event.0.iter().cloned(), cx)
+                },
+            ),
+        ];
+    }
+
+    // --- The plugins' problems (part 8.2) ---
+
+    /// A plugin's problems of a file (absolute), replacing those it published before; an empty
+    /// list clears them. They go into the file's document now if it is open.
+    pub(crate) fn publish_diagnostics(
+        &mut self,
+        plugin: &str,
+        path: PathBuf,
+        mut diagnostics: Vec<ApiDiagnostic>,
+        cx: &mut Context<Self>,
+    ) {
+        // A late call of a plugin that has stopped since.
+        if !self.instances.contains_key(plugin) {
+            return;
+        }
+        if diagnostics.len() > MAX_PUBLISHED {
+            self.log(
+                plugin,
+                Level::Warn,
+                &format!(
+                    "diagnostics.publish: {} problems for {}; only the first {MAX_PUBLISHED} are shown",
+                    diagnostics.len(),
+                    path.display()
+                ),
+            );
+            diagnostics.truncate(MAX_PUBLISHED);
+        }
+        let files = self.published.entry(Arc::from(plugin)).or_default();
+        if diagnostics.is_empty() {
+            files.remove(&path);
+        } else {
+            files.insert(path.clone(), diagnostics);
+        }
+        let target = crate::navigation::canonical(&path);
+        for editor in self.live_editors() {
+            let on_path = editor
+                .read(cx)
+                .document
+                .path()
+                .is_some_and(|path| crate::navigation::canonical(path) == target);
+            if on_path {
+                self.apply_plugin_diagnostics(plugin, &editor, cx);
+            }
+        }
+        self.diagnostics_changed([path], cx);
+    }
+
+    /// Takes away every problem a plugin published: it asked, or it stopped.
+    pub(crate) fn clear_diagnostics(&mut self, plugin: &str, cx: &mut Context<Self>) {
+        let Some(files) = self.published.remove(plugin) else {
+            return;
+        };
+        let owner = crate::diagnostics::plugin_owner(plugin);
+        for editor in self.live_editors() {
+            editor.update(cx, |editor, cx| {
+                if editor.diagnostics.iter().any(|d| d.owner == owner) {
+                    editor.diagnostics.clear_owner(owner);
+                    cx.notify();
+                }
+            });
+        }
+        self.diagnostics_changed(files.into_keys(), cx);
+    }
+
+    /// The problems the plugins published for files none of `open` (canonical paths) is: the
+    /// file and its problems (several plugins' together, each with its source).
+    pub(crate) fn published_elsewhere(&self, open: &[PathBuf]) -> Vec<(PathBuf, Vec<ApiDiagnostic>)> {
+        let mut files: Vec<(PathBuf, Vec<ApiDiagnostic>)> = Vec::new();
+        for (plugin, published) in &self.published {
+            let name = self.plugin(plugin).map_or(plugin.to_string(), |state| state.name().to_string());
+            for (path, diagnostics) in published {
+                if open.contains(&crate::navigation::canonical(path)) {
+                    continue;
+                }
+                let diagnostics = diagnostics.iter().cloned().map(|mut diagnostic| {
+                    diagnostic.source.get_or_insert_with(|| name.clone());
+                    diagnostic
+                });
+                match files.iter_mut().find(|(known, _)| known == path) {
+                    Some((_, known)) => known.extend(diagnostics),
+                    None => files.push((path.clone(), diagnostics.collect())),
+                }
+            }
+        }
+        files
+    }
+
+    /// The documents the store knows that are still open.
+    fn live_editors(&self) -> Vec<Entity<Editor>> {
+        self.editor_handles
+            .values()
+            .filter_map(WeakEntity::upgrade)
+            .collect()
+    }
+
+    /// Puts every plugin's problems of the document's file into it (and takes away those of a file
+    /// it no longer is: Save As).
+    fn apply_published(&self, editor: &Entity<Editor>, cx: &mut App) {
+        let plugins: Vec<Arc<str>> = self.published.keys().cloned().collect();
+        for plugin in plugins {
+            self.apply_plugin_diagnostics(&plugin, editor, cx);
+        }
+    }
+
+    /// Puts a plugin's problems of the document's file into the document under the plugin's owner,
+    /// in place of those it had.
+    fn apply_plugin_diagnostics(&self, plugin: &str, editor: &Entity<Editor>, cx: &mut App) {
+        let owner = crate::diagnostics::plugin_owner(plugin);
+        let source = self
+            .plugin(plugin)
+            .map_or(plugin.to_string(), |state| state.name().to_string());
+        let target = editor.read(cx).document.path().map(crate::navigation::canonical);
+        let published = target.and_then(|target| {
+            self.published
+                .get(plugin)?
+                .iter()
+                .find(|(path, _)| crate::navigation::canonical(path) == target)
+                .map(|(_, diagnostics)| diagnostics.clone())
+        });
+        editor.update(cx, |editor, cx| {
+            let had = editor.diagnostics.iter().any(|d| d.owner == owner);
+            match published {
+                Some(published) => {
+                    let items = crate::plugin_calls::to_editor_diagnostics(
+                        editor.document.text(),
+                        &published,
+                        &source,
+                    );
+                    editor.diagnostics.set(owner, items);
+                }
+                None if had => editor.diagnostics.clear_owner(owner),
+                None => return,
+            }
+            cx.notify();
+        });
+    }
+
+    /// The problems of `paths` changed: the plugins hear of them together, a moment later.
+    fn diagnostics_changed(&mut self, paths: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
+        if self.instances.is_empty() {
+            return;
+        }
+        self.changed_diagnostics.extend(paths);
+        if self.diagnostics_flush.is_some() || self.changed_diagnostics.is_empty() {
+            return;
+        }
+        self.diagnostics_flush = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DIAGNOSTICS_DEBOUNCE).await;
+            this.update(cx, |this, _| {
+                this.diagnostics_flush = None;
+                let paths: Vec<String> = std::mem::take(&mut this.changed_diagnostics)
+                    .iter()
+                    .map(|path| path_text(path))
+                    .collect();
+                if !paths.is_empty() {
+                    this.broadcast(Event::DiagnosticsChanged(paths));
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Delivers an event to one plugin, if it runs.
@@ -791,7 +1102,9 @@ impl PluginStore {
         self.building.remove(id);
         if let Some(instance) = self.instances.remove(id) {
             instance.stop();
+            cx.emit(PluginStoreEvent::PluginStopped(Arc::from(id)));
         }
+        self.clear_diagnostics(id, cx);
         let before = self.status_items.len();
         self.status_items.retain(|item| item.plugin != id);
         self.disabled_commands.retain(|(plugin, _)| &**plugin != id);
@@ -1147,6 +1460,7 @@ impl PluginStore {
                 let action = RunCommand {
                     plugin: plugin.clone(),
                     command: command.id.clone().into(),
+                    origin: None,
                 };
                 let what = format!("command \"{}\"", command.id);
                 bind_plugin_keys(keys, action, &what, &log, cx);
@@ -1195,6 +1509,8 @@ impl PluginStore {
             MessageKind::Logged => cx.notify(),
             MessageKind::Stopped { error, details } => {
                 self.instances.remove(&plugin);
+                cx.emit(PluginStoreEvent::PluginStopped(plugin.clone()));
+                self.clear_diagnostics(&plugin, cx);
                 self.bump_generation(&plugin);
                 self.status_items.retain(|item| item.plugin != *plugin);
                 let Some(index) = self.index(&plugin) else {
@@ -1297,9 +1613,10 @@ impl PluginStore {
                     cx.emit(PluginStoreEvent::HideToolWindow(key));
                 }
             }
-            call @ (HostCall::Ask { .. } | HostCall::AskText { .. } | HostCall::Editor { .. }) => {
-                cx.emit(PluginStoreEvent::Call { plugin, call })
-            }
+            call @ (HostCall::Ask { .. }
+            | HostCall::AskText { .. }
+            | HostCall::Editor { .. }
+            | HostCall::Window { .. }) => cx.emit(PluginStoreEvent::Call { plugin, call }),
         }
     }
 
@@ -1340,6 +1657,7 @@ impl PluginStore {
                 command: item.command.map(|command| RunCommand {
                     plugin: plugin.to_string().into(),
                     command: command.into(),
+                    origin: Some(CommandOrigin::new(CommandSource::StatusBar)),
                 }),
             });
         }
@@ -1456,7 +1774,7 @@ fn undeclared(what: &str, id: &str) -> String {
     format!("The {what} \"{id}\" isn't declared in flux-plugin.toml")
 }
 
-fn path_text(path: &Path) -> String {
+pub(crate) fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
@@ -1480,6 +1798,7 @@ fn plugin_notification(plugin: &str, notification: &ApiNotification) -> Notifica
             RunCommand {
                 plugin: plugin.to_string().into(),
                 command: action.command.clone().into(),
+                origin: Some(CommandOrigin::new(CommandSource::Notification)),
             },
         );
     }
@@ -1632,7 +1951,7 @@ fn same_keystrokes(bound: &[KeybindingKeystroke], wanted: &[Keystroke]) -> bool 
 pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
     root.on_action(cx.listener(|this, action: &RunCommand, _, cx| {
         this.plugins.update(cx, |store, cx| {
-            store.run_command(&action.plugin, &action.command, cx)
+            store.run_command(&action.plugin, &action.command, action.origin.as_ref(), cx)
         })
     }))
     .on_action(cx.listener(|this, _: &OpenManager, window, cx| {
@@ -1717,6 +2036,9 @@ pub(crate) fn handle_call(
             }
         }
         HostCall::Editor { call, reply } => editor_call(workspace, plugin, call, reply, window, cx),
+        HostCall::Window { call, reply } => {
+            crate::plugin_calls::window_call(workspace, plugin, call, reply, window, cx)
+        }
         // The store carries out the rest itself.
         _ => {}
     }
@@ -1984,7 +2306,7 @@ impl Drop for OpenReply {
 }
 
 /// A plugin's path: absolute, or relative to the project root.
-fn resolve(root: Option<&Path>, path: &str) -> PathBuf {
+pub(crate) fn resolve(root: Option<&Path>, path: &str) -> PathBuf {
     let path = Path::new(path);
     match root {
         Some(root) if path.is_relative() => root.join(path),
@@ -1993,7 +2315,7 @@ fn resolve(root: Option<&Path>, path: &str) -> PathBuf {
 }
 
 /// A document as plugins see it.
-fn editor_info(editor: &Entity<Editor>, cx: &App) -> EditorInfo {
+pub(crate) fn editor_info(editor: &Entity<Editor>, cx: &App) -> EditorInfo {
     let read = editor.read(cx);
     EditorInfo {
         id: editor.entity_id().as_u64(),
@@ -2005,7 +2327,7 @@ fn editor_info(editor: &Entity<Editor>, cx: &App) -> EditorInfo {
 
 /// The selections of a document, the primary one first; a range keeps its direction (the
 /// cursor is at `end`).
-fn selections_of(editor: &Editor) -> Vec<ApiRange> {
+pub(crate) fn selections_of(editor: &Editor) -> Vec<ApiRange> {
     let text = editor.document.text();
     let selection = editor.document.selection();
     let primary = selection.primary_index();
@@ -2029,12 +2351,12 @@ fn selections_of(editor: &Editor) -> Vec<ApiRange> {
 
 /// A position as an offset in characters; past the end of a line — the line's end, past the last
 /// line — the last line.
-fn to_offset(text: &Rope, position: &Position) -> usize {
+pub(crate) fn to_offset(text: &Rope, position: &Position) -> usize {
     let line = (position.line as usize).min(text.len_lines().saturating_sub(1));
     line_start(text, line) + (position.column as usize).min(line_len(text, line))
 }
 
-fn to_position(text: &Rope, offset: usize) -> Position {
+pub(crate) fn to_position(text: &Rope, offset: usize) -> Position {
     let offset = offset.min(text.len_chars());
     let line = text.char_to_line(offset);
     Position {
@@ -2207,7 +2529,8 @@ mod tests {
             action.as_any().downcast_ref::<RunCommand>(),
             Some(&RunCommand {
                 plugin: "flux.todo".into(),
-                command: "show".into()
+                command: "show".into(),
+                origin: Some(CommandOrigin::new(CommandSource::Notification)),
             })
         );
     }

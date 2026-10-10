@@ -107,9 +107,10 @@ fn install_unpacked(entry: &PluginEntry, unpacked: &Path) -> Result<PluginEntry,
     load_dir(&target, PluginSource::Installed)
 }
 
-/// Removes an installed plugin's folder; its data (`paths::data_dir`) stays, as JetBrains IDEs
-/// keep a removed plugin's settings. A plugin under development is only unlinked by the caller;
-/// a bundled one can't be removed.
+/// Removes an installed plugin's folder and its secrets in the keychain (best effort: the plugin is
+/// gone either way); its data (`paths::data_dir`) stays, as JetBrains IDEs keep a removed plugin's
+/// settings. A plugin under development is only unlinked by the caller; a bundled one can't be
+/// removed.
 pub fn uninstall(entry: &PluginEntry) -> Result<(), String> {
     match entry.source {
         PluginSource::Bundled => Err("A bundled plugin can't be removed, only turned off".into()),
@@ -124,7 +125,9 @@ pub fn uninstall(entry: &PluginEntry) -> Result<(), String> {
             if dir.parent() != Some(crate::paths::plugins_dir().as_path()) {
                 return Err(format!("{} isn't in the plugins folder", dir.display()));
             }
-            std::fs::remove_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))
+            std::fs::remove_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+            let _ = crate::keychain::delete_all(&crate::keychain::service(entry.id()));
+            Ok(())
         }
     }
 }
@@ -245,7 +248,7 @@ mod tests {
         std::fs::write(
             dir.join(MANIFEST),
             format!(
-                "id = \"{id}\"\nname = \"Packed\"\nversion = \"{version}\"\napi = \"0.1\"\nwasm \
+                "id = \"{id}\"\nname = \"Packed\"\nversion = \"{version}\"\napi = \"0.2\"\nwasm \
                  = \"plugin.wasm\"\n"
             ),
         )
@@ -335,7 +338,7 @@ mod tests {
         let folder = plugin_folder("test.future", "1.0.0");
         let manifest = std::fs::read_to_string(folder.join(MANIFEST))
             .unwrap()
-            .replace("api = \"0.1\"", "api = \"9.0\"");
+            .replace("api = \"0.2\"", "api = \"9.0\"");
         std::fs::write(folder.join(MANIFEST), manifest).unwrap();
         let archive = temp_dir("archives").join("future.tar.gz");
         pack(&folder, &archive, false);

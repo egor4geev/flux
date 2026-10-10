@@ -2,6 +2,11 @@
 //! `wasm32-wasip2` by the first test that needs it (a test is skipped, with a note, when it can't
 //! be built). Everything the plugins write goes into a temporary folder of this run.
 
+/// Requests and the plugin's server (part 8.2, agent A).
+mod net;
+/// Programs, timers, secrets, folders, the time limit (part 8.2, agent F).
+mod process;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -76,9 +81,16 @@ fn probe_wasm() -> Option<&'static [u8]> {
 /// A plugin folder with the probe component, a manifest with `project` access and the probe's
 /// commands, and a Russian table.
 fn probe(id: &str, project: &str) -> Option<PluginEntry> {
+    probe_with(id, &format!("project = \"{project}\""), &[])
+}
+
+/// The probe with `permissions` (the lines of `[permissions]`) and more commands (`net:…`,
+/// `proc:…`).
+fn probe_with(id: &str, permissions: &str, more_commands: &[&str]) -> Option<PluginEntry> {
     let wasm = probe_wasm()?;
     let dir = temp_dir(id);
     let commands = [
+        "context",
         "hello",
         "echo",
         "panic",
@@ -92,11 +104,14 @@ fn probe(id: &str, project: &str) -> Option<PluginEntry> {
         "setting",
         "translate",
     ]
+    .iter()
+    .chain(more_commands)
     .map(|command| format!("[[commands]]\nid = \"{command}\"\ntitle = \"{command}\"\n"))
+    .collect::<Vec<_>>()
     .join("\n");
     let manifest = format!(
-        "id = \"{id}\"\nname = \"Probe\"\nversion = \"0.1.0\"\napi = \"0.1\"\nwasm = \
-         \"probe.wasm\"\n\n[permissions]\nproject = \"{project}\"\n\n{commands}\n\
+        "id = \"{id}\"\nname = \"Probe\"\nversion = \"0.1.0\"\napi = \"0.2\"\nwasm = \
+         \"probe.wasm\"\n\n[permissions]\n{permissions}\n\n{commands}\n\
          [[settings]]\nkey = \"greeting\"\ntitle = \"Greeting\"\ntype = \"string\"\ndefault = \
          \"hello from the manifest\"\n"
     );
@@ -105,6 +120,16 @@ fn probe(id: &str, project: &str) -> Option<PluginEntry> {
     std::fs::create_dir_all(dir.join("locales")).unwrap();
     std::fs::write(dir.join("locales/ru.toml"), "\"Hello\" = \"Привет\"\n").unwrap();
     Some(load_dir(&dir, PluginSource::Installed).unwrap())
+}
+
+/// The context of a command run from the palette, with no document.
+fn palette() -> crate::api::types::CommandContext {
+    crate::api::types::CommandContext {
+        source: crate::api::types::CommandSource::Palette,
+        editor: None,
+        selections: Vec::new(),
+        paths: Vec::new(),
+    }
 }
 
 /// A running probe and its messages.
@@ -180,7 +205,7 @@ impl Probe {
     }
 
     fn run(&mut self, command: &str) -> String {
-        self.instance.run_command(command);
+        self.instance.run_command(command, palette());
         self.notification()
     }
 
@@ -219,7 +244,7 @@ fn asks_the_window_about_documents() {
         return;
     };
     let mut probe = start(entry, None, Map::new());
-    probe.instance.run_command("echo");
+    probe.instance.run_command("echo", palette());
     let info = EditorInfo {
         id: 7,
         path: Some("/tmp/main.rs".into()),
@@ -251,7 +276,7 @@ fn a_panic_stops_the_plugin() {
         return;
     };
     let mut probe = start(entry, None, Map::new());
-    probe.instance.run_command("panic");
+    probe.instance.run_command("panic", palette());
     let (error, details) = probe.stopped();
     assert_eq!(error, "panicked: boom 42");
     assert!(details.contains("boom 42"), "{details}");
@@ -269,7 +294,7 @@ fn an_endless_call_is_stopped_by_the_time_limit() {
         .insert("test.spin".into(), Duration::from_millis(300));
     let mut probe = start(entry, None, Map::new());
     let started = Instant::now();
-    probe.instance.run_command("spin");
+    probe.instance.run_command("spin", palette());
     let (error, _) = probe.stopped();
     assert_eq!(error, "took longer than 300 ms");
     assert!(started.elapsed() < Duration::from_secs(5));
@@ -281,7 +306,7 @@ fn running_out_of_memory_stops_the_plugin() {
         return;
     };
     let mut probe = start(entry, None, Map::new());
-    probe.instance.run_command("oom");
+    probe.instance.run_command("oom", palette());
     let (error, _) = probe.stopped();
     assert_eq!(error, "ran out of memory (512 MB)");
 }
@@ -333,7 +358,7 @@ fn storage_outlives_the_instance() {
         return;
     };
     let mut first = start(entry.clone(), None, Map::new());
-    first.instance.run_command("store");
+    first.instance.run_command("store", palette());
     assert_eq!(first.run("load"), "stored: hi there");
     drop(first);
     let mut second = start(entry, None, Map::new());
@@ -391,12 +416,12 @@ fn a_plugin_without_code_starts_and_ignores_calls() {
     let dir = temp_dir("declarative");
     std::fs::write(
         dir.join("flux-plugin.toml"),
-        "id = \"test.theme\"\nname = \"Theme\"\nversion = \"1.0.0\"\napi = \"0.1\"\n",
+        "id = \"test.theme\"\nname = \"Theme\"\nversion = \"1.0.0\"\napi = \"0.2\"\n",
     )
     .unwrap();
     let entry = load_dir(&dir, PluginSource::Installed).unwrap();
     let mut probe = start(entry, None, Map::new());
-    probe.instance.run_command("anything");
+    probe.instance.run_command("anything", palette());
     probe.instance.send_event(Event::SettingsChanged);
     std::thread::sleep(Duration::from_millis(50));
     assert!(
@@ -411,15 +436,15 @@ fn a_stopped_instance_says_nothing_more() {
         return;
     };
     let mut probe = start(entry, None, Map::new());
-    probe.instance.run_command("hello");
+    probe.instance.run_command("hello", palette());
     assert_eq!(probe.notification(), "hello");
     let Probe {
         instance,
         mut messages,
         log,
     } = probe;
-    instance.run_command("hello");
-    instance.run_command("panic");
+    instance.run_command("hello", palette());
+    instance.run_command("panic", palette());
     drop(instance);
     // The queued calls run (the panic too), and `deactivate` doesn't: the plugin trapped.
     std::thread::sleep(Duration::from_millis(300));

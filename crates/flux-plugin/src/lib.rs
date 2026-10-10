@@ -7,7 +7,8 @@
 //! - [`install`] — installing from disk and removing.
 //! - [`runtime`] — an instance of a plugin: its thread, calls into it, its calls to the window
 //!   ([`runtime::PluginMessage`]); limits on time and memory; the sandbox. `host` answers the
-//!   API's functions on the plugin's side of the thread.
+//!   API's functions on the plugin's side of the thread: what needs the window becomes a message,
+//!   the rest (the network, the server, programs, timers, secrets) is done right there.
 //! - [`api`] — the types of the WIT interfaces, shared with the window.
 //! - [`log`], [`locales`], [`dev`], [`paths`] — the plugin's log, its translations, building a
 //!   plugin under development, where everything lives on disk.
@@ -16,6 +17,7 @@ pub mod api;
 pub mod dev;
 mod host;
 pub mod install;
+pub(crate) mod keychain;
 pub mod locales;
 pub mod log;
 pub mod manifest;
@@ -25,5 +27,5 @@ pub mod runtime;
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// The version of the plugin API (`flux:plugin@0.1.0`) a manifest names in `api`.
-pub const API_VERSION: &str = "0.1";
+/// The version of the plugin API (`flux:plugin@0.2.0`) a manifest names in `api`.
+pub const API_VERSION: &str = "0.2";

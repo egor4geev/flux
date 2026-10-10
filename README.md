@@ -129,11 +129,20 @@ folder or an archive, read its log — all in Settings → Plugins.
 
 <img src="docs/images/plugins.png" alt="Settings → Plugins: plugins under development and built-in ones with their switches, and the details of the TODO plugin" width="100%">
 
-Plugins add commands with shortcuts, tool windows, status bar items and settings pages, and look like
-the rest of Flux. A TODO window comes built in; write your own in Rust — see
-[Writing plugins](docs/plugins.md).
+Plugins add commands with shortcuts, tool windows, status bar items, settings pages and items of the
+context menus, and look like the rest of Flux. A TODO window comes built in; write your own in Rust —
+see [Writing plugins](docs/plugins.md).
 
 <img src="docs/images/todo.png" alt="The TODO window on the right: TODO and FIXME comments of the project grouped by file" width="100%">
+
+A plugin can work with the world outside the editor: call a web service and sign in to it, run a
+local server for a tool or an AI agent to talk to, run programs and terminals, propose an edit you
+review as a diff, read Git and the problems in your code, and show problems of its own. It gets
+only what you allowed: when you install it, Flux lists in plain words which sites it may reach,
+which programs it may run and which folders it may read, and points out what deserves a second
+look.
+
+<img src="docs/images/plugin-permissions.png" alt="The question before installing a plugin: the project's files, the sites it may connect to, a local server, the programs it may run, terminals — highlighted — and a folder it may read" width="100%">
 
 ### Claude Code, built in
 
@@ -221,7 +230,8 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 - [x] Plugins: sandboxed plugins, the plugin manager, a TODO window
 - [x] Claude Code: a chat that runs your `claude`, with every edit as a diff
 - [x] Claude Code: a review of Claude's changes, session history, the editor's menu
-- [ ] Plugins: an API for more integrations; a catalog, themes, file icons and languages as plugins
+- [x] Plugins: web services, programs, terminals, edits to review, context menus — with your permission
+- [ ] Plugins: a catalog, themes, file icons and languages as plugins; Appearance settings
 - [ ] Public beta
 
 ## License

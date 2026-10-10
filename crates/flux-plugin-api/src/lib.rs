@@ -2,7 +2,7 @@
 //! `wasm32-wasip2`; it implements [`Plugin`] and registers it with [`register_plugin!`]:
 //!
 //! ```ignore
-//! use flux_plugin_api::{Event, Plugin, register_plugin, notify, tr};
+//! use flux_plugin_api::{CommandContext, Plugin, register_plugin, notify, tr};
 //!
 //! struct Hello;
 //!
@@ -11,7 +11,7 @@
 //!         Hello
 //!     }
 //!
-//!     fn run_command(&mut self, command: &str) {
+//!     fn run_command(&mut self, command: &str, _context: &CommandContext) {
 //!         if command == "hello" {
 //!             notify::info(&tr("Hello from a plugin"));
 //!         }
@@ -25,11 +25,31 @@
 //! (the reference); the rest are shortcuts for the common cases: [`view`] builds a tool window's
 //! content, [`notify`] and [`dialog`] talk to the user, [`editor`] reads the documents,
 //! [`storage`] keeps the plugin's data, [`log`] writes its log, [`tr`] / [`trf`] translate and
-//! [`setting`] reads its settings. Guide: `docs/plugins.md`.
+//! [`setting`] reads its settings; [`CommandContext`] says what a command acts on.
+//!
+//! Beyond the window, as the manifest's permissions allow: [`http`] — requests to web services,
+//! [`server`] — the plugin's server on 127.0.0.1, [`process`] — programs, [`terminal`] — terminal
+//! tabs, [`review`] — edits the user reviews in a diff, [`git`] — the repositories, [`diagnostics`]
+//! — problems in files; and for every plugin: [`secrets`] in the keychain, [`timers`],
+//! [`system`] (the browser, the clipboard, the home folder), [`status`] items. Guide:
+//! `docs/plugins.md`.
 
+pub mod diagnostics;
+pub mod git;
+pub mod http;
+pub mod process;
+pub mod review;
+pub mod secrets;
+pub mod server;
+pub mod status;
+pub mod system;
+pub mod terminal;
+pub mod timers;
 pub mod view;
 
+mod context;
 mod text;
+mod url;
 
 pub use text::{offset, slice};
 
@@ -51,14 +71,17 @@ pub mod bindings {
 /// `host::ui::set_view`…).
 pub mod host {
     pub use crate::bindings::flux::plugin::{
-        commands, dialogs, editors, events, i18n, log, notifications, project, settings,
-        status_bar, storage, types, ui,
+        commands, diagnostics, dialogs, editors, events, git, http, i18n, log, notifications,
+        process, project, review, secrets, server, settings, status_bar, storage, system,
+        terminal, timers, types, ui,
     };
 }
 
 pub use bindings::Event;
 pub use bindings::flux::plugin::events::{UiEvent, UiInput};
-pub use bindings::flux::plugin::types::{EditorInfo, Position, Range};
+pub use bindings::flux::plugin::types::{
+    CommandContext, CommandSource, EditorInfo, Position, Range,
+};
 
 use std::cell::RefCell;
 use std::fmt::Display;
@@ -77,9 +100,10 @@ pub trait Plugin: 'static {
     /// The plugin is about to be unloaded.
     fn deactivate(&mut self) {}
 
-    /// One of the commands of the manifest was run.
-    fn run_command(&mut self, command: &str) {
-        let _ = command;
+    /// One of the commands of the manifest was run: `context` says from where (the palette, a
+    /// menu…) and what it acts on (the document, its selections, the files).
+    fn run_command(&mut self, command: &str, context: &CommandContext) {
+        let _ = (command, context);
     }
 
     /// Something happened in the window, or an answer to a question came.
@@ -119,9 +143,9 @@ macro_rules! register_plugin {
                 $crate::__with_plugin::<$plugin>(|plugin| $crate::Plugin::deactivate(plugin));
             }
 
-            fn run_command(command: String) {
+            fn run_command(command: String, context: $crate::CommandContext) {
                 $crate::__with_plugin::<$plugin>(|plugin| {
-                    $crate::Plugin::run_command(plugin, &command)
+                    $crate::Plugin::run_command(plugin, &command, &context)
                 });
             }
 

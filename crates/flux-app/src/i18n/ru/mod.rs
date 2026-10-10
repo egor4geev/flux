@@ -44,6 +44,9 @@ mod claude_history;
 mod claude_changes;
 mod claude_actions;
 mod code_actions;
+mod plugin_api;
+mod plugin_menus;
+mod plugin_review;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
 pub(super) const STRINGS: &[&[(&str, &str)]] = &[
@@ -91,6 +94,9 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     claude_changes::STRINGS,
     claude_actions::STRINGS,
     code_actions::STRINGS,
+    plugin_api::STRINGS,
+    plugin_menus::STRINGS,
+    plugin_review::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -118,4 +124,7 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     claude_changes::PLURALS,
     claude_actions::PLURALS,
     code_actions::PLURALS,
+    plugin_api::PLURALS,
+    plugin_menus::PLURALS,
+    plugin_review::PLURALS,
 ];

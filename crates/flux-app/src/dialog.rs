@@ -75,6 +75,15 @@ pub struct DialogButton {
     pub role: ButtonRole,
 }
 
+/// A line with an icon under the message: what a plugin will be able to do (part 8.2).
+#[derive(Debug, Clone)]
+pub struct DialogPoint {
+    pub icon: IconName,
+    pub text: SharedString,
+    /// Drawn in the warning tone: something to think twice about (a broad permission).
+    pub warning: bool,
+}
+
 /// A question or a message.
 #[derive(Debug, Clone)]
 pub struct Dialog {
@@ -84,6 +93,8 @@ pub struct Dialog {
     pub message: Option<SharedString>,
     /// Long text in the code font with a scroll (git's output, a hook's output).
     pub details: Option<SharedString>,
+    /// Lines with an icon under the message (a plugin's permissions).
+    pub points: Vec<DialogPoint>,
     /// The answer is an index into this list. They are shown as in macOS and JetBrains IDEs: the
     /// main button on the right, Cancel next to it, a destructive alternative of a dialog with a
     /// main button ("Don't Save") on the left.
@@ -99,6 +110,7 @@ impl Dialog {
             title: title.into(),
             message: None,
             details: None,
+            points: Vec::new(),
             buttons: Vec::new(),
             dont_ask_again: false,
         }
@@ -124,6 +136,16 @@ impl Dialog {
 
     pub fn details(mut self, details: impl Into<SharedString>) -> Self {
         self.details = Some(details.into());
+        self
+    }
+
+    /// A line with an icon under the message; `warning` — in the warning tone.
+    pub fn point(mut self, icon: IconName, text: impl Into<SharedString>, warning: bool) -> Self {
+        self.points.push(DialogPoint {
+            icon,
+            text: text.into(),
+            warning,
+        });
         self
     }
 
@@ -736,6 +758,37 @@ impl Render for DialogLayer {
             .details
             .as_ref()
             .map(|details| self.render_details(details, ui, cx));
+        let points = (!dialog.points.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .pb_1()
+                .children(dialog.points.iter().map(|point| {
+                    let (glyph, text) = if point.warning {
+                        (ui.warning, ui.warning)
+                    } else {
+                        (ui.accent_text, ui.foreground)
+                    };
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_none()
+                                .pt(px(2.))
+                                .child(icon(point.icon, glyph).size(px(14.))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(text)
+                                .child(point.text.clone()),
+                        )
+                }))
+        });
         let dont_ask = dialog.dont_ask_again.then(|| {
             div()
                 .id("dialog-dont-ask")
@@ -805,6 +858,7 @@ impl Render for DialogLayer {
                                             .collect::<Vec<_>>(),
                                     )
                                 }))
+                                .children(points)
                                 .children(details)
                                 .children(dont_ask),
                         ),

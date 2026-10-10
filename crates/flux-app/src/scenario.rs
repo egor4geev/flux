@@ -10,6 +10,9 @@
 //!   - `wait:500` — a pause in ms;
 //!   - `action:notifications_panel::Toggle` — dispatch an action (one without data) by name on the
 //!     focused element, as the command palette does;
+//!   - `ui:<plugin>/<window>/<element>` — a click on an element of a plugin's tool window (the
+//!     event goes to the plugin as a click would send it: the mouse can't be fed);
+//!     `ui-submit:<plugin>/<window>/<element>=<text>` — ↵ in its text field with the text;
 //!   - `shot:name` — print `SHOT name` and wait for the window to be captured from outside.
 //!
 //!   `END` is printed after the last step.
@@ -88,6 +91,13 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
     if let Some(ms) = step.strip_prefix("wait:") {
         return Duration::from_millis(ms.parse().unwrap_or(0));
     }
+    if let Some(target) = step.strip_prefix("ui:") {
+        return plugin_ui(target, None, window, cx);
+    }
+    if let Some(target) = step.strip_prefix("ui-submit:") {
+        let (target, text) = target.split_once('=').unwrap_or((target, ""));
+        return plugin_ui(target, Some(text.to_string()), window, cx);
+    }
     if let Some(name) = step.strip_prefix("action:") {
         let dispatched = window
             .update(cx, |_, window, cx| match cx.build_action(name, None) {
@@ -124,6 +134,46 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
         "KEY {step} -> {}",
         if handled { "handled" } else { "ignored" }
     );
+    STEP_PAUSE
+}
+
+/// A click on a plugin's tool window element (or ↵ in its field with `text`), delivered to the
+/// plugin as the view would deliver it.
+fn plugin_ui(
+    target: &str,
+    text: Option<String>,
+    window: AnyWindowHandle,
+    cx: &mut AsyncApp,
+) -> Duration {
+    use flux_plugin::api::events::{Event, UiEvent, UiInput};
+    let mut parts = target.splitn(3, '/');
+    let (Some(plugin), Some(tool), Some(element)) = (parts.next(), parts.next(), parts.next())
+    else {
+        println!("BAD STEP ui:{target}: <plugin>/<window>/<element>");
+        return STEP_PAUSE;
+    };
+    let event = match text {
+        Some(text) => UiEvent::Submitted(text),
+        None => UiEvent::Clicked,
+    };
+    let input = UiInput {
+        window: tool.to_string(),
+        element: element.to_string(),
+        event,
+    };
+    let sent = window
+        .downcast::<crate::workspace::Workspace>()
+        .and_then(|workspace| {
+            workspace
+                .update(cx, |workspace, _, cx| {
+                    workspace
+                        .plugins
+                        .update(cx, |store, _| store.send_to(plugin, Event::Ui(input)))
+                })
+                .ok()
+        })
+        .is_some();
+    println!("UI {target} -> {}", if sent { "sent" } else { "no window" });
     STEP_PAUSE
 }
 

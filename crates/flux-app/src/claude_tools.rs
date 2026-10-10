@@ -36,7 +36,7 @@ use futures::channel::oneshot;
 use gpui::{App, AsyncApp, Context, Entity, Task, Window};
 use serde_json::{Value, json};
 
-use crate::diagnostics::Severity;
+use crate::diagnostics::{KnownFile, Severity};
 use crate::editor::Editor;
 use crate::locations::{self, NavTarget};
 use crate::lsp::{FileServers, LspStore};
@@ -478,33 +478,17 @@ fn editor_problems(editor: &Editor) -> Vec<Problem> {
 /// The problems known for every file: open documents, then the files only the servers checked.
 fn all_problems(workspace: &Workspace, cx: &App) -> Vec<(PathBuf, Vec<Problem>)> {
     let mut files: Vec<(PathBuf, Vec<Problem>)> = Vec::new();
-    let mut open = Vec::new();
-    for editor in workspace.editors(cx) {
-        let editor = editor.read(cx);
-        let Some(path) = editor.document.path() else {
-            continue;
+    for (path, known) in crate::diagnostics::known_files(workspace, cx) {
+        let problems: Vec<Problem> = match known {
+            KnownFile::Open(editor) => editor_problems(editor.read(cx)),
+            KnownFile::Published(diagnostics) => diagnostics
+                .iter()
+                .map(Problem::from_lsp)
+                .filter(|problem| problem.severity != Severity::Hint)
+                .collect(),
         };
-        open.push(canonical(path));
-        let problems = editor_problems(editor);
         if !problems.is_empty() {
-            files.push((path.to_path_buf(), problems));
-        }
-    }
-    for (path, _, diagnostics) in workspace.lsp.read(cx).unopened_diagnostics() {
-        if open.contains(&canonical(&path)) {
-            continue;
-        }
-        let problems: Vec<Problem> = diagnostics
-            .iter()
-            .map(Problem::from_lsp)
-            .filter(|problem| problem.severity != Severity::Hint)
-            .collect();
-        if problems.is_empty() {
-            continue;
-        }
-        match files.iter_mut().find(|(known, _)| *known == path) {
-            Some((_, known)) => known.extend(problems),
-            None => files.push((path, problems)),
+            files.push((path, problems));
         }
     }
     for (_, problems) in &mut files {

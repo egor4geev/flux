@@ -9,7 +9,9 @@ mod model;
 use flux_plugin_api::host::project::{self, Query};
 use flux_plugin_api::host::{editors, ui};
 use flux_plugin_api::view::*;
-use flux_plugin_api::{Event, Plugin, Position, Range, UiEvent, log, register_plugin};
+use flux_plugin_api::{
+    CommandContext, Event, Plugin, Position, Range, UiEvent, log, register_plugin,
+};
 use flux_plugin_api::{notify, setting, tr, trf};
 
 use model::File;
@@ -76,7 +78,7 @@ impl Plugin for Todo {
         self.render();
     }
 
-    fn run_command(&mut self, command: &str) {
+    fn run_command(&mut self, command: &str, _context: &CommandContext) {
         if command == "refresh" {
             self.stale = true;
             if self.shown {

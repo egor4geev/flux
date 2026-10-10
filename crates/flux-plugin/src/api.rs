@@ -10,6 +10,6 @@ pub(crate) mod bindings {
 }
 
 pub use bindings::flux::plugin::{
-    dialogs, editors, events, i18n, log, notifications, project, settings, status_bar, storage,
-    types, ui,
+    diagnostics, dialogs, editors, events, git, http, i18n, log, notifications, process, project,
+    review, secrets, server, settings, status_bar, storage, system, terminal, timers, types, ui,
 };

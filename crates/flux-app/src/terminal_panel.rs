@@ -242,6 +242,29 @@ impl TerminalPanel {
         self.activate(index, window, cx);
     }
 
+    /// Makes a tab the panel's active one (a plugin shows its terminal, part 8.2); `focus` — its
+    /// terminal takes the keyboard. `false` if it isn't here.
+    pub fn show_group(
+        &mut self,
+        group: &Entity<TerminalGroup>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(index) = self.index_of(group) else {
+            return false;
+        };
+        if focus {
+            self.activate(index, window, cx);
+        } else {
+            self.active = index;
+            self.tab_scroll.scroll_to_item(index);
+            group.update(cx, |group, cx| group.clear_bell(cx));
+            cx.notify();
+        }
+        true
+    }
+
     /// Takes a tab out of the panel without closing its terminals (it moves to the editor area).
     /// `false` if it isn't here.
     pub fn remove_group(&mut self, group: &Entity<TerminalGroup>, cx: &mut Context<Self>) -> bool {

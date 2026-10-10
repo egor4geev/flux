@@ -1,0 +1,79 @@
+# The API Playground: every capability of the plugin API 0.2 behind a button (docs/plugins.md). Not
+# bundled into Flux — install the folder: Settings → Plugins → ⚙ → Install Plugin from Disk….
+id = "flux.api-playground"
+name = "API Playground"
+version = "0.1.0"
+api = "0.2"
+authors = ["Egor Ageev"]
+description = "Every capability of the plugin API behind a button: requests, a local server, programs, terminals, proposed edits, Git, problems, secrets, timers, context menus."
+repository = "https://github.com/egor4geev/flux"
+icon = "icons/playground.svg"
+wasm = "target/wasm32-wasip2/release/flux_api_playground.wasm"
+
+# Everything the API asks permission for, to try each: the install question lists them.
+[permissions]
+project = "write"
+network = ["api.github.com", "localhost"]
+server = true
+processes = ["git"]
+terminal = true
+folders = [{ path = "~/.config", access = "read" }]
+
+[[commands]]
+id = "open"
+title = "Open API Playground"
+category = "Playground"
+
+[[commands]]
+id = "show-context"
+title = "Show Context"
+category = "Playground"
+
+[[commands]]
+id = "show-file-context"
+title = "Show File Context"
+category = "Playground"
+
+[[commands]]
+id = "show-folder-context"
+title = "Show Folder Context"
+category = "Playground"
+
+[[commands]]
+id = "show-tab-context"
+title = "Show Tab Context"
+category = "Playground"
+
+[[commands]]
+id = "stop-clock"
+title = "Stop the Clock"
+category = "Playground"
+
+[[tool-windows]]
+id = "playground"
+title = "API Playground"
+icon = "icons/playground.svg"
+
+# The clock of the timers' section.
+[[status-items]]
+id = "clock"
+
+# The context menus: each item prints the context its command gets.
+[[menus]]
+command = "show-context"
+location = "editor"
+when = "selection"
+
+[[menus]]
+command = "show-file-context"
+location = "tree"
+when = "file"
+
+[[menus]]
+command = "show-folder-context"
+location = "tree"
+when = "folder"
+
+[[menus]]
+command = "show-tab-context"
+location = "tab"

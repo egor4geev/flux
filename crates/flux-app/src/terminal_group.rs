@@ -18,7 +18,7 @@ use gpui::{
 use crate::dialog::Dialog;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
-use crate::terminal_view::{TerminalLink, TerminalView, TerminalViewEvent};
+use crate::terminal_view::{SpawnSpec, TerminalLink, TerminalView, TerminalViewEvent};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 
@@ -230,7 +230,21 @@ impl TerminalGroup {
         window: &mut Window,
         cx: &mut App,
     ) -> std::io::Result<Entity<Self>> {
-        let view = TerminalView::spawn(cwd, root.clone(), window, cx)?;
+        let spec = SpawnSpec {
+            cwd,
+            ..SpawnSpec::default()
+        };
+        Self::spawn_with(spec, root, window, cx)
+    }
+
+    /// A tab with one terminal started as `spec` says (a plugin's command, part 8.2).
+    pub fn spawn_with(
+        spec: SpawnSpec,
+        root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> std::io::Result<Entity<Self>> {
+        let view = TerminalView::spawn_with(spec, root.clone(), window, cx)?;
         Ok(cx.new(|cx| {
             let subscription = Self::subscribe(&view, window, cx);
             Self {
@@ -263,6 +277,8 @@ impl TerminalGroup {
                 cx.emit(TerminalGroupEvent::OpenLink(link.clone()))
             }
             TerminalViewEvent::Exited => this.remove_pane(view, window, cx),
+            // A plugin that started the program hears of it from the view itself.
+            TerminalViewEvent::ProcessEnded(_) => {}
             TerminalViewEvent::Focused => {
                 this.active = view.clone();
                 this.bell = false;
@@ -391,6 +407,17 @@ impl TerminalGroup {
             }
         })
         .detach();
+    }
+
+    /// Closes a pane without asking: the plugin that opened it closes it (part 8.2). The last pane
+    /// gone empties the tab.
+    pub(crate) fn close_view(
+        &mut self,
+        view: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remove_pane(view, window, cx);
     }
 
     /// Removes a pane without asking (its shell exited, or closing was confirmed); its terminal is

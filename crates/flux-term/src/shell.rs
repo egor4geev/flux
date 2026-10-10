@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 /// The user's shell as a login shell: `$SHELL`, otherwise the account's shell from the user
 /// database, otherwise `/bin/zsh` (the macOS default). A login shell reads the profile, so `PATH`
 /// is complete even when Flux was started from Finder with a minimal environment.
-pub(crate) fn login_shell() -> (String, Vec<String>) {
+pub fn login_shell() -> (String, Vec<String>) {
     let shell = env::var("SHELL")
         .ok()
         .filter(|shell| !shell.is_empty())

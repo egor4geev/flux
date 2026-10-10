@@ -36,6 +36,10 @@
 //! never saved: the answer carries it). A block's arrow puts the file's lines back on the right,
 //! which rejects that change; a banner accepts (⌘↵) or rejects the proposal, and the tab closes once
 //! the question is answered here, in the chat, or withdrawn.
+//!
+//! **Plugins' proposals** ([`DiffView::plugin_proposal`], part 8.2): the same view for a plugin's
+//! `review.propose`; the answer goes out as [`PluginProposalAnswer`] (`crate::plugin_review` writes
+//! an accepted text when the plugin asked it to, and tells the plugin).
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -75,9 +79,9 @@ actions!(
         RevertChange,
         /// Side by side ↔ unified.
         ToggleUnified,
-        /// ⌘↵ on a Claude proposal: the right side is the answer.
+        /// ⌘↵ on a proposal (Claude's, a plugin's): the right side is the answer.
         AcceptProposal,
-        /// A Claude proposal is refused.
+        /// A proposal is refused.
         RejectProposal,
     ]
 );
@@ -565,20 +569,58 @@ pub struct DiffView {
     /// A comparison of two revisions (or a revision and the working copy) instead of HEAD and the
     /// working copy.
     compare: Option<Compare>,
-    /// An edit Claude proposes instead of HEAD and the working copy.
+    /// An edit Claude or a plugin proposes instead of HEAD and the working copy.
     proposal: Option<Proposal>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
-/// An edit Claude asks permission for: whose question it is, and the text Claude proposed (an
-/// untouched right side allows the call as it is).
+/// An edit proposed for review: whose it is, and the text proposed (an untouched right side allows
+/// Claude's call as it is).
 struct Proposal {
-    session: Entity<ClaudeSession>,
-    request: String,
+    owner: ProposalOwner,
     proposed: String,
     /// The answer went (or the question did): the tab is closing.
     done: bool,
+    /// Accepted or rejected here; a plugin's proposal closed without it is answered `closed`.
+    answered: bool,
+}
+
+/// Who proposes an edit, and where the answer goes.
+enum ProposalOwner {
+    /// A question of a Claude session (stage 9).
+    Claude {
+        session: Entity<ClaudeSession>,
+        request: String,
+    },
+    /// A plugin's `review.propose` (part 8.2).
+    Plugin(PluginProposal),
+}
+
+/// A plugin's proposal ([`DiffView::plugin_proposal`]): the answer goes out as
+/// [`PluginProposalAnswer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginProposal {
+    pub plugin: Arc<str>,
+    /// The plugin's name in the interface language: the banner and the tab say who proposes.
+    pub name: SharedString,
+    /// The plugin's id of the proposal.
+    pub id: u64,
+    /// The file, absolute.
+    pub path: PathBuf,
+    /// Flux writes the accepted text itself.
+    pub apply: bool,
+    /// The tab's title the plugin gave.
+    pub title: Option<SharedString>,
+}
+
+/// The user answered a plugin's proposal: the accepted text (the right side as the user left it),
+/// or none — rejected. A proposal closed without an answer sends nothing: `crate::plugin_review`
+/// tells the plugin when the view goes ([`DiffView::unanswered_plugin_proposal`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginProposalAnswer {
+    pub proposal: PluginProposal,
+    pub accepted: Option<String>,
 }
 
 /// What Claude is told when the user rejects a proposal in its diff: the turn stops.
@@ -648,6 +690,8 @@ fn revision_text(content: Option<Vec<u8>>) -> RevisionText {
 }
 
 impl EventEmitter<DiffViewEvent> for DiffView {}
+
+impl EventEmitter<PluginProposalAnswer> for DiffView {}
 
 impl DiffView {
     pub fn new(
@@ -762,12 +806,11 @@ impl DiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let right = cx.new(|cx| {
-            let mut editor = Editor::new(Document::from_text(&proposed), window, cx);
-            editor.set_highlight_path(&path, cx);
-            editor
-        });
-        let mut view = Self::build(path, git, Some(right), false, None, window, cx);
+        let owner = ProposalOwner::Claude {
+            session: session.clone(),
+            request: request.clone(),
+        };
+        let mut view = Self::proposal_view(path, original, proposed, owner, git, window, cx);
         let subscription = cx.subscribe(&session, {
             let request = request.clone();
             move |this, _, event: &SessionEvent, cx| {
@@ -782,11 +825,46 @@ impl DiffView {
             }
         });
         view._subscriptions.push(subscription);
+        view
+    }
+
+    /// An edit a plugin proposes (part 8.2): `original` — the file now (the open document's text;
+    /// `None` — it doesn't exist yet), `proposed` — the text after the edit, on the right in an
+    /// editor of its own. The answer goes out as [`PluginProposalAnswer`].
+    pub fn plugin_proposal(
+        original: Option<String>,
+        proposed: String,
+        proposal: PluginProposal,
+        git: Entity<GitStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let path = proposal.path.clone();
+        let owner = ProposalOwner::Plugin(proposal);
+        Self::proposal_view(path, original, proposed, owner, git, window, cx)
+    }
+
+    /// The view of a proposal: the file on the left, the proposed text on the right.
+    fn proposal_view(
+        path: PathBuf,
+        original: Option<String>,
+        proposed: String,
+        owner: ProposalOwner,
+        git: Entity<GitStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let right = cx.new(|cx| {
+            let mut editor = Editor::new(Document::from_text(&proposed), window, cx);
+            editor.set_highlight_path(&path, cx);
+            editor
+        });
+        let mut view = Self::build(path, git, Some(right), false, None, window, cx);
         view.proposal = Some(Proposal {
-            session,
-            request,
+            owner,
             proposed,
             done: false,
+            answered: false,
         });
         let base = match original.as_deref() {
             Some(text) if text.contains('\r') => normalize(text),
@@ -797,16 +875,56 @@ impl DiffView {
         view
     }
 
-    /// Whether this is a Claude proposal (not a diff of the file's changes: ⌘D opens its own tab).
+    /// Whether this is a proposal (Claude's or a plugin's), not a diff of the file's changes: ⌘D
+    /// opens its own tab.
     pub fn is_proposal(&self) -> bool {
         self.proposal.is_some()
     }
 
     /// Whether this is the proposal of the question `request` of `session`.
     pub fn is_proposal_of(&self, session: &Entity<ClaudeSession>, request: &str) -> bool {
-        self.proposal
-            .as_ref()
-            .is_some_and(|proposal| &proposal.session == session && proposal.request == request)
+        self.proposal.as_ref().is_some_and(|proposal| {
+            matches!(&proposal.owner, ProposalOwner::Claude { session: owner, request: asked }
+                if owner == session && asked == request)
+        })
+    }
+
+    /// The plugin's proposal this view shows, if it is one.
+    pub fn proposed_by_plugin(&self) -> Option<&PluginProposal> {
+        match &self.proposal.as_ref()?.owner {
+            ProposalOwner::Plugin(proposal) => Some(proposal),
+            ProposalOwner::Claude { .. } => None,
+        }
+    }
+
+    /// The plugin's proposal, if it wasn't answered here: closing the tab answers it `closed`.
+    pub fn unanswered_plugin_proposal(&self) -> Option<PluginProposal> {
+        let proposal = self.proposal.as_ref().filter(|proposal| !proposal.answered)?;
+        match &proposal.owner {
+            ProposalOwner::Plugin(proposal) => Some(proposal.clone()),
+            ProposalOwner::Claude { .. } => None,
+        }
+    }
+
+    /// The mark of a proposal's tab: Claude's, or the plugins' puzzle piece.
+    pub fn proposal_icon(&self) -> Option<IconName> {
+        Some(match self.proposal.as_ref()?.owner {
+            ProposalOwner::Claude { .. } => IconName::Claude,
+            ProposalOwner::Plugin(_) => IconName::Puzzle,
+        })
+    }
+
+    /// The plugin withdrew its proposal: the tab closes (the plugin is answered `closed`).
+    pub fn withdraw_proposal(&mut self, cx: &mut Context<Self>) {
+        self.close_proposal(cx);
+    }
+
+    /// The plugin stopped: the tab closes, and nobody is told.
+    pub fn drop_proposal(&mut self, cx: &mut Context<Self>) {
+        if let Some(proposal) = &mut self.proposal {
+            proposal.answered = true;
+        }
+        self.close_proposal(cx);
     }
 
     /// Accept: the right side — the proposal as it is, or as the user changed it — answers the
@@ -819,6 +937,10 @@ impl DiffView {
             return;
         }
         let text = right.read(cx).document.text().to_string();
+        if let ProposalOwner::Plugin(plugin) = &proposal.owner {
+            let plugin = plugin.clone();
+            return self.answer_plugin(plugin, Some(text), cx);
+        }
         let answer = if text == proposal.proposed {
             flux_claude::Answer::Allow {
                 remember: Vec::new(),
@@ -833,6 +955,14 @@ impl DiffView {
     }
 
     fn reject_proposal(&mut self, cx: &mut Context<Self>) {
+        if let Some(Proposal {
+            owner: ProposalOwner::Plugin(plugin),
+            ..
+        }) = &self.proposal
+        {
+            let plugin = plugin.clone();
+            return self.answer_plugin(plugin, None, cx);
+        }
         self.answer_proposal(
             flux_claude::Answer::Deny {
                 message: REJECTED.to_string(),
@@ -849,8 +979,32 @@ impl DiffView {
         if proposal.done {
             return;
         }
-        let (session, request) = (proposal.session.clone(), proposal.request.clone());
+        let ProposalOwner::Claude { session, request } = &proposal.owner else {
+            return;
+        };
+        let (session, request) = (session.clone(), request.clone());
         session.update(cx, |session, cx| session.answer(&request, answer, cx));
+        self.close_proposal(cx);
+    }
+
+    /// A plugin's proposal is answered: the answer goes out, the tab closes.
+    fn answer_plugin(
+        &mut self,
+        plugin: PluginProposal,
+        accepted: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(proposal) = &mut self.proposal else {
+            return;
+        };
+        if proposal.done {
+            return;
+        }
+        proposal.answered = true;
+        cx.emit(PluginProposalAnswer {
+            proposal: plugin,
+            accepted,
+        });
         self.close_proposal(cx);
     }
 
@@ -912,8 +1066,15 @@ impl DiffView {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if self.proposal.is_some() {
-            return trf("{0} — Claude", &[&name]).into();
+        match self.proposal.as_ref().map(|proposal| &proposal.owner) {
+            Some(ProposalOwner::Claude { .. }) => return trf("{0} — Claude", &[&name]).into(),
+            Some(ProposalOwner::Plugin(plugin)) => {
+                return match &plugin.title {
+                    Some(title) => title.clone(),
+                    None => format!("{name} — {}", plugin.name).into(),
+                };
+            }
+            None => {}
         }
         match &self.compare {
             Some(compare) if compare.right == DiffSide::WorkingCopy => {
@@ -1672,7 +1833,7 @@ impl DiffView {
 
     // --- Rendering ---
 
-    /// The banner of a Claude proposal: what it is, Reject, Accept (⌘↵).
+    /// The banner of a proposal: who proposes what, Reject, Accept (⌘↵).
     fn render_proposal_banner(
         &self,
         window: &Window,
@@ -1690,6 +1851,16 @@ impl DiffView {
             .as_ref()
             .is_some_and(|right| *right.read(cx).document.text() != proposal.proposed);
         let accept_keys = ui::shortcut_in(&AcceptProposal, &self.focus_handle, window);
+        let (glyph, headline) = match &proposal.owner {
+            ProposalOwner::Claude { .. } => (
+                IconName::Claude,
+                trf("Claude proposes changes to {0}", &[&name]),
+            ),
+            ProposalOwner::Plugin(plugin) => (
+                IconName::Puzzle,
+                trf("{0} proposes changes to {1}", &[&plugin.name, &name]),
+            ),
+        };
         Some(
             div()
                 .flex_none()
@@ -1704,7 +1875,7 @@ impl DiffView {
                 .bg(UiColors::tint(ui.accent, 0.12))
                 .border_1()
                 .border_color(UiColors::tint(ui.accent, 0.35))
-                .child(icon(IconName::Claude, ui.accent_text).size(px(15.)))
+                .child(icon(glyph, ui.accent_text).size(px(15.)))
                 .child(
                     div()
                         .flex_1()
@@ -1715,7 +1886,7 @@ impl DiffView {
                             div()
                                 .truncate()
                                 .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(trf("Claude proposes changes to {0}", &[&name])),
+                                .child(headline),
                         )
                         .child(
                             div()
@@ -1841,7 +2012,10 @@ impl DiffView {
             ),
             None if self.proposal.is_some() => (
                 tr("Current version").to_string(),
-                tr("Proposed by Claude").to_string(),
+                match self.proposed_by_plugin() {
+                    Some(plugin) => trf("Proposed by {0}", &[&plugin.name]),
+                    None => tr("Proposed by Claude").to_string(),
+                },
             ),
             None => {
                 let head = self

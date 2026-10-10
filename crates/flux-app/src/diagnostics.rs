@@ -2,6 +2,10 @@
 //! fresh ones; drawn as wavy underlines and colored line numbers; F2 / Shift+F2 go to the next /
 //! previous one (errors first, as in JetBrains). A document may have several servers (Python:
 //! pyright and ruff): each publication replaces only its own server's diagnostics.
+//!
+//! Plugins publish problems too (part 8.2, a linter): they live in the same list under an owner of
+//! their own ([`plugin_owner`]: the high bit, never a server's id), so they are drawn, counted and
+//! visited by F2 as the servers' are, and a server's publication doesn't touch them.
 
 use std::cmp::Reverse;
 use std::ops::Range;
@@ -10,9 +14,12 @@ use flux_core::text::{line_len, line_start};
 use flux_core::{Assoc, ChangeSet, Rope};
 use flux_lsp::lsp_types::{self, DiagnosticSeverity, NumberOrString};
 use gpui::prelude::FluentBuilder;
+use std::path::PathBuf;
+
 use gpui::{
-    App, Context, Div, Hsla, InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels,
-    Point, StatefulInteractiveElement, Styled, UnderlineStyle, Window, actions, div, point, px,
+    App, Context, Div, Entity, Hsla, InteractiveElement, IntoElement, KeyBinding, ParentElement,
+    Pixels, Point, StatefulInteractiveElement, Styled, UnderlineStyle, Window, actions, div, point,
+    px,
 };
 
 use crate::editor::Editor;
@@ -21,8 +28,28 @@ use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
 use crate::theme::UiColors;
 use crate::ui;
+use crate::workspace::Workspace;
 
 actions!(diagnostics, [NextProblem, PreviousProblem]);
+
+/// The bit of the owners of plugins' problems: servers' ids count up from 0 and never have it.
+const PLUGIN_OWNER: u64 = 1 << 63;
+
+/// The owner of a plugin's problems in the documents: stable for the plugin's id (FNV-1a), with
+/// the high bit set.
+pub fn plugin_owner(plugin: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in plugin.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    PLUGIN_OWNER | (hash & !PLUGIN_OWNER)
+}
+
+/// Whether the problems of `owner` are a plugin's (not a server's).
+pub fn is_plugin_owner(owner: u64) -> bool {
+    owner & PLUGIN_OWNER != 0
+}
 
 /// Wavy underline: the line thickness; the wave is three times as high.
 const UNDERLINE_THICKNESS: f32 = 1.;
@@ -112,6 +139,12 @@ impl Diagnostics {
 
     pub fn clear(&mut self) {
         self.items.clear();
+    }
+
+    /// The servers' diagnostics go (the document is opened on its servers again: they publish
+    /// theirs anew); the plugins' stay.
+    pub fn clear_servers(&mut self) {
+        self.items.retain(|d| is_plugin_owner(d.owner));
     }
 
     /// Server `owner` is gone (exited, restarted): its diagnostics are stale.
@@ -219,6 +252,43 @@ impl Diagnostics {
     }
 }
 
+/// A file Flux knows problems of: an open document (its servers' and plugins' problems, in its
+/// text, unsaved changes included), or one no editor shows, with what its servers published as
+/// they sent it.
+pub(crate) enum KnownFile {
+    Open(Entity<Editor>),
+    Published(Vec<lsp_types::Diagnostic>),
+}
+
+/// The files Flux knows problems of: every open document of the window (with problems or not —
+/// the caller looks), then the files only the servers checked (several servers' publications of a
+/// file together), in that order. Shared by Flux's tools for Claude and the plugin API.
+pub(crate) fn known_files(workspace: &Workspace, cx: &App) -> Vec<(PathBuf, KnownFile)> {
+    let mut files: Vec<(PathBuf, KnownFile)> = Vec::new();
+    let mut open = Vec::new();
+    for editor in workspace.editors(cx) {
+        let Some(path) = editor.read(cx).document.path().map(PathBuf::from) else {
+            continue;
+        };
+        open.push(crate::navigation::canonical(&path));
+        files.push((path, KnownFile::Open(editor)));
+    }
+    for (path, _, diagnostics) in workspace.lsp.read(cx).unopened_diagnostics() {
+        if open.contains(&crate::navigation::canonical(&path)) {
+            continue;
+        }
+        let known = files.iter_mut().find_map(|(known, file)| match file {
+            KnownFile::Published(list) if *known == path => Some(list),
+            _ => None,
+        });
+        match known {
+            Some(list) => list.extend(diagnostics),
+            None => files.push((path, KnownFile::Published(diagnostics))),
+        }
+    }
+    files
+}
+
 /// Server diagnostics → ours, positions in `text` (the document the server reported on).
 pub fn from_lsp(text: &Rope, diagnostics: &[lsp_types::Diagnostic]) -> Vec<Diagnostic> {
     let lines = flux_lsp::position::Lines::new(text);
@@ -226,22 +296,31 @@ pub fn from_lsp(text: &Rope, diagnostics: &[lsp_types::Diagnostic]) -> Vec<Diagn
         .iter()
         .map(|d| Diagnostic {
             range: lines.range_from_lsp(d.range),
-            // Without a severity it is up to the client; like VS Code, an error.
-            severity: match d.severity {
-                Some(DiagnosticSeverity::WARNING) => Severity::Warning,
-                Some(DiagnosticSeverity::INFORMATION) => Severity::Info,
-                Some(DiagnosticSeverity::HINT) => Severity::Hint,
-                _ => Severity::Error,
-            },
+            severity: severity_from_lsp(d),
             message: d.message.clone(),
             source: d.source.clone(),
-            code: d.code.as_ref().map(|code| match code {
-                NumberOrString::Number(n) => n.to_string(),
-                NumberOrString::String(s) => s.clone(),
-            }),
+            code: code_from_lsp(d),
             owner: 0,
         })
         .collect()
+}
+
+/// A server diagnostic's severity: without one it is up to the client; like VS Code, an error.
+pub fn severity_from_lsp(diagnostic: &lsp_types::Diagnostic) -> Severity {
+    match diagnostic.severity {
+        Some(DiagnosticSeverity::WARNING) => Severity::Warning,
+        Some(DiagnosticSeverity::INFORMATION) => Severity::Info,
+        Some(DiagnosticSeverity::HINT) => Severity::Hint,
+        _ => Severity::Error,
+    }
+}
+
+/// A server diagnostic's code as text: "E0308", "6133".
+pub fn code_from_lsp(diagnostic: &lsp_types::Diagnostic) -> Option<String> {
+    diagnostic.code.as_ref().map(|code| match code {
+        NumberOrString::Number(n) => n.to_string(),
+        NumberOrString::String(s) => s.clone(),
+    })
 }
 
 /// Diagnostics of the visible lines, ready to paint.
@@ -446,6 +525,27 @@ mod tests {
 
     fn ranges(diagnostics: &Diagnostics) -> Vec<Range<usize>> {
         diagnostics.items.iter().map(|d| d.range.clone()).collect()
+    }
+
+    #[test]
+    fn plugins_own_their_problems_apart_from_servers() {
+        let owner = plugin_owner("someone.linter");
+        assert_eq!(owner, plugin_owner("someone.linter"), "stable");
+        assert_ne!(owner, plugin_owner("someone.other"));
+        assert!(is_plugin_owner(owner));
+        // Servers count from 0: a server's id is never a plugin's owner.
+        assert!(!is_plugin_owner(0) && !is_plugin_owner(12_345));
+        let mut diagnostics = Diagnostics::default();
+        diagnostics.set(3, vec![diagnostic(0, 4, Severity::Error)]);
+        diagnostics.set(owner, vec![diagnostic(6, 8, Severity::Warning)]);
+        // A server's fresh publication leaves the plugin's problems alone.
+        diagnostics.set(3, vec![diagnostic(1, 2, Severity::Error)]);
+        assert_eq!(ranges(&diagnostics), vec![1..2, 6..8]);
+        // Opened on its servers again: theirs go, the plugin's stay.
+        diagnostics.clear_servers();
+        assert_eq!(ranges(&diagnostics), vec![6..8]);
+        diagnostics.clear_owner(owner);
+        assert!(ranges(&diagnostics).is_empty());
     }
 
     #[test]

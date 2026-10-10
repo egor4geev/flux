@@ -448,9 +448,14 @@ impl Workspace {
         let claude_panel =
             cx.new(|cx| ClaudePanel::new(claude.clone(), right_width.clone(), window, cx));
         let plugins = cx.new(|cx| PluginStore::new(root.clone(), right_width, cx));
-        plugins.update(cx, |store, _| {
-            store.set_notification_center(notification_center.downgrade())
+        plugins.update(cx, |store, cx| {
+            store.set_notification_center(notification_center.downgrade());
+            store.set_window_parts(git.clone(), lsp.clone(), cx);
         });
+        if let Some(tree) = &file_tree {
+            tree.panel
+                .update(cx, |panel, _| panel.set_plugins(plugins.clone()));
+        }
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
         let subscriptions = vec![
@@ -569,8 +574,10 @@ impl Workspace {
             self.remove_tab_at(index, window, cx);
         }
         let tree = Self::build_tree(root.clone(), self.left_width.clone(), window, cx);
-        tree.panel
-            .update(cx, |panel, cx| panel.set_git(self.git.clone(), cx));
+        tree.panel.update(cx, |panel, cx| {
+            panel.set_git(self.git.clone(), cx);
+            panel.set_plugins(self.plugins.clone());
+        });
         self.file_tree = Some(tree);
         self.tree_open = true;
         self.revealed = None;
@@ -580,8 +587,12 @@ impl Workspace {
         self.terminal_panel
             .update(cx, |panel, _| panel.set_root(Some(root.clone())));
         self.lsp = Self::build_lsp(Some(root.clone()), cx);
-        self.plugins
-            .update(cx, |store, cx| store.set_root(Some(root), cx));
+        // The plugins hear the new hubs: `git-changed`, `diagnostics-changed`, their problems.
+        let (git, lsp) = (self.git.clone(), self.lsp.clone());
+        self.plugins.update(cx, |store, cx| {
+            store.set_window_parts(git, lsp, cx);
+            store.set_root(Some(root), cx);
+        });
         for editor in self.editors(cx) {
             self.lsp.update(cx, |store, cx| store.register(&editor, cx));
             self.git.update(cx, |store, cx| store.register(&editor, cx));
@@ -867,11 +878,56 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let subscriptions = vec![
-            cx.subscribe_in(&group, window, Self::on_terminal_tab_event),
-            cx.observe(&group, |_, _, cx| cx.notify()),
-        ];
+        let subscriptions = self.terminal_tab_subscriptions(&group, window, cx);
         self.insert_tab(TabItem::Terminal(group), subscriptions, index, window, cx);
+    }
+
+    fn terminal_tab_subscriptions(
+        &mut self,
+        group: &Entity<TerminalGroup>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
+        vec![
+            cx.subscribe_in(group, window, Self::on_terminal_tab_event),
+            cx.observe(group, |_, _, cx| cx.notify()),
+        ]
+    }
+
+    /// Adds a tab next to the active one without taking the keyboard (a proposal's diff or a
+    /// plugin's terminal opened without `focus`). When the keyboard is in the active tab, the new tab waits behind
+    /// it: bringing it forward would hide what the user is typing into, and the keys would go
+    /// nowhere. Otherwise it comes forward, and the keyboard stays where it is.
+    fn insert_tab_quietly(
+        &mut self,
+        item: TabItem,
+        subscriptions: Vec<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.typing_in_active_tab(window, cx) {
+            let focused = window.focused(cx);
+            self.insert_tab(item, subscriptions, None, window, cx);
+            if let Some(focused) = focused {
+                window.focus(&focused);
+            }
+            return;
+        }
+        let index = (self.active + 1).min(self.tabs.len());
+        self.tabs.insert(
+            index,
+            Tab {
+                item,
+                _subscriptions: subscriptions,
+            },
+        );
+        cx.notify();
+    }
+
+    /// The keyboard is in the active tab of the editor area.
+    fn typing_in_active_tab(&self, window: &Window, cx: &App) -> bool {
+        self.active_item()
+            .is_some_and(|item| item.focus_handle(cx).contains_focused(window, cx))
     }
 
     fn insert_tab(
@@ -901,7 +957,12 @@ impl Workspace {
     }
 
     /// Removes a document's tab.
-    fn remove_tab(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn remove_tab(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(index) = self.index_of(editor) {
             self.remove_tab_at(index, window, cx);
         }
@@ -1333,21 +1394,33 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Without `focus` the keyboard stays where it was (the Claude chat answering a card).
-        let focused = (!focus).then(|| window.focused(cx)).flatten();
-        let subscriptions = vec![
-            cx.observe(&view, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
+        let subscriptions = self.diff_tab_subscriptions(&view, window, cx);
+        if focus {
+            self.insert_tab(TabItem::Diff(view), subscriptions, None, window, cx);
+        } else {
+            // The keyboard stays where it was: the Claude chat answering a card, the user typing in
+            // a file (a proposal of Claude or a plugin that arrives by itself must not take the
+            // keys, nor hide the file they go to).
+            self.insert_tab_quietly(TabItem::Diff(view), subscriptions, window, cx);
+        }
+    }
+
+    /// A diff tab follows its view: redraws, Jump to Source, closing itself.
+    fn diff_tab_subscriptions(
+        &mut self,
+        view: &Entity<DiffView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
+        vec![
+            cx.observe(view, |_, _, cx| cx.notify()),
+            cx.subscribe_in(view, window, |this, view, event, window, cx| match event {
                 DiffViewEvent::OpenFile(location) => {
                     this.open_location(location.clone(), true, window, cx)
                 }
                 DiffViewEvent::Close => this.close_diff_tab(view.clone(), window, cx),
             }),
-        ];
-        self.insert_tab(TabItem::Diff(view), subscriptions, None, window, cx);
-        if let Some(focused) = focused {
-            window.focus(&focused);
-        }
+        ]
     }
 
     /// The diff tabs of the window.
@@ -1804,7 +1877,7 @@ impl Workspace {
     }
 
     /// All terminal tabs of the window: the panel's, then those in the editor area.
-    fn terminal_groups(&self, cx: &App) -> Vec<Entity<TerminalGroup>> {
+    pub(crate) fn terminal_groups(&self, cx: &App) -> Vec<Entity<TerminalGroup>> {
         let mut groups = self.terminal_panel.read(cx).groups();
         groups.extend(
             self.tabs
@@ -2015,6 +2088,10 @@ impl Workspace {
             }
             PluginStoreEvent::Call { plugin, call } => {
                 plugins::handle_call(self, plugin, call, window, cx)
+            }
+            PluginStoreEvent::PluginStopped(plugin) => {
+                crate::plugin_terminals::plugin_stopped(self, plugin, cx);
+                crate::plugin_review::plugin_stopped(self, plugin, window, cx);
             }
         }
     }
@@ -2620,6 +2697,65 @@ impl Workspace {
             TerminalGroupEvent::OpenLink(link) => self.open_terminal_link(link, window, cx),
             TerminalGroupEvent::ShellFailed(reason) => self.shell_failed(reason, cx),
         }
+    }
+
+    /// A terminal tab a plugin opened (part 8.2): into the panel, which shows, or among the editor's
+    /// tabs. Without `focus` the keyboard stays where it was.
+    pub(crate) fn add_plugin_terminal(
+        &mut self,
+        group: Entity<TerminalGroup>,
+        in_editor: bool,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if in_editor && focus {
+            return self.add_terminal_tab(group, None, window, cx);
+        }
+        if in_editor {
+            let subscriptions = self.terminal_tab_subscriptions(&group, window, cx);
+            return self.insert_tab_quietly(TabItem::Terminal(group), subscriptions, window, cx);
+        }
+        let focused = (!focus).then(|| window.focused(cx)).flatten();
+        self.terminal_open = true;
+        self.git_open = false;
+        self.terminal_panel
+            .update(cx, |panel, cx| panel.add_group(group, None, window, cx));
+        if let Some(focused) = focused {
+            window.focus(&focused);
+        }
+        cx.notify();
+    }
+
+    /// Brings a terminal tab forward — the panel's (the panel shows) or the editor area's; `focus`
+    /// — its terminal takes the keyboard. `false` if the window has no such tab.
+    pub(crate) fn show_terminal_group(
+        &mut self,
+        group: &Entity<TerminalGroup>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(index) = self.index_of_terminal(group) {
+            // The keyboard can't stay in a tab that goes behind: then it goes with the shown one.
+            let focused = (!focus && !self.typing_in_active_tab(window, cx))
+                .then(|| window.focused(cx))
+                .flatten();
+            self.activate(index, window, cx);
+            if let Some(focused) = focused {
+                window.focus(&focused);
+            }
+            return true;
+        }
+        let shown = self
+            .terminal_panel
+            .update(cx, |panel, cx| panel.show_group(group, focus, window, cx));
+        if shown {
+            self.terminal_open = true;
+            self.git_open = false;
+            cx.notify();
+        }
+        shown
     }
 
     /// A terminal tab moves from the panel to the editor area at `index` (by default, next to the
@@ -3542,8 +3678,9 @@ impl Workspace {
         let ui = Theme::ui(cx);
         let active = index == self.active;
         let title = view.read(cx).title();
-        // A Claude proposal reads "main.rs — Claude", with Claude's mark.
+        // A proposal reads "main.rs — Claude" (or a plugin's title), with its owner's mark.
         let proposal = view.read(cx).is_proposal();
+        let proposal_icon = view.read(cx).proposal_icon();
         let dot = TabItem::Diff(view.clone())
             .is_modified(cx)
             .then_some(ui.modified);
@@ -3567,10 +3704,9 @@ impl Workspace {
                     this.close_diff_tab(close.clone(), window, cx)
                 }),
             )
-            .child(if proposal {
-                icon(IconName::Claude, ui.accent_text).size(px(14.))
-            } else {
-                icon(IconName::Diff, ui.vcs_modified).size(px(14.))
+            .child(match proposal_icon {
+                Some(glyph) => icon(glyph, ui.accent_text).size(px(14.)),
+                None => icon(IconName::Diff, ui.vcs_modified).size(px(14.)),
             })
             .child(label(&title))
             .when(!proposal, |tab| tab.child(label(tr("diff")).text_color(ui.dim)))
@@ -5292,10 +5428,17 @@ impl Workspace {
         self.activate_editor(editor, window, cx);
         let path = editor.read(cx).document.path().map(Path::to_path_buf);
         let claude = crate::claude_actions::offered(cx);
+        let plugins = self.plugins.clone();
         let menu = cx.new(|cx| {
             let menu = crate::context_menu::ContextMenu::new(window, cx).entry(tr("Close Tab"), CloseTab);
+            // The plugins' items for the tab's file (part 8.2).
+            let target = crate::plugin_menus::MenuTarget {
+                location: flux_plugin::manifest::MenuLocation::Tab,
+                selection: false,
+                paths: path.iter().cloned().collect(),
+            };
             let Some(path) = path else {
-                return menu;
+                return crate::plugin_menus::append(menu, &plugins, &target, cx);
             };
             let menu = menu
                 .separator()
@@ -5305,14 +5448,15 @@ impl Workspace {
                         .entry(tr("File Name"), crate::editor_menu::CopyFileName)
                 })
                 .entry(tr("Reveal in Finder"), crate::editor_menu::RevealInFinder);
-            if claude {
+            let menu = if claude {
                 menu.separator().entry(
                     tr("Send to Claude"),
                     crate::claude_actions::SendPathsToClaude(vec![path]),
                 )
             } else {
                 menu
-            }
+            };
+            crate::plugin_menus::append(menu, &plugins, &target, cx)
         });
         let focus = menu.focus_handle(cx);
         let subscriptions = [

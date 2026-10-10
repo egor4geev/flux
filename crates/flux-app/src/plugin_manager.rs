@@ -7,7 +7,7 @@
 //! the selected plugin on the right: who made it, its buttons, and tabs — Overview, Permissions,
 //! Contributions, Log. The gear menu installs a plugin from a folder (under development: Flux
 //! builds it with cargo and reloads it when it changes) or an archive, and reloads the plugins
-//! under development. The catalog (Marketplace) comes in 8.2.
+//! under development. The catalog (Marketplace) comes in 8.3.
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use flux_plugin::install::{Candidate, CandidateKind};
 use flux_plugin::log::{Level, LogLine, PluginLog};
-use flux_plugin::manifest::{Manifest, Permissions, ProjectAccess};
+use flux_plugin::manifest::{FolderAccess, Manifest, MenuLocation, Permissions, ProjectAccess};
 use flux_plugin::registry::{PluginEntry, PluginSource, ScanError};
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, DismissEvent, Div,
@@ -183,7 +183,9 @@ async fn install_path(
 /// The index of Install in [`install_question`].
 const INSTALL: usize = 0;
 
-/// The question before installing: who made the plugin and what it will be able to do.
+/// The question before installing: who made the plugin and what it will be able to do. A plugin
+/// with a broad permission (any server, any program, terminals, a whole home folder) is asked
+/// about as a warning, and those lines are in the warning tone.
 fn install_question(candidate: &Candidate) -> Dialog {
     let entry = &candidate.entry;
     let manifest = &entry.manifest;
@@ -191,43 +193,137 @@ fn install_question(candidate: &Candidate) -> Dialog {
     if !manifest.authors.is_empty() {
         paragraphs.push(trf("By {0}", &[&manifest.authors.join(", ")]));
     }
-    let permissions = permission_lines(&manifest.permissions);
-    if permissions.is_empty() {
-        paragraphs.push(tr("The plugin asks for no special permissions.").to_string());
-    } else {
-        paragraphs.push(tr("The plugin will be able to:").to_string());
-        paragraphs.extend(
-            permissions
-                .into_iter()
-                .map(|(_, line)| format!("•  {line}")),
-        );
-    }
     if candidate.kind == CandidateKind::Folder {
         paragraphs.push(
             tr("It will be linked as a plugin under development: Flux builds it with cargo and reloads it when it changes.")
                 .to_string(),
         );
     }
+    let permissions = permission_lines(&manifest.permissions);
+    if permissions.is_empty() {
+        paragraphs.push(tr("The plugin asks for no special permissions.").to_string());
+    } else {
+        paragraphs.push(tr("The plugin will be able to:").to_string());
+    }
     let name = translated(entry, &manifest.name);
-    Dialog::info(trf("Install “{0}” {1}?", &[&name, &manifest.version]))
-        .message(paragraphs.join("\n\n"))
-        .primary(tr("Install"))
-        .cancel(tr("Cancel"))
+    let title = trf("Install “{0}” {1}?", &[&name, &manifest.version]);
+    let mut dialog = if permissions.iter().any(|line| line.broad) {
+        Dialog::warning(title)
+    } else {
+        Dialog::info(title)
+    };
+    dialog = dialog.message(paragraphs.join("\n\n"));
+    for line in permissions {
+        dialog = dialog.point(line.icon, line.text, line.broad);
+    }
+    dialog.primary(tr("Install")).cancel(tr("Cancel"))
 }
 
-/// What the permissions let a plugin do, in plain words: an icon and a line each.
-fn permission_lines(permissions: &Permissions) -> Vec<(IconName, &'static str)> {
+/// What a permission lets a plugin do, in plain words.
+#[derive(Debug, Clone, PartialEq)]
+struct PermissionLine {
+    icon: IconName,
+    text: String,
+    /// Broad — any server, any program (a shell counts: it runs any), terminals (typing in one runs
+    /// anything), the whole home folder or disk: drawn in the warning tone.
+    broad: bool,
+}
+
+/// Programs that run any other program: a plugin allowed one of them may run anything.
+const SHELLS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "env",
+    "xargs",
+    "sudo",
+    "su",
+    "osascript",
+    "python",
+    "python3",
+    "node",
+    "ruby",
+    "perl",
+    "deno",
+    "bun",
+];
+
+/// What the permissions let a plugin do, in plain words: the project's files, the network, the
+/// local server, programs, terminals, folders outside the project — a line each.
+fn permission_lines(permissions: &Permissions) -> Vec<PermissionLine> {
+    let line = |icon, text: String, broad| PermissionLine { icon, text, broad };
     let mut lines = Vec::new();
     match permissions.project {
         ProjectAccess::None => {}
-        ProjectAccess::Read => lines.push((
+        ProjectAccess::Read => lines.push(line(
             IconName::FolderOpen,
-            tr("Read and search the files of the project"),
+            tr("Read and search the files of the project").to_string(),
+            false,
         )),
-        ProjectAccess::Write => lines.push((
+        ProjectAccess::Write => lines.push(line(
             IconName::Pencil,
-            tr("Read, search and change the files of the project"),
+            tr("Read, search and change the files of the project").to_string(),
+            false,
         )),
+    }
+    if permissions.any_host() {
+        lines.push(line(
+            IconName::Globe,
+            tr("Connect to any server on the internet").to_string(),
+            true,
+        ));
+    } else if !permissions.network.is_empty() {
+        lines.push(line(
+            IconName::Globe,
+            trf("Connect to {0}", &[&permissions.network.join(", ")]),
+            false,
+        ));
+    }
+    if permissions.server {
+        lines.push(line(
+            IconName::Plug,
+            tr("Accept connections from programs on this Mac").to_string(),
+            false,
+        ));
+    }
+    if permissions.any_program() {
+        lines.push(line(
+            IconName::Command,
+            tr("Run any program with your rights").to_string(),
+            true,
+        ));
+    } else if !permissions.processes.is_empty() {
+        let shell = permissions
+            .processes
+            .iter()
+            .any(|program| SHELLS.contains(&program.as_str()));
+        lines.push(line(
+            IconName::Command,
+            trf("Run programs: {0}", &[&permissions.processes.join(", ")]),
+            shell,
+        ));
+    }
+    if permissions.terminal {
+        lines.push(line(
+            IconName::Terminal,
+            tr("Open terminals and type commands into them").to_string(),
+            true,
+        ));
+    }
+    for folder in &permissions.folders {
+        let path = folder.path.trim_end_matches('/');
+        let whole = matches!(path, "~" | "") || folder.path == "/";
+        let shown = if path.is_empty() { "/" } else { path };
+        let text = match folder.access {
+            FolderAccess::Read => trf("Read the folder {0}", &[&shown]),
+            FolderAccess::Write => trf("Read and change the folder {0}", &[&shown]),
+        };
+        lines.push(line(IconName::Folder, text, whole));
     }
     lines
 }
@@ -1340,13 +1436,21 @@ impl PluginManager {
             vec![permission_row(
                 IconName::CheckCircle,
                 ui.success,
-                tr("Asks for no special permissions"),
+                tr("Asks for no special permissions").into(),
+                ui.foreground,
                 ui,
             )]
         } else {
             lines
                 .into_iter()
-                .map(|(name, line)| permission_row(name, ui.accent_text, line, ui))
+                .map(|line| {
+                    let (glyph, text) = if line.broad {
+                        (ui.warning, ui.warning)
+                    } else {
+                        (ui.accent_text, ui.foreground)
+                    };
+                    permission_row(line.icon, glyph, line.text.into(), text, ui)
+                })
                 .collect()
         };
         div()
@@ -1398,6 +1502,19 @@ impl PluginManager {
                 )
             });
             sections.push(contribution_section(tr("Tool Windows"), rows, ui));
+        }
+        if !manifest.menus.is_empty() {
+            let rows = manifest.menus.iter().filter_map(|menu| {
+                let command = manifest.command(&menu.command)?;
+                let title = translated(entry, &command.title);
+                let text = match menu.location {
+                    MenuLocation::Editor => trf("Editor menu: {0}", &[&title]),
+                    MenuLocation::Tree => trf("Project tree menu: {0}", &[&title]),
+                    MenuLocation::Tab => trf("Tab menu: {0}", &[&title]),
+                };
+                Some(contribution_row(IconName::More, text, None, ui))
+            });
+            sections.push(contribution_section(tr("Context Menus"), rows, ui));
         }
         if !manifest.status_items.is_empty() {
             let count = manifest.status_items.len();
@@ -1665,17 +1782,30 @@ fn code_text(text: impl Into<SharedString>, ui: UiColors) -> AnyElement {
         .into_any_element()
 }
 
-fn permission_row(name: IconName, color: Hsla, text: &'static str, ui: UiColors) -> AnyElement {
+/// A row of the Permissions tab: the icon and the text, in the warning tone for a broad
+/// permission. A long list of hosts wraps.
+fn permission_row(
+    name: IconName,
+    color: Hsla,
+    text: SharedString,
+    text_color: Hsla,
+    ui: UiColors,
+) -> AnyElement {
     div()
         .flex()
-        .items_center()
+        .items_start()
         .gap_2p5()
         .px_2()
         .py_1p5()
         .rounded(px(ui::RADIUS_SM))
         .bg(ui.input_background)
-        .child(icon(name, color).size(px(14.)))
-        .child(div().text_color(ui.foreground).child(text))
+        .child(
+            div()
+                .flex_none()
+                .pt(px(2.))
+                .child(icon(name, color).size(px(14.))),
+        )
+        .child(div().flex_1().min_w_0().text_color(text_color).child(text))
         .into_any_element()
 }
 
@@ -1796,7 +1926,7 @@ mod tests {
 id = "someone.hello"
 name = "Hello"
 version = "1.2.0"
-api = "0.1"
+api = "0.2"
 authors = ["Someone", "Another"]
 "#;
 
@@ -1811,12 +1941,77 @@ authors = ["Someone", "Another"]
 
         let reads = format!("{HELLO}\n[permissions]\nproject = \"read\"\n");
         let dev = install_question(&candidate(&reads, CandidateKind::Folder));
-        let message = dev.message.unwrap();
-        assert!(
-            message.contains("will be able to:\n\n•  Read and search the files of the project")
-        );
+        let message = dev.message.clone().unwrap();
+        assert!(message.ends_with("will be able to:"));
         assert!(message.contains("under development"));
+        assert_eq!(dev.points.len(), 1);
+        assert_eq!(
+            dev.points[0].text.as_ref(),
+            "Read and search the files of the project"
+        );
+        assert!(!dev.points[0].warning);
+        assert_eq!(dev.level, gpui::PromptLevel::Info);
         assert_eq!(dev.buttons[INSTALL].label.as_ref(), "Install");
+    }
+
+    fn lines(permissions: &str) -> Vec<(String, bool)> {
+        let manifest =
+            Manifest::parse(&format!("{HELLO}\n[permissions]\n{permissions}\n")).unwrap();
+        permission_lines(&manifest.permissions)
+            .into_iter()
+            .map(|line| (line.text, line.broad))
+            .collect()
+    }
+
+    #[test]
+    fn permissions_read_in_plain_words() {
+        assert_eq!(
+            lines(
+                "project = \"write\"\nnetwork = [\"api.tracker.yandex.net\", \"*.yandex.ru\"]\n\
+                 server = true\nprocesses = [\"git\", \"gh\"]\n\
+                 folders = [{ path = \"~/.config/gh\" }, { path = \"/tmp/x\", access = \"write\" }]"
+            ),
+            [
+                (
+                    "Read, search and change the files of the project".into(),
+                    false
+                ),
+                (
+                    "Connect to api.tracker.yandex.net, *.yandex.ru".into(),
+                    false
+                ),
+                ("Accept connections from programs on this Mac".into(), false),
+                ("Run programs: git, gh".into(), false),
+                ("Read the folder ~/.config/gh".into(), false),
+                ("Read and change the folder /tmp/x".into(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn broad_permissions_are_marked() {
+        assert_eq!(
+            lines("network = [\"api.github.com\", \"*\"]\nprocesses = [\"*\"]\nterminal = true"),
+            [
+                ("Connect to any server on the internet".into(), true),
+                ("Run any program with your rights".into(), true),
+                ("Open terminals and type commands into them".into(), true),
+            ]
+        );
+        // A shell runs anything; so does a whole home folder.
+        assert_eq!(
+            lines(
+                "processes = [\"git\", \"bash\"]\nfolders = [{ path = \"~\", access = \"write\" }]"
+            ),
+            [
+                ("Run programs: git, bash".into(), true),
+                ("Read and change the folder ~".into(), true),
+            ]
+        );
+        let broad = format!("{HELLO}\n[permissions]\nterminal = true\n");
+        let question = install_question(&candidate(&broad, CandidateKind::Archive));
+        assert_eq!(question.level, gpui::PromptLevel::Warning);
+        assert!(question.points[0].warning);
     }
 
     #[test]
