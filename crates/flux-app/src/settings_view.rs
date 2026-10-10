@@ -24,7 +24,7 @@ use gpui::{
     AnyElement, App, AppContext as _, BoxShadow, Context, DismissEvent, Div, Entity, EventEmitter,
     FocusHandle, Focusable, FontWeight, KeyBinding, PathPromptOptions, Render, SharedString,
     Subscription, Task, WeakEntity, Window, actions, div, img, linear_color_stop, linear_gradient,
-    point, prelude::*, px,
+    point, prelude::*, px, svg,
 };
 
 use crate::appearance_settings::{AppearancePage, Page};
@@ -731,27 +731,37 @@ impl SettingsView {
     }
 
     /// The list of sections on the left; the open one is highlighted. The plugins' pages are
-    /// indented under Plugins, as the settings tree of JetBrains IDEs.
+    /// indented under Plugins, as the settings tree of JetBrains IDEs, each with the plugin's icon.
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
         let store = self.plugins.read(cx);
-        let plugin_pages: Vec<(Section, SharedString)> = self
+        let plugin_pages: Vec<(Section, SharedString, Option<SharedString>)> = self
             .plugin_pages_listed(cx)
             .into_iter()
             .filter_map(|id| {
                 let plugin = store.plugin(&id)?;
-                let name = plugin.tr(&plugin.entry.manifest.name).to_string();
-                Some((Section::Plugin(id), SharedString::from(name)))
+                let manifest = &plugin.entry.manifest;
+                let name = plugin.tr(&manifest.name).to_string();
+                let icon = (manifest.icon.as_deref()).map(|file| icons::plugin_asset(&id, file));
+                Some((Section::Plugin(id), SharedString::from(name), icon))
             })
             .collect();
-        let row = |section: Section, label: SharedString, nested: bool, cx: &mut Context<Self>| {
+        // A plugin's page shows its icon from the manifest (a puzzle piece without one) in the
+        // icons' column, so its name lines up with the rest; the other nested pages have none.
+        let row = |section: Section,
+                   label: SharedString,
+                   nested: bool,
+                   plugin_icon: Option<SharedString>,
+                   cx: &mut Context<Self>| {
             let selected = section == self.section;
+            let icon_color = if selected { ui.accent_text } else { ui.dim };
+            let with_icon = !nested || matches!(section, Section::Plugin(_));
             let icon_name = section.icon();
             div()
                 .id(SharedString::from(format!("settings-section-{}", section.key())))
                 .h(px(30.))
                 .px_2()
-                .when(nested, |row| row.pl(px(30.)))
+                .when(nested && !with_icon, |row| row.pl(px(30.)))
                 .flex()
                 .items_center()
                 .gap_2()
@@ -771,11 +781,15 @@ impl SettingsView {
                         this.select(section.clone(), window, cx)
                     }),
                 )
-                .when(!nested, |row| {
-                    row.child(
-                        icon(icon_name, if selected { ui.accent_text } else { ui.dim })
-                            .size(px(14.)),
-                    )
+                .when(with_icon, |row| match plugin_icon {
+                    Some(path) => row.child(
+                        svg()
+                            .path(path)
+                            .flex_none()
+                            .size(px(14.))
+                            .text_color(icon_color),
+                    ),
+                    None => row.child(icon(icon_name, icon_color).flex_none().size(px(14.))),
                 })
                 .child(div().min_w_0().truncate().child(label))
         };
@@ -816,18 +830,20 @@ impl SettingsView {
         ];
         rows.extend(Section::APPEARANCE.into_iter().map(|section| {
             let label = SharedString::from(section.label());
-            row(section, label, true, cx).into_any_element()
+            row(section, label, true, None, cx).into_any_element()
         }));
         rows.extend(Section::BUILT_IN.into_iter().map(|section| {
             let label = SharedString::from(section.label());
-            row(section, label, false, cx).into_any_element()
+            row(section, label, false, None, cx).into_any_element()
         }));
         rows.extend(
             plugin_pages
                 .into_iter()
-                .map(|(section, label)| row(section, label, true, cx).into_any_element()),
+                .map(|(section, label, icon)| {
+                    row(section, label, true, icon, cx).into_any_element()
+                }),
         );
-        rows.push(row(Section::About, tr("About").into(), false, cx).into_any_element());
+        rows.push(row(Section::About, tr("About").into(), false, None, cx).into_any_element());
         div()
             .flex_none()
             .w(px(SIDEBAR_WIDTH))
