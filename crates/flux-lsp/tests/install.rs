@@ -1,14 +1,21 @@
-//! Installs every built-in server that is not on the machine into Flux's real servers directory, so
-//! that Flux finds them ready: `cargo test -p flux-lsp --test install -- --ignored --nocapture`.
-//! `FLUX_SERVERS_DIR` sets another directory.
+//! Installs every server of the fixtures (the ten Flux had built in before its language plugins)
+//! that is not on the machine into Flux's real servers directory, so that Flux finds them ready:
+//! `cargo test -p flux-lsp --test install -- --ignored --nocapture`. `FLUX_SERVERS_DIR` sets another
+//! directory.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use flux_lsp::default_servers;
 use flux_lsp::install::{self, Progress};
+
+mod fixtures {
+    use flux_lsp::config::{Install, ServerConfig};
+    include!("fixtures/servers.rs");
+}
+
+use fixtures::default_servers;
 
 fn servers_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FLUX_SERVERS_DIR") {

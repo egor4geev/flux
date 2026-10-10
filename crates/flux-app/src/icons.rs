@@ -1,17 +1,24 @@
 //! Icons: monochrome 16×16 SVGs embedded in the binary. gpui draws an SVG as a mask, so the element
 //! sets the color (`text_color`) and one file works in any color. A file's icon and its color are
-//! chosen by name ([`file_icon`]), a directory's by [`folder_icon`].
+//! chosen by name ([`file_icon`]), a directory's by [`folder_icon`]: from the set of file icons in
+//! use (since stage 8.3 they are plugins; Flux's own set is the bundled `flux.icons`), otherwise the
+//! plain file and folder icons.
 //!
 //! Plugins (stage 8) name their icons in views and manifests ([`plugin_icon`]): a built-in icon by
 //! its file name, a file type by a file name, or an SVG of their own folder, served by [`Assets`]
 //! under `plugins/<id>/…` once the plugin's files are registered ([`register_plugin_files`]).
+//!
+//! Stage 8.3: a file's icon comes from the chosen set of file icons — a plugin's
+//! ([`crate::icon_themes`]), then from the language plugin of the file's type; an icon of a plugin
+//! is one of its SVGs ([`IconSource::Asset`]), drawn as a mask in the set's color or, for a
+//! full-color set, in its own colors ([`FileIcon::multicolor`]).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use flux_plugin::registry::PluginFiles;
-use gpui::{AssetSource, Hsla, SharedString, Svg, prelude::*, px, svg};
+use gpui::{AssetSource, Div, Hsla, SharedString, Svg, div, img, prelude::*, px, svg};
 
 use crate::theme::UiColors;
 
@@ -33,7 +40,7 @@ macro_rules! icons {
                 }
             }
 
-            /// The icon whose file is `icons/<name>.svg` ("refresh", "file-rust").
+            /// The icon whose file is `icons/<name>.svg` ("refresh", "file-plus").
             pub fn from_file_name(name: &str) -> Option<IconName> {
                 match name {
                     $($file => Some(IconName::$name),)*
@@ -76,6 +83,7 @@ icons! {
     Commit => "commit",
     Copy => "copy",
     Diff => "diff",
+    Download => "download",
     Error => "error",
     ExpandAll => "expand-all",
     File => "file",
@@ -92,8 +100,10 @@ icons! {
     Logo => "logo",
     Merge => "merge",
     Minus => "minus",
+    Moon => "moon",
     More => "more",
     Paperclip => "paperclip",
+    Palette => "palette",
     Pencil => "pencil",
     Plan => "plan",
     Plug => "plug",
@@ -118,6 +128,7 @@ icons! {
     StarFilled => "star-filled",
     Stash => "stash",
     Stop => "stop",
+    Sun => "sun",
     Tag => "tag",
     Terminal => "terminal",
     Trash => "trash",
@@ -125,33 +136,6 @@ icons! {
     Update => "update",
     Warning => "warning",
     WholeWord => "whole-word",
-    // File types
-    FileArchive => "file-archive",
-    FileC => "file-c",
-    FileCode => "file-code",
-    FileConfig => "file-config",
-    FileCss => "file-css",
-    FileDocker => "file-docker",
-    FileGit => "file-git",
-    FileGo => "file-go",
-    FileHtml => "file-html",
-    FileImage => "file-image",
-    FileJavaScript => "file-javascript",
-    FileJson => "file-json",
-    FileLicense => "file-license",
-    FileLock => "file-lock",
-    FileMarkdown => "file-markdown",
-    FilePackage => "file-package",
-    FilePython => "file-python",
-    FileReact => "file-react",
-    FileReadme => "file-readme",
-    FileRust => "file-rust",
-    FileShell => "file-shell",
-    FileSwift => "file-swift",
-    FileText => "file-text",
-    FileToml => "file-toml",
-    FileTypeScript => "file-typescript",
-    FileYaml => "file-yaml",
 }
 
 /// Default icon size, to fit a list row and 13 px text.
@@ -169,101 +153,104 @@ pub fn icon(name: IconName, color: Hsla) -> Svg {
         .text_color(color)
 }
 
-/// Icon and color for a file or directory.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FileIcon {
-    pub name: IconName,
-    pub color: Hsla,
+/// What an icon is drawn from: one of Flux's own, or an SVG of a plugin (an asset path,
+/// [`plugin_asset`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum IconSource {
+    Builtin(IconName),
+    Asset(SharedString),
 }
 
-impl FileIcon {
-    pub fn render(self) -> Svg {
-        icon(self.name, self.color)
+impl IconSource {
+    /// The path gpui asks [`Assets`] for.
+    pub fn path(&self) -> SharedString {
+        match self {
+            IconSource::Builtin(name) => name.path().into(),
+            IconSource::Asset(path) => path.clone(),
+        }
     }
 }
 
-/// A file's icon by name: exact names first (`Cargo.toml`, `Dockerfile`, `.env.local`), then the
-/// extension. The color is a palette shade by the file's language or role; utility files (lock
-/// files, unknown types) are muted.
-pub fn file_icon(file_name: &str, ui: &UiColors) -> FileIcon {
-    let lower = file_name.to_ascii_lowercase();
-    let (name, color) = match lower.as_str() {
-        "cargo.toml" => (IconName::FilePackage, ui.orange),
-        "package.json" => (IconName::FilePackage, ui.red),
-        "cargo.lock" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "bun.lockb"
-        | "poetry.lock" | "gemfile.lock" | "composer.lock" | "flake.lock" => {
-            (IconName::FileLock, ui.dim)
-        }
-        ".gitignore" | ".gitattributes" | ".gitmodules" | ".gitkeep" => (IconName::FileGit, ui.red),
-        "dockerfile"
-        | ".dockerignore"
-        | "docker-compose.yml"
-        | "docker-compose.yaml"
-        | "compose.yml"
-        | "compose.yaml" => (IconName::FileDocker, ui.blue),
-        "readme" | "readme.md" | "readme.markdown" | "readme.txt" => {
-            (IconName::FileReadme, ui.teal)
-        }
-        "makefile" | "gnumakefile" | "justfile" => (IconName::FileShell, ui.green),
-        "go.mod" | "go.sum" => (IconName::FileGo, ui.cyan),
-        "rust-toolchain" | "rust-toolchain.toml" => (IconName::FileRust, ui.orange),
-        "tsconfig.json" => (IconName::FileTypeScript, ui.blue),
-        "jsconfig.json" => (IconName::FileJavaScript, ui.amber),
-        _ if lower.starts_with("license") || lower.starts_with("licence") || lower == "copying" => {
-            (IconName::FileLicense, ui.amber)
-        }
-        _ if lower == ".env" || lower.starts_with(".env.") => (IconName::FileConfig, ui.lime),
-        _ => match lower.rsplit_once('.').map_or("", |(_, ext)| ext) {
-            "rs" => (IconName::FileRust, ui.orange),
-            "ts" | "mts" | "cts" => (IconName::FileTypeScript, ui.blue),
-            "js" | "mjs" | "cjs" => (IconName::FileJavaScript, ui.amber),
-            "tsx" | "jsx" => (IconName::FileReact, ui.cyan),
-            "json" | "jsonc" | "json5" => (IconName::FileJson, ui.amber),
-            "md" | "markdown" | "mdx" => (IconName::FileMarkdown, ui.indigo),
-            "toml" => (IconName::FileToml, ui.text_muted),
-            "yaml" | "yml" => (IconName::FileYaml, ui.pink),
-            "py" | "pyi" | "pyw" => (IconName::FilePython, ui.blue),
-            "go" => (IconName::FileGo, ui.cyan),
-            "sh" | "bash" | "zsh" | "fish" | "ksh" => (IconName::FileShell, ui.green),
-            "swift" => (IconName::FileSwift, ui.orange),
-            "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "m" | "mm" => {
-                (IconName::FileC, ui.indigo)
-            }
-            "html" | "htm" | "xhtml" => (IconName::FileHtml, ui.orange),
-            "css" | "scss" | "sass" | "less" => (IconName::FileCss, ui.violet),
-            "lock" => (IconName::FileLock, ui.dim),
-            "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" | "tiff" | "avif"
-            | "icns" => (IconName::FileImage, ui.violet),
-            "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "zst" | "dmg" => {
-                (IconName::FileArchive, ui.amber)
-            }
-            "txt" | "log" | "text" | "rst" => (IconName::FileText, ui.text_muted),
-            "env" | "ini" | "cfg" | "conf" | "editorconfig" | "properties" | "plist" => {
-                (IconName::FileConfig, ui.lime)
-            }
-            "rb" => (IconName::FileCode, ui.red),
-            "java" | "xml" | "svelte" => (IconName::FileCode, ui.orange),
-            "kt" | "kts" | "wasm" | "wat" => (IconName::FileCode, ui.violet),
-            "php" => (IconName::FileCode, ui.indigo),
-            "lua" | "dart" => (IconName::FileCode, ui.blue),
-            "sql" => (IconName::FileCode, ui.amber),
-            "vue" | "zig" => (IconName::FileCode, ui.green),
-            _ => (IconName::File, ui.text_muted),
-        },
-    };
-    FileIcon { name, color }
+/// Icon and color for a file or directory.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileIcon {
+    pub source: IconSource,
+    /// The color of the file type: the icon's (unless it is multicolor), and the tints that go with
+    /// the file (a tab's badge).
+    pub color: Hsla,
+    /// The SVG has colors of its own (a full-color set of icons): drawn as an image, not as a mask.
+    pub multicolor: bool,
 }
 
-/// Directory icon: open or closed.
-pub fn folder_icon(expanded: bool, ui: &UiColors) -> FileIcon {
-    FileIcon {
-        name: if expanded {
+impl FileIcon {
+    /// One of Flux's icons in `color`.
+    pub fn builtin(name: IconName, color: Hsla) -> Self {
+        Self {
+            source: IconSource::Builtin(name),
+            color,
+            multicolor: false,
+        }
+    }
+
+    /// A box of [`ICON_SIZE`] with the icon filling it: `size` and margins of the box apply. A
+    /// full-color icon takes the alpha of [`FileIcon::color`] as its opacity: a list mutes an icon
+    /// (an excluded file) by tinting its color.
+    pub fn render(&self) -> Div {
+        let path = self.source.path();
+        let inner = if self.multicolor {
+            img(path)
+                .size_full()
+                .opacity(self.color.a)
+                .into_any_element()
+        } else {
+            svg()
+                .path(path)
+                .size_full()
+                .text_color(self.color)
+                .into_any_element()
+        };
+        div().flex_none().size(px(ICON_SIZE)).child(inner)
+    }
+}
+
+/// An icon drawn from `source` as a mask in `color`, in a box of [`ICON_SIZE`].
+pub fn source_icon(source: &IconSource, color: Hsla) -> Div {
+    div()
+        .flex_none()
+        .size(px(ICON_SIZE))
+        .child(svg().path(source.path()).size_full().text_color(color))
+}
+
+/// A file's icon by name: the chosen set of file icons first, then the icon of the file's
+/// language (both from plugins, [`crate::icon_themes`]), then Flux's plain one.
+pub fn file_icon(file_name: &str, ui: &UiColors) -> FileIcon {
+    crate::icon_themes::resolve_file(file_name, ui)
+        .unwrap_or_else(|| builtin_file_icon(file_name, ui))
+}
+
+/// Flux's plain icon of a file, when no set of file icons has one for it (the set is turned off, or
+/// it doesn't know the file): the document glyph in the muted text color.
+pub fn builtin_file_icon(file_name: &str, ui: &UiColors) -> FileIcon {
+    let _ = file_name;
+    FileIcon::builtin(IconName::File, ui.text_muted)
+}
+
+/// Flux's plain folder icon, open or closed.
+pub fn builtin_folder_icon(expanded: bool, ui: &UiColors) -> FileIcon {
+    FileIcon::builtin(
+        if expanded {
             IconName::FolderOpen
         } else {
             IconName::Folder
         },
-        color: ui.folder,
-    }
+        ui.folder,
+    )
+}
+
+/// Directory icon: open or closed — the chosen set's, otherwise Flux's plain one.
+pub fn folder_icon(expanded: bool, ui: &UiColors) -> FileIcon {
+    crate::icon_themes::resolve_folder(expanded, ui)
+        .unwrap_or_else(|| builtin_folder_icon(expanded, ui))
 }
 
 /// The flux logo is a color SVG (facets and gradients); it is drawn with `img(icons::LOGO)`, not as
@@ -323,12 +310,12 @@ pub enum PluginIcon {
 }
 
 impl PluginIcon {
-    /// The icon of size [`ICON_SIZE`]: in `color`, a file type in its own.
-    pub fn render(&self, color: Hsla) -> Svg {
+    /// The icon in a box of [`ICON_SIZE`]: in `color`, a file type in its own.
+    pub fn render(&self, color: Hsla) -> Div {
         match self {
-            PluginIcon::Builtin(name) => icon(*name, color),
+            PluginIcon::Builtin(name) => source_icon(&IconSource::Builtin(*name), color),
             PluginIcon::File(file) => file.render(),
-            PluginIcon::Asset(path) => icon_at(path.clone(), color),
+            PluginIcon::Asset(path) => source_icon(&IconSource::Asset(path.clone()), color),
         }
     }
 
@@ -336,7 +323,7 @@ impl PluginIcon {
     pub fn path(&self) -> SharedString {
         match self {
             PluginIcon::Builtin(name) => name.path().into(),
-            PluginIcon::File(file) => file.name.path().into(),
+            PluginIcon::File(file) => file.source.path(),
             PluginIcon::Asset(path) => path.clone(),
         }
     }
@@ -410,9 +397,11 @@ mod tests {
     fn icons_by_file_name() {
         assert_eq!(IconName::from_file_name("refresh"), Some(IconName::Refresh));
         assert_eq!(
-            IconName::from_file_name("file-rust"),
-            Some(IconName::FileRust)
+            IconName::from_file_name("file-plus"),
+            Some(IconName::FilePlus)
         );
+        // File types are icons of the sets of file icons (plugins), not Flux's own.
+        assert_eq!(IconName::from_file_name("file-rust"), None);
         assert_eq!(IconName::from_file_name("puzzle"), Some(IconName::Puzzle));
         assert_eq!(IconName::from_file_name("nothing"), None);
         for icon in IconName::ALL {
@@ -480,32 +469,27 @@ mod tests {
     }
 
     #[test]
-    fn file_icons_by_name_then_extension() {
+    fn without_a_set_files_and_folders_are_plain() {
         let ui = Theme::flux_night().ui;
-        let name = |file: &str| file_icon(file, &ui).name;
-        assert_eq!(name("main.rs"), IconName::FileRust);
-        assert_eq!(name("Cargo.toml"), IconName::FilePackage);
-        assert_eq!(name("config.toml"), IconName::FileToml);
-        assert_eq!(name("App.TSX"), IconName::FileReact);
-        assert_eq!(name(".gitignore"), IconName::FileGit);
-        assert_eq!(name("README.md"), IconName::FileReadme);
-        assert_eq!(name("notes.md"), IconName::FileMarkdown);
-        assert_eq!(name("Makefile"), IconName::FileShell);
-        assert_eq!(name("archive.tar.gz"), IconName::FileArchive);
-        assert_eq!(name("LICENSE-MIT"), IconName::FileLicense);
-        assert_eq!(name(".env.local"), IconName::FileConfig);
-        assert_eq!(name("Cargo.lock"), IconName::FileLock);
-        assert_eq!(name("types.d.ts"), IconName::FileTypeScript);
-        assert_eq!(name("Без расширения"), IconName::File);
-        assert_eq!(name("trailing."), IconName::File);
+        assert_eq!(
+            builtin_file_icon("main.rs", &ui),
+            FileIcon::builtin(IconName::File, ui.text_muted)
+        );
+        assert!(!builtin_file_icon("main.rs", &ui).multicolor);
     }
 
     /// Directory icons are filled; the open one differs from the closed one.
     #[test]
     fn folders_open_and_closed() {
         let ui = Theme::flux_night().ui;
-        assert_eq!(folder_icon(false, &ui).name, IconName::Folder);
-        assert_eq!(folder_icon(true, &ui).name, IconName::FolderOpen);
-        assert_eq!(folder_icon(true, &ui).color, ui.folder);
+        assert_eq!(
+            builtin_folder_icon(false, &ui).source,
+            IconSource::Builtin(IconName::Folder)
+        );
+        assert_eq!(
+            builtin_folder_icon(true, &ui).source,
+            IconSource::Builtin(IconName::FolderOpen)
+        );
+        assert_eq!(builtin_folder_icon(true, &ui).color, ui.folder);
     }
 }

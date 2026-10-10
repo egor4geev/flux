@@ -6,9 +6,11 @@ mod common;
 use std::time::Duration;
 
 use common::samples::{sample, snippets};
-use common::{NaiveTree, Rng, check_points, dump, fresh_tree, parse_now, random_changes};
+use common::{
+    NaiveTree, Rng, check_points, dump, fresh_tree, language_by_name, parse_now, random_changes,
+};
 use flux_core::{ChangeSet, Rope};
-use flux_syntax::{Syntax, language_by_name};
+use flux_syntax::Syntax;
 
 /// The outcome of random edits for one language.
 #[derive(Debug, Default)]
@@ -45,9 +47,9 @@ impl Session {
         let language = language_by_name(language_name).unwrap();
         let source = sample(language_name);
         let text = Rope::from_str(&source);
-        let mut syntax = Syntax::new(language);
+        let mut syntax = Syntax::new(language.clone());
         parse_now(&mut syntax, &text);
-        let naive = NaiveTree::new(language, &source);
+        let naive = NaiveTree::new(&language, &source);
         Self {
             language_name,
             seed,
@@ -130,8 +132,8 @@ fn random_edits(language_name: &'static str, seed: u64, rounds: usize) -> Stats 
 
 #[test]
 fn samples_parse_without_errors() {
-    for language in flux_syntax::languages() {
-        let tree = fresh_tree(language, &Rope::from_str(&sample(language.name())));
+    for language in common::languages() {
+        let tree = fresh_tree(&language, &Rope::from_str(&sample(language.name())));
         assert!(
             !tree.root_node().has_error(),
             "{}: {}",
@@ -154,8 +156,9 @@ fn rust_incremental_matches_fresh_parse() {
 #[test]
 fn every_language_incremental_matches_fresh_parse() {
     let mut total = Stats::default();
-    for language in flux_syntax::languages() {
-        let stats = random_edits(language.name(), 7, 30);
+    for language in common::languages() {
+        let name: &'static str = language.name().to_string().leak();
+        let stats = random_edits(name, 7, 30);
         eprintln!("{}: {stats:?}", language.name());
         total.add(&stats);
     }
@@ -168,7 +171,7 @@ fn foreign_line_breaks_keep_points_exact() {
     let language = language_by_name("rust").unwrap();
     let mut rng = Rng::new(42);
     let mut text = Rope::from_str("fn a() {}\rfn b() {}\u{2028}fn c() {}\u{c}\n// x\u{85}y\r\n");
-    let mut syntax = Syntax::new(language);
+    let mut syntax = Syntax::new(language.clone());
     parse_now(&mut syntax, &text);
     let pool = [
         "\r",
@@ -205,8 +208,8 @@ fn edits_during_parse_are_replayed() {
         let source = sample("rust");
         let original = Rope::from_str(&source);
         let mut text = original.clone();
-        let mut syntax = Syntax::new(language);
-        let mut naive = NaiveTree::new(language, &source);
+        let mut syntax = Syntax::new(language.clone());
+        let mut naive = NaiveTree::new(&language, &source);
         let mut undo = Vec::new();
         let edit =
             |syntax: &mut Syntax, naive: &mut NaiveTree, text: &mut Rope, changes: &ChangeSet| {
@@ -257,7 +260,7 @@ fn edits_during_parse_are_replayed() {
         assert_eq!(dump(tree), dump(&naive.tree), "seed {seed}");
         assert_eq!(
             dump(tree),
-            dump(&fresh_tree(language, &text)),
+            dump(&fresh_tree(&language, &text)),
             "seed {seed}"
         );
     }
@@ -267,7 +270,7 @@ fn edits_during_parse_are_replayed() {
 fn edits_without_any_tree_or_job_need_nothing() {
     let language = language_by_name("go").unwrap();
     let mut text = Rope::from_str(&sample("go"));
-    let mut syntax = Syntax::new(language);
+    let mut syntax = Syntax::new(language.clone());
     let mut rng = Rng::new(5);
     for _ in 0..10 {
         let changes = random_changes(&mut rng, &text, snippets("go"));
@@ -278,7 +281,7 @@ fn edits_without_any_tree_or_job_need_nothing() {
     parse_now(&mut syntax, &text);
     assert_eq!(
         dump(syntax.tree().unwrap()),
-        dump(&fresh_tree(language, &text))
+        dump(&fresh_tree(&language, &text))
     );
 }
 
@@ -320,8 +323,8 @@ fn abandoned_job_is_replaced() {
 fn foreign_and_stale_results_are_rejected() {
     let rust = language_by_name("rust").unwrap();
     let text = Rope::from_str("fn main() {}\n");
-    let mut a = Syntax::new(rust);
-    let mut b = Syntax::new(rust);
+    let mut a = Syntax::new(rust.clone());
+    let mut b = Syntax::new(rust.clone());
     let job_a = a.parse_job(&text).unwrap();
     let job_b = b.parse_job(&text).unwrap();
     assert!(!a.finish(job_b.run()), "result of another Syntax");
@@ -369,7 +372,7 @@ fn big_rust() -> Rope {
 fn tiny_budget_on_big_text_yields_job_that_can_finish() {
     let language = language_by_name("rust").unwrap();
     let mut text = big_rust();
-    let mut syntax = Syntax::new(language);
+    let mut syntax = Syntax::new(language.clone());
     let job = syntax.parse_job(&text).unwrap();
     let job = match job.run_with_budget(Duration::ZERO) {
         Ok(_) => panic!("a big text cannot be parsed in zero time"),
@@ -401,7 +404,7 @@ fn tiny_budget_on_big_text_yields_job_that_can_finish() {
     parse_now(&mut syntax, &text);
     assert_eq!(
         dump(syntax.tree().unwrap()),
-        dump(&fresh_tree(language, &text))
+        dump(&fresh_tree(&language, &text))
     );
 }
 
@@ -409,7 +412,7 @@ fn tiny_budget_on_big_text_yields_job_that_can_finish() {
 fn small_edit_reparses_within_budget() {
     let language = language_by_name("rust").unwrap();
     let mut text = big_rust();
-    let mut syntax = Syntax::new(language);
+    let mut syntax = Syntax::new(language.clone());
     parse_now(&mut syntax, &text);
     // A newline between functions: the text stays error-free.
     let at = text.line_to_char(text.len_lines() / 2 / 6 * 6);
@@ -424,6 +427,6 @@ fn small_edit_reparses_within_budget() {
     assert!(syntax.finish(result));
     assert_eq!(
         dump(syntax.tree().unwrap()),
-        dump(&fresh_tree(language, &text))
+        dump(&fresh_tree(&language, &text))
     );
 }

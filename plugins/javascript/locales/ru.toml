@@ -1,0 +1,3 @@
+# The Russian interface of the plugin: English text = translation (the manifest's strings).
+"JavaScript and TypeScript" = "JavaScript и TypeScript"
+"JavaScript, TypeScript, JSX and TSX: highlighting, and the TypeScript language server with errors, completion, navigation and refactoring." = "JavaScript, TypeScript, JSX и TSX: подсветка и языковой сервер TypeScript — ошибки, подсказки, навигация и рефакторинг."

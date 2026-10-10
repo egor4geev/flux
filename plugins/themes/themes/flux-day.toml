@@ -1,0 +1,135 @@
+# Flux Day — the light theme of Flux: islands of near-white glass on a light frosted frame over the
+# blurred desktop; the accent is the indigo of Flux Night, deepened for light. Text, states, version
+# control and the palette's shades are darker than Night's, to read on light. Code is in the GitHub
+# Light palette (Primer, "prettylights"): keywords and operators red, functions purple, types,
+# constructors and parameters brown-orange, strings navy, constants, numbers, properties and
+# built-ins blue, tags green, comments gray.
+#
+# The base of every light theme: a light theme names only what it changes. Tokens: `docs/themes.md`.
+name = "Flux Day"
+appearance = "light"
+
+[ui]
+# Surfaces (glass)
+frame = "#e8ebf2cc"
+frame_glow = "#5862e61f"
+island = "#fbfcfef0"
+island_border = "#1d23331a"
+sheen = "#ffffffd9"
+elevated = "#fefeffff"
+elevated_border = "#1d233324"
+shadow = "#3c476640"
+backdrop = "#3c47662e"
+divider = "#1d233314"
+# Text
+foreground = "#1d2333"
+text_muted = "#545d75"
+dim = "#7d859c"
+text_disabled = "#a9afc0"
+# Interaction
+accent = "#5862e6"
+accent_text = "#4a52d4"
+accent_soft = "#5862e624"
+on_accent = "#ffffff"
+hover = "#1d23330d"
+pressed = "#1d233317"
+list_selected = "#5862e62e"
+list_selected_inactive = "#1d233314"
+input_background = "#ffffffe6"
+input_border = "#1d233324"
+focus_border = "#5862e6d9"
+focus_ring = "#5862e640"
+drop_target = "#5862e62e"
+keycap = "#1d23330d"
+keycap_border = "#1d233326"
+# States
+success = "#1a8a4f"
+warning = "#b26a00"
+error = "#d1343a"
+info = "#2a6fd1"
+modified = "#c96a12"
+# Editor
+current_line = "#1d233308"
+selection = "#5862e630"
+cursor = "#4a52d4"
+match_text = "#4a52d4"
+search_match = "#ffcc0059"
+search_match_active = "#ffa600a6"
+# Version control: names in the tree, the tabs, the commit window
+vcs_modified = "#2563c7"
+vcs_added = "#1d8048"
+vcs_deleted = "#7a8199"
+vcs_renamed = "#0c7f78"
+vcs_untracked = "#b8502d"
+vcs_conflict = "#d1343a"
+# Diffs: gutter markers, blocks, changed words; the merge tool
+diff_added = "#2da44e"
+diff_modified = "#3b7fe0"
+diff_deleted = "#8c95a6"
+diff_added_bg = "#2da44e1f"
+diff_modified_bg = "#3b7fe01c"
+diff_deleted_bg = "#8c95a61f"
+diff_added_word = "#2da44e4d"
+diff_modified_word = "#3b7fe047"
+diff_deleted_word = "#8c95a64d"
+diff_conflict = "#d1343a"
+diff_conflict_bg = "#d1343a1c"
+diff_conflict_word = "#d1343a47"
+diff_resolved_bg = "#8c95a614"
+# Git history
+graph_lanes = ["#2f6fd6", "#1f9455", "#8250df", "#d9621f", "#0b8fc4", "#d03d82", "#b88200", "#0f8f86"]
+blame_recent = "#5862e62e"
+# Shades: meaning, not decoration (file types, categories, counters)
+blue = "#2f6fd6"
+indigo = "#5862e6"
+violet = "#8250df"
+pink = "#d03d82"
+red = "#d1343a"
+orange = "#d9621f"
+amber = "#b88200"
+lime = "#5c8f12"
+green = "#1f9455"
+teal = "#0f8f86"
+cyan = "#0b8fc4"
+folder = "#4b7fdc"
+
+[syntax]
+attribute = "#0550ae"
+boolean = "#0550ae"
+comment = "#6e7781"
+constant = "#0550ae"
+constructor = "#953800"
+# Code inside `${…}` and f-strings is not a string.
+embedded = "#1f2328"
+escape = "#0550ae"
+function = "#8250df"
+keyword = "#cf222e"
+label = "#953800"
+number = "#0550ae"
+operator = "#cf222e"
+property = "#0550ae"
+punctuation = "#1f2328"
+"punctuation.special" = "#cf222e"
+string = "#0a3069"
+"string.escape" = "#0550ae"
+"string.special" = "#116329"
+tag = "#116329"
+"text.literal" = "#0550ae"
+"text.reference" = "#0a3069"
+"text.title" = { color = "#0550ae", bold = true }
+"text.uri" = "#0a3069"
+type = "#953800"
+"type.builtin" = "#0550ae"
+variable = "#1f2328"
+"variable.builtin" = "#0550ae"
+"variable.parameter" = "#953800"
+
+# The terminal in GitHub Light: "white" is a gray that reads on the light island.
+[terminal]
+foreground = "#1f2328"
+background = "#fbfcfe"
+cursor = "#4a52d4"
+ansi = [
+    "#24292f", "#cf222e", "#116329", "#4d2d00", "#0969da", "#8250df", "#1b7c83", "#6e7781",
+    "#57606a", "#a40e26", "#1a7f37", "#633c01", "#218bff", "#a475f9", "#3192aa", "#8c959f",
+]

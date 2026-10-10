@@ -1,0 +1,67 @@
+# JavaScript and TypeScript come with Flux (stage 8.3): the bundled plugin, as in JetBrains IDEs. The
+# other languages are plugins of the catalog. The grammars are compiled into Flux (`builtin`); the
+# highlighting queries are the grammars' own (MIT), in `languages/`.
+id = "flux.javascript"
+name = "JavaScript and TypeScript"
+version = "0.1.0"
+api = "0.2"
+authors = ["Egor Ageev"]
+description = "JavaScript, TypeScript, JSX and TSX: highlighting, and the TypeScript language server with errors, completion, navigation and refactoring."
+repository = "https://github.com/egor4geev/flux"
+
+[[languages]]
+id = "javascript"
+name = "JavaScript"
+extensions = ["js", "mjs", "cjs"]
+aliases = ["js", "node"]
+grammar = "javascript"
+# JSX is allowed in .js files too. The order of the parts follows the grammar's tree-sitter.json.
+highlights = ["languages/javascript.scm", "languages/jsx.scm", "languages/javascript-params.scm"]
+
+[[languages]]
+id = "jsx"
+name = "JavaScript JSX"
+extensions = ["jsx"]
+grammar = "javascript"
+highlights = ["languages/javascript.scm", "languages/jsx.scm", "languages/javascript-params.scm"]
+lsp-id = "javascriptreact"
+
+# The TypeScript query supplements the JavaScript one. The grammar's tree-sitter.json lists it first,
+# the order from the "earlier pattern wins" days; with "the later pattern wins", the TypeScript parts
+# must come after JavaScript, or its generic `(identifier) @variable` would override them.
+[[languages]]
+id = "typescript"
+name = "TypeScript"
+extensions = ["ts", "mts", "cts"]
+aliases = ["ts"]
+grammar = "typescript"
+highlights = ["languages/javascript.scm", "languages/typescript.scm"]
+
+[[languages]]
+id = "tsx"
+name = "TSX"
+extensions = ["tsx"]
+grammar = "tsx"
+highlights = ["languages/javascript.scm", "languages/jsx.scm", "languages/typescript.scm"]
+lsp-id = "typescriptreact"
+
+[[grammars]]
+id = "javascript"
+builtin = "javascript"
+
+[[grammars]]
+id = "typescript"
+builtin = "typescript"
+
+[[grammars]]
+id = "tsx"
+builtin = "tsx"
+
+# TypeScript 6: the last one with `tsserver`, which typescript-language-server drives; TypeScript 7
+# is native and has an LSP server of its own.
+[[language-servers]]
+id = "typescript-language-server"
+command = "typescript-language-server"
+args = ["--stdio"]
+languages = ["javascript", "jsx", "typescript", "tsx"]
+install = { npm = ["typescript-language-server", "typescript@6"], bin = "typescript-language-server" }

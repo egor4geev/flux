@@ -1,0 +1,16 @@
+# Flux's own color themes (stage 8.3): the bundled plugin, part of Flux — it can't be turned off,
+# and the themes of other plugins sit next to them in Settings → Appearance → Theme. The format of a
+# theme file is in `docs/themes.md`.
+id = "flux.themes"
+name = "Flux Themes"
+version = "0.1.0"
+api = "0.2"
+authors = ["Egor Ageev"]
+description = "Flux Night and Flux Day: the color themes of Flux, dark and light, on frosted glass."
+repository = "https://github.com/egor4geev/flux"
+
+[[themes]]
+file = "themes/flux-night.toml"
+
+[[themes]]
+file = "themes/flux-day.toml"

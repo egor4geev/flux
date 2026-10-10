@@ -137,17 +137,18 @@ pub fn source(config: &ServerConfig) -> Source {
     if let Some(path) = config.resolve_system_command() {
         return Source::System(path);
     }
-    match dir().filter(|dir| installed_in(dir, config).is_some()) {
-        Some(dir) => Source::Flux {
-            version: installed_version(&dir, config),
+    match dir().and_then(|dir| installed_home(&dir, config)) {
+        Some((home, _)) => Source::Flux {
+            version: installed_version(&home, config),
         },
         None => Source::Missing,
     }
 }
 
-/// From `install.json`: `version`, or for an npm server — the version of its package.
-fn installed_version(dir: &Path, config: &ServerConfig) -> Option<String> {
-    let manifest = fs::read_to_string(dir.join(&config.name).join("install.json")).ok()?;
+/// From the `install.json` of the server's folder: `version`, or for an npm server — the version of
+/// its package.
+fn installed_version(home: &Path, config: &ServerConfig) -> Option<String> {
+    let manifest = fs::read_to_string(home.join("install.json")).ok()?;
     let manifest: Value = serde_json::from_str(&manifest).ok()?;
     let version = match (&manifest["version"], &config.install) {
         (Value::String(version), _) => version.as_str(),
@@ -205,17 +206,43 @@ pub(crate) fn installed_command(config: &ServerConfig) -> Option<PathBuf> {
 /// The command, if `<dir>/<name>` has the server installed by the same recipe: when a new Flux
 /// changes the recipe (another package version, another source), the old install is replaced.
 fn installed_in(dir: &Path, config: &ServerConfig) -> Option<PathBuf> {
+    installed_home(dir, config).map(|(_, command)| command)
+}
+
+/// Where the server is installed (its folder) and its command. An npm server may live in the folder
+/// of another server installed from the same packages: the JSON, HTML and CSS servers all come from
+/// `vscode-langservers-extracted`, and one copy (~90 MB) serves the three.
+fn installed_home(dir: &Path, config: &ServerConfig) -> Option<(PathBuf, PathBuf)> {
     let recipe = config.install.as_ref()?;
-    let path = command_path(dir, &config.name, recipe);
     let node_ready = !matches!(recipe, Install::Npm { .. })
         || is_executable(&dir.join("node").join("bin").join("node"));
-    let same_recipe = || {
-        let manifest = fs::read_to_string(dir.join(&config.name).join("install.json")).ok()?;
+    if !node_ready {
+        return None;
+    }
+    let recipe_of = |home: &Path| -> Option<String> {
+        let manifest = fs::read_to_string(home.join("install.json")).ok()?;
         let manifest: Value = serde_json::from_str(&manifest).ok()?;
-        let installed = manifest["recipe"].as_str()?;
-        Some(installed == recipe_key(recipe))
+        manifest["recipe"].as_str().map(str::to_string)
     };
-    (node_ready && is_executable(&path) && same_recipe() == Some(true)).then_some(path)
+    let home = dir.join(&config.name);
+    let path = command_path(dir, &config.name, recipe);
+    if is_executable(&path) && recipe_of(&home).as_deref() == Some(recipe_key(recipe).as_str()) {
+        return Some((home, path));
+    }
+    let Install::Npm { packages, bin } = recipe else {
+        return None;
+    };
+    let same_packages = format!("npm:{}:", packages.join(","));
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|other| other.is_dir() && *other != home)
+        .find_map(|other| {
+            let command = other.join("node_modules").join(".bin").join(bin);
+            let shared = recipe_of(&other).is_some_and(|key| key.starts_with(&same_packages));
+            (shared && is_executable(&command)).then_some((other, command))
+        })
 }
 
 /// What an install was made from, kept in its `install.json`.
@@ -1599,7 +1626,7 @@ mod tests {
     #[ignore]
     fn real_concurrent_installs_wait_for_each_other() {
         let dir = tempfile::tempdir().unwrap();
-        let config = crate::default_servers()
+        let config = crate::fixtures::default_servers()
             .into_iter()
             .find(|c| c.name == "taplo")
             .unwrap();
@@ -1663,6 +1690,59 @@ mod tests {
         .unwrap();
         assert_eq!(installed_in(dir.path(), &old), Some(bin));
         assert_eq!(installed_in(dir.path(), &tool("tool-2.gz")), None);
+    }
+
+    #[test]
+    fn npm_servers_of_the_same_packages_share_an_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("node/bin/node");
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        fs::write(&node, "").unwrap();
+        make_executable(&node).unwrap();
+        let server = |name: &str, bin: &str| {
+            config(
+                name,
+                Install::Npm {
+                    packages: vec!["vscode-langservers-extracted".into()],
+                    bin: bin.into(),
+                },
+            )
+        };
+        let json = server("vscode-json-language-server", "vscode-json-language-server");
+        let html = server("vscode-html-language-server", "vscode-html-language-server");
+        let home = dir.path().join("vscode-json-language-server");
+        for bin in ["vscode-json-language-server", "vscode-html-language-server"] {
+            let path = home.join("node_modules/.bin").join(bin);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "").unwrap();
+            make_executable(&path).unwrap();
+        }
+        assert_eq!(installed_in(dir.path(), &html), None, "no manifest yet");
+        write_manifest(
+            &home,
+            json!({
+                "recipe": recipe_key(json.install.as_ref().unwrap()),
+                "packages": { "vscode-langservers-extracted": "4.10.0" },
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            installed_in(dir.path(), &html),
+            Some(home.join("node_modules/.bin/vscode-html-language-server"))
+        );
+        assert_eq!(
+            installed_version(&installed_home(dir.path(), &html).unwrap().0, &html).as_deref(),
+            Some("4.10.0")
+        );
+        // Another package set doesn't count.
+        let other = config(
+            "x-server",
+            Install::Npm {
+                packages: vec!["other".into()],
+                bin: "vscode-html-language-server".into(),
+            },
+        );
+        assert_eq!(installed_in(dir.path(), &other), None);
     }
 
     #[test]

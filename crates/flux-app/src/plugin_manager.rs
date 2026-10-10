@@ -7,7 +7,14 @@
 //! the selected plugin on the right: who made it, its buttons, and tabs — Overview, Permissions,
 //! Contributions, Log. The gear menu installs a plugin from a folder (under development: Flux
 //! builds it with cargo and reloads it when it changes) or an archive, and reloads the plugins
-//! under development. The catalog (Marketplace) comes in 8.3.
+//! under development.
+//!
+//! Stage 8.3: two tabs at the top, as in JetBrains IDEs — Marketplace (the catalog,
+//! [`crate::plugin_catalog`]) and Installed (the list above). An installed plugin the catalog has a
+//! newer version of offers «Update to …», and the list says how many updates there are, with
+//! «Update All»; the Contributions tab lists the languages, language servers, themes and icon sets
+//! a plugin brings, and what of them couldn't be read. Flux Themes is part of Flux: it can't be
+//! turned off (Flux needs a theme).
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -16,7 +23,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use flux_plugin::install::{Candidate, CandidateKind};
 use flux_plugin::log::{Level, LogLine, PluginLog};
-use flux_plugin::manifest::{FolderAccess, Manifest, MenuLocation, Permissions, ProjectAccess};
+use flux_plugin::catalog::IndexEntry;
+use flux_plugin::manifest::{
+    FolderAccess, GrammarSourceSpec, InstallSpec, Manifest, MenuLocation, Permissions,
+    ProjectAccess,
+};
 use flux_plugin::registry::{PluginEntry, PluginSource, ScanError};
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, DismissEvent, Div,
@@ -32,7 +43,9 @@ use crate::dialog::Dialog;
 use crate::i18n::{lang_code, tr, trf, trn};
 use crate::icons::{self, IconName, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::plugin_catalog::{self, PluginCatalog};
 use crate::plugins::{self, PluginStatus, PluginStore};
+use crate::settings;
 use crate::settings_view::{self, Section};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
@@ -181,12 +194,20 @@ async fn install_path(
 }
 
 /// The index of Install in [`install_question`].
-const INSTALL: usize = 0;
+pub(crate) const INSTALL: usize = 0;
+
+/// Bundled plugins that are part of Flux: they can't be turned off (Flux needs a theme).
+pub(crate) const ESSENTIAL: &[&str] = &["flux.themes"];
+
+/// Whether the plugin is part of Flux ([`ESSENTIAL`]).
+pub(crate) fn is_essential(id: &str) -> bool {
+    ESSENTIAL.contains(&id)
+}
 
 /// The question before installing: who made the plugin and what it will be able to do. A plugin
 /// with a broad permission (any server, any program, terminals, a whole home folder) is asked
 /// about as a warning, and those lines are in the warning tone.
-fn install_question(candidate: &Candidate) -> Dialog {
+pub(crate) fn install_question(candidate: &Candidate) -> Dialog {
     let entry = &candidate.entry;
     let manifest = &entry.manifest;
     let mut paragraphs: Vec<String> = Vec::new();
@@ -462,6 +483,22 @@ impl Tab {
     }
 }
 
+/// The tabs at the top of the page, as in JetBrains IDEs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    Marketplace,
+    Installed,
+}
+
+impl Page {
+    fn label(self) -> &'static str {
+        match self {
+            Page::Marketplace => tr("Marketplace"),
+            Page::Installed => tr("Installed"),
+        }
+    }
+}
+
 pub enum PluginManagerEvent {
     /// «Settings» of a plugin: its page in Settings.
     OpenSettings(SharedString),
@@ -471,6 +508,10 @@ pub enum PluginManagerEvent {
 pub struct PluginManager {
     plugins: Entity<PluginStore>,
     workspace: WeakEntity<Workspace>,
+    /// Marketplace or Installed.
+    page: Page,
+    /// The Marketplace, made when first shown.
+    catalog: Option<Entity<PluginCatalog>>,
     search: Entity<TextInput>,
     /// The plugin shown on the right, by id.
     selected: Option<SharedString>,
@@ -516,10 +557,14 @@ impl PluginManager {
                 this.plugins_changed(cx);
                 cx.notify()
             }),
+            // Updates offered on the Installed tab follow the catalog.
+            cx.observe_global::<plugin_catalog::Catalog>(|_, cx| cx.notify()),
         ];
         let mut manager = Self {
             plugins,
             workspace,
+            page: Page::Marketplace,
+            catalog: None,
             search,
             selected: None,
             tab: Tab::Overview,
@@ -530,11 +575,41 @@ impl PluginManager {
             _subscriptions: subscriptions,
         };
         manager.plugins_changed(cx);
+        // The catalog is read for the updates of the Installed tab too.
+        plugin_catalog::index(cx);
+        plugin_catalog::ensure_fresh(cx);
         #[cfg(feature = "scenario")]
         manager.scenario_start(window, cx);
         #[cfg(not(feature = "scenario"))]
         let _ = window;
+        if manager.page == Page::Marketplace {
+            manager.catalog(cx);
+        }
         manager
+    }
+
+    /// The Marketplace: made once, then kept with its search and selection.
+    fn catalog(&mut self, cx: &mut Context<Self>) -> Entity<PluginCatalog> {
+        if let Some(catalog) = &self.catalog {
+            return catalog.clone();
+        }
+        let plugins = self.plugins.clone();
+        let workspace = self.workspace.clone();
+        let catalog = cx.new(|cx| PluginCatalog::new(plugins, workspace, cx));
+        self.catalog = Some(catalog.clone());
+        catalog
+    }
+
+    /// Shows a tab of the page; the focus goes to its search, as JetBrains IDEs do.
+    pub fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page != page {
+            self.page = page;
+            if page == Page::Marketplace {
+                self.catalog(cx);
+            }
+            cx.notify();
+        }
+        self.focus_search(window, cx);
     }
 
     /// Shows a plugin on the right.
@@ -549,6 +624,7 @@ impl PluginManager {
     /// Shows a plugin even if the search would hide it (one just installed): the search is
     /// cleared.
     pub fn reveal(&mut self, id: SharedString, cx: &mut Context<Self>) {
+        self.page = Page::Installed;
         if !self.search.read(cx).is_empty() {
             self.search.update(cx, |search, cx| search.set_text("", cx));
         }
@@ -557,7 +633,30 @@ impl PluginManager {
 
     /// The Plugins page was opened: typing goes to the search.
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.search.focus_handle(cx));
+        match (self.page, &self.catalog) {
+            (Page::Marketplace, Some(catalog)) => catalog.read(cx).focus_search(window, cx),
+            _ => window.focus(&self.search.focus_handle(cx)),
+        }
+    }
+
+    /// The catalog's newer versions of the installed plugins, by id.
+    fn updates(&self, cx: &App) -> Vec<IndexEntry> {
+        let Some(index) = plugin_catalog::peek(cx) else {
+            return Vec::new();
+        };
+        plugin_catalog::updates(self.plugins.read(cx), &index)
+    }
+
+    /// The catalog's newer version of a plugin, if any.
+    fn update_of(&self, id: &str, cx: &App) -> Option<IndexEntry> {
+        self.updates(cx).into_iter().find(|entry| entry.id == id)
+    }
+
+    /// Updates every plugin the catalog has a newer version of.
+    fn update_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for entry in self.updates(cx) {
+            plugin_catalog::install(entry, self.workspace.clone(), window, cx);
+        }
     }
 
     /// The plugins of the store, in the order of the list (groups, then the store's order).
@@ -620,11 +719,21 @@ impl PluginManager {
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection(1, cx);
+        match (self.page, &self.catalog) {
+            (Page::Marketplace, Some(catalog)) => {
+                catalog.update(cx, |catalog, cx| catalog.select_next(1, cx))
+            }
+            _ => self.move_selection(1, cx),
+        }
     }
 
     fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection(-1, cx);
+        match (self.page, &self.catalog) {
+            (Page::Marketplace, Some(catalog)) => {
+                catalog.update(cx, |catalog, cx| catalog.select_next(-1, cx))
+            }
+            _ => self.move_selection(-1, cx),
+        }
     }
 
     fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
@@ -652,6 +761,9 @@ impl PluginManager {
     }
 
     fn set_enabled(&mut self, id: &str, enabled: bool, cx: &mut Context<Self>) {
+        if !enabled && is_essential(id) {
+            return;
+        }
         self.plugins
             .update(cx, |store, cx| store.set_enabled(id, enabled, cx));
         cx.notify();
@@ -736,6 +848,7 @@ impl PluginManager {
         let menu = cx.new(|cx| {
             ContextMenu::new(window, cx)
                 .entry(tr("Install Plugin from Disk…"), plugins::InstallFromDisk)
+                .entry(tr("Check for Updates"), crate::plugin_updates::CheckForUpdates)
                 .separator()
                 .entry_if(
                     has_dev,
@@ -786,6 +899,12 @@ impl PluginManager {
     fn scenario_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Ok(id) = std::env::var("FLUX_SCENARIO_PLUGIN") {
             self.selected = Some(id.into());
+            self.page = Page::Installed;
+        }
+        match std::env::var("FLUX_SCENARIO_PLUGINS_PAGE").as_deref() {
+            Ok("installed") => self.page = Page::Installed,
+            Ok("marketplace") => self.page = Page::Marketplace,
+            _ => {}
         }
         if let Ok(tab) = std::env::var("FLUX_SCENARIO_PLUGIN_TAB") {
             self.tab = match tab.as_str() {
@@ -814,6 +933,7 @@ impl PluginManager {
             }
         }
         if std::env::var_os("FLUX_SCENARIO_INSTALL_PATH").is_some() {
+            self.page = Page::Installed;
             let manager = cx.weak_entity();
             let workspace = self.workspace.clone();
             window.defer(cx, move |window, cx| {
@@ -826,10 +946,36 @@ impl PluginManager {
 // --- Drawing ---
 
 impl PluginManager {
-    /// The page's title, a line about plugins, and the gear menu.
+    /// The page's title, a line about plugins, the tabs, and the gear menu.
     fn render_header(&self, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
         let menu_open = self.menu.is_some();
+        let updates = self.updates(cx).len();
+        let tabs = [Page::Marketplace, Page::Installed].map(|page| {
+            let active = self.page == page;
+            div()
+                .id(SharedString::from(format!("plugins-page-{page:?}")))
+                .h(px(26.))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .rounded(px(ui::RADIUS_SM))
+                .cursor_pointer()
+                .font_weight(FontWeight::MEDIUM)
+                .when(active, |tab| tab.bg(ui.pressed).text_color(ui.foreground))
+                .when(!active, |tab| {
+                    tab.text_color(ui.text_muted)
+                        .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
+                })
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.set_page(page, window, cx)
+                }))
+                .child(page.label())
+                .when(page == Page::Installed && updates > 0, |tab| {
+                    tab.child(ui::badge(updates.to_string(), ui.accent_text))
+                })
+        });
         div()
             .flex_none()
             .px_4()
@@ -856,6 +1002,18 @@ impl PluginManager {
                     ))),
             )
             .child(
+                div()
+                    .flex_none()
+                    .p_0p5()
+                    .flex()
+                    .gap_0p5()
+                    .rounded(px(ui::RADIUS_MD))
+                    .bg(ui.input_background)
+                    .border_1()
+                    .border_color(ui.island_border)
+                    .children(tabs),
+            )
+            .child(
                 ui::toggle_button("plugins-gear", IconName::Settings, menu_open, ui)
                     .tooltip(ui::tooltip(tr("Install and Reload"), None))
                     .on_mouse_down(
@@ -868,10 +1026,50 @@ impl PluginManager {
             )
     }
 
-    /// The list: the search field, then the groups of plugins.
+    /// The list: the search field, the updates, then the groups of plugins; at the bottom, whether
+    /// Flux looks for updates when it starts.
     fn render_list(&self, listed: &[Shown], any: bool, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
         let mut rows: Vec<AnyElement> = Vec::new();
+        let updates = self.updates(cx).len();
+        if updates > 0 {
+            rows.push(
+                div()
+                    .mx_1()
+                    .mb_1()
+                    .px_2()
+                    .py_1p5()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(ui::RADIUS_SM))
+                    .bg(UiColors::tint(ui.accent, 0.10))
+                    .child(icon(IconName::Download, ui.accent_text).size(px(13.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(theme::TEXT_SM))
+                            .text_color(ui.foreground)
+                            .child(trn(updates, "{n} update", "{n} updates")),
+                    )
+                    .child(
+                        div()
+                            .id("plugins-update-all")
+                            .flex_none()
+                            .text_size(px(theme::TEXT_SM))
+                            .text_color(ui.accent_text)
+                            .cursor_pointer()
+                            .hover(|style| style.underline())
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.update_all(window, cx)
+                            }))
+                            .child(tr("Update All")),
+                    )
+                    .into_any_element(),
+            );
+        }
         for group in GROUPS {
             let members: Vec<&Shown> = listed
                 .iter()
@@ -952,6 +1150,32 @@ impl PluginManager {
                 .children(rows)
                 .into_any_element()
         };
+        let check = settings::check_plugin_updates(cx);
+        let footer = div()
+            .flex_none()
+            .px_2p5()
+            .py_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_t_1()
+            .border_color(ui.divider)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(ui.text_muted)
+                    .child(tr("Check for updates at start")),
+            )
+            .child(
+                ui::switch("plugins-check-updates", check, ui).on_click(cx.listener(
+                    move |_, _: &ClickEvent, _, cx| {
+                        settings::set_check_plugin_updates(!check, cx);
+                        cx.notify()
+                    },
+                )),
+            );
         div()
             .flex_none()
             .w(px(LIST_WIDTH))
@@ -963,6 +1187,7 @@ impl PluginManager {
             .border_color(ui.island_border)
             .child(div().flex_none().p_2().child(self.search.clone()))
             .child(body)
+            .child(footer)
     }
 
     /// A plugin in the list: its icon, name and version, what it's doing, and its switch.
@@ -971,7 +1196,18 @@ impl PluginManager {
         let selected = self.selected.as_ref() == Some(&plugin.id);
         let on = plugin.on();
         let available = plugin.available();
-        let (status, status_color) = status_line(plugin, ui);
+        let (mut status, mut status_color) = status_line(plugin, ui);
+        if let Some(update) = self.update_of(&plugin.id, cx)
+            && plugin_catalog::progress(&plugin.id, cx).is_none()
+        {
+            status = trf("Update available: {0}", &[&update.version]).into();
+            status_color = ui.accent_text;
+        }
+        if let Some(progress) = plugin_catalog::progress(&plugin.id, cx) {
+            status = progress.label().into();
+            status_color = ui.accent_text;
+        }
+        let essential = is_essential(&plugin.id);
         let id = plugin.id.clone();
         let switch_id = plugin.id.clone();
         div()
@@ -1026,31 +1262,37 @@ impl PluginManager {
                             .child(status),
                     ),
             )
-            .child(
-                ui::switch(
-                    SharedString::from(format!("plugin-switch-{}", plugin.id)),
-                    on,
-                    ui,
+            .when(!essential, |row| {
+                row.child(
+                    ui::switch(
+                        SharedString::from(format!("plugin-switch-{}", plugin.id)),
+                        on,
+                        ui,
+                    )
+                    .when(!available, |switch| switch.opacity(0.4).cursor_default())
+                    .when(available, |switch| {
+                        switch.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.set_enabled(&switch_id, !on, cx)
+                        }))
+                    }),
                 )
-                .when(!available, |switch| switch.opacity(0.4).cursor_default())
-                .when(available, |switch| {
-                    switch.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.set_enabled(&switch_id, !on, cx)
-                    }))
-                }),
-            )
+            })
     }
 
     /// The selected plugin: who it is, its buttons, the tabs.
     fn render_details(&mut self, plugin: &Shown, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
         let manifest = plugin.manifest().clone();
-        // Where it comes from (a badge: a word for one plugin, unlike the list's group labels).
-        let (source_label, source_color) = match plugin.entry.source {
-            PluginSource::Bundled => (tr("Built-in"), ui.text_muted),
-            PluginSource::Installed => (tr("Installed"), ui.accent_text),
-            PluginSource::Dev => (tr("Development"), ui.amber),
+        // Where it comes from (a badge: a word for one plugin, unlike the list's group labels); a
+        // downloaded plugin needs none.
+        let source = match plugin.entry.source {
+            PluginSource::Bundled if is_essential(&plugin.id) => {
+                Some((tr("Part of Flux"), ui.text_muted))
+            }
+            PluginSource::Bundled => Some((tr("Built-in"), ui.text_muted)),
+            PluginSource::Installed => None,
+            PluginSource::Dev => Some((tr("Development"), ui.amber)),
         };
         let mut meta: Vec<AnyElement> = Vec::new();
         if !manifest.authors.is_empty() {
@@ -1122,7 +1364,7 @@ impl PluginManager {
                                     .child(plugin.name()),
                             )
                             .child(ui::badge(manifest.version.clone(), ui.text_muted))
-                            .child(ui::badge(source_label, source_color)),
+                            .children(source.map(|(label, color)| ui::badge(label, color))),
                     )
                     .when(!meta.is_empty(), |column| {
                         column.child(
@@ -1166,7 +1408,46 @@ impl PluginManager {
         let ui = Theme::ui(cx);
         let on = plugin.on();
         let mut buttons: Vec<AnyElement> = Vec::new();
-        if plugin.available() {
+        // The catalog's newer version: Update first, as JetBrains IDEs put it.
+        match (
+            plugin_catalog::progress(&plugin.id, cx),
+            self.update_of(&plugin.id, cx),
+        ) {
+            (Some(progress), _) => {
+                buttons.push(
+                    div()
+                        .text_size(px(theme::TEXT_SM))
+                        .text_color(ui.accent_text)
+                        .child(progress.label())
+                        .into_any_element(),
+                );
+                if !progress.installing() {
+                    let id = plugin.id.clone();
+                    buttons.push(
+                        ui::text_button("plugin-update-cancel", tr("Cancel"), false, ui)
+                            .on_click(move |_, _, cx| plugin_catalog::cancel(&id, cx))
+                            .into_any_element(),
+                    );
+                }
+            }
+            (None, Some(update)) => {
+                let label = trf("Update to {0}", &[&update.version]);
+                buttons.push(
+                    ui::primary_button("plugin-update", label, true, ui)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            plugin_catalog::install(
+                                update.clone(),
+                                this.workspace.clone(),
+                                window,
+                                cx,
+                            )
+                        }))
+                        .into_any_element(),
+                );
+            }
+            (None, None) => {}
+        }
+        if plugin.available() && !is_essential(&plugin.id) {
             let id = plugin.id.clone();
             let button = if on {
                 ui::text_button("plugin-disable", tr("Disable"), false, ui)
@@ -1406,32 +1687,19 @@ impl PluginManager {
             .gap_4()
             .child(text)
             .child(ui::divider(ui))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children(facts.into_iter().map(|(label, value)| {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .w(px(110.))
-                                    .text_color(ui.dim)
-                                    .child(label),
-                            )
-                            .child(div().flex_1().min_w_0().child(value))
-                    })),
-            )
+            .child(facts_view(facts, ui))
     }
 
     /// What the plugin may do beyond the API, in plain words, and what the sandbox keeps from it.
     fn render_permissions(&self, plugin: &Shown, cx: &mut Context<Self>) -> Div {
-        let ui = Theme::ui(cx);
-        let lines = permission_lines(&plugin.manifest().permissions);
+        permissions_view(plugin.manifest(), Theme::ui(cx))
+    }
+}
+
+/// What a plugin may do beyond the API, in plain words, and what the sandbox keeps from it: the
+/// Permissions tab of the Installed and of the Marketplace.
+pub(crate) fn permissions_view(manifest: &Manifest, ui: UiColors) -> Div {
+    let lines = permission_lines(&manifest.permissions);
         let list = if lines.is_empty() {
             vec![permission_row(
                 IconName::CheckCircle,
@@ -1466,69 +1734,41 @@ impl PluginManager {
                         "Every plugin may show notifications and questions, and add what its manifest declares. Beyond that, the sandbox lets it reach only its own folder and what is listed here: no other files, no network, no programs.",
                     )),
             )
-    }
+}
 
-    /// What the plugin adds to the window: commands, tool windows, status bar items, settings.
+impl PluginManager {
+    /// What the plugin adds to the window: commands, tool windows, status bar items, languages,
+    /// language servers, themes, icon sets, settings; what of them couldn't be read.
     fn render_contributions(&self, plugin: &Shown, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
         let manifest = plugin.manifest();
-        let entry = &plugin.entry;
-        let mut sections: Vec<AnyElement> = Vec::new();
-        if !manifest.commands.is_empty() {
-            let category = |category: &Option<String>| {
-                translated(entry, category.as_deref().unwrap_or(&manifest.name)).to_string()
-            };
-            let rows = manifest.commands.iter().map(|command| {
-                contribution_row(
-                    IconName::Command,
-                    format!(
-                        "{}: {}",
-                        category(&command.category),
-                        translated(entry, &command.title)
-                    ),
-                    command.keys.as_deref(),
-                    ui,
-                )
-            });
-            sections.push(contribution_section(tr("Commands"), rows, ui));
-        }
-        if !manifest.tool_windows.is_empty() {
-            let rows = manifest.tool_windows.iter().map(|window| {
-                contribution_row(
-                    IconName::Sidebar,
-                    translated(entry, &window.title).to_string(),
-                    window.keys.as_deref(),
-                    ui,
-                )
-            });
-            sections.push(contribution_section(tr("Tool Windows"), rows, ui));
-        }
-        if !manifest.menus.is_empty() {
-            let rows = manifest.menus.iter().filter_map(|menu| {
-                let command = manifest.command(&menu.command)?;
-                let title = translated(entry, &command.title);
-                let text = match menu.location {
-                    MenuLocation::Editor => trf("Editor menu: {0}", &[&title]),
-                    MenuLocation::Tree => trf("Project tree menu: {0}", &[&title]),
-                    MenuLocation::Tab => trf("Tab menu: {0}", &[&title]),
-                };
-                Some(contribution_row(IconName::More, text, None, ui))
-            });
-            sections.push(contribution_section(tr("Context Menus"), rows, ui));
-        }
-        if !manifest.status_items.is_empty() {
-            let count = manifest.status_items.len();
-            sections.push(contribution_section(
-                tr("Status Bar"),
-                std::iter::once(contribution_row(
-                    IconName::Info,
-                    trn(count, "{n} item", "{n} items"),
-                    None,
-                    ui,
-                )),
-                ui,
-            ));
-        }
+        let entry = plugin.entry.clone();
+        let names = ContributionNames {
+            themes: crate::theme::available(cx)
+                .into_iter()
+                .filter(|theme| {
+                    theme
+                        .plugin
+                        .as_ref()
+                        .is_some_and(|owner| owner.as_ref() == plugin.id.as_ref())
+                })
+                .map(|theme| {
+                    let appearance = match theme.appearance {
+                        crate::theme::Appearance::Light => "light",
+                        crate::theme::Appearance::Dark => "dark",
+                    };
+                    (theme.name.to_string(), appearance.to_string())
+                })
+                .collect(),
+            icon_themes: crate::icon_themes::available()
+                .into_iter()
+                .filter(|icons| icons.plugin == plugin.id)
+                .map(|icons| icons.name.to_string())
+                .collect(),
+            problems: crate::contributions::problems(&plugin.id, cx),
+        };
+        let translate = move |text: &str| translated(&entry, text).to_string();
+        let mut sections = contribution_sections(manifest, &translate, names, ui);
         if !manifest.settings.is_empty() {
             let count = manifest.settings.len();
             let id = plugin.id.clone();
@@ -1559,12 +1799,7 @@ impl PluginManager {
                 ui,
             ));
         }
-        if sections.is_empty() {
-            return div()
-                .text_color(ui.dim)
-                .child(tr("The plugin adds nothing to the window."));
-        }
-        div().flex().flex_col().gap_4().children(sections)
+        contributions_list(sections, ui)
     }
 
     /// The plugin's log: the newest line at the bottom, followed as lines come.
@@ -1647,6 +1882,39 @@ impl PluginManager {
 
 impl Render for PluginManager {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match self.page {
+            Page::Marketplace => self.catalog(cx).into_any_element(),
+            Page::Installed => self.render_installed(cx).into_any_element(),
+        };
+        div()
+            .key_context("PluginManager")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(
+                cx.listener(|this, _: &plugins::InstallFromDisk, window, cx| {
+                    this.install(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &plugins::ReloadDevPlugins, _, cx| this.reload_dev(cx)),
+            )
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.render_header(cx))
+            .child(body)
+            .children(
+                self.menu
+                    .as_ref()
+                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
+            )
+    }
+}
+
+impl PluginManager {
+    /// The Installed tab: the list and the selected plugin.
+    fn render_installed(&mut self, cx: &mut Context<Self>) -> Div {
         let any = !self.plugins.read(cx).plugins().is_empty();
         let listed = self.listed(cx);
         let selected = self
@@ -1674,38 +1942,14 @@ impl Render for PluginManager {
             }
         };
         div()
-            .key_context("PluginManager")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::select_next))
-            .on_action(cx.listener(Self::select_previous))
-            .on_action(
-                cx.listener(|this, _: &plugins::InstallFromDisk, window, cx| {
-                    this.install(window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &plugins::ReloadDevPlugins, _, cx| this.reload_dev(cx)),
-            )
-            .size_full()
+            .flex_1()
+            .min_h_0()
+            .px_4()
+            .pb_4()
             .flex()
-            .flex_col()
-            .child(self.render_header(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .px_4()
-                    .pb_4()
-                    .flex()
-                    .gap_3()
-                    .child(self.render_list(&listed, any, cx))
-                    .child(details),
-            )
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .gap_3()
+            .child(self.render_list(&listed, any, cx))
+            .child(details)
     }
 }
 
@@ -1756,7 +2000,7 @@ fn plugin_icon(plugin: &Shown, size: f32, color: Hsla) -> AnyElement {
 }
 
 /// Elements with a dot between them: "Egor Ageev · github.com/…".
-fn dot_separated(items: Vec<AnyElement>, ui: UiColors) -> Vec<AnyElement> {
+pub(crate) fn dot_separated(items: Vec<AnyElement>, ui: UiColors) -> Vec<AnyElement> {
     let mut joined = Vec::new();
     for (index, item) in items.into_iter().enumerate() {
         if index > 0 {
@@ -1773,7 +2017,7 @@ fn dot_separated(items: Vec<AnyElement>, ui: UiColors) -> Vec<AnyElement> {
     joined
 }
 
-fn code_text(text: impl Into<SharedString>, ui: UiColors) -> AnyElement {
+pub(crate) fn code_text(text: impl Into<SharedString>, ui: UiColors) -> AnyElement {
     div()
         .font_family(theme::code_font())
         .text_size(px(theme::TEXT_SM))
@@ -1807,6 +2051,234 @@ fn permission_row(
         )
         .child(div().flex_1().min_w_0().text_color(text_color).child(text))
         .into_any_element()
+}
+
+/// Facts of a plugin: a label and a value a row (the Overview of the Installed and of the
+/// Marketplace).
+pub(crate) fn facts_view(facts: Vec<(&'static str, AnyElement)>, ui: UiColors) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .children(facts.into_iter().map(|(label, value)| {
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(110.))
+                        .text_color(ui.dim)
+                        .child(label),
+                )
+                .child(div().flex_1().min_w_0().child(value))
+        }))
+}
+
+/// What a plugin adds, from its manifest (the Contributions tab of the Installed and of the
+/// Marketplace): commands, tool windows, context menus, status bar items, languages, language
+/// servers, color themes, icon sets; then `problems` — what of them couldn't be read. Theme and
+/// icon set names come from their files: `themes` and `icon_themes` when known, else the files.
+pub(crate) fn contribution_sections(
+    manifest: &Manifest,
+    translate: &dyn Fn(&str) -> String,
+    names: ContributionNames,
+    ui: UiColors,
+) -> Vec<AnyElement> {
+    let mut sections: Vec<AnyElement> = Vec::new();
+    if !manifest.commands.is_empty() {
+        let category = |category: &Option<String>| {
+            translate(category.as_deref().unwrap_or(&manifest.name))
+        };
+        let rows = manifest.commands.iter().map(|command| {
+            contribution_row(
+                IconName::Command,
+                format!(
+                    "{}: {}",
+                    category(&command.category),
+                    translate(&command.title)
+                ),
+                command.keys.as_deref(),
+                ui,
+            )
+        });
+        sections.push(contribution_section(tr("Commands"), rows, ui));
+    }
+    if !manifest.tool_windows.is_empty() {
+        let rows = manifest.tool_windows.iter().map(|window| {
+            contribution_row(
+                IconName::Sidebar,
+                translate(&window.title),
+                window.keys.as_deref(),
+                ui,
+            )
+        });
+        sections.push(contribution_section(tr("Tool Windows"), rows, ui));
+    }
+    if !manifest.menus.is_empty() {
+        let rows = manifest.menus.iter().filter_map(|menu| {
+            let command = manifest.command(&menu.command)?;
+            let title = translate(&command.title);
+            let text = match menu.location {
+                MenuLocation::Editor => trf("Editor menu: {0}", &[&title]),
+                MenuLocation::Tree => trf("Project tree menu: {0}", &[&title]),
+                MenuLocation::Tab => trf("Tab menu: {0}", &[&title]),
+            };
+            Some(contribution_row(IconName::More, text, None, ui))
+        });
+        sections.push(contribution_section(tr("Context Menus"), rows, ui));
+    }
+    if !manifest.status_items.is_empty() {
+        let count = manifest.status_items.len();
+        sections.push(contribution_section(
+            tr("Status Bar"),
+            std::iter::once(contribution_row(
+                IconName::Info,
+                trn(count, "{n} item", "{n} items"),
+                None,
+                ui,
+            )),
+            ui,
+        ));
+    }
+    if !manifest.languages.is_empty() {
+        let rows = manifest.languages.iter().map(|language| {
+            let mut files: Vec<String> = language
+                .extensions
+                .iter()
+                .map(|extension| format!(".{extension}"))
+                .collect();
+            files.extend(language.file_names.iter().cloned());
+            let grammar = match manifest.grammar(&language.grammar).map(|grammar| &grammar.source)
+            {
+                Some(GrammarSourceSpec::Builtin(_)) => tr("grammar built into Flux"),
+                Some(GrammarSourceSpec::Wasm { .. }) => tr("WebAssembly grammar"),
+                None => "",
+            };
+            let mut text = translate(&language.name);
+            if !files.is_empty() {
+                text = format!("{text} · {}", files.join(", "));
+            }
+            if !grammar.is_empty() {
+                text = format!("{text} · {grammar}");
+            }
+            contribution_row(IconName::File, text, None, ui)
+        });
+        sections.push(contribution_section(tr("Languages"), rows, ui));
+    }
+    if !manifest.language_servers.is_empty() {
+        let rows = manifest.language_servers.iter().map(|server| {
+            let how = match &server.install {
+                None => tr("uses the one on this Mac").to_string(),
+                Some(install) => install_label(install),
+            };
+            contribution_row(
+                IconName::Command,
+                format!("{} · {how}", server.id),
+                None,
+                ui,
+            )
+        });
+        sections.push(contribution_section(tr("Language Servers"), rows, ui));
+    }
+    if !manifest.themes.is_empty() {
+        let rows: Vec<Div> = if names.themes.is_empty() {
+            manifest
+                .themes
+                .iter()
+                .map(|theme| contribution_row(IconName::Palette, theme.file.clone(), None, ui))
+                .collect()
+        } else {
+            names
+                .themes
+                .iter()
+                .map(|(name, appearance)| {
+                    let appearance = if appearance == "light" {
+                        tr("Light")
+                    } else {
+                        tr("Dark")
+                    };
+                    contribution_row(
+                        IconName::Palette,
+                        format!("{name} · {appearance}"),
+                        None,
+                        ui,
+                    )
+                })
+                .collect()
+        };
+        sections.push(contribution_section(tr("Color Themes"), rows, ui));
+    }
+    if !manifest.icon_themes.is_empty() {
+        let rows: Vec<Div> = if names.icon_themes.is_empty() {
+            manifest
+                .icon_themes
+                .iter()
+                .map(|icons| contribution_row(IconName::Folder, icons.file.clone(), None, ui))
+                .collect()
+        } else {
+            names
+                .icon_themes
+                .iter()
+                .map(|name| contribution_row(IconName::Folder, name.clone(), None, ui))
+                .collect()
+        };
+        sections.push(contribution_section(tr("Icon Sets"), rows, ui));
+    }
+    if !names.problems.is_empty() {
+        let rows = names.problems.into_iter().map(|problem| {
+            div()
+                .flex()
+                .items_start()
+                .gap_2p5()
+                .px_2()
+                .py_1()
+                .rounded(px(ui::RADIUS_SM))
+                .child(
+                    div()
+                        .pt(px(2.))
+                        .child(icon(IconName::Error, ui.error).size(px(13.))),
+                )
+                .child(div().flex_1().min_w_0().text_color(ui.error).child(problem))
+        });
+        sections.push(contribution_section(tr("Problems"), rows, ui));
+    }
+    sections
+}
+
+/// The names [`contribution_sections`] can't read from the manifest: the themes and icon sets (from
+/// their files), and the problems of reading the contributions.
+#[derive(Default)]
+pub(crate) struct ContributionNames {
+    /// (name, "dark" | "light").
+    pub themes: Vec<(String, String)>,
+    pub icon_themes: Vec<String>,
+    pub problems: Vec<String>,
+}
+
+/// The sections of the Contributions tab, or a word that there are none.
+pub(crate) fn contributions_list(sections: Vec<AnyElement>, ui: UiColors) -> Div {
+    if sections.is_empty() {
+        return div()
+            .text_color(ui.dim)
+            .child(tr("The plugin adds nothing to the window."));
+    }
+    div().flex().flex_col().gap_4().children(sections)
+}
+
+/// How Flux installs a language server, in a few words.
+fn install_label(install: &InstallSpec) -> String {
+    match install {
+        InstallSpec::Npm { packages, .. } => {
+            trf("installs with npm: {0}", &[&packages.join(", ")])
+        }
+        InstallSpec::GitHub { repo, .. } => trf("installs from GitHub: {0}", &[repo]),
+        InstallSpec::Go { package, .. } => trf("installs with go install: {0}", &[package]),
+        InstallSpec::Rustup { component, .. } => {
+            trf("installs with rustup: {0}", &[component])
+        }
+    }
 }
 
 /// A group of the Contributions tab: a label over its rows.

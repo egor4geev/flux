@@ -18,6 +18,11 @@
 //! linting): it is open on all of them, the first is the main one (completion, hover, navigation),
 //! diagnostics are kept per server.
 //!
+//! Stage 8.3: the servers come from the language plugins (`[[language-servers]]`,
+//! [`crate::contributions::servers`]). When the turned-on plugins change, so do the servers: one
+//! whose config is gone stops, one whose config changed starts again, and documents that now have a
+//! server (a language plugin was installed) are opened on it.
+//!
 //! Part 9.2: a file nobody opened can be opened on its servers without an editor — a background
 //! document (Flux's tools for Claude: the problems of a file, its definitions and usages); a few are
 //! kept, the least recently used closed. What servers published last is kept as they sent it (the
@@ -130,10 +135,14 @@ pub struct LspStore {
     this: WeakEntity<LspStore>,
     /// Project root: the workspace root of every server, when there is one.
     root: Option<PathBuf>,
+    /// The servers the language plugins bring ([`crate::contributions::servers`]).
     configs: Vec<ServerConfig>,
     servers: Vec<Server>,
     /// Registered editors: each has one release observer, whatever its path changes.
     registered: HashSet<EntityId>,
+    /// The registered editors themselves: when the plugins bring other servers, their documents
+    /// are opened on the new ones.
+    editors: Vec<WeakEntity<Editor>>,
     next_server_id: u64,
     /// Callers waiting for the next diagnostics of a file ([`LspStore::wait_diagnostics`]).
     waiters: Vec<(PathBuf, oneshot::Sender<()>)>,
@@ -280,13 +289,18 @@ impl LspStore {
                     futures::future::join_all(shutdowns).await;
                 }
             }),
+            // A language plugin turned on or off, installed, removed: other servers.
+            cx.observe_global::<crate::contributions::Contributions>(|this, cx| {
+                this.configs_changed(cx)
+            }),
         ];
         Self {
             this: cx.weak_entity(),
             root,
-            configs: config::default_servers(),
+            configs: crate::contributions::servers(cx),
             servers: Vec::new(),
             registered: HashSet::new(),
+            editors: Vec::new(),
             next_server_id: 0,
             waiters: Vec::new(),
             background_clock: 0,
@@ -303,6 +317,7 @@ impl LspStore {
                 this.released(id, editor, cx)
             })
             .detach();
+            self.editors.push(editor.downgrade());
         }
         for server in &mut self.servers {
             server.editors.retain(|e| e.entity_id() != id);
@@ -339,6 +354,56 @@ impl LspStore {
             server.editors.push(editor.downgrade());
             if server.status == Status::Running {
                 open_document(server, editor, rank, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The language plugins bring other servers: those whose config is gone stop, those whose
+    /// config changed start again with it, and each document is opened on the servers that serve
+    /// it now.
+    fn configs_changed(&mut self, cx: &mut Context<Self>) {
+        let configs = crate::contributions::servers(cx);
+        if configs == self.configs {
+            return;
+        }
+        let old = std::mem::replace(&mut self.configs, configs);
+        // One server per name and root: each name once.
+        let mut names: Vec<String> = self
+            .servers
+            .iter()
+            .map(|server| server.key.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        for name in names {
+            let before = old.iter().find(|config| config.name == name);
+            match self.configs.iter().find(|config| config.name == name) {
+                None => self.stop_named(&name, cx),
+                Some(after) if before != Some(after) => self.restart_named(&name, cx),
+                Some(_) => {}
+            }
+        }
+        self.editors.retain(|editor| editor.upgrade().is_some());
+        for editor in self.editors.clone().iter().filter_map(WeakEntity::upgrade) {
+            let Some(path) = editor.read(cx).document.path().map(Path::to_path_buf) else {
+                continue;
+            };
+            let mut wanted: Vec<String> = config::servers_for_path(&self.configs, &path)
+                .iter()
+                .map(|config| config.name.clone())
+                .collect();
+            let id = editor.entity_id();
+            let mut serving: Vec<String> = self
+                .servers
+                .iter()
+                .filter(|server| server.editors.iter().any(|e| e.entity_id() == id))
+                .map(|server| server.key.name.clone())
+                .collect();
+            wanted.sort();
+            serving.sort();
+            if wanted != serving {
+                self.register(&editor, cx);
             }
         }
         cx.notify();
@@ -657,7 +722,7 @@ impl LspStore {
                         .map_or(0, |path| rank_of(configs, path, &server.key.name));
                     open_document(server, editor, rank, cx);
                 }
-                open_background_documents(server);
+                open_background_documents(server, cx);
                 cx.notify();
             }
             ServerEvent::ApplyEdit(request) => {
@@ -891,7 +956,7 @@ impl LspStore {
                 used,
             });
             if server.status == Status::Running {
-                open_background_documents(server);
+                open_background_documents(server, cx);
             }
         }
         self.trim_background();
@@ -1076,6 +1141,7 @@ impl LspStore {
     /// A tab was closed (the editor released): its document is closed on the server.
     fn released(&mut self, id: EntityId, editor: &mut Editor, cx: &mut Context<Self>) {
         self.registered.remove(&id);
+        self.editors.retain(|e| e.entity_id() != id);
         close_documents(editor);
         for server in &mut self.servers {
             server.editors.retain(|e| e.entity_id() != id);
@@ -1420,7 +1486,7 @@ fn open_document(
         handle.notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
-                language_id: config::language_id(&path).to_string(),
+                language_id: crate::contributions::lsp_language_id(&path, cx),
                 version: 0,
                 text: editor.document.text().to_string(),
             },
@@ -1447,7 +1513,7 @@ fn open_document(
 }
 
 /// Sends `didOpen` for the background documents the server doesn't have yet (it was starting).
-fn open_background_documents(server: &mut Server) {
+fn open_background_documents(server: &mut Server, cx: &App) {
     let Some(handle) = server.handle.clone() else {
         return;
     };
@@ -1458,7 +1524,7 @@ fn open_background_documents(server: &mut Server) {
         handle.notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: doc.uri.clone(),
-                language_id: config::language_id(&doc.path).to_string(),
+                language_id: crate::contributions::lsp_language_id(&doc.path, cx),
                 version: 0,
                 text,
             },

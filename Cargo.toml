@@ -17,7 +17,9 @@ flux-plugin = { path = "crates/flux-plugin" }
 flux-syntax = { path = "crates/flux-syntax" }
 flux-search = { path = "crates/flux-search" }
 flux-term = { path = "crates/flux-term" }
-tree-sitter = "0.27.0"
+# `wasm`: grammars compiled to WebAssembly, run on wasmtime 48 (`wasmtime-c-api-impl`); the
+# plugins' wasmtime (flux-plugin) stays on the same major, so Flux has one. Building it needs cmake.
+tree-sitter = { version = "0.27.1", features = ["wasm"] }
 tree-sitter-bash = "0.25.1"
 tree-sitter-go = "0.25.0"
 tree-sitter-javascript = "0.25.0"
@@ -105,4 +107,42 @@ opt-level = 3
 [profile.dev.package.wasmtime-internal-cranelift]
 opt-level = 3
 [profile.dev.package.wasmparser]
+opt-level = 3
+# WebAssembly grammars (flux-syntax, stage 8.3): a grammar is compiled by the same Cranelift, and a
+# parse calls into wasmtime for every token. Without these a debug build loads grammars ~20 times
+# slower (12 grammars: 5.3 s instead of 0.27 s) and parses 12–21 times slower than a release build.
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+[profile.dev.package.cranelift-bitset]
+opt-level = 3
+[profile.dev.package.cranelift-control]
+opt-level = 3
+[profile.dev.package.cranelift-native]
+opt-level = 3
+[profile.dev.package.wasmtime]
+opt-level = 3
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+[profile.dev.package.wasmtime-c-api-impl]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-core]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-unwinder]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-jit-icache-coherence]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-jit-debug]
+opt-level = 3
+[profile.dev.package.gimli]
+opt-level = 3
+[profile.dev.package.object]
+opt-level = 3
+# The cache of compiled grammars: a grammar's hash, its compressed machine code.
+[profile.dev.package.wasmtime-internal-cache]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.zstd-sys]
 opt-level = 3

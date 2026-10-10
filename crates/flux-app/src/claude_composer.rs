@@ -1425,7 +1425,7 @@ impl Composer {
                         .border_color(ui.input_border)
                         .hover(move |style| style.bg(ui.pressed))
                 })
-                .child(icon(name, if accent { ui.foreground } else { ui.text_muted }).size(px(14.)))
+                .child(icon(name, if accent { ui.on_accent } else { ui.text_muted }).size(px(14.)))
         };
         div()
             .flex()

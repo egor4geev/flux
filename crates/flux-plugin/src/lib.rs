@@ -2,7 +2,10 @@
 //! (`wit/flux-plugin.wit`) run by wasmtime, each on its own thread.
 //!
 //! - [`manifest`] — `flux-plugin.toml`: who the plugin is, its permissions and what it adds
-//!   (commands, tool windows, status bar items, settings).
+//!   (commands, tool windows, status bar items, settings; with 8.3 — languages, grammars, language
+//!   servers, color themes, file icons, without code).
+//! - [`catalog`] — the catalog (Marketplace, stage 8.3): the index of published plugins, packages,
+//!   updates, suggestions for files.
 //! - [`registry`] — where plugins come from: bundled into Flux, installed, under development.
 //! - [`install`] — installing from disk and removing.
 //! - [`runtime`] — an instance of a plugin: its thread, calls into it, its calls to the window
@@ -14,6 +17,7 @@
 //!   plugin under development, where everything lives on disk.
 
 pub mod api;
+pub mod catalog;
 pub mod dev;
 mod host;
 pub mod install;

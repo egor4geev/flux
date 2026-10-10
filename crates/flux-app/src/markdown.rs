@@ -10,6 +10,7 @@
 //! blocks with a copy button ([`render_copyable`]).
 
 use std::path::Path;
+use std::sync::Arc;
 
 use flux_core::Rope;
 use flux_lsp::lsp_types::{MarkupContent, MarkupKind};
@@ -224,25 +225,39 @@ pub fn plain(text: &str) -> Vec<Block> {
 /// Highlights the code blocks: by the fence's language, otherwise by `fallback` (the language of
 /// the document the documentation is about). `scopes` are the theme scopes. Parses synchronously,
 /// and may compile a language's query: call it off the UI thread.
-pub fn highlight(blocks: &mut [Block], fallback: Option<&'static Language>, scopes: &[String]) {
+pub fn highlight(blocks: &mut [Block], fallback: Option<Arc<Language>>, scopes: &[String]) {
     for block in blocks {
         let Block::Code(code) = block else {
             continue;
         };
         let language = match &code.language {
             Some(info) => fence_language(info),
-            None => fallback,
+            None => fallback.clone(),
         };
         let Some(language) = language else {
             continue;
         };
         let text = Rope::from_str(&code.text);
-        let mut syntax = Syntax::new(language);
+        let mut syntax = Syntax::new(language.clone());
         let Some(job) = syntax.parse_job(&text) else {
             continue;
         };
-        syntax.finish(job.run());
-        let map = HighlightMap::new(language, scopes);
+        let result = if language.is_wasm() {
+            // A plugin's grammar parses on a thread of its own: a scanner that never returns
+            // leaves that thread stuck, not this one (flux-syntax's watchdog turns the grammar off).
+            let (sender, receiver) = std::sync::mpsc::channel();
+            job.spawn(move |result| {
+                sender.send(result).ok();
+            });
+            match receiver.recv_timeout(flux_syntax::PARSE_LIMIT) {
+                Ok(result) => result,
+                Err(_) => continue,
+            }
+        } else {
+            job.run()
+        };
+        syntax.finish(result);
+        let map = HighlightMap::new(&language, scopes);
         code.highlights = syntax.highlight_lines(&text, 0..text.len_lines(), &map);
     }
 }
@@ -256,9 +271,9 @@ pub fn scopes(cx: &App) -> Vec<String> {
         .collect()
 }
 
-/// The language of a fence's info string: a flux-syntax name ("rust"), an extension ("rs", "py"),
-/// or a common alias.
-fn fence_language(info: &str) -> Option<&'static Language> {
+/// The language of a fence's info string: a language's name ("rust") or alias (a plugin's
+/// `aliases`), an extension ("rs", "py"), or a common alias.
+fn fence_language(info: &str) -> Option<Arc<Language>> {
     let name = match info {
         "golang" => "go",
         "python3" | "py3" => "python",
@@ -1165,12 +1180,13 @@ mod tests {
 
     #[test]
     fn fence_languages_resolve_by_name_extension_and_alias() {
-        let name = |info: &str| fence_language(info).map(|l| l.name());
-        assert_eq!(name("rust"), Some("rust"));
-        assert_eq!(name("rs"), Some("rust"));
-        assert_eq!(name("py"), Some("python"));
-        assert_eq!(name("golang"), Some("go"));
-        assert_eq!(name("sh"), Some("bash"));
+        flux_syntax::standard::register();
+        let name = |info: &str| fence_language(info).map(|l| l.name().to_string());
+        assert_eq!(name("rust").as_deref(), Some("rust"));
+        assert_eq!(name("rs").as_deref(), Some("rust"));
+        assert_eq!(name("py").as_deref(), Some("python"));
+        assert_eq!(name("golang").as_deref(), Some("go"));
+        assert_eq!(name("sh").as_deref(), Some("bash"));
         assert_eq!(name("text"), None);
     }
 
@@ -1195,6 +1211,7 @@ mod tests {
 
     #[test]
     fn code_blocks_get_highlighted() {
+        flux_syntax::standard::register();
         let scopes: Vec<String> = Theme::flux_night()
             .syntax_scopes()
             .iter()

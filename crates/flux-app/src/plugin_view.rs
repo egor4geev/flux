@@ -1126,7 +1126,7 @@ fn indent_guides(depth: usize, ui: UiColors) -> impl IntoElement {
 /// [`ui::text_button`] with an icon before the label.
 fn text_button_with_icon(
     id: ElementId,
-    button_icon: gpui::Svg,
+    button_icon: gpui::Div,
     label: String,
     ui: UiColors,
 ) -> gpui::Stateful<gpui::Div> {

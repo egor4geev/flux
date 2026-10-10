@@ -15,10 +15,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
-use common::{Rng, parse_now};
+use common::{Rng, language_for_path, languages, parse_now};
 use flux_core::{ChangeSet, Rope};
 use flux_syntax::tree_sitter::{Parser, QueryCursor};
-use flux_syntax::{HighlightMap, Syntax, language_for_path, languages};
+use flux_syntax::{HighlightMap, Syntax};
 
 const THEME: &[&str] = &[
     "attribute",
@@ -113,7 +113,7 @@ fn bench() {
             query.capture_names().len()
         );
     }
-    let map = HighlightMap::new(language, THEME);
+    let map = HighlightMap::new(&language, THEME);
 
     let mut setup = Samples::new();
     for _ in 0..20 {
@@ -127,9 +127,9 @@ fn bench() {
 
     let rounds = if cfg!(debug_assertions) { 5 } else { 15 };
     let mut full = Samples::new();
-    let mut syntax = Syntax::new(language);
+    let mut syntax = Syntax::new(language.clone());
     for _ in 0..rounds {
-        syntax = Syntax::new(language);
+        syntax = Syntax::new(language.clone());
         let job = syntax.parse_job(&text).unwrap();
         let result = full.time(|| job.run());
         assert!(syntax.finish(result));
@@ -201,7 +201,7 @@ fn bench() {
 
     // A check that the benchmark measured the real thing: the tree is correct after all the edits.
     assert_eq!(text, original);
-    let mut fresh = Syntax::new(language);
+    let mut fresh = Syntax::new(language.clone());
     parse_now(&mut fresh, &text);
     assert_eq!(
         syntax.tree().unwrap().root_node().to_sexp(),

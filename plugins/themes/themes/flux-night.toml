@@ -1,0 +1,136 @@
+# Flux Night — the dark theme of Flux: a glass frame and islands in cool blue-violet neutrals over the
+# blurred desktop; the accent is indigo. Code is in the GitHub Dark palette (Primer, "prettylights"):
+# keywords and operators red, functions purple, types and constructors orange, strings light blue,
+# constants, numbers, properties and built-ins blue, tags green, comments gray; plain variables and
+# punctuation take the text color, parameters are orange.
+#
+# The base of every dark theme: a dark theme names only what it changes. Colors are "#rrggbb" or
+# "#rrggbbaa" (the alpha lets the blurred desktop show through). Tokens: `docs/themes.md`.
+name = "Flux Night"
+appearance = "dark"
+
+[ui]
+# Surfaces (glass)
+frame = "#07090fc7"
+frame_glow = "#8590ff24"
+island = "#0d1018e6"
+island_border = "#ffffff14"
+sheen = "#ffffff2e"
+elevated = "#171b28fa"
+elevated_border = "#ffffff1f"
+shadow = "#00000080"
+backdrop = "#00000047"
+divider = "#ffffff12"
+# Text
+foreground = "#e6e9f2"
+text_muted = "#a3abc3"
+dim = "#6b7391"
+text_disabled = "#4a516a"
+# Interaction
+accent = "#8590ff"
+accent_text = "#aab2ff"
+accent_soft = "#8590ff2e"
+on_accent = "#e6e9f2"
+hover = "#ffffff0f"
+pressed = "#ffffff17"
+list_selected = "#8590ff3d"
+list_selected_inactive = "#ffffff14"
+input_background = "#00000052"
+input_border = "#ffffff17"
+focus_border = "#8590ffd9"
+focus_ring = "#8590ff3d"
+drop_target = "#8590ff29"
+keycap = "#ffffff0f"
+keycap_border = "#ffffff1a"
+# States
+success = "#4fd18b"
+warning = "#ffc560"
+error = "#ff6b6b"
+info = "#5aa9ff"
+modified = "#ffb35c"
+# Editor
+current_line = "#ffffff0a"
+selection = "#8590ff4d"
+cursor = "#aab2ff"
+match_text = "#aab2ff"
+search_match = "#ffc56038"
+search_match_active = "#ffc5608f"
+# Version control: names in the tree, the tabs, the commit window
+vcs_modified = "#6cb0ff"
+vcs_added = "#5fd38d"
+vcs_deleted = "#8a91ab"
+vcs_renamed = "#3cd3c4"
+vcs_untracked = "#e8806b"
+vcs_conflict = "#ff6b6b"
+# Diffs: gutter markers, blocks, changed words; the merge tool
+diff_added = "#3fb950"
+diff_modified = "#5aa9ff"
+diff_deleted = "#8b949e"
+diff_added_bg = "#3fb9501f"
+diff_modified_bg = "#5aa9ff1c"
+diff_deleted_bg = "#8b949e1f"
+diff_added_word = "#3fb95052"
+diff_modified_word = "#5aa9ff4d"
+diff_deleted_word = "#8b949e4d"
+diff_conflict = "#ff6b6b"
+diff_conflict_bg = "#ff6b6b24"
+diff_conflict_word = "#ff6b6b52"
+diff_resolved_bg = "#8b949e14"
+# Git history
+graph_lanes = ["#5aa9ff", "#4fd18b", "#b48cff", "#ff9c5b", "#5ccfff", "#ff7eb6", "#ffc560", "#3cd3c4"]
+blame_recent = "#8590ff38"
+# Shades: meaning, not decoration (file types, categories, counters)
+blue = "#5aa9ff"
+indigo = "#8590ff"
+violet = "#b48cff"
+pink = "#ff7eb6"
+red = "#ff6b6b"
+orange = "#ff9c5b"
+amber = "#ffc560"
+lime = "#b8e06a"
+green = "#4fd18b"
+teal = "#3cd3c4"
+cyan = "#5ccfff"
+folder = "#7fa8ff"
+
+[syntax]
+attribute = "#79c0ff"
+boolean = "#79c0ff"
+comment = "#8b949e"
+constant = "#79c0ff"
+constructor = "#ffa657"
+# Code inside `${…}` and f-strings is not a string.
+embedded = "#c9d1d9"
+escape = "#79c0ff"
+function = "#d2a8ff"
+keyword = "#ff7b72"
+label = "#ffa657"
+number = "#79c0ff"
+operator = "#ff7b72"
+property = "#79c0ff"
+punctuation = "#c9d1d9"
+"punctuation.special" = "#ff7b72"
+string = "#a5d6ff"
+"string.escape" = "#79c0ff"
+"string.special" = "#7ee787"
+tag = "#7ee787"
+"text.literal" = "#79c0ff"
+"text.reference" = "#a5d6ff"
+"text.title" = { color = "#79c0ff", bold = true }
+"text.uri" = "#a5d6ff"
+type = "#ffa657"
+"type.builtin" = "#79c0ff"
+variable = "#c9d1d9"
+"variable.builtin" = "#79c0ff"
+"variable.parameter" = "#ffa657"
+
+# The terminal follows GitHub Dark too. `background` is what programs assume (inverse video, color
+# queries): the island without its alpha — the terminal itself is transparent.
+[terminal]
+foreground = "#c9d1d9"
+background = "#0d1018"
+cursor = "#aab2ff"
+ansi = [
+    "#484f58", "#ff7b72", "#3fb950", "#d29922", "#58a6ff", "#bc8cff", "#39c5cf", "#b1bac4",
+    "#6e7681", "#ffa198", "#56d364", "#e3b341", "#79c0ff", "#d2a8ff", "#56d4dd", "#f0f6fc",
+]

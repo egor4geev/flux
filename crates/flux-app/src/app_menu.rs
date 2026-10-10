@@ -1,6 +1,9 @@
 //! The menu bar: the application menu (the bold «Flux» next to the Apple menu) with About, Settings,
 //! Services, hiding, and Quit. The items dispatch the same actions as their keys; macOS shows the
 //! shortcuts from the keymap.
+//!
+//! The menu's titles are in the interface language: when it changes while Flux runs (Settings →
+//! Appearance → Language), the menu is built anew ([`rebuild`]).
 
 use gpui::{App, KeyBinding, Menu, MenuItem, SystemMenuType, actions};
 
@@ -17,6 +20,11 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    rebuild(cx);
+}
+
+/// Sets the menu bar in the current interface language.
+pub fn rebuild(cx: &mut App) {
     cx.set_menus(vec![Menu {
         name: "Flux".into(),
         items: vec![

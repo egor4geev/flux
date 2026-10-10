@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use flux_core::Rope;
 use flux_core::text::line_ending_len;
@@ -39,7 +40,7 @@ pub struct HighlightSpan {
 /// The mapping "capture index → theme scope" for one language and one theme.
 #[derive(Debug, Clone)]
 pub struct HighlightMap {
-    language: &'static Language,
+    language: Arc<Language>,
     by_capture: Box<[Option<Highlight>]>,
 }
 
@@ -52,23 +53,19 @@ impl HighlightMap {
     /// Needs the language's compiled query: if there is none yet, compiles it (up to ~20 ms).
     /// Convenient to build after the first [`ParseResult`](crate::ParseResult): by then the
     /// background [`ParseJob::run`](crate::ParseJob::run) has compiled the query.
-    pub fn new(language: &'static Language, scopes: &[impl AsRef<str>]) -> Self {
+    pub fn new(language: &Arc<Language>, scopes: &[impl AsRef<str>]) -> Self {
         Self::build(language, language.capture_names(), scopes)
     }
 
     /// Like [`HighlightMap::new`], but only if the language's query is already compiled (for
     /// example, by a background [`ParseJob::run`](crate::ParseJob::run)); otherwise `None`. Never
     /// compiles the query; intended for the UI thread.
-    pub fn try_new(language: &'static Language, scopes: &[impl AsRef<str>]) -> Option<Self> {
+    pub fn try_new(language: &Arc<Language>, scopes: &[impl AsRef<str>]) -> Option<Self> {
         let query = language.compiled_query()?;
         Some(Self::build(language, query.capture_names(), scopes))
     }
 
-    fn build(
-        language: &'static Language,
-        capture_names: &[&str],
-        scopes: &[impl AsRef<str>],
-    ) -> Self {
+    fn build(language: &Arc<Language>, capture_names: &[&str], scopes: &[impl AsRef<str>]) -> Self {
         let mut index = HashMap::with_capacity(scopes.len());
         for (i, scope) in scopes.iter().enumerate() {
             index.entry(scope.as_ref()).or_insert(Highlight(i));
@@ -78,13 +75,13 @@ impl HighlightMap {
             .map(|name| resolve(name, &index))
             .collect();
         Self {
-            language,
+            language: language.clone(),
             by_capture,
         }
     }
 
-    pub fn language(&self) -> &'static Language {
-        self.language
+    pub fn language(&self) -> &Arc<Language> {
+        &self.language
     }
 
     /// The scope for the capture with index `capture`.
@@ -125,7 +122,7 @@ pub(crate) fn highlight_lines(
     let Some(tree) = tree else {
         return result;
     };
-    let language = map.language;
+    let language = &map.language;
     let Some(query) = language.query() else {
         return result;
     };
@@ -348,8 +345,12 @@ mod tests {
 
     #[test]
     fn map_follows_query_capture_order() {
+        crate::standard::register();
         let rust = language_by_name("rust").unwrap();
-        let map = HighlightMap::new(rust, &["keyword", "function", "function.method", "keyword"]);
+        let map = HighlightMap::new(
+            &rust,
+            &["keyword", "function", "function.method", "keyword"],
+        );
         let names = rust.capture_names();
         for (i, name) in names.iter().enumerate() {
             let expected = match *name {

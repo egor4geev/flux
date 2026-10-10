@@ -726,7 +726,7 @@ impl Render for DialogLayer {
             .size_full()
             // Modal: the window under the dialog takes no clicks, scrolls or hovers.
             .occlude()
-            .bg(gpui::black().opacity(0.28))
+            .bg(ui.backdrop)
             .flex()
             .flex_col()
             .items_center()

@@ -38,6 +38,38 @@
 //! type = "string-list"
 //! default = ["\\bTODO\\b", "\\bFIXME\\b"]
 //! ```
+//!
+//! Declarative contributions (stage 8.3) need no code: a language with its tree-sitter grammar and
+//! highlighting query, a language server and how Flux installs it, a color theme, a set of file
+//! icons.
+//!
+//! ```toml
+//! [[languages]]
+//! id = "rust"
+//! name = "Rust"
+//! extensions = ["rs"]
+//! aliases = ["rs"]
+//! grammar = "rust"
+//! highlights = "languages/rust/highlights.scm"
+//! icon = "icons/rust.svg"
+//! icon-color = "orange"
+//!
+//! [[grammars]]
+//! id = "rust"
+//! wasm = "grammars/rust.wasm"
+//!
+//! [[language-servers]]
+//! id = "rust-analyzer"
+//! command = "rust-analyzer"
+//! languages = ["rust"]
+//! install = { rustup = "rust-analyzer", fallback = { github = "rust-lang/rust-analyzer", asset = "rust-analyzer-{arch}-apple-darwin.gz", bin = "rust-analyzer" } }
+//!
+//! [[themes]]
+//! file = "themes/flux-night.toml"
+//!
+//! [[icon-themes]]
+//! file = "icon-themes/flux.toml"
+//! ```
 
 use std::collections::HashSet;
 use std::fmt;
@@ -72,6 +104,16 @@ pub struct Manifest {
     pub settings: Vec<SettingSpec>,
     /// Items of the context menus that run the plugin's commands.
     pub menus: Vec<MenuSpec>,
+    /// Languages: file types with a grammar and a highlighting query (stage 8.3).
+    pub languages: Vec<LanguageSpec>,
+    /// The tree-sitter grammars of the languages.
+    pub grammars: Vec<GrammarSpec>,
+    /// Language servers and how Flux installs them.
+    pub language_servers: Vec<LanguageServerSpec>,
+    /// Color themes: files in the plugin's folder.
+    pub themes: Vec<ThemeSpec>,
+    /// Sets of file icons: files in the plugin's folder.
+    pub icon_themes: Vec<IconThemeSpec>,
 }
 
 /// What a plugin may do beyond its own folder and the API's notifications, questions and windows.
@@ -274,6 +316,131 @@ pub struct StatusItemSpec {
     pub id: String,
 }
 
+/// A language (stage 8.3): which files are of it, its grammar and its highlighting query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageSpec {
+    /// The key Flux knows the language by: "rust", "typescript", "tsx". Lowercase letters,
+    /// digits, `-`, `_`, `+`, `#`. Also a name of code fences.
+    pub id: String,
+    /// The name people read: "Rust".
+    pub name: String,
+    /// Extensions without the dot, in lowercase ("rs"); a file matches in any case.
+    pub extensions: Vec<String>,
+    /// Exact file names ("Cargo.lock", ".bashrc").
+    pub file_names: Vec<String>,
+    /// More names of code fences: "rs", "py".
+    pub aliases: Vec<String>,
+    /// The id of one of the plugin's `[[grammars]]`.
+    pub grammar: String,
+    /// Highlighting query files in the plugin's folder, concatenated in this order.
+    pub highlights: Vec<String>,
+    pub precedence: QueryPrecedence,
+    /// The language id language servers know it by (`textDocument/didOpen`): "typescriptreact";
+    /// the id by default.
+    pub lsp_id: Option<String>,
+    /// The icon of the language's files: a monochrome 16×16 SVG in the plugin's folder, drawn when
+    /// the icon theme has none for these files.
+    pub icon: Option<String>,
+    /// The icon's color: a shade of the theme's palette ("orange", "blue", "text-muted"…) or
+    /// "#rrggbb".
+    pub icon_color: Option<String>,
+}
+
+impl LanguageSpec {
+    /// The language id for language servers.
+    pub fn lsp_id(&self) -> &str {
+        self.lsp_id.as_deref().unwrap_or(&self.id)
+    }
+}
+
+/// Which pattern wins when patterns of the highlighting query capture the same text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QueryPrecedence {
+    /// The later one: queries written for tree-sitter-highlight 0.21 and later.
+    #[default]
+    LastPattern,
+    /// The earlier one: older queries, with special cases before generic ones.
+    FirstPattern,
+}
+
+/// A tree-sitter grammar: compiled to WebAssembly and shipped with the plugin, or compiled into
+/// Flux.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrammarSpec {
+    /// The id `[[languages]]` name it by.
+    pub id: String,
+    pub source: GrammarSourceSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrammarSourceSpec {
+    /// A `.wasm` in the plugin's folder (`tree-sitter build --wasm`). `symbol` is the grammar's
+    /// own name: the module exports `tree_sitter_<symbol>`.
+    Wasm { path: String, symbol: String },
+    /// A grammar compiled into Flux, by name: only Flux's bundled plugins have them.
+    Builtin(String),
+}
+
+/// A language server: the program, the files it serves, its settings, and how Flux installs it
+/// when it isn't on the machine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LanguageServerSpec {
+    /// The server's name, also its key: "rust-analyzer" (its folder among installed servers, its
+    /// row in Settings → Language Servers).
+    pub id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    /// The languages whose files it serves (by language id, of any plugin).
+    pub languages: Vec<String>,
+    /// Instead of the languages' files: these extensions and file names. A server that serves
+    /// only some of a language's files (bash-language-server: not `.zsh`).
+    pub extensions: Vec<String>,
+    pub file_names: Vec<String>,
+    /// `initializationOptions` of `initialize`.
+    pub initialization_options: Option<Value>,
+    /// Answers to `workspace/configuration`, by section.
+    pub settings: Option<Value>,
+    pub install: Option<InstallSpec>,
+}
+
+/// How Flux installs a language server that isn't on the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallSpec {
+    /// npm packages (the server first, then what it needs), with a Node.js of Flux's own;
+    /// `bin` — the executable in `node_modules/.bin`. `{ npm = ["pyright"], bin = "pyright-langserver" }`.
+    Npm { packages: Vec<String>, bin: String },
+    /// A binary from the latest GitHub release of `repo`; `asset` with `{arch}` (`aarch64`,
+    /// `x86_64`) and `{tag}`; `bin` — its name inside an archive.
+    /// `{ github = "astral-sh/ruff", asset = "ruff-{arch}-apple-darwin.tar.gz", bin = "ruff" }`.
+    GitHub {
+        repo: String,
+        asset: String,
+        bin: String,
+    },
+    /// `go install <package>@latest`. `{ go = "golang.org/x/tools/gopls", bin = "gopls" }`.
+    Go { package: String, bin: String },
+    /// `rustup component add <component>`, otherwise `fallback`.
+    Rustup {
+        component: String,
+        fallback: Box<InstallSpec>,
+    },
+}
+
+/// A color theme: a file in the plugin's folder (its format — `docs/themes.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ThemeSpec {
+    pub file: String,
+}
+
+/// A set of file icons: a file in the plugin's folder (its format — `docs/icon-themes.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct IconThemeSpec {
+    pub file: String,
+}
+
 /// A setting of the plugin: Settings → the plugin shows a form of them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingSpec {
@@ -346,6 +513,48 @@ impl Manifest {
     pub fn setting(&self, key: &str) -> Option<&SettingSpec> {
         self.settings.iter().find(|setting| setting.key == key)
     }
+
+    pub fn language(&self, id: &str) -> Option<&LanguageSpec> {
+        self.languages.iter().find(|language| language.id == id)
+    }
+
+    pub fn grammar(&self, id: &str) -> Option<&GrammarSpec> {
+        self.grammars.iter().find(|grammar| grammar.id == id)
+    }
+
+    /// The plugin adds something without code: languages, servers, themes or icons.
+    pub fn has_contributions(&self) -> bool {
+        !self.languages.is_empty()
+            || !self.language_servers.is_empty()
+            || !self.themes.is_empty()
+            || !self.icon_themes.is_empty()
+    }
+
+    /// The files of the plugin's folder the manifest names (queries, grammars, themes, icons), to
+    /// check they are there.
+    pub fn named_files(&self) -> Vec<&str> {
+        let mut files: Vec<&str> = Vec::new();
+        for language in &self.languages {
+            files.extend(language.highlights.iter().map(String::as_str));
+            files.extend(language.icon.as_deref());
+        }
+        for grammar in &self.grammars {
+            if let GrammarSourceSpec::Wasm { path, .. } = &grammar.source {
+                files.push(path);
+            }
+        }
+        files.extend(self.themes.iter().map(|theme| theme.file.as_str()));
+        files.extend(self.icon_themes.iter().map(|icons| icons.file.as_str()));
+        files
+    }
+}
+
+/// A language id: lowercase letters, digits, `-`, `_`, `+`, `#` ("c++", "c#", "objective-c").
+pub fn is_valid_language_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '+' | '#')
+        })
 }
 
 /// `flux.todo`, `someone.hello-world`: lowercase letters and digits, words joined by `.` or `-`.
@@ -387,6 +596,137 @@ struct RawManifest {
     settings: Vec<RawSetting>,
     #[serde(default)]
     menus: Vec<MenuSpec>,
+    #[serde(default)]
+    languages: Vec<RawLanguage>,
+    #[serde(default)]
+    grammars: Vec<RawGrammar>,
+    #[serde(default)]
+    language_servers: Vec<RawLanguageServer>,
+    #[serde(default)]
+    themes: Vec<ThemeSpec>,
+    #[serde(default)]
+    icon_themes: Vec<IconThemeSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawLanguage {
+    id: String,
+    name: String,
+    #[serde(default)]
+    extensions: Vec<String>,
+    #[serde(default)]
+    file_names: Vec<String>,
+    #[serde(default)]
+    aliases: Vec<String>,
+    grammar: String,
+    highlights: OneOrMany,
+    #[serde(default)]
+    precedence: QueryPrecedence,
+    lsp_id: Option<String>,
+    icon: Option<String>,
+    icon_color: Option<String>,
+}
+
+/// A string or a list of them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            OneOrMany::One(one) => vec![one],
+            OneOrMany::Many(many) => many,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawGrammar {
+    id: String,
+    wasm: Option<String>,
+    symbol: Option<String>,
+    builtin: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawLanguageServer {
+    id: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
+    extensions: Vec<String>,
+    #[serde(default)]
+    file_names: Vec<String>,
+    initialization_options: Option<toml::Value>,
+    settings: Option<toml::Value>,
+    install: Option<RawInstall>,
+}
+
+/// `{ npm = […], bin = … }`, `{ github = …, asset = …, bin = … }`, `{ go = …, bin = … }`,
+/// `{ rustup = …, fallback = {…} }`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawInstall {
+    Npm {
+        npm: Vec<String>,
+        bin: String,
+    },
+    GitHub {
+        github: String,
+        asset: String,
+        bin: String,
+    },
+    Go {
+        go: String,
+        bin: String,
+    },
+    Rustup {
+        rustup: String,
+        fallback: Box<RawInstall>,
+    },
+}
+
+impl RawInstall {
+    fn check(self) -> InstallSpec {
+        match self {
+            RawInstall::Npm { npm, bin } => InstallSpec::Npm { packages: npm, bin },
+            RawInstall::GitHub { github, asset, bin } => InstallSpec::GitHub {
+                repo: github,
+                asset,
+                bin,
+            },
+            RawInstall::Go { go, bin } => InstallSpec::Go { package: go, bin },
+            RawInstall::Rustup { rustup, fallback } => InstallSpec::Rustup {
+                component: rustup,
+                fallback: Box::new(fallback.check()),
+            },
+        }
+    }
+}
+
+/// A path in the plugin's folder: relative, `/`-separated, without `..`.
+fn check_relative(what: &str, path: &str) -> Result<(), ManifestError> {
+    let fine = !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && path.split('/').all(|part| !part.is_empty() && part != "..");
+    if fine {
+        Ok(())
+    } else {
+        Err(ManifestError(format!(
+            "{what}: \"{path}\" — a path in the plugin's folder, like \"themes/dark.toml\""
+        )))
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -529,6 +869,14 @@ impl RawManifest {
             .into_iter()
             .map(RawSetting::check)
             .collect::<Result<Vec<_>, _>>()?;
+        let (languages, grammars, language_servers) =
+            check_languages(self.languages, self.grammars, self.language_servers)?;
+        for theme in &self.themes {
+            check_relative("themes", &theme.file)?;
+        }
+        for icons in &self.icon_themes {
+            check_relative("icon-themes", &icons.file)?;
+        }
         Ok(Manifest {
             id: self.id,
             name: self.name,
@@ -546,8 +894,129 @@ impl RawManifest {
             status_items: self.status_items,
             settings,
             menus: self.menus,
+            languages,
+            grammars,
+            language_servers,
+            themes: self.themes,
+            icon_themes: self.icon_themes,
         })
     }
+}
+
+/// The languages, grammars and language servers of a manifest.
+type LanguageParts = (Vec<LanguageSpec>, Vec<GrammarSpec>, Vec<LanguageServerSpec>);
+
+/// Checks the languages, grammars and servers of a manifest: ids, references between them, paths.
+fn check_languages(
+    raw_languages: Vec<RawLanguage>,
+    raw_grammars: Vec<RawGrammar>,
+    raw_servers: Vec<RawLanguageServer>,
+) -> Result<LanguageParts, ManifestError> {
+    let error = |message: String| Err(ManifestError(message));
+    unique("grammar", raw_grammars.iter().map(|g| g.id.as_str()))?;
+    let mut grammars = Vec::new();
+    for raw in raw_grammars {
+        let source = match (raw.wasm, raw.builtin) {
+            (Some(path), None) => {
+                check_relative(&format!("grammar \"{}\"", raw.id), &path)?;
+                let symbol = raw.symbol.unwrap_or_else(|| raw.id.replace('-', "_"));
+                GrammarSourceSpec::Wasm { path, symbol }
+            }
+            (None, Some(name)) if raw.symbol.is_none() => GrammarSourceSpec::Builtin(name),
+            _ => {
+                return error(format!(
+                    "grammar \"{}\": either `wasm` (with an optional `symbol`) or `builtin`",
+                    raw.id
+                ));
+            }
+        };
+        grammars.push(GrammarSpec { id: raw.id, source });
+    }
+    unique("language", raw_languages.iter().map(|l| l.id.as_str()))?;
+    let mut languages = Vec::new();
+    for raw in raw_languages {
+        if !is_valid_language_id(&raw.id) {
+            return error(format!(
+                "language \"{}\": lowercase letters, digits, \"-\", \"_\", \"+\", \"#\"",
+                raw.id
+            ));
+        }
+        if raw.name.trim().is_empty() {
+            return error(format!("language \"{}\": the name is empty", raw.id));
+        }
+        if !grammars.iter().any(|grammar| grammar.id == raw.grammar) {
+            return error(format!(
+                "language \"{}\": the grammar \"{}\" isn't in [[grammars]]",
+                raw.id, raw.grammar
+            ));
+        }
+        let highlights = raw.highlights.into_vec();
+        if highlights.is_empty() {
+            return error(format!("language \"{}\": no highlights", raw.id));
+        }
+        for file in &highlights {
+            check_relative(&format!("language \"{}\"", raw.id), file)?;
+        }
+        if let Some(icon) = &raw.icon {
+            check_relative(&format!("language \"{}\"", raw.id), icon)?;
+        }
+        if raw
+            .extensions
+            .iter()
+            .any(|extension| extension.starts_with('.'))
+        {
+            return error(format!(
+                "language \"{}\": extensions go without the dot (\"rs\", not \".rs\")",
+                raw.id
+            ));
+        }
+        languages.push(LanguageSpec {
+            id: raw.id,
+            name: raw.name,
+            extensions: raw
+                .extensions
+                .into_iter()
+                .map(|extension| extension.to_ascii_lowercase())
+                .collect(),
+            file_names: raw.file_names,
+            aliases: raw.aliases,
+            grammar: raw.grammar,
+            highlights,
+            precedence: raw.precedence,
+            lsp_id: raw.lsp_id,
+            icon: raw.icon,
+            icon_color: raw.icon_color,
+        });
+    }
+    unique("language server", raw_servers.iter().map(|s| s.id.as_str()))?;
+    let mut servers = Vec::new();
+    for raw in raw_servers {
+        if raw.command.trim().is_empty() {
+            return error(format!("language server \"{}\": no command", raw.id));
+        }
+        if raw.languages.is_empty() && raw.extensions.is_empty() && raw.file_names.is_empty() {
+            return error(format!(
+                "language server \"{}\": which files — `languages`, `extensions` or `file-names`",
+                raw.id
+            ));
+        }
+        servers.push(LanguageServerSpec {
+            id: raw.id,
+            command: raw.command,
+            args: raw.args,
+            languages: raw.languages,
+            extensions: raw
+                .extensions
+                .into_iter()
+                .map(|extension| extension.to_ascii_lowercase())
+                .collect(),
+            file_names: raw.file_names,
+            initialization_options: raw.initialization_options.map(toml_to_json),
+            settings: raw.settings.map(toml_to_json),
+            install: raw.install.map(RawInstall::check),
+        });
+    }
+    Ok((languages, grammars, servers))
 }
 
 fn unique<'a>(what: &str, ids: impl Iterator<Item = &'a str>) -> Result<(), ManifestError> {
@@ -777,6 +1246,167 @@ options = [{ value = "project", title = "Project" }, { value = "file", title = "
         assert!(with("command = \"nope\"\nlocation = \"editor\"").is_err());
         assert!(with("command = \"refresh\"\nlocation = \"editor\"\nwhen = \"folder\"").is_err());
         assert!(with("command = \"refresh\"\nlocation = \"tab\"\nwhen = \"selection\"").is_err());
+    }
+
+    const RUST: &str = r#"
+id = "flux.rust"
+name = "Rust"
+version = "0.1.0"
+api = "0.2"
+
+[[languages]]
+id = "rust"
+name = "Rust"
+extensions = ["RS"]
+aliases = ["rs"]
+grammar = "rust"
+highlights = "languages/rust/highlights.scm"
+icon = "icons/rust.svg"
+icon-color = "orange"
+
+[[languages]]
+id = "typescriptreact"
+name = "TSX"
+extensions = ["tsx"]
+grammar = "tsx"
+highlights = ["queries/javascript.scm", "queries/typescript.scm"]
+precedence = "first-pattern"
+lsp-id = "typescriptreact"
+
+[[grammars]]
+id = "rust"
+wasm = "grammars/rust.wasm"
+
+[[grammars]]
+id = "tsx"
+builtin = "tsx"
+
+[[language-servers]]
+id = "rust-analyzer"
+command = "rust-analyzer"
+languages = ["rust"]
+initialization-options = { cargo = { features = "all" } }
+install = { rustup = "rust-analyzer", fallback = { github = "rust-lang/rust-analyzer", asset = "rust-analyzer-{arch}-apple-darwin.gz", bin = "rust-analyzer" } }
+
+[[language-servers]]
+id = "pyright"
+command = "pyright-langserver"
+args = ["--stdio"]
+extensions = ["py"]
+install = { npm = ["pyright"], bin = "pyright-langserver" }
+
+[[language-servers]]
+id = "gopls"
+command = "gopls"
+file-names = ["go.mod"]
+install = { go = "golang.org/x/tools/gopls", bin = "gopls" }
+
+[[themes]]
+file = "themes/night.toml"
+
+[[icon-themes]]
+file = "icon-themes/flux.toml"
+"#;
+
+    #[test]
+    fn reads_declarative_contributions() {
+        let manifest = Manifest::parse(RUST).unwrap();
+        assert!(manifest.wasm.is_none());
+        assert!(manifest.has_contributions());
+        let rust = manifest.language("rust").unwrap();
+        assert_eq!(rust.extensions, ["rs"]);
+        assert_eq!(rust.highlights, ["languages/rust/highlights.scm"]);
+        assert_eq!(rust.precedence, QueryPrecedence::LastPattern);
+        assert_eq!(rust.lsp_id(), "rust");
+        assert_eq!(rust.icon_color.as_deref(), Some("orange"));
+        let tsx = manifest.language("typescriptreact").unwrap();
+        assert_eq!(tsx.highlights.len(), 2);
+        assert_eq!(tsx.precedence, QueryPrecedence::FirstPattern);
+        assert_eq!(
+            manifest.grammar("rust").unwrap().source,
+            GrammarSourceSpec::Wasm {
+                path: "grammars/rust.wasm".into(),
+                symbol: "rust".into()
+            }
+        );
+        assert_eq!(
+            manifest.grammar("tsx").unwrap().source,
+            GrammarSourceSpec::Builtin("tsx".into())
+        );
+        let servers = &manifest.language_servers;
+        assert_eq!(
+            servers[0].initialization_options,
+            Some(serde_json::json!({ "cargo": { "features": "all" } }))
+        );
+        assert_eq!(
+            servers[0].install,
+            Some(InstallSpec::Rustup {
+                component: "rust-analyzer".into(),
+                fallback: Box::new(InstallSpec::GitHub {
+                    repo: "rust-lang/rust-analyzer".into(),
+                    asset: "rust-analyzer-{arch}-apple-darwin.gz".into(),
+                    bin: "rust-analyzer".into(),
+                }),
+            })
+        );
+        assert_eq!(
+            servers[1].install,
+            Some(InstallSpec::Npm {
+                packages: vec!["pyright".into()],
+                bin: "pyright-langserver".into()
+            })
+        );
+        assert_eq!(
+            servers[2].install,
+            Some(InstallSpec::Go {
+                package: "golang.org/x/tools/gopls".into(),
+                bin: "gopls".into()
+            })
+        );
+        assert_eq!(manifest.themes[0].file, "themes/night.toml");
+        assert_eq!(manifest.icon_themes[0].file, "icon-themes/flux.toml");
+        let files = manifest.named_files();
+        for file in [
+            "languages/rust/highlights.scm",
+            "icons/rust.svg",
+            "grammars/rust.wasm",
+            "themes/night.toml",
+            "icon-themes/flux.toml",
+        ] {
+            assert!(files.contains(&file), "{file}");
+        }
+        assert!(!Manifest::parse(TODO).unwrap().has_contributions());
+    }
+
+    #[test]
+    fn rejects_contribution_mistakes() {
+        for (wrong, right) in [
+            ("grammar = \"rust\"", "grammar = \"nope\""),
+            (
+                "id = \"rust\"\nname = \"Rust\"",
+                "id = \"Rust\"\nname = \"Rust\"",
+            ),
+            ("extensions = [\"RS\"]", "extensions = [\".rs\"]"),
+            ("highlights = \"languages", "highlights = \"../languages"),
+            (
+                "wasm = \"grammars/rust.wasm\"",
+                "wasm = \"grammars/rust.wasm\"\nbuiltin = \"rust\"",
+            ),
+            (
+                "file = \"themes/night.toml\"",
+                "file = \"/themes/night.toml\"",
+            ),
+            ("extensions = [\"py\"]", "extensions = []"),
+            ("install = { go", "install = { goo"),
+        ] {
+            let text = RUST.replacen(wrong, right, 1);
+            assert_ne!(text, RUST, "{wrong}");
+            assert!(Manifest::parse(&text).is_err(), "{right}");
+        }
+        assert!(is_valid_language_id("c++"));
+        assert!(is_valid_language_id("c#"));
+        assert!(!is_valid_language_id("C"));
+        assert!(!is_valid_language_id("a b"));
     }
 
     #[test]

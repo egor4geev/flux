@@ -8,9 +8,13 @@ proposes edits the user reviews in a diff, reads Git and the problems of the cod
 own. Plugins look like Flux itself — they describe their windows with elements, and Flux draws them
 in its own design system.
 
+A plugin without code can add languages, their grammars and language servers: [Language plugins](languages.md);
+color themes: [Themes](themes.md); sets of file icons: [File icon sets](icon-themes.md).
+
 > [!NOTE]
-> The plugin API is version **0.2** and still young: it may change between versions until the plugin
-> catalog opens. A manifest names the version it is built for ([From 0.1 to 0.2](#from-01-to-02)).
+> The plugin API is version **0.2**. A manifest names the version it is built for
+> ([From 0.1 to 0.2](#from-01-to-02)); with the [catalog](catalog.md) open, Flux keeps running
+> plugins built for the API versions it had before.
 
 ## How plugins run
 
@@ -798,6 +802,9 @@ tar czf hello-0.1.0.tar.gz flux-plugin.toml locales icons \
 
 The plugin's data is in `~/Library/Application Support/flux/plugin-data/<id>/`; removing the plugin
 keeps it, as JetBrains IDEs keep a removed plugin's settings (its secrets in the keychain go).
+
+To publish a plugin for everyone, add it to the catalog — the Marketplace of Settings → Plugins:
+[The plugin catalog](catalog.md).
 
 ## Bundled plugins
 

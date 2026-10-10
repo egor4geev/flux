@@ -2,8 +2,10 @@
 //!
 //! Strings stay English in the code; [`tr`] returns their translation for the current
 //! language and falls back to English when a translation is missing. The language is chosen
-//! once at startup ([`init`]): `FLUX_LANG=en|ru` if set, otherwise the first supported
-//! language among the system's preferred languages, otherwise English.
+//! at startup ([`init`]): `FLUX_LANG=en|ru` if set, otherwise the first supported language
+//! among the system's preferred languages, otherwise English. Since stage 8.3 Settings →
+//! Appearance → Language chooses it too ([`apply_choice`]), while Flux runs: what is drawn next
+//! speaks the new language.
 //!
 //! - `tr("Search files")` — a plain string;
 //! - `trf("{0} of {1} files", &[&shown, &total])` — a template with numbered arguments;
@@ -16,6 +18,9 @@ mod ru;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::settings::LanguageChoice;
 
 /// A language of the interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,18 +29,73 @@ pub enum Lang {
     Ru,
 }
 
-static LANG: OnceLock<Lang> = OnceLock::new();
+/// The language of the interface: 0 — English, 1 — Russian.
+static LANG: AtomicU8 = AtomicU8::new(0);
 
-/// Chooses the language of the interface; call once before any window opens.
+fn set_lang(lang: Lang) {
+    LANG.store(
+        match lang {
+            Lang::En => 0,
+            Lang::Ru => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Chooses the language of the interface by `FLUX_LANG` and the system's languages; call before
+/// any window opens.
 pub fn init() {
     let override_lang = std::env::var("FLUX_LANG").ok();
-    LANG.set(choose(override_lang.as_deref(), &system_languages()))
-        .ok();
+    set_lang(choose(override_lang.as_deref(), &system_languages()));
+}
+
+/// The language Settings → Appearance → Language chose; `FLUX_LANG` still wins. Windows draw the
+/// new language from their next frame (`cx.refresh_windows()`; the app menu is built anew by
+/// `app_menu::rebuild`).
+pub fn apply_choice(choice: LanguageChoice) {
+    let override_lang = std::env::var("FLUX_LANG").ok();
+    set_lang(resolve(override_lang.as_deref(), choice, &system_languages()));
+}
+
+/// The language of a choice: `FLUX_LANG` (`override_lang`) wins, then the choice; "System" is the
+/// first of the system's preferred languages Flux speaks, otherwise English.
+fn resolve(override_lang: Option<&str>, choice: LanguageChoice, preferred: &[String]) -> Lang {
+    match (override_lang.and_then(parse), choice) {
+        (Some(lang), _) => lang,
+        (None, LanguageChoice::English) => Lang::En,
+        (None, LanguageChoice::Russian) => Lang::Ru,
+        (None, LanguageChoice::System) => choose(None, preferred),
+    }
+}
+
+/// The language "System" stands for now: the first of the system's preferred languages Flux
+/// speaks, otherwise English.
+pub fn system_lang() -> Lang {
+    choose(None, &system_languages())
+}
+
+/// `FLUX_LANG`, when it names a language Flux speaks: it decides the language for the whole run.
+pub fn override_lang() -> Option<(String, Lang)> {
+    let value = std::env::var("FLUX_LANG").ok()?;
+    let lang = parse(&value)?;
+    Some((value, lang))
+}
+
+/// A language's own name, as its speakers write it: the choices of Settings → Appearance →
+/// Language are never translated.
+pub fn lang_name(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "English",
+        Lang::Ru => "Русский",
+    }
 }
 
 /// The language of the interface (English until [`init`]).
 pub fn lang() -> Lang {
-    LANG.get().copied().unwrap_or(Lang::En)
+    match LANG.load(Ordering::Relaxed) {
+        1 => Lang::Ru,
+        _ => Lang::En,
+    }
 }
 
 /// The interface language as a code: "en", "ru" (plugins' translations are keyed by it).
@@ -199,6 +259,29 @@ mod tests {
         assert_eq!(choose(Some("en"), &system(&["ru-RU"])), Lang::En);
         assert_eq!(choose(Some("ru_RU.UTF-8"), &system(&["en-US"])), Lang::Ru);
         assert_eq!(choose(Some("xx"), &system(&["ru"])), Lang::Ru);
+    }
+
+    #[test]
+    fn a_choice_gives_its_language_unless_flux_lang_says_otherwise() {
+        let system = |tags: &[&str]| tags.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        let russian_mac = system(&["ru-RU", "en-US"]);
+        assert_eq!(resolve(None, LanguageChoice::System, &russian_mac), Lang::Ru);
+        assert_eq!(resolve(None, LanguageChoice::English, &russian_mac), Lang::En);
+        assert_eq!(
+            resolve(None, LanguageChoice::Russian, &system(&["en-US"])),
+            Lang::Ru
+        );
+        assert_eq!(resolve(None, LanguageChoice::System, &system(&["de"])), Lang::En);
+        // FLUX_LANG wins over the choice; a value Flux doesn't speak is ignored.
+        assert_eq!(
+            resolve(Some("en"), LanguageChoice::Russian, &russian_mac),
+            Lang::En
+        );
+        assert_eq!(
+            resolve(Some("xx"), LanguageChoice::English, &russian_mac),
+            Lang::En
+        );
+        assert_eq!(lang_name(Lang::Ru), "Русский");
     }
 
     #[test]

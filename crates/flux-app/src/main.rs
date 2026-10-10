@@ -1,4 +1,5 @@
 mod app_menu;
+mod appearance_settings;
 mod blame;
 mod branch_dialogs;
 mod branches_popup;
@@ -14,14 +15,15 @@ mod claude_panel;
 mod claude_session;
 mod claude_tools;
 mod claude_transcript;
+mod code_actions;
 mod command_palette;
 mod commit_details;
-mod code_actions;
 mod commit_panel;
 mod compare_dialog;
 mod completion;
 mod conflicts_dialog;
 mod context_menu;
+mod contributions;
 mod diagnostics;
 mod dialog;
 mod diff_view;
@@ -42,6 +44,7 @@ mod go_to_line;
 mod highlighter;
 mod hover;
 mod i18n;
+mod icon_themes;
 mod icons;
 mod input;
 mod input_dialog;
@@ -57,17 +60,21 @@ mod notifications;
 mod notifications_panel;
 mod picker;
 mod plugin_calls;
+mod plugin_catalog;
 mod plugin_manager;
 mod plugin_menus;
 mod plugin_review;
 mod plugin_settings;
-mod plugin_view;
+mod plugin_suggestions;
 mod plugin_terminals;
+mod plugin_updates;
+mod plugin_view;
 mod plugins;
 mod popup;
 mod project_search;
 mod prompt_input;
 mod push_dialog;
+mod quick_switch;
 mod rebase_dialog;
 mod recent;
 mod rename;
@@ -123,6 +130,8 @@ fn main() {
     let (dirs, paths): (Vec<_>, Vec<_>) = args.into_iter().partition(|path| path.is_dir());
     let root = project_root(dirs);
     i18n::init();
+    // Compiled WebAssembly grammars of plugins: next to the compiled plugins' components.
+    flux_syntax::set_wasm_cache_dir(flux_plugin::paths::cache_dir().with_file_name("grammars"));
 
     Application::new()
         .with_assets(icons::Assets)
@@ -142,6 +151,11 @@ fn main() {
             go_to_line::init(cx);
             project_search::init(cx);
             settings::init(cx);
+            // The interface language, the theme and the icons as the settings choose them, from
+            // the plugins that bring them (stage 8.3): before any window opens.
+            i18n::apply_choice(settings::appearance(cx).language);
+            contributions::init(cx);
+            quick_switch::init(cx);
             dialog::init(cx);
             settings_view::init(cx);
             app_menu::init(cx);

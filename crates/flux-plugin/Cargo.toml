@@ -31,11 +31,16 @@ ureq = { version = "3.4", default-features = false, features = [
     "platform-verifier",
     "rustls-no-provider",
 ] }
+# The catalog's packages (stage 8.3): their SHA-256 is checked before installing (ring is in Flux's
+# tree already, through rustls).
+ring = "0.17.14"
 # Redirects (a relative `Location` against the request's URL) and the URLs of the plugins' requests.
 url = "2"
 # The plugins' runtime: WebAssembly components (ADR-029). Only what Flux needs: the component
-# model compiled by Cranelift; no WAT, GC, threads, profiling or the async component model.
-wasmtime = { version = "49.0.2", default-features = false, features = [
+# model compiled by Cranelift; no WAT, threads, profiling or the async component model. The major
+# version is the one tree-sitter's `wasm` feature is built on (`wasmtime-c-api-impl` 48, which also
+# turns on `gc` and `gc-null`): one wasmtime in Flux, not two. Move them together.
+wasmtime = { version = "48.0.5", default-features = false, features = [
     "anyhow",
     "backtrace",
     "component-model",
@@ -46,7 +51,7 @@ wasmtime = { version = "49.0.2", default-features = false, features = [
 ] }
 # WASI 0.2 for the plugins: the file system (the project, the plugin's folder), clocks, random,
 # stdout and stderr into the plugin's log.
-wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p2"] }
+wasmtime-wasi = { version = "48.0.5", default-features = false, features = ["p2"] }
 
 # The plugins' secrets (`secrets`): generic passwords in the macOS keychain (the crate is in the tree
 # already, through rustls).

@@ -1,4 +1,7 @@
-//! Which language server serves which files, and how to start it.
+//! Which language server serves which files, and how to start it. The configs come from the
+//! language plugins (stage 8.3: `[[language-servers]]` of their manifests, turned into a
+//! [`ServerConfig`] by the application); this module picks the servers of a file and finds their
+//! executables.
 
 use std::env;
 use std::ffi::OsString;
@@ -53,147 +56,6 @@ pub enum Install {
     },
 }
 
-/// The built-in servers: rust-analyzer, gopls, pyright and ruff (Python: types, then formatting
-/// and linting), typescript-language-server, taplo, bash-language-server, yaml-language-server,
-/// vscode-json-language-server, marksman. A server that is not on the machine is installed by Flux
-/// ([`crate::install`]).
-pub fn default_servers() -> Vec<ServerConfig> {
-    vec![
-        server("rust-analyzer", "rust-analyzer", &[], &["rs"], &[]).installed(Install::Rustup {
-            component: "rust-analyzer".into(),
-            fallback: Box::new(github(
-                "rust-lang/rust-analyzer",
-                "rust-analyzer-{arch}-apple-darwin.gz",
-                "rust-analyzer",
-            )),
-        }),
-        server("gopls", "gopls", &[], &["go"], &[]).installed(Install::GoInstall {
-            package: "golang.org/x/tools/gopls".into(),
-            bin: "gopls".into(),
-        }),
-        server(
-            "pyright",
-            "pyright-langserver",
-            &["--stdio"],
-            &["py", "pyi", "pyw"],
-            &[],
-        )
-        .installed(npm(&["pyright"], "pyright-langserver")),
-        // After pyright: it has no formatter; ruff formats and lints.
-        server("ruff", "ruff", &["server"], &["py", "pyi"], &[]).installed(github(
-            "astral-sh/ruff",
-            "ruff-{arch}-apple-darwin.tar.gz",
-            "ruff",
-        )),
-        server(
-            "typescript-language-server",
-            "typescript-language-server",
-            &["--stdio"],
-            &["ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx"],
-            &[],
-        )
-        // TypeScript 6: the last one with `tsserver`, which typescript-language-server drives;
-        // TypeScript 7 is native and has an LSP server of its own.
-        .installed(npm(
-            &["typescript-language-server", "typescript@6"],
-            "typescript-language-server",
-        )),
-        server(
-            "taplo",
-            "taplo",
-            &["lsp", "stdio"],
-            &["toml"],
-            &["Cargo.lock", "Pipfile", "poetry.lock", "uv.lock"],
-        )
-        .installed(github("tamasfe/taplo", "taplo-darwin-{arch}.gz", "taplo")),
-        server(
-            "bash-language-server",
-            "bash-language-server",
-            &["start"],
-            &["sh", "bash"],
-            &[
-                ".bashrc",
-                ".bash_profile",
-                ".bash_aliases",
-                ".bash_logout",
-                ".profile",
-                "PKGBUILD",
-            ],
-        )
-        .installed(npm(&["bash-language-server"], "bash-language-server")),
-        server(
-            "yaml-language-server",
-            "yaml-language-server",
-            &["--stdio"],
-            &["yaml", "yml"],
-            &[".clang-format", ".clang-tidy"],
-        )
-        .installed(npm(&["yaml-language-server"], "yaml-language-server")),
-        ServerConfig {
-            // Formatting is off unless asked for.
-            initialization_options: Some(serde_json::json!({ "provideFormatter": true })),
-            ..server(
-                "vscode-json-language-server",
-                "vscode-json-language-server",
-                &["--stdio"],
-                &["json", "jsonc"],
-                &["flake.lock"],
-            )
-        }
-        .installed(npm(
-            &["vscode-langservers-extracted"],
-            "vscode-json-language-server",
-        )),
-        server(
-            "marksman",
-            "marksman",
-            &["server"],
-            &["md", "markdown"],
-            &[],
-        )
-        .installed(github(
-            "artempyanykh/marksman",
-            "marksman-macos",
-            "marksman",
-        )),
-    ]
-}
-
-fn npm(packages: &[&str], bin: &str) -> Install {
-    Install::Npm {
-        packages: packages.iter().map(|p| p.to_string()).collect(),
-        bin: bin.to_string(),
-    }
-}
-
-fn github(repo: &str, asset: &str, bin: &str) -> Install {
-    Install::GitHubRelease {
-        repo: repo.to_string(),
-        asset: asset.to_string(),
-        bin: bin.to_string(),
-    }
-}
-
-fn server(
-    name: &str,
-    command: &str,
-    args: &[&str],
-    extensions: &[&str],
-    file_names: &[&str],
-) -> ServerConfig {
-    let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect();
-    ServerConfig {
-        name: name.to_string(),
-        command: command.to_string(),
-        args: strings(args),
-        extensions: strings(extensions),
-        file_names: strings(file_names),
-        initialization_options: None,
-        settings: None,
-        install: None,
-    }
-}
-
 /// Every config that serves `path`, the main server first (Python: pyright, then ruff for formatting
 /// and linting): those that name the file exactly if any, otherwise those for its extension (any
 /// case), in the order of `configs`.
@@ -226,44 +88,6 @@ pub fn server_for_path<'a>(configs: &'a [ServerConfig], path: &Path) -> Option<&
     servers_for_path(configs, path).into_iter().next()
 }
 
-/// `languageId` for `textDocument/didOpen`: "rust", "typescriptreact" for `.tsx`, …; "plaintext"
-/// for anything unknown.
-pub fn language_id(path: &Path) -> &'static str {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    match file_name {
-        "Cargo.lock" | "Pipfile" | "poetry.lock" | "uv.lock" => return "toml",
-        "flake.lock" => return "json",
-        ".clang-format" | ".clang-tidy" => return "yaml",
-        ".bashrc" | ".bash_profile" | ".bash_aliases" | ".bash_logout" | ".profile" | ".zshrc"
-        | ".zshenv" | ".zprofile" | ".zlogin" | ".zlogout" | "PKGBUILD" => return "shellscript",
-        _ => {}
-    }
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match extension.as_str() {
-        "rs" => "rust",
-        "go" => "go",
-        "py" | "pyi" | "pyw" => "python",
-        "js" | "mjs" | "cjs" => "javascript",
-        "jsx" => "javascriptreact",
-        "ts" | "mts" | "cts" => "typescript",
-        "tsx" => "typescriptreact",
-        "toml" => "toml",
-        "sh" | "bash" | "zsh" => "shellscript",
-        "yaml" | "yml" => "yaml",
-        "json" => "json",
-        "jsonc" => "jsonc",
-        "md" | "markdown" => "markdown",
-        _ => "plaintext",
-    }
-}
-
 impl ServerConfig {
     /// The executable: `command` looked up in `PATH` and, because an app started from Finder gets
     /// a minimal `PATH`, also in the usual install locations (`~/.cargo/bin`, `~/go/bin`,
@@ -286,13 +110,6 @@ impl ServerConfig {
             .map(|dir| dir.join(command))
             .find(|path| is_executable(path))
             .filter(|path| !self.is_bare_rustup_proxy(path))
-    }
-
-    fn installed(self, install: Install) -> Self {
-        Self {
-            install: Some(install),
-            ..self
-        }
     }
 
     /// rustup puts a proxy for `rust-analyzer` next to itself whether or not the toolchain has the
@@ -526,6 +343,7 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::{default_servers, server};
 
     #[test]
     fn servers_by_file_name_and_extension() {
@@ -655,28 +473,6 @@ mod tests {
             options,
             Some(json!({ "tsserver": { "fallbackPath": lib.to_string_lossy() } }))
         );
-    }
-
-    #[test]
-    fn every_config_has_a_language_id_for_its_files() {
-        for config in default_servers() {
-            for extension in &config.extensions {
-                let path = PathBuf::from(format!("file.{extension}"));
-                assert_ne!(language_id(&path), "plaintext", "{extension}");
-            }
-            for file_name in &config.file_names {
-                assert_ne!(
-                    language_id(Path::new(file_name)),
-                    "plaintext",
-                    "{file_name}"
-                );
-            }
-        }
-        assert_eq!(language_id(Path::new("a.tsx")), "typescriptreact");
-        assert_eq!(language_id(Path::new("a.jsx")), "javascriptreact");
-        assert_eq!(language_id(Path::new("a.mts")), "typescript");
-        assert_eq!(language_id(Path::new("x.sh")), "shellscript");
-        assert_eq!(language_id(Path::new("README")), "plaintext");
     }
 
     #[test]

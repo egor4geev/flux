@@ -347,7 +347,14 @@ pub fn switch(id: impl Into<ElementId>, on: bool, ui: UiColors) -> Stateful<Div>
                 .left(px(if on { WIDTH - KNOB - inset } else { inset }))
                 .size(px(KNOB))
                 .rounded(px(KNOB / 2.))
-                .bg(ui.foreground),
+                .bg(ui.on_accent)
+                // The knob stands out of a light track too.
+                .shadow(vec![BoxShadow {
+                    color: UiColors::tint(ui.shadow, 0.3),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(2.),
+                    spread_radius: px(0.),
+                }]),
         )
 }
 
@@ -406,8 +413,8 @@ pub fn checkbox(id: impl Into<gpui::ElementId>, state: CheckState, ui: UiColors)
                 .hover(move |style| style.border_color(ui.foreground))
         })
         .children(match state {
-            CheckState::Checked => Some(icon(IconName::Check, ui.foreground).size(px(11.))),
-            CheckState::Partial => Some(icon(IconName::Minus, ui.foreground).size(px(11.))),
+            CheckState::Checked => Some(icon(IconName::Check, ui.on_accent).size(px(11.))),
+            CheckState::Partial => Some(icon(IconName::Minus, ui.on_accent).size(px(11.))),
             CheckState::Unchecked => None,
         })
 }

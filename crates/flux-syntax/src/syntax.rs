@@ -26,7 +26,7 @@ use crate::language::Language;
 use crate::text::{chunk_from, count_newlines};
 
 pub struct Syntax {
-    language: &'static Language,
+    language: Arc<Language>,
     /// The latest tree, edited to match the current text. It may be stale (edits made after the
     /// parse), but its node offsets have already been shifted.
     tree: Option<Tree>,
@@ -62,7 +62,7 @@ enum PendingEdit {
 
 impl Syntax {
     /// Empty state: no highlighting until the first parse.
-    pub fn new(language: &'static Language) -> Self {
+    pub fn new(language: Arc<Language>) -> Self {
         Self {
             language,
             tree: None,
@@ -74,8 +74,8 @@ impl Syntax {
         }
     }
 
-    pub fn language(&self) -> &'static Language {
-        self.language
+    pub fn language(&self) -> &Arc<Language> {
+        &self.language
     }
 
     /// The current tree; after edits with no re-parse, it is the edited, stale one.
@@ -96,7 +96,7 @@ impl Syntax {
             Some(_) => true,
             None => self.dirty,
         };
-        pending && self.language.grammar().is_some()
+        pending && !self.language.grammar_failed()
     }
 
     /// A document edit: `old_text` is the text before `changes`. Cheap: it only shifts the tree's
@@ -104,6 +104,14 @@ impl Syntax {
     /// parse result.
     pub fn edit(&mut self, old_text: &Rope, changes: &ChangeSet) {
         if changes.is_empty() {
+            return;
+        }
+        if self.language.grammar_failed() {
+            // A grammar that failed or got stuck is not parsed again: there is nothing to keep up
+            // to date, and a stuck parse never hands its job back to replay the edits onto.
+            self.tree = None;
+            self.job = None;
+            self.newlines = None;
             return;
         }
         if changes.len() != old_text.len_chars() {
@@ -154,7 +162,9 @@ impl Syntax {
         if !self.dirty {
             return None;
         }
-        self.language.grammar()?;
+        if self.language.grammar_failed() {
+            return None;
+        }
         let token = Arc::new(());
         self.job = Some(InFlight {
             token: Arc::downgrade(&token),
@@ -163,7 +173,7 @@ impl Syntax {
         });
         self.dirty = false;
         Some(ParseJob {
-            language: self.language,
+            language: self.language.clone(),
             text: text.clone(),
             old_tree: self.tree.clone(),
             parser: self.parser.take(),
@@ -192,7 +202,9 @@ impl Syntax {
         };
         debug_assert_eq!(job.version, version);
         debug_assert_eq!(job.version + job.pending.len() as u64, self.version);
-        self.parser.get_or_insert(parser);
+        if let Some(parser) = parser {
+            self.parser.get_or_insert(parser);
+        }
         let Some(mut tree) = tree else {
             // The parse failed: the previous (edited) tree stays.
             return true;
@@ -236,9 +248,9 @@ impl Syntax {
         let tree = self
             .tree
             .as_ref()
-            .filter(|_| std::ptr::eq(map.language(), self.language));
+            .filter(|_| Arc::ptr_eq(map.language(), &self.language));
         debug_assert!(
-            std::ptr::eq(map.language(), self.language),
+            Arc::ptr_eq(map.language(), &self.language),
             "highlight map is for another language"
         );
         highlight::highlight_lines(tree, text, lines, map)
@@ -266,7 +278,7 @@ fn apply_edits(tree: &mut Tree, edits: &[InputEdit]) {
 
 /// A parse of a text snapshot. `Send + 'static`: can be handed to a background thread.
 pub struct ParseJob {
-    language: &'static Language,
+    language: Arc<Language>,
     text: Rope,
     /// The edited tree for incremental parsing.
     old_tree: Option<Tree>,
@@ -280,7 +292,8 @@ pub struct ParseJob {
 /// The job's result; pass it to [`Syntax::finish`].
 pub struct ParseResult {
     tree: Option<Tree>,
-    parser: Parser,
+    /// None when no parser could be made (the grammar didn't load).
+    parser: Option<Parser>,
     /// The number of `\n` in the snapshot text.
     newlines: usize,
     token: Arc<()>,
@@ -288,19 +301,46 @@ pub struct ParseResult {
 }
 
 impl ParseJob {
-    /// Parses to completion. Also compiles the language's highlighting query, so the first
-    /// highlighting on the UI thread doesn't pay milliseconds for it.
+    /// The language being parsed.
+    pub fn language(&self) -> &Arc<Language> {
+        &self.language
+    }
+
+    /// Parses to completion. Also loads the grammar and compiles the language's highlighting
+    /// query, so the first highlighting on the UI thread doesn't pay milliseconds for them. A
+    /// WebAssembly grammar is parsed under the watchdog ([`crate::wasm::PARSE_LIMIT`]).
     pub fn run(mut self) -> ParseResult {
+        let _watch = self
+            .language
+            .is_wasm()
+            .then(|| crate::wasm::Watch::start(&self.language));
         self.language.query();
         let tree = self.parse(None);
         self.into_result(tree)
     }
 
+    /// Runs the job ([`ParseJob::run`]) on a thread of its own and hands the result to `done`
+    /// there. For a WebAssembly grammar ([`Language::is_wasm`]): its scanner is a plugin's code
+    /// that may never return, and then only this thread is stuck, not a thread of a pool. If the
+    /// thread can't be made, the job is dropped and `done` is never called.
+    pub fn spawn(self, done: impl FnOnce(ParseResult) + Send + 'static) {
+        let thread = std::thread::Builder::new().name("flux-parse".into());
+        if let Err(err) = thread.spawn(move || done(self.run())) {
+            eprintln!("flux: can't start a parse: {err}");
+        }
+    }
+
     /// Parses for no longer than `budget`. If it doesn't finish in time, returns `Err` with the
     /// same job: the parser remembers where it stopped, and the next run continues from the same
     /// place. The budget is checked once every hundred parser steps, so a small text finishes even
-    /// with a zero budget.
+    /// with a zero budget. A grammar that isn't loaded yet is not loaded here (it may take a while),
+    /// and a WebAssembly grammar is never parsed here — this is for the UI thread, and its scanner
+    /// may never return ([`crate::wasm`]): the job comes back for [`ParseJob::run`].
     pub fn run_with_budget(mut self, budget: Duration) -> Result<ParseResult, ParseJob> {
+        let not_loaded = self.parser.is_none() && self.language.loaded_grammar().is_none();
+        if self.language.is_wasm() || not_loaded {
+            return Err(self);
+        }
         // A budget that doesn't fit in an Instant is the same as no budget.
         match self.parse(Instant::now().checked_add(budget)) {
             Some(tree) => Ok(self.into_result(Some(tree))),
@@ -310,7 +350,7 @@ impl ParseJob {
 
     /// `deadline` is when to interrupt the parse; `None` means parse to completion.
     fn parse(&mut self, deadline: Option<Instant>) -> Option<Tree> {
-        let language = self.language;
+        let language = self.language.clone();
         let Self {
             text,
             old_tree,
@@ -318,7 +358,7 @@ impl ParseJob {
             ..
         } = self;
         if parser.is_none() {
-            *parser = new_parser(language);
+            *parser = new_parser(&language);
         }
         let parser = parser.as_mut()?;
         let mut read = |byte: usize, _: Point| chunk_from(text, byte);
@@ -338,12 +378,9 @@ impl ParseJob {
 
     fn into_result(self, tree: Option<Tree>) -> ParseResult {
         let newlines = self.newlines.unwrap_or_else(|| count_newlines(&self.text));
-        // The parser is always there except for an unsupported grammar, which parse_job never lets
-        // into a job.
-        let parser = self.parser.unwrap_or_default();
         ParseResult {
             tree,
-            parser,
+            parser: self.parser,
             newlines,
             token: self.token,
             version: self.version,
@@ -351,9 +388,14 @@ impl ParseJob {
     }
 }
 
+/// A parser of the language; one of a WebAssembly grammar gets a store of its own.
 fn new_parser(language: &Language) -> Option<Parser> {
+    let grammar = language.grammar()?;
     let mut parser = Parser::new();
-    parser.set_language(language.grammar()?).ok()?;
+    if language.is_wasm() {
+        parser.set_wasm_store(crate::wasm::new_store().ok()?).ok()?;
+    }
+    parser.set_language(grammar).ok()?;
     Some(parser)
 }
 
@@ -374,6 +416,7 @@ mod tests {
     #[test]
     fn job_runs_on_another_thread() {
         let text = Rope::from_str("fn main() { let x = 1; }\n");
+        crate::standard::register();
         let mut syntax = Syntax::new(language_by_name("rust").unwrap());
         let job = syntax.parse_job(&text).unwrap();
         let result = std::thread::spawn(move || job.run()).join().unwrap();
@@ -387,6 +430,7 @@ mod tests {
     #[test]
     fn no_job_when_nothing_changed() {
         let text = Rope::from_str("a = 1\n");
+        crate::standard::register();
         let mut syntax = Syntax::new(language_by_name("python").unwrap());
         assert!(syntax.needs_parse());
         let job = syntax.parse_job(&text).unwrap();
@@ -410,6 +454,7 @@ mod tests {
     #[test]
     fn parser_is_reused_between_jobs() {
         let text = Rope::from_str("x\n");
+        crate::standard::register();
         let mut syntax = Syntax::new(language_by_name("rust").unwrap());
         let job = syntax.parse_job(&text).unwrap();
         assert!(job.parser.is_none());

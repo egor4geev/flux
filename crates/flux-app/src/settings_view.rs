@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
-use flux_lsp::config::{self, ServerConfig};
+use flux_lsp::config::ServerConfig;
 use flux_lsp::install::{self, Source};
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -27,6 +27,7 @@ use gpui::{
     point, prelude::*, px,
 };
 
+use crate::appearance_settings::{AppearancePage, Page};
 use crate::claude::{self, ClaudeStore, CliState};
 use crate::i18n::{tr, trf};
 use crate::icons::{self, IconName, file_icon, icon};
@@ -73,6 +74,10 @@ pub fn init(cx: &mut App) {
 /// A section of Settings, listed on the left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Section {
+    /// Appearance (stage 8.3), first: its pages are listed under it.
+    Theme,
+    FileIcons,
+    Language,
     LanguageServers,
     VersionControl,
     Notifications,
@@ -86,6 +91,9 @@ pub enum Section {
 }
 
 impl Section {
+    /// The pages of Appearance, listed under it.
+    const APPEARANCE: [Section; 3] = [Section::Theme, Section::FileIcons, Section::Language];
+
     /// The sections above the plugins' pages; About goes after them.
     const BUILT_IN: [Section; 5] = [
         Section::LanguageServers,
@@ -97,6 +105,9 @@ impl Section {
 
     fn label(&self) -> &'static str {
         match self {
+            Section::Theme => tr("Theme"),
+            Section::FileIcons => tr("File Icons"),
+            Section::Language => tr("Language"),
             Section::LanguageServers => tr("Language Servers"),
             Section::VersionControl => tr("Version Control"),
             Section::Notifications => tr("Notifications"),
@@ -108,6 +119,7 @@ impl Section {
 
     fn icon(&self) -> IconName {
         match self {
+            Section::Theme | Section::FileIcons | Section::Language => IconName::Palette,
             Section::LanguageServers => IconName::Command,
             Section::VersionControl => IconName::Branch,
             Section::Notifications => IconName::Bell,
@@ -117,9 +129,22 @@ impl Section {
         }
     }
 
+    /// The page of Appearance this section shows.
+    fn appearance_page(&self) -> Option<Page> {
+        match self {
+            Section::Theme => Some(Page::Theme),
+            Section::FileIcons => Some(Page::FileIcons),
+            Section::Language => Some(Page::Language),
+            _ => None,
+        }
+    }
+
     /// A stable key: the element ids of the sidebar.
     fn key(&self) -> SharedString {
         match self {
+            Section::Theme => "theme".into(),
+            Section::FileIcons => "file-icons".into(),
+            Section::Language => "language".into(),
             Section::LanguageServers => "language-servers".into(),
             Section::VersionControl => "version-control".into(),
             Section::Notifications => "notifications".into(),
@@ -134,9 +159,9 @@ impl Section {
 /// Opens Settings, or closes them if open (the gear, ⌘,).
 pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     #[cfg(feature = "scenario")]
-    let section = scenario_section().unwrap_or(Section::LanguageServers);
+    let section = scenario_section().unwrap_or(Section::Theme);
     #[cfg(not(feature = "scenario"))]
-    let section = Section::LanguageServers;
+    let section = Section::Theme;
     show(workspace, section, None, window, cx, false);
 }
 
@@ -200,6 +225,10 @@ struct Handles {
 fn scenario_section() -> Option<Section> {
     let section = std::env::var("FLUX_SCENARIO_SETTINGS").ok()?;
     Some(match section.as_str() {
+        "theme" => Section::Theme,
+        "file-icons" => Section::FileIcons,
+        "language" => Section::Language,
+        "language-servers" => Section::LanguageServers,
         "plugins" => Section::Plugins,
         "notifications" => Section::Notifications,
         "version-control" => Section::VersionControl,
@@ -244,6 +273,8 @@ pub struct SettingsView {
     initial_plugin: Option<SharedString>,
     /// The pages of the plugins' settings, made when first shown, by plugin id.
     plugin_pages: HashMap<SharedString, Entity<PluginSettingsPage>>,
+    /// The pages of Appearance, made when first shown.
+    appearance: Option<Entity<AppearancePage>>,
     servers: Vec<ServerRow>,
     /// Operations in progress or failed, by server name.
     jobs: HashMap<String, Job>,
@@ -257,6 +288,8 @@ pub struct SettingsView {
 
 struct ServerRow {
     config: ServerConfig,
+    /// The language plugin that brings it, by its name in the interface language.
+    plugin: SharedString,
     /// Where it comes from; `None` until the background check is done.
     source: Option<Source>,
     /// Whether Flux can install it here.
@@ -295,14 +328,7 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let servers = config::default_servers()
-            .into_iter()
-            .map(|config| ServerRow {
-                config,
-                source: None,
-                installable: Ok(()),
-            })
-            .collect();
+        let servers = server_rows(&handles.plugins, cx);
         let claude_args = cx.new(|cx| {
             let mut input = TextInput::new("--add-dir ../shared", cx).code();
             input.set_text(&settings::claude(cx).extra_args.join(" "), cx);
@@ -319,6 +345,10 @@ impl SettingsView {
                 cx.notify()
             }),
             cx.observe(&handles.claude, |_, _, cx| cx.notify()),
+            // Language plugins turned on or off, installed, removed: other servers.
+            cx.observe_global::<crate::contributions::Contributions>(|this, cx| {
+                this.servers_changed(cx)
+            }),
             cx.subscribe(&claude_args, |this, input, _: &InputEvent, cx| {
                 let args = input.read(cx).text();
                 let args: Vec<String> = args.split_whitespace().map(str::to_string).collect();
@@ -328,13 +358,14 @@ impl SettingsView {
         ];
         let mut view = Self {
             focus_handle: cx.focus_handle(),
-            section: Section::LanguageServers,
+            section: Section::Theme,
             store: handles.lsp,
             plugins: handles.plugins,
             workspace: handles.workspace,
             manager: None,
             initial_plugin: plugin,
             plugin_pages: HashMap::new(),
+            appearance: None,
             servers,
             jobs: HashMap::new(),
             claude: handles.claude,
@@ -356,20 +387,46 @@ impl SettingsView {
                 .background_spawn(async move {
                     configs
                         .iter()
-                        .map(|config| (install::source(config), install::check(config)))
+                        .map(|config| {
+                            let found = (install::source(config), install::check(config));
+                            (config.name.clone(), found)
+                        })
                         .collect::<Vec<_>>()
                 })
                 .await;
             this.update(cx, |this, cx| {
-                for (row, (source, installable)) in this.servers.iter_mut().zip(found) {
-                    row.source = Some(source);
-                    row.installable = installable;
+                // By name: the rows may have changed meanwhile (a language plugin installed).
+                for (name, (source, installable)) in found {
+                    if let Some(row) = this.servers.iter_mut().find(|row| row.config.name == name)
+                    {
+                        row.source = Some(source);
+                        row.installable = installable;
+                    }
                 }
                 cx.notify();
             })
             .ok();
         });
         self._tasks.push(task);
+    }
+
+    /// The language plugins bring other servers: the rows follow (a row that stays keeps what is
+    /// known about it), then where they come from is checked again.
+    fn servers_changed(&mut self, cx: &mut Context<Self>) {
+        let mut rows = server_rows(&self.plugins, cx);
+        for row in &mut rows {
+            if let Some(known) = self
+                .servers
+                .iter()
+                .find(|known| known.config == row.config)
+            {
+                row.source = known.source.clone();
+                row.installable = known.installable.clone();
+            }
+        }
+        self.servers = rows;
+        self.refresh(cx);
+        cx.notify();
     }
 
     fn set_auto_install(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -460,12 +517,18 @@ impl SettingsView {
         let ui = Theme::ui(cx);
         let row = &self.servers[index];
         let config = &row.config;
-        let languages = config
+        let files = config
             .extensions
             .iter()
             .map(|extension| format!(".{extension}"))
+            .chain(config.file_names.iter().cloned())
             .collect::<Vec<_>>()
             .join(" ");
+        let languages = if files.is_empty() {
+            row.plugin.to_string()
+        } else {
+            format!("{} · {files}", row.plugin)
+        };
         let file = file_icon(
             &format!("x.{}", config.extensions.first().map_or("", String::as_str)),
             &ui,
@@ -604,6 +667,21 @@ impl SettingsView {
                 }
                 window.focus(&self.focus_handle);
             }
+            Section::Theme | Section::FileIcons | Section::Language => {
+                let page = section.appearance_page().unwrap_or(Page::Theme);
+                match &self.appearance {
+                    Some(appearance) => {
+                        appearance.update(cx, |appearance, cx| appearance.show(page, cx))
+                    }
+                    None => {
+                        let appearance = cx.new(|cx| AppearancePage::new(page, window, cx));
+                        self.appearance = Some(appearance);
+                    }
+                }
+                if !self.focus_handle.is_focused(window) {
+                    window.focus(&self.focus_handle);
+                }
+            }
             _ => {
                 // The focus leaves a field of the page that goes away (Esc must still close).
                 if !self.focus_handle.is_focused(window) {
@@ -701,13 +779,49 @@ impl SettingsView {
                 })
                 .child(div().min_w_0().truncate().child(label))
         };
-        let mut rows: Vec<AnyElement> = Section::BUILT_IN
-            .into_iter()
-            .map(|section| {
-                let label = SharedString::from(section.label());
-                row(section, label, false, cx).into_any_element()
-            })
-            .collect();
+        // Appearance: a heading (it opens its first page) with its pages under it.
+        let appearance_open = Section::APPEARANCE.contains(&self.section);
+        let mut rows: Vec<AnyElement> = vec![
+            div()
+                .id("settings-section-appearance")
+                .h(px(30.))
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(ui::RADIUS_SM))
+                .cursor_pointer()
+                .text_color(if appearance_open {
+                    ui.foreground
+                } else {
+                    ui.text_muted
+                })
+                .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.select(Section::Theme, window, cx)),
+                )
+                .child(
+                    icon(
+                        IconName::Palette,
+                        if appearance_open {
+                            ui.accent_text
+                        } else {
+                            ui.dim
+                        },
+                    )
+                    .size(px(14.)),
+                )
+                .child(div().min_w_0().truncate().child(tr("Appearance")))
+                .into_any_element(),
+        ];
+        rows.extend(Section::APPEARANCE.into_iter().map(|section| {
+            let label = SharedString::from(section.label());
+            row(section, label, true, cx).into_any_element()
+        }));
+        rows.extend(Section::BUILT_IN.into_iter().map(|section| {
+            let label = SharedString::from(section.label());
+            row(section, label, false, cx).into_any_element()
+        }));
         rows.extend(
             plugin_pages
                 .into_iter()
@@ -730,9 +844,50 @@ impl SettingsView {
         let ui = Theme::ui(cx);
         let auto = settings::auto_install_servers(cx);
         let servers_dir = dirs_label();
-        let rows: Vec<_> = (0..self.servers.len())
-            .map(|index| self.render_server(index, cx))
+        let rows: Vec<AnyElement> = (0..self.servers.len())
+            .map(|index| self.render_server(index, cx).into_any_element())
             .collect();
+        // No language plugin brings a server: they are in the Marketplace.
+        let rows = if rows.is_empty() {
+            vec![
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .p_3()
+                    .rounded(px(ui::RADIUS_MD))
+                    .border_1()
+                    .border_color(ui.island_border)
+                    .child(icon(IconName::Puzzle, ui.dim).size(px(16.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(tr("No language servers yet"))
+                            .child(
+                                div()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.dim)
+                                    .child(tr(
+                                        "Language plugins bring them: install one for your language in Settings → Plugins.",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        ui::text_button("open-plugins", tr("Open Plugins"), false, ui).on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.select(Section::Plugins, window, cx)
+                            }),
+                        ),
+                    )
+                    .into_any_element(),
+            ]
+        } else {
+            rows
+        };
         div()
             .flex()
             .flex_col()
@@ -1523,6 +1678,29 @@ fn logo_tile(size: f32, ui: UiColors) -> Div {
         .child(img(icons::LOGO).size(px(size * 0.68)))
 }
 
+/// The rows of Settings → Language Servers: the servers of the turned-on language plugins, each
+/// with its plugin's name.
+fn server_rows(plugins: &Entity<PluginStore>, cx: &App) -> Vec<ServerRow> {
+    let store = plugins.read(cx);
+    crate::contributions::servers(cx)
+        .into_iter()
+        .map(|config| {
+            let plugin = crate::contributions::server_plugin(&config.name, cx)
+                .map(|id| match store.plugin(&id) {
+                    Some(plugin) => plugin.name().to_string(),
+                    None => id,
+                })
+                .unwrap_or_default();
+            ServerRow {
+                config,
+                plugin: plugin.into(),
+                source: None,
+                installable: Ok(()),
+            }
+        })
+        .collect()
+}
+
 /// A section's title and its description.
 fn section_header(title: &'static str, description: &'static str, ui: UiColors) -> Div {
     div()
@@ -1551,6 +1729,12 @@ impl Render for SettingsView {
         let ui = Theme::ui(cx);
         // The Plugins page scrolls its list and its details apart: it takes the whole height.
         let content = match self.section.clone() {
+            Section::Theme | Section::FileIcons | Section::Language => {
+                Some(match &self.appearance {
+                    Some(page) => page.clone().into_any_element(),
+                    None => div().into_any_element(),
+                })
+            }
             Section::LanguageServers => Some(self.render_language_servers(cx).into_any_element()),
             Section::VersionControl => Some(self.render_version_control(cx).into_any_element()),
             Section::Notifications => Some(self.render_notifications(cx).into_any_element()),

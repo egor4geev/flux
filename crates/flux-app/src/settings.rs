@@ -35,8 +35,64 @@ pub struct Settings {
     pub plugin_values: BTreeMap<String, serde_json::Map<String, Value>>,
     /// Claude Code (`claude`): the chat's defaults.
     pub claude: ClaudeSettings,
+    /// Settings → Appearance (stage 8.3): the theme, the file icons, the interface language.
+    pub appearance: AppearanceSettings,
+    /// Look for updates of the installed plugins in the catalog when Flux starts
+    /// (`plugins.check_updates`).
+    pub check_plugin_updates: bool,
+    /// Kinds of files whose plugin suggestion the user ignored ("*.rs", "Dockerfile";
+    /// `plugins.ignored_suggestions`).
+    pub ignored_suggestions: BTreeSet<String>,
     /// Where the settings are saved; `None` — kept in memory only.
     path: Option<PathBuf>,
+}
+
+/// Settings → Appearance (stage 8.3): themes and icons are chosen by name among those the
+/// turned-on plugins bring; a name that is gone falls back to the default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AppearanceSettings {
+    /// The chosen theme; `None` — Flux Night.
+    pub theme: Option<String>,
+    /// The theme follows macOS: [`AppearanceSettings::light_theme`] or
+    /// [`AppearanceSettings::dark_theme`] (Sync with OS, as in JetBrains IDEs).
+    pub sync_with_os: bool,
+    /// The theme for macOS's light appearance; `None` — Flux Day.
+    pub light_theme: Option<String>,
+    /// The theme for macOS's dark appearance; `None` — Flux Night.
+    pub dark_theme: Option<String>,
+    /// The chosen set of file icons; `None` — Flux's own.
+    pub icon_theme: Option<String>,
+    /// The interface language.
+    pub language: LanguageChoice,
+}
+
+/// The interface language: the system's (the first of its preferred languages Flux speaks), or one
+/// chosen. `FLUX_LANG` still wins (scenarios, screenshots).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LanguageChoice {
+    #[default]
+    System,
+    English,
+    Russian,
+}
+
+impl LanguageChoice {
+    pub fn key(self) -> &'static str {
+        match self {
+            LanguageChoice::System => "system",
+            LanguageChoice::English => "en",
+            LanguageChoice::Russian => "ru",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "system" => Some(LanguageChoice::System),
+            "en" => Some(LanguageChoice::English),
+            "ru" => Some(LanguageChoice::Russian),
+            _ => None,
+        }
+    }
 }
 
 /// Claude Code (stage 9): the chat's defaults, edited in Settings → Claude Code. A new session
@@ -132,6 +188,9 @@ impl Default for Settings {
             dev_plugins: Vec::new(),
             plugin_values: BTreeMap::new(),
             claude: ClaudeSettings::default(),
+            appearance: AppearanceSettings::default(),
+            check_plugin_updates: true,
+            ignored_suggestions: BTreeSet::new(),
             path: None,
         }
     }
@@ -288,6 +347,47 @@ pub fn update_claude(cx: &mut App, change: impl FnOnce(&mut ClaudeSettings)) {
     save(settings);
 }
 
+/// Settings → Appearance.
+pub fn appearance(cx: &App) -> AppearanceSettings {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.appearance.clone())
+        .unwrap_or_default()
+}
+
+/// Changes the appearance settings and saves them. Applying them (the theme, the icons, the
+/// language) is up to the caller.
+pub fn update_appearance(cx: &mut App, change: impl FnOnce(&mut AppearanceSettings)) {
+    let settings = cx.default_global::<Settings>();
+    change(&mut settings.appearance);
+    save(settings);
+}
+
+/// Whether Flux looks for plugin updates when it starts.
+pub fn check_plugin_updates(cx: &App) -> bool {
+    cx.try_global::<Settings>()
+        .is_none_or(|settings| settings.check_plugin_updates)
+}
+
+pub fn set_check_plugin_updates(on: bool, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    settings.check_plugin_updates = on;
+    save(settings);
+}
+
+/// Whether the user ignored plugin suggestions for this kind of file ("*.rs", "Dockerfile").
+pub fn suggestion_ignored(kind: &str, cx: &App) -> bool {
+    cx.try_global::<Settings>()
+        .is_some_and(|settings| settings.ignored_suggestions.contains(kind))
+}
+
+/// Ignores plugin suggestions for a kind of file ("Ignore extension").
+pub fn ignore_suggestion(kind: &str, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    if settings.ignored_suggestions.insert(kind.to_string()) {
+        save(settings);
+    }
+}
+
 fn save(settings: &Settings) {
     if let Some(path) = &settings.path
         && let Err(err) = write(path, &to_json(settings))
@@ -365,7 +465,40 @@ fn parse(text: &str) -> Settings {
             })
             .unwrap_or_default(),
         claude: parse_claude(&value["claude"]),
+        appearance: parse_appearance(&value["appearance"]),
+        check_plugin_updates: value["plugins"]["check_updates"]
+            .as_bool()
+            .unwrap_or(defaults.check_plugin_updates),
+        ignored_suggestions: value["plugins"]["ignored_suggestions"]
+            .as_array()
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .filter_map(|kind| Some(kind.as_str()?.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         ..defaults
+    }
+}
+
+fn parse_appearance(value: &Value) -> AppearanceSettings {
+    let text = |key: &str| {
+        value[key]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    AppearanceSettings {
+        theme: text("theme"),
+        sync_with_os: value["sync_with_os"].as_bool().unwrap_or(false),
+        light_theme: text("light_theme"),
+        dark_theme: text("dark_theme"),
+        icon_theme: text("icon_theme"),
+        language: value["language"]
+            .as_str()
+            .and_then(LanguageChoice::from_key)
+            .unwrap_or_default(),
     }
 }
 
@@ -431,6 +564,16 @@ fn to_json(settings: &Settings) -> String {
                 .map(|dir| dir.to_string_lossy())
                 .collect::<Vec<_>>(),
             "settings": settings.plugin_values,
+            "check_updates": settings.check_plugin_updates,
+            "ignored_suggestions": settings.ignored_suggestions.iter().collect::<Vec<_>>(),
+        },
+        "appearance": {
+            "theme": settings.appearance.theme,
+            "sync_with_os": settings.appearance.sync_with_os,
+            "light_theme": settings.appearance.light_theme,
+            "dark_theme": settings.appearance.dark_theme,
+            "icon_theme": settings.appearance.icon_theme,
+            "language": settings.appearance.language.key(),
         },
         "claude": {
             "enabled": settings.claude.enabled,
@@ -497,6 +640,16 @@ mod tests {
                 flux_tools: false,
                 report_problems: false,
             },
+            appearance: AppearanceSettings {
+                theme: Some("Flux Day".to_string()),
+                sync_with_os: true,
+                light_theme: Some("Solarized Light".to_string()),
+                dark_theme: Some("Flux Night".to_string()),
+                icon_theme: Some("Flux Icons".to_string()),
+                language: LanguageChoice::Russian,
+            },
+            check_plugin_updates: false,
+            ignored_suggestions: BTreeSet::from(["*.rs".to_string()]),
             path: None,
         };
         assert_eq!(parse(&to_json(&off)), off);

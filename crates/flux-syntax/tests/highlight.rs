@@ -4,10 +4,10 @@
 mod common;
 
 use common::samples::{sample, snippets};
-use common::{Rng, parse_now, random_changes};
+use common::{Rng, language_by_name, languages, parse_now, random_changes};
 use flux_core::text::line_len;
 use flux_core::{ChangeSet, Rope};
-use flux_syntax::{Highlight, HighlightMap, HighlightSpan, Syntax, language_by_name, languages};
+use flux_syntax::{Highlight, HighlightMap, HighlightSpan, Syntax};
 
 /// The theme for the tests is the union of the capture names of all queries, with fallbacks.
 const SCOPES: &[&str] = &[
@@ -59,12 +59,12 @@ impl Doc {
     fn new(language: &str, source: &str, scopes: &'static [&'static str]) -> Self {
         let language = language_by_name(language).unwrap();
         let text = Rope::from_str(source);
-        let mut syntax = Syntax::new(language);
+        let mut syntax = Syntax::new(language.clone());
         parse_now(&mut syntax, &text);
         Self {
             text,
             syntax,
-            map: HighlightMap::new(language, scopes),
+            map: HighlightMap::new(&language, scopes),
             scopes,
         }
     }
@@ -173,9 +173,9 @@ fn every_sample_is_highlighted_consistently() {
 #[test]
 fn empty_document_and_out_of_range_lines() {
     let rust = language_by_name("rust").unwrap();
-    let map = HighlightMap::new(rust, SCOPES);
+    let map = HighlightMap::new(&rust, SCOPES);
     let empty = Rope::new();
-    let mut syntax = Syntax::new(rust);
+    let mut syntax = Syntax::new(rust.clone());
     assert_eq!(
         syntax.highlight_lines(&empty, 0..10, &map),
         vec![Vec::new()]
@@ -219,8 +219,8 @@ fn empty_document_and_out_of_range_lines() {
 fn no_highlight_before_first_parse() {
     let rust = language_by_name("rust").unwrap();
     let text = Rope::from_str("fn main() {}\n");
-    let syntax = Syntax::new(rust);
-    let lines = syntax.highlight_lines(&text, 0..2, &HighlightMap::new(rust, SCOPES));
+    let syntax = Syntax::new(rust.clone());
+    let lines = syntax.highlight_lines(&text, 0..2, &HighlightMap::new(&rust, SCOPES));
     assert_eq!(lines, vec![Vec::new(), Vec::new()]);
 }
 

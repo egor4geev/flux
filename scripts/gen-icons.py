@@ -4,12 +4,18 @@ stroke with round caps and joins; file types are recognisable glyphs (filled or 
 
 Source of the icon set: edit icons here, then
     python3 scripts/gen-icons.py crates/flux-app/assets/icons
-A new icon also needs a variant in `icons!` (`crates/flux-app/src/icons.rs`). To see the whole
-set: `swift scripts/icon-sheet.swift crates/flux-app/assets/icons sheet.png [filter]`
-(64 px plus 16/32 px as in the tree). Rules: the wiki note "Iconography"."""
+Interface icons go there; a new one also needs a variant in `icons!`
+(`crates/flux-app/src/icons.rs`). File types (`file-…`, but `file-plus`) belong to Flux's own set
+of file icons, the bundled plugin `plugins/icons` (stage 8.3): they go to `plugins/icons/icons/`
+without the `file-` prefix (or to the folder given second), and `icon-themes/flux.toml` there maps
+files to them. To see the whole set: `swift scripts/icon-sheet.swift crates/flux-app/assets/icons
+sheet.png [filter]` (64 px plus 16/32 px as in the tree). Rules: the wiki note "Iconography"."""
 import sys, os
 
 OUT = sys.argv[1]
+# File types: Flux's own set of file icons, the bundled plugin.
+FILE_TYPES = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "plugins", "icons", "icons")
 S = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'
 F = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#000">'
 B = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
@@ -78,6 +84,11 @@ ICONS = {
   "info": (S, '<circle cx="8" cy="8" r="6.25"/><path d="M8 7.25v3.75"/><circle cx="8" cy="5" r=".4" fill="#000"/>'),
   # A light bulb: the context actions of ⌥↵ (quick fixes and intentions, as in JetBrains IDEs).
   "bulb": (S, '<path d="M5.75 11.25c0-1.6-2.5-2.6-2.5-5.25a4.75 4.75 0 0 1 9.5 0c0 2.65-2.5 3.65-2.5 5.25z"/><path d="M6.25 13.75h3.5"/>'),
+  # Appearance and the catalog (stage 8.3): Settings → Appearance, light and dark themes, Install.
+  "palette": (S, '<path d="M8 1.75a6.25 6.25 0 0 0 0 12.5c.85 0 1.45-.55 1.45-1.3 0-.4-.2-.7-.45-.95-.25-.3-.4-.55-.4-.95 0-.75.6-1.3 1.35-1.3h1.6A2.7 2.7 0 0 0 14.25 7c0-2.9-2.8-5.25-6.25-5.25z"/><circle cx="4.75" cy="7.6" r=".9" fill="#000" stroke="none"/><circle cx="6.5" cy="4.6" r=".9" fill="#000" stroke="none"/><circle cx="9.9" cy="4.75" r=".9" fill="#000" stroke="none"/>'),
+  "sun": (S, '<circle cx="8" cy="8" r="2.75"/><path d="M8 1.5v1.25M8 13.25v1.25M1.5 8h1.25M13.25 8h1.25M3.4 3.4l.9.9M11.7 11.7l.9.9M3.4 12.6l.9-.9M11.7 4.3l.9-.9"/>'),
+  "moon": (S, '<path d="M13.25 9.75A5.5 5.5 0 0 1 6.25 2.75a5.75 5.75 0 1 0 7 7z"/>'),
+  "download": (S, '<path d="M8 2.25v7.5M4.75 6.5 8 9.75l3.25-3.25M2.75 10.75v1.5c0 .55.45 1 1 1h8.5c.55 0 1-.45 1-1v-1.5"/>'),
   "sparkle": (F, '<path d="M7 1.5c.42 3.15 1.35 4.08 4.5 4.5C8.35 6.42 7.42 7.35 7 10.5 6.58 7.35 5.65 6.42 2.5 6 5.65 5.58 6.58 4.65 7 1.5zM12 9c.24 1.75.75 2.26 2.5 2.5-1.75.24-2.26.75-2.5 2.5-.24-1.75-.75-2.26-2.5-2.5 1.75-.24 2.26-.75 2.5-2.5z"/>'),
   "settings": (S, '<path d="M6.85 1.75h2.3l.35 1.8 1.35.78 1.73-.6 1.15 2-1.38 1.2v1.54l1.38 1.2-1.15 2-1.73-.6-1.35.78-.35 1.8h-2.3l-.35-1.8-1.35-.78-1.73.6-1.15-2 1.38-1.2V6.73l-1.38-1.2 1.15-2 1.73.6 1.35-.78z"/><circle cx="8" cy="8" r="2"/>'),
   # Version control (stage 6).
@@ -167,12 +178,25 @@ ICONS = {
   "file-archive": (S, DOC + '<path d="M6.5 2.6h1.25M7.75 4.1H9M6.5 5.6h1.25M7.75 7.1H9" stroke-width="1.25"/><rect x="6.6" y="8.75" width="2.8" height="3" rx=".8" stroke-width="1.25"/>'),
 }
 
+def is_file_type(name):
+    """A file type's glyph: Flux's set of file icons, not the interface."""
+    return name.startswith("file-") and name != "file-plus"
+
+
 os.makedirs(OUT, exist_ok=True)
+os.makedirs(FILE_TYPES, exist_ok=True)
 for name, (style, body) in ICONS.items():
     if style == "raw":
         svg = body + "\n</svg>\n" if not body.rstrip().endswith("</svg>") else body
     else:
         svg = f"{style}\n{body}\n</svg>\n"
-    with open(os.path.join(OUT, name + ".svg"), "w") as f:
+    path = (os.path.join(FILE_TYPES, name[len("file-"):] + ".svg") if is_file_type(name)
+            else os.path.join(OUT, name + ".svg"))
+    with open(path, "w") as f:
         f.write(svg)
-print(len(ICONS), "icons")
+# File types used to be interface icons: their old files go.
+for stale in os.listdir(OUT):
+    if stale.endswith(".svg") and is_file_type(stale[:-4]):
+        os.remove(os.path.join(OUT, stale))
+types = sum(1 for name in ICONS if is_file_type(name))
+print(len(ICONS) - types, "interface icons,", types, "file types")

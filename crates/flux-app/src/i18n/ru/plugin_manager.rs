@@ -21,7 +21,6 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Downloaded", "Скачанные"),
     ("Bundled", "Встроенные"),
     ("Built-in", "Встроенный"),
-    ("Installed", "Установлен"),
     ("No plugins yet", "Плагинов пока нет"),
     (
         "Install one from a folder or an archive: the gear menu above.",

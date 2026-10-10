@@ -1,7 +1,7 @@
 //! The editor view: connects a document from the core with the window, keyboard, mouse, and IME.
 
 use std::ops::Range as Utf16Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use flux_core::movement::{self, Direction};
@@ -259,6 +259,8 @@ impl Editor {
                 this.highlighter.refresh_map(Theme::get(cx));
                 cx.notify();
             }),
+            // Plugins added or took away languages: the document's may have changed.
+            cx.observe_global::<crate::contributions::Contributions>(Self::languages_changed),
         ];
         Self::build(document, focus_handle, false, subscriptions, cx)
     }
@@ -279,10 +281,13 @@ impl Editor {
     /// [`Editor::show_position`] shows the location, [`Editor::set_search_highlights`] the matches.
     pub fn preview(document: Document, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        let subscriptions = vec![cx.observe_global::<Theme>(|this, cx| {
-            this.highlighter.refresh_map(Theme::get(cx));
-            cx.notify();
-        })];
+        let subscriptions = vec![
+            cx.observe_global::<Theme>(|this, cx| {
+                this.highlighter.refresh_map(Theme::get(cx));
+                cx.notify();
+            }),
+            cx.observe_global::<crate::contributions::Contributions>(Self::languages_changed),
+        ];
         Self::build(document, focus_handle, true, subscriptions, cx)
     }
 
@@ -723,6 +728,19 @@ impl Editor {
 
     /// The file changed on disk: the text takes its content as one edit (⌘Z brings the old text
     /// back) and the document counts as saved. `false` — the text was already the same.
+    /// The registered languages changed (a language plugin turned on or off, installed,
+    /// removed): the document looks its language up again and is parsed with the new one.
+    fn languages_changed(&mut self, cx: &mut Context<Self>) {
+        let path = self.document.path().map(Path::to_path_buf);
+        if self
+            .highlighter
+            .languages_changed(path.as_deref(), self.document.text())
+        {
+            highlighter::parse(self, ParseMode::Background, cx);
+        }
+        cx.notify();
+    }
+
     pub fn reload(&mut self, content: &str, cx: &mut Context<Self>) -> bool {
         if self.read_only {
             return false;

@@ -1,0 +1,145 @@
+# Flux Icons: the set `docs/icon-themes.md` describes. A color is a shade of the theme's palette, so
+# the icons follow light and dark themes. Order: exact file names, then name prefixes, then
+# extensions; anything else — Flux's plain file icon (the set has no defaults: folders and unknown
+# files keep the plain ones).
+name = "Flux Icons"
+
+[file-names]
+"cargo.toml" = { icon = "icons/package.svg", color = "orange" }
+"package.json" = { icon = "icons/package.svg", color = "red" }
+"cargo.lock" = { icon = "icons/lock.svg", color = "dim" }
+"package-lock.json" = { icon = "icons/lock.svg", color = "dim" }
+"yarn.lock" = { icon = "icons/lock.svg", color = "dim" }
+"pnpm-lock.yaml" = { icon = "icons/lock.svg", color = "dim" }
+"bun.lockb" = { icon = "icons/lock.svg", color = "dim" }
+"poetry.lock" = { icon = "icons/lock.svg", color = "dim" }
+"gemfile.lock" = { icon = "icons/lock.svg", color = "dim" }
+"composer.lock" = { icon = "icons/lock.svg", color = "dim" }
+"flake.lock" = { icon = "icons/lock.svg", color = "dim" }
+".gitignore" = { icon = "icons/git.svg", color = "red" }
+".gitattributes" = { icon = "icons/git.svg", color = "red" }
+".gitmodules" = { icon = "icons/git.svg", color = "red" }
+".gitkeep" = { icon = "icons/git.svg", color = "red" }
+"dockerfile" = { icon = "icons/docker.svg", color = "blue" }
+".dockerignore" = { icon = "icons/docker.svg", color = "blue" }
+"docker-compose.yml" = { icon = "icons/docker.svg", color = "blue" }
+"docker-compose.yaml" = { icon = "icons/docker.svg", color = "blue" }
+"compose.yml" = { icon = "icons/docker.svg", color = "blue" }
+"compose.yaml" = { icon = "icons/docker.svg", color = "blue" }
+"readme" = { icon = "icons/readme.svg", color = "teal" }
+"readme.md" = { icon = "icons/readme.svg", color = "teal" }
+"readme.markdown" = { icon = "icons/readme.svg", color = "teal" }
+"readme.txt" = { icon = "icons/readme.svg", color = "teal" }
+"makefile" = { icon = "icons/shell.svg", color = "green" }
+"gnumakefile" = { icon = "icons/shell.svg", color = "green" }
+"justfile" = { icon = "icons/shell.svg", color = "green" }
+"go.mod" = { icon = "icons/go.svg", color = "cyan" }
+"go.sum" = { icon = "icons/go.svg", color = "cyan" }
+"rust-toolchain" = { icon = "icons/rust.svg", color = "orange" }
+"rust-toolchain.toml" = { icon = "icons/rust.svg", color = "orange" }
+"tsconfig.json" = { icon = "icons/typescript.svg", color = "blue" }
+"jsconfig.json" = { icon = "icons/javascript.svg", color = "amber" }
+"copying" = { icon = "icons/license.svg", color = "amber" }
+".env" = { icon = "icons/config.svg", color = "lime" }
+
+[name-prefixes]
+"license" = { icon = "icons/license.svg", color = "amber" }
+"licence" = { icon = "icons/license.svg", color = "amber" }
+".env." = { icon = "icons/config.svg", color = "lime" }
+
+[extensions]
+# Code
+"rs" = { icon = "icons/rust.svg", color = "orange" }
+"ts" = { icon = "icons/typescript.svg", color = "blue" }
+"mts" = { icon = "icons/typescript.svg", color = "blue" }
+"cts" = { icon = "icons/typescript.svg", color = "blue" }
+"js" = { icon = "icons/javascript.svg", color = "amber" }
+"mjs" = { icon = "icons/javascript.svg", color = "amber" }
+"cjs" = { icon = "icons/javascript.svg", color = "amber" }
+"tsx" = { icon = "icons/react.svg", color = "cyan" }
+"jsx" = { icon = "icons/react.svg", color = "cyan" }
+"py" = { icon = "icons/python.svg", color = "blue" }
+"pyi" = { icon = "icons/python.svg", color = "blue" }
+"pyw" = { icon = "icons/python.svg", color = "blue" }
+"go" = { icon = "icons/go.svg", color = "cyan" }
+"sh" = { icon = "icons/shell.svg", color = "green" }
+"bash" = { icon = "icons/shell.svg", color = "green" }
+"zsh" = { icon = "icons/shell.svg", color = "green" }
+"fish" = { icon = "icons/shell.svg", color = "green" }
+"ksh" = { icon = "icons/shell.svg", color = "green" }
+"swift" = { icon = "icons/swift.svg", color = "orange" }
+"c" = { icon = "icons/c.svg", color = "indigo" }
+"h" = { icon = "icons/c.svg", color = "indigo" }
+"cc" = { icon = "icons/c.svg", color = "indigo" }
+"cpp" = { icon = "icons/c.svg", color = "indigo" }
+"cxx" = { icon = "icons/c.svg", color = "indigo" }
+"hpp" = { icon = "icons/c.svg", color = "indigo" }
+"hh" = { icon = "icons/c.svg", color = "indigo" }
+"m" = { icon = "icons/c.svg", color = "indigo" }
+"mm" = { icon = "icons/c.svg", color = "indigo" }
+"html" = { icon = "icons/html.svg", color = "orange" }
+"htm" = { icon = "icons/html.svg", color = "orange" }
+"xhtml" = { icon = "icons/html.svg", color = "orange" }
+"css" = { icon = "icons/css.svg", color = "violet" }
+"scss" = { icon = "icons/css.svg", color = "violet" }
+"sass" = { icon = "icons/css.svg", color = "violet" }
+"less" = { icon = "icons/css.svg", color = "violet" }
+"rb" = { icon = "icons/code.svg", color = "red" }
+"java" = { icon = "icons/code.svg", color = "orange" }
+"xml" = { icon = "icons/code.svg", color = "orange" }
+"svelte" = { icon = "icons/code.svg", color = "orange" }
+"kt" = { icon = "icons/code.svg", color = "violet" }
+"kts" = { icon = "icons/code.svg", color = "violet" }
+"wasm" = { icon = "icons/code.svg", color = "violet" }
+"wat" = { icon = "icons/code.svg", color = "violet" }
+"php" = { icon = "icons/code.svg", color = "indigo" }
+"lua" = { icon = "icons/code.svg", color = "blue" }
+"dart" = { icon = "icons/code.svg", color = "blue" }
+"sql" = { icon = "icons/code.svg", color = "amber" }
+"vue" = { icon = "icons/code.svg", color = "green" }
+"zig" = { icon = "icons/code.svg", color = "green" }
+# Data and documents
+"json" = { icon = "icons/json.svg", color = "amber" }
+"jsonc" = { icon = "icons/json.svg", color = "amber" }
+"json5" = { icon = "icons/json.svg", color = "amber" }
+"md" = { icon = "icons/markdown.svg", color = "indigo" }
+"markdown" = { icon = "icons/markdown.svg", color = "indigo" }
+"mdx" = { icon = "icons/markdown.svg", color = "indigo" }
+"toml" = { icon = "icons/toml.svg", color = "text-muted" }
+"yaml" = { icon = "icons/yaml.svg", color = "pink" }
+"yml" = { icon = "icons/yaml.svg", color = "pink" }
+"txt" = { icon = "icons/text.svg", color = "text-muted" }
+"log" = { icon = "icons/text.svg", color = "text-muted" }
+"text" = { icon = "icons/text.svg", color = "text-muted" }
+"rst" = { icon = "icons/text.svg", color = "text-muted" }
+# Configuration
+"env" = { icon = "icons/config.svg", color = "lime" }
+"ini" = { icon = "icons/config.svg", color = "lime" }
+"cfg" = { icon = "icons/config.svg", color = "lime" }
+"conf" = { icon = "icons/config.svg", color = "lime" }
+"editorconfig" = { icon = "icons/config.svg", color = "lime" }
+"properties" = { icon = "icons/config.svg", color = "lime" }
+"plist" = { icon = "icons/config.svg", color = "lime" }
+"lock" = { icon = "icons/lock.svg", color = "dim" }
+# Images and archives
+"png" = { icon = "icons/image.svg", color = "violet" }
+"jpg" = { icon = "icons/image.svg", color = "violet" }
+"jpeg" = { icon = "icons/image.svg", color = "violet" }
+"gif" = { icon = "icons/image.svg", color = "violet" }
+"svg" = { icon = "icons/image.svg", color = "violet" }
+"webp" = { icon = "icons/image.svg", color = "violet" }
+"ico" = { icon = "icons/image.svg", color = "violet" }
+"bmp" = { icon = "icons/image.svg", color = "violet" }
+"tiff" = { icon = "icons/image.svg", color = "violet" }
+"avif" = { icon = "icons/image.svg", color = "violet" }
+"icns" = { icon = "icons/image.svg", color = "violet" }
+"zip" = { icon = "icons/archive.svg", color = "amber" }
+"tar" = { icon = "icons/archive.svg", color = "amber" }
+"gz" = { icon = "icons/archive.svg", color = "amber" }
+"tgz" = { icon = "icons/archive.svg", color = "amber" }
+"bz2" = { icon = "icons/archive.svg", color = "amber" }
+"xz" = { icon = "icons/archive.svg", color = "amber" }
+"7z" = { icon = "icons/archive.svg", color = "amber" }
+"rar" = { icon = "icons/archive.svg", color = "amber" }
+"zst" = { icon = "icons/archive.svg", color = "amber" }
+"dmg" = { icon = "icons/archive.svg", color = "amber" }

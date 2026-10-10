@@ -7,13 +7,44 @@ license.workspace = true
 [dependencies]
 flux-core.workspace = true
 tree-sitter.workspace = true
-tree-sitter-bash.workspace = true
-tree-sitter-go.workspace = true
+# The grammars compiled into Flux: JavaScript and TypeScript come with it (the bundled plugin
+# `flux.javascript`); every other language is a plugin with a WebAssembly grammar.
 tree-sitter-javascript.workspace = true
-tree-sitter-json.workspace = true
-tree-sitter-md.workspace = true
-tree-sitter-python.workspace = true
-tree-sitter-rust.workspace = true
-tree-sitter-toml-ng.workspace = true
 tree-sitter-typescript.workspace = true
-tree-sitter-yaml.workspace = true
+# The wasmtime of tree-sitter's `wasm` feature (the same crate, through `wasmtime-c-api-impl`):
+# named here only to turn on what it leaves off — compiling a grammar's functions on several
+# threads, and the on-disk cache of compiled grammars (a cached grammar loads in ~1–6 ms instead
+# of 4–50 ms and takes a quarter of the memory). Keep the version with tree-sitter's.
+wasmtime = { version = "=48.0.5", default-features = false, features = [
+    "cache",
+    "parallel-compilation",
+] }
+# The test languages (`standard-languages`): native grammars of languages Flux gets from the
+# catalog.
+tree-sitter-bash = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-json = { workspace = true, optional = true }
+tree-sitter-md = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-toml-ng = { workspace = true, optional = true }
+tree-sitter-yaml = { workspace = true, optional = true }
+
+[features]
+# `flux_syntax::standard`: the eleven languages Flux had before stage 8.3, with native grammars — the
+# languages of the tests (this crate's and flux-app's). Only dev-dependencies turn it on: a product
+# build has none of these grammars.
+standard-languages = [
+    "dep:tree-sitter-bash",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-json",
+    "dep:tree-sitter-md",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-toml-ng",
+    "dep:tree-sitter-yaml",
+]
+
+[dev-dependencies]
+# The crate's own tests use the standard languages.
+flux-syntax = { path = ".", features = ["standard-languages"] }

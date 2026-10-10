@@ -18,7 +18,14 @@ use flux_lsp::lsp_types::{
     Position, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
 };
 use flux_lsp::position::{path_from_uri, uri_from_path};
-use flux_lsp::{LanguageServer, RequestError, ServerConfig, ServerEvent, default_servers, install};
+use flux_lsp::{LanguageServer, RequestError, ServerConfig, ServerEvent, install};
+
+mod fixtures {
+    use flux_lsp::config::{Install, ServerConfig};
+    include!("fixtures/servers.rs");
+}
+
+use fixtures::default_servers;
 use futures::channel::mpsc::{TryRecvError, UnboundedReceiver};
 
 const TIMEOUT: Duration = Duration::from_secs(240);

@@ -321,6 +321,9 @@ pub struct PluginStore {
     /// The component of each plugin under development as it was when it started: a newer one is
     /// reloaded.
     dev_components: HashMap<Arc<str>, Option<SystemTime>>,
+    /// The declarative files of each plugin under development (its manifest, queries, grammars,
+    /// themes, icon sets) as they were when it started: a change reloads it (stage 8.3).
+    dev_files: HashMap<Arc<str>, Vec<(String, Option<SystemTime>)>>,
     /// Plugins under development being built.
     building: HashSet<Arc<str>>,
     pending_questions: VecDeque<PendingQuestion>,
@@ -383,6 +386,7 @@ impl PluginStore {
             _window_parts: Vec::new(),
             active_editor: None,
             dev_components: HashMap::new(),
+            dev_files: HashMap::new(),
             building: HashSet::new(),
             pending_questions: VecDeque::new(),
             _pump: pump,
@@ -955,8 +959,35 @@ impl PluginStore {
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
+        self.refresh_contributions(cx);
         cx.emit(PluginStoreEvent::Changed);
         cx.notify();
+    }
+
+    /// The plugins whose declarative contributions are in place: turned on and able to run (a
+    /// plugin with code adds them whether its instance runs or stopped).
+    fn contributing(&self) -> Vec<Arc<PluginEntry>> {
+        self.plugins
+            .iter()
+            .filter(|plugin| {
+                !matches!(
+                    plugin.status,
+                    PluginStatus::Disabled | PluginStatus::Unavailable(_)
+                )
+            })
+            .map(|plugin| plugin.entry.clone())
+            .collect()
+    }
+
+    /// Puts the languages, servers, themes and icons of the turned-on plugins in place (stage
+    /// 8.3); what couldn't be read goes into the plugin's log.
+    fn refresh_contributions(&mut self, cx: &mut Context<Self>) {
+        let plugins = self.contributing();
+        for (id, problem) in crate::contributions::refresh(&plugins, cx) {
+            if let Some(plugin) = self.plugins.iter().find(|plugin| plugin.id() == id) {
+                plugin.log.write(Level::Warn, &problem);
+            }
+        }
     }
 
     fn bump_generation(&mut self, id: &str) -> u64 {
@@ -1074,6 +1105,10 @@ impl PluginStore {
         };
         let state = &self.plugins[index];
         let entry = state.entry.clone();
+        if entry.source == PluginSource::Dev {
+            self.dev_files
+                .insert(Arc::from(id), declarative_files(&entry));
+        }
         if entry.manifest.wasm.is_none() {
             self.plugins[index].status = PluginStatus::Running;
             return self.changed(cx);
@@ -1129,6 +1164,7 @@ impl PluginStore {
         self.tool_windows.retain(|tool| tool.plugin != id);
         self.status_items.retain(|item| item.plugin != id);
         self.dev_components.remove(id);
+        self.dev_files.remove(id);
         cx.notify();
     }
 
@@ -1252,35 +1288,41 @@ impl PluginStore {
     /// Looks at the components of the running plugins under development: a newer one (the
     /// author built it) is reloaded.
     fn check_dev_components(&mut self, cx: &mut Context<Self>) {
-        let changed: Vec<String> = self
-            .plugins
-            .iter()
-            .filter(|plugin| {
-                plugin.source() == PluginSource::Dev
-                    && !self.building.contains(plugin.id())
-                    && matches!(
-                        plugin.status,
-                        PluginStatus::Running | PluginStatus::Stopped { .. }
-                    )
-            })
-            .filter(|plugin| {
+        let watched = self.plugins.iter().filter(|plugin| {
+            plugin.source() == PluginSource::Dev
+                && !self.building.contains(plugin.id())
+                && matches!(
+                    plugin.status,
+                    PluginStatus::Running | PluginStatus::Stopped { .. }
+                )
+        });
+        let changed: Vec<(String, &'static str)> = watched
+            .filter_map(|plugin| {
                 let now = flux_plugin::dev::component_mtime(&plugin.entry);
-                now.is_some()
+                let component = now.is_some()
                     && self
                         .dev_components
                         .get(plugin.id())
-                        .is_none_or(|known| *known != now)
+                        .is_none_or(|known| *known != now);
+                // A query, a theme or the manifest edited: the plugin is read again (stage 8.3).
+                let files = self
+                    .dev_files
+                    .get(plugin.id())
+                    .is_some_and(|known| *known != declarative_files(&plugin.entry));
+                let why = match (component, files) {
+                    (true, _) => "The component changed: reloading",
+                    (false, true) => "Its files changed: reloading",
+                    (false, false) => return None,
+                };
+                Some((plugin.id().to_string(), why))
             })
-            .map(|plugin| plugin.id().to_string())
             .collect();
-        for id in changed {
+        for (id, why) in changed {
             let Some(index) = self.index(&id) else {
                 continue;
             };
             let name = self.plugins[index].name().to_string();
-            self.plugins[index]
-                .log
-                .write(Level::Info, "The component changed: reloading");
+            self.plugins[index].log.write(Level::Info, why);
             self.reload_from_disk(&id, false, cx);
             self.post(
                 Notification::success(trf("Plugin «{0}» reloaded", &[&name]))
@@ -1809,6 +1851,23 @@ fn plugin_notification(plugin: &str, notification: &ApiNotification) -> Notifica
 }
 
 /// The content of a stopped plugin's tool window: why, and Restart.
+/// The declarative files of a plugin under development with their times of change: its manifest
+/// and the files it names (queries, grammars, themes, icon sets). A change reloads it.
+fn declarative_files(entry: &PluginEntry) -> Vec<(String, Option<SystemTime>)> {
+    let Some(dir) = entry.files.dir() else {
+        return Vec::new();
+    };
+    std::iter::once(flux_plugin::registry::MANIFEST)
+        .chain(entry.manifest.named_files())
+        .map(|file| {
+            let modified = std::fs::metadata(dir.join(file))
+                .and_then(|meta| meta.modified())
+                .ok();
+            (file.to_string(), modified)
+        })
+        .collect()
+}
+
 fn stopped_view(name: &str, error: &str) -> View {
     let span = |text: String, tone: Tone, bold: bool| Span {
         text,

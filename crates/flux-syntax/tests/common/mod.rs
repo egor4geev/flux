@@ -9,8 +9,32 @@ use std::fmt::Write;
 
 use flux_core::transaction::Operation;
 use flux_core::{ChangeSet, Rope};
+use std::path::Path;
+use std::sync::Arc;
+
 use flux_syntax::tree_sitter::{InputEdit, Parser, Point, Tree};
 use flux_syntax::{Language, Syntax};
+
+/// The standard languages (registered on first use) by name.
+pub fn language_by_name(name: &str) -> Option<Arc<Language>> {
+    flux_syntax::standard::register();
+    flux_syntax::language_by_name(name)
+}
+
+/// The standard languages, registered on first use; other tests' languages are left out.
+pub fn languages() -> Vec<Arc<Language>> {
+    flux_syntax::standard::register();
+    flux_syntax::languages()
+        .into_iter()
+        .filter(|language| language.owner() == flux_syntax::standard::OWNER)
+        .collect()
+}
+
+/// The standard language of a file.
+pub fn language_for_path(path: &Path) -> Option<Arc<Language>> {
+    flux_syntax::standard::register();
+    flux_syntax::language_for_path(path)
+}
 
 /// SplitMix64: dependency-free and identical on any machine.
 pub struct Rng(u64);

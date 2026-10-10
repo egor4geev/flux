@@ -33,6 +33,17 @@ projects and the actions you need first, each with its shortcut.
 
 <img src="docs/images/start-screen.png" alt="Start screen with quick actions and recent projects" width="100%">
 
+### Light or dark, your way
+
+Flux Night and Flux Day: the same calm glass, dark or light. Let Flux follow macOS between a light and
+a dark theme, or pick one — Settings → Appearance shows each theme as it will look, and more themes and
+sets of file icons come from the Marketplace. Switch the theme, the icons or the interface language
+without leaving the keyboard: <kbd>⌃</kbd><kbd>`</kbd>, as in JetBrains IDEs.
+
+<img src="docs/images/flux-day.png" alt="Flux Day, the light theme: the project tree and a SCSS file highlighted by a plugin from the Marketplace" width="100%">
+
+<img src="docs/images/appearance.png" alt="Settings → Appearance → Theme: Flux Night and Flux Day as previews, and Sync with OS" width="100%">
+
 ### Find anything
 
 Jump to a file by a few letters of its name (<kbd>⌘</kbd><kbd>P</kbd>). Search the whole project with a
@@ -45,9 +56,10 @@ regular-expression options — and turn every match into a cursor to edit them a
 ### Understands your code
 
 Errors as you type, completion with documentation, documentation on hover, go to definition, find
-usages, rename across the project and reformat — for Rust, Go, Python, TypeScript and JavaScript, TOML,
-YAML, JSON, Bash and Markdown. Flux uses the language servers you already have and quietly installs the
-missing ones in the background.
+usages, rename across the project and reformat. JavaScript and TypeScript come with Flux; Rust, Go,
+Python, TOML, YAML, JSON, Bash, Markdown, HTML, CSS and SCSS, Dockerfile, SQL and Makefile are one click
+away in the Marketplace — open such a file and Flux offers the plugin. Flux uses the language servers
+you already have and quietly installs the missing ones in the background.
 
 Press <kbd>⌥</kbd><kbd>↵</kbd> on an error for the quick fixes and refactorings the language server
 offers, as in JetBrains IDEs, or right-click the code for everything else: go to, find usages, rename,
@@ -144,6 +156,14 @@ look.
 
 <img src="docs/images/plugin-permissions.png" alt="The question before installing a plugin: the project's files, the sites it may connect to, a local server, the programs it may run, terminals — highlighted — and a folder it may read" width="100%">
 
+Find plugins in the Marketplace: languages with their language servers, color themes and sets of file
+icons, ready to install in one click and updated when a new version comes out. When you open a file
+Flux has no language for, it tells you which plugin knows it.
+
+<img src="docs/images/marketplace.png" alt="Settings → Plugins → Marketplace: languages, themes and icon sets, with the Rust plugin's details" width="100%">
+
+<img src="docs/images/plugin-suggestion.png" alt="A Rust file without its plugin: a banner over the editor offers to install Rust" width="100%">
+
 ### Claude Code, built in
 
 Talk to Claude in a window on the right (<kbd>⌘</kbd><kbd>Esc</kbd>), or move the chat to a tab next
@@ -180,7 +200,8 @@ Pick up any earlier conversation of the project — started in Flux or in the te
 ### Keyboard first, in your language
 
 Every command is in the command palette with its shortcut, and the keys are familiar if you come from
-JetBrains IDEs. The interface speaks English or Russian, following your system settings.
+JetBrains IDEs. The interface speaks English or Russian — following your system, or the one you pick in
+Settings → Appearance, at once.
 
 ## Get started
 
@@ -192,7 +213,8 @@ open target/release/Flux.app
 ```
 
 You will need [Rust](https://rustup.rs) with the WebAssembly target for the built-in plugins:
-`rustup target add wasm32-wasip2` (without it Flux still builds, just without them). Open a folder
+`rustup target add wasm32-wasip2` (without it Flux still builds, just without them), and
+[CMake](https://cmake.org) for the build: `brew install cmake`. Open a folder
 with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. For Claude, install
 [Claude Code](https://code.claude.com) and sign in once; <kbd>⌘</kbd><kbd>Esc</kbd> opens the chat.
 
@@ -214,6 +236,7 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 | <kbd>⌘</kbd><kbd>0</kbd> · <kbd>⌃</kbd><kbd>V</kbd> | Show or hide the commit window · Git operations |
 | <kbd>⌘</kbd><kbd>9</kbd> · <kbd>⌥</kbd><kbd>⌘</kbd><kbd>A</kbd> | Show or hide the Git log · who changed each line |
 | <kbd>⌘</kbd><kbd>Esc</kbd> · <kbd>⌥</kbd><kbd>⌘</kbd><kbd>K</kbd> | Claude · mention the selection in Claude's message |
+| <kbd>⌃</kbd><kbd>`</kbd> | Quick Switch: theme, file icons, language |
 
 ## Roadmap
 
@@ -231,7 +254,8 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 - [x] Claude Code: a chat that runs your `claude`, with every edit as a diff
 - [x] Claude Code: a review of Claude's changes, session history, the editor's menu
 - [x] Plugins: web services, programs, terminals, edits to review, context menus — with your permission
-- [ ] Plugins: a catalog, themes, file icons and languages as plugins; Appearance settings
+- [x] Plugins: the Marketplace, languages, themes and file icons as plugins, a light theme, Appearance settings
+- [ ] Before the beta: polish, updates over the air, a signed and notarized app
 - [ ] Public beta
 
 ## License

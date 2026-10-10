@@ -31,7 +31,7 @@ use flux_claude::{
 use crate::claude_chat::{ClaudeChat, ClaudeChatEvent};
 use crate::claude_session::ClaudeSession;
 use crate::i18n::{tr, trf, trn};
-use crate::icons::{IconName, file_icon, icon};
+use crate::icons::{IconName, IconSource, file_icon, icon, source_icon};
 use crate::markdown::{self, Block};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
@@ -832,17 +832,19 @@ impl Renderer<'_> {
         let expanded = details.is_some() && self.state.expanded(id, default_open);
         let mark = state_mark(tool.state, ui);
         // A file's row has the file type's icon (in the row's quiet color).
-        let icon_name = match &tool.call {
+        let icon_source = match &tool.call {
             ToolCall::Read { path, .. } => path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .map_or(summary.icon, |name| file_icon(name, &ui).name),
-            _ => summary.icon,
+                .map_or(IconSource::Builtin(summary.icon), |name| {
+                    file_icon(name, &ui).source
+                }),
+            _ => IconSource::Builtin(summary.icon),
         };
         let leading = if running {
             pulse(("claude-tool-pulse", id), ui).into_any_element()
         } else {
-            icon(icon_name, tool_color(tool.state, ui))
+            source_icon(&icon_source, tool_color(tool.state, ui))
                 .size(px(14.))
                 .into_any_element()
         };

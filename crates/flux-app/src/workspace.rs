@@ -458,7 +458,17 @@ impl Workspace {
         }
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
+        // A theme that follows macOS changes with it (Settings → Appearance → Sync with OS).
+        crate::theme::system_appearance_changed(crate::theme::window_appearance(window), cx);
+        // Updates of the installed plugins, once the plugins are found (stage 8.3).
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            this.update(cx, crate::plugin_updates::check_on_start).ok();
+        });
         let subscriptions = vec![
+            cx.observe_window_appearance(window, |_, window, cx| {
+                crate::theme::system_appearance_changed(crate::theme::window_appearance(window), cx)
+            }),
             // Files may have changed while the window was inactive (git in a terminal, another
             // editor): the watcher reports them, and a refresh on return makes sure.
             cx.observe_window_activation(window, |this, window, cx| {
@@ -3966,6 +3976,7 @@ impl Render for Workspace {
             .map(|root| crate::rebase_dialog::workspace_actions(root, cx))
             .map(|root| crate::blame::workspace_actions(root, cx))
             .map(|root| crate::plugins::workspace_actions(root, cx))
+            .map(|root| crate::quick_switch::workspace_actions(root, cx))
             .map(|root| crate::editor_menu::workspace_actions(root, cx))
             .map(|root| Self::claude_actions(root, claude_chat, claude_in_tab, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
@@ -4174,7 +4185,13 @@ impl Render for Workspace {
                     TabItem::Log(view) => view.clone().into_any_element(),
                     TabItem::Claude(chat) => chat.clone().into_any_element(),
                 };
+                // A file Flux has no language for, while the catalog has one: the banner of a
+                // plugin to install, as JetBrains IDEs suggest one (stage 8.3).
+                let suggestion = item.editor().cloned().and_then(|editor| {
+                    crate::plugin_suggestions::banner(self, &editor, window, cx)
+                });
                 main.child(self.render_tab_bar(cx))
+                    .children(suggestion)
                     .when(
                         item.editor().is_some() && self.find_bar.read(cx).is_open(),
                         |main| main.child(self.find_bar.clone()),

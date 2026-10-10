@@ -1241,7 +1241,7 @@ fn expand(
 
 fn documentation_blocks(
     documentation: Option<Documentation>,
-    language: Option<&'static flux_syntax::Language>,
+    language: Option<std::sync::Arc<flux_syntax::Language>>,
     scopes: &[String],
 ) -> Vec<Block> {
     let mut blocks = match documentation {
