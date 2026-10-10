@@ -17,6 +17,13 @@
 //! A document may have several servers (Python: pyright for the language, ruff for formatting and
 //! linting): it is open on all of them, the first is the main one (completion, hover, navigation),
 //! diagnostics are kept per server.
+//!
+//! Part 9.2: a file nobody opened can be opened on its servers without an editor — a background
+//! document (Flux's tools for Claude: the problems of a file, its definitions and usages); a few are
+//! kept, the least recently used closed. What servers published last is kept as they sent it (the
+//! context of ⌥↵ code actions carries a problem's `data`), and a caller can wait for the next
+//! publication of a file. A server's `workspace/applyEdit` goes to the window
+//! ([`LspEvent::ApplyEdit`]).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -37,9 +44,10 @@ use flux_lsp::lsp_types::{
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncKind,
     Uri, VersionedTextDocumentIdentifier,
 };
-use flux_lsp::{LanguageServer, ServerEvent, install, position, sync};
+use flux_lsp::{ApplyEdit, LanguageServer, ServerEvent, install, position, sync};
 use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedReceiver};
+use futures::channel::oneshot;
 use gpui::{
     App, AppContext, AsyncApp, Context, Div, Entity, EntityId, EventEmitter, InteractiveElement,
     IntoElement,
@@ -68,10 +76,21 @@ actions!(
 );
 
 /// What the window tells the user about the servers: installed, failed to install, stopped, an
-/// error the server showed.
+/// error the server showed; and an edit a server asks the window to apply.
 pub enum LspEvent {
     Notify(Notification),
+    /// `workspace/applyEdit` of `server` (a code action's command): the window applies it and
+    /// answers the request.
+    ApplyEdit {
+        server: LanguageServer,
+        request: ApplyEdit,
+    },
 }
+
+/// How many files may be open on servers without an editor ([`LspStore::open_background`]).
+const BACKGROUND_LIMIT: usize = 8;
+/// A file larger than this is not opened in the background (a server would chew on it).
+const BACKGROUND_MAX_BYTES: u64 = 4 << 20;
 
 impl EventEmitter<LspEvent> for LspStore {}
 
@@ -109,7 +128,23 @@ pub struct LspStore {
     /// Registered editors: each has one release observer, whatever its path changes.
     registered: HashSet<EntityId>,
     next_server_id: u64,
+    /// Callers waiting for the next diagnostics of a file ([`LspStore::wait_diagnostics`]).
+    waiters: Vec<(PathBuf, oneshot::Sender<()>)>,
+    /// Orders background documents by last use.
+    background_clock: u64,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A file open on a server without an editor (Flux's tools for Claude).
+struct BackgroundDocument {
+    path: PathBuf,
+    uri: Uri,
+    /// Of the text the server has: 0 at `didOpen`, +1 per `didChange`.
+    version: i32,
+    /// `didOpen` sent (the server may still be starting).
+    opened: bool,
+    /// [`LspStore::background_clock`] at the last use.
+    used: u64,
 }
 
 /// Which server: the config and the workspace root.
@@ -131,6 +166,11 @@ struct Server {
     /// Diagnostics published for files that are not open in an editor (`cargo check` reports the
     /// whole crate): applied when such a file is opened.
     unopened: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    /// The last diagnostics of every file as the server sent them (with `data`): the context of a
+    /// code action.
+    published: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    /// Files open on this server without an editor.
+    background: Vec<BackgroundDocument>,
     /// Work in progress (`$/progress`), in order of start.
     progress: Vec<Progress>,
     /// The last error or warning the server showed (`window/showMessage`), for a few seconds.
@@ -241,6 +281,8 @@ impl LspStore {
             servers: Vec::new(),
             registered: HashSet::new(),
             next_server_id: 0,
+            waiters: Vec::new(),
+            background_clock: 0,
             _subscriptions: subscriptions,
         }
     }
@@ -273,6 +315,8 @@ impl LspStore {
         let Some(path) = path else {
             return;
         };
+        // Open in an editor now: a background copy of it would be a second didOpen.
+        self.close_background(&path);
         let configs: Vec<ServerConfig> = config::servers_for_path(&self.configs, &path)
             .into_iter()
             .cloned()
@@ -283,23 +327,7 @@ impl LspStore {
                 name: config.name.clone(),
                 root: root.clone(),
             };
-            let index = match self.servers.iter().position(|server| server.key == key) {
-                // Exited, failed to install, or couldn't be installed earlier: opening a document
-                // it serves tries again, with its old documents.
-                Some(index) if self.servers[index].status.retried_on_open() => {
-                    let mut old = self.servers.remove(index);
-                    let mut server = self.start_server(config, key, cx);
-                    server.editors = std::mem::take(&mut old.editors);
-                    self.servers.push(server);
-                    self.servers.len() - 1
-                }
-                Some(index) => index,
-                None => {
-                    let server = self.start_server(config, key, cx);
-                    self.servers.push(server);
-                    self.servers.len() - 1
-                }
-            };
+            let index = self.ensure_server(config, key, cx);
             let server = &mut self.servers[index];
             server.editors.push(editor.downgrade());
             if server.status == Status::Running {
@@ -307,6 +335,26 @@ impl LspStore {
             }
         }
         cx.notify();
+    }
+
+    /// The server `key` (its index): the running one, or a new one — also in place of one that
+    /// exited, failed to install, or couldn't be installed earlier (with its old documents).
+    fn ensure_server(&mut self, config: ServerConfig, key: ServerKey, cx: &mut Context<Self>) -> usize {
+        match self.servers.iter().position(|server| server.key == key) {
+            Some(index) if self.servers[index].status.retried_on_open() => {
+                let mut old = self.servers.remove(index);
+                let mut server = self.start_server(config, key, cx);
+                server.editors = std::mem::take(&mut old.editors);
+                self.servers.push(server);
+                self.servers.len() - 1
+            }
+            Some(index) => index,
+            None => {
+                let server = self.start_server(config, key, cx);
+                self.servers.push(server);
+                self.servers.len() - 1
+            }
+        }
     }
 
     /// Stops the server of the editor's document and starts it again (also finds a server installed
@@ -527,6 +575,8 @@ impl LspStore {
             handle: None,
             editors: Vec::new(),
             unopened: HashMap::new(),
+            published: HashMap::new(),
+            background: Vec::new(),
             progress: Vec::new(),
             message: None,
             message_timer: None,
@@ -600,7 +650,15 @@ impl LspStore {
                         .map_or(0, |path| rank_of(configs, path, &server.key.name));
                     open_document(server, editor, rank, cx);
                 }
+                open_background_documents(server);
                 cx.notify();
+            }
+            ServerEvent::ApplyEdit(request) => {
+                let Some(server) = self.server_mut(id).and_then(|server| server.handle.clone())
+                else {
+                    return;
+                };
+                cx.emit(LspEvent::ApplyEdit { server, request });
             }
             ServerEvent::Diagnostics(params) => self.publish_diagnostics(id, params, cx),
             ServerEvent::Progress {
@@ -685,6 +743,8 @@ impl LspStore {
         server.handle = None;
         server.progress.clear();
         server.unopened.clear();
+        server.published.clear();
+        server.background.clear();
         let editors: Vec<_> = server
             .editors
             .iter()
@@ -722,27 +782,279 @@ impl LspStore {
                 editor.lsp.iter().any(|doc| doc.server_id == id)
                     && editor.document.path() == Some(path.as_path())
             });
-        let Some(editor) = editor else {
-            if params.diagnostics.is_empty() {
-                server.unopened.remove(&path);
-            } else {
-                server.unopened.insert(path, params.diagnostics);
+        let accepted = match editor {
+            None => {
+                // A background document's: only for its current text.
+                let current = server
+                    .background
+                    .iter()
+                    .find(|doc| doc.path == path)
+                    .is_none_or(|doc| params.version.is_none_or(|v| v == doc.version));
+                if current {
+                    if params.diagnostics.is_empty() {
+                        server.unopened.remove(&path);
+                    } else {
+                        server.unopened.insert(path.clone(), params.diagnostics.clone());
+                    }
+                }
+                current
             }
-            return;
+            Some(editor) => editor.update(cx, |editor, cx| {
+                let Some(document) = editor.lsp.iter().find(|doc| doc.server_id == id) else {
+                    return false;
+                };
+                // For an older text: the server will publish again for the current one; until
+                // then the old diagnostics follow the edits.
+                if params.version.is_some_and(|v| v != document.version) {
+                    return false;
+                }
+                let items = diagnostics::from_lsp(editor.document.text(), &params.diagnostics);
+                editor.diagnostics.set(id, items);
+                cx.notify();
+                true
+            }),
         };
-        editor.update(cx, |editor, cx| {
-            let Some(document) = editor.lsp.iter().find(|doc| doc.server_id == id) else {
-                return;
+        if !accepted {
+            return;
+        }
+        let server = self.server_mut(id).expect("found above");
+        if params.diagnostics.is_empty() {
+            server.published.remove(&path);
+        } else {
+            server.published.insert(path.clone(), params.diagnostics);
+        }
+        // Those waiting for this file learn that its diagnostics are fresh.
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
+            .into_iter()
+            .partition(|(waited, _)| *waited == path);
+        self.waiters = waiting;
+        for (_, waiter) in ready {
+            let _ = waiter.send(());
+        }
+    }
+
+    // --- Files without an editor (part 9.2: Flux's tools for Claude) ---
+
+    /// Opens `path` on the servers of its language without an editor (starting them if needed),
+    /// or marks it used if it is open already; its diagnostics then come like those of any file
+    /// nobody opened. `false` — no server serves the file, or it is too big; `true` too when an
+    /// editor has it open (it is on its servers already).
+    pub fn open_background(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
+        let configs: Vec<ServerConfig> = config::servers_for_path(&self.configs, path)
+            .into_iter()
+            .cloned()
+            .collect();
+        if configs.is_empty() {
+            return false;
+        }
+        if self.editor_for_path(path, cx).is_some() {
+            return true;
+        }
+        if std::fs::metadata(path).map_or(true, |meta| meta.len() > BACKGROUND_MAX_BYTES) {
+            return false;
+        }
+        self.background_clock += 1;
+        let used = self.background_clock;
+        let root = self.server_root(path);
+        for config in configs {
+            let key = ServerKey {
+                name: config.name.clone(),
+                root: root.clone(),
             };
-            // For an older text: the server will publish again for the current one; until then
-            // the old diagnostics follow the edits.
-            if params.version.is_some_and(|v| v != document.version) {
-                return;
+            let index = self.ensure_server(config, key, cx);
+            let server = &mut self.servers[index];
+            if let Some(doc) = server.background.iter_mut().find(|doc| doc.path == path) {
+                doc.used = used;
+                continue;
             }
-            let items = diagnostics::from_lsp(editor.document.text(), &params.diagnostics);
-            editor.diagnostics.set(id, items);
-            cx.notify();
-        });
+            server.background.push(BackgroundDocument {
+                path: path.to_path_buf(),
+                uri: position::uri_from_path(path),
+                version: 0,
+                opened: false,
+                used,
+            });
+            if server.status == Status::Running {
+                open_background_documents(server);
+            }
+        }
+        self.trim_background();
+        cx.notify();
+        true
+    }
+
+    /// The file of a background document changed on disk (an edit of Claude): the servers get the
+    /// new text. `false` — it isn't open in the background.
+    pub fn refresh_background(&mut self, path: &Path) -> bool {
+        let mut found = false;
+        let mut text = None;
+        for server in &mut self.servers {
+            let Some(handle) = server.handle.clone() else {
+                continue;
+            };
+            let Some(doc) = server
+                .background
+                .iter_mut()
+                .find(|doc| doc.path == path && doc.opened)
+            else {
+                continue;
+            };
+            found = true;
+            let Some(text) = text.get_or_insert_with(|| std::fs::read_to_string(path).ok()) else {
+                continue;
+            };
+            doc.version += 1;
+            handle.notify::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: doc.uri.clone(),
+                    version: doc.version,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.clone(),
+                }],
+            });
+        }
+        found
+    }
+
+    /// Resolves at the next diagnostics a server publishes for `path` (for its current text).
+    pub fn wait_diagnostics(&mut self, path: &Path) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.waiters.retain(|(_, waiter)| !waiter.is_canceled());
+        self.waiters.push((path.to_path_buf(), sender));
+        receiver
+    }
+
+    /// What `server_id` last published for `path`, as it sent it.
+    pub fn published(&self, server_id: u64, path: &Path) -> Option<&[lsp_types::Diagnostic]> {
+        let server = self.servers.iter().find(|server| server.id == server_id)?;
+        server.published.get(path).map(Vec::as_slice)
+    }
+
+    /// Every file with diagnostics that no editor shows (files the servers checked, background
+    /// documents): the path, the server's name, the diagnostics as sent.
+    pub fn unopened_diagnostics(&self) -> Vec<(PathBuf, String, Vec<lsp_types::Diagnostic>)> {
+        let mut files: Vec<_> = self
+            .servers
+            .iter()
+            .flat_map(|server| {
+                server.unopened.iter().map(|(path, diagnostics)| {
+                    (path.clone(), server.key.name.clone(), diagnostics.clone())
+                })
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        files
+    }
+
+    /// The main server of `path` with the file open on it (in an editor or in the background),
+    /// and the text it has: the editor's (with unsaved changes) or the background copy's (the disk).
+    pub fn file_server(&self, path: &Path, cx: &App) -> Option<(LanguageServer, Uri)> {
+        if let Some(editor) = self.editor_for_path(path, cx) {
+            return document_server(editor.read(cx));
+        }
+        let main = config::servers_for_path(&self.configs, path).first()?.name.clone();
+        let root = self.server_root(path);
+        let server = self
+            .servers
+            .iter()
+            .find(|server| server.key.name == main && server.key.root == root)?;
+        let doc = server
+            .background
+            .iter()
+            .find(|doc| doc.path == path && doc.opened)?;
+        Some((server.handle.clone()?, doc.uri.clone()))
+    }
+
+    /// The running servers (one per name and root), for requests about the whole workspace
+    /// (`workspace/symbol`).
+    pub fn running_servers(&self) -> Vec<LanguageServer> {
+        self.servers
+            .iter()
+            .filter(|server| server.status == Status::Running)
+            .filter_map(|server| server.handle.clone())
+            .collect()
+    }
+
+    /// Why `path` has no server to ask yet (starting, installing, not installed), as
+    /// [`Self::waiting`] says it for an editor; `None` — running, or no server serves it.
+    pub fn file_waiting(&self, path: &Path) -> Option<FileServers> {
+        let configs = config::servers_for_path(&self.configs, path);
+        let main = configs.first()?;
+        let root = self.server_root(path);
+        let Some(server) = self
+            .servers
+            .iter()
+            .find(|server| server.key.name == main.name && server.key.root == root)
+        else {
+            return Some(FileServers::Starting(main.name.clone()));
+        };
+        let name = server.key.name.clone();
+        Some(match &server.status {
+            Status::Running => return None,
+            Status::Starting | Status::Installing(_) => FileServers::Starting(name),
+            Status::Unavailable | Status::CannotInstall(_) | Status::NotInstalled => {
+                FileServers::Missing(name)
+            }
+            Status::InstallFailed(reason) | Status::Failed(reason) => {
+                FileServers::Failed(name, reason.clone())
+            }
+        })
+    }
+
+    /// Whether any server serves files like `path`.
+    pub fn serves(&self, path: &Path) -> bool {
+        !config::servers_for_path(&self.configs, path).is_empty()
+    }
+
+    /// The editor that has `path` open on its servers.
+    fn editor_for_path(&self, path: &Path, cx: &App) -> Option<Entity<Editor>> {
+        self.servers
+            .iter()
+            .flat_map(|server| server.editors.iter().filter_map(WeakEntity::upgrade))
+            .find(|editor| editor.read(cx).document.path() == Some(path))
+    }
+
+    /// Closes the background copies of `path` (an editor opens it now).
+    fn close_background(&mut self, path: &Path) {
+        for server in &mut self.servers {
+            let (closed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut server.background)
+                .into_iter()
+                .partition(|doc| doc.path == path);
+            server.background = kept;
+            if let Some(handle) = &server.handle {
+                for doc in closed.into_iter().filter(|doc| doc.opened) {
+                    handle.notify::<DidCloseTextDocument>(DidCloseTextDocumentParams {
+                        text_document: TextDocumentIdentifier { uri: doc.uri },
+                    });
+                }
+            }
+        }
+    }
+
+    /// Keeps the [`BACKGROUND_LIMIT`] most recently used background files open.
+    fn trim_background(&mut self) {
+        let mut paths: Vec<(u64, PathBuf)> = Vec::new();
+        for doc in self.servers.iter().flat_map(|server| &server.background) {
+            match paths.iter_mut().find(|(_, path)| *path == doc.path) {
+                Some((used, _)) => *used = (*used).max(doc.used),
+                None => paths.push((doc.used, doc.path.clone())),
+            }
+        }
+        if paths.len() <= BACKGROUND_LIMIT {
+            return;
+        }
+        paths.sort();
+        let excess = paths.len() - BACKGROUND_LIMIT;
+        for (_, path) in paths.into_iter().take(excess) {
+            self.close_background(&path);
+            for server in &mut self.servers {
+                server.unopened.remove(&path);
+                server.published.remove(&path);
+            }
+        }
     }
 
     /// A tab was closed (the editor released): its document is closed on the server.
@@ -1116,6 +1428,39 @@ fn open_document(
             cx.notify();
         }
     });
+}
+
+/// Sends `didOpen` for the background documents the server doesn't have yet (it was starting).
+fn open_background_documents(server: &mut Server) {
+    let Some(handle) = server.handle.clone() else {
+        return;
+    };
+    for doc in server.background.iter_mut().filter(|doc| !doc.opened) {
+        let Ok(text) = std::fs::read_to_string(&doc.path) else {
+            continue;
+        };
+        handle.notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc.uri.clone(),
+                language_id: config::language_id(&doc.path).to_string(),
+                version: 0,
+                text,
+            },
+        });
+        doc.opened = true;
+        doc.version = 0;
+    }
+}
+
+/// Why a file's main server can't answer yet.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileServers {
+    /// Starting or being installed: worth waiting a little.
+    Starting(String),
+    /// Not on the machine, and Flux won't install it.
+    Missing(String),
+    /// Stopped or failed to install, with the reason.
+    Failed(String, String),
 }
 
 /// Sends `didClose` for the editor's document to all its servers and detaches it.

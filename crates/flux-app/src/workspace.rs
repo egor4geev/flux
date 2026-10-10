@@ -235,6 +235,8 @@ pub struct Workspace {
     /// The cards that ask the user about a session's question, by session and the CLI's request:
     /// they expire once it is answered.
     claude_attention: HashMap<(EntityId, String), crate::notification_center::NotificationId>,
+    /// The context menu of an editor tab (the right button).
+    tab_menu: Option<TabMenu>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -353,9 +355,16 @@ impl TabItem {
 
 /// A file tab being dragged along the tab strip: it is also the label next to the pointer.
 #[derive(Clone)]
-struct DraggedEditorTab {
-    editor: Entity<Editor>,
+pub(crate) struct DraggedEditorTab {
+    pub(crate) editor: Entity<Editor>,
     name: SharedString,
+}
+
+/// The context menu of an editor tab, at the click.
+struct TabMenu {
+    menu: Entity<crate::context_menu::ContextMenu>,
+    position: Point<Pixels>,
+    _subscriptions: [Subscription; 2],
 }
 
 /// Overlay window. It closes by itself (`DismissEvent`: Esc, making a choice) or when the same
@@ -460,7 +469,10 @@ impl Workspace {
             cx.observe(&notifications_panel, |_, _, cx| cx.notify()),
             cx.observe(&plugins, |_, _, cx| cx.notify()),
             cx.subscribe_in(&plugins, window, Self::on_plugin_store_event),
-            cx.observe(&claude_panel, |_, _, cx| cx.notify()),
+            cx.observe(&claude_panel, |this, _, cx| {
+                this.save_claude_sessions(cx);
+                cx.notify()
+            }),
             cx.subscribe_in(&claude, window, Self::on_claude_event),
             cx.subscribe_in(&claude_panel, window, Self::on_claude_panel_event),
             cx.subscribe_in(&terminal_panel, window, Self::on_terminal_panel_event),
@@ -525,6 +537,7 @@ impl Workspace {
             claude_return: None,
             claude_last_editor: None,
             claude_attention: HashMap::new(),
+            tab_menu: None,
             _subscriptions: subscriptions,
         };
         if !paths.is_empty() {
@@ -584,6 +597,9 @@ impl Workspace {
         cx.observe(&lsp, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&lsp, |this, _, event, cx| match event {
             crate::lsp::LspEvent::Notify(notification) => this.notify(notification.clone(), cx),
+            crate::lsp::LspEvent::ApplyEdit { server, request } => {
+                crate::code_actions::apply_server_edit(this, server.clone(), request.clone(), cx)
+            }
         })
         .detach();
         lsp
@@ -1590,7 +1606,8 @@ impl Workspace {
         }
         let git = self.git.clone();
         let width = self.left_width.clone();
-        let panel = cx.new(|cx| CommitPanel::new(git, width, window, cx));
+        let claude = self.claude.clone();
+        let panel = cx.new(|cx| CommitPanel::new(git, claude, width, window, cx));
         let subscription =
             cx.subscribe_in(&panel, window, |this, _, event, window, cx| match event {
                 CommitPanelEvent::OpenDiff(path) => this.open_diff(path.clone(), window, cx),
@@ -1598,6 +1615,22 @@ impl Workspace {
                 CommitPanelEvent::FocusEditor => this.focus_active(window, cx),
                 CommitPanelEvent::Push => crate::push_dialog::open(this, window, cx),
                 CommitPanelEvent::Removed(paths) => this.documents_removed(paths, window, cx),
+                // A file of a Claude changelist against its text before Claude (part 9.2).
+                CommitPanelEvent::OpenClaudeDiff {
+                    path,
+                    repo,
+                    original,
+                } => this.open_compare(
+                    path.clone(),
+                    *repo,
+                    DiffSide::Text {
+                        label: tr("Before Claude").to_string(),
+                        text: original.clone(),
+                    },
+                    DiffSide::WorkingCopy,
+                    window,
+                    cx,
+                ),
             });
         self.commit_panel = Some(CommitPanelHandle {
             panel: panel.clone(),
@@ -2139,7 +2172,7 @@ impl Workspace {
     /// Files changed on disk (`None` — any may have: the window was activated, events were lost):
     /// an open document without unsaved changes takes the new content, as one edit that ⌘Z undoes;
     /// one with unsaved changes keeps them, and the status bar says the file changed.
-    fn sync_documents(&mut self, paths: Option<Vec<PathBuf>>, cx: &mut Context<Self>) {
+    pub(crate) fn sync_documents(&mut self, paths: Option<Vec<PathBuf>>, cx: &mut Context<Self>) {
         let editors: Vec<(Entity<Editor>, PathBuf)> = self
             .editors(cx)
             .into_iter()
@@ -2206,7 +2239,7 @@ impl Workspace {
 
     /// A file or directory was moved (renamed, or moved within the tree): the open documents inside
     /// it are switched to the new paths.
-    fn documents_moved(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+    pub(crate) fn documents_moved(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
         for editor in self.editors(cx) {
             let moved = editor
                 .read(cx)
@@ -3463,11 +3496,18 @@ impl Workspace {
         let status_color = document
             .path()
             .and_then(|path| crate::git::file_color(&self.git, path, &ui, cx));
+        let menu_for = editor.clone();
         tab_shell(editor.entity_id(), active, ui)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                     this.activate_editor(&activate, window, cx)
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.open_tab_menu(&menu_for, event.position, window, cx)
                 }),
             )
             .on_mouse_up(
@@ -3777,6 +3817,7 @@ impl Render for Workspace {
                 }),
             )
             .map(|root| crate::lsp::workspace_actions(root, cx))
+            .map(|root| crate::code_actions::workspace_actions(root, cx))
             .map(|root| crate::git::workspace_actions(root, cx))
             .map(|root| crate::vcs_menu::workspace_actions(root, cx))
             .map(|root| crate::branches_popup::workspace_actions(root, cx))
@@ -3789,6 +3830,7 @@ impl Render for Workspace {
             .map(|root| crate::rebase_dialog::workspace_actions(root, cx))
             .map(|root| crate::blame::workspace_actions(root, cx))
             .map(|root| crate::plugins::workspace_actions(root, cx))
+            .map(|root| crate::editor_menu::workspace_actions(root, cx))
             .map(|root| Self::claude_actions(root, claude_chat, claude_in_tab, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
                 // A directory from the recent list may have disappeared since launch.
@@ -4144,6 +4186,11 @@ impl Render for Workspace {
             .children(cards)
             .children(self.render_project_search(cx))
             .children(self.render_modal(cx))
+            .children(
+                self.tab_menu
+                    .as_ref()
+                    .map(|menu| crate::context_menu::ContextMenu::overlay(&menu.menu, menu.position)),
+            )
     }
 }
 
@@ -4601,6 +4648,10 @@ impl Workspace {
         .on_action(cx.listener(|this, action: &claude::TypeInTerminal, window, cx| {
             this.type_in_terminal(action.0.clone(), false, window, cx)
         }))
+        .on_action(cx.listener(|this, _: &claude::ResumeSession, window, cx| {
+            crate::claude_history::open(this, window, cx)
+        }))
+        .map(|root| crate::claude_actions::actions(root, cx))
         .on_action(cx.listener(|_, action: &claude::ShowExitDetails, window, cx| {
             // The answer doesn't matter: the dialog only shows the output.
             drop(
@@ -4775,10 +4826,7 @@ impl Workspace {
     ) {
         match event {
             ClaudeStoreEvent::SessionAdded(session) => {
-                let chat = cx.new(|cx| ClaudeChat::new(session.clone(), window, cx));
-                let subscription = cx.subscribe_in(&chat, window, Self::on_claude_chat_event);
-                self.claude_chat_subscriptions
-                    .push((chat.clone(), subscription));
+                let chat = self.new_claude_chat(session, window, cx);
                 self.claude_panel
                     .update(cx, |panel, cx| panel.add_chat(chat.clone(), None, cx));
                 self.show_right(RightTool::Claude, window, cx);
@@ -4920,7 +4968,127 @@ impl Workspace {
             }
             ClaudeStoreEvent::FilesChanged(paths) => self.sync_documents(Some(paths.clone()), cx),
             ClaudeStoreEvent::Changed => cx.notify(),
+            ClaudeStoreEvent::ToolCall {
+                session,
+                request,
+                tool,
+                input,
+            } => {
+                let output = crate::claude_tools::call(self, tool, input, window, cx);
+                let session = session.downgrade();
+                let request = request.clone();
+                cx.spawn(async move |_, cx| {
+                    let output = output.await;
+                    session
+                        .update(cx, |session, cx| session.answer_tool(&request, output, cx))
+                        .ok();
+                })
+                .detach();
+            }
+            ClaudeStoreEvent::EditHook {
+                session,
+                request,
+                path,
+            } => {
+                let problems = crate::claude_tools::after_edit(self, path, cx);
+                let session = session.downgrade();
+                let request = request.clone();
+                cx.spawn(async move |_, cx| {
+                    let problems = problems.await;
+                    session
+                        .update(cx, |session, cx| {
+                            session.answer_edit_hook(&request, problems, cx)
+                        })
+                        .ok();
+                })
+                .detach();
+            }
+            ClaudeStoreEvent::SessionRestored {
+                session,
+                place,
+                active,
+            } => self.restore_claude_chat(session, *place, *active, window, cx),
         }
+        // Sessions came, went or got their ids: the next start reopens them.
+        self.save_claude_sessions(cx);
+    }
+
+    /// The chat of a session of the window, subscribed to.
+    fn new_claude_chat(
+        &mut self,
+        session: &Entity<crate::claude_session::ClaudeSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ClaudeChat> {
+        let chat = cx.new(|cx| ClaudeChat::new(session.clone(), window, cx));
+        let subscription = cx.subscribe_in(&chat, window, Self::on_claude_chat_event);
+        self.claude_chat_subscriptions
+            .push((chat.clone(), subscription));
+        chat
+    }
+
+    /// A session open when the project last closed: its chat goes back to its pill or its editor
+    /// tab without coming into sight (it starts its process once it is shown).
+    fn restore_claude_chat(
+        &mut self,
+        session: &Entity<crate::claude_session::ClaudeSession>,
+        place: crate::claude_history::SessionPlace,
+        active: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let chat = self.new_claude_chat(session, window, cx);
+        match place {
+            crate::claude_history::SessionPlace::Panel => self
+                .claude_panel
+                .update(cx, |panel, cx| panel.restore_chat(chat, active, cx)),
+            crate::claude_history::SessionPlace::Editor => {
+                let subscriptions = vec![cx.observe(&chat, |_, _, cx| cx.notify())];
+                let item = TabItem::Claude(chat);
+                if self.tabs.is_empty() {
+                    // The only tab: shown at once.
+                    self.insert_tab(item, subscriptions, None, window, cx);
+                } else {
+                    self.tabs.push(Tab {
+                        item,
+                        _subscriptions: subscriptions,
+                    });
+                }
+            }
+        }
+        self.update_claude_context(cx);
+        cx.notify();
+    }
+
+    /// The window's open sessions of the project — the Claude window's pills, then the chats in
+    /// the editor's tabs — for the next start (Settings → Claude Code → "Reopen sessions with the
+    /// project"); written only when they changed.
+    fn save_claude_sessions(&mut self, cx: &mut Context<Self>) {
+        use crate::claude_history::{OpenSessions, SessionPlace};
+        let Some(root) = self.claude.read(cx).root().map(Path::to_path_buf) else {
+            return;
+        };
+        // A session of another project (the root changed while it ran) isn't this one's.
+        let id_of = |chat: &Entity<ClaudeChat>, cx: &App| {
+            let session = chat.read(cx).session().read(cx);
+            (session.model().info.cwd == root)
+                .then(|| session.session_id().map(str::to_string))
+                .flatten()
+        };
+        let panel = self.claude_panel.read(cx);
+        let mut open = OpenSessions::default();
+        for chat in panel.chats() {
+            if let Some(id) = id_of(chat, cx) {
+                open.sessions.push((id, SessionPlace::Panel));
+            }
+        }
+        open.active = panel.active_chat().and_then(|chat| id_of(chat, cx));
+        for chat in self.tabs.iter().filter_map(|tab| tab.item.claude()) {
+            if let Some(id) = id_of(chat, cx) {
+                open.sessions.push((id, SessionPlace::Editor));
+            }
+        }
+        self.claude.update(cx, |store, _| store.persist(open));
     }
 
     /// A session goes: the cards that ask about it expire.
@@ -4968,6 +5136,9 @@ impl Workspace {
                 self.move_chat_to_panel(chat.clone(), Some(*index), window, cx)
             }
             ClaudePanelEvent::CloseChat(chat) => self.close_claude_chat(chat.clone(), window, cx),
+            ClaudePanelEvent::ShowHistory(anchor) => {
+                crate::claude_history::open_at(self, Some(*anchor), window, cx)
+            }
         }
     }
 
@@ -5056,6 +5227,142 @@ impl Workspace {
             self.activate(index, window, cx);
         }
         chat.update(cx, |chat, cx| chat.insert(&mention, window, cx));
+    }
+
+    /// Mentions (`@src/main.rs`, `@src/ui/`) go into the message of the current chat (else the
+    /// Claude window's, else one in a tab), which comes into sight; without any chat, a new
+    /// session takes them once it starts. "Send to Claude" of the tree and the tabs, dropped files.
+    pub(crate) fn send_mentions_to_claude(
+        &mut self,
+        mentions: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if mentions.is_empty() {
+            return;
+        }
+        let text = mentions.join(" ") + " ";
+        let chat = self
+            .current_claude_chat(window, cx)
+            .or_else(|| self.claude_panel.read(cx).active_chat().cloned())
+            .or_else(|| self.tabs.iter().find_map(|tab| tab.item.claude().cloned()));
+        let Some(chat) = chat else {
+            if self.claude.read(cx).is_ready() {
+                self.claude_pending_mention = Some(text);
+            }
+            return self.toggle_claude(window, cx);
+        };
+        if self.claude_panel.read(cx).chats().contains(&chat) {
+            self.claude_panel
+                .update(cx, |panel, cx| panel.activate_chat(&chat, window, cx));
+            self.show_right(RightTool::Claude, window, cx);
+        } else if let Some(index) = self.tabs.iter().position(|tab| tab.item.claude() == Some(&chat))
+        {
+            self.claude_return = self.active_item();
+            self.activate(index, window, cx);
+        }
+        chat.update(cx, |chat, cx| chat.insert(&text, window, cx));
+    }
+
+    /// A ready request (Explain, Fix…) in a new session: its chat comes into sight in the Claude
+    /// window and the request goes at once; while `claude` isn't ready, the window says why.
+    pub(crate) fn ask_claude(
+        &mut self,
+        input: flux_claude::UserInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::claude_session::ClaudeSession>> {
+        let session = self.claude.update(cx, |store, cx| store.new_session(cx));
+        match &session {
+            Some(session) => session.update(cx, |session, cx| session.send(input, cx)),
+            None => self.show_right(RightTool::Claude, window, cx),
+        }
+        session
+    }
+
+    /// The right button on an editor tab: the tab becomes active and its menu opens at the click —
+    /// Close, the file's path, the Finder, Send to Claude.
+    fn open_tab_menu(
+        &mut self,
+        editor: &Entity<Editor>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_editor(editor, window, cx);
+        let path = editor.read(cx).document.path().map(Path::to_path_buf);
+        let claude = crate::claude_actions::offered(cx);
+        let menu = cx.new(|cx| {
+            let menu = crate::context_menu::ContextMenu::new(window, cx).entry(tr("Close Tab"), CloseTab);
+            let Some(path) = path else {
+                return menu;
+            };
+            let menu = menu
+                .separator()
+                .submenu(tr("Copy Path/Reference"), |copy| {
+                    copy.entry(tr("Absolute Path"), crate::editor_menu::CopyAbsolutePath)
+                        .entry(tr("Path From Project Root"), crate::editor_menu::CopyPathFromRoot)
+                        .entry(tr("File Name"), crate::editor_menu::CopyFileName)
+                })
+                .entry(tr("Reveal in Finder"), crate::editor_menu::RevealInFinder);
+            if claude {
+                menu.separator().entry(
+                    tr("Send to Claude"),
+                    crate::claude_actions::SendPathsToClaude(vec![path]),
+                )
+            } else {
+                menu
+            }
+        });
+        let focus = menu.focus_handle(cx);
+        let subscriptions = [
+            cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
+                this.close_tab_menu(menu, window, cx)
+            }),
+            cx.on_focus_out(&focus, window, {
+                let menu = menu.clone();
+                move |this, _, window, cx| this.close_tab_menu(&menu, window, cx)
+            }),
+        ];
+        window.focus(&focus);
+        self.tab_menu = Some(TabMenu {
+            menu,
+            position,
+            _subscriptions: subscriptions,
+        });
+        cx.notify();
+    }
+
+    fn close_tab_menu(
+        &mut self,
+        menu: &Entity<crate::context_menu::ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_menu.as_ref().is_none_or(|open| open.menu != *menu) {
+            return;
+        }
+        let had_focus = menu.focus_handle(cx).contains_focused(window, cx);
+        self.tab_menu = None;
+        if had_focus {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// A new terminal in `dir` (Open In ▸ Terminal of the editor's menu).
+    pub(crate) fn open_terminal_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        match crate::terminal_group::TerminalGroup::spawn(Some(dir), root, window, cx) {
+            Ok(group) => {
+                self.terminal_open = true;
+                self.git_open = false;
+                self.terminal_panel
+                    .update(cx, |panel, cx| panel.add_group(group, None, window, cx));
+                cx.notify();
+            }
+            Err(err) => self.show_message(trf("Couldn't start the shell: {0}", &[&err]).into(), cx),
+        }
     }
 
     // --- Moving chats ---

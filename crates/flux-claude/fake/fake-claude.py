@@ -12,9 +12,17 @@ Environment:
   `g_tasks` (a task list), `h_ask` (Claude's question), `i_plan` / `i_plan_feedback` (plan mode),
   `j_subagent`, `j_background`, `l_slash` (/usage, /context, /compact), `m_image` (summarized
   thinking), `m2_read_image`, `o_queue`, `r_web`.
+  `s_flux_tool` (a synthetic turn: Claude calls `get_diagnostics` of the host's `flux` MCP server
+  and shows the host's answer as the tool's result).
 - `FLUX_FAKE_CLAUDE_DELAY_MS`: the pause between frames (default 25; stream events — a third).
 - `FLUX_FAKE_CLAUDE_SIGNED_OUT=1`: `auth status` says signed out.
-- Arguments `--fake-fixture=<name>` and `--fake-delay-ms=<n>` do the same as the variables (tests).
+- `FLUX_FAKE_CLAUDE_ASK`: the answer of a question without a session (`-p --output-format json`,
+  `Cli::ask`; default — a commit message); `FLUX_FAKE_CLAUDE_ASK_ERROR`: answer it with this error
+  instead; `FLUX_FAKE_CLAUDE_ASK_DELAY_MS`: how long it thinks (default 300).
+- `FLUX_FAKE_CLAUDE_HOOK_LOG=<file>`: every hook answer of the host (`flux-edit` after an edit —
+  the problems the language server found) is appended there as a JSON line.
+- Arguments `--fake-fixture=<name>`, `--fake-delay-ms=<n>` and `--fake-hook-log=<file>` do the same
+  as the variables (tests).
 
 Behaviour:
 - `--version` and `auth status` answer at once; anything else is host mode.
@@ -27,9 +35,21 @@ Behaviour:
   a denial ends the turn: the denial's tool result, then the turn's `result`.
 - Host requests: `interrupt` ends the turn as the CLI does (a pending request is withdrawn with
   `control_cancel_request`); the rest get canned answers.
+- Hooks the host registers in `initialize` run as the CLI runs them: PostToolUse after an allowed
+  edit (the host's answer goes to the hook log), PreToolUse before a call of the host's MCP tool
+  (a denial ends the call).
+- `sdkMcpServers: ["flux"]` in `initialize`: the MCP handshake with the host (`initialize`,
+  `notifications/initialized`, `tools/list`), and the `init` frames list the server and its tools.
+  A recorded `mcp_message` `tools/call` waits for the host's answer, which becomes the call's
+  result.
+- `--resume <id>` / `--session-id <id>`: the frames carry that session id instead of the
+  recording's.
 """
+import copy
+import itertools
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -54,7 +74,37 @@ def main():
             os.environ["FLUX_FAKE_CLAUDE"] = arg.split("=", 1)[1]
         elif arg.startswith("--fake-delay-ms="):
             os.environ["FLUX_FAKE_CLAUDE_DELAY_MS"] = arg.split("=", 1)[1]
-    Host(load(os.environ.get("FLUX_FAKE_CLAUDE", "a_text"))).run()
+        elif arg.startswith("--fake-hook-log="):
+            os.environ["FLUX_FAKE_CLAUDE_HOOK_LOG"] = arg.split("=", 1)[1]
+    if option(args, "--output-format") == "json":
+        return ask()
+    host = Host(load(os.environ.get("FLUX_FAKE_CLAUDE", "a_text")))
+    host.session_override = option(args, "--resume") or option(args, "--session-id")
+    host.run()
+
+
+def option(args, name):
+    """The value of `--name value` or `--name=value`."""
+    for index, arg in enumerate(args):
+        if arg == name and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def ask():
+    """A question without a session (`Cli::ask`): the prompt on stdin, one JSON result."""
+    sys.stdin.read()
+    time.sleep(int(os.environ.get("FLUX_FAKE_CLAUDE_ASK_DELAY_MS", "300")) / 1000)
+    error = os.environ.get("FLUX_FAKE_CLAUDE_ASK_ERROR")
+    if error:
+        print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "result": error}))
+        sys.exit(1)
+    text = os.environ.get("FLUX_FAKE_CLAUDE_ASK",
+                          "Make the greeting friendlier\n\nhello.py prints \"hello\" instead of \"hi\".")
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": text,
+                      "num_turns": 1, "total_cost_usd": 0}))
 
 
 def load(name):
@@ -81,6 +131,16 @@ class Host:
         self.cwd = os.getcwd()
         self.recorded_cwd = next((f.get("cwd") for f in frames
                                   if f.get("type") == "system" and f.get("subtype") == "init"), None)
+        self.recorded_session = next((f.get("session_id") for f in frames
+                                      if f.get("type") == "system" and f.get("subtype") == "init"), None)
+        self.session_override = None
+        # What the host registered in `initialize`.
+        self.hooks = {}
+        self.sdk_servers = []
+        self.flux_tools = []
+        self.request_ids = itertools.count(1)
+        # Results of the host's MCP tools, by tool call: they replace the recorded ones.
+        self.tool_results = {}
 
     # --- Paths and files ---
 
@@ -175,9 +235,14 @@ class Host:
         subtype = request.get("subtype")
         request_id = message.get("request_id")
         if subtype == "initialize":
+            self.hooks = request.get("hooks") or {}
+            self.sdk_servers = request.get("sdkMcpServers") or []
+            if "flux" in self.sdk_servers:
+                threading.Thread(target=self.mcp_handshake, daemon=True).start()
             recorded = next((f for f in self.frames if f.get("type") == "control_response"
                              and "commands" in (f.get("response", {}).get("response") or {})), None)
             response = recorded["response"]["response"] if recorded else {"commands": [], "models": []}
+            response = dict(response, hooks_applied=bool(self.hooks))
             return self.reply(request_id, response)
         if subtype == "interrupt":
             self.interrupted.set()
@@ -211,9 +276,130 @@ class Host:
         text = json.dumps(frame, ensure_ascii=False)
         if self.recorded_cwd:
             text = text.replace(self.recorded_cwd, self.cwd)
+        if self.session_override and self.recorded_session:
+            text = text.replace(self.recorded_session, self.session_override)
         with self.lock:
             sys.stdout.write(text + "\n")
             sys.stdout.flush()
+
+    def wait_for(self, request_id, timeout=None):
+        """The host's answer to a request of ours; `None` — the turn was interrupted (or the time
+        ran out)."""
+        deadline = time.time() + timeout if timeout else None
+        with self.answered:
+            while request_id not in self.answers and not self.interrupted.is_set():
+                if deadline and time.time() > deadline:
+                    break
+                self.answered.wait(0.1)
+            return self.answers.get(request_id)
+
+    def request(self, request, timeout=None):
+        """A control request to the host; its answer (`response` of the control response)."""
+        request_id = "fake-%d" % next(self.request_ids)
+        self.write({"type": "control_request", "request_id": request_id, "request": request})
+        answer = self.wait_for(request_id, timeout)
+        return (answer or {}).get("response") if answer else None
+
+    # --- Hooks and the host's MCP server ---
+
+    def matching_hooks(self, event, tool):
+        for hook in self.hooks.get(event) or []:
+            matcher = hook.get("matcher") or ".*"
+            try:
+                matches = re.fullmatch(matcher, tool) is not None
+            except re.error:
+                matches = matcher == tool
+            if matches:
+                for callback_id in hook.get("hookCallbackIds") or []:
+                    yield callback_id, hook.get("timeout") or 60
+
+    def run_hooks(self, event, tool, tool_input, tool_use_id, tool_response=None):
+        """The host's hooks for a tool call; their answers."""
+        answers = []
+        for callback_id, timeout in self.matching_hooks(event, tool):
+            hook_input = {"session_id": self.session_override or self.recorded_session or "",
+                          "transcript_path": "", "cwd": self.cwd, "permission_mode": "default",
+                          "hook_event_name": event, "tool_name": tool, "tool_input": tool_input,
+                          "tool_use_id": tool_use_id}
+            if tool_response is not None:
+                hook_input["tool_response"] = tool_response
+            answer = self.request({"subtype": "hook_callback", "callback_id": callback_id,
+                                   "input": hook_input, "tool_use_id": tool_use_id}, timeout)
+            answers.append(answer or {})
+            log = os.environ.get("FLUX_FAKE_CLAUDE_HOOK_LOG")
+            if log:
+                with open(log, "a") as file:
+                    file.write(json.dumps({"callback_id": callback_id, "event": event, "tool": tool,
+                                           "tool_use_id": tool_use_id, "answer": answer}) + "\n")
+        return answers
+
+    def mcp_handshake(self):
+        """What the CLI asks the host's `flux` server right after `initialize`."""
+        self.request({"subtype": "mcp_message", "server_name": "flux", "message": {
+            "method": "initialize", "jsonrpc": "2.0", "id": 0,
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                       "clientInfo": {"name": "claude-code", "version": "2.1.285"}}}}, 10)
+        self.request({"subtype": "mcp_message", "server_name": "flux", "message": {
+            "jsonrpc": "2.0", "method": "notifications/initialized"}}, 10)
+        answer = self.request({"subtype": "mcp_message", "server_name": "flux", "message": {
+            "method": "tools/list", "jsonrpc": "2.0", "id": 1}}, 10) or {}
+        tools = ((answer.get("mcp_response") or {}).get("result") or {}).get("tools") or []
+        self.flux_tools = [tool.get("name") for tool in tools if tool.get("name")]
+
+    def with_flux_server(self, frame):
+        """An `init` frame lists the host's server and its tools."""
+        if "flux" not in self.sdk_servers:
+            return frame
+        frame = dict(frame)
+        servers = [server for server in frame.get("mcp_servers") or [] if server.get("name") != "flux"]
+        frame["mcp_servers"] = servers + [{"name": "flux", "status": "connected", "source": "sdk"}]
+        tools = list(frame.get("tools") or [])
+        for name in self.flux_tools:
+            if "mcp__flux__" + name not in tools:
+                tools.append("mcp__flux__" + name)
+        frame["tools"] = tools
+        return frame
+
+    def flux_call(self, frame):
+        """A recorded call of the host's tool: the PreToolUse hooks, the call, its answer kept for
+        the tool result. `False` — the turn was interrupted."""
+        params = frame.get("request", {}).get("message", {}).get("params", {})
+        name = params.get("name", "")
+        arguments = params.get("arguments", {})
+        tool_use_id = params.get("_meta", {}).get("claudecode/toolUseId")
+        tool = "mcp__flux__" + name
+        if "flux" not in self.sdk_servers:
+            self.tool_results[tool_use_id] = ([{"type": "text", "text": "Error: No such tool available: " + tool}], True)
+            return True
+        for answer in self.run_hooks("PreToolUse", tool, arguments, tool_use_id):
+            decision = (answer.get("hookSpecificOutput") or {}).get("permissionDecision")
+            if decision == "deny":
+                self.tool_results[tool_use_id] = ([{"type": "text", "text": "The host denied the call."}], True)
+                return True
+        self.write(frame)
+        answer = self.wait_for(frame.get("request_id"))
+        if answer is None:
+            self.finish_interrupted(tool_use_id=tool_use_id)
+            return False
+        mcp = (answer.get("response") or {}).get("mcp_response") or {}
+        result = mcp.get("result") or {}
+        content = result.get("content") or [{"type": "text", "text": json.dumps(mcp.get("error") or {})}]
+        self.tool_results[tool_use_id] = (content, bool(result.get("isError")) or "error" in mcp)
+        return True
+
+    def with_tool_results(self, frame):
+        """A recorded tool result of the host's tool: the host's own answer instead."""
+        content = frame.get("message", {}).get("content")
+        if not isinstance(content, list) or not any(
+                isinstance(block, dict) and block.get("tool_use_id") in self.tool_results for block in content):
+            return frame
+        frame = copy.deepcopy(frame)
+        for block in frame["message"]["content"]:
+            result = self.tool_results.pop(block.get("tool_use_id"), None) if isinstance(block, dict) else None
+            if result:
+                block["content"], block["is_error"] = result
+                frame["tool_use_result"] = result[0]
+        return frame
 
     # --- Replay ---
 
@@ -239,6 +425,16 @@ class Host:
                 self.finish_interrupted()
                 return
             time.sleep(self.delay / 3 if kind == "stream_event" else self.delay)
+            if kind == "control_request" and frame.get("request", {}).get("subtype") == "mcp_message":
+                if frame["request"].get("server_name") == "flux" and \
+                        frame["request"].get("message", {}).get("method") == "tools/call":
+                    if not self.flux_call(frame):
+                        return
+                continue  # the recording's own handshake: the host's ran at `initialize`
+            if kind == "system" and frame.get("subtype") == "init":
+                frame = self.with_flux_server(frame)
+            if kind == "user":
+                frame = self.with_tool_results(frame)
             self.prepare(frame)
             self.write(frame)
             if kind == "control_request" and frame.get("request", {}).get("subtype") == "can_use_tool":
@@ -274,7 +470,11 @@ class Host:
             self.finish_denied(request.get("tool_use_id"), decision.get("message", ""))
             return False
         if request.get("tool_name") in EDIT_TOOLS:
-            self.apply_edit(request.get("tool_name"), decision.get("updatedInput") or request.get("input", {}))
+            data = decision.get("updatedInput") or request.get("input", {})
+            self.apply_edit(request.get("tool_name"), data)
+            # As the CLI: the PostToolUse hooks before the tool's result goes out.
+            self.run_hooks("PostToolUse", request.get("tool_name"), data, request.get("tool_use_id"),
+                           {"filePath": data.get("file_path"), "success": True})
         return True
 
     def skip_to_result(self):

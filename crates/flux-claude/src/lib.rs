@@ -12,9 +12,11 @@
 //! - [`edits`]: what an edit Claude proposes would make of a file, and the answer for the user's
 //!   (possibly changed) version.
 //! - [`transcript`]: past sessions of a project from `~/.claude/projects` (part 9.2).
+//! - [`mcp`]: Flux's own MCP server for Claude — the tools of the window (part 9.2).
 
 pub mod cli;
 pub mod edits;
+pub mod mcp;
 pub mod process;
 pub mod protocol;
 pub mod session;
@@ -22,10 +24,12 @@ pub mod transcript;
 mod types;
 
 pub use cli::{AuthStatus, Cli, LaunchOptions};
+pub use mcp::{McpReply, McpServer, ToolOutput, ToolSpec};
 pub use process::{Process, ProcessEvent};
+pub use transcript::SavedSession;
 pub use protocol::{CliRequest, HostRequest, Incoming};
 pub use session::{
-    Activity, Answer, Change, Entry, EntryId, EntryKind, Notice, Pending, PendingKind, Session,
+    Activity, Answer, Change, ChangedFile, Entry, EntryId, EntryKind, Notice, Pending, PendingKind, Session,
     SessionInfo, Status, TaskItem, TaskStatus, ToolCall, ToolEntry, ToolResult, ToolState,
 };
 pub use types::{

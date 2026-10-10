@@ -27,6 +27,10 @@
 //! (`Editor::frame_decorations`), which the element takes; the same editor shown in its own tab gets
 //! none.
 //!
+//! **Before Claude** ([`DiffSide::Text`], part 9.2): a file of a Claude changelist in the commit
+//! window against its text before Claude's first change in the session — a text the session kept,
+//! no revision; its blocks can be reverted like a revision's.
+//!
 //! **Claude's proposals** ([`DiffView::proposal`], stage 9): an edit Claude asks permission for — the
 //! file as it is on the left, the proposed text on the right in an editor of its own (editable,
 //! never saved: the answer carries it). A block's arrow puts the file's lines back on the right,
@@ -511,6 +515,12 @@ pub enum DiffSide {
     },
     /// The file in the working tree: its editor, editable.
     WorkingCopy,
+    /// A text kept elsewhere: the file before Claude changed it (`None` — the file didn't exist);
+    /// `label` is the caption ("Before Claude").
+    Text {
+        label: String,
+        text: Option<Arc<str>>,
+    },
 }
 
 /// What the diff viewer asks the workspace to do.
@@ -966,6 +976,10 @@ impl DiffView {
                 let path = self.path.clone();
                 cx.background_spawn(async move { revision_text(std::fs::read(&path).ok()) })
             }
+            DiffSide::Text { text, .. } => Task::ready(match text {
+                Some(text) => RevisionText::Text(text.clone()),
+                None => RevisionText::Missing,
+            }),
         }
     }
 
@@ -1010,7 +1024,7 @@ impl DiffView {
     /// The caption of a side.
     fn side_caption(side: &DiffSide) -> String {
         match side {
-            DiffSide::Revision { label, .. } => label.clone(),
+            DiffSide::Revision { label, .. } | DiffSide::Text { label, .. } => label.clone(),
             DiffSide::WorkingCopy => tr("Working copy").to_string(),
         }
     }
@@ -2301,6 +2315,7 @@ fn missing_note(side: &DiffSide) -> String {
     match side {
         DiffSide::Revision { label, .. } => trf("The file doesn't exist in {0}", &[label]),
         DiffSide::WorkingCopy => tr("The file doesn't exist in the working tree").to_string(),
+        DiffSide::Text { label, .. } => trf("{0}: the file didn't exist", &[label]),
     }
 }
 
@@ -2319,7 +2334,7 @@ fn is_stash_pair(left: &DiffSide, right: &DiffSide) -> bool {
 
 fn short_label(side: &DiffSide, max_chars: usize) -> String {
     let label = match side {
-        DiffSide::Revision { label, .. } => label.as_str(),
+        DiffSide::Revision { label, .. } | DiffSide::Text { label, .. } => label.as_str(),
         DiffSide::WorkingCopy => tr("Working copy"),
     };
     if label.chars().count() <= max_chars {

@@ -1,5 +1,7 @@
 //! Hover: the type and documentation of the symbol under the mouse (after a pause) or at the cursor
-//! (F1), with the diagnostics at that place on top.
+//! (F1), with the diagnostics at that place on top. Under the problems, as in JetBrains' error
+//! tooltip: "Fix with Claude" (a new session) and "More actions… ⌥↵" (the context actions there).
+//! F2 / ⇧F2 show the problem they go to in the same popup, without the documentation.
 //!
 //! A mouse popup stays while the mouse is over its symbol or over the popup itself; when it leaves
 //! both, the popup hides after a moment (time to cross the gap to the popup). An edit, a cursor
@@ -205,6 +207,41 @@ fn show_at_cursor(editor: &mut Editor, cx: &mut Context<Editor>) {
         position..(position + 1).min(len)
     };
     show(editor, position, range, Trigger::Keyboard, cx);
+}
+
+/// F2 / ⇧F2 went to the problem at `position`: its popup at the caret — the problem only, with its
+/// actions; hidden by Esc, typing and caret moves.
+pub fn show_problem(editor: &mut Editor, position: usize, cx: &mut Context<Editor>) {
+    let diagnostics: Vec<Diagnostic> = editor
+        .diagnostics
+        .at(position)
+        .into_iter()
+        .cloned()
+        .collect();
+    let Some(first) = diagnostics.first() else {
+        return;
+    };
+    let len = editor.document.text().len_chars();
+    let range = if first.range.is_empty() {
+        position..(position + 1).min(len.max(position + 1))
+    } else {
+        first.range.clone()
+    };
+    let id = editor.hover.next_id;
+    editor.hover.next_id += 1;
+    editor.hover.pending = None;
+    editor.hover.hide_task = None;
+    editor.hover.over_popup = false;
+    editor.hover.popup = Some(Popup {
+        id,
+        trigger: Trigger::Keyboard,
+        range,
+        selection: editor.document.selection().clone(),
+        diagnostics,
+        blocks: Vec::new(),
+        request: None,
+    });
+    cx.notify();
 }
 
 /// Shows the popup for `position`: the diagnostics there right away, the server's hover when it
@@ -515,6 +552,7 @@ fn render_popup(
     if editor.autoscroll.is_some() {
         window.request_animation_frame();
     }
+    let actions = problem_actions(editor, popup, cx);
     let theme = Theme::get(cx);
     let ui = theme.ui;
     let (above, below) = popup::space(&anchor, window.viewport_size().height);
@@ -560,6 +598,7 @@ fn render_popup(
         .flex_col()
         .gap_2()
         .children(popup.diagnostics.iter().map(|d| diagnostic_row(d, ui)))
+        .children(actions)
         .when(
             !popup.diagnostics.is_empty() && !popup.blocks.is_empty(),
             |content| content.child(ui::divider(ui)),
@@ -583,6 +622,72 @@ fn render_popup(
         )
         .with_priority(1)
         .into_any_element(),
+    )
+}
+
+/// Under the problems: "Fix with Claude" (while Claude Code is on and the document is a file) and
+/// "More actions… ⌥↵" — the context actions at the problem (the caret goes there first).
+fn problem_actions(
+    editor: &Editor,
+    popup: &Popup,
+    cx: &mut Context<Editor>,
+) -> Option<AnyElement> {
+    let problems: Vec<&Diagnostic> = popup
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity != Severity::Hint)
+        .collect();
+    let first = problems.first()?;
+    let ui = Theme::ui(cx);
+    let link = |id: &'static str| {
+        div()
+            .id((id, popup.id))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .py_0p5()
+            .rounded(px(ui::RADIUS_SM))
+            .cursor_pointer()
+            .text_color(ui.accent_text)
+            .hover(move |style| style.bg(ui.hover))
+    };
+    let fix = (crate::claude_actions::offered(cx))
+        .then(|| editor.document.path().map(|path| path.to_path_buf()))
+        .flatten()
+        .map(|path| {
+            let action = crate::claude_actions::FixProblemsWithClaude {
+                path,
+                problems: problems
+                    .iter()
+                    .map(|d| crate::claude_actions::Problem::of(d, editor))
+                    .collect(),
+            };
+            link("hover-fix-with-claude")
+                .child(icon(IconName::Claude, ui.accent_text).size(px(13.)))
+                .child(tr("Fix with Claude"))
+                .on_click(move |_, window, cx| window.dispatch_action(Box::new(action.clone()), cx))
+        });
+    let start = first.range.start;
+    let more = link("hover-more-actions")
+        .child(tr("More actions…"))
+        .child(ui::keys("⌥↵", ui))
+        .on_click(cx.listener(move |editor, _, window, cx| {
+            editor.hover.popup = None;
+            editor.select_range(start..start, cx);
+            window.dispatch_action(Box::new(crate::code_actions::ShowContextActions), cx);
+        }));
+    Some(
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .ml(px(-4.))
+            .text_size(px(theme::TEXT_SM))
+            .children(fix)
+            .child(more)
+            .into_any_element(),
     )
 }
 

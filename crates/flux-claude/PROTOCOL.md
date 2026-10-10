@@ -389,6 +389,11 @@ Sequence observed:
 
 This is **the clean way to give Claude IDE tools** such as open-in-editor or diagnostics. Server-initiated messages travel host→CLI as `mcp_message` [T].
 
+**Flux's `flux` server** (part 9.2, `src/mcp.rs`, live on 2.1.285 with Haiku, 2026-10-09) [V]:
+- `initialize` with `sdkMcpServers:["flux"]` → `mcp_message` `initialize`, `notifications/initialized`, `tools/list` → `init.mcp_servers:[{name:"flux",status:"connected",source:"sdk"}]` and the tools as `mcp__flux__<name>`. The MCP `initialize` arrives **before** the reply to the host's `initialize`.
+- A PreToolUse hook with `matcher:"mcp__flux__.*"` (a regex) answering `permissionDecision:"allow"` → **no `can_use_tool`** for the tool: hook_callback → `tools/call` → the host's `content` is the tool_result. (Before the call Claude may first run its deferred-tool search to load the tool's schema.)
+- A PostToolUse hook on `Edit|MultiEdit|Write` (`timeout` in seconds in the hook entry; Flux registers 30) is called **after the edit is on disk and before the tool_result frame** — the CLI waits for the answer. `hookSpecificOutput.additionalContext` answered after 2 s reached the model (it quoted the text verbatim). Flux uses this to tell Claude the problems the language server finds in the edited file.
+
 **`elicitation`** [T]: request `{mcp_server_name, message, mode?:"form"|"url", url?, elicitation_id?, requested_schema?, title?, display_name?, description?}`; reply with an MCP ElicitResult, `{action:"accept"|"decline"|"cancel", content?}`. The SDK's default is `decline`.
 
 **`request_user_dialog`** [T]: request `{dialog_kind, payload, tool_use_id?}`, sent only for kinds declared in `initialize.supportedDialogKinds` (the only known kind is `refusal_fallback_prompt`); reply `{behavior:"completed", result}` or `{behavior:"cancelled"}`.
@@ -585,6 +590,16 @@ Without `--forward-subagent-text` (or `initialize.forwardSubagentText`), only th
 
 To rebuild the chat, follow `parentUuid` back from the leaf, skipping `isSidechain` and bookkeeping lines. The SDK's `listSessions`/`getSessionMessages` read these files directly; they are not control requests [T].
 
+**How Flux reads them** (`src/transcript.rs`, checked on 93 real transcripts of 2.1.x — key names and types only — and a synthetic one in `tests/fixtures/transcripts/`) [V]:
+- **The active branch.** The leaf is the last `user`/`assistant`/`system`/`attachment` line that is not a sidechain; walking `parentUuid` back reached the root in every file. Lines left out are abandoned branches (a rewind or an edited message). A `system/compact_boundary` has `parentUuid: null` and `logicalParentUuid` → the walk continues there, so the whole history shows, with a "compacted" notice; the summary message after it (`isCompactSummary`, `isVisibleInTranscriptOnly`) is skipped.
+- **Bookkeeping written after every turn**: `custom-title{customTitle}` (most sessions have it), `agent-name`, `mode`, `permission-mode`, `last-prompt{lastPrompt,leafUuid}`, `atis-latch`; rarer: `ai-title{aiTitle}`, `pr-link`, `cost-state`, `file-history-snapshot`/`-delta`, `relocated`, `worktree-state`, `continued-in`. Title = the last `custom-title`, else `ai-title`, else the old `summary` line, else the first prompt. Since titles repeat every turn, the history reads only the first 64 KB (first prompt, `gitBranch`) and the last 128 KB (titles, `last-prompt`) of a file: 13 sessions of up to 34 MB list in ~11 ms (release).
+- **`user` lines**: the typed prompt is a string (terminal) or `[{type:"text"}…]` (SDK, Flux); tool results carry `toolUseResult` (the stream's `tool_use_result`: an edit's `originalFile` and `structuredPatch`, a Write's `type:"create"`). Wrapped texts the CLI writes itself: `<command-name>/x</command-name><command-message>…<command-args>…` (a slash command), `<local-command-stdout>` (its output, with ANSI escapes), `<local-command-caveat>` (`isMeta`), `<bash-input>`/`<bash-stdout>`/`<bash-stderr>` (the terminal's `!` mode), `<task-notification>` (`promptSource:"system"`, a background task finished), `[Request interrupted by user…]`. `promptSource`: `typed`, `system`, `suggestion_accepted`, `queued`, `sdk`; `turnOrigin`: `human`, `task_notification`, `peer`, `sdk`, `scheduled`.
+- **A message typed while Claude works** reaches it mid-turn as an `attachment{type:"queued_command", commandMode:"prompt", prompt}` (`commandMode:"task-notification"` — a background task's).
+- **`assistant` lines**: one content block each. API errors: `isApiErrorMessage:true`, `error` (`server_error`, `authentication_failed`, `rate_limit`, `invalid_request`), `message.model:"<synthetic>"`, the text in a text block.
+- **`system` lines**: `turn_duration{durationMs,messageCount}` closes a turn of the terminal CLI (host-mode sessions have none: Flux takes the time between the prompt and the turn's last message), `stop_hook_summary`, `local_command{content}` (a command or its `<local-command-stdout>`), `informational{content,level}`, `model_refusal_fallback`/`_no_fallback{content}`, `away_summary`, `scheduled_task_fire`, `compact_boundary{compactMetadata{trigger,preTokens}}`.
+- **Subagents**: the Agent call's `toolUseResult.agentId` names `<session id>/subagents/agent-<agentId>.jsonl` (all lines `isSidechain:true`); Flux feeds them into the call as the stream does with `parent_tool_use_id`.
+- **Speed**: the largest real transcript (34 MB, 929 messages) reads in ~75 ms (release; ~290 ms debug).
+
 ---------------------------------------------------------------------------------------------------
 
 ## 12. Usage, cost, context, rate limits
@@ -712,5 +727,7 @@ To rebuild the chat, follow `parentUuid` back from the leaf, skipping `isSidecha
 | `n_resume_1_create`, `n_resume_2_resume` | Persisted session with `--session-id`, then `--resume` (nothing replayed) |
 | `o_queue` | Queued message, `priority:"now"`, `cancel_async_message`, `initialize.promptSuggestions` |
 | `p_hooks` / `q_sdk_mcp` / `r_web` | Callback hooks (a PreToolUse allow skips can_use_tool) / in-process MCP server over `mcp_message` / WebFetch and WebSearch |
+| `s_flux_tool` | **Synthetic** (not a recording): Claude calls `mcp__flux__get_diagnostics`; the fake CLI waits for the host's answer and puts it into the tool result |
+| `transcripts/<id>.jsonl` (+ `<id>/subagents/`) | **Synthetic** saved session for `transcript::load` and `list`: tools, an edit and a create, a command, a rewind, a subagent, a queued message, an interrupt, a compaction, an API error, titles |
 
 **Privacy.** The fixtures contain account data: the email and organization in initialize responses, the user's permission rules in `k_control`, local paths and usage numbers. Redact them before committing.

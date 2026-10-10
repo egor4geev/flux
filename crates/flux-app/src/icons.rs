@@ -57,6 +57,7 @@ icons! {
     ArrowRight => "arrow-right",
     ArrowUp => "arrow-up",
     Bell => "bell",
+    Bulb => "bulb",
     Branch => "branch",
     At => "at",
     Agent => "agent",

@@ -130,6 +130,22 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "How much of the 5-hour and the weekly limits is used.",
         "Сколько израсходовано из 5-часового и недельного лимитов.",
     ),
+    ("Reopen sessions with the project", "Открывать сессии вместе с проектом"),
+    (
+        "The sessions open when the project closed come back, their history read from Claude Code's transcripts.",
+        "Сессии, открытые при закрытии проекта, возвращаются, а их история читается из записей Claude Code.",
+    ),
+    ("Flux Tools for Claude", "Инструменты Flux для Claude"),
+    ("Give Claude the tools of Flux", "Дать Claude инструменты Flux"),
+    (
+        "Problems the language servers find, definitions, usages and symbols, the open files. Takes effect in new sessions.",
+        "Проблемы, найденные языковыми серверами, определения, использования и символы, открытые файлы. Действует в новых сессиях.",
+    ),
+    ("Tell Claude about new problems after its edits", "Сообщать Claude о новых проблемах после его правок"),
+    (
+        "After an edit, the errors the language server finds in the file go back to Claude, so it fixes them at once.",
+        "После правки ошибки, которые языковой сервер находит в файле, уходят Claude — и он сразу их исправляет.",
+    ),
     ("Additional Arguments", "Дополнительные аргументы"),
     (
         "Given to claude when a session starts, after the ones Flux uses: --add-dir, --mcp-config, --settings…",

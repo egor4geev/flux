@@ -2,8 +2,8 @@
 //!
 //! Three background threads per server: a writer (our messages go to stdin in call order, so a
 //! server that doesn't read never blocks the caller), a reader (responses resolve their futures,
-//! notifications become [`ServerEvent`]s, server requests are answered right there), and a stderr
-//! reader. The process belongs to the [`LanguageServer`] handles: when the last one is dropped it
+//! notifications become [`ServerEvent`]s, server requests are answered right there — except
+//! `workspace/applyEdit`, which the window answers through [`ApplyEdit`]), and a stderr reader. The process belongs to the [`LanguageServer`] handles: when the last one is dropped it
 //! is killed. Set `FLUX_LSP_LOG=1` to log the traffic and the server's stderr to our stderr.
 
 use std::collections::HashMap;
@@ -22,8 +22,9 @@ use futures::channel::oneshot;
 use lsp_types::notification::Notification;
 use lsp_types::request::Request;
 use lsp_types::{
-    InitializeResult, NumberOrString, ProgressParams, ProgressParamsValue,
-    PublishDiagnosticsParams, ServerCapabilities, ShowMessageParams, WorkDoneProgress,
+    ApplyWorkspaceEditParams, InitializeResult, NumberOrString, ProgressParams,
+    ProgressParamsValue, PublishDiagnosticsParams, ServerCapabilities, ShowMessageParams,
+    WorkDoneProgress,
 };
 use serde_json::{Value, json};
 
@@ -62,6 +63,70 @@ pub enum ServerEvent {
     Exited {
         reason: String,
     },
+    /// `workspace/applyEdit`: the server asks to apply an edit (mostly while it runs the command of
+    /// a code action). The answer goes back through [`ApplyEdit::respond`].
+    ApplyEdit(ApplyEdit),
+}
+
+/// The server's request to apply a workspace edit. Answer it once with [`ApplyEdit::respond`];
+/// dropped unanswered (every clone gone), it is answered "not applied", so the server never waits
+/// forever.
+#[derive(Clone)]
+pub struct ApplyEdit {
+    pub params: ApplyWorkspaceEditParams,
+    reply: Arc<Reply>,
+}
+
+impl fmt::Debug for ApplyEdit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApplyEdit")
+            .field("label", &self.params.label)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ApplyEdit {
+    /// `failure` — why it wasn't applied (shown by some servers).
+    pub fn respond(&self, applied: bool, failure: Option<String>) {
+        self.reply.send(applied, failure);
+    }
+}
+
+/// The answer of one `workspace/applyEdit`, written at most once.
+struct Reply {
+    id: Value,
+    name: String,
+    log: bool,
+    writer: Mutex<Option<Sender<Vec<u8>>>>,
+}
+
+impl Reply {
+    fn send(&self, applied: bool, failure: Option<String>) {
+        let Some(writer) = self
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let mut result = json!({ "applied": applied });
+        if let Some(reason) = failure {
+            result["failureReason"] = Value::String(reason);
+        }
+        let body = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": self.id, "result": result }))
+            .expect("JSON values serialize");
+        if self.log {
+            eprintln!("[lsp {}] --> {}", self.name, abbreviate(&body));
+        }
+        let _ = writer.send(transport::frame(&body));
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        self.send(false, Some("Flux did not apply the edit".to_string()));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -555,10 +620,20 @@ impl Shared {
             "client/registerCapability"
             | "client/unregisterCapability"
             | "window/workDoneProgress/create" => Ok(Value::Null),
-            "workspace/applyEdit" => Ok(json!({
-                "applied": false,
-                "failureReason": "Flux does not apply edits requested by the server",
-            })),
+            // The window applies it (open documents are its editors) and answers later.
+            "workspace/applyEdit" => match serde_json::from_value(params) {
+                Ok(params) => {
+                    let reply = Arc::new(Reply {
+                        id,
+                        name: self.name.clone(),
+                        log: self.log,
+                        writer: Mutex::new(Some(self.writer.clone())),
+                    });
+                    self.emit(ServerEvent::ApplyEdit(ApplyEdit { params, reply }));
+                    return;
+                }
+                Err(err) => Err(format!("invalid workspace/applyEdit: {err}")),
+            },
             "window/showMessageRequest" => {
                 if let Ok(ShowMessageParams { typ, message }) = serde_json::from_value(params) {
                     self.emit(ServerEvent::Message {
@@ -768,25 +843,31 @@ fn initialize_params(
     params
 }
 
-/// What flux-app can do with a server's answers. Positions are UTF-16 only; edits from the server
-/// are applied by us (no `workspace/applyEdit`), without file operations; file changes are watched
-/// by the servers themselves (no `didChangeWatchedFiles`).
+/// What flux-app can do with a server's answers. Positions are UTF-16 only; the window applies
+/// workspace edits — ours and the server's own (`workspace/applyEdit`, after a code action's
+/// command), with file operations; file changes are watched by the servers themselves (no
+/// `didChangeWatchedFiles` registration).
 fn client_capabilities() -> Value {
     json!({
         "general": {
             "positionEncodings": ["utf-16"],
         },
         "workspace": {
-            "applyEdit": false,
+            "applyEdit": true,
             "configuration": true,
             "workspaceFolders": true,
             "workspaceEdit": {
                 "documentChanges": true,
-                "resourceOperations": [],
+                "resourceOperations": ["create", "rename", "delete"],
                 "failureHandling": "abort",
             },
             "didChangeConfiguration": { "dynamicRegistration": false },
             "didChangeWatchedFiles": { "dynamicRegistration": false },
+            "executeCommand": { "dynamicRegistration": false },
+            "symbol": {
+                "dynamicRegistration": false,
+                "symbolKind": { "valueSet": (1..=26).collect::<Vec<u32>>() },
+            },
         },
         "textDocument": {
             "synchronization": {
@@ -800,7 +881,8 @@ fn client_capabilities() -> Value {
                 "versionSupport": true,
                 "tagSupport": { "valueSet": [1, 2] },
                 "codeDescriptionSupport": true,
-                "dataSupport": false,
+                // Fixes ride in `data` (ruff): it goes back in a code action's context.
+                "dataSupport": true,
             },
             "completion": {
                 "dynamicRegistration": false,
@@ -848,6 +930,25 @@ fn client_capabilities() -> Value {
                 "dynamicRegistration": false,
                 "prepareSupport": true,
                 "prepareSupportDefaultBehavior": 1,
+                "honorsChangeAnnotations": false,
+            },
+            // ⌥↵: quick fixes, refactorings, source actions; the edit may come with
+            // `codeAction/resolve`.
+            "codeAction": {
+                "dynamicRegistration": false,
+                "codeActionLiteralSupport": {
+                    "codeActionKind": {
+                        "valueSet": [
+                            "", "quickfix", "refactor", "refactor.extract", "refactor.inline",
+                            "refactor.rewrite", "source", "source.organizeImports",
+                            "source.fixAll",
+                        ],
+                    },
+                },
+                "isPreferredSupport": true,
+                "disabledSupport": true,
+                "dataSupport": true,
+                "resolveSupport": { "properties": ["edit"] },
                 "honorsChangeAnnotations": false,
             },
         },

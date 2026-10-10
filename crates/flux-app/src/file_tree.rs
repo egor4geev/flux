@@ -219,8 +219,8 @@ struct Menu {
 
 /// The row being dragged; it also serves as the label next to the cursor (icon and name).
 #[derive(Debug, Clone)]
-struct DraggedEntry {
-    path: PathBuf,
+pub(crate) struct DraggedEntry {
+    pub(crate) path: PathBuf,
     name: SharedString,
     is_dir: bool,
 }
@@ -1116,7 +1116,15 @@ impl FileTreePanel {
                     .separator(),
                 None => menu,
             };
-            menu.entry(tr("Reveal in Finder"), RevealInFinder)
+            let menu = menu.entry(tr("Reveal in Finder"), RevealInFinder);
+            // Claude: the file or the folder as a mention in the current chat's message.
+            match path.filter(|_| crate::claude_actions::offered(cx)) {
+                Some(path) => menu.separator().entry(
+                    tr("Send to Claude"),
+                    crate::claude_actions::SendPathsToClaude(vec![path]),
+                ),
+                None => menu,
+            }
         });
         let focus = menu.focus_handle(cx);
         let subscriptions = [

@@ -6,6 +6,9 @@
 //! A session's pill can be dragged to the editor's tabs (its chat moves there) and an editor tab
 //! of a chat back onto the pills. Keys (context "ClaudePanel"): Esc returns to the editor when the
 //! message field doesn't take it, ⇧Esc hides the window.
+//!
+//! Part 9.2: the History button (and "Resume Session…" in ⋯) opens the project's saved sessions
+//! ([`crate::claude_history`]); without sessions the window lists the recent ones.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -14,13 +17,14 @@ use gpui::{
     Action, Animation, AnimationExt, AnyElement, App, ClickEvent, Context, CursorStyle,
     DismissEvent, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     FontWeight, KeyBinding, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollHandle, SharedString, Subscription, Window, div, prelude::*, px,
+    ScrollHandle, SharedString, Subscription, Task, Window, div, point, prelude::*, px,
 };
 
-use flux_claude::Status;
+use flux_claude::{SavedSession, Status};
 
 use crate::claude::{self, ClaudeStore, ClaudeStoreEvent, CliState};
 use crate::claude_chat::ClaudeChat;
+use crate::claude_history;
 use crate::context_menu::ContextMenu;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
@@ -66,6 +70,9 @@ pub enum ClaudePanelEvent {
     },
     /// × on a pill, its middle click: the window ends the session (asking first if it works).
     CloseChat(Entity<ClaudeChat>),
+    /// The History button, "Show All…" of the recent sessions: the history popup at this window
+    /// point.
+    ShowHistory(Point<Pixels>),
 }
 
 /// A session's pill or editor tab being dragged: also the label next to the pointer.
@@ -132,6 +139,10 @@ pub struct ClaudePanel {
     unseen: HashSet<EntityId>,
     menu: Option<Menu>,
     resizing: bool,
+    /// The project's recent saved sessions, listed while the window has none open; `None` — not
+    /// read yet.
+    recent: Option<Vec<SavedSession>>,
+    _recent: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -144,7 +155,15 @@ impl ClaudePanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subscriptions = vec![cx.subscribe(&store, |_, _, _: &ClaudeStoreEvent, cx| cx.notify())];
+        let subscriptions = vec![cx.subscribe(&store, |this, _, event: &ClaudeStoreEvent, cx| {
+            // Ready now, or the last session closed: the recent ones are read again.
+            if matches!(event, ClaudeStoreEvent::Changed | ClaudeStoreEvent::SessionRemoved(_))
+                && this.chats.is_empty()
+            {
+                this.refresh_recent(cx);
+            }
+            cx.notify()
+        })];
         Self {
             store,
             chats: Vec::new(),
@@ -157,11 +176,44 @@ impl ClaudePanel {
             unseen: HashSet::new(),
             menu: None,
             resizing: false,
+            recent: None,
+            _recent: None,
             _subscriptions: subscriptions,
         }
     }
 
+    /// Reads the project's recent sessions again for the empty window (in the background).
+    fn refresh_recent(&mut self, cx: &mut Context<Self>) {
+        if !self.store.read(cx).is_ready() || self._recent.is_some() {
+            return;
+        }
+        let history = self.store.update(cx, |store, cx| store.history(cx));
+        self._recent = Some(cx.spawn(async move |this, cx| {
+            let sessions = history.await;
+            this.update(cx, |this, cx| {
+                this.recent = Some(sessions);
+                this._recent = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// A session open when the project last closed, back on its pill without coming into sight:
+    /// `active` — the pill that was active.
+    pub fn restore_chat(&mut self, chat: Entity<ClaudeChat>, active: bool, cx: &mut Context<Self>) {
+        self.chats.push(chat);
+        if active {
+            self.active = self.chats.len() - 1;
+            self.tab_scroll.scroll_to_item(self.active);
+        }
+        cx.notify();
+    }
+
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if visible && !self.visible && self.chats.is_empty() {
+            self.refresh_recent(cx);
+        }
         self.visible = visible;
         if visible && let Some(chat) = self.chats.get(self.active) {
             self.unseen.remove(&chat.entity_id());
@@ -299,7 +351,8 @@ impl ClaudePanel {
         let ready = self.store.read(cx).is_ready();
         let menu = cx.new(|cx| {
             let mut menu = ContextMenu::new(window, cx)
-                .entry_if(ready, tr("New Session"), claude::NewSession);
+                .entry_if(ready, tr("New Session"), claude::NewSession)
+                .entry_if(ready, tr("Resume Session…"), claude::ResumeSession);
             if has_chat {
                 menu = menu
                     .separator()
@@ -507,6 +560,19 @@ impl ClaudePanel {
             .on_drag_move(cx.listener(
                 |this, event: &DragMoveEvent<DraggedClaudeChat>, _, cx| this.drag_over_tail(event, cx),
             ));
+        // The project's saved sessions, in a popup under the button (as Chat History of JetBrains
+        // AI Assistant).
+        let history = ready.then(|| {
+            ui::icon_button("claude-history", IconName::History, ui)
+                .tooltip(ui::tooltip(tr("Session History"), None))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(ClaudePanelEvent::ShowHistory(under(event.position)))
+                    }),
+                )
+        });
         // The menu opens at the button, as the filter of Notifications.
         let more = ui::icon_button("claude-more", IconName::More, ui)
             .tooltip(ui::tooltip(tr("More"), None))
@@ -546,6 +612,7 @@ impl ClaudePanel {
             .children(sessions)
             .children(new_session)
             .child(tail)
+            .children(history)
             .child(more)
             .child(hide)
     }
@@ -695,6 +762,7 @@ impl ClaudePanel {
     /// The window's content without a chat: what `claude` needs, or how to start.
     fn render_onboarding(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
+        let recent = self.render_recent(cx);
         let store = self.store.read(cx);
         let project = store
             .root()
@@ -856,6 +924,7 @@ impl ClaudePanel {
                         true,
                         Box::new(claude::NewSession),
                     ))
+                    .children(recent)
                     .child(
                         div()
                             .mt_2()
@@ -892,6 +961,87 @@ impl ClaudePanel {
             .child(content)
             .into_any_element()
     }
+}
+
+impl ClaudePanel {
+    /// The project's recent sessions in the empty window: a click resumes one; "Show All…" opens
+    /// the history.
+    fn render_recent(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ui = Theme::ui(cx);
+        let recent = self.recent.as_ref().filter(|recent| !recent.is_empty())?;
+        let now = claude_history::now_seconds();
+        let rows = recent
+            .iter()
+            .take(claude_history::RECENT_COUNT)
+            .enumerate()
+            .map(|(index, saved)| {
+                let store = self.store.clone();
+                let chosen = saved.clone();
+                div()
+                    .id(("claude-recent", index))
+                    .w_full()
+                    .h(px(28.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(RADIUS_SM))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(ui.hover))
+                    .on_click(move |_, window, cx| {
+                        claude_history::resume(&store, &chosen, window, cx)
+                    })
+                    .child(icon(IconName::Claude, ui.dim).size(px(13.)).flex_none())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_left()
+                            .text_color(ui.foreground)
+                            .child(saved.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(theme::TEXT_XS))
+                            .text_color(ui.dim)
+                            .child(claude_history::when(now, claude_history::seconds(saved.modified))),
+                    )
+            });
+        let show_all = ui::text_button("claude-recent-all", tr("Show All…"), false, ui).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                cx.emit(ClaudePanelEvent::ShowHistory(under(event.position)))
+            }),
+        );
+        Some(
+            div()
+                .w_full()
+                .mt_3()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .px_2()
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .child(ui::section_label(tr("Recent Sessions"), ui))
+                        .child(div().flex_1())
+                        .child(show_all),
+                )
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+}
+
+/// Where a popup opened from a header button goes: under the button, from the click.
+fn under(position: Point<Pixels>) -> Point<Pixels> {
+    point(position.x - px(16.), position.y + px(16.))
 }
 
 /// An install option: its name, the command (code font), and "Type in Terminal".

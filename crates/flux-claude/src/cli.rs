@@ -3,8 +3,11 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -92,6 +95,55 @@ impl Cli {
         (self.path.clone(), vec!["auth".into(), "login".into()])
     }
 
+    /// One question without a session (part 9.2: a commit message): `claude -p` in `cwd` with no
+    /// tools and no MCP servers, nothing saved to the history; the prompt goes through stdin.
+    /// Blocks — run it on a background thread. `model` — an alias ("haiku") or an id; `None` — the
+    /// account's default. The answer's text, or why there is none.
+    pub fn ask(&self, cwd: &Path, prompt: &str, model: Option<&str>) -> Result<String, String> {
+        let mut child = self
+            .command()
+            .args(ask_args(model))
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("{}: {err}", self.path.display()))?;
+        // A long prompt (a diff) is written while the CLI reads; its output is read meanwhile.
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let prompt = prompt.to_string();
+        let writer = thread::spawn(move || stdin.write_all(prompt.as_bytes()));
+        let read = |mut pipe: Box<dyn Read + Send>| {
+            thread::spawn(move || {
+                let mut text = String::new();
+                pipe.read_to_string(&mut text).ok();
+                text
+            })
+        };
+        let stdout = read(Box::new(child.stdout.take().expect("stdout is piped")));
+        let stderr = read(Box::new(child.stderr.take().expect("stderr is piped")));
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() > ASK_TIMEOUT => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    return Err(format!(
+                        "Claude didn't answer in {} s.",
+                        ASK_TIMEOUT.as_secs()
+                    ));
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(err) => return Err(err.to_string()),
+            }
+        };
+        writer.join().ok();
+        let stdout = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
+        ask_answer(&stdout, &stderr, status.code())
+    }
+
     /// A command for this executable with the environment a session needs.
     pub fn command(&self) -> Command {
         let mut command = Command::new(&self.path);
@@ -103,6 +155,67 @@ impl Cli {
             .env_remove("NODE_OPTIONS")
             .env_remove("DEBUG");
         command
+    }
+}
+
+/// How long [`Cli::ask`] waits for the answer.
+const ASK_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The arguments of [`Cli::ask`]: print mode with the result as JSON, no tools, no MCP servers
+/// of the user's configuration, no transcript.
+fn ask_args(model: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-p",
+        "--output-format",
+        "json",
+        "--no-session-persistence",
+        "--tools=",
+        "--strict-mcp-config",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    if let Some(model) = model {
+        args.push(format!("--model={model}"));
+    }
+    args
+}
+
+/// The answer in the CLI's JSON result (`{"type":"result","is_error":false,"result":"…"}`), or
+/// the error it reports, or the last line of its stderr.
+fn ask_answer(stdout: &str, stderr: &str, code: Option<i32>) -> Result<String, String> {
+    let result = stdout
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .find(|value| value["type"] == "result");
+    match result {
+        Some(result) if result["is_error"] != true => match result["result"].as_str() {
+            Some(text) if !text.trim().is_empty() => Ok(text.trim().to_string()),
+            _ => Err("Claude gave an empty answer.".to_string()),
+        },
+        Some(result) => Err(result["result"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| text.trim().to_string())
+            .or_else(|| {
+                result["errors"]
+                    .as_array()
+                    .and_then(|errors| errors.first())
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "Claude couldn't answer.".to_string())),
+        None => Err(stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| match code {
+                Some(code) => format!("claude exited with code {code}."),
+                None => "claude was stopped.".to_string(),
+            })),
     }
 }
 
@@ -260,6 +373,39 @@ mod tests {
         assert!(joined.contains("--permission-mode acceptEdits"));
         assert!(joined.contains("--effort high"));
         assert!(joined.contains("--resume abc"));
+    }
+
+    #[test]
+    fn questions_without_a_session() {
+        assert_eq!(
+            ask_args(Some("haiku")),
+            [
+                "-p",
+                "--output-format",
+                "json",
+                "--no-session-persistence",
+                "--tools=",
+                "--strict-mcp-config",
+                "--model=haiku",
+            ]
+        );
+        assert!(!ask_args(None).iter().any(|arg| arg.starts_with("--model")));
+
+        let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"  Fix the parser\n"}"#;
+        assert_eq!(ask_answer(ok, "", Some(0)), Ok("Fix the parser".to_string()));
+        let failed = r#"{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}"#;
+        assert_eq!(
+            ask_answer(failed, "", Some(1)),
+            Err("Not logged in · Please run /login".to_string())
+        );
+        assert_eq!(
+            ask_answer("", "warming up\nerror: unknown option '--tools='\n", Some(1)),
+            Err("error: unknown option '--tools='".to_string())
+        );
+        assert_eq!(
+            ask_answer("", "", Some(2)),
+            Err("claude exited with code 2.".to_string())
+        );
     }
 
     #[test]

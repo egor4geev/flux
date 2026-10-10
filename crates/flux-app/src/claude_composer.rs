@@ -345,6 +345,16 @@ enum Item {
     },
 }
 
+/// Flux's own slash command: the history popup instead of the CLI's terminal-only `/resume`.
+const RESUME: &str = "resume";
+
+/// The message is `/resume` (with or without words after it).
+fn is_resume(body: &str) -> bool {
+    body.strip_prefix('/')
+        .and_then(|rest| rest.strip_prefix(RESUME))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
 impl Item {
     /// What the token becomes.
     fn replacement(&self) -> String {
@@ -541,11 +551,21 @@ impl Composer {
         cx.notify();
     }
 
-    /// Files dropped on the field: pictures are attached, other files mentioned.
-    fn drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+    /// Files dropped on the field (or elsewhere on the chat): pictures are attached, other files and
+    /// folders mentioned.
+    pub(crate) fn drop_paths(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let root = self.session.read(cx).model().info.cwd.clone();
         let mut mentions = Vec::new();
         for path in paths.paths() {
+            if path.is_dir() {
+                mentions.push(crate::claude_actions::path_mention(path, Some(&root)));
+                continue;
+            }
             match image_format(path) {
                 Some(format) => match std::fs::read(path) {
                     Ok(bytes) => self.attach(Image::from_bytes(format, bytes), cx),
@@ -573,6 +593,13 @@ impl Composer {
         let text = self.input.read(cx).text();
         let body = text.trim();
         if body.is_empty() && self.images.is_empty() {
+            return;
+        }
+        // `/resume` is Flux's: the project's saved sessions in the history popup.
+        if is_resume(body) {
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+            self.close_suggestions(cx);
+            window.dispatch_action(Box::new(crate::claude::ResumeSession), cx);
             return;
         }
         // A slash command must stay first: no mention in front of it.
@@ -743,13 +770,20 @@ impl Composer {
             }
             Token::Command { query, .. } => {
                 let model = self.session.read(cx).model();
-                let commands: Vec<&SlashCommand> = model
-                    .commands
-                    .iter()
-                    .filter(|command| {
+                // Flux's `/resume` (the history popup) first, then the CLI's commands.
+                let resume = SlashCommand {
+                    name: RESUME.to_string(),
+                    description: tr("Resume a session of this project").to_string(),
+                    argument_hint: None,
+                    aliases: Vec::new(),
+                    builtin: true,
+                };
+                let commands: Vec<&SlashCommand> = std::iter::once(&resume)
+                    .chain(model.commands.iter().filter(|command| {
                         !command.name.starts_with("__")
+                            && command.name != RESUME
                             && !model.info.terminal_commands.contains(&command.name)
-                    })
+                    }))
                     .collect();
                 let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
                 match_list(query, &names)
@@ -1579,6 +1613,15 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_is_flux_s_own_command() {
+        assert!(is_resume("/resume"));
+        assert!(is_resume("/resume  fix login"));
+        assert!(!is_resume("/resumes"));
+        assert!(!is_resume("resume"));
+        assert!(!is_resume("/compact"));
+    }
 
     #[test]
     fn mentions_and_commands_are_found_at_the_caret() {

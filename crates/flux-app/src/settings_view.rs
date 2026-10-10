@@ -1299,6 +1299,31 @@ impl SettingsView {
                 current.show_limits,
                 |claude, on| claude.show_limits = on,
                 cx,
+            ))
+            .child(switch_row(
+                "claude-restore-sessions",
+                tr("Reopen sessions with the project"),
+                tr("The sessions open when the project closed come back, their history read from Claude Code's transcripts."),
+                current.restore_sessions,
+                |claude, on| claude.restore_sessions = on,
+                cx,
+            ));
+        let tools_card = card(tr("Flux Tools for Claude"))
+            .child(switch_row(
+                "claude-flux-tools",
+                tr("Give Claude the tools of Flux"),
+                tr("Problems the language servers find, definitions, usages and symbols, the open files. Takes effect in new sessions."),
+                current.flux_tools,
+                |claude, on| claude.flux_tools = on,
+                cx,
+            ))
+            .child(switch_row(
+                "claude-report-problems",
+                tr("Tell Claude about new problems after its edits"),
+                tr("After an edit, the errors the language server finds in the file go back to Claude, so it fixes them at once."),
+                current.report_problems,
+                |claude, on| claude.report_problems = on,
+                cx,
             ));
         let args_card = card(tr("Additional Arguments")).child(
             div()
@@ -1353,6 +1378,7 @@ impl SettingsView {
                     .child(cli_card)
                     .child(defaults_card)
                     .child(chat_card)
+                    .child(tools_card)
                     .child(args_card),
             )
     }

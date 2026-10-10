@@ -39,6 +39,11 @@ mod claude;
 mod claude_transcript;
 mod claude_composer;
 mod claude_cards;
+mod claude_session;
+mod claude_history;
+mod claude_changes;
+mod claude_actions;
+mod code_actions;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
 pub(super) const STRINGS: &[&[(&str, &str)]] = &[
@@ -81,6 +86,11 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     claude_transcript::STRINGS,
     claude_composer::STRINGS,
     claude_cards::STRINGS,
+    claude_session::STRINGS,
+    claude_history::STRINGS,
+    claude_changes::STRINGS,
+    claude_actions::STRINGS,
+    code_actions::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -103,4 +113,9 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     claude_transcript::PLURALS,
     claude_composer::PLURALS,
     claude_cards::PLURALS,
+    claude_session::PLURALS,
+    claude_history::PLURALS,
+    claude_changes::PLURALS,
+    claude_actions::PLURALS,
+    code_actions::PLURALS,
 ];

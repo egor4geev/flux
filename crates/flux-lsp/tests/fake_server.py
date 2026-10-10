@@ -97,6 +97,8 @@ while True:
         send({"id": id, "error": {"code": -32801, "message": "content modified"}})
     elif method == "$/cancelRequest":
         send({"id": message["params"]["id"], "error": {"code": -32800, "message": "cancelled"}})
+    elif method == "flux/askApply":
+        send({"id": 103, "method": "workspace/applyEdit", "params": {"label": "dropped", "edit": {}}})
     elif method == "flux/crash":
         sys.stderr.write("fatal: boom\n")
         sys.stderr.flush()

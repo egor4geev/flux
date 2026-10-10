@@ -18,6 +18,13 @@
 //! - "Merge Conflicts" first in a repository with conflicted files: no checkboxes (they can't be
 //!   committed until resolved), "Resolve" opens the Conflicts dialog, ↵ the merge tool; a banner
 //!   says what operation is in progress (merging, rebasing 2/5…) with Continue / Skip / Abort.
+//! - "Claude · <session>" changelists (part 9.2, as the changelists of JetBrains IDEs): the files
+//!   a Claude session changed leave "Changes" for its group while they have uncommitted changes (a
+//!   file two sessions changed belongs to the later one). Their checkboxes commit Claude's work as
+//!   any others; ↵ shows the file against its text before Claude, ⌥⌘Z rolls it back to that text;
+//!   a commit, a rollback or "Move to Changes" takes the file out of the session's list.
+//! - "Generate Commit Message with Claude" (as JetBrains AI Assistant's): the checked changes and
+//!   the recent commit subjects go to `claude -p` (Haiku), the answer into the field.
 //!
 //! A commit first saves the open documents it takes, then commits each repository: a file checked
 //! partly goes in as its HEAD version with only the checked changes applied (`flux_git::apply_hunks`).
@@ -27,9 +34,11 @@
 //! edit each, saved).
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use flux_core::Rope;
 use flux_git::{
@@ -37,13 +46,14 @@ use flux_git::{
     Operation, RepoState,
 };
 use gpui::{
-    Action, AnyElement, App, AsyncApp, ClickEvent, ClipboardItem, Context, CursorStyle,
-    DismissEvent, Div, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyBinding, MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString,
-    Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
-    uniform_list,
+    Action, Animation, AnimationExt, AnyElement, App, AsyncApp, ClickEvent, ClipboardItem,
+    Context, CursorStyle, DismissEvent, Div, DragMoveEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, Pixels, Point,
+    Render, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window,
+    actions, div, prelude::*, px, uniform_list,
 };
 
+use crate::claude::{self, ClaudeStore, ClaudeStoreEvent};
 use crate::context_menu::ContextMenu;
 use crate::dialog::Dialog;
 use crate::editor::{self, Editor};
@@ -79,6 +89,15 @@ const HISTORY_ITEM_CHARS: usize = 60;
 /// How many file names a rollback question lists before "and N more".
 const LISTED_FILES: usize = 8;
 const ROW_GROUP: &str = "commit-row";
+/// What the commit message's request shows Claude: the diff up to this size, then only the names
+/// of the rest.
+const MESSAGE_DIFF_LIMIT: usize = 40_000;
+/// How many recent subjects show Claude the project's style.
+const MESSAGE_EXAMPLES: usize = 10;
+/// Lines of context around a change in the diff Claude reads (as `git diff`).
+const DIFF_CONTEXT: u32 = 3;
+/// The model that writes commit messages: quick and cheap.
+const MESSAGE_MODEL: &str = "haiku";
 
 // The list of changes (context "CommitChanges"): the message field is outside it, so Space and the
 // arrows keep typing there.
@@ -113,6 +132,21 @@ actions!(
         AcceptTheirs,
         /// The selected files into a stash (the Stash Changes dialog for them).
         StashSelectedFiles,
+        /// A file of a Claude changelist: its diff against HEAD (↵ shows it against its text
+        /// before Claude).
+        ShowDiffWithHead,
+        /// The selected files of a Claude changelist go back to "Changes" (the session forgets
+        /// them).
+        MoveToChanges,
+    ]
+);
+
+// The message field's tools (context "CommitPanel").
+actions!(
+    commit_panel,
+    [
+        /// Claude writes the commit message for the checked changes (a second time: stops it).
+        GenerateCommitMessage,
     ]
 );
 
@@ -170,24 +204,27 @@ pub enum CommitPanelEvent {
     /// Files are gone from disk (deleted, or added ones rolled back with their copies): their
     /// unmodified tabs close.
     Removed(Vec<PathBuf>),
+    /// A file of a Claude changelist against its text before Claude (`None` — Claude created it).
+    OpenClaudeDiff {
+        path: PathBuf,
+        repo: usize,
+        original: Option<Arc<str>>,
+    },
 }
 
-/// The groups of a repository's changes, in this order.
+/// The groups of a repository's changes, in this order (the Claude changelists after the
+/// conflicts, in the order of the sessions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum GroupKind {
     /// Conflicted files of a merge, rebase, cherry-pick or unstash.
     Conflicts,
+    /// The files a Claude session changed (part 9.2).
+    Claude(EntityId),
     Changes,
     Unversioned,
 }
 
 impl GroupKind {
-    const ALL: [GroupKind; 3] = [
-        GroupKind::Conflicts,
-        GroupKind::Changes,
-        GroupKind::Unversioned,
-    ];
-
     fn of(status: FileStatus) -> Self {
         match status {
             FileStatus::Conflicted => GroupKind::Conflicts,
@@ -199,9 +236,99 @@ impl GroupKind {
     fn label(self) -> &'static str {
         match self {
             GroupKind::Conflicts => tr("Merge Conflicts"),
+            GroupKind::Claude(_) => "Claude",
             GroupKind::Changes => tr("Changes"),
             GroupKind::Unversioned => tr("Unversioned Files"),
         }
+    }
+}
+
+// --- Claude's changelists (part 9.2) ---
+
+/// A file a Claude session changed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ClaudeFile {
+    /// As the session knows it (Claude's path).
+    pub path: PathBuf,
+    /// Canonical, as git's paths are: the key against the changes.
+    pub key: PathBuf,
+    pub changed_at: SystemTime,
+}
+
+/// A Claude session with the files it changed: one changelist.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ClaudeList {
+    pub session: EntityId,
+    pub title: String,
+    pub files: Vec<ClaudeFile>,
+}
+
+/// The Claude changelists as the tree uses them: the sessions in order and the session that owns
+/// each file — the one that changed it last.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ClaudeGroups {
+    pub sessions: Vec<(EntityId, String)>,
+    /// A file (canonical, and as Claude wrote it) → its session.
+    owners: HashMap<PathBuf, (EntityId, SystemTime)>,
+}
+
+impl ClaudeGroups {
+    pub fn build(lists: &[ClaudeList]) -> Self {
+        let mut owners: HashMap<PathBuf, (EntityId, SystemTime)> = HashMap::new();
+        for list in lists {
+            for file in &list.files {
+                for path in [&file.key, &file.path] {
+                    let later = owners
+                        .get(path)
+                        .is_none_or(|(_, changed_at)| file.changed_at >= *changed_at);
+                    if later {
+                        owners.insert(path.clone(), (list.session, file.changed_at));
+                    }
+                }
+            }
+        }
+        ClaudeGroups {
+            sessions: lists
+                .iter()
+                .map(|list| (list.session, list.title.clone()))
+                .collect(),
+            owners,
+        }
+    }
+
+    /// The session whose changelist has the change; a conflicted file stays with the conflicts.
+    pub fn owner(&self, change: &Change) -> Option<EntityId> {
+        if change.status == FileStatus::Conflicted {
+            return None;
+        }
+        self.owners.get(&change.path).map(|(session, _)| *session)
+    }
+
+    pub fn title(&self, session: EntityId) -> Option<&str> {
+        self.sessions
+            .iter()
+            .find(|(id, _)| *id == session)
+            .map(|(_, title)| title.as_str())
+    }
+
+    /// The group of a change.
+    fn group_of(&self, change: &Change) -> GroupKind {
+        match self.owner(change) {
+            Some(session) => GroupKind::Claude(session),
+            None => GroupKind::of(change.status),
+        }
+    }
+
+    /// Every group, in order: the conflicts, the sessions' changelists, the rest.
+    fn order(&self) -> Vec<GroupKind> {
+        let mut groups = vec![GroupKind::Conflicts];
+        groups.extend(
+            self.sessions
+                .iter()
+                .map(|(session, _)| GroupKind::Claude(*session)),
+        );
+        groups.extend([GroupKind::Changes, GroupKind::Unversioned]);
+        groups
     }
 }
 
@@ -271,13 +398,15 @@ pub(crate) struct RepoLabel {
 }
 
 /// The visible rows: per repository (a node of its own when there are several) the groups
-/// "Changes" and "Unversioned Files", then directories (joined through single-child chains) and
-/// files in natural order — or files by path, flat. Collapsed nodes hide what is inside.
+/// "Changes" and "Unversioned Files" (the conflicts and the Claude changelists before them), then
+/// directories (joined through single-child chains) and files in natural order — or files by path,
+/// flat. Collapsed nodes hide what is inside.
 pub(crate) fn build_rows(
     changes: &[Change],
     repos: &[RepoLabel],
     by_directory: bool,
     collapsed: &HashSet<RowKey>,
+    claude: &ClaudeGroups,
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     let several = repos.len() > 1;
@@ -307,11 +436,11 @@ pub(crate) fn build_rows(
             }
             depth = 1;
         }
-        for group in GroupKind::ALL {
+        for group in claude.order() {
             let files: Vec<usize> = in_repo
                 .iter()
                 .copied()
-                .filter(|&index| GroupKind::of(changes[index].status) == group)
+                .filter(|&index| claude.group_of(&changes[index]) == group)
                 .collect();
             if files.is_empty() {
                 continue;
@@ -564,6 +693,15 @@ pub struct CommitPanel {
     menu: Option<Menu>,
     /// Recent messages, for the history menu ([`UseMessage`] picks by index).
     history: Vec<String>,
+    /// Claude Code of the window: its sessions' changelists, the commit message it writes.
+    claude: Entity<ClaudeStore>,
+    claude_lists: Vec<ClaudeList>,
+    claude_groups: ClaudeGroups,
+    /// Sessions without a process (resumed, stopped) whose files were checked against git once:
+    /// those committed meanwhile left their changelist.
+    claude_checked: HashSet<EntityId>,
+    /// Claude writes the commit message.
+    generating: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -572,6 +710,7 @@ impl EventEmitter<CommitPanelEvent> for CommitPanel {}
 impl CommitPanel {
     pub fn new(
         git: Entity<GitStore>,
+        claude: Entity<ClaudeStore>,
         width: ui::LeftIslandWidth,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -580,6 +719,14 @@ impl CommitPanel {
         let stash = cx.new(|cx| StashPanel::new(git.clone(), window, cx));
         let subscriptions = vec![
             cx.observe(&git, |this, _, cx| this.rebuild(cx)),
+            // Not every event: a streaming answer notifies the store with each token.
+            cx.subscribe(&claude, |this, _, event: &ClaudeStoreEvent, cx| match event {
+                ClaudeStoreEvent::SessionAdded(_)
+                | ClaudeStoreEvent::SessionRemoved(_)
+                | ClaudeStoreEvent::FilesChanged(_)
+                | ClaudeStoreEvent::Changed => this.claude_changed(cx),
+                _ => {}
+            }),
             // The stash tab's toolbar follows its selection.
             cx.observe(&stash, |_, _, cx| cx.notify()),
             cx.subscribe(&stash, |_, _, event: &StashPanelEvent, cx| match event {
@@ -606,8 +753,15 @@ impl CommitPanel {
             resizing: false,
             menu: None,
             history: Vec::new(),
+            claude,
+            claude_lists: Vec::new(),
+            claude_groups: ClaudeGroups::default(),
+            claude_checked: HashSet::new(),
+            generating: None,
             _subscriptions: subscriptions,
         };
+        panel.claude_lists = panel.read_claude_lists(cx);
+        panel.claude_groups = ClaudeGroups::build(&panel.claude_lists);
         panel.rebuild(cx);
         panel
     }
@@ -693,8 +847,10 @@ impl CommitPanel {
             &repos,
             self.group_by_directory,
             &self.collapsed,
+            &self.claude_groups,
         );
         self.follow_merge(cx);
+        self.check_stopped_sessions(cx);
         // A selected file hidden in a collapsed node: the node is selected; one that went away
         // (committed, rolled back): nothing is.
         if self.selected_index().is_none() {
@@ -714,6 +870,153 @@ impl CommitPanel {
             };
         }
         cx.notify();
+    }
+
+    // --- Claude's changelists ---
+
+    /// The files each session of the window changed (none while Claude Code is off).
+    fn read_claude_lists(&self, cx: &App) -> Vec<ClaudeList> {
+        if !claude::enabled(cx) {
+            return Vec::new();
+        }
+        self.claude
+            .read(cx)
+            .sessions()
+            .iter()
+            .filter_map(|session| {
+                let model = session.read(cx);
+                let files: Vec<ClaudeFile> = model
+                    .model()
+                    .changed_files
+                    .iter()
+                    .map(|file| ClaudeFile {
+                        path: file.path.clone(),
+                        key: crate::navigation::canonical(&file.path),
+                        changed_at: file.changed_at,
+                    })
+                    .collect();
+                (!files.is_empty()).then(|| ClaudeList {
+                    session: session.entity_id(),
+                    title: model.title().to_string(),
+                    files,
+                })
+            })
+            .collect()
+    }
+
+    /// A session came or went, changed files or its title: the tree follows when the changelists
+    /// differ.
+    fn claude_changed(&mut self, cx: &mut Context<Self>) {
+        let lists = self.read_claude_lists(cx);
+        let alive: HashSet<EntityId> = self
+            .claude
+            .read(cx)
+            .sessions()
+            .iter()
+            .map(|session| session.entity_id())
+            .collect();
+        self.claude_checked.retain(|session| alive.contains(session));
+        if lists != self.claude_lists {
+            self.claude_lists = lists;
+            self.claude_groups = ClaudeGroups::build(&self.claude_lists);
+            self.rebuild(cx);
+        } else {
+            // The generate button follows `claude`'s state.
+            cx.notify();
+        }
+    }
+
+    /// A session that came without a process (resumed after a restart) may list files committed
+    /// since Claude changed them: once git's status is in, those leave its changelist. A session
+    /// seen running isn't checked — its newest edit may not be in the status yet.
+    fn check_stopped_sessions(&mut self, cx: &mut Context<Self>) {
+        let ready = {
+            let git = self.git.read(cx);
+            !git.is_discovering()
+                && git
+                    .repos()
+                    .iter()
+                    .all(|repo| repo.status.branch != Default::default())
+        };
+        if !ready || self.claude_lists.is_empty() {
+            return;
+        }
+        let changed: HashSet<&Path> = self
+            .changes
+            .iter()
+            .map(|change| change.path.as_path())
+            .collect();
+        let mut forget: Vec<(EntityId, Vec<PathBuf>)> = Vec::new();
+        for list in &self.claude_lists {
+            if self.claude_checked.contains(&list.session) {
+                continue;
+            }
+            let Some(session) = self.claude.read(cx).session(list.session).cloned() else {
+                continue;
+            };
+            let session = session.read(cx);
+            if session.is_loading() {
+                continue;
+            }
+            self.claude_checked.insert(list.session);
+            if session.is_started() {
+                continue;
+            }
+            let committed: Vec<PathBuf> = list
+                .files
+                .iter()
+                .filter(|file| {
+                    !changed.contains(file.key.as_path()) && !changed.contains(file.path.as_path())
+                })
+                .map(|file| file.path.clone())
+                .collect();
+            if !committed.is_empty() {
+                forget.push((list.session, committed));
+            }
+        }
+        for (session, paths) in forget {
+            self.forget_claude_files(session, &paths, cx);
+        }
+    }
+
+    /// The files leave a session's changelist (committed, rolled back, moved to "Changes").
+    fn forget_claude_files(&mut self, session: EntityId, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if let Some(session) = self.claude.read(cx).session(session).cloned() {
+            session.update(cx, |session, cx| session.forget_changed_files(paths, cx));
+        }
+    }
+
+    /// The changelist file behind a change: its session and the path as Claude wrote it.
+    fn claude_file(&self, change: &Change) -> Option<(EntityId, PathBuf)> {
+        let session = self.claude_groups.owner(change)?;
+        let list = self.claude_lists.iter().find(|list| list.session == session)?;
+        let file = list
+            .files
+            .iter()
+            .find(|file| file.key == change.path || file.path == change.path)?;
+        Some((session, file.path.clone()))
+    }
+
+    /// A change's text before Claude: `Some(None)` — Claude created the file; `None` — not a file
+    /// of a changelist.
+    fn claude_original(&self, change: &Change, cx: &App) -> Option<Option<Arc<str>>> {
+        let (session, path) = self.claude_file(change)?;
+        let session = self.claude.read(cx).session(session)?.read(cx);
+        let file = session.model().changed_file(&path)?;
+        Some(file.original.as_deref().map(Arc::from))
+    }
+
+    /// Whether the selected row is in a Claude changelist (the session).
+    fn selected_claude_session(&self) -> Option<EntityId> {
+        match &self.selected_row()?.key {
+            RowKey::Group(_, GroupKind::Claude(session))
+            | RowKey::Dir(_, GroupKind::Claude(session), _) => Some(*session),
+            RowKey::File(_) => {
+                let change = self.selected_file()?;
+                self.claude_groups.owner(change)
+            }
+            _ => None,
+        }
     }
 
     /// A merge in progress puts git's message into an empty field (and Amend can't go with it);
@@ -941,12 +1244,32 @@ impl CommitPanel {
             if change.status == FileStatus::Conflicted {
                 return open_conflict(&change, window, cx);
             }
-            return cx.emit(CommitPanelEvent::OpenDiff(change.path));
+            return self.open_diff_of(&change, cx);
         }
         if let Some(row) = self.selected_row().cloned()
             && row.expandable()
         {
             self.set_expanded(&row.key, !row.expanded, cx);
+        }
+    }
+
+    /// The diff of a change: in a Claude changelist against its text before Claude, otherwise
+    /// against HEAD.
+    fn open_diff_of(&mut self, change: &Change, cx: &mut Context<Self>) {
+        match self.claude_original(change, cx) {
+            Some(original) => cx.emit(CommitPanelEvent::OpenClaudeDiff {
+                path: change.path.clone(),
+                repo: change.repo,
+                original,
+            }),
+            None => cx.emit(CommitPanelEvent::OpenDiff(change.path.clone())),
+        }
+    }
+
+    /// A file of a Claude changelist against HEAD, as the other files.
+    fn show_diff_with_head(&mut self, _: &ShowDiffWithHead, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(change) = self.selected_file().cloned() {
+            cx.emit(CommitPanelEvent::OpenDiff(change.path));
         }
     }
 
@@ -965,6 +1288,9 @@ impl CommitPanel {
     /// ⌥⌘Z: rolls back the selected changes (the checked ones, with nothing selected), after a
     /// question. Conflicted files are resolved, not rolled back.
     fn rollback(&mut self, _: &Rollback, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_claude_session().is_some() {
+            return self.rollback_claude(window, cx);
+        }
         let changes: Vec<Change> = self
             .target_changes(cx)
             .into_iter()
@@ -975,6 +1301,134 @@ impl CommitPanel {
             this.update(cx, |_, cx| cx.emit(CommitPanelEvent::Removed(removed)))
                 .ok();
         });
+    }
+
+    /// The selected files of a Claude changelist: each with its session, Claude's path and its
+    /// text before Claude.
+    fn selected_claude_files(&self, cx: &App) -> Vec<ClaudeTarget> {
+        let Some(row) = self.selected_row() else {
+            return Vec::new();
+        };
+        row.files
+            .iter()
+            .filter_map(|&index| self.changes.get(index))
+            .filter_map(|change| {
+                let (session, path) = self.claude_file(change)?;
+                let original = self.claude_original(change, cx)?;
+                Some(ClaudeTarget {
+                    change: change.clone(),
+                    session,
+                    path,
+                    original,
+                })
+            })
+            .collect()
+    }
+
+    /// ⌥⌘Z in a Claude changelist: the selected files get their text before Claude (a file Claude
+    /// created goes to the Trash), after a question; open documents follow (one undoable edit,
+    /// saved) and the files leave the changelist.
+    fn rollback_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.selected_claude_files(cx);
+        if targets.is_empty() {
+            return;
+        }
+        let created = targets.iter().any(|target| target.original.is_none());
+        let question = match targets.as_slice() {
+            [target] => trf(
+                "Roll back Claude's changes in “{0}”?",
+                &[&file_name(&target.change.path)],
+            ),
+            _ => trf(
+                "Roll back Claude's changes {0}?",
+                &[&trn(targets.len(), "in {n} file", "in {n} files")],
+            ),
+        };
+        let mut message = tr("The files get back their text from before Claude changed them.").to_string();
+        if created {
+            message.push(' ');
+            message.push_str(tr("Files Claude created are moved to the Trash."));
+        }
+        let mut files = targets
+            .iter()
+            .take(LISTED_FILES)
+            .map(|target| target.change.relative.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if targets.len() > LISTED_FILES {
+            files.push('\n');
+            files.push_str(&trf("and {0} more", &[&(targets.len() - LISTED_FILES)]));
+        }
+        let answer = Dialog::warning(question)
+            .message(message)
+            .details(files)
+            .danger(tr("Rollback"))
+            .cancel(tr("Cancel"))
+            .show(window, cx);
+        cx.spawn(async move |this, cx| {
+            if answer.await != Some(0) {
+                return;
+            }
+            let jobs: Vec<(PathBuf, Option<Arc<str>>)> = targets
+                .iter()
+                .map(|target| (target.change.path.clone(), target.original.clone()))
+                .collect();
+            let errors = cx
+                .background_spawn(async move { restore_originals(&jobs) })
+                .await;
+            this.update(cx, |this, cx| {
+                let changes: Vec<Change> =
+                    targets.iter().map(|target| target.change.clone()).collect();
+                let removed = follow_rollback(&this.git, &changes, cx);
+                let mut by_session: Vec<(EntityId, Vec<PathBuf>)> = Vec::new();
+                for target in &targets {
+                    match by_session.iter_mut().find(|(id, _)| *id == target.session) {
+                        Some((_, paths)) => paths.push(target.path.clone()),
+                        None => by_session.push((target.session, vec![target.path.clone()])),
+                    }
+                }
+                for (session, paths) in by_session {
+                    this.forget_claude_files(session, &paths, cx);
+                }
+                this.git.update(cx, |git, cx| git.refresh(cx));
+                let notification = if errors.is_empty() {
+                    Notification::success(match changes.as_slice() {
+                        [change] => trf(
+                            "Rolled back Claude's changes: {0}",
+                            &[&file_name(&change.path)],
+                        ),
+                        _ => trf(
+                            "Rolled back Claude's changes in {0}",
+                            &[&trn(changes.len(), "{n} file", "{n} files")],
+                        ),
+                    })
+                } else {
+                    Notification::error(tr("Couldn't roll back Claude's changes"))
+                        .body(errors.join("\n"))
+                };
+                this.git.update(cx, |git, cx| git.notify(notification, cx));
+                if !removed.is_empty() {
+                    cx.emit(CommitPanelEvent::Removed(removed));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// "Move to Changes": the selected files leave their Claude changelist.
+    fn move_to_changes(&mut self, _: &MoveToChanges, _: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.selected_claude_files(cx);
+        let mut by_session: Vec<(EntityId, Vec<PathBuf>)> = Vec::new();
+        for target in targets {
+            match by_session.iter_mut().find(|(id, _)| *id == target.session) {
+                Some((_, paths)) => paths.push(target.path),
+                None => by_session.push((target.session, vec![target.path])),
+            }
+        }
+        for (session, paths) in by_session {
+            self.forget_claude_files(session, &paths, cx);
+        }
     }
 
     /// ⌘⌫ on unversioned files: to the Trash, after a question. Tracked files are rolled back
@@ -1217,7 +1671,7 @@ impl CommitPanel {
                     if change.status == FileStatus::Conflicted {
                         open_conflict(&change, window, cx);
                     } else {
-                        cx.emit(CommitPanelEvent::OpenDiff(change.path));
+                        self.open_diff_of(&change, cx);
                     }
                 }
             }
@@ -1236,6 +1690,9 @@ impl CommitPanel {
     ) {
         window.focus(&self.focus_handle);
         self.selected = key;
+        if let Some(session) = self.selected_claude_session() {
+            return self.claude_menu(session, position, window, cx);
+        }
         let file = self.selected_file().cloned();
         let row = self.selected_row().cloned();
         let conflicts = self.selected_conflicts();
@@ -1278,6 +1735,54 @@ impl CommitPanel {
                 .entry(tr("Stash Changes…"), git::StashChanges)
                 .separator()
                 .entry_if(row.is_some(), tr("Copy Path"), CopyPath)
+                .separator()
+                .entry(tr("Expand All"), ExpandAll)
+                .entry(tr("Collapse All"), CollapseAll)
+                .entry(tr("Refresh"), Refresh)
+        });
+        self.open_menu(menu, position, window, cx);
+        cx.notify();
+    }
+
+    /// The menu of a Claude changelist: its diffs, the rollback to the text before Claude, back to
+    /// "Changes", the session's chat.
+    fn claude_menu(
+        &mut self,
+        session: EntityId,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file = self.selected_file().cloned();
+        let group = matches!(
+            self.selected_row().map(|row| &row.key),
+            Some(RowKey::Group(..))
+        );
+        let menu = cx.new(|cx| {
+            ContextMenu::new(window, cx)
+                .entry_if(file.is_some(), tr("Show Diff"), ShowDiff)
+                .entry_if(file.is_some(), tr("Show Diff with HEAD"), ShowDiffWithHead)
+                .entry_if(
+                    file.as_ref()
+                        .is_some_and(|file| file.status != FileStatus::Deleted),
+                    tr("Jump to Source"),
+                    JumpToSource,
+                )
+                .separator()
+                .entry(
+                    if group {
+                        tr("Rollback All Claude Changes…")
+                    } else {
+                        tr("Rollback to Before Claude…")
+                    },
+                    Rollback,
+                )
+                .entry(tr("Move to Changes"), MoveToChanges)
+                .separator()
+                .entry(tr("Show Session"), claude::ShowSession(session))
+                .separator()
+                .entry(tr("Stash Selected Files…"), StashSelectedFiles)
+                .entry(tr("Copy Path"), CopyPath)
                 .separator()
                 .entry(tr("Expand All"), ExpandAll)
                 .entry(tr("Collapse All"), CollapseAll)
@@ -1507,6 +2012,133 @@ impl CommitPanel {
         .detach();
     }
 
+    // --- The message Claude writes ---
+
+    /// Whether Claude can write the message: Claude Code is on and `claude` is ready.
+    fn can_generate(&self, cx: &App) -> bool {
+        claude::enabled(cx) && self.claude.read(cx).is_ready()
+    }
+
+    /// "Generate Commit Message with Claude" (as JetBrains AI Assistant's): the checked changes as
+    /// they would be committed (partly checked files with their checked hunks, open documents with
+    /// their unsaved text) and the repository's recent subjects go to `claude -p` (Haiku); the
+    /// answer replaces the message, one undoable edit. A second click stops it.
+    fn generate_message(&mut self, cx: &mut Context<Self>) {
+        if self.generating.take().is_some() {
+            return cx.notify();
+        }
+        let cli = self
+            .claude
+            .read(cx)
+            .cli()
+            .cli()
+            .cloned()
+            .filter(|_| self.can_generate(cx));
+        let Some(cli) = cli else {
+            let message = tr("Claude Code isn't ready");
+            return self.report(GitEvent::Message(message.into()), cx);
+        };
+        let items: Vec<(Change, bool)> = {
+            let git = self.git.read(cx);
+            self.changes
+                .iter()
+                .filter(|change| checkable(change))
+                .map(|change| (change, git.check_state(change)))
+                .filter(|(_, state)| *state != CheckState::Unchecked)
+                .map(|(change, state)| (change.clone(), state == CheckState::Partial))
+                .collect()
+        };
+        if items.is_empty() {
+            return self.report(GitEvent::Message(tr("No changes are checked").into()), cx);
+        }
+        let Some(repo) = self.message_repo(cx) else {
+            return;
+        };
+        // The commit saves open documents first: the message follows their unsaved text.
+        let open: HashMap<PathBuf, String> = self
+            .git
+            .read(cx)
+            .editors()
+            .iter()
+            .filter_map(|editor| {
+                let document = &editor.read(cx).document;
+                let path = document.path().filter(|_| document.is_modified())?;
+                Some((path.to_path_buf(), document.text().to_string()))
+            })
+            .collect();
+        let bases: Vec<Task<Option<Arc<str>>>> = items
+            .iter()
+            .map(|(change, _)| {
+                if change.status == FileStatus::Untracked {
+                    Task::ready(None)
+                } else {
+                    self.git
+                        .update(cx, |git, cx| git.base_text(&change.path, cx))
+                }
+            })
+            .collect();
+        self.generating = Some(cx.spawn(async move |this, cx| {
+            let mut files = Vec::new();
+            for ((change, partial), base) in items.into_iter().zip(bases) {
+                let base = base.await.map(|base| base.to_string()).unwrap_or_default();
+                let current = match open.get(&change.path) {
+                    Some(text) => text.clone(),
+                    None => {
+                        let path = change.path.clone();
+                        cx.background_spawn(async move {
+                            std::fs::read_to_string(&path).unwrap_or_default()
+                        })
+                        .await
+                    }
+                };
+                let new = if partial {
+                    let path = change.path.clone();
+                    this.update(cx, |this, cx| {
+                        let git = this.git.read(cx);
+                        partial_content(&base, &current, |hunk| git.is_hunk_included(&path, hunk))
+                    })
+                    .unwrap_or(current)
+                } else {
+                    current
+                };
+                files.push(MessageFile {
+                    relative: change.relative,
+                    status: change.status,
+                    old: base,
+                    new,
+                });
+            }
+            let answer = cx
+                .background_spawn(async move {
+                    let subjects =
+                        flux_git::recent_messages(&repo, MESSAGE_EXAMPLES).unwrap_or_default();
+                    let prompt = message_prompt(&files, &subjects);
+                    cli.ask(&repo.work_dir, &prompt, Some(MESSAGE_MODEL))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.generating = None;
+                let failure = match answer.map(|text| clean_message(&text)) {
+                    Ok(message) if !message.is_empty() => {
+                        this.set_message(&message, cx);
+                        None
+                    }
+                    Ok(_) => Some(tr("Claude's answer was empty").to_string()),
+                    Err(err) => Some(err),
+                };
+                if let Some(failure) = failure {
+                    let notification =
+                        Notification::error(tr("Claude couldn't write the commit message"))
+                            .body(failure);
+                    this.git.update(cx, |git, cx| git.notify(notification, cx));
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     // --- Commit ---
 
     /// Commits the checked changes of every repository with the message; with `push`, the push
@@ -1581,6 +2213,12 @@ impl CommitPanel {
                 (path, base)
             })
             .collect();
+        // Wholly committed files leave their Claude changelist: Claude's next edit starts anew.
+        let claude_committed: Vec<(EntityId, PathBuf)> = included
+            .iter()
+            .filter(|item| !item.partial)
+            .filter_map(|item| self.claude_file(&item.change))
+            .collect();
         self.committing = true;
         cx.notify();
         let amend = self.amend && merging.is_empty();
@@ -1591,6 +2229,9 @@ impl CommitPanel {
                 this.committing = false;
                 match outcome {
                     Ok((count, summary)) => {
+                        for (session, path) in claude_committed {
+                            this.forget_claude_files(session, &[path], cx);
+                        }
                         this.set_message("", cx);
                         this.amend = false;
                         this.amend_message = None;
@@ -1921,6 +2562,19 @@ impl CommitPanel {
             ),
             // The count is a bare number: "Unversioned Files 2 files" doesn't fit the island in
             // Russian («Неотслеживаемые файлы 2 файла»).
+            // A Claude changelist: Claude's mark and the session's title.
+            RowKind::Group(GroupKind::Claude(session)) => (
+                icon(IconName::Claude, ui.accent_text)
+                    .size(px(13.))
+                    .into_any_element(),
+                format!(
+                    "Claude · {}",
+                    self.claude_groups.title(*session).unwrap_or_default()
+                ),
+                ui.foreground,
+                Some(row.files.len().to_string()),
+                false,
+            ),
             RowKind::Group(group) => (
                 div().into_any_element(),
                 group.label().to_string(),
@@ -2070,6 +2724,9 @@ impl CommitPanel {
     fn render_message(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let focused = self.message.focus_handle(cx).is_focused(window);
+        let generate = self.can_generate(cx);
+        // The text keeps clear of the buttons in the corner.
+        let buttons = if generate { 2. } else { 1. };
         div()
             .flex_none()
             .relative()
@@ -2077,6 +2734,7 @@ impl CommitPanel {
             .mx_2()
             .pl_1()
             .pt_1()
+            .pr(px(buttons * (ui::ICON_BUTTON_SIZE + 2.) + 4.))
             .rounded(px(RADIUS_MD))
             .bg(ui.input_background)
             .border_1()
@@ -2088,18 +2746,58 @@ impl CommitPanel {
             .when(focused, |field| field.shadow(ui::focus_ring(ui)))
             .child(self.message.clone())
             .child(
-                div().absolute().top(px(3.)).right(px(3.)).child(
-                    ui::icon_button("commit-history", IconName::History, ui)
-                        .tooltip(ui::tooltip(tr("Commit Message History"), None))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.show_history(event.position, window, cx)
-                            }),
-                        ),
-                ),
+                div()
+                    .absolute()
+                    .top(px(3.))
+                    .right(px(3.))
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .children(generate.then(|| self.render_generate_button(cx)))
+                    .child(
+                        ui::icon_button("commit-history", IconName::History, ui)
+                            .tooltip(ui::tooltip(tr("Commit Message History"), None))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.show_history(event.position, window, cx)
+                                }),
+                            ),
+                    ),
             )
+    }
+
+    /// Claude's mark in the message field: writes the message; while it does, the mark pulses and
+    /// a click stops it.
+    fn render_generate_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let ui = Theme::ui(cx);
+        let generating = self.generating.is_some();
+        let button = if generating {
+            ui::toggle_button("commit-generate", IconName::Claude, true, ui)
+                .tooltip(ui::tooltip(tr("Stop Generating"), None))
+        } else {
+            ui::icon_button("commit-generate", IconName::Claude, ui).tooltip(ui::tooltip(
+                tr("Generate Commit Message with Claude"),
+                None,
+            ))
+        }
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            this.generate_message(cx)
+        }));
+        if !generating {
+            return button.into_any_element();
+        }
+        div()
+            .child(button)
+            .with_animation(
+                "commit-generating",
+                Animation::new(Duration::from_millis(1000)).repeat(),
+                |button, delta| button.opacity(0.45 + 0.55 * (1. - (2. * delta - 1.).abs())),
+            )
+            .into_any_element()
     }
 
     fn render_footer(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -2484,6 +3182,61 @@ pub(crate) fn confirm_rollback(
     .detach();
 }
 
+/// A file of a Claude changelist an operation acts on.
+struct ClaudeTarget {
+    change: Change,
+    session: EntityId,
+    /// As Claude wrote it (the session's key).
+    path: PathBuf,
+    /// The text before Claude; `None` — Claude created the file.
+    original: Option<Arc<str>>,
+}
+
+/// Puts the files back as they were before Claude (on a background thread): a text is written
+/// atomically, a file Claude created goes to the Trash. The errors, as lines.
+fn restore_originals(jobs: &[(PathBuf, Option<Arc<str>>)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut trash = Vec::new();
+    for (path, original) in jobs {
+        match original {
+            Some(text) => {
+                if let Err(err) = write_atomically(path, text) {
+                    errors.push(format!("{}: {err}", path.display()));
+                }
+            }
+            None if path.exists() => trash.push(path.clone()),
+            None => {}
+        }
+    }
+    if !trash.is_empty()
+        && let Err(err) = flux_fs::trash(&trash)
+    {
+        errors.push(err.to_string());
+    }
+    errors
+}
+
+/// Writes a file through a temporary one and a rename, keeping its permissions (as a document's
+/// save): a failure leaves the old file whole.
+fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let permissions = std::fs::metadata(&target).ok().map(|meta| meta.permissions());
+    let temp = target.with_file_name(format!(
+        ".{}.flux-tmp",
+        target.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let result = std::fs::write(&temp, text).and_then(|()| {
+        if let Some(permissions) = permissions {
+            std::fs::set_permissions(&temp, permissions)?;
+        }
+        std::fs::rename(&temp, &target)
+    });
+    if result.is_err() {
+        std::fs::remove_file(&temp).ok();
+    }
+    result
+}
+
 /// Open documents of rolled-back files take the content from disk (one edit, saved state); the files
 /// that are gone are returned.
 fn follow_rollback(git: &Entity<GitStore>, changes: &[Change], cx: &mut App) -> Vec<PathBuf> {
@@ -2527,6 +3280,152 @@ fn file_name(path: &Path) -> String {
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
+}
+
+/// A file as the commit would take it, for Claude's message.
+pub(crate) struct MessageFile {
+    pub relative: String,
+    pub status: FileStatus,
+    /// HEAD's text (empty for a new file).
+    pub old: String,
+    /// The committed text (empty for a deleted file).
+    pub new: String,
+}
+
+/// The request for a commit message: the style of the recent subjects, the changed files, their
+/// diff — up to [`MESSAGE_DIFF_LIMIT`], then only the names of the rest.
+pub(crate) fn message_prompt(files: &[MessageFile], subjects: &[String]) -> String {
+    let mut prompt = String::from(
+        "Write the commit message for the changes below. Follow the style of the repository's \
+         recent commits: the same language, the same format of the subject line, the same level \
+         of detail. Reply with the commit message only: no explanations, no quotes, no code \
+         fences.\n\n",
+    );
+    if subjects.is_empty() {
+        prompt.push_str("The repository has no commits yet.\n\n");
+    } else {
+        prompt.push_str("Recent commits:\n");
+        for subject in subjects {
+            let line = subject.lines().next().unwrap_or_default().trim();
+            prompt.push_str(&format!("- {line}\n"));
+        }
+        prompt.push('\n');
+    }
+    prompt.push_str("Changed files:\n");
+    for file in files {
+        prompt.push_str(&format!("{} {}\n", status_letter(file.status), file.relative));
+    }
+    prompt.push_str("\nDiff:\n");
+    let mut size = 0;
+    let mut left_out = 0;
+    for file in files {
+        let diff = unified_diff(&file.relative, &file.old, &file.new);
+        if size + diff.len() > MESSAGE_DIFF_LIMIT {
+            left_out += 1;
+            continue;
+        }
+        size += diff.len();
+        prompt.push_str(&diff);
+    }
+    if left_out > 0 {
+        prompt.push_str(&format!(
+            "\n(The diff of {left_out} more file(s) is left out: too long.)\n"
+        ));
+    }
+    prompt
+}
+
+/// The letter of `git status --short` for a change.
+fn status_letter(status: FileStatus) -> char {
+    match status {
+        FileStatus::Added | FileStatus::Untracked => 'A',
+        FileStatus::Deleted => 'D',
+        FileStatus::Renamed => 'R',
+        _ => 'M',
+    }
+}
+
+/// A `git diff`-like text of one file: `--- a/…`, `+++ b/…` and the changed blocks with
+/// [`DIFF_CONTEXT`] lines around them (blocks closer than that share their context). Compared
+/// without `\r`.
+pub(crate) fn unified_diff(relative: &str, old: &str, new: &str) -> String {
+    let old = old.replace("\r\n", "\n");
+    let new = new.replace("\r\n", "\n");
+    let hunks = flux_git::diff_lines(&old, &new);
+    if hunks.is_empty() {
+        return String::new();
+    }
+    let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
+    let new_lines: Vec<&str> = new.split_inclusive('\n').collect();
+    let mut out = format!("--- a/{relative}\n+++ b/{relative}\n");
+    let line = |out: &mut String, mark: char, text: &str| {
+        out.push(mark);
+        out.push_str(text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+    };
+    let mut start = 0;
+    while start < hunks.len() {
+        // The blocks sharing context with the first one.
+        let mut end = start + 1;
+        while end < hunks.len()
+            && hunks[end].old.start.saturating_sub(hunks[end - 1].old.end) <= 2 * DIFF_CONTEXT
+        {
+            end += 1;
+        }
+        let (first, last) = (&hunks[start], &hunks[end - 1]);
+        let old_from = first.old.start.saturating_sub(DIFF_CONTEXT);
+        let old_to = (last.old.end + DIFF_CONTEXT).min(old_lines.len() as u32);
+        let new_from = first.new.start - (first.old.start - old_from);
+        let new_to = last.new.end + (old_to - last.old.end);
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_from + 1,
+            old_to - old_from,
+            new_from + 1,
+            new_to - new_from
+        ));
+        let mut at = old_from;
+        for hunk in &hunks[start..end] {
+            for index in at..hunk.old.start {
+                line(&mut out, ' ', old_lines[index as usize]);
+            }
+            for index in hunk.old.clone() {
+                line(&mut out, '-', old_lines[index as usize]);
+            }
+            for index in hunk.new.clone() {
+                line(&mut out, '+', new_lines[index as usize]);
+            }
+            at = hunk.old.end;
+        }
+        for index in at..old_to {
+            line(&mut out, ' ', old_lines[index as usize]);
+        }
+        start = end;
+    }
+    out
+}
+
+/// Claude's answer as a message: without the code fence or the quotes it may wrap it in.
+pub(crate) fn clean_message(answer: &str) -> String {
+    let mut text = answer.trim();
+    if let Some(rest) = text.strip_prefix("```") {
+        // The fence's first line may name a language.
+        text = rest.split_once('\n').map_or("", |(_, body)| body);
+        text = text.trim_end().strip_suffix("```").unwrap_or(text);
+    }
+    let text = text.trim();
+    let quoted = text.len() >= 2
+        && ((text.starts_with('"') && text.ends_with('"'))
+            || (text.starts_with('“') && text.ends_with('”')));
+    let text = if quoted {
+        &text[text.char_indices().nth(1).map_or(0, |(at, _)| at)
+            ..text.char_indices().last().map_or(text.len(), |(at, _)| at)]
+    } else {
+        text
+    };
+    text.trim().to_string()
 }
 
 /// A node's chevron (right when collapsed, down when expanded); for a file, an empty column.
@@ -2625,6 +3524,9 @@ impl Render for CommitPanel {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleAmend, _, cx| this.toggle_amend(cx)))
+            .on_action(cx.listener(|this, _: &GenerateCommitMessage, _, cx| {
+                this.generate_message(cx)
+            }))
             .on_action(cx.listener(|this, action: &UseMessage, _, cx| {
                 if let Some(message) = this.history.get(action.0).cloned() {
                     this.set_message(&message, cx);
@@ -2731,6 +3633,8 @@ impl CommitPanel {
                     .on_action(cx.listener(Self::show_diff))
                     .on_action(cx.listener(Self::jump_to_source))
                     .on_action(cx.listener(Self::rollback))
+                    .on_action(cx.listener(Self::show_diff_with_head))
+                    .on_action(cx.listener(Self::move_to_changes))
                     .on_action(cx.listener(Self::delete))
                     .on_action(cx.listener(Self::copy_path))
                     .on_action(cx.listener(Self::add_to_gitignore))
@@ -2813,6 +3717,10 @@ mod tests {
                 let text = match &row.kind {
                     RowKind::Repo { name, .. } => format!("repo {name}"),
                     RowKind::Group(GroupKind::Conflicts) => "Conflicts".into(),
+                    // The slot of the session's id, without its version.
+                    RowKind::Group(GroupKind::Claude(session)) => {
+                        format!("Claude {}", session.as_u64() as u32)
+                    }
                     RowKind::Group(GroupKind::Changes) => "Changes".into(),
                     RowKind::Group(GroupKind::Unversioned) => "Unversioned".into(),
                     RowKind::Dir { label } => format!("{label}/"),
@@ -2842,7 +3750,7 @@ mod tests {
             change(0, "file10.rs", FileStatus::Untracked),
             change(0, "file2.rs", FileStatus::Untracked),
         ];
-        let rows = build_rows(&changes, &one_repo(), true, &HashSet::new());
+        let rows = build_rows(&changes, &one_repo(), true, &HashSet::new(), &ClaudeGroups::default());
         assert_eq!(
             labels(&rows),
             vec![
@@ -2868,7 +3776,7 @@ mod tests {
             change(0, "src/main.rs", FileStatus::Modified),
             change(0, "Cargo.toml", FileStatus::Modified),
         ];
-        let rows = build_rows(&changes, &one_repo(), false, &HashSet::new());
+        let rows = build_rows(&changes, &one_repo(), false, &HashSet::new(), &ClaudeGroups::default());
         assert_eq!(
             labels(&rows),
             vec!["Changes", "  Cargo.toml", "  main.rs (src)"]
@@ -2892,7 +3800,7 @@ mod tests {
             },
         ];
         let collapsed: HashSet<RowKey> = [RowKey::Dir(1, GroupKind::Changes, "lib".into())].into();
-        let rows = build_rows(&changes, &repos, true, &collapsed);
+        let rows = build_rows(&changes, &repos, true, &collapsed, &ClaudeGroups::default());
         assert_eq!(
             labels(&rows),
             vec![
@@ -2906,7 +3814,7 @@ mod tests {
         );
         assert!(!rows[5].expanded);
         let collapsed: HashSet<RowKey> = [RowKey::Repo(0)].into();
-        let rows = build_rows(&changes, &repos, true, &collapsed);
+        let rows = build_rows(&changes, &repos, true, &collapsed, &ClaudeGroups::default());
         assert_eq!(labels(&rows)[0..2], ["repo app", "repo core"]);
     }
 
@@ -2918,7 +3826,7 @@ mod tests {
             change(0, "README.md", FileStatus::Conflicted),
             change(0, "notes.md", FileStatus::Untracked),
         ];
-        let rows = build_rows(&changes, &one_repo(), true, &HashSet::new());
+        let rows = build_rows(&changes, &one_repo(), true, &HashSet::new(), &ClaudeGroups::default());
         assert_eq!(
             labels(&rows),
             vec![
@@ -2935,6 +3843,156 @@ mod tests {
         );
         assert_eq!(rows[0].files.len(), 2);
         assert!(!checkable(&changes[1]) && checkable(&changes[0]));
+    }
+
+    fn claude_file(path: &str, seconds: u64) -> ClaudeFile {
+        ClaudeFile {
+            path: PathBuf::from(path),
+            key: PathBuf::from(path),
+            changed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+        }
+    }
+
+    #[test]
+    fn claude_changelists_take_their_files_and_the_later_session_wins() {
+        let (first, second) = (EntityId::from(1u64), EntityId::from(2u64));
+        let lists = vec![
+            ClaudeList {
+                session: first,
+                title: "Fix login".into(),
+                files: vec![
+                    claude_file("/r0/src/auth.rs", 10),
+                    claude_file("/r0/src/shared.rs", 30),
+                    claude_file("/r0/src/parser.rs", 10),
+                ],
+            },
+            ClaudeList {
+                session: second,
+                title: "Docs".into(),
+                files: vec![
+                    claude_file("/r0/README.md", 20),
+                    claude_file("/r0/src/shared.rs", 20),
+                    // Committed already: not among the changes, not shown.
+                    claude_file("/r0/old.md", 20),
+                ],
+            },
+        ];
+        let groups = ClaudeGroups::build(&lists);
+        let changes = vec![
+            change(0, "src/auth.rs", FileStatus::Modified),
+            change(0, "src/shared.rs", FileStatus::Modified),
+            change(0, "README.md", FileStatus::Modified),
+            change(0, "notes.md", FileStatus::Untracked),
+            change(0, "main.rs", FileStatus::Modified),
+            // Conflicted: it stays with the conflicts, whoever changed it.
+            change(0, "src/parser.rs", FileStatus::Conflicted),
+        ];
+        let rows = build_rows(&changes, &one_repo(), true, &HashSet::new(), &groups);
+        assert_eq!(
+            labels(&rows),
+            vec![
+                "Conflicts",
+                "  src/",
+                "    parser.rs",
+                "Claude 1",
+                "  src/",
+                "    auth.rs",
+                "    shared.rs",
+                "Claude 2",
+                "  README.md",
+                "Changes",
+                "  main.rs",
+                "Unversioned",
+                "  notes.md",
+            ]
+        );
+        assert_eq!(groups.title(second), Some("Docs"));
+        // The Claude path and the canonical one both find the owner.
+        let mut lists = lists;
+        lists[1].files[0].key = PathBuf::from("/private/r0/README.md");
+        let groups = ClaudeGroups::build(&lists);
+        assert_eq!(groups.owner(&changes[2]), Some(second));
+    }
+
+    #[test]
+    fn a_unified_diff_keeps_context_and_joins_close_blocks() {
+        let old = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\n";
+        let new = "a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\nO\n";
+        let diff = unified_diff("x.txt", old, new);
+        assert_eq!(
+            diff,
+            "--- a/x.txt\n+++ b/x.txt\n\
+             @@ -1,5 +1,5 @@\n a\n-b\n+B\n c\n d\n e\n\
+             @@ -12,3 +12,4 @@\n l\n m\n n\n+O\n"
+        );
+        // Blocks closer than twice the context share one header.
+        let joined = unified_diff("x.txt", "1\n2\n3\n4\n5\n", "1\nX\n3\n4\nY\n");
+        assert_eq!(joined.matches("@@ -").count(), 1);
+        assert_eq!(unified_diff("x.txt", "same\r\n", "same\n"), "");
+        // A new file: everything added.
+        assert_eq!(
+            unified_diff("new.rs", "", "fn main() {}"),
+            "--- a/new.rs\n+++ b/new.rs\n@@ -1,0 +1,1 @@\n+fn main() {}\n"
+        );
+    }
+
+    #[test]
+    fn the_message_request_follows_the_style_and_cuts_a_long_diff() {
+        let files = vec![
+            MessageFile {
+                relative: "src/a.rs".into(),
+                status: FileStatus::Modified,
+                old: "let x = 1;\n".into(),
+                new: "let x = 2;\n".into(),
+            },
+            MessageFile {
+                relative: "big.txt".into(),
+                status: FileStatus::Untracked,
+                old: String::new(),
+                new: "line\n".repeat(MESSAGE_DIFF_LIMIT / 4),
+            },
+        ];
+        let subjects = vec![
+            "Этап 9.1: Claude Code — чат\n\nBody".to_string(),
+            "README: снимки".to_string(),
+        ];
+        let prompt = message_prompt(&files, &subjects);
+        assert!(prompt.contains("- Этап 9.1: Claude Code — чат\n- README: снимки\n"));
+        assert!(!prompt.contains("Body"));
+        assert!(prompt.contains("M src/a.rs\nA big.txt\n"));
+        assert!(prompt.contains("-let x = 1;\n+let x = 2;\n"));
+        assert!(prompt.contains("The diff of 1 more file(s) is left out"));
+        assert!(message_prompt(&files[..1], &[]).contains("no commits yet"));
+    }
+
+    #[test]
+    fn claudes_answer_loses_its_fence_and_quotes() {
+        assert_eq!(clean_message("  Fix login\n\nBody  "), "Fix login\n\nBody");
+        assert_eq!(clean_message("```text\nFix login\n```"), "Fix login");
+        assert_eq!(clean_message("```\nFix\n```\n"), "Fix");
+        assert_eq!(clean_message("\"Fix login\""), "Fix login");
+        assert_eq!(clean_message("“Исправить вход”"), "Исправить вход");
+        assert_eq!(clean_message("```"), "");
+    }
+
+    #[test]
+    fn a_rollback_writes_the_text_before_claude() {
+        let dir = std::env::temp_dir().join(format!("flux-claude-rollback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "changed by Claude\n").unwrap();
+        let missing = dir.join("gone.rs");
+        let errors = restore_originals(&[
+            (path.clone(), Some(Arc::from("before\r\n"))),
+            // Created by Claude and already gone: nothing to do.
+            (missing.clone(), None),
+        ]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\r\n");
+        assert!(!missing.exists());
+        // No temporary file is left next to it.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -4,7 +4,9 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use flux_core::Rope;
-use lsp_types::{DocumentChangeOperation, DocumentChanges, OneOf, TextDocumentEdit, WorkspaceEdit};
+use lsp_types::{
+    DocumentChangeOperation, DocumentChanges, OneOf, ResourceOp, TextDocumentEdit, WorkspaceEdit,
+};
 
 use crate::position::{Lines, path_from_uri};
 
@@ -76,6 +78,91 @@ pub fn workspace_files(
         files.sort_by(|(a, _), (b, _)| a.cmp(b));
     }
     Ok(files)
+}
+
+/// One step of a workspace edit with file operations (code actions: "move to a new file").
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileChange {
+    /// Edits of a file, relative to its text after the previous steps.
+    Edit {
+        path: PathBuf,
+        edits: Vec<lsp_types::TextEdit>,
+    },
+    Create {
+        path: PathBuf,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    },
+    Delete {
+        path: PathBuf,
+        recursive: bool,
+        ignore_if_not_exists: bool,
+    },
+}
+
+/// The steps of a workspace edit in order: `documentChanges` (edits and file operations) as the
+/// server sent them, else `changes` sorted by path. Non-`file` URIs: `Err` with a message.
+pub fn workspace_changes(edit: &WorkspaceEdit) -> Result<Vec<FileChange>, String> {
+    let Some(DocumentChanges::Operations(operations)) = &edit.document_changes else {
+        return Ok(workspace_files(edit)?
+            .into_iter()
+            .map(|(path, edits)| FileChange::Edit { path, edits })
+            .collect());
+    };
+    let mut changes = Vec::new();
+    for operation in operations {
+        changes.push(match operation {
+            DocumentChangeOperation::Edit(document) => FileChange::Edit {
+                path: file_path(&document.text_document.uri)?,
+                edits: text_edits(document),
+            },
+            DocumentChangeOperation::Op(ResourceOp::Create(create)) => {
+                let options = create.options.as_ref();
+                FileChange::Create {
+                    path: file_path(&create.uri)?,
+                    overwrite: options.and_then(|o| o.overwrite).unwrap_or(false),
+                    ignore_if_exists: options.and_then(|o| o.ignore_if_exists).unwrap_or(false),
+                }
+            }
+            DocumentChangeOperation::Op(ResourceOp::Rename(rename)) => {
+                let options = rename.options.as_ref();
+                FileChange::Rename {
+                    from: file_path(&rename.old_uri)?,
+                    to: file_path(&rename.new_uri)?,
+                    overwrite: options.and_then(|o| o.overwrite).unwrap_or(false),
+                    ignore_if_exists: options.and_then(|o| o.ignore_if_exists).unwrap_or(false),
+                }
+            }
+            DocumentChangeOperation::Op(ResourceOp::Delete(delete)) => {
+                let options = delete.options.as_ref();
+                FileChange::Delete {
+                    path: file_path(&delete.uri)?,
+                    recursive: options.and_then(|o| o.recursive).unwrap_or(false),
+                    ignore_if_not_exists: options
+                        .and_then(|o| o.ignore_if_not_exists)
+                        .unwrap_or(false),
+                }
+            }
+        });
+    }
+    Ok(changes)
+}
+
+fn text_edits(document: &TextDocumentEdit) -> Vec<lsp_types::TextEdit> {
+    document
+        .edits
+        .iter()
+        .map(|edit| match edit {
+            OneOf::Left(edit) => edit.clone(),
+            OneOf::Right(annotated) => annotated.text_edit.clone(),
+        })
+        .collect()
 }
 
 fn file_path(uri: &lsp_types::Uri) -> Result<PathBuf, String> {
@@ -220,5 +307,65 @@ mod tests {
             vec![edit((0, 0), (0, 0), "x")],
         )]));
         assert!(workspace_files(&remote).is_err());
+        assert!(workspace_changes(&remote).is_err());
+    }
+
+    #[test]
+    fn file_operations_keep_their_order_with_the_edits() {
+        let edit = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri("file:///src/new.rs"),
+                    options: Some(lsp_types::CreateFileOptions {
+                        overwrite: None,
+                        ignore_if_exists: Some(true),
+                    }),
+                    annotation_id: None,
+                })),
+                DocumentChangeOperation::Edit(TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri: uri("file:///src/new.rs"),
+                        version: None,
+                    },
+                    edits: vec![OneOf::Left(self::edit((0, 0), (0, 0), "fn moved() {}\n"))],
+                }),
+                DocumentChangeOperation::Op(ResourceOp::Delete(lsp_types::DeleteFile {
+                    uri: uri("file:///src/old.rs"),
+                    options: None,
+                })),
+            ])),
+            ..Default::default()
+        };
+        assert_eq!(
+            workspace_changes(&edit).unwrap(),
+            vec![
+                FileChange::Create {
+                    path: PathBuf::from("/src/new.rs"),
+                    overwrite: false,
+                    ignore_if_exists: true,
+                },
+                FileChange::Edit {
+                    path: PathBuf::from("/src/new.rs"),
+                    edits: vec![self::edit((0, 0), (0, 0), "fn moved() {}\n")],
+                },
+                FileChange::Delete {
+                    path: PathBuf::from("/src/old.rs"),
+                    recursive: false,
+                    ignore_if_not_exists: false,
+                },
+            ]
+        );
+        // Without file operations, the plain edits.
+        let plain = WorkspaceEdit::new(HashMap::from([(
+            uri("file:///b.rs"),
+            vec![self::edit((0, 0), (0, 0), "x")],
+        )]));
+        assert_eq!(
+            workspace_changes(&plain).unwrap(),
+            vec![FileChange::Edit {
+                path: PathBuf::from("/b.rs"),
+                edits: vec![self::edit((0, 0), (0, 0), "x")],
+            }]
+        );
     }
 }

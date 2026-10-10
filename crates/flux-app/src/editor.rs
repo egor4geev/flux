@@ -214,6 +214,8 @@ pub struct Editor {
     pub(crate) git: crate::git_gutter::GitState,
     /// Annotations (blame) in the gutter and the gutter's menu.
     pub(crate) blame: crate::blame::BlameState,
+    /// The context menu over the text (the right button, ⇧F10).
+    pub(crate) menu: crate::editor_menu::MenuState,
     /// What a host view draws over this editor for one frame (the diff viewer: changed blocks and
     /// words): the host sets it before every render, the element takes it. An editor shown in its
     /// own tab gets none.
@@ -312,6 +314,7 @@ impl Editor {
             message: None,
             git: Default::default(),
             blame: Default::default(),
+            menu: Default::default(),
             frame_decorations: None,
             recorded_changes: None,
             disk_mtime: None,
@@ -731,6 +734,9 @@ impl Editor {
         self.replace_ranges(vec![(range, text)], cx);
         self.document.set_selection(selection);
         self.document.mark_saved();
+        // The text is the file's now, as after a save: servers that check on save (rust-analyzer's
+        // `cargo check`) check it again — a file Claude fixed doesn't keep its old errors.
+        crate::lsp::saved(self);
         self.scroll = scroll;
         self.autoscroll = None;
         cx.notify();
@@ -1195,6 +1201,8 @@ impl Render for Editor {
             .map(|root| crate::hover::actions(root, self, cx))
             .map(|root| crate::git_gutter::actions(root, self, cx))
             .map(|root| crate::blame::actions(root, self, cx))
+            .map(|root| crate::code_actions::actions(root, self, cx))
+            .map(|root| crate::editor_menu::actions(root, self, cx))
             .child(
                 div()
                     .flex_1()
@@ -1206,7 +1214,7 @@ impl Render for Editor {
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(|this, event, window, cx| {
-                                    crate::blame::secondary_click(this, event, window, cx)
+                                    crate::editor_menu::secondary_click(this, event, window, cx)
                                 }),
                             )
                             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1222,6 +1230,8 @@ impl Render for Editor {
             .children(crate::hover::render(self, window, cx))
             .children(crate::git_gutter::render(self, window, cx))
             .children(crate::blame::render(self, window, cx))
+            .children(crate::code_actions::render(self, window, cx))
+            .children(crate::editor_menu::render(self))
     }
 }
 

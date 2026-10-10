@@ -177,9 +177,16 @@ fn lifecycle_requests_and_notifications() {
     let capabilities = server.capabilities().unwrap();
     assert!(capabilities.hover_provider.is_some());
 
-    // After `initialized` the server reports progress and a message; the queued didOpen went
-    // after `initialized` too, and the server answered it with diagnostics.
-    // (`window/logMessage` in between is not an event.)
+    // After `initialized` the server asks to apply an edit (the window answers it), reports
+    // progress and a message; the queued didOpen went after `initialized` too, and the server
+    // answered it with diagnostics. (`window/logMessage` in between is not an event.)
+    let ServerEvent::ApplyEdit(apply) = next_event(&mut events) else {
+        panic!("the applyEdit request comes as an event");
+    };
+    apply.respond(true, None);
+    // Answered once: a second answer (or the drop) writes nothing.
+    apply.respond(false, None);
+    drop(apply);
     let received: Vec<ServerEvent> = (0..5).map(|_| next_event(&mut events)).collect();
     assert!(matches!(
         &received[0],
@@ -255,7 +262,31 @@ fn lifecycle_requests_and_notifications() {
     );
     assert_eq!(response(100.into())["result"], Value::Null);
     assert_eq!(response(101.into())["error"]["code"], -32601);
-    assert_eq!(response(102.into())["result"]["applied"], false);
+    assert_eq!(response(102.into())["result"]["applied"], true);
+    let applies = fake
+        .received()
+        .iter()
+        .filter(|m| m["id"] == 102 && m.get("method").is_none())
+        .count();
+    assert_eq!(applies, 1);
+
+    // An applyEdit request nobody answers is answered "not applied" when dropped.
+    server.notify::<AskApply>(());
+    let ServerEvent::ApplyEdit(apply) = wait_event(&mut events, |e| matches!(e, ServerEvent::ApplyEdit(_)))
+    else {
+        unreachable!()
+    };
+    assert_eq!(apply.params.label.as_deref(), Some("dropped"));
+    drop(apply);
+    assert_eq!(response(103.into())["result"]["applied"], false);
+
+    // The client offers what code actions and workspace edits need.
+    let capabilities = &initialize["params"]["capabilities"];
+    assert_eq!(capabilities["workspace"]["applyEdit"], true);
+    assert_eq!(
+        capabilities["textDocument"]["codeAction"]["resolveSupport"]["properties"],
+        serde_json::json!(["edit"])
+    );
 
     // Cancellation: the request was sent, then the dropped future cancels it.
     let pending = server.request::<HoverRequest>(hover_params(uri(&fake), 99));
@@ -278,6 +309,14 @@ fn lifecycle_requests_and_notifications() {
         block_on(server.request::<HoverRequest>(hover_params(uri(&fake), 0))),
         Err(RequestError::Exited)
     );
+}
+
+/// A custom notification: the fake server asks to apply an edit, and nobody answers.
+enum AskApply {}
+
+impl flux_lsp::lsp_types::notification::Notification for AskApply {
+    type Params = ();
+    const METHOD: &'static str = "flux/askApply";
 }
 
 /// A custom request: the fake server exits on it with a message on stderr.

@@ -63,6 +63,13 @@ pub struct ClaudeSettings {
     pub show_limits: bool,
     /// More arguments for `claude`, as the user typed them.
     pub extra_args: Vec<String>,
+    /// The sessions open when the project closed come back when it opens (part 9.2).
+    pub restore_sessions: bool,
+    /// Claude gets Flux's tools: problems of the language servers, navigation, the open files
+    /// (the `flux` MCP server, part 9.2).
+    pub flux_tools: bool,
+    /// After an edit of Claude, the problems language servers find in the file go back to Claude.
+    pub report_problems: bool,
 }
 
 impl Default for ClaudeSettings {
@@ -77,6 +84,9 @@ impl Default for ClaudeSettings {
             share_selection: true,
             show_limits: true,
             extra_args: Vec::new(),
+            restore_sessions: true,
+            flux_tools: true,
+            report_problems: true,
         }
     }
 }
@@ -388,6 +398,15 @@ fn parse_claude(value: &Value) -> ClaudeSettings {
                     .collect()
             })
             .unwrap_or_default(),
+        restore_sessions: value["restore_sessions"]
+            .as_bool()
+            .unwrap_or(defaults.restore_sessions),
+        flux_tools: value["flux_tools"]
+            .as_bool()
+            .unwrap_or(defaults.flux_tools),
+        report_problems: value["report_problems"]
+            .as_bool()
+            .unwrap_or(defaults.report_problems),
     }
 }
 
@@ -423,6 +442,9 @@ fn to_json(settings: &Settings) -> String {
             "share_selection": settings.claude.share_selection,
             "show_limits": settings.claude.show_limits,
             "extra_args": settings.claude.extra_args,
+            "restore_sessions": settings.claude.restore_sessions,
+            "flux_tools": settings.claude.flux_tools,
+            "report_problems": settings.claude.report_problems,
         },
     });
     serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
@@ -471,6 +493,9 @@ mod tests {
                 share_selection: false,
                 show_limits: false,
                 extra_args: vec!["--verbose".to_string()],
+                restore_sessions: false,
+                flux_tools: false,
+                report_problems: false,
             },
             path: None,
         };

@@ -17,8 +17,11 @@ use gpui::{
     Subscription, Task, actions,
 };
 
-use flux_claude::{Cli, EntryKind, LaunchOptions, Notice, PendingKind, RateLimits, Status};
+use flux_claude::{
+    Cli, EntryKind, LaunchOptions, Notice, PendingKind, RateLimits, SavedSession, Status,
+};
 
+use crate::claude_history::{self, OpenSessions, SessionPlace};
 use crate::claude_session::{ClaudeSession, SessionEvent};
 use crate::i18n::{tr, trf};
 use crate::settings;
@@ -53,6 +56,9 @@ actions!(
         CheckAgain,
         /// Settings → Claude Code.
         OpenSettings,
+        /// "Resume Session…" (the history button, `/resume`, the palette): the project's saved
+        /// sessions in a popup; the chosen one comes back in a tab (part 9.2).
+        ResumeSession,
     ]
 );
 
@@ -165,6 +171,40 @@ pub enum ClaudeStoreEvent {
     FilesChanged(Vec<PathBuf>),
     /// The CLI's state, the limits, a session's status or title: redraw.
     Changed,
+    /// Claude calls a Flux tool: the window runs it ([`crate::claude_tools::call`]) and answers
+    /// the session ([`ClaudeSession::answer_tool`]).
+    ToolCall {
+        session: Entity<ClaudeSession>,
+        request: String,
+        tool: String,
+        input: serde_json::Value,
+    },
+    /// An edit of Claude ran: the window tells Claude what language servers now find wrong in the
+    /// file ([`crate::claude_tools::after_edit`], [`ClaudeSession::answer_edit_hook`]).
+    EditHook {
+        session: Entity<ClaudeSession>,
+        request: String,
+        path: PathBuf,
+    },
+    /// A session open when the project last closed came back (Settings → Claude Code → "Reopen
+    /// sessions with the project"): its chat goes where it was — a pill of the Claude window
+    /// (`active` — the active one) or an editor tab — without coming into sight.
+    SessionRestored {
+        session: Entity<ClaudeSession>,
+        place: SessionPlace,
+        active: bool,
+    },
+}
+
+/// Bringing back the sessions open when the project last closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restore {
+    /// Not yet for this root: `claude` isn't ready.
+    Pending,
+    /// The transcripts are being listed.
+    Running,
+    /// Done (or nothing to do): from now on the open sessions are saved.
+    Done,
 }
 
 pub struct ClaudeStore {
@@ -178,6 +218,12 @@ pub struct ClaudeStore {
     /// Polls the sign-in while `claude auth login` runs in a terminal.
     _sign_in: Option<Task<()>>,
     subscriptions: Vec<(Entity<ClaudeSession>, Subscription)>,
+    /// The sessions of the root open when it last closed: they come back once `claude` is ready;
+    /// only then is the window's state saved over them.
+    restore: Restore,
+    _restore: Option<Task<()>>,
+    /// What was last saved for the root: an unchanged state isn't written again.
+    saved_open: Option<OpenSessions>,
 }
 
 impl EventEmitter<ClaudeStoreEvent> for ClaudeStore {}
@@ -193,6 +239,9 @@ impl ClaudeStore {
             _check: None,
             _sign_in: None,
             subscriptions: Vec::new(),
+            restore: Restore::Pending,
+            _restore: None,
+            saved_open: None,
         };
         store.check(cx);
         store
@@ -210,9 +259,16 @@ impl ClaudeStore {
         self.root.as_deref()
     }
 
-    /// The project root changed: new sessions work there (running ones keep theirs).
+    /// The project root changed: new sessions work there (running ones keep theirs); the sessions
+    /// the new project had open come back.
     pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
-        self.root = root;
+        if self.root != root {
+            self.root = root;
+            self.restore = Restore::Pending;
+            self._restore = None;
+            self.saved_open = None;
+            self.restore(cx);
+        }
         cx.notify();
     }
 
@@ -305,6 +361,7 @@ impl ClaudeStore {
             cx.emit(ClaudeStoreEvent::Changed);
             cx.notify();
         }
+        self.restore(cx);
     }
 
     /// Starts a session in the project root (the home folder without a project) with the defaults
@@ -314,13 +371,22 @@ impl ClaudeStore {
             return None;
         };
         let cli = cli.clone();
+        let options = self.launch_options(cx);
+        let session = cx.new(|cx| ClaudeSession::new(cli, options, cx));
+        self.add(session.clone(), cx);
+        Some(session)
+    }
+
+    /// How a session of this window starts: in the project root (the home folder without a
+    /// project), with the defaults of the settings.
+    fn launch_options(&self, cx: &App) -> LaunchOptions {
         let defaults = settings::claude(cx);
         let cwd = self
             .root
             .clone()
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("/"));
-        let options = LaunchOptions {
+        LaunchOptions {
             cwd,
             model: defaults.model.clone(),
             permission_mode: defaults
@@ -333,14 +399,144 @@ impl ClaudeStore {
                 .and_then(flux_claude::Effort::from_wire),
             extra_args: defaults.extra_args.clone(),
             ..LaunchOptions::default()
-        };
-        let session = cx.new(|cx| ClaudeSession::new(cli, options, cx));
+        }
+    }
+
+    fn add(&mut self, session: Entity<ClaudeSession>, cx: &mut Context<Self>) {
+        self.track(session.clone(), cx);
+        cx.emit(ClaudeStoreEvent::SessionAdded(session));
+        cx.notify();
+    }
+
+    /// One of the window's sessions from now on.
+    fn track(&mut self, session: Entity<ClaudeSession>, cx: &mut Context<Self>) {
         let subscription = cx.subscribe(&session, Self::on_session_event);
         self.subscriptions.push((session.clone(), subscription));
-        self.sessions.push(session.clone());
-        cx.emit(ClaudeStoreEvent::SessionAdded(session.clone()));
-        cx.notify();
+        self.sessions.push(session);
+    }
+
+    /// The project's saved sessions, the most recent first (the history popup), read in the
+    /// background.
+    pub fn history(&self, cx: &mut Context<Self>) -> Task<Vec<SavedSession>> {
+        let Some(root) = self.root.clone() else {
+            return Task::ready(Vec::new());
+        };
+        cx.background_spawn(async move {
+            flux_claude::transcript::projects_dir()
+                .map(|projects| flux_claude::transcript::list(&projects, &root))
+                .unwrap_or_default()
+        })
+    }
+
+    /// A saved session back in a tab (the history, Flux restarting): the open one when it is
+    /// already open; `None` while `claude` isn't ready.
+    pub fn resume(
+        &mut self,
+        saved: &SavedSession,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ClaudeSession>> {
+        if let Some(open) = self.open_session(&saved.id, cx) {
+            return Some(open);
+        }
+        let session = self.resumed_session(saved, cx)?;
+        self.add(session.clone(), cx);
         Some(session)
+    }
+
+    /// The open session with this id.
+    fn open_session(&self, id: &str, cx: &App) -> Option<Entity<ClaudeSession>> {
+        self.sessions
+            .iter()
+            .find(|session| session.read(cx).session_id() == Some(id))
+            .cloned()
+    }
+
+    /// A saved session as a new entity of the window, its title known before the transcript is
+    /// read; not yet among the sessions.
+    fn resumed_session(
+        &self,
+        saved: &SavedSession,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ClaudeSession>> {
+        let CliState::Ready { cli, .. } = &self.cli else {
+            return None;
+        };
+        let cli = cli.clone();
+        let mut options = self.launch_options(cx);
+        options.resume = Some(saved.id.clone());
+        let path = saved.path.clone();
+        let title = saved.title.clone();
+        Some(cx.new(|cx| {
+            let mut session = ClaudeSession::resumed(cli, options, path, cx);
+            session.set_title_hint(title);
+            session
+        }))
+    }
+
+    /// Brings back the sessions the root had open when it last closed, once `claude` is ready
+    /// (Settings → Claude Code → "Reopen sessions with the project"). The transcripts are listed
+    /// in the background; an id whose transcript is gone is dropped.
+    fn restore(&mut self, cx: &mut Context<Self>) {
+        if self.restore != Restore::Pending || !self.is_ready() {
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        self.restore = Restore::Done;
+        let open = claude_history::load_open(&root);
+        self.saved_open = Some(open.clone());
+        if !settings::claude(cx).restore_sessions || open.sessions.is_empty() {
+            return;
+        }
+        self.restore = Restore::Running;
+        let list = cx.background_spawn(async move {
+            flux_claude::transcript::projects_dir()
+                .map(|projects| flux_claude::transcript::list(&projects, &root))
+                .unwrap_or_default()
+        });
+        self._restore = Some(cx.spawn(async move |this, cx| {
+            let saved = list.await;
+            this.update(cx, |this, cx| this.bring_back(open, saved, cx))
+                .ok();
+        }));
+    }
+
+    fn bring_back(&mut self, open: OpenSessions, saved: Vec<SavedSession>, cx: &mut Context<Self>) {
+        self.restore = Restore::Done;
+        self._restore = None;
+        for (id, place) in &open.sessions {
+            let Some(saved) = saved.iter().find(|saved| &saved.id == id) else {
+                continue;
+            };
+            if self.open_session(id, cx).is_some() {
+                continue;
+            }
+            let Some(session) = self.resumed_session(saved, cx) else {
+                return;
+            };
+            self.track(session.clone(), cx);
+            cx.emit(ClaudeStoreEvent::SessionRestored {
+                session,
+                place: *place,
+                active: open.active.as_deref() == Some(id.as_str()),
+            });
+        }
+        cx.emit(ClaudeStoreEvent::Changed);
+        cx.notify();
+    }
+
+    /// The window's open sessions of the project changed (which, their order, where): saved for
+    /// the next start — only after the saved ones came back, and only when something changed.
+    pub fn persist(&mut self, open: OpenSessions) {
+        let Some(root) = &self.root else {
+            return;
+        };
+        if self.restore != Restore::Done || self.saved_open.as_ref() == Some(&open) {
+            return;
+        }
+        claude_history::save_open(root, &open);
+        self.saved_open = Some(open);
     }
 
     /// Ends a session: its process stops, its chat goes.
@@ -416,6 +612,21 @@ impl ClaudeStore {
                 cx.emit(ClaudeStoreEvent::Changed);
             }
             SessionEvent::Title => cx.emit(ClaudeStoreEvent::Changed),
+            SessionEvent::ToolCall {
+                request,
+                tool,
+                input,
+            } => cx.emit(ClaudeStoreEvent::ToolCall {
+                session,
+                request: request.clone(),
+                tool: tool.clone(),
+                input: input.clone(),
+            }),
+            SessionEvent::EditHook { request, path } => cx.emit(ClaudeStoreEvent::EditHook {
+                session,
+                request: request.clone(),
+                path: path.clone(),
+            }),
             SessionEvent::Changed | SessionEvent::TurnFinished { .. } => {}
         }
         cx.notify();

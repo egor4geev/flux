@@ -4,8 +4,8 @@
 //! tasks, limits and context. [`Session::apply`] takes a frame and says what changed.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 
@@ -62,8 +62,13 @@ pub struct Session {
 }
 
 /// The hook Flux registers in `initialize`: after an edit ran, the CLI asks it whether Claude
-/// should learn anything (the user changed the edit before allowing it).
+/// should learn anything (the user changed the edit before allowing it, the language server finds
+/// new problems in the file).
 pub const EDIT_HOOK: &str = "flux-edit";
+
+/// How long the CLI waits for the answer of [`EDIT_HOOK`]: well above the few seconds the window
+/// gives the language server.
+pub const EDIT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A user's version of an edit up to this size goes to Claude whole; a longer one — only the note
 /// that the file differs from the proposal.
@@ -582,6 +587,9 @@ pub struct ChangedFile {
     pub path: PathBuf,
     /// The text before Claude's first change in the session; `None` — Claude created it.
     pub original: Option<String>,
+    /// When Claude last changed it: of two sessions that changed a file, the later one owns it in
+    /// the commit window's "Claude" changelist.
+    pub changed_at: SystemTime,
 }
 
 /// What [`Session::apply`] changed: the chat redraws, the window notifies, opens a diff.
@@ -639,14 +647,16 @@ impl Session {
         }
     }
 
-    /// The first request to the CLI: registers the edit hook (the user's changes to an edit reach
-    /// Claude through it).
+    /// The first request to the CLI: registers the edit hook (the user's changes to an edit, and
+    /// the problems language servers find after it, reach Claude through it). Its timeout leaves
+    /// the window time to ask the language server ([`EDIT_HOOK_TIMEOUT`]).
     pub fn initialize_request() -> HostRequest {
         HostRequest::Initialize(json!({
             "hooks": {
                 "PostToolUse": [{
                     "matcher": "Edit|MultiEdit|Write",
                     "hookCallbackIds": [EDIT_HOOK],
+                    "timeout": EDIT_HOOK_TIMEOUT.as_secs(),
                 }],
             },
         }))
@@ -654,6 +664,105 @@ impl Session {
 
     pub fn is_working(&self) -> bool {
         self.status.is_working()
+    }
+
+    /// These files leave the review (committed, rolled back to their text before Claude): Claude's
+    /// next change of one records its text at that moment as the new original.
+    pub fn forget_changed_files(&mut self, paths: &[PathBuf]) -> Vec<Change> {
+        let before = self.changed_files.len();
+        self.changed_files
+            .retain(|file| !paths.iter().any(|path| path == &file.path));
+        if self.changed_files.len() == before {
+            return Vec::new();
+        }
+        vec![Change::FilesChanged(paths.to_vec())]
+    }
+
+    /// The file Claude changed, if it did in this session.
+    pub fn changed_file(&self, path: &Path) -> Option<&ChangedFile> {
+        self.changed_files.iter().find(|file| file.path == path)
+    }
+
+    /// The conversation read from a saved session's transcript ([`crate::transcript::load`])
+    /// joins this one, which may already have gone on (a message sent while the transcript was
+    /// being read, the process started): the saved entries go first, under new ids; what this
+    /// session already knows wins.
+    pub fn prepend_history(&mut self, mut saved: Session) -> Vec<Change> {
+        fn renumber(entries: &mut [Entry], next: &mut EntryId) {
+            for entry in entries {
+                entry.id = *next;
+                *next += 1;
+                if let EntryKind::Tool(tool) = &mut entry.kind {
+                    renumber(&mut tool.children, next);
+                }
+            }
+        }
+        renumber(&mut saved.entries, &mut self.next_id);
+        saved.entries.append(&mut self.entries);
+        self.entries = saved.entries;
+        for file in saved.changed_files {
+            if !self.changed_files.iter().any(|known| known.path == file.path) {
+                self.changed_files.push(file);
+            }
+        }
+        if self.tasks.is_empty() {
+            self.tasks = saved.tasks;
+        }
+        let info = &mut self.info;
+        info.session_id = info.session_id.take().or(saved.info.session_id);
+        info.title = info.title.take().or(saved.info.title);
+        info.model = info.model.take().or(saved.info.model);
+        vec![
+            Change::Entries,
+            Change::Title,
+            Change::Info,
+            Change::Tasks,
+        ]
+    }
+
+    // --- Reading a saved session (`crate::transcript`) ---
+
+    /// A message of the user in a saved conversation: shown as sent, the status stays.
+    pub(crate) fn restore_user(
+        &mut self,
+        uuid: Option<String>,
+        text: String,
+        images: Vec<ImageAttachment>,
+    ) {
+        self.push(EntryKind::User(UserEntry {
+            uuid,
+            text,
+            images,
+            queued: false,
+            cancelled: false,
+        }));
+    }
+
+    pub(crate) fn restore_entry(&mut self, kind: EntryKind) {
+        self.push(kind);
+    }
+
+    /// The time of a saved change: of two sessions, the later one owns the file.
+    pub(crate) fn restore_changed_at(&mut self, path: &Path, at: SystemTime) {
+        if let Some(file) = self.changed_files.iter_mut().find(|file| file.path == path) {
+            file.changed_at = at;
+        }
+    }
+
+    /// The last entry of the main conversation, if any.
+    pub(crate) fn last_entry(&self) -> Option<&EntryKind> {
+        self.entries.last().map(|entry| &entry.kind)
+    }
+
+    /// The saved conversation is read: nothing streams or runs any more, nothing waits for the
+    /// user; the session is idle until a message resumes it.
+    pub(crate) fn finish_restore(&mut self) {
+        self.finish_streaming();
+        self.mark_running(ToolState::Interrupted);
+        self.pending.clear();
+        self.background.clear();
+        self.partial_inputs.clear();
+        self.status = Status::Idle;
     }
 
     pub fn pending(&self, id: &str) -> Option<&Pending> {
@@ -1357,12 +1466,15 @@ impl Session {
                                     Value::Null if result["type"] == "create" => Some(None),
                                     _ => None,
                                 });
-                        if let Some(original) = original
-                            && !self.changed_files.iter().any(|file| file.path == path)
+                        if let Some(file) =
+                            self.changed_files.iter_mut().find(|file| file.path == path)
                         {
+                            file.changed_at = SystemTime::now();
+                        } else if let Some(original) = original {
                             self.changed_files.push(ChangedFile {
                                 path: path.clone(),
                                 original,
+                                changed_at: SystemTime::now(),
                             });
                         }
                         changes.push(Change::FilesChanged(vec![path]));

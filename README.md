@@ -49,6 +49,12 @@ usages, rename across the project and reformat — for Rust, Go, Python, TypeScr
 YAML, JSON, Bash and Markdown. Flux uses the language servers you already have and quietly installs the
 missing ones in the background.
 
+Press <kbd>⌥</kbd><kbd>↵</kbd> on an error for the quick fixes and refactorings the language server
+offers, as in JetBrains IDEs, or right-click the code for everything else: go to, find usages, rename,
+reformat, Git and Claude.
+
+<img src="docs/images/context-actions.png" alt="⌥↵ on an error: the language server's quick fix and refactorings, and Claude to fix or explain the code" width="100%">
+
 ### A terminal built in
 
 Your own shell with its prompt and colours, in a panel under the editor or as a tab next to your
@@ -145,6 +151,23 @@ and the mode, and keep an eye on your subscription's limits in the status bar. F
 
 <img src="docs/images/claude-question.png" alt="Claude asks a question with options to choose from, right in the chat" width="100%">
 
+Ask about code right where it is: from the editor's menu or <kbd>⌥</kbd><kbd>↵</kbd>, Claude explains
+the selection, fixes the errors in it, looks for bugs, writes tests or documentation — each request in
+a fresh session named after it. Send files and folders from the tree or a tab, or drop them on the chat.
+Claude sees what Flux sees: it asks the language servers for errors, definitions and usages, and learns
+about the errors its edit caused right after making it.
+
+Everything Claude changed in a session gathers in its own changelist in the commit window. Compare a
+file with its text before Claude, roll back a file or a single change, and commit Claude's work with
+one checkbox — Claude can even write the commit message, in the style of your history.
+
+<img src="docs/images/claude-review.png" alt="The commit window with Claude's changelist, a file compared with its text before Claude, and the session on the right" width="100%">
+
+Pick up any earlier conversation of the project — started in Flux or in the terminal — from the history
+(or type `/resume`), and the sessions you had open come back when you reopen the project.
+
+<img src="docs/images/claude-history.png" alt="The history of the project's Claude sessions with search, branch and time" width="100%">
+
 ### Keyboard first, in your language
 
 Every command is in the command palette with its shortcut, and the keys are familiar if you come from
@@ -173,6 +196,7 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>P</kbd> | All commands |
 | <kbd>⌘</kbd><kbd>F</kbd> · <kbd>⌘</kbd><kbd>R</kbd> | Find · replace in a file |
 | <kbd>⌘</kbd><kbd>B</kbd> · <kbd>⌥</kbd><kbd>F7</kbd> | Go to definition · find usages |
+| <kbd>⌥</kbd><kbd>↵</kbd> | Quick fixes and context actions, Fix with Claude |
 | <kbd>⇧</kbd><kbd>F6</kbd> | Rename everywhere |
 | <kbd>⌘</kbd><kbd>1</kbd> | Show or hide the project tree |
 | <kbd>⌥</kbd><kbd>F12</kbd> · <kbd>⌘</kbd><kbd>T</kbd> | Show or hide the terminal · new terminal |
@@ -196,7 +220,7 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 - [x] Notification center and unified dialogs
 - [x] Plugins: sandboxed plugins, the plugin manager, a TODO window
 - [x] Claude Code: a chat that runs your `claude`, with every edit as a diff
-- [ ] Claude Code: a review of Claude's changes, session history, the editor's menu
+- [x] Claude Code: a review of Claude's changes, session history, the editor's menu
 - [ ] Plugins: an API for more integrations; a catalog, themes, file icons and languages as plugins
 - [ ] Public beta
 

@@ -281,7 +281,7 @@ pub(crate) fn apply_workspace_edit(
 
 /// A file may come several times (`documentChanges`), each batch of edits relative to the text
 /// after the previous ones: the batches are grouped per file, in order.
-fn group_by_file(files: Vec<(PathBuf, Vec<TextEdit>)>) -> Vec<(PathBuf, Vec<Vec<TextEdit>>)> {
+pub(crate) fn group_by_file(files: Vec<(PathBuf, Vec<TextEdit>)>) -> Vec<(PathBuf, Vec<Vec<TextEdit>>)> {
     let mut grouped: Vec<(PathBuf, PathBuf, Vec<Vec<TextEdit>>)> = Vec::new();
     for (path, edits) in files {
         let key = canonical(&path);
@@ -299,7 +299,7 @@ fn group_by_file(files: Vec<(PathBuf, Vec<TextEdit>)>) -> Vec<(PathBuf, Vec<Vec<
 /// Edits of the original text that the batches amount to, with the document's line endings. One
 /// batch is used as it is; several are applied in turn to a copy, and the result becomes one
 /// replacement of the span that differs — still one undo step.
-fn document_edits(
+pub(crate) fn document_edits(
     text: &Rope,
     batches: &[Vec<TextEdit>],
     line_ending: &str,
@@ -342,7 +342,7 @@ pub(crate) fn difference(old: &Rope, new: &Rope) -> Option<(Range<usize>, String
 }
 
 /// Applies edit batches to a file that isn't open: read, edit, atomic write.
-fn apply_to_file(path: &Path, batches: &[Vec<TextEdit>]) -> io::Result<()> {
+pub(crate) fn apply_to_file(path: &Path, batches: &[Vec<TextEdit>]) -> io::Result<()> {
     if !path.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,

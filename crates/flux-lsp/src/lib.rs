@@ -17,7 +17,7 @@ pub mod sync;
 mod client;
 mod transport;
 
-pub use client::{LanguageServer, RequestError, ServerEvent};
+pub use client::{ApplyEdit, LanguageServer, RequestError, ServerEvent};
 pub use config::{
     Install, ServerConfig, default_servers, language_id, server_for_path, servers_for_path,
 };

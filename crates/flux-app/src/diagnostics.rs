@@ -170,6 +170,23 @@ impl Diagnostics {
         found
     }
 
+    /// Every diagnostic, by start (Flux's tools for Claude, the context of ⌥↵).
+    pub fn iter(&self) -> std::slice::Iter<'_, Diagnostic> {
+        self.items.iter()
+    }
+
+    /// Diagnostics that touch `range` (an empty one — when it lies in it), in order: Fix with
+    /// Claude takes those of the selection.
+    pub fn in_range(&self, range: Range<usize>) -> Vec<&Diagnostic> {
+        self.items
+            .iter()
+            .filter(|d| {
+                d.range.start < range.end && d.range.end > range.start
+                    || d.range.is_empty() && range.contains(&d.range.start)
+            })
+            .collect()
+    }
+
     /// Errors and warnings, for the status bar.
     pub fn counts(&self) -> (usize, usize) {
         let count = |severity| self.items.iter().filter(|d| d.severity == severity).count();
@@ -349,8 +366,9 @@ pub fn prepaint(
     paint
 }
 
-/// F2 / Shift+F2: the cursor goes to the start of the next / previous problem, its message goes to
-/// the status bar.
+/// F2 / Shift+F2: the cursor goes to the start of the next / previous problem; its popup shows at
+/// the caret (as JetBrains' error tooltip: Fix with Claude, More actions… ⌥↵) and its message goes
+/// to the status bar.
 fn go_to_problem(editor: &mut Editor, forward: bool, cx: &mut Context<Editor>) {
     let head = editor.document.selection().primary().head;
     let Some(stop) = editor.diagnostics.next_stop(head, forward) else {
@@ -360,6 +378,7 @@ fn go_to_problem(editor: &mut Editor, forward: bool, cx: &mut Context<Editor>) {
     let (start, summary) = (stop.range.start, stop.summary());
     editor.select_range(start..start, cx);
     editor.show_status(summary.into(), cx);
+    crate::hover::show_problem(editor, start, cx);
 }
 
 /// Registers the editor actions of this module.
@@ -427,6 +446,30 @@ mod tests {
 
     fn ranges(diagnostics: &Diagnostics) -> Vec<Range<usize>> {
         diagnostics.items.iter().map(|d| d.range.clone()).collect()
+    }
+
+    #[test]
+    fn a_range_takes_the_diagnostics_that_touch_it() {
+        let mut diagnostics = Diagnostics::default();
+        diagnostics.set(
+            1,
+            vec![
+                diagnostic(0, 4, Severity::Error),
+                diagnostic(10, 10, Severity::Warning),
+                diagnostic(12, 20, Severity::Error),
+                diagnostic(30, 35, Severity::Info),
+            ],
+        );
+        let found = |range: Range<usize>| -> Vec<Range<usize>> {
+            diagnostics
+                .in_range(range)
+                .into_iter()
+                .map(|d| d.range.clone())
+                .collect()
+        };
+        assert_eq!(found(3..12), vec![0..4, 10..10]);
+        assert_eq!(found(19..31), vec![12..20, 30..35]);
+        assert_eq!(found(21..29), Vec::<Range<usize>>::new());
     }
 
     fn change(len: usize, changes: Vec<(usize, usize, Option<&str>)>) -> ChangeSet {
