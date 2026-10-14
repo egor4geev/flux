@@ -371,28 +371,52 @@ pub fn sync(
 
 /// The list's items over `entries`: one per shown entry, Claude's minor steps in a row as one
 /// group. Hidden entries (thinking without text, an empty text) belong to no item and don't break
-/// a group.
+/// a group. A lone minor step is its own item: a group of one thought would be «Thought» opening
+/// to another «Thought» (the author, after 10.2).
 pub(crate) fn items(entries: &[Entry]) -> Vec<Item> {
+    /// The group being gathered: its first and past-the-last entries, how many it shows.
+    struct Open {
+        start: usize,
+        end: usize,
+        shown: usize,
+    }
+    fn close(open: Open, items: &mut Vec<Item>) {
+        items.push(match open.shown {
+            1 => Item::Entry(open.start),
+            _ => Item::Group {
+                start: open.start,
+                end: open.end,
+            },
+        });
+    }
     let mut items = Vec::new();
-    let mut group: Option<(usize, usize)> = None;
+    let mut group: Option<Open> = None;
     for (index, entry) in entries.iter().enumerate() {
         if is_hidden(&entry.kind) {
             continue;
         }
         if is_minor(&entry.kind) {
             group = Some(match group {
-                Some((start, _)) => (start, index + 1),
-                None => (index, index + 1),
+                Some(open) => Open {
+                    end: index + 1,
+                    shown: open.shown + 1,
+                    ..open
+                },
+                None => Open {
+                    start: index,
+                    end: index + 1,
+                    shown: 1,
+                },
             });
             continue;
         }
-        if let Some((start, end)) = group.take() {
-            items.push(Item::Group { start, end });
+        if let Some(open) = group.take() {
+            close(open, &mut items);
         }
         items.push(Item::Entry(index));
     }
-    if let Some((start, end)) = group {
-        items.push(Item::Group { start, end });
+    if let Some(open) = group {
+        close(open, &mut items);
     }
     items
 }
@@ -4714,13 +4738,14 @@ mod tests {
             kind: EntryKind::Tool(Box::new(tool("Bash", json!({ "command": "ls" }), None))),
         };
         let entries = vec![read(1), text(2, ""), read(3), text(4, "Done."), bash, read(6)];
+        // A lone step (the last read) is its own item, not a group of one.
         assert_eq!(
             items(&entries),
             [
                 Item::Group { start: 0, end: 3 },
                 Item::Entry(3),
                 Item::Entry(4),
-                Item::Group { start: 5, end: 6 },
+                Item::Entry(5),
             ]
         );
         let shown: Vec<&Entry> = entries[..3].iter().collect();
