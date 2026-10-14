@@ -490,7 +490,7 @@ pub fn render(
     let button =
         |id: &'static str, name: IconName, label: &'static str, action: &dyn gpui::Action| {
             ui::icon_button(id, name, ui)
-                .tooltip(ui::tooltip(label, ui::shortcut_for(action, window)))
+                .tooltip(ui::tooltip(label, ui::shortcut_for(action, cx)))
         };
     let toolbar = div()
         .flex_none()

@@ -529,8 +529,8 @@ impl Renderer<'_> {
                 tokens,
                 streaming,
                 duration,
-                started,
-            } => self.thinking(entry.id, text, *tokens, *streaming, *duration, *started),
+                ..
+            } => self.thinking(entry.id, text, *tokens, *streaming, *duration),
             EntryKind::Tool(tool) => self.tool(entry.id, tool, depth),
             EntryKind::Notice(notice) => self.notice(notice),
             EntryKind::TurnEnd(summary) => self.turn_end(entry.id, summary),
@@ -757,19 +757,9 @@ impl Renderer<'_> {
         tokens: u64,
         streaming: bool,
         duration: Option<Duration>,
-        started: Instant,
     ) -> AnyElement {
         let ui = self.ui;
-        let label = if streaming {
-            if tokens > 0 {
-                trf("Thinking… {0} tokens", &[&format_tokens(tokens)])
-            } else {
-                tr("Thinking…").to_string()
-            }
-        } else {
-            let duration = duration.unwrap_or_else(|| started.elapsed());
-            trf("Thought for {0}", &[&format_duration(duration)])
-        };
+        let label = thinking_label(streaming, tokens, duration);
         let expandable = !text.trim().is_empty();
         let expanded = expandable && self.state.expanded(id, false);
         let row = div()
@@ -1846,7 +1836,7 @@ fn activity_line(model: &Session, ui: UiColors) -> Option<AnyElement> {
     match &model.status {
         Status::Working { since, activity } => {
             let (label, tokens) = activity_label(activity, model);
-            let mut details = vec![format_duration(since.elapsed())];
+            let mut details = vec![format_elapsed(since.elapsed())];
             if let Some(tokens) = tokens.filter(|tokens| *tokens > 0) {
                 details.push(trf("{0} tokens", &[&format_tokens(tokens)]));
             }
@@ -2355,7 +2345,33 @@ fn first_changed_line(structured: &Value) -> Option<usize> {
         .map(|line| line.saturating_sub(1))
 }
 
-/// "350 ms", "12 s", "1 min 5 s", "1 h 2 min".
+/// The row of a thought: "Thinking…" while it streams; then how long it took — or just
+/// "Thought" when that is unknown (it came whole: a saved conversation, a subagent) or under a
+/// second (no "0 s" or milliseconds).
+fn thinking_label(streaming: bool, tokens: u64, duration: Option<Duration>) -> String {
+    if streaming {
+        return if tokens > 0 {
+            trf("Thinking… {0} tokens", &[&format_tokens(tokens)])
+        } else {
+            tr("Thinking…").to_string()
+        };
+    }
+    match duration.filter(|duration| duration.as_secs() > 0) {
+        Some(duration) => trf("Thought for {0}", &[&format_duration(duration)]),
+        None => tr("Thought").to_string(),
+    }
+}
+
+/// A live clock, as the CLI's: whole seconds from "0 s" ("0 s", "12 s", "1 min 5 s") — no
+/// milliseconds flickering through the first second.
+pub(crate) fn format_elapsed(elapsed: Duration) -> String {
+    match elapsed.as_secs() {
+        0 => trf("{0} s", &[&0]),
+        _ => format_duration(elapsed),
+    }
+}
+
+/// "350 ms", "12 s", "1 min 5 s", "1 h 2 min": how long something finished took.
 pub(crate) fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     if seconds == 0 {
@@ -2573,6 +2589,30 @@ mod tests {
         assert_eq!(format_tokens(1_234), "1.2k");
         assert_eq!(format_tokens(35_400), "35k");
         assert_eq!(format_tokens(1_250_000), "1.2M");
+    }
+
+    #[test]
+    fn live_clocks_count_whole_seconds_from_zero() {
+        assert_eq!(format_elapsed(Duration::ZERO), "0 s");
+        assert_eq!(format_elapsed(Duration::from_millis(350)), "0 s");
+        assert_eq!(format_elapsed(Duration::from_millis(1_999)), "1 s");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1 min 5 s");
+    }
+
+    #[test]
+    fn a_thought_shows_its_time_only_when_it_is_known() {
+        assert_eq!(thinking_label(true, 0, None), "Thinking…");
+        assert_eq!(thinking_label(true, 1_234, None), "Thinking… 1.2k tokens");
+        assert_eq!(
+            thinking_label(false, 0, Some(Duration::from_millis(6_002))),
+            "Thought for 6 s"
+        );
+        // Came whole (a saved conversation), or under a second: no "0 s", no milliseconds.
+        assert_eq!(thinking_label(false, 0, None), "Thought");
+        assert_eq!(
+            thinking_label(false, 0, Some(Duration::from_millis(2))),
+            "Thought"
+        );
     }
 
     #[test]

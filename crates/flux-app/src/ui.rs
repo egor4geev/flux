@@ -5,8 +5,8 @@
 
 use gpui::{
     Action, AnyView, App, BoxShadow, Context, Div, ElementId, FocusHandle, FontWeight, Hsla,
-    IntoElement, KeyBinding, Render, SharedString, Stateful, Window, div, linear_color_stop,
-    linear_gradient, point, prelude::*, px,
+    IntoElement, KeyBinding, KeyContext, Keymap, Render, SharedString, Stateful, Window, div,
+    linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 
 use crate::command_palette::keystroke_label;
@@ -524,31 +524,64 @@ fn split_keys(group: &str) -> Vec<String> {
     keys
 }
 
-/// The shortcut of an action's first binding in macOS symbols ("⇧⌘P"), for tooltips and buttons.
-/// Bindings are looked up along the path from the focused element (previous frame).
-pub fn shortcut_for(action: &dyn Action, window: &Window) -> Option<SharedString> {
-    shortcut_label(&window.bindings_for_action(action))
+/// The shortcut of an action in macOS symbols ("⇧⌘P"), for tooltips and buttons: its first binding
+/// that works at the window's level, else its first binding in the key context it has (a panel's
+/// own keys). It doesn't depend on the focus: gpui's `Window::bindings_for_action` goes by the key
+/// contexts of whatever the last frame painted last — a dialog, a tooltip, a popup — and the labels
+/// came and went with them (part 10.1).
+pub fn shortcut_for(action: &dyn Action, cx: &App) -> Option<SharedString> {
+    action_binding(action, cx).map(|binding| shortcut_label(&binding))
 }
 
 /// The same, as if focus were in `focus`: a panel's buttons show its keys even when focus is
-/// elsewhere (the tree header, the find bar buttons).
+/// elsewhere (the tree header, the find bar buttons). Until the panel is drawn (its first frame),
+/// as [`shortcut_for`].
 pub fn shortcut_in(
     action: &dyn Action,
     focus: &FocusHandle,
     window: &Window,
+    cx: &App,
 ) -> Option<SharedString> {
-    shortcut_label(&window.bindings_for_action_in(action, focus))
+    match window.bindings_for_action_in(action, focus).first() {
+        Some(binding) => Some(shortcut_label(binding)),
+        None => shortcut_for(action, cx),
+    }
 }
 
-fn shortcut_label(bindings: &[KeyBinding]) -> Option<SharedString> {
-    let binding = bindings.first()?;
-    let label = binding
+/// The binding an action's label shows ([`shortcut_for`]).
+pub fn action_binding(action: &dyn Action, cx: &App) -> Option<KeyBinding> {
+    label_binding(&cx.key_bindings().borrow(), action)
+}
+
+/// The first binding of `action` that the window's own key context (`Workspace`) reaches and
+/// nothing there shadows, else the first binding it has in any context.
+fn label_binding(keymap: &Keymap, action: &dyn Action) -> Option<KeyBinding> {
+    let mut window_level = KeyContext::default();
+    window_level.add("Workspace");
+    let contexts = [window_level];
+    let mut first = None;
+    for binding in keymap.bindings_for_action(action) {
+        let (found, _) = keymap.bindings_for_input(binding.keystrokes(), &contexts);
+        if found
+            .first()
+            .is_some_and(|found| found.action().partial_eq(action))
+        {
+            return Some(binding.clone());
+        }
+        first.get_or_insert_with(|| binding.clone());
+    }
+    first
+}
+
+/// A binding's keys in macOS symbols, a chord's keystrokes apart.
+pub fn shortcut_label(binding: &KeyBinding) -> SharedString {
+    binding
         .keystrokes()
         .iter()
         .map(|k| keystroke_label(k.modifiers(), k.key()))
         .collect::<Vec<_>>()
-        .join(" ");
-    Some(label.into())
+        .join(" ")
+        .into()
 }
 
 /// Badge: a number or a short label in `color` on a backdrop of the same hue.
@@ -653,5 +686,35 @@ mod tests {
         assert_eq!(split_keys("⌘PgUp"), ["⌘", "PgUp"]);
         assert_eq!(split_keys("F2"), ["F2"]);
         assert_eq!(split_keys("⌥⌘"), ["⌥", "⌘"]);
+    }
+
+    gpui::actions!(
+        label_test,
+        [Commit, ClearTerminal, MentionSelection, HideApp, NewTab, Unbound]
+    );
+
+    /// The label's binding doesn't depend on where the focus is: the window's own key first (a
+    /// context-dependent key goes to the window's action), else the action's binding wherever it
+    /// works.
+    #[test]
+    fn labels_take_the_window_level_binding_then_any() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("cmd-k", Commit, Some("Workspace")),
+            KeyBinding::new("cmd-k", ClearTerminal, Some("Terminal")),
+            KeyBinding::new("alt-cmd-k", MentionSelection, Some("Editor")),
+            KeyBinding::new("cmd-h", HideApp, None),
+            KeyBinding::new("cmd-t", NewTab, Some("Terminal")),
+            KeyBinding::new("ctrl-t", NewTab, Some("Workspace")),
+        ]);
+        let label = |action: &dyn Action| {
+            label_binding(&keymap, action).map(|binding| shortcut_label(&binding).to_string())
+        };
+        assert_eq!(label(&Commit).as_deref(), Some("⌘K"));
+        assert_eq!(label(&ClearTerminal).as_deref(), Some("⌘K"));
+        assert_eq!(label(&MentionSelection).as_deref(), Some("⌥⌘K"));
+        assert_eq!(label(&HideApp).as_deref(), Some("⌘H"));
+        // Bound in a panel first, at the window's level after: the window's key is shown.
+        assert_eq!(label(&NewTab).as_deref(), Some("⌃T"));
+        assert_eq!(label(&Unbound), None);
     }
 }

@@ -355,7 +355,7 @@ impl Focusable for UpdateDialog {
 impl Render for UpdateDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        let keys = ui::shortcut_in(&Confirm, &self.focus_handle, window);
+        let keys = ui::shortcut_in(&Confirm, &self.focus_handle, window, cx);
         ui::popover(ui)
             .key_context("UpdateDialog")
             .track_focus(&self.focus_handle)
@@ -787,7 +787,7 @@ impl Focusable for PullDialog {
 }
 
 impl Render for PullDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let can_pull = self.can_pull(cx);
         let git = self.git.read(cx);
@@ -798,7 +798,7 @@ impl Render for PullDialog {
             .unwrap_or_else(|| tr("detached HEAD").to_string());
         let remote = self.remote_name().unwrap_or("—").to_string();
         let several_remotes = self.refs.remotes.len() > 1;
-        let keys = ui::shortcut_for(&Confirm, window);
+        let keys = ui::shortcut_for(&Confirm, cx);
         let chip = |id: &'static str, text: String, cycles: bool, tooltip: &'static str| {
             div()
                 .id(id)

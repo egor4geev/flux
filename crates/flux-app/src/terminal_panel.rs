@@ -578,7 +578,7 @@ impl TerminalPanel {
         let new_terminal = ui::icon_button("terminal-new", IconName::Plus, ui)
             .tooltip(ui::tooltip(
                 tr("New Terminal"),
-                ui::shortcut_for(&NewTerminal, window),
+                ui::shortcut_for(&NewTerminal, cx),
             ))
             .on_click(
                 cx.listener(|this, _: &ClickEvent, window, cx| this.new_terminal(window, cx)),
@@ -596,8 +596,8 @@ impl TerminalPanel {
         // Keys as in a terminal, even while focus is elsewhere.
         let terminal_focus = self.active_group().map(|group| group.focus_handle(cx));
         let keys = |action: &dyn Action| match &terminal_focus {
-            Some(focus) => ui::shortcut_in(action, focus, window),
-            None => ui::shortcut_for(action, window),
+            Some(focus) => ui::shortcut_in(action, focus, window, cx),
+            None => ui::shortcut_for(action, cx),
         };
         let error = (!self.tabs.is_empty())
             .then(|| self.error.clone())
@@ -814,7 +814,7 @@ impl TerminalPanel {
     }
 
     /// No tabs: why the last terminal didn't start (and a retry), or a way to open one.
-    fn render_empty(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let (glyph, color, text) = match &self.error {
             Some(error) => (IconName::Warning, ui.error, error.clone()),
@@ -828,7 +828,7 @@ impl TerminalPanel {
         let keys = self
             .error
             .is_none()
-            .then(|| ui::shortcut_for(&NewTerminal, window))
+            .then(|| ui::shortcut_for(&NewTerminal, cx))
             .flatten();
         div()
             .flex_1()
@@ -961,7 +961,7 @@ impl Render for TerminalPanel {
                 .pb_1p5()
                 .child(group)
                 .into_any_element(),
-            None => self.render_empty(window, cx).into_any_element(),
+            None => self.render_empty(cx).into_any_element(),
         };
         div()
             .track_focus(&self.focus_handle)

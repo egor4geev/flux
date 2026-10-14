@@ -2338,7 +2338,7 @@ impl CommitPanel {
                       label: &'static str,
                       action: Box<dyn Action>,
                       on: Option<bool>| {
-            let keys = ui::shortcut_in(action.as_ref(), &self.focus_handle, window);
+            let keys = ui::shortcut_in(action.as_ref(), &self.focus_handle, window, cx);
             let button = match on {
                 Some(on) => ui::toggle_button(id, name, on, ui),
                 None => ui::icon_button(id, name, ui),
@@ -2800,13 +2800,13 @@ impl CommitPanel {
             .into_any_element()
     }
 
-    fn render_footer(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let merging = !self.merging_repos(cx).is_empty();
         // A merge whose result is HEAD's tree has no changes, and still needs its commit.
         let can_commit = !self.committing && (!self.changes.is_empty() || merging);
-        let commit_keys = ui::shortcut_for(&CommitChanges, window);
-        let push_keys = ui::shortcut_for(&CommitAndPush, window);
+        let commit_keys = ui::shortcut_for(&CommitChanges, cx);
+        let push_keys = ui::shortcut_for(&CommitAndPush, cx);
         div()
             .flex_none()
             .px_2()
@@ -3692,7 +3692,7 @@ impl CommitPanel {
             .child(ui::divider(ui).mx(px(ui::GAP)))
             .child(div().h_2())
             .child(self.render_message(window, cx))
-            .child(self.render_footer(window, cx))
+            .child(self.render_footer(cx))
     }
 }
 

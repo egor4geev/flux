@@ -1152,7 +1152,7 @@ impl RebaseDialog {
                       action: RebaseAction,
                       key: Box<dyn gpui::Action>,
                       cx: &mut Context<Self>| {
-            let keys = ui::shortcut_in(key.as_ref(), &focus, window);
+            let keys = ui::shortcut_in(key.as_ref(), &focus, window, cx);
             ui::text_button(id, tr(label), false, ui)
                 .tooltip(ui::tooltip(tr(label), keys))
                 .on_click(
@@ -1165,7 +1165,7 @@ impl RebaseDialog {
                      up: bool,
                      key: Box<dyn gpui::Action>,
                      cx: &mut Context<Self>| {
-            let keys = ui::shortcut_in(key.as_ref(), &focus, window);
+            let keys = ui::shortcut_in(key.as_ref(), &focus, window, cx);
             ui::icon_button(id, icon, ui)
                 .tooltip(ui::tooltip(tr(label), keys))
                 .on_click(

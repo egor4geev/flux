@@ -7,14 +7,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use flux_core::Document;
+use flux_core::{Document, Selection};
 use flux_fs::remap;
 use gpui::{
     Action, AnyElement, AnyView, App, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, Context,
     DismissEvent, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Global,
     KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    Point, Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
-    WindowHandle, actions, anchored, deferred, div, prelude::*, px, relative,
+    Point, Render, ScrollHandle, SharedString, Subscription, Task, TitlebarOptions, WeakEntity,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowId, WindowOptions,
+    actions, anchored, deferred, div, point, prelude::*, px, relative, size,
 };
 
 use crate::claude::{self, ClaudeStore, ClaudeStoreEvent};
@@ -41,6 +42,10 @@ use crate::notifications::{self, Notification};
 use crate::notifications_panel::{self, NotificationsPanel};
 use crate::plugins::{self, PluginStore, PluginStoreEvent, ToolKey};
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
+use crate::project_state::{
+    self, LeftIsland, OpenProjects, ProjectState, RightIsland, SavedBounds, SavedTab,
+};
+use crate::settings::OpenProjectIn;
 use crate::start_screen::{self, StartScreen};
 use crate::terminal_group::{DraggedTerminal, TerminalGroup, TerminalGroupEvent};
 use crate::terminal_panel::{self, TerminalPanel, TerminalPanelEvent};
@@ -79,6 +84,13 @@ const OPERATION_ACTIONS: &[&str] = &[
 /// How long a status bar message stays while a terminal tab is active (an editor keeps its own until
 /// the next edit).
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
+/// The project's state is saved this long after its tabs or layout changed (part 10.1): a burst of
+/// changes is one write, and a crash loses little.
+const STATE_SAVE_DELAY: Duration = Duration::from_millis(1500);
+/// A window's size when nothing else says it (the first launch, a project never opened).
+const WINDOW_SIZE: (f32, f32) = (1240., 820.);
+/// A new window opens this far right and down from the window it was opened from, as in macOS.
+const CASCADE: f32 = 28.;
 
 actions!(
     workspace,
@@ -107,6 +119,13 @@ pub struct OpenProject(pub PathBuf);
 pub fn init(cx: &mut App) {
     bind_keys(cx);
     cx.on_action(quit);
+    // Quitting (⌘Q, Quit in the Dock, logging out): every window saves its project's state, and the
+    // open project windows are remembered for the next launch.
+    cx.on_app_quit(|cx| {
+        save_windows(cx);
+        async {}
+    })
+    .detach();
 }
 
 fn bind_keys(cx: &mut App) {
@@ -237,7 +256,29 @@ pub struct Workspace {
     claude_attention: HashMap<(EntityId, String), crate::notification_center::NotificationId>,
     /// The context menu of an editor tab (the right button).
     tab_menu: Option<TabMenu>,
+    /// The window's frame as it last changed: saved with the project's state.
+    window_bounds: Option<WindowBounds>,
+    /// What the project's state depends on besides the carets, as last drawn: when it changes, a
+    /// save is scheduled.
+    layout: Option<LayoutKey>,
+    /// The project's state as last saved (part 10.1): an unchanged one isn't written again.
+    saved_state: Option<ProjectState>,
+    /// Saves the state a moment after the tabs or the layout changed.
+    state_save: Option<Task<()>>,
+    /// The saved tabs are being read back: until they are in, nothing is saved (the half-restored
+    /// window would be saved over the whole one).
+    restoring: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The tabs (by item), the active one and the islands: a change of any of them is a change of the
+/// project's saved state.
+#[derive(Clone, PartialEq)]
+struct LayoutKey {
+    tabs: Vec<EntityId>,
+    active: usize,
+    islands: [bool; 4],
+    right: Option<RightTool>,
 }
 
 /// A tool window of the island on the right: Notifications, Claude, or a plugin's window.
@@ -328,6 +369,17 @@ impl TabItem {
         match self {
             TabItem::Claude(chat) => Some(chat),
             _ => None,
+        }
+    }
+
+    fn entity_id(&self) -> EntityId {
+        match self {
+            TabItem::Editor(editor) => editor.entity_id(),
+            TabItem::Terminal(group) => group.entity_id(),
+            TabItem::Diff(view) => view.entity_id(),
+            TabItem::Merge(view) => view.entity_id(),
+            TabItem::Log(view) => view.entity_id(),
+            TabItem::Claude(chat) => chat.entity_id(),
         }
     }
 
@@ -475,7 +527,16 @@ impl Workspace {
                 if window.is_window_active() {
                     this.git.update(cx, |git, cx| git.refresh(cx));
                     this.sync_documents(None, cx);
+                    // The window in front is the one to come back in front after a restart.
+                    cx.defer(|cx| remember_open_projects(None, cx));
+                } else {
+                    // The carets and the scroll aren't watched: leaving the window saves them.
+                    this.save_state(cx);
                 }
+            }),
+            cx.observe_window_bounds(window, |this, window, cx| {
+                this.window_bounds = Some(window.window_bounds());
+                this.schedule_state_save(cx);
             }),
             cx.observe(&find_bar, |_, _, cx| cx.notify()),
             cx.observe(&project_search, |_, _, cx| cx.notify()),
@@ -553,11 +614,18 @@ impl Workspace {
             claude_last_editor: None,
             claude_attention: HashMap::new(),
             tab_menu: None,
+            window_bounds: Some(window.window_bounds()),
+            layout: None,
+            saved_state: None,
+            state_save: None,
+            restoring: false,
             _subscriptions: subscriptions,
         };
-        if !paths.is_empty() {
-            workspace.open_paths(paths, Source::CommandLine, window, cx);
-        }
+        // The project comes back as it was left (part 10.1); the files from the command line open
+        // after its documents.
+        let state = workspace.root.as_deref().and_then(project_state::load);
+        workspace.restore_state(state, paths, Source::CommandLine, window, cx);
+        cx.defer(|cx| remember_open_projects(None, cx));
         workspace
     }
 
@@ -609,6 +677,369 @@ impl Workspace {
         }
         self.reveal_active(cx);
         cx.notify();
+    }
+
+    // --- Projects and windows (part 10.1) ---
+
+    /// Opens a project (a recent one, ⌘O with a folder), as JetBrains IDEs do: the window that has
+    /// it comes forward; a window without a project takes it; otherwise it opens in this window or
+    /// a new one, as Settings → System Settings → "Open project in" says (asking by default).
+    /// `files` open in the project's window.
+    pub(crate) fn open_project(
+        &mut self,
+        root: PathBuf,
+        files: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let root = fs::canonicalize(&root).unwrap_or(root);
+        if !root.is_dir() {
+            // A folder from the recent list may have disappeared since.
+            let message = trf("Folder not found: {0}", &[&tilde(&root)]);
+            return self.notify(Notification::warning(message), cx);
+        }
+        if self.root.as_ref() == Some(&root) {
+            return self.open_paths(files, Source::Dialog, window, cx);
+        }
+        if let Some(handle) = project_window(&root, cx) {
+            handle
+                .update(cx, |workspace, window, cx| {
+                    window.activate_window();
+                    workspace.open_paths(files, Source::Dialog, window, cx);
+                })
+                .ok();
+            #[cfg(feature = "scenario")]
+            crate::scenario::target(handle.into());
+            return;
+        }
+        if self.root.is_none() {
+            self.set_root(root.clone(), window, cx);
+            self.saved_state = None;
+            let state = project_state::load(&root);
+            self.restore_state(state, files, Source::Dialog, window, cx);
+            return cx.defer(|cx| remember_open_projects(None, cx));
+        }
+        match crate::settings::projects(cx).open_in {
+            OpenProjectIn::Ask => self.ask_where_to_open(root, files, window, cx),
+            OpenProjectIn::ThisWindow => self.open_in_this_window(root, files, window, cx),
+            OpenProjectIn::NewWindow => {
+                open_project_window(root, files, Some(window.bounds()), cx);
+            }
+        }
+    }
+
+    /// "Open Project": in this window, in a new one, or not at all; "Don't ask again" remembers the
+    /// answer in the settings.
+    fn ask_where_to_open(
+        &mut self,
+        root: PathBuf,
+        files: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = root
+            .file_name()
+            .map_or_else(|| tilde(&root), |name| name.to_string_lossy().into_owned());
+        let answer = crate::dialog::ask(
+            Dialog::info(tr("Open Project"))
+                .message(trf("Where would you like to open the project “{0}”?", &[&name]))
+                .normal(tr("This Window"))
+                .primary(tr("New Window"))
+                .cancel(tr("Cancel"))
+                .dont_ask_again(),
+            window,
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(answer) = answer.await else {
+                return;
+            };
+            let open_in = match answer.button {
+                0 => OpenProjectIn::ThisWindow,
+                1 => OpenProjectIn::NewWindow,
+                _ => return,
+            };
+            this.update_in(cx, |this, window, cx| {
+                if answer.dont_ask_again {
+                    crate::settings::update_projects(cx, |projects| projects.open_in = open_in);
+                }
+                match open_in {
+                    OpenProjectIn::ThisWindow => this.open_in_this_window(root, files, window, cx),
+                    _ => {
+                        open_project_window(root, files, Some(window.bounds()), cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// "This Window": the current project closes as the window would — after the questions about
+    /// running commands, Claude at work and unsaved documents, its state saved — and the window
+    /// takes the other project with its own state. The old project's servers, sessions and
+    /// terminals end with its [`Workspace`].
+    fn open_in_this_window(
+        &mut self,
+        root: PathBuf,
+        files: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let confirm = self.confirm_close_all(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if !confirm.await {
+                return;
+            }
+            if this.update(cx, |this, cx| this.save_state(cx)).is_err() {
+                return;
+            }
+            cx.update(|window, cx| {
+                window.replace_root(cx, |window, cx| {
+                    Workspace::new(Some(root), files, window, cx)
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Brings the project's window back as it was left (part 10.1): the islands at once, the
+    /// documents once read in the background, with their carets and scroll. `files` (the command
+    /// line, ⌘O) open after them and come forward.
+    fn restore_state(
+        &mut self,
+        state: Option<ProjectState>,
+        files: Vec<PathBuf>,
+        source: Source,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = state else {
+            if !files.is_empty() {
+                self.open_paths(files, source, window, cx);
+            }
+            return;
+        };
+        self.restore_layout(&state, window, cx);
+        if state.tabs.is_empty() {
+            if !files.is_empty() {
+                self.open_paths(files, source, window, cx);
+            }
+            return;
+        }
+        self.restoring = true;
+        self.loading += 1;
+        let tabs = state.tabs;
+        let active = state.active;
+        let paths: Vec<PathBuf> = tabs.iter().map(|tab| tab.path.clone()).collect();
+        let read = cx
+            .background_executor()
+            .spawn(async move { paths.into_iter().map(read_document).collect::<Vec<_>>() });
+        cx.spawn_in(window, async move |this, cx| {
+            let results = read.await;
+            this.update_in(cx, |this, window, cx| {
+                this.loading -= 1;
+                this.restoring = false;
+                this.restore_tabs(&tabs, active, results, window, cx);
+                if !files.is_empty() {
+                    this.open_paths(files, source, window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The islands as they were: the tree or the commit window, the terminal panel (a new shell in
+    /// the project), the tool window on the right. The keyboard stays in the editor area.
+    fn restore_layout(&mut self, state: &ProjectState, window: &mut Window, cx: &mut Context<Self>) {
+        match state.left {
+            LeftIsland::Tree => {}
+            LeftIsland::Commit if self.file_tree.is_some() => {
+                self.commit_panel(window, cx);
+                self.tree_before_commit = true;
+                self.tree_open = false;
+                self.commit_open = true;
+            }
+            LeftIsland::Commit | LeftIsland::Hidden => self.tree_open = false,
+        }
+        if state.terminal && !self.terminal_open {
+            self.terminal_open = true;
+            self.git_open = false;
+            if self.terminal_panel.read(cx).is_empty() {
+                self.terminal_panel
+                    .update(cx, |panel, cx| panel.new_terminal(window, cx));
+            }
+        }
+        match state.right {
+            Some(RightIsland::Claude) if claude::enabled(cx) => {
+                self.show_right(RightTool::Claude, window, cx)
+            }
+            Some(RightIsland::Notifications) => {
+                self.show_right(RightTool::Notifications, window, cx)
+            }
+            _ => {}
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// The saved documents, read: tabs after those open now, in their order, with the caret and the
+    /// scroll they had; the one that was active comes forward. A file that is gone is left out
+    /// without a word, as JetBrains IDEs do; one already open keeps its tab.
+    fn restore_tabs(
+        &mut self,
+        tabs: &[SavedTab],
+        active: Option<usize>,
+        results: Vec<Result<Document, OpenError>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut activate = None;
+        for (index, (saved, result)) in tabs.iter().zip(results).enumerate() {
+            let Ok(document) = result else {
+                continue;
+            };
+            let open = document.path().is_some_and(|path| {
+                let path = canonical(path);
+                self.editors(cx).iter().any(|editor| {
+                    editor.read(cx).document.path().map(canonical).as_ref() == Some(&path)
+                })
+            });
+            if open {
+                continue;
+            }
+            let editor = self.new_editor(document, window, cx);
+            editor.update(cx, |editor, cx| {
+                let position = editor.position(saved.line, saved.column);
+                editor.document.set_selection(Selection::point(position));
+                editor.scroll = point(0., saved.scroll * theme::LINE_HEIGHT);
+                editor.autoscroll = None;
+                cx.notify();
+            });
+            let subscriptions = self.editor_tab_subscriptions(&editor, cx);
+            self.tabs.push(Tab {
+                item: TabItem::Editor(editor),
+                _subscriptions: subscriptions,
+            });
+            if active == Some(index) || activate.is_none() {
+                activate = Some(self.tabs.len() - 1);
+            }
+        }
+        if let Some(index) = activate {
+            self.notice = None;
+            self.activate(index, window, cx);
+            self.retry_tab_scroll(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The project's state as the window shows it now.
+    fn capture_state(&self, cx: &App) -> ProjectState {
+        let mut tabs = Vec::new();
+        let mut active = None;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let Some(editor) = tab.item.editor() else {
+                continue;
+            };
+            let editor = editor.read(cx);
+            let Some(path) = editor.document.path() else {
+                continue;
+            };
+            let text = editor.document.text();
+            let head = editor.document.selection().primary().head.min(text.len_chars());
+            let line = text.char_to_line(head);
+            if index == self.active {
+                active = Some(tabs.len());
+            }
+            tabs.push(SavedTab {
+                path: path.to_path_buf(),
+                line,
+                column: head - text.line_to_char(line),
+                scroll: (editor.scroll.y / theme::LINE_HEIGHT).max(0.),
+            });
+        }
+        let left = if self.commit_open {
+            LeftIsland::Commit
+        } else if self.tree_open {
+            LeftIsland::Tree
+        } else {
+            LeftIsland::Hidden
+        };
+        let right = match self.right_tool {
+            Some(RightTool::Claude) => Some(RightIsland::Claude),
+            Some(RightTool::Notifications) => Some(RightIsland::Notifications),
+            Some(RightTool::Plugin(_)) | None => None,
+        };
+        ProjectState {
+            tabs,
+            active,
+            left,
+            terminal: self.terminal_open && !self.git_open,
+            right,
+            bounds: self.window_bounds.map(SavedBounds::from_window),
+        }
+    }
+
+    fn layout_key(&self) -> LayoutKey {
+        LayoutKey {
+            tabs: self.tabs.iter().map(|tab| tab.item.entity_id()).collect(),
+            active: self.active,
+            islands: [
+                self.tree_open,
+                self.commit_open,
+                self.terminal_open,
+                self.git_open,
+            ],
+            right: self.right_tool,
+        }
+    }
+
+    /// Writes the project's state if it changed since it was last written.
+    pub(crate) fn save_state(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        if self.restoring {
+            return;
+        }
+        let state = self.capture_state(cx);
+        if self.saved_state.as_ref() == Some(&state) {
+            return;
+        }
+        project_state::save(&root, &state);
+        self.saved_state = Some(state);
+    }
+
+    /// Saves the state in a moment: the tabs or the islands changed.
+    fn schedule_state_save(&mut self, cx: &mut Context<Self>) {
+        if self.root.is_none() || self.restoring {
+            return;
+        }
+        self.state_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STATE_SAVE_DELAY).await;
+            this.update(cx, |this, cx| this.save_state(cx)).ok();
+        }));
+    }
+
+    /// The user closes the window: its project's state is saved, and the project is no longer
+    /// among the open ones — unless this is the last window, whose closing quits Flux: its project
+    /// opens again at the next launch.
+    fn window_closing(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.save_state(cx);
+        let closing = window.window_handle().window_id();
+        let others = cx.windows().iter().any(|handle| {
+            handle.window_id() != closing && handle.downcast::<Workspace>().is_some()
+        });
+        if others {
+            cx.defer(move |cx| remember_open_projects(Some(closing), cx));
+        } else {
+            project_state::set_open_projects(&OpenProjects {
+                roots: self.root.iter().cloned().collect(),
+                active: self.root.clone(),
+            });
+        }
     }
 
     /// Language servers for a project root; the status bar follows their status, notifications
@@ -857,12 +1288,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let subscriptions = self.editor_tab_subscriptions(&editor, cx);
+        self.insert_tab(TabItem::Editor(editor), subscriptions, None, window, cx);
+    }
+
+    /// What a document's tab follows: the editor's changes and its events.
+    fn editor_tab_subscriptions(
+        &mut self,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
         // A document's path changes on "Save As": the tree then shows the new file.
-        let observer = cx.observe(&editor, |this, _, cx| {
+        let observer = cx.observe(editor, |this, _, cx| {
             this.reveal_active(cx);
             cx.notify()
         });
-        let events = cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
+        let events = cx.subscribe(editor, |this, editor, event: &EditorEvent, cx| {
             if matches!(event, EditorEvent::SelectionsChanged)
                 && this.active_editor().as_ref() == Some(&editor)
             {
@@ -876,7 +1317,7 @@ impl Workspace {
                 this.notify(notification, cx)
             }
         });
-        self.insert_tab(TabItem::Editor(editor), vec![observer, events], None, window, cx);
+        vec![observer, events]
     }
 
     /// Adds a terminal tab (moved from the panel) at `index`, by default to the right of the
@@ -1006,7 +1447,8 @@ impl Workspace {
 
     // --- Opening ---
 
-    /// cmd-o: files open in tabs; a chosen directory becomes the project root.
+    /// cmd-o: files open in tabs; a chosen directory is a project to open ([`Self::open_project`]),
+    /// and the files go with it.
     fn open(&mut self, _: &Open, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -1020,10 +1462,10 @@ impl Workspace {
             };
             this.update_in(cx, |this, window, cx| {
                 let (dirs, files): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| p.is_dir());
-                if let Some(dir) = dirs.into_iter().last() {
-                    this.set_root(dir, window, cx);
+                match dirs.into_iter().last() {
+                    Some(dir) => this.open_project(dir, files, window, cx),
+                    None => this.open_paths(files, Source::Dialog, window, cx),
                 }
-                this.open_paths(files, Source::Dialog, window, cx)
             })
             .ok();
         })
@@ -1781,11 +2223,14 @@ impl Workspace {
             && self.claude.read(cx).working_sessions(cx).is_empty()
             && !self.tabs.iter().any(|tab| tab.item.is_modified(cx))
         {
+            self.window_closing(window, cx);
             return true;
         }
         let confirm = self.confirm_close_all(window, cx);
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if confirm.await {
+                this.update_in(cx, |this, window, cx| this.window_closing(window, cx))
+                    .ok();
                 cx.update(|window, _| window.remove_window()).ok();
             }
         })
@@ -1984,7 +2429,7 @@ impl Workspace {
             Tool::FindInFiles => self.project_search.read(cx).is_open(),
             Tool::Terminal => self.terminal_open && !self.git_open,
             Tool::Git => self.git_open,
-            Tool::Claude => self.right_tool == Some(RightTool::Claude),
+            Tool::Claude => self.claude_in_sight(),
             Tool::Notifications => self.right_tool == Some(RightTool::Notifications),
         }
     }
@@ -3154,7 +3599,7 @@ impl Workspace {
                 .rounded(px(RADIUS_SM))
                 .cursor_pointer()
                 .hover(move |style| style.bg(ui.hover))
-                .tooltip(ui::tooltip(tilde(root), ui::shortcut_for(&Open, window)))
+                .tooltip(ui::tooltip(tilde(root), ui::shortcut_for(&Open, cx)))
                 .on_click(|_, window, cx| window.dispatch_action(Open.boxed_clone(), cx))
                 .child(icon(IconName::Folder, ui.folder).size(px(14.)))
                 .child(
@@ -3178,13 +3623,13 @@ impl Workspace {
                 .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
                 .tooltip(ui::tooltip(
                     tr("Open Folder…"),
-                    ui::shortcut_for(&Open, window),
+                    ui::shortcut_for(&Open, cx),
                 ))
                 .on_click(|_, window, cx| window.dispatch_action(Open.boxed_clone(), cx))
                 .child(icon(IconName::FolderPlus, ui.folder).size(px(14.)))
                 .child(tr("Open Folder…"))
         });
-        let branch = crate::branches_popup::branch_chip(self, window, cx);
+        let branch = crate::branches_popup::branch_chip(self, cx);
         let search =
             (f32::from(window.viewport_size().width) >= TITLE_SEARCH_MIN_WINDOW).then(|| {
                 div()
@@ -3219,14 +3664,14 @@ impl Workspace {
                             .child(icon(IconName::Search, ui.dim).size(px(13.)))
                             .child(div().flex_1().child(tr("Search files")))
                             .children(
-                                ui::shortcut_for(&file_finder::Toggle, window)
+                                ui::shortcut_for(&file_finder::Toggle, cx)
                                     .map(|keys| ui::keys(&keys, ui)),
                             ),
                     )
             });
         let button =
             |id: &'static str, name: IconName, label: &'static str, action: Box<dyn Action>| {
-                let keys = ui::shortcut_for(action.as_ref(), window);
+                let keys = ui::shortcut_for(action.as_ref(), cx);
                 ui::icon_button(id, name, ui)
                     .tooltip(ui::tooltip(label, keys))
                     .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
@@ -3933,13 +4378,19 @@ impl Workspace {
             .track_focus(&self.focus_handle)
             .flex_1()
             .min_h_0()
-            .child(start_screen::render(screen, window, cx))
+            .child(start_screen::render(screen, cx))
     }
 }
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_title(window, cx);
+        // The tabs or the islands changed since the last frame: the project's state is saved soon.
+        let layout = self.layout_key();
+        if self.layout.as_ref() != Some(&layout) {
+            self.layout = Some(layout);
+            self.schedule_state_save(cx);
+        }
         let ui = Theme::ui(cx);
         // The session actions of Claude are offered while a chat is current.
         let claude_chat = self.current_claude_chat(window, cx).is_some();
@@ -3980,13 +4431,7 @@ impl Render for Workspace {
             .map(|root| crate::editor_menu::workspace_actions(root, cx))
             .map(|root| Self::claude_actions(root, claude_chat, claude_in_tab, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
-                // A directory from the recent list may have disappeared since launch.
-                if !action.0.is_dir() {
-                    let message = trf("Folder not found: {0}", &[&tilde(&action.0)]);
-                    let notification = Notification::warning(message);
-                    return this.notify(notification, cx);
-                }
-                this.set_root(action.0.clone(), window, cx)
+                this.open_project(action.0.clone(), Vec::new(), window, cx)
             }))
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 this.add_document(Document::from_text(""), window, cx)
@@ -4322,7 +4767,7 @@ impl Render for Workspace {
                     .flex()
                     .flex_row()
                     .gap(px(GAP))
-                    .child(launchpad::render(self, window, cx))
+                    .child(launchpad::render(self, cx))
                     .children(tree)
                     .child(main)
                     .children(right),
@@ -4447,6 +4892,218 @@ async fn confirm_windows(windows: Vec<WindowHandle<Workspace>>, cx: &mut AsyncAp
         }
     }
     true
+}
+
+// --- Windows (part 10.1) ---
+
+/// A Flux window: the project `root` (`None` — the start screen) with `files` in tabs, at `bounds`.
+pub(crate) fn open_window(
+    root: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    bounds: WindowBounds,
+    cx: &mut App,
+) -> Option<WindowHandle<Workspace>> {
+    // A custom title bar on a glass window frame: the system title bar is transparent, the traffic
+    // lights are centered in the title bar, and the desktop behind the window is blurred.
+    let options = WindowOptions {
+        window_bounds: Some(bounds),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Flux".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(16.), px(13.))),
+        }),
+        window_background: WindowBackgroundAppearance::Blurred,
+        window_min_size: Some(size(px(720.), px(480.))),
+        ..Default::default()
+    };
+    #[cfg(feature = "scenario")]
+    let options = crate::scenario::window_options(options);
+    match cx.open_window(options, |window, cx| {
+        cx.new(|cx| Workspace::new(root, files, window, cx))
+    }) {
+        Ok(handle) => {
+            // A scenario's steps go to the window opened last.
+            #[cfg(feature = "scenario")]
+            crate::scenario::window_opened(handle.into());
+            Some(handle)
+        }
+        Err(error) => {
+            eprintln!("flux: can't open a window: {error}");
+            None
+        }
+    }
+}
+
+/// A new window for a project ("New Window"): where the project's window was last, or a step down
+/// and right from `near` (the window it is opened from).
+pub(crate) fn open_project_window(
+    root: PathBuf,
+    files: Vec<PathBuf>,
+    near: Option<Bounds<Pixels>>,
+    cx: &mut App,
+) -> Option<WindowHandle<Workspace>> {
+    let saved = project_state::load(&root).and_then(|state| state.bounds);
+    let bounds = window_bounds(saved, near, cx);
+    open_window(Some(root), files, bounds, cx)
+}
+
+/// The windows Flux starts with: the project of the command line (with its files), or, launched
+/// without one (from the Dock, the Finder), the projects open when it quit — the one in front last,
+/// so it stays in front (Settings → System Settings → "Reopen projects on startup"); otherwise the
+/// start screen. Returns the window in front.
+pub(crate) fn open_startup_windows(
+    root: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    cx: &mut App,
+) -> Option<WindowHandle<Workspace>> {
+    if root.is_some() || !files.is_empty() {
+        let saved = root
+            .as_deref()
+            .and_then(project_state::load)
+            .and_then(|state| state.bounds);
+        let bounds = window_bounds(saved, None, cx);
+        return open_window(root, files, bounds, cx);
+    }
+    let open = if crate::settings::projects(cx).reopen {
+        project_state::open_projects()
+    } else {
+        OpenProjects::default()
+    };
+    let roots: Vec<PathBuf> = open.roots.into_iter().filter(|root| root.is_dir()).collect();
+    if roots.is_empty() {
+        let bounds = window_bounds(None, None, cx);
+        return open_window(None, Vec::new(), bounds, cx);
+    }
+    let mut front = None;
+    for root in roots.iter().rev() {
+        let saved = project_state::load(root).and_then(|state| state.bounds);
+        let bounds = window_bounds(saved, None, cx);
+        if let Some(handle) = open_window(Some(root.clone()), Vec::new(), bounds, cx) {
+            front = Some(handle);
+        }
+    }
+    // The window that had the keyboard, if it isn't the front one already.
+    if let Some(active) = open.active.filter(|active| Some(active) != roots.first())
+        && let Some(handle) = project_window(&active, cx)
+    {
+        handle
+            .update(cx, |_, window, _| window.activate_window())
+            .ok();
+        #[cfg(feature = "scenario")]
+        crate::scenario::target(handle.into());
+        front = Some(handle);
+    }
+    front
+}
+
+/// Where a window opens: the saved frame when it is still on a screen and not right on top of
+/// another Flux window (then a step down and right from it), else a step from `near`, else the
+/// middle of the main screen.
+fn window_bounds(
+    saved: Option<SavedBounds>,
+    near: Option<Bounds<Pixels>>,
+    cx: &mut App,
+) -> WindowBounds {
+    let cascade = |frame: Bounds<Pixels>| Bounds {
+        origin: frame.origin + point(px(CASCADE), px(CASCADE)),
+        size: frame.size,
+    };
+    let on_screen = |frame: &Bounds<Pixels>, cx: &App| {
+        cx.displays()
+            .iter()
+            .any(|display| display.bounds().intersects(frame))
+    };
+    if let Some(saved) = saved
+        && on_screen(&saved.frame(), cx)
+    {
+        // `near` too: the window opening this one is being updated, `window_frames` can't read it.
+        let taken = window_frames(cx).iter().chain(near.as_ref()).any(|frame| {
+            (frame.origin.x - saved.frame().origin.x).abs() < px(4.)
+                && (frame.origin.y - saved.frame().origin.y).abs() < px(4.)
+        });
+        if !taken {
+            return saved.to_window();
+        }
+        let frame = cascade(saved.frame());
+        return WindowBounds::Windowed(frame);
+    }
+    if let Some(near) = near
+        && on_screen(&cascade(near), cx)
+    {
+        return WindowBounds::Windowed(cascade(near));
+    }
+    let (width, height) = WINDOW_SIZE;
+    WindowBounds::Windowed(Bounds::centered(None, size(px(width), px(height)), cx))
+}
+
+/// The frames of the Flux windows that can be read now (the one being updated can't).
+fn window_frames(cx: &mut App) -> Vec<Bounds<Pixels>> {
+    cx.windows()
+        .into_iter()
+        .filter_map(|handle| handle.update(cx, |_, window, _| window.bounds()).ok())
+        .collect()
+}
+
+/// The window that has the project open (other than the one being updated, which can't be read).
+fn project_window(root: &Path, cx: &App) -> Option<WindowHandle<Workspace>> {
+    cx.windows()
+        .into_iter()
+        .filter_map(|handle| handle.downcast::<Workspace>())
+        .find(|handle| {
+            handle
+                .read(cx)
+                .is_ok_and(|workspace| workspace.root.as_deref() == Some(root))
+        })
+}
+
+/// Remembers which project windows are open, front to back, for "Reopen projects on startup";
+/// `closing` — a window on its way out, left out.
+pub(crate) fn remember_open_projects(closing: Option<WindowId>, cx: &mut App) {
+    let mut windows = cx.window_stack().unwrap_or_default();
+    for handle in cx.windows() {
+        if !windows.contains(&handle) {
+            windows.push(handle);
+        }
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for handle in windows {
+        if Some(handle.window_id()) == closing {
+            continue;
+        }
+        let Some(handle) = handle.downcast::<Workspace>() else {
+            continue;
+        };
+        let Ok(workspace) = handle.read(cx) else {
+            continue;
+        };
+        if let Some(root) = &workspace.root
+            && !roots.contains(root)
+        {
+            roots.push(root.clone());
+        }
+    }
+    let active = roots.first().cloned();
+    project_state::set_open_projects(&OpenProjects { roots, active });
+}
+
+/// Flux quits: every window saves its project's state, and the open project windows are
+/// remembered. With no window left (the last one closed, which quits Flux), what that window
+/// remembered stays.
+fn save_windows(cx: &mut App) {
+    let windows: Vec<WindowHandle<Workspace>> = cx
+        .windows()
+        .into_iter()
+        .filter_map(|handle| handle.downcast())
+        .collect();
+    if windows.is_empty() {
+        return;
+    }
+    for handle in windows {
+        handle
+            .update(cx, |workspace, _, cx| workspace.save_state(cx))
+            .ok();
+    }
+    remember_open_projects(None, cx);
 }
 
 // --- Miscellaneous ---
@@ -4780,6 +5437,9 @@ impl Workspace {
         root.on_action(cx.listener(|this, _: &claude::ToggleClaude, window, cx| {
             this.toggle_claude(window, cx)
         }))
+        .on_action(cx.listener(|this, _: &launchpad::ToggleClaude, window, cx| {
+            this.toggle_claude_icon(window, cx)
+        }))
         .on_action(cx.listener(|this, _: &claude::NewSession, window, cx| {
             this.new_claude_session(window, cx)
         }))
@@ -4895,26 +5555,57 @@ impl Workspace {
         matches!(self.active_item(), Some(TabItem::Claude(active)) if &active == chat)
     }
 
-    /// ⌘Esc: from a chat — back to where the user was; otherwise to the chat (the editor tab it
-    /// lives in, or the Claude window; a ready CLI without sessions starts one).
+    /// ⌘Esc goes by the focus: from a chat — back to where the user was; otherwise into the chat on
+    /// the screen (the active tab's, the shown window's), else Claude comes into sight
+    /// ([`Self::show_claude`]).
     fn toggle_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(chat) = self.current_claude_chat(window, cx)
             && chat.read(cx).contains_focus(window, cx)
         {
             return self.leave_claude(&chat, window, cx);
         }
-        let panel_empty = self.claude_panel.read(cx).chats().is_empty();
-        if panel_empty
-            && let Some(index) = self.tabs.iter().position(|tab| tab.item.claude().is_some())
-        {
-            self.claude_return = self.active_item();
-            self.activate(index, window, cx);
-            if let Some(TabItem::Claude(chat)) = self.active_item() {
-                chat.read(cx).focus_composer(window, cx);
-            }
-            return;
+        if let Some(TabItem::Claude(chat)) = self.active_item() {
+            return chat.read(cx).focus_composer(window, cx);
         }
-        if panel_empty && self.claude.read(cx).is_ready() {
+        if self.right_tool == Some(RightTool::Claude)
+            && !self.claude_panel.read(cx).chats().is_empty()
+        {
+            return self.show_right(RightTool::Claude, window, cx);
+        }
+        self.show_claude(window, cx);
+    }
+
+    /// The launchpad's Claude icon is a toggle, whatever has the focus: Claude in sight — the
+    /// Claude window, a chat's tab — goes (the window hides, the tab gives way to the one before
+    /// it); otherwise Claude comes into sight.
+    fn toggle_claude_icon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.claude_in_sight() {
+            return self.show_claude(window, cx);
+        }
+        if self.right_tool == Some(RightTool::Claude) {
+            self.hide_right(window, cx);
+        }
+        if let Some(TabItem::Claude(chat)) = self.active_item() {
+            self.leave_chat_tab(&chat, window, cx);
+        }
+    }
+
+    /// The Claude window is shown or a chat's tab is active: the launchpad icon is highlighted.
+    fn claude_in_sight(&self) -> bool {
+        self.right_tool == Some(RightTool::Claude)
+            || matches!(self.active_item(), Some(TabItem::Claude(_)))
+    }
+
+    /// Brings Claude into sight: the Claude window when it has chats; else a chat's tab; else a
+    /// new session (its chat shows the window), or the window saying why `claude` isn't ready.
+    fn show_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.claude_panel.read(cx).chats().is_empty() {
+            return self.show_right(RightTool::Claude, window, cx);
+        }
+        if let Some(index) = self.tabs.iter().position(|tab| tab.item.claude().is_some()) {
+            return self.enter_chat_tab(index, window, cx);
+        }
+        if self.claude.read(cx).is_ready() {
             // The new session's chat shows the window ([`ClaudeStoreEvent::SessionAdded`]).
             self.claude.update(cx, |store, cx| {
                 store.new_session(cx);
@@ -4924,21 +5615,66 @@ impl Workspace {
         self.show_right(RightTool::Claude, window, cx);
     }
 
-    /// ⌘Esc in a chat: a chat in a tab gives the tab back to the one active before (or the nearest
-    /// document); the Claude window stays and the focus goes to the editor.
+    /// A chat's tab comes forward with the focus in its message field; leaving it goes back to the
+    /// tab that was active.
+    fn enter_chat_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_claude_return();
+        self.activate(index, window, cx);
+        if let Some(TabItem::Claude(chat)) = self.active_item() {
+            chat.read(cx).focus_composer(window, cx);
+        }
+    }
+
+    /// The tab to go back to from a chat's tab: the active one, unless it is a chat itself (then
+    /// the one remembered before stays — a chat going back to itself did nothing).
+    fn remember_claude_return(&mut self) {
+        if let Some(item) = self.active_item().filter(|item| item.claude().is_none()) {
+            self.claude_return = Some(item);
+        }
+    }
+
+    /// ⌘Esc in a chat: a chat's tab gives way ([`Self::leave_chat_tab`]); from the Claude window,
+    /// the focus goes to the editor and the window stays.
     fn leave_claude(&mut self, chat: &Entity<ClaudeChat>, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.active_item(), Some(TabItem::Claude(active)) if &active == chat) {
-            let back = self
-                .claude_return
-                .take()
-                .and_then(|item| self.tabs.iter().position(|tab| tab.item == item))
-                .or_else(|| self.tabs.iter().rposition(|tab| tab.item.editor().is_some()));
-            if let Some(index) = back {
-                self.activate(index, window, cx);
-            }
-            return;
+            return self.leave_chat_tab(chat, window, cx);
         }
         self.focus_active(window, cx);
+    }
+
+    /// A chat's tab gives way to the tab active before it came forward, else the document nearest
+    /// to it, else any other tab. A chat alone in the tabs stays; the focus leaves it for the tree
+    /// (or the window), so ⌘Esc still goes somewhere.
+    fn leave_chat_tab(
+        &mut self,
+        chat: &Entity<ClaudeChat>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(at) = self.tabs.iter().position(|tab| tab.item.claude() == Some(chat)) else {
+            return;
+        };
+        let nearest = |accept: &dyn Fn(&TabItem) -> bool| {
+            (0..self.tabs.len())
+                .filter(|index| *index != at && accept(&self.tabs[*index].item))
+                .min_by_key(|index| (index.abs_diff(at), *index > at))
+        };
+        let back = self
+            .claude_return
+            .take()
+            .and_then(|item| self.tabs.iter().position(|tab| tab.item == item))
+            .filter(|index| *index != at)
+            .or_else(|| nearest(&|item| item.editor().is_some()))
+            .or_else(|| nearest(&|item| item.claude().is_none()))
+            .or_else(|| nearest(&|_| true));
+        match back {
+            Some(index) => self.activate(index, window, cx),
+            None => match self.tree_panel().filter(|_| self.tree_open) {
+                Some(tree) => window.focus(&tree.focus_handle(cx)),
+                None => window.focus(&self.focus_handle),
+            },
+        }
+        cx.notify();
     }
 
     /// "+", "New Session": a session in the Claude window; while `claude` isn't ready, the window
@@ -5376,7 +6112,7 @@ impl Workspace {
             self.show_right(RightTool::Claude, window, cx);
         } else if let Some(index) = self.tabs.iter().position(|tab| tab.item.claude() == Some(&chat))
         {
-            self.claude_return = self.active_item();
+            self.remember_claude_return();
             self.activate(index, window, cx);
         }
         chat.update(cx, |chat, cx| chat.insert(&mention, window, cx));
@@ -5411,7 +6147,7 @@ impl Workspace {
             self.show_right(RightTool::Claude, window, cx);
         } else if let Some(index) = self.tabs.iter().position(|tab| tab.item.claude() == Some(&chat))
         {
-            self.claude_return = self.active_item();
+            self.remember_claude_return();
             self.activate(index, window, cx);
         }
         chat.update(cx, |chat, cx| chat.insert(&text, window, cx));

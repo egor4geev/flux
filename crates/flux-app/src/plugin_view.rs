@@ -659,7 +659,7 @@ impl PluginView {
                 ui::icon_button("plugin-view-hide", IconName::ChevronRight, ui)
                     .tooltip(ui::tooltip(
                         tr("Hide"),
-                        ui::shortcut_in(&Hide, &self.focus_handle, window),
+                        ui::shortcut_in(&Hide, &self.focus_handle, window, cx),
                     ))
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(Hide), cx)),
             )

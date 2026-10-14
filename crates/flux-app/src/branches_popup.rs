@@ -117,11 +117,7 @@ pub fn open(
 /// The branch chip of the title bar: the branch of the active file's repository (or the
 /// project's), the commits to pull ↓ and to push ↑, an operation in progress; a click opens the
 /// popup under it.
-pub fn branch_chip(
-    workspace: &Workspace,
-    window: &Window,
-    cx: &Context<Workspace>,
-) -> Option<AnyElement> {
+pub fn branch_chip(workspace: &Workspace, cx: &Context<Workspace>) -> Option<AnyElement> {
     let ui = Theme::ui(cx);
     let git = workspace.git().read(cx);
     let active = workspace.active_path(cx);
@@ -154,7 +150,7 @@ pub fn branch_chip(
     let bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
     let was_open = Rc::new(Cell::new(false));
     let workspace = cx.weak_entity();
-    let keys = ui::shortcut_for(&git::Branches, window);
+    let keys = ui::shortcut_for(&git::Branches, cx);
     let counter = |glyph: IconName, count: u32, color| {
         div()
             .flex()
@@ -1526,7 +1522,7 @@ impl BranchesPopup {
         };
         let content: AnyElement = match &row.kind {
             RowKind::Action(action) => {
-                let keys = self.keys_for(action.action().as_ref(), window);
+                let keys = self.keys_for(action.action().as_ref(), window, cx);
                 div()
                     .flex()
                     .items_center()
@@ -1739,10 +1735,10 @@ impl BranchesPopup {
     }
 
     /// An action's shortcut where the popup was opened from.
-    fn keys_for(&self, action: &dyn Action, window: &Window) -> Option<SharedString> {
+    fn keys_for(&self, action: &dyn Action, window: &Window, cx: &App) -> Option<SharedString> {
         match &self.previous_focus {
-            Some(focus) => ui::shortcut_in(action, focus, window),
-            None => ui::shortcut_for(action, window),
+            Some(focus) => ui::shortcut_in(action, focus, window, cx),
+            None => ui::shortcut_for(action, cx),
         }
     }
 
@@ -1850,7 +1846,7 @@ impl Focusable for BranchesPopup {
 }
 
 impl Render for BranchesPopup {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         self.clamp_selection();
         let count = self.rows.len();
@@ -1873,7 +1869,7 @@ impl Render for BranchesPopup {
             }
         };
         let activity = self.git.read(cx).activity().cloned();
-        let fetch_keys = ui::shortcut_for(&git::Fetch, window);
+        let fetch_keys = ui::shortcut_for(&git::Fetch, cx);
         let popover = ui::popover(ui)
             .w(px(WIDTH))
             .flex()

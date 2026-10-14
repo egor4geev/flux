@@ -999,7 +999,8 @@ impl ConflictsDialog {
             .files()
             .find(|change| Some(&change.path) == self.cursor.as_ref());
         let can_merge = !self.busy && cursor.is_some_and(|change| mergeable(change.conflict));
-        let keys = |action: &dyn gpui::Action| ui::shortcut_in(action, &self.focus_handle, window);
+        let keys =
+            |action: &dyn gpui::Action| ui::shortcut_in(action, &self.focus_handle, window, cx);
         let (left_keys, right_keys) = (keys(&AcceptLeftColumn), keys(&AcceptRightColumn));
         let merge_keys = keys(&MergeSelected);
         let button = |id: &'static str, label: &'static str, enabled: bool, keys| {

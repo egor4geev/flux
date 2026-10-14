@@ -558,7 +558,7 @@ impl ProjectSearch {
 
     // --- Rendering ---
 
-    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let toggle = |id: &'static str,
                       name: IconName,
@@ -568,7 +568,7 @@ impl ProjectSearch {
                       option: fn(&mut ProjectSearch) -> &mut bool,
                       cx: &mut Context<Self>| {
             ui::toggle_button(id, name, on, ui)
-                .tooltip(ui::tooltip(label, ui::shortcut_for(action, window)))
+                .tooltip(ui::tooltip(label, ui::shortcut_for(action, cx)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.toggle_option(option, window, cx)
                 }))
@@ -1044,10 +1044,10 @@ impl ProjectSearch {
 }
 
 impl Render for ProjectSearch {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         self.last_query = single_line_label(&self.query.read(cx).text());
-        let header = self.render_header(window, cx);
+        let header = self.render_header(cx);
         let results = self.render_results(cx);
         let preview = self.render_preview(cx);
         ui::popover(ui)

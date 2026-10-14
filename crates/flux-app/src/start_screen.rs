@@ -7,10 +7,9 @@
 //! it shows is passed in by the Workspace ([`StartScreen`]).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    Action, AnyElement, BoxShadow, Context, Div, FontWeight, Hsla, SharedString, Window, div,
+    Action, AnyElement, BoxShadow, Context, Div, FontWeight, Hsla, SharedString, div,
     linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 
@@ -123,7 +122,7 @@ fn quick_actions(ui: &UiColors) -> Vec<QuickAction> {
     ]
 }
 
-pub fn render(screen: StartScreen, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
+pub fn render(screen: StartScreen, cx: &mut Context<Workspace>) -> AnyElement {
     let ui = Theme::ui(cx);
     if screen.loading {
         return div().size_full().into_any_element();
@@ -134,9 +133,8 @@ pub fn render(screen: StartScreen, window: &mut Window, cx: &mut Context<Workspa
         .collect();
     let shortcuts: Vec<Option<SharedString>> = actions
         .iter()
-        .map(|action| ui::shortcut_for(action.action.as_ref(), window))
+        .map(|action| ui::shortcut_for(action.action.as_ref(), cx))
         .collect();
-    request_frame_for_shortcuts(&shortcuts, window);
 
     let action_rows = actions
         .into_iter()
@@ -167,7 +165,7 @@ pub fn render(screen: StartScreen, window: &mut Window, cx: &mut Context<Workspa
         .children(screen.notice.map(|notice| notice_banner(notice, ui)))
         .child(match screen.root {
             Some(root) => project_card(root, screen.branch, ui).into_any_element(),
-            None => open_folder_card(window, ui).into_any_element(),
+            None => open_folder_card(ui::shortcut_for(&workspace::Open, cx), ui).into_any_element(),
         })
         .child(
             div()
@@ -202,16 +200,6 @@ fn spacer(grow: f32) -> Div {
     let mut spacer = div().flex_basis(px(0.));
     spacer.style().flex_grow = Some(grow);
     spacer
-}
-
-/// Shortcuts are taken from the previous frame's tree, so they are not there yet in the window's
-/// very first frame. In that case one extra frame is requested so that the keys appear without
-/// waiting for mouse movement.
-fn request_frame_for_shortcuts(shortcuts: &[Option<SharedString>], window: &mut Window) {
-    static REQUESTED: AtomicBool = AtomicBool::new(false);
-    if shortcuts.iter().all(Option::is_none) && !REQUESTED.swap(true, Ordering::Relaxed) {
-        window.request_animation_frame();
-    }
 }
 
 /// Card background: slightly lighter than the island.
@@ -286,8 +274,7 @@ fn branch_chip(branch: &str, ui: UiColors) -> Div {
 }
 
 /// No project: the same card as for a project, with an invitation and a prominent primary button.
-fn open_folder_card(window: &Window, ui: UiColors) -> Div {
-    let keys = ui::shortcut_for(&workspace::Open, window);
+fn open_folder_card(keys: Option<SharedString>, ui: UiColors) -> Div {
     // Dark text reads better than white on the light accent.
     let on_accent = UiColors::tint(ui.island, 1.);
     card(ui)

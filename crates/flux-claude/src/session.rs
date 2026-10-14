@@ -47,6 +47,9 @@ pub struct Session {
     next_id: EntryId,
     /// The blocks of the message being streamed, by their index.
     streaming: HashMap<usize, EntryId>,
+    /// Thinking that a new block goes on: the length of its text before that block (the
+    /// separator included), where the block's final text goes.
+    thinking_bases: HashMap<EntryId, usize>,
     /// The input JSON of tool calls being streamed, so far.
     partial_inputs: HashMap<String, String>,
     /// Background and subagent tasks → their tool call (`task_updated` names only the task).
@@ -73,6 +76,9 @@ pub const EDIT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// A user's version of an edit up to this size goes to Claude whole; a longer one — only the note
 /// that the file differs from the proposal.
 const MODIFIED_EDIT_TEXT_LIMIT: usize = 6_000;
+
+/// Between the texts of thinking blocks that make one thought: a paragraph break.
+const THINKING_SEPARATOR: &str = "\n\n";
 
 /// What the session is.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -151,11 +157,16 @@ pub enum EntryKind {
         streaming: bool,
     },
     /// Claude's thinking: summarized text (may be empty), the token estimate, how long it took.
+    /// Blocks of thinking in a row are one entry: Opus sends an empty block and then the summary,
+    /// or two summaries, a few milliseconds apart.
     Thinking {
         text: String,
         tokens: u64,
         streaming: bool,
+        /// From the start of its first streamed block to the end of its last; `None` — unknown:
+        /// it came whole (a saved conversation, a subagent's thinking).
         duration: Option<Duration>,
+        /// When its first block started streaming.
         started: Instant,
     },
     Tool(Box<ToolEntry>),
@@ -639,6 +650,7 @@ impl Session {
             changed_files: Vec::new(),
             next_id: 1,
             streaming: HashMap::new(),
+            thinking_bases: HashMap::new(),
             partial_inputs: HashMap::new(),
             task_tools: HashMap::new(),
             modified_edits: HashMap::new(),
@@ -1212,6 +1224,14 @@ impl Session {
                 Vec::new()
             }
             StreamKind::BlockStart { index, block } => {
+                // Thinking right after thinking goes on in the same entry, its time adds up.
+                if matches!(block, BlockStart::Thinking)
+                    && let Some(id) = self.continue_thinking()
+                {
+                    self.set_activity(Activity::Thinking { tokens: 0 });
+                    self.streaming.insert(*index, id);
+                    return vec![Change::Entries, Change::Status];
+                }
                 let entry = match block {
                     BlockStart::Text => EntryKind::Text {
                         text: String::new(),
@@ -1715,50 +1735,74 @@ impl Session {
         commit: impl FnOnce(&mut EntryKind) -> bool,
         make: impl FnOnce() -> EntryKind,
     ) {
-        if parent.is_none() {
-            let streamed = self
-                .streaming
-                .values()
-                .copied()
-                .filter(|id| {
-                    self.entry(*id).is_some_and(|entry| match &entry.kind {
-                        EntryKind::Text { streaming, .. }
-                        | EntryKind::Thinking { streaming, .. } => *streaming,
-                        _ => false,
-                    })
-                })
-                .min();
-            if let Some(id) = streamed
-                && let Some(entry) = self.entry_mut(id)
-                && commit(&mut entry.kind)
-            {
-                return;
-            }
+        if parent.is_none()
+            && let Some(id) = self.streamed_block()
+            && let Some(entry) = self.entry_mut(id)
+            && commit(&mut entry.kind)
+        {
+            return;
         }
         self.push_in(parent, make());
     }
 
+    /// A thinking block is over (or came whole). A streamed one gets its final text — after the
+    /// text of the blocks it goes on, if any — and its time; a whole one goes on the thought right
+    /// before it, if any, or is added without a time.
     fn commit_thinking(&mut self, parent: Option<&str>, text: &str) {
-        self.commit_streamed(
-            parent,
-            |kind| match kind {
+        if parent.is_none()
+            && let Some(id) = self.streamed_block()
+            && let Some(base) = self.thinking_base(id)
+            && let Some(Entry {
+                kind:
+                    EntryKind::Thinking {
+                        text: shown,
+                        streaming,
+                        duration,
+                        started,
+                        ..
+                    },
+                ..
+            }) = self.entry_mut(id)
+        {
+            // The final text replaces what streamed of this block; an empty one keeps it.
+            if !text.is_empty() {
+                shown.truncate(base.min(shown.len()));
+                shown.push_str(text);
+            }
+            trim_separator(shown);
+            *streaming = false;
+            *duration = Some(started.elapsed());
+            self.thinking_bases.remove(&id);
+            return;
+        }
+        if let Some(Entry {
+            kind:
                 EntryKind::Thinking {
                     text: shown,
-                    streaming,
+                    streaming: false,
                     duration,
                     started,
                     ..
-                } => {
-                    if !text.is_empty() {
-                        *shown = text.to_string();
-                    }
-                    *streaming = false;
-                    *duration = Some(started.elapsed());
-                    true
+                },
+            ..
+        }) = self.last_in_mut(parent)
+        {
+            if !text.trim().is_empty() {
+                if !shown.trim().is_empty() {
+                    shown.push_str(THINKING_SEPARATOR);
                 }
-                _ => false,
-            },
-            || EntryKind::Thinking {
+                shown.push_str(text);
+            }
+            // A thought that streamed knows when it started; one that came whole stays without a
+            // time.
+            if duration.is_some() {
+                *duration = Some(started.elapsed());
+            }
+            return;
+        }
+        self.push_in(
+            parent,
+            EntryKind::Thinking {
                 text: text.to_string(),
                 tokens: 0,
                 streaming: false,
@@ -1766,6 +1810,68 @@ impl Session {
                 started: Instant::now(),
             },
         );
+    }
+
+    /// Where the final text of a streamed thinking block goes in its entry: after the blocks it
+    /// went on, or from the start. `None` — the entry isn't thinking.
+    fn thinking_base(&self, id: EntryId) -> Option<usize> {
+        match &self.entry(id)?.kind {
+            EntryKind::Thinking { .. } => Some(self.thinking_bases.get(&id).copied().unwrap_or(0)),
+            _ => None,
+        }
+    }
+
+    /// The oldest block of the main conversation still streaming its text or thinking: the one an
+    /// `assistant` message finishes.
+    fn streamed_block(&self) -> Option<EntryId> {
+        self.streaming
+            .values()
+            .copied()
+            .filter(|id| {
+                self.entry(*id).is_some_and(|entry| match &entry.kind {
+                    EntryKind::Text { streaming, .. } | EntryKind::Thinking { streaming, .. } => {
+                        *streaming
+                    }
+                    _ => false,
+                })
+            })
+            .min()
+    }
+
+    /// A thinking block starts right after a finished thought of the main conversation: the
+    /// thought streams again and takes the block (its text goes after a paragraph break).
+    fn continue_thinking(&mut self) -> Option<EntryId> {
+        let Some(Entry {
+            id,
+            kind:
+                EntryKind::Thinking {
+                    text,
+                    streaming: streaming @ false,
+                    ..
+                },
+        }) = self.last_in_mut(None)
+        else {
+            return None;
+        };
+        let id = *id;
+        trim_separator(text);
+        if !text.is_empty() {
+            text.push_str(THINKING_SEPARATOR);
+        }
+        *streaming = true;
+        let base = text.len();
+        self.thinking_bases.insert(id, base);
+        Some(id)
+    }
+
+    /// The last entry of the main conversation (above the queued messages) or of the subagent of
+    /// `parent`.
+    fn last_in_mut(&mut self, parent: Option<&str>) -> Option<&mut Entry> {
+        if let Some(parent) = parent {
+            return self.tool_mut(parent)?.children.last_mut();
+        }
+        let at = self.queued_tail_start();
+        at.checked_sub(1).and_then(|index| self.entries.get_mut(index))
     }
 
     /// The streamed text block of a request that failed: the error notice replaces it.
@@ -1784,6 +1890,7 @@ impl Session {
                 match &mut entry.kind {
                     EntryKind::Text { streaming, .. } => *streaming = false,
                     EntryKind::Thinking {
+                        text,
                         streaming,
                         duration,
                         started,
@@ -1792,12 +1899,14 @@ impl Session {
                         if *streaming {
                             *duration = Some(started.elapsed());
                         }
+                        trim_separator(text);
                         *streaming = false;
                     }
                     _ => {}
                 }
             }
         }
+        self.thinking_bases.clear();
     }
 
     /// The turn is over: streamed blocks stop, a tool call whose input never finished is cut off.
@@ -1910,6 +2019,12 @@ impl Session {
         }
         find(&mut self.entries, tool_use_id)
     }
+}
+
+/// A paragraph break left at the end of a thought (its last block brought no text) goes.
+fn trim_separator(text: &mut String) {
+    let kept = text.trim_end().len();
+    text.truncate(kept);
 }
 
 /// What Claude is told after an edit the user changed: the file as it is now (or, for a long

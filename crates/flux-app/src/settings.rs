@@ -43,6 +43,9 @@ pub struct Settings {
     /// Kinds of files whose plugin suggestion the user ignored ("*.rs", "Dockerfile";
     /// `plugins.ignored_suggestions`).
     pub ignored_suggestions: BTreeSet<String>,
+    /// Settings → System → Projects (part 10.1): where another project opens, reopening the
+    /// projects on startup.
+    pub projects: ProjectSettings,
     /// Where the settings are saved; `None` — kept in memory only.
     path: Option<PathBuf>,
 }
@@ -147,6 +150,54 @@ impl Default for ClaudeSettings {
     }
 }
 
+/// Settings → System → Projects (part 10.1), as JetBrains IDEs have them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectSettings {
+    /// Where a project opens when the window already has one (`projects.open_in`).
+    pub open_in: OpenProjectIn,
+    /// Flux started without a project (from the Dock, the Finder) opens the projects that were
+    /// open when it quit (`projects.reopen`).
+    pub reopen: bool,
+}
+
+impl Default for ProjectSettings {
+    fn default() -> Self {
+        Self {
+            open_in: OpenProjectIn::default(),
+            reopen: true,
+        }
+    }
+}
+
+/// Where another project opens: asked each time (with "Don't ask again", which remembers the
+/// answer here), or always in this window or a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenProjectIn {
+    #[default]
+    Ask,
+    ThisWindow,
+    NewWindow,
+}
+
+impl OpenProjectIn {
+    pub fn key(self) -> &'static str {
+        match self {
+            OpenProjectIn::Ask => "ask",
+            OpenProjectIn::ThisWindow => "this-window",
+            OpenProjectIn::NewWindow => "new-window",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "ask" => Some(OpenProjectIn::Ask),
+            "this-window" => Some(OpenProjectIn::ThisWindow),
+            "new-window" => Some(OpenProjectIn::NewWindow),
+            _ => None,
+        }
+    }
+}
+
 /// Update Project's method: asked the first time (as JetBrains IDEs do), then remembered when the
 /// user says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -191,6 +242,7 @@ impl Default for Settings {
             appearance: AppearanceSettings::default(),
             check_plugin_updates: true,
             ignored_suggestions: BTreeSet::new(),
+            projects: ProjectSettings::default(),
             path: None,
         }
     }
@@ -374,6 +426,20 @@ pub fn set_check_plugin_updates(on: bool, cx: &mut App) {
     save(settings);
 }
 
+/// Settings → System → Projects.
+pub fn projects(cx: &App) -> ProjectSettings {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.projects)
+        .unwrap_or_default()
+}
+
+/// Changes the project settings and saves them.
+pub fn update_projects(cx: &mut App, change: impl FnOnce(&mut ProjectSettings)) {
+    let settings = cx.default_global::<Settings>();
+    change(&mut settings.projects);
+    save(settings);
+}
+
 /// Whether the user ignored plugin suggestions for this kind of file ("*.rs", "Dockerfile").
 pub fn suggestion_ignored(kind: &str, cx: &App) -> bool {
     cx.try_global::<Settings>()
@@ -478,6 +544,15 @@ fn parse(text: &str) -> Settings {
                     .collect()
             })
             .unwrap_or_default(),
+        projects: ProjectSettings {
+            open_in: value["projects"]["open_in"]
+                .as_str()
+                .and_then(OpenProjectIn::from_key)
+                .unwrap_or(defaults.projects.open_in),
+            reopen: value["projects"]["reopen"]
+                .as_bool()
+                .unwrap_or(defaults.projects.reopen),
+        },
         ..defaults
     }
 }
@@ -589,6 +664,10 @@ fn to_json(settings: &Settings) -> String {
             "flux_tools": settings.claude.flux_tools,
             "report_problems": settings.claude.report_problems,
         },
+        "projects": {
+            "open_in": settings.projects.open_in.key(),
+            "reopen": settings.projects.reopen,
+        },
     });
     serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
 }
@@ -650,6 +729,10 @@ mod tests {
             },
             check_plugin_updates: false,
             ignored_suggestions: BTreeSet::from(["*.rs".to_string()]),
+            projects: ProjectSettings {
+                open_in: OpenProjectIn::NewWindow,
+                reopen: false,
+            },
             path: None,
         };
         assert_eq!(parse(&to_json(&off)), off);

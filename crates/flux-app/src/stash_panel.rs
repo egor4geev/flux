@@ -924,7 +924,7 @@ impl StashPanel {
                       label: &'static str,
                       action: Box<dyn Action>,
                       enabled: bool| {
-            let keys = ui::shortcut_in(action.as_ref(), &focus, window);
+            let keys = ui::shortcut_in(action.as_ref(), &focus, window, cx);
             let focus = focus.clone();
             ui::icon_button(id, name, ui)
                 .tooltip(ui::tooltip(label, keys))

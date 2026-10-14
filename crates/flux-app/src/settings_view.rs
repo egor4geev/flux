@@ -1,5 +1,7 @@
 //! Settings (⌘, or the gear at the bottom of the launchpad): an overlay window with sections on the
 //! left.
+//! - System Settings (part 10.1): reopening the projects on startup, and where another project
+//!   opens — a new window, this one, or ask (JetBrains: Appearance & Behavior → System Settings).
 //! - Language Servers: automatic installation on or off, and every server Flux knows with where it
 //!   comes from; those Flux installed can be updated and deleted, missing ones installed.
 //! - Version Control: how Update Project (⌘T) brings incoming commits into the current branch —
@@ -37,7 +39,7 @@ use crate::notification_center::{self, Display};
 use crate::plugin_manager::{PluginManager, PluginManagerEvent};
 use crate::plugin_settings::PluginSettingsPage;
 use crate::plugins::{PluginStatus, PluginStore};
-use crate::settings::{self, UpdatePreference};
+use crate::settings::{self, OpenProjectIn, UpdatePreference};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 use crate::workspace::{Workspace, tilde};
@@ -78,6 +80,8 @@ pub enum Section {
     Theme,
     FileIcons,
     Language,
+    /// System Settings: how projects open (part 10.1).
+    System,
     LanguageServers,
     VersionControl,
     Notifications,
@@ -95,7 +99,8 @@ impl Section {
     const APPEARANCE: [Section; 3] = [Section::Theme, Section::FileIcons, Section::Language];
 
     /// The sections above the plugins' pages; About goes after them.
-    const BUILT_IN: [Section; 5] = [
+    const BUILT_IN: [Section; 6] = [
+        Section::System,
         Section::LanguageServers,
         Section::VersionControl,
         Section::Notifications,
@@ -108,6 +113,7 @@ impl Section {
             Section::Theme => tr("Theme"),
             Section::FileIcons => tr("File Icons"),
             Section::Language => tr("Language"),
+            Section::System => tr("System Settings"),
             Section::LanguageServers => tr("Language Servers"),
             Section::VersionControl => tr("Version Control"),
             Section::Notifications => tr("Notifications"),
@@ -120,6 +126,7 @@ impl Section {
     fn icon(&self) -> IconName {
         match self {
             Section::Theme | Section::FileIcons | Section::Language => IconName::Palette,
+            Section::System => IconName::Settings,
             Section::LanguageServers => IconName::Command,
             Section::VersionControl => IconName::Branch,
             Section::Notifications => IconName::Bell,
@@ -145,6 +152,7 @@ impl Section {
             Section::Theme => "theme".into(),
             Section::FileIcons => "file-icons".into(),
             Section::Language => "language".into(),
+            Section::System => "system".into(),
             Section::LanguageServers => "language-servers".into(),
             Section::VersionControl => "version-control".into(),
             Section::Notifications => "notifications".into(),
@@ -219,8 +227,8 @@ struct Handles {
     claude: Entity<ClaudeStore>,
 }
 
-/// With the `scenario` feature, `FLUX_SCENARIO_SETTINGS=plugins` (or `plugin:<id>`) opens Settings
-/// on that section: a scenario can't click the sidebar.
+/// With the `scenario` feature, `FLUX_SCENARIO_SETTINGS=plugins` (or `plugin:<id>`, `system`…)
+/// opens Settings on that section: a scenario can't click the sidebar.
 #[cfg(feature = "scenario")]
 fn scenario_section() -> Option<Section> {
     let section = std::env::var("FLUX_SCENARIO_SETTINGS").ok()?;
@@ -228,6 +236,7 @@ fn scenario_section() -> Option<Section> {
         "theme" => Section::Theme,
         "file-icons" => Section::FileIcons,
         "language" => Section::Language,
+        "system" => Section::System,
         "language-servers" => Section::LanguageServers,
         "plugins" => Section::Plugins,
         "notifications" => Section::Notifications,
@@ -1047,6 +1056,130 @@ impl SettingsView {
             )
     }
 
+    /// System Settings: reopening the projects on startup, and where another project opens.
+    fn render_system(&self, cx: &mut Context<Self>) -> Div {
+        let ui = Theme::ui(cx);
+        let projects = settings::projects(cx);
+        let reopen = projects.reopen;
+        let options = [
+            (
+                OpenProjectIn::NewWindow,
+                tr("New window"),
+                tr("The project gets a window of its own; the open one stays as it is"),
+            ),
+            (
+                OpenProjectIn::ThisWindow,
+                tr("This window"),
+                tr("The open project closes, keeping its tabs for next time, and the new one takes its place"),
+            ),
+            (
+                OpenProjectIn::Ask,
+                tr("Ask"),
+                tr("Flux asks every time; “Don’t ask again” remembers the answer here"),
+            ),
+        ];
+        let rows = options
+            .into_iter()
+            .enumerate()
+            .map(|(index, (choice, title, detail))| {
+                let selected = projects.open_in == choice;
+                div()
+                    .id(("open-project-in", index))
+                    .flex()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(ui::RADIUS_MD))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(ui.hover))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        settings::update_projects(cx, |projects| projects.open_in = choice);
+                        cx.notify();
+                    }))
+                    .child(div().pt(px(2.)).child(ui::radio(
+                        ("open-project-in-radio", index),
+                        selected,
+                        ui,
+                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(title)
+                            .child(
+                                div()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.dim)
+                                    .child(detail),
+                            ),
+                    )
+            });
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_header(
+                tr("System Settings"),
+                tr("How Flux opens projects: when it starts, and when the window already has one."),
+                ui,
+            ))
+            .child(
+                div()
+                    .id("reopen-projects")
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .p_3()
+                    .rounded(px(ui::RADIUS_MD))
+                    .border_1()
+                    .border_color(ui.island_border)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        settings::update_projects(cx, |projects| projects.reopen = !reopen);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(tr("Reopen projects on startup"))
+                            .child(
+                                div()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.dim)
+                                    .child(tr(
+                                        "Flux started from the Dock or the Finder opens the projects that were open when it quit.",
+                                    )),
+                            ),
+                    )
+                    .child(ui::switch("reopen-projects-switch", reopen, ui)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_1()
+                    .rounded(px(ui::RADIUS_MD))
+                    .border_1()
+                    .border_color(ui.island_border)
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .pb_1()
+                            .child(ui::section_label(tr("Open project in"), ui)),
+                    )
+                    .children(rows),
+            )
+    }
+
     /// Notifications: Do Not Disturb, then a row per group with its display.
     fn render_notifications(&self, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
@@ -1751,6 +1884,7 @@ impl Render for SettingsView {
                     None => div().into_any_element(),
                 })
             }
+            Section::System => Some(self.render_system(cx).into_any_element()),
             Section::LanguageServers => Some(self.render_language_servers(cx).into_any_element()),
             Section::VersionControl => Some(self.render_version_control(cx).into_any_element()),
             Section::Notifications => Some(self.render_notifications(cx).into_any_element()),

@@ -21,6 +21,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Thinking…", "Думает…"),
     ("Thinking… {0} tokens", "Думает… {0} токенов"),
     ("Thought for {0}", "Думал {0}"),
+    ("Thought", "Думал"),
     ("Writing…", "Пишет…"),
     ("Running {0}…", "Выполняет {0}…"),
     ("Compacting the conversation…", "Сжимает разговор…"),

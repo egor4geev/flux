@@ -1850,7 +1850,7 @@ impl DiffView {
             .working
             .as_ref()
             .is_some_and(|right| *right.read(cx).document.text() != proposal.proposed);
-        let accept_keys = ui::shortcut_in(&AcceptProposal, &self.focus_handle, window);
+        let accept_keys = ui::shortcut_in(&AcceptProposal, &self.focus_handle, window, cx);
         let (glyph, headline) = match &proposal.owner {
             ProposalOwner::Claude { .. } => (
                 IconName::Claude,
@@ -1915,7 +1915,8 @@ impl DiffView {
 
     fn render_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
-        let keys = |action: &dyn gpui::Action| ui::shortcut_in(action, &self.focus_handle, window);
+        let keys =
+            |action: &dyn gpui::Action| ui::shortcut_in(action, &self.focus_handle, window, cx);
         let count = self
             .model
             .as_ref()

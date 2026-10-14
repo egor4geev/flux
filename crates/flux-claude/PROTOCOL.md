@@ -302,7 +302,7 @@ The interrupted turn in f_interrupt reported `total_cost_usd:0` and `errors:["[e
 | Block | Shape / notes |
 |---|---|
 | text | `{type:"text", text, citations?}` [V] |
-| thinking | `{type:"thinking", thinking, signature}`. **By default `thinking` is `""`** (signature only); stream events carry `thinking_display:"updates"` and progress comes as `thinking_tokens`. `--thinking-display summarized` gives readable summarized text deltas [V m_image]. |
+| thinking | `{type:"thinking", thinking, signature}`. **By default `thinking` is `""`** (signature only); stream events carry `thinking_display:"updates"` and progress comes as `thinking_tokens`. `--thinking-display summarized` gives readable summarized text deltas [V m_image]. Opus 5.5 often splits one thought into **two blocks in a row** of the same message: an empty one (the thinking time is spent there), then the summary 2–18 ms later, or two different summaries (seen in its transcripts, 2026-10-14) — a host shows them as one thought. |
 | redacted_thinking | `{type:"redacted_thinking", data}` [T] |
 | tool_use | `{type:"tool_use", id, name, input, caller:{type:"direct"}≠}`; the input streams as `input_json_delta` [V] |
 | tool_result | `{type:"tool_result", tool_use_id, content: string \| [text\|image blocks], is_error?}`. An image result is `content:[{type:"image",source:{type:"base64",media_type:"image/png",data}}]` [V m2_read_image]. |
@@ -728,6 +728,7 @@ To rebuild the chat, follow `parentUuid` back from the leaf, skipping `isSidecha
 | `o_queue` | Queued message, `priority:"now"`, `cancel_async_message`, `initialize.promptSuggestions` |
 | `p_hooks` / `q_sdk_mcp` / `r_web` | Callback hooks (a PreToolUse allow skips can_use_tool) / in-process MCP server over `mcp_message` / WebFetch and WebSearch |
 | `s_flux_tool` | **Synthetic** (not a recording): Claude calls `mcp__flux__get_diagnostics`; the fake CLI waits for the host's answer and puts it into the tool result |
+| `t_split_thinking` | **Synthetic**: one thought split into two `thinking` blocks of one message, as Opus 5.5 sends it with `--thinking-display summarized` (its transcripts: an empty block — only `thinking_tokens` while the model thinks — then the summary in the next block 2–18 ms later; sometimes two summaries) |
 | `transcripts/<id>.jsonl` (+ `<id>/subagents/`) | **Synthetic** saved session for `transcript::load` and `list`: tools, an edit and a create, a command, a rewind, a subagent, a queued message, an interrupt, a compaction, an API error, titles |
 
 **Privacy.** The fixtures contain account data: the email and organization in initialize responses, the user's permission rules in `k_control`, local paths and usage numbers. Redact them before committing.

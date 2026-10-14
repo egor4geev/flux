@@ -385,7 +385,7 @@ impl GitWindow {
 
     // --- Display ---
 
-    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let drop_index = self.drop_index.filter(|_| cx.has_active_drag());
         let tabs: Vec<AnyElement> = (0..self.tabs.len())
@@ -436,7 +436,7 @@ impl GitWindow {
                 ui::icon_button("git-window-hide", IconName::ChevronDown, ui)
                     .tooltip(ui::tooltip(
                         tr("Hide"),
-                        ui::shortcut_for(&crate::git::ToggleGitWindow, window),
+                        ui::shortcut_for(&crate::git::ToggleGitWindow, cx),
                     ))
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(HideWindow), cx)),
             )
@@ -641,7 +641,7 @@ impl Render for GitWindow {
                     cx.notify();
                 }),
             )
-            .child(self.render_header(window, cx))
+            .child(self.render_header(cx))
             .child(ui::divider(ui).mx(px(GAP)))
             .child(
                 div()

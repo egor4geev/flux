@@ -1337,7 +1337,7 @@ impl FileTreePanel {
         run: fn(&mut Self, &mut Window, &mut Context<Self>),
     ) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
-        let keys = ui::shortcut_in(action, &self.focus_handle, window);
+        let keys = ui::shortcut_in(action, &self.focus_handle, window, cx);
         ui::icon_button(id, name, ui)
             .tooltip(ui::tooltip(label, keys))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {

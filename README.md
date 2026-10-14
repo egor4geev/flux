@@ -79,6 +79,16 @@ A file tree that hides what Git ignores, follows the file you are editing and up
 on disk. Create, rename, move and delete files right in it — open tabs keep up with renamed and moved
 files, and open files pick up changes made outside Flux.
 
+### A window for every project
+
+Open as many projects as you like, each in its own window with its own language servers, terminals
+and Claude sessions — or switch the current window to another project. Like JetBrains IDEs, Flux
+asks which you prefer until you tell it to remember, and switching to a project that is already open
+just brings its window forward. Every project keeps its tabs, cursor positions, chats and layout, and
+when you start Flux from the Dock, the projects you had open come back where you left them.
+
+<img src="docs/images/open-project.png" alt="Flux asks whether to open another project in this window or a new one" width="100%">
+
 ### Git, the way JetBrains IDEs do it
 
 Everything around Git is one shortcut away, and it works with all the repositories in your folder.
@@ -237,6 +247,7 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 | <kbd>⌘</kbd><kbd>9</kbd> · <kbd>⌥</kbd><kbd>⌘</kbd><kbd>A</kbd> | Show or hide the Git log · who changed each line |
 | <kbd>⌘</kbd><kbd>Esc</kbd> · <kbd>⌥</kbd><kbd>⌘</kbd><kbd>K</kbd> | Claude · mention the selection in Claude's message |
 | <kbd>⌃</kbd><kbd>`</kbd> | Quick Switch: theme, file icons, language |
+| <kbd>⌘</kbd><kbd>`</kbd> · <kbd>⇧</kbd><kbd>⌘</kbd><kbd>`</kbd> | Next · previous project window |
 
 ## Roadmap
 
@@ -255,7 +266,8 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 - [x] Claude Code: a review of Claude's changes, session history, the editor's menu
 - [x] Plugins: web services, programs, terminals, edits to review, context menus — with your permission
 - [x] Plugins: the Marketplace, languages, themes and file icons as plugins, a light theme, Appearance settings
-- [ ] Before the beta: polish, updates over the air, a signed and notarized app
+- [x] Before the beta: fixes after a week of daily use, a window for every project
+- [ ] Before the beta: Claude and editor polish, updates over the air, a signed and notarized app
 - [ ] Public beta
 
 ## License

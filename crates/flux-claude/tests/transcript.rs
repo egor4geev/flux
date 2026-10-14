@@ -292,3 +292,46 @@ fn timing() {
         );
     }
 }
+
+#[test]
+fn a_saved_split_thought_reads_back_as_one_without_a_time() {
+    // Opus's thinking as its transcripts keep it: an empty block, then the summary 2 ms later.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("split.jsonl");
+    let assistant = |uuid: &str, parent: &str, at: &str, block: &str| {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","parentUuid":"{parent}","timestamp":"2026-10-14T06:22:{at}Z","message":{{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{block}]}}}}"#
+        )
+    };
+    let lines = [
+        r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-10-14T06:22:31.729Z","message":{"role":"user","content":[{"type":"text","text":"Check the tests"}]}}"#.to_string(),
+        assistant("a1", "u1", "37.823", r#"{"type":"thinking","thinking":"","signature":"s1"}"#),
+        assistant(
+            "a2",
+            "a1",
+            "37.825",
+            r#"{"type":"thinking","thinking":"Looking at the tests first.","signature":"s2"}"#,
+        ),
+        assistant("a3", "a2", "39.546", r#"{"type":"text","text":"They pass."}"#),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+    let session = transcript::load(&path, PathBuf::from("/project")).unwrap();
+    assert_eq!(
+        outline(&session.entries),
+        [
+            "user: Check the tests",
+            "thinking: Looking at the tests first.",
+            "text: They pass.",
+            "turn end: 7 s",
+        ]
+    );
+    // How long it thought isn't in the transcript: no clock counting from when Flux read it.
+    assert!(session.entries.iter().any(|entry| matches!(
+        entry.kind,
+        EntryKind::Thinking {
+            duration: None,
+            streaming: false,
+            ..
+        }
+    )));
+}

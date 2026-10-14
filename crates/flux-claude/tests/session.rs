@@ -486,3 +486,284 @@ fn queued_messages_stay_below_the_running_turn() {
         matches!(&session.entries.last().unwrap().kind, EntryKind::User(user) if !user.cancelled)
     );
 }
+
+/// Synthetic frames of one message, in the shapes the CLI sends (`m_image`; Opus's thinking split
+/// into blocks, as its transcripts show it: an empty block, then the summary 2–18 ms later).
+mod wire {
+    use flux_claude::protocol::{self, Incoming};
+    use serde_json::{Value, json};
+
+    fn stream(event: Value) -> Incoming {
+        protocol::parse(json!({
+            "type": "stream_event",
+            "event": event,
+            "parent_tool_use_id": null,
+            "session_id": "s",
+            "uuid": "u",
+        }))
+    }
+
+    pub fn message_start() -> Incoming {
+        stream(json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "type": "message", "role": "assistant", "content": [] },
+        }))
+    }
+
+    pub fn block_start(index: usize, kind: &str) -> Incoming {
+        let block = match kind {
+            "thinking" => json!({ "type": "thinking", "thinking": "", "signature": "" }),
+            _ => json!({ "type": "text", "text": "" }),
+        };
+        stream(json!({ "type": "content_block_start", "index": index, "content_block": block }))
+    }
+
+    pub fn thinking_delta(index: usize, text: &str) -> Incoming {
+        stream(json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": { "type": "thinking_delta", "thinking": text },
+        }))
+    }
+
+    pub fn text_delta(index: usize, text: &str) -> Incoming {
+        stream(json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": { "type": "text_delta", "text": text },
+        }))
+    }
+
+    pub fn block_stop(index: usize) -> Incoming {
+        stream(json!({ "type": "content_block_stop", "index": index }))
+    }
+
+    /// One finished block, as the CLI sends each one (`parent` — a subagent's call).
+    pub fn assistant(block: Value, parent: Option<&str>) -> Incoming {
+        protocol::parse(json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-opus-5-5",
+                "content": [block],
+            },
+            "parent_tool_use_id": parent,
+            "session_id": "s",
+            "uuid": "u",
+        }))
+    }
+
+    pub fn thinking(text: &str) -> Value {
+        json!({ "type": "thinking", "thinking": text, "signature": "sig" })
+    }
+
+    pub fn text(text: &str) -> Value {
+        json!({ "type": "text", "text": text })
+    }
+}
+
+/// The thoughts of the main conversation: their text and time.
+fn thoughts(session: &Session) -> Vec<(String, Option<std::time::Duration>)> {
+    session
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Thinking { text, duration, .. } => Some((text.clone(), *duration)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn feed_all(session: &mut Session, frames: Vec<Incoming>) {
+    for frame in frames {
+        feed(session, frame);
+    }
+}
+
+#[test]
+fn split_thinking_is_one_thought_that_took_the_whole_time() {
+    let mut session = Session::new(PathBuf::from("/project"));
+    // The model thinks in the first block (only token counts come), then the summary follows in
+    // a second block a few milliseconds later.
+    feed_all(
+        &mut session,
+        vec![wire::message_start(), wire::block_start(0, "thinking")],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    feed_all(
+        &mut session,
+        vec![
+            wire::assistant(wire::thinking(""), None),
+            wire::block_stop(0),
+            wire::block_start(1, "thinking"),
+            wire::thinking_delta(1, "Checked the tests."),
+            wire::assistant(wire::thinking("Checked the tests."), None),
+            wire::block_stop(1),
+            wire::block_start(2, "text"),
+            wire::text_delta(2, "Done."),
+            wire::assistant(wire::text("Done."), None),
+            wire::block_stop(2),
+        ],
+    );
+    let thoughts = thoughts(&session);
+    assert_eq!(thoughts.len(), 1, "{thoughts:?}");
+    let (text, duration) = &thoughts[0];
+    assert_eq!(text, "Checked the tests.");
+    assert!(duration.unwrap() >= std::time::Duration::from_millis(40));
+    assert_eq!(texts(&session), ["Done."]);
+}
+
+#[test]
+fn two_summaries_in_a_row_read_as_one_thought() {
+    let mut session = Session::new(PathBuf::from("/project"));
+    feed_all(
+        &mut session,
+        vec![
+            wire::message_start(),
+            wire::block_start(0, "thinking"),
+            wire::thinking_delta(0, "First part."),
+            wire::assistant(wire::thinking("First part."), None),
+            wire::block_stop(0),
+            wire::block_start(1, "thinking"),
+            wire::thinking_delta(1, "Second"),
+        ],
+    );
+    // While the second block streams, the thought streams again after a paragraph break.
+    assert!(matches!(
+        &session.entries[..],
+        [flux_claude::Entry { kind: EntryKind::Thinking { text, streaming: true, .. }, .. }]
+            if text == "First part.\n\nSecond"
+    ));
+    // The block's final text replaces only what streamed of it.
+    feed_all(
+        &mut session,
+        vec![
+            wire::assistant(wire::thinking("Second part."), None),
+            wire::block_stop(1),
+        ],
+    );
+    let thoughts = thoughts(&session);
+    assert_eq!(thoughts.len(), 1);
+    assert_eq!(thoughts[0].0, "First part.\n\nSecond part.");
+    assert!(thoughts[0].1.is_some());
+}
+
+#[test]
+fn an_empty_last_block_leaves_no_paragraph_break() {
+    let mut session = Session::new(PathBuf::from("/project"));
+    feed_all(
+        &mut session,
+        vec![
+            wire::message_start(),
+            wire::block_start(0, "thinking"),
+            wire::thinking_delta(0, "A plan."),
+            wire::assistant(wire::thinking("A plan."), None),
+            wire::block_stop(0),
+            wire::block_start(1, "thinking"),
+            wire::assistant(wire::thinking(""), None),
+            wire::block_stop(1),
+        ],
+    );
+    assert_eq!(thoughts(&session)[0].0, "A plan.");
+    // Cut off before the block's message: the turn's end drops the break as well.
+    let mut session = Session::new(PathBuf::from("/project"));
+    feed_all(
+        &mut session,
+        vec![
+            wire::message_start(),
+            wire::block_start(0, "thinking"),
+            wire::assistant(wire::thinking("A plan."), None),
+            wire::block_stop(0),
+            wire::block_start(1, "thinking"),
+            wire::message_start(),
+        ],
+    );
+    let thoughts = thoughts(&session);
+    assert_eq!(thoughts.len(), 1);
+    assert_eq!(thoughts[0].0, "A plan.");
+}
+
+#[test]
+fn thoughts_with_something_between_stay_apart() {
+    let mut session = Session::new(PathBuf::from("/project"));
+    feed_all(
+        &mut session,
+        vec![
+            wire::message_start(),
+            wire::block_start(0, "thinking"),
+            wire::assistant(wire::thinking("First."), None),
+            wire::block_stop(0),
+            wire::block_start(1, "text"),
+            wire::assistant(wire::text("Looking."), None),
+            wire::block_stop(1),
+            wire::message_start(),
+            wire::block_start(0, "thinking"),
+            wire::assistant(wire::thinking("Second."), None),
+            wire::block_stop(0),
+        ],
+    );
+    let thoughts: Vec<String> = thoughts(&session).into_iter().map(|(text, _)| text).collect();
+    assert_eq!(thoughts, ["First.", "Second."]);
+}
+
+#[test]
+fn a_thought_that_came_whole_has_no_time() {
+    // No stream (a saved conversation is read this way): the empty block and the summary make one
+    // thought, and nothing says how long it took.
+    let mut session = Session::new(PathBuf::from("/project"));
+    feed_all(
+        &mut session,
+        vec![
+            wire::assistant(wire::thinking(""), None),
+            wire::assistant(wire::thinking("Summary."), None),
+        ],
+    );
+    assert_eq!(thoughts(&session), [("Summary.".to_string(), None)]);
+}
+
+#[test]
+fn a_subagent_s_split_thinking_is_one_thought_too() {
+    let mut session = Session::new(PathBuf::from("/project"));
+    let call = serde_json::json!({
+        "type": "tool_use",
+        "id": "toolu_agent",
+        "name": "Agent",
+        "input": { "description": "Review", "prompt": "Review the change" },
+    });
+    feed_all(
+        &mut session,
+        vec![
+            wire::assistant(call, None),
+            wire::assistant(wire::thinking(""), Some("toolu_agent")),
+            wire::assistant(wire::thinking("Reading the diff."), Some("toolu_agent")),
+        ],
+    );
+    let agent = tools(&session, "Agent")[0];
+    let children: Vec<_> = agent
+        .children
+        .iter()
+        .map(|entry| match &entry.kind {
+            EntryKind::Thinking { text, duration, .. } => (text.as_str(), *duration),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(children, [("Reading the diff.", None)]);
+}
+
+#[test]
+fn a_recorded_split_thought_replays_as_one() {
+    // `t_split_thinking`: a synthetic stream in the shape of Opus's split thinking (token counts
+    // only in the first block, the summary in the second), for the scenarios as well.
+    let session = replay("t_split_thinking");
+    let thoughts = thoughts(&session);
+    assert_eq!(thoughts.len(), 1);
+    assert_eq!(
+        thoughts[0].0,
+        "The tests fail on the date parser. The fixture uses a local time, so the parser needs an \
+         explicit offset."
+    );
+    assert!(thoughts[0].1.is_some());
+    assert_eq!(turn_ends(&session), 1);
+}

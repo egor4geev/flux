@@ -3,8 +3,12 @@
 //! a [`Tool`] variant with its icon, label, and action, plus an entry in [`Tool::ALL`]. Plugins'
 //! tool windows (stage 8) come from the window's plugins and sit above Notifications: they live in
 //! the same island on the right.
+//!
+//! Claude's icon is a toggle of its own ([`ToggleClaude`]): Claude in sight — its window or a
+//! chat's tab — goes, otherwise it comes, whatever has the focus; ⌘Esc, which its tooltip shows,
+//! goes by the focus (part 10.1).
 
-use gpui::{Action, Context, IntoElement, Window, div, prelude::*, px};
+use gpui::{Action, Context, IntoElement, actions, div, prelude::*, px};
 
 use crate::i18n::tr;
 use crate::icons::IconName;
@@ -13,6 +17,15 @@ use crate::theme::{Theme, UiColors};
 use crate::ui;
 use crate::workspace::Workspace;
 use crate::{file_tree, git, notifications_panel, project_search, terminal_panel};
+
+actions!(
+    launchpad,
+    [
+        /// The Claude icon: shows Claude, or hides it when it is in sight, whatever has the focus
+        /// (⌘Esc, `claude::ToggleClaude`, goes by the focus). Not in the command palette.
+        ToggleClaude,
+    ]
+);
 
 /// Width of the strip; the buttons are centered.
 pub const WIDTH: f32 = 40.;
@@ -84,19 +97,24 @@ impl Tool {
             Tool::FindInFiles => Box::new(project_search::Toggle),
             Tool::Terminal => Box::new(terminal_panel::TogglePanel),
             Tool::Git => Box::new(git::ToggleGitWindow),
-            Tool::Claude => Box::new(crate::claude::ToggleClaude),
+            Tool::Claude => Box::new(ToggleClaude),
             Tool::Notifications => Box::new(notifications_panel::Toggle),
+        }
+    }
+
+    /// The action whose keys the tooltip shows: the icon's own, except Claude's, whose icon has no
+    /// keys — ⌘Esc brings Claude as well.
+    fn keys_action(self) -> Box<dyn Action> {
+        match self {
+            Tool::Claude => Box::new(crate::claude::ToggleClaude),
+            tool => tool.action(),
         }
     }
 }
 
 /// The tool strip: one button per tool; the open one gets an accent background and a marker on the
 /// left.
-pub fn render(
-    workspace: &Workspace,
-    window: &Window,
-    cx: &Context<Workspace>,
-) -> impl IntoElement + use<> {
+pub fn render(workspace: &Workspace, cx: &Context<Workspace>) -> impl IntoElement + use<> {
     let ui = Theme::ui(cx);
     div()
         .flex_none()
@@ -110,7 +128,7 @@ pub fn render(
         .children(
             Tool::ALL
                 .into_iter()
-                .map(|tool| tool_button(workspace, tool, window, cx)),
+                .map(|tool| tool_button(workspace, tool, cx)),
         )
         // Settings: at the bottom of the strip, apart from the tools; above them, the windows of the
         // right island: the plugins', then Notifications.
@@ -121,18 +139,18 @@ pub fn render(
                 .read(cx)
                 .tool_windows()
                 .iter()
-                .map(|tool| plugin_tool_button(workspace, tool, window, cx))
+                .map(|tool| plugin_tool_button(workspace, tool, cx))
                 .collect::<Vec<_>>(),
         )
         .children(
             Tool::BOTTOM
                 .into_iter()
                 .filter(|tool| workspace.tool_visible(*tool, cx))
-                .map(|tool| tool_button(workspace, tool, window, cx)),
+                .map(|tool| tool_button(workspace, tool, cx)),
         )
         .child({
             let open = crate::settings_view::is_open(workspace);
-            let keys = ui::shortcut_for(&crate::settings_view::Toggle, window);
+            let keys = ui::shortcut_for(&crate::settings_view::Toggle, cx);
             ui::toggle_button("settings", IconName::Settings, open, ui)
                 .size(px(BUTTON_SIZE))
                 .rounded(px(ui::RADIUS_MD))
@@ -147,7 +165,6 @@ pub fn render(
 fn tool_button(
     workspace: &Workspace,
     tool: Tool,
-    window: &Window,
     cx: &Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let ui = Theme::ui(cx);
@@ -156,7 +173,7 @@ fn tool_button(
     let alarm = workspace.tool_badge_alarm(tool, cx);
     let dot = workspace.tool_dot(tool, cx);
     let action = tool.action();
-    let keys = ui::shortcut_for(action.as_ref(), window);
+    let keys = ui::shortcut_for(tool.keys_action().as_ref(), cx);
     div()
         .relative()
         .child(
@@ -209,7 +226,6 @@ fn tool_button(
 fn plugin_tool_button(
     workspace: &Workspace,
     tool: &ToolWindow,
-    window: &Window,
     cx: &Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let ui = Theme::ui(cx);
@@ -218,7 +234,7 @@ fn plugin_tool_button(
         plugin: tool.plugin.clone(),
         window: tool.id.clone(),
     };
-    let keys = ui::shortcut_for(&action, window);
+    let keys = ui::shortcut_for(&action, cx);
     let path = tool
         .icon
         .clone()

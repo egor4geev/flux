@@ -7,7 +7,8 @@
 # Builds flux with the `scenario` feature, launches it, takes a screenshot of every window of the
 # process at each `SHOT name` marker into <dir>/<name>-<window id>.png and stops the process at
 # `END` (or after FLUX_SCENARIO_TIMEOUT, 120 s by default). The flux output goes to
-# <dir>/stdout.log and stderr.log. Scenario steps and dialog auto-answers are described in
+# <dir>/stdout.log and stderr.log. FLUX_SCENARIO_BACKGROUND=1 — neither flux nor this script
+# activates the app: the keyboard stays with the app the user works in. Scenario steps and dialog auto-answers are described in
 # crates/flux-app/src/scenario.rs.
 set -euo pipefail
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
@@ -36,7 +37,10 @@ LOG="$OUT/stdout.log"
 PID=$!
 trap 'kill "$PID" 2>/dev/null || true' EXIT
 sleep 1
-"$TOOL" activate "$PID"
+# FLUX_SCENARIO_BACKGROUND=1: the app isn't activated (the user keeps typing in their own app).
+if [ -z "${FLUX_SCENARIO_BACKGROUND:-}" ]; then
+    "$TOOL" activate "$PID"
+fi
 
 seen=0
 deadline=$((SECONDS + ${FLUX_SCENARIO_TIMEOUT:-120}))

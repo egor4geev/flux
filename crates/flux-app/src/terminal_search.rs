@@ -419,7 +419,7 @@ pub fn render_bar(
     // Tooltips show the keys as if focus were in the field: they are right in the terminal, too.
     let focus = query.focus_handle(cx);
     let tip = |label: &'static str, action: &dyn Action, focus: &FocusHandle| {
-        ui::tooltip(label, ui::shortcut_in(action, focus, window))
+        ui::tooltip(label, ui::shortcut_in(action, focus, window, cx))
     };
     let counter = match counter(&view.search) {
         Counter::None => None,

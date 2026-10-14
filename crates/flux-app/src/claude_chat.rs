@@ -13,7 +13,7 @@ use gpui::{
     div, prelude::*, px,
 };
 
-use flux_claude::Session;
+use flux_claude::{Session, Status};
 
 use crate::claude_cards::{self, CardsState};
 use crate::claude_composer::Composer;
@@ -24,6 +24,8 @@ use crate::theme::{self, Theme};
 
 /// How often the line of what Claude does is redrawn while it works (its clock).
 const TICK: Duration = Duration::from_secs(1);
+/// The redraw comes this long after the clock's second turns, so it shows the new second.
+const TICK_SLACK: Duration = Duration::from_millis(15);
 
 /// What the chat asks of the window.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,7 +149,10 @@ impl ClaudeChat {
         }
         self.ticker = Some(cx.spawn(async move |chat, cx| {
             loop {
-                cx.background_executor().timer(TICK).await;
+                let wait = chat
+                    .read_with(cx, |chat, cx| next_tick(&chat.session.read(cx).model().status))
+                    .unwrap_or(TICK);
+                cx.background_executor().timer(wait).await;
                 let working = chat.update(cx, |chat, cx| {
                     cx.notify();
                     chat.session.read(cx).model().is_working()
@@ -157,6 +162,18 @@ impl ClaudeChat {
                 }
             }
         }));
+    }
+}
+
+/// Until the clock under the conversation turns to its next second (it counts from the moment
+/// Claude started working, not from the chat's last redraw).
+fn next_tick(status: &Status) -> Duration {
+    match status {
+        Status::Working { since, .. } => {
+            let into_second = Duration::from_nanos(since.elapsed().subsec_nanos().into());
+            TICK - into_second + TICK_SLACK
+        }
+        _ => TICK,
     }
 }
 

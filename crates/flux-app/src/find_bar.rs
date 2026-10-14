@@ -610,7 +610,7 @@ impl Render for FindBar {
         let query_focus = self.query.focus_handle(cx);
         let replace_focus = self.replacement.focus_handle(cx);
         let tip = |label: &'static str, action: &dyn Action, focus: &FocusHandle| {
-            ui::tooltip(label, ui::shortcut_in(action, focus, window))
+            ui::tooltip(label, ui::shortcut_in(action, focus, window, cx))
         };
         let row = || div().flex().items_center().gap_1p5();
         let counter = match self.counter(cx) {

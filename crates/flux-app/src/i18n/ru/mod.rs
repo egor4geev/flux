@@ -41,6 +41,7 @@ mod plugin_review;
 mod plugin_view;
 mod plugins;
 mod popups;
+mod projects;
 mod rebase;
 mod search;
 mod settings;
@@ -52,6 +53,7 @@ mod terminal_panel;
 mod terminal_search;
 mod themes;
 mod tree;
+mod windows;
 mod workspace;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
@@ -109,6 +111,8 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     appearance::STRINGS,
     icon_themes::STRINGS,
     catalog::STRINGS,
+    projects::STRINGS,
+    windows::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -145,4 +149,6 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     appearance::PLURALS,
     icon_themes::PLURALS,
     catalog::PLURALS,
+    projects::PLURALS,
+    windows::PLURALS,
 ];

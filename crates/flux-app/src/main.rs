@@ -72,6 +72,7 @@ mod plugin_view;
 mod plugins;
 mod popup;
 mod project_search;
+mod project_state;
 mod prompt_input;
 mod push_dialog;
 mod quick_switch;
@@ -99,13 +100,9 @@ use std::path::{PathBuf, absolute};
 
 use flux_search::find_vcs_root;
 
-use gpui::{
-    App, AppContext, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, point, px, size,
-};
+use gpui::{App, Application};
 
 use theme::Theme;
-use workspace::Workspace;
 
 fn main() {
     // A UI scenario doesn't touch the user's plugins, their data and logs (as it doesn't touch
@@ -201,27 +198,8 @@ fn main() {
             plugin_manager::init(cx);
             plugin_settings::init(cx);
 
-            let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
-            // A custom title bar on a glass window frame: the system title bar is transparent, the
-            // traffic lights are centered in the title bar, and the desktop behind the window is
-            // blurred.
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Flux".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(16.), px(13.))),
-                }),
-                window_background: WindowBackgroundAppearance::Blurred,
-                window_min_size: Some(size(px(720.), px(480.))),
-                ..Default::default()
-            };
-            #[cfg(feature = "scenario")]
-            let options = scenario::window_options(options);
-            let _window = cx
-                .open_window(options, |window, cx| {
-                    cx.new(|cx| Workspace::new(root, paths, window, cx))
-                })
+            // The project of the command line, or the projects open when Flux quit (part 10.1).
+            let _window = workspace::open_startup_windows(root, paths, cx)
                 .expect("failed to open window");
             #[cfg(feature = "scenario")]
             scenario::run(_window.into(), cx);
@@ -232,18 +210,31 @@ fn main() {
                 }
             })
             .detach();
-            cx.activate(true);
+            // A scenario in the background doesn't take the keyboard from the app the user works
+            // in (`FLUX_SCENARIO_BACKGROUND`).
+            #[cfg(feature = "scenario")]
+            let activate = !scenario::background();
+            #[cfg(not(feature = "scenario"))]
+            let activate = true;
+            if activate {
+                cx.activate(true);
+            }
         });
 }
 
 /// Project root: the directory from the arguments; without one, the nearest ancestor of the current
 /// directory that contains a repository (`.git`, etc.), otherwise the current directory itself. If
-/// not launched from a terminal (the current directory is `/`), there is no project.
+/// not launched from a terminal (the current directory is `/`), there is no project: the projects
+/// open when Flux quit come back instead (a scenario pretends so with `FLUX_SCENARIO_FINDER`).
 fn project_root(dirs: Vec<PathBuf>) -> Option<PathBuf> {
     let mut dirs = dirs.into_iter();
     let root = match dirs.next() {
         Some(dir) => dir,
         None => {
+            #[cfg(feature = "scenario")]
+            if scenario::launched_from_finder() {
+                return None;
+            }
             let cwd = std::env::current_dir().ok()?;
             cwd.parent()?;
             find_vcs_root(&cwd).unwrap_or(cwd)

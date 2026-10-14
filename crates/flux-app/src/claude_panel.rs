@@ -586,7 +586,7 @@ impl ClaudePanel {
         let hide = ui::icon_button("claude-hide", IconName::ChevronRight, ui)
             .tooltip(ui::tooltip(
                 tr("Hide"),
-                ui::shortcut_in(&notifications_panel::Hide, &self.focus_handle, window),
+                ui::shortcut_in(&notifications_panel::Hide, &self.focus_handle, window, cx),
             ))
             .on_click(|_, window, cx| {
                 window.dispatch_action(Box::new(notifications_panel::Hide), cx)
@@ -760,7 +760,7 @@ impl ClaudePanel {
     }
 
     /// The window's content without a chat: what `claude` needs, or how to start.
-    fn render_onboarding(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_onboarding(&self, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
         let recent = self.render_recent(cx);
         let store = self.store.read(cx);
@@ -905,8 +905,8 @@ impl ClaudePanel {
                         )),
                 ),
             CliState::Ready { account, .. } => {
-                let keys = ui::shortcut_for(&claude::ToggleClaude, window);
-                let mention_keys = ui::shortcut_for(&claude::AddSelectionToClaude, window);
+                let keys = ui::shortcut_for(&claude::ToggleClaude, cx);
+                let mention_keys = ui::shortcut_for(&claude::AddSelectionToClaude, cx);
                 column
                     .child(tile(IconName::Claude, ui.accent_text))
                     .child(heading(tr("Start a session").into()))
@@ -1213,7 +1213,7 @@ impl Render for ClaudePanel {
         let header = self.render_header(window, cx);
         let body = match self.chats.get(self.active) {
             Some(chat) => chat.clone().into_any_element(),
-            None => self.render_onboarding(window, cx),
+            None => self.render_onboarding(cx),
         };
         div()
             .key_context(CONTEXT)

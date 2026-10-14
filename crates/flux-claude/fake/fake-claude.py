@@ -13,7 +13,8 @@ Environment:
   `j_subagent`, `j_background`, `l_slash` (/usage, /context, /compact), `m_image` (summarized
   thinking), `m2_read_image`, `o_queue`, `r_web`.
   `s_flux_tool` (a synthetic turn: Claude calls `get_diagnostics` of the host's `flux` MCP server
-  and shows the host's answer as the tool's result).
+  and shows the host's answer as the tool's result), `t_split_thinking` (synthetic: thinking split
+  into two blocks as Opus sends it — token counts only, then the summary in a second block).
 - `FLUX_FAKE_CLAUDE_DELAY_MS`: the pause between frames (default 25; stream events — a third).
 - `FLUX_FAKE_CLAUDE_SIGNED_OUT=1`: `auth status` says signed out.
 - `FLUX_FAKE_CLAUDE_ASK`: the answer of a question without a session (`-p --output-format json`,

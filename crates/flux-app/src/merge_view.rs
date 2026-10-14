@@ -1424,7 +1424,8 @@ impl MergeView {
 
     fn render_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
-        let keys = |action: &dyn gpui::Action| ui::shortcut_in(action, &self.focus_handle, window);
+        let keys =
+            |action: &dyn gpui::Action| ui::shortcut_in(action, &self.focus_handle, window, cx);
         let counter = match &self.state {
             State::Ready(panes) if panes.model.conflicts() == 0 => tr("No conflicts").to_string(),
             State::Ready(panes) => match panes.model.unresolved() {
@@ -1710,7 +1711,7 @@ impl MergeView {
         let ready = matches!(self.state, State::Ready(_));
         let can_accept =
             matches!(self.state, State::Ready(_) | State::OneSided(_)) && !self.finishing;
-        let apply_keys = ui::shortcut_in(&ApplyResult, &self.focus_handle, window);
+        let apply_keys = ui::shortcut_in(&ApplyResult, &self.focus_handle, window, cx);
         let (left, right) = match &self.state {
             State::Ready(panes) => panes.captions.clone(),
             _ => Default::default(),

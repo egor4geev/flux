@@ -25,7 +25,6 @@ use gpui::{
     Window, actions, anchored, canvas, deferred, div, point, prelude::*, px,
 };
 
-use crate::command_palette::keystroke_label;
 use crate::icons::{IconName, icon};
 use crate::popup;
 use crate::theme::Theme;
@@ -444,19 +443,14 @@ impl ContextMenu {
         window.dispatch_action(action, cx);
     }
 
-    /// The action's shortcut as macOS symbols, in the key context of whoever opened the menu.
-    fn keys_for(&self, action: &dyn Action, window: &Window) -> Option<SharedString> {
-        let bindings = match &self.previous_focus {
-            Some(focus) => window.bindings_for_action_in(action, focus),
-            None => window.bindings_for_action(action),
+    /// The action's shortcut as macOS symbols, in the key context of whoever opened the menu
+    /// (without one, the window's own keys — [`ui::action_binding`]).
+    fn keys_for(&self, action: &dyn Action, window: &Window, cx: &App) -> Option<SharedString> {
+        let binding = match &self.previous_focus {
+            Some(focus) => window.bindings_for_action_in(action, focus).first().cloned(),
+            None => ui::action_binding(action, cx),
         };
-        let binding = bindings.first()?;
-        let keys: Vec<String> = binding
-            .keystrokes()
-            .iter()
-            .map(|keystroke| keystroke_label(keystroke.modifiers(), keystroke.key()))
-            .collect();
-        Some(keys.join(" ").into())
+        binding.map(|binding| ui::shortcut_label(&binding))
     }
 
     /// An entry in its row ([`item_row`]): the label and the shortcut.
@@ -470,7 +464,7 @@ impl ContextMenu {
         cx: &App,
     ) -> gpui::Stateful<gpui::Div> {
         let ui = Theme::ui(cx);
-        let keys = self.keys_for(action, window);
+        let keys = self.keys_for(action, window, cx);
         row.child(label.clone())
             .children(keys.map(|keys| ui::keys(&keys, ui).when(!enabled, |keys| keys.opacity(0.5))))
     }

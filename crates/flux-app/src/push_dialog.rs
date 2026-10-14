@@ -1037,13 +1037,13 @@ impl Focusable for PushDialog {
 }
 
 impl Render for PushDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let can_push = self.can_push(cx);
         let repos: Vec<_> = (0..self.repos.len())
             .map(|slot| self.render_repo(slot, cx).into_any_element())
             .collect();
-        let push_keys = ui::shortcut_for(&Confirm, window);
+        let push_keys = ui::shortcut_for(&Confirm, cx);
         ui::popover(ui)
             .key_context("PushDialog")
             .track_focus(&self.focus_handle)

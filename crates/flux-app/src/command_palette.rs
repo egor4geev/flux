@@ -75,9 +75,13 @@ impl CommandPalette {
         let mut commands: Vec<Command> = window
             .available_actions(cx)
             .into_iter()
-            .filter(|action| action.name() != Toggle.name())
+            // The palette itself, and the launchpad's Claude icon (⌘Esc is "Toggle Claude").
+            .filter(|action| {
+                action.name() != Toggle.name()
+                    && action.name() != crate::launchpad::ToggleClaude.name()
+            })
             .map(|action| {
-                let keys = keys_label(action.as_ref(), previous_focus.as_ref(), window);
+                let keys = keys_label(action.as_ref(), previous_focus.as_ref(), window, cx);
                 let humanized = humanize_action_name(action.name());
                 let (namespace, title) = humanized.split_once(": ").unwrap_or(("", &humanized));
                 // The chip and the title are looked up as «Editor» and «Move Word Left».
@@ -102,7 +106,7 @@ impl CommandPalette {
             namespace_chars: category.chars().count(),
             label: format!("{category}: {title}"),
             namespace: PLUGIN_NAMESPACE.to_string(),
-            keys: keys_label(action.as_ref(), previous_focus.as_ref(), window),
+            keys: keys_label(action.as_ref(), previous_focus.as_ref(), window, cx),
             action,
             enabled: true,
         };
@@ -262,25 +266,18 @@ const PLUGIN_NAMESPACE: &str = "plugin";
 
 /// The first key binding of an action where focus was, in macOS symbols. Our primary binding is
 /// registered first, with the alternates (`home` for cmd-left, `shift-backspace` for backspace)
-/// after it.
+/// after it. Without a focus, the window's own keys ([`ui::action_binding`]).
 fn keys_label(
     action: &dyn Action,
     focus: Option<&FocusHandle>,
     window: &Window,
+    cx: &App,
 ) -> Option<SharedString> {
-    let bindings = match focus {
-        Some(focus) => window.bindings_for_action_in(action, focus),
-        None => window.bindings_for_action(action),
+    let binding = match focus {
+        Some(focus) => window.bindings_for_action_in(action, focus).first().cloned(),
+        None => ui::action_binding(action, cx),
     };
-    bindings.first().map(|binding| {
-        binding
-            .keystrokes()
-            .iter()
-            .map(|k| keystroke_label(k.modifiers(), k.key()))
-            .collect::<Vec<_>>()
-            .join(" ")
-            .into()
-    })
+    binding.map(|binding| ui::shortcut_label(&binding))
 }
 
 /// A label split into the namespace (chip) and the name; match positions are in characters of each

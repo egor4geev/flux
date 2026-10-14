@@ -789,6 +789,7 @@ impl TerminalView {
             &crate::terminal_group::ClosePane,
             &self.focus_handle,
             window,
+            cx,
         );
         Some(
             div()
