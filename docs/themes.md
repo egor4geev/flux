@@ -121,6 +121,7 @@ The tokens of the design system, by name.
 | Token | Is |
 |-------|----|
 | `blue`, `indigo`, `violet`, `pink`, `red`, `orange`, `amber`, `lime`, `green`, `teal`, `cyan` | the palette's shades; sets of file icons color their icons with them by name |
+| `claude` | Claude's own orange: its avatar in the chat |
 | `folder` | a folder's icon |
 
 ### `[syntax]` — the code

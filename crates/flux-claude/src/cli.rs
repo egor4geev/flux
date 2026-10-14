@@ -230,6 +230,10 @@ pub struct LaunchOptions {
     pub effort: Option<Effort>,
     /// Continue a saved session by its id.
     pub resume: Option<String>,
+    /// With `resume`: only the conversation up to this entry (`--resume-session-at`, a uuid of the
+    /// transcript's chain) — a message edited and sent again continues from just before the old
+    /// one (part 10.2).
+    pub resume_at: Option<String>,
     /// The id of a new session (a UUID); `None` — the CLI makes one.
     pub session_id: Option<String>,
     /// More arguments the user gave in the settings.
@@ -269,6 +273,9 @@ impl LaunchOptions {
         }
         if let Some(resume) = &self.resume {
             args.extend(["--resume".into(), resume.clone()]);
+            if let Some(at) = &self.resume_at {
+                args.extend(["--resume-session-at".into(), at.clone()]);
+            }
         }
         if let Some(id) = &self.session_id {
             args.extend(["--session-id".into(), id.clone()]);
@@ -373,6 +380,18 @@ mod tests {
         assert!(joined.contains("--permission-mode acceptEdits"));
         assert!(joined.contains("--effort high"));
         assert!(joined.contains("--resume abc"));
+        assert!(!joined.contains("--resume-session-at"));
+        let at = LaunchOptions {
+            resume_at: Some("e1".into()),
+            ..options.clone()
+        };
+        assert!(at.args().join(" ").contains("--resume abc --resume-session-at e1"));
+        // Without a session to resume there is nothing to cut.
+        let fresh = LaunchOptions {
+            resume: None,
+            ..at
+        };
+        assert!(!fresh.args().join(" ").contains("--resume-session-at"));
     }
 
     #[test]

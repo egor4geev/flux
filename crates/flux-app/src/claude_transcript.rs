@@ -1,64 +1,98 @@
-//! The conversation of a Claude chat: the user's messages, Claude's text (Markdown) and thinking,
-//! the rows of Claude's actions with their results and subagents, notices, the ends of turns, and
-//! the line of what Claude is doing now.
+//! The conversation of a Claude chat, in the "chat" look the author chose for part 10.2: the
+//! user's messages are bubbles on the right (mentions at their ends as chips above, pictures as
+//! thumbnails, the time under them), Claude's turns are on the left under its avatar — Markdown,
+//! the minor steps (reads, searches, thinking, task updates) folded into a group, the major ones
+//! as cards (a command, an edit, a subagent) — and a turn that changed files ends with the "Done"
+//! card. `!` commands are terminal cards on the user's side; notices and the line of what Claude
+//! is doing now complete it.
 //!
 //! The conversation is a gpui `list` anchored to the bottom, as a chat log: it follows new content
 //! while the user is at the end and stays put when they scrolled up (a "↓" button brings them
-//! back). Only the visible entries are drawn; an entry whose content changed is measured again
-//! (`TranscriptState::sync` compares a fingerprint of each entry). Claude's Markdown is parsed
-//! once per change of the text and highlighted off the UI thread when the text is complete.
+//! back). Its items ([`Item`]) are the shown entries, minor steps in a row being one item; only the
+//! visible items are drawn, and an item whose content changed is measured again
+//! (`TranscriptState::sync` compares a fingerprint of each). Claude's Markdown is parsed once per
+//! change of the text and highlighted off the UI thread when the text is complete.
 
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, ClipboardItem, Context, Entity, FontWeight, Hsla,
-    Image, ImageFormat, InteractiveText, ListAlignment, ListOffset, ListState, SharedString,
-    StyledImage, StyledText, TextRun, WeakEntity, Window, div, font, img, list, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, BoxShadow, ClipboardItem, Context, Div, Entity,
+    FontWeight, Hsla, Image, ImageFormat, InteractiveText, ListAlignment, ListOffset, ListState,
+    SharedString, Stateful, StyledImage, StyledText, TextRun, WeakEntity, Window, div, font, img,
+    linear_color_stop, linear_gradient, list, point, prelude::*, px,
 };
 use serde_json::Value;
 
-use flux_claude::session::{TaskProgress, TurnSummary, UserEntry};
+use flux_claude::session::{ShellEntry, ShellState, TaskProgress, TurnFile, TurnSummary, UserEntry};
 use flux_claude::{
     Activity, Entry, EntryId, EntryKind, Notice, Session, Status, ToolCall, ToolEntry, ToolState,
 };
 
 use crate::claude_chat::{ClaudeChat, ClaudeChatEvent};
+use crate::claude_search::SearchMarks;
 use crate::claude_session::ClaudeSession;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, IconSource, file_icon, icon, source_icon};
-use crate::markdown::{self, Block};
+use crate::image_view::ImageSource;
+use crate::markdown::{self, Block, Marks};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 use crate::workspace::Location;
 
-/// The entries' inset from the island's edges.
-const INSET: f32 = 12.;
+/// The conversation's column: centered, at most this wide (the chat as an editor tab); the field
+/// and the cards under it keep to the same column.
+pub const COLUMN_MAX_WIDTH: f32 = 780.;
+/// The column's inset from the island's edges.
+pub const COLUMN_INSET: f32 = 14.;
+/// Claude's avatar, and the room its side of the conversation keeps for it.
+const AVATAR: f32 = 26.;
+const AVATAR_GAP: f32 = 10.;
+/// The user's bubbles and command cards take at most this share of the column.
+const BUBBLE_SHARE: f32 = 0.78;
+/// The size of the conversation's text.
+const CHAT_TEXT: f32 = 13.5;
 /// A row of Claude's actions.
-const ROW_HEIGHT: f32 = 24.;
+const ROW_HEIGHT: f32 = 26.;
 /// Where a tool's details start: under the row's label, past the icon.
 const DETAIL_INSET: f32 = 22.;
 /// Output lines shown before "Show more".
 const CLIP_LINES: usize = 12;
-/// Diff lines shown before "Show more".
-const DIFF_LINES: usize = 40;
+/// Diff lines an edit card shows before "Show more".
+const DIFF_PREVIEW_LINES: usize = 8;
+/// A running subagent's latest steps on its card.
+const AGENT_STEPS: usize = 3;
+/// The cards' corners.
+const CARD_RADIUS: f32 = 10.;
 /// How long a copy button shows its check mark.
 const COPIED_FOR: Duration = Duration::from_millis(1500);
 
-pub fn init(_cx: &mut App) {}
+pub fn init(cx: &mut App) {
+    crate::claude_agent_view::init(cx);
+}
 
 /// The transcript's state in its chat: the list, what the user expanded, parsed Markdown.
 pub struct TranscriptState {
     list: ListState,
-    /// What each top-level entry looked like when it was last measured.
+    /// The list's items as of the last sync.
+    items: Vec<Item>,
+    /// What each item looked like when it was last measured.
     fingerprints: Vec<u64>,
-    /// Entries whose expansion the user flipped (tool details, thinking, a subagent).
+    /// How many entries there were at the last sync: the user's new message brings the view down.
+    entry_count: usize,
+    /// The item that shows each entry; a subagent's entries — by the item of their Agent call.
+    item_of: HashMap<EntryId, usize>,
+    /// Entries whose expansion the user flipped (tool details, thinking, a card's output).
     pub(crate) toggled: HashSet<EntryId>,
+    /// Groups of steps the user opened or closed, by their first entry (otherwise a group is open
+    /// while its turn runs and closed after).
+    opened: HashMap<EntryId, bool>,
     /// Long outputs and diffs the user asked to see whole.
     unclipped: HashSet<EntryId>,
     /// Claude's texts and thinking, parsed (and highlighted once complete), by entry.
@@ -67,8 +101,15 @@ pub struct TranscriptState {
     images: HashMap<(EntryId, usize), Arc<Image>>,
     /// The copy button that shows a check mark, and since when.
     copied: Option<(EntryId, Instant)>,
+    /// An entry to bring into view at the next sync ([`TranscriptState::reveal`]).
+    reveal: Option<EntryId>,
     /// The session changed since the last sync.
     dirty: bool,
+    /// What it shows: `None` — the session's conversation; an Agent call — its subagent's (the
+    /// subagent's view, part 10.2).
+    pub(crate) scope: Option<EntryId>,
+    /// The chat's search (⌘F): the matches to mark, the current one opened (part 10.2).
+    pub(crate) search: Option<SearchMarks>,
 }
 
 /// Claude's text as Markdown blocks.
@@ -81,6 +122,16 @@ struct Parsed {
     highlighting: bool,
 }
 
+/// One item of the conversation's list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Item {
+    /// The entry at this index.
+    Entry(usize),
+    /// Claude's minor steps in a row (reads, searches, thinking, task updates…): the entries at
+    /// `start..end`; hidden ones among them aren't drawn.
+    Group { start: usize, end: usize },
+}
+
 impl TranscriptState {
     pub fn new(chat: WeakEntity<ClaudeChat>) -> Self {
         let list = ListState::new(0, ListAlignment::Bottom, px(600.));
@@ -90,14 +141,34 @@ impl TranscriptState {
         });
         Self {
             list,
+            items: Vec::new(),
             fingerprints: Vec::new(),
+            entry_count: 0,
+            item_of: HashMap::new(),
             toggled: HashSet::new(),
+            opened: HashMap::new(),
             unclipped: HashSet::new(),
             texts: HashMap::new(),
             images: HashMap::new(),
             copied: None,
+            reveal: None,
             dirty: true,
+            scope: None,
+            search: None,
         }
+    }
+
+    /// The conversation of the subagent of the Agent call `tool` (part 10.2).
+    pub fn scoped(chat: WeakEntity<ClaudeChat>, tool: EntryId) -> Self {
+        Self {
+            scope: Some(tool),
+            ..Self::new(chat)
+        }
+    }
+
+    /// The entry of the search's current match: it shows opened and whole.
+    fn search_current(&self) -> Option<EntryId> {
+        self.search.as_ref()?.current.map(|(entry, _)| entry)
     }
 
     /// The session changed: the next frame compares the entries again.
@@ -110,6 +181,15 @@ impl TranscriptState {
         self.list.logical_scroll_top().item_ix >= self.list.item_count()
     }
 
+    /// Scrolls the conversation so the entry `id` is in sight — a subagent's entry by its Agent
+    /// call, a step by its group (opened) — when the chat is drawn next: the caller redraws it
+    /// (`cx.notify()` on the chat). A click on a session tab's status, a match of the search
+    /// (part 10.2).
+    pub fn reveal(&mut self, id: EntryId) {
+        self.reveal = Some(id);
+        self.dirty = true;
+    }
+
     pub fn scroll_to_bottom(&self) {
         self.list.scroll_to(ListOffset {
             item_ix: self.list.item_count(),
@@ -118,6 +198,9 @@ impl TranscriptState {
     }
 
     fn expanded(&self, id: EntryId, default: bool) -> bool {
+        if self.search_current() == Some(id) {
+            return true;
+        }
         (default || expand_all()) != self.toggled.contains(&id)
     }
 
@@ -128,13 +211,18 @@ impl TranscriptState {
         self.dirty = true;
     }
 
+    /// A group of steps (by its first entry) is open: as the user left it, else by `default`.
+    fn group_open(&self, id: EntryId, default: bool) -> bool {
+        expand_all() || self.opened.get(&id).copied().unwrap_or(default)
+    }
+
     fn just_copied(&self, id: EntryId) -> bool {
         self.copied
             .is_some_and(|(copied, at)| copied == id && at.elapsed() < COPIED_FOR)
     }
 }
 
-/// Brings the list up to date with the session: new and changed entries are measured again,
+/// Brings the list up to date with the session: new and changed items are measured again,
 /// changed texts parsed, complete ones highlighted in the background, new pictures decoded.
 pub fn sync(
     state: &mut TranscriptState,
@@ -147,15 +235,28 @@ pub fn sync(
     state.dirty = false;
     let mut texts = Vec::new();
     let mut pictures = Vec::new();
-    let (fingerprints, user_sent) = {
+    let (fingerprints, user_sent, reveal) = {
         let model = session.read(cx).model();
-        let fingerprints: Vec<u64> = model
-            .entries
-            .iter()
-            .map(|entry| fingerprint(entry, state))
+        let entries = scope_entries(model, state.scope);
+        let items = items(entries);
+        state.item_of = item_index(entries, &items);
+        // The entry to reveal opens the group that holds it before the items are measured.
+        let reveal = state.reveal.take().and_then(|id| {
+            let index = *state.item_of.get(&id)?;
+            if let Item::Group { start, .. } = items[index] {
+                state.opened.insert(entries[start].id, true);
+            }
+            Some(index)
+        });
+        let working = match state.scope {
+            None => model.status.is_working(),
+            Some(tool) => find_tool(&model.entries, tool).is_some_and(agent_running),
+        };
+        let fingerprints: Vec<u64> = (0..items.len())
+            .map(|index| item_fingerprint(entries, &items, index, working, state))
             .collect();
-        collect_texts(&model.entries, &state.texts, &mut texts);
-        for entry in &model.entries {
+        collect_texts(entries, &state.texts, &mut texts);
+        for entry in entries {
             if let EntryKind::User(user) = &entry.kind {
                 for (index, image) in user.images.iter().enumerate() {
                     if !state.images.contains_key(&(entry.id, index)) {
@@ -168,14 +269,16 @@ pub fn sync(
                 }
             }
         }
-        // The user's own new message brings the view to the end.
-        let user_sent = model.entries[state.fingerprints.len().min(model.entries.len())..]
+        // The user's own new message (or `!` command) brings the view to the end.
+        let user_sent = entries[state.entry_count.min(entries.len())..]
             .iter()
-            .any(|entry| matches!(entry.kind, EntryKind::User(_)));
-        (fingerprints, user_sent)
+            .any(|entry| matches!(entry.kind, EntryKind::User(_) | EntryKind::Shell(_)));
+        state.entry_count = entries.len();
+        state.items = items;
+        (fingerprints, user_sent, reveal)
     };
 
-    // Measure changed entries again; new ones are added at the end.
+    // Measure changed items again; new ones are added at the end.
     let old = std::mem::take(&mut state.fingerprints);
     let common = old.len().min(fingerprints.len());
     let mut index = 0;
@@ -200,6 +303,9 @@ pub fn sync(
     state.fingerprints = fingerprints;
     if user_sent {
         state.scroll_to_bottom();
+    }
+    if let Some(index) = reveal {
+        state.list.scroll_to_reveal_item(index);
     }
 
     for (key, media_type, data) in pictures {
@@ -239,12 +345,20 @@ pub fn sync(
                     })
                     .await;
                 chat.update(cx, |chat, cx| {
-                    if let Some(parsed) = chat.transcript.texts.get_mut(&id)
-                        && parsed.len == len
-                    {
-                        parsed.blocks = Rc::new(highlighted);
-                        parsed.highlighted = true;
-                        parsed.highlighting = false;
+                    // The session's view and a subagent's may both show the text.
+                    let highlighted = Rc::new(highlighted);
+                    let mut done = false;
+                    for transcript in chat.transcripts_mut() {
+                        if let Some(parsed) = transcript.texts.get_mut(&id)
+                            && parsed.len == len
+                        {
+                            parsed.blocks = highlighted.clone();
+                            parsed.highlighted = true;
+                            parsed.highlighting = false;
+                            done = true;
+                        }
+                    }
+                    if done {
                         cx.notify();
                     }
                 })
@@ -253,6 +367,190 @@ pub fn sync(
             .detach();
         }
     }
+}
+
+/// The list's items over `entries`: one per shown entry, Claude's minor steps in a row as one
+/// group. Hidden entries (thinking without text, an empty text) belong to no item and don't break
+/// a group.
+pub(crate) fn items(entries: &[Entry]) -> Vec<Item> {
+    let mut items = Vec::new();
+    let mut group: Option<(usize, usize)> = None;
+    for (index, entry) in entries.iter().enumerate() {
+        if is_hidden(&entry.kind) {
+            continue;
+        }
+        if is_minor(&entry.kind) {
+            group = Some(match group {
+                Some((start, _)) => (start, index + 1),
+                None => (index, index + 1),
+            });
+            continue;
+        }
+        if let Some((start, end)) = group.take() {
+            items.push(Item::Group { start, end });
+        }
+        items.push(Item::Entry(index));
+    }
+    if let Some((start, end)) = group {
+        items.push(Item::Group { start, end });
+    }
+    items
+}
+
+/// Which item shows each entry; a subagent's entries (at any depth) go by their Agent call's.
+fn item_index(entries: &[Entry], items: &[Item]) -> HashMap<EntryId, usize> {
+    fn nested(children: &[Entry], item: usize, index: &mut HashMap<EntryId, usize>) {
+        for child in children {
+            index.insert(child.id, item);
+            if let EntryKind::Tool(tool) = &child.kind {
+                nested(&tool.children, item, index);
+            }
+        }
+    }
+    let mut index = HashMap::new();
+    for (item, range) in items.iter().map(|item| item.range()).enumerate() {
+        for entry in entries.get(range).into_iter().flatten() {
+            index.insert(entry.id, item);
+            if let EntryKind::Tool(tool) = &entry.kind {
+                nested(&tool.children, item, &mut index);
+            }
+        }
+    }
+    index
+}
+
+/// The entries a transcript shows: the session's conversation, or the subagent's of the Agent call
+/// `scope` (nothing, if the call is gone).
+pub(crate) fn scope_entries(model: &Session, scope: Option<EntryId>) -> &[Entry] {
+    match scope {
+        None => &model.entries,
+        Some(id) => find_tool(&model.entries, id).map_or(&[], |tool| tool.children.as_slice()),
+    }
+}
+
+/// The tool call with the entry id `id`, at any depth (subagents' calls too).
+pub(crate) fn find_tool(entries: &[Entry], id: EntryId) -> Option<&ToolEntry> {
+    entries.iter().find_map(|entry| match &entry.kind {
+        EntryKind::Tool(tool) if entry.id == id => Some(tool.as_ref()),
+        EntryKind::Tool(tool) => find_tool(&tool.children, id),
+        _ => None,
+    })
+}
+
+impl Item {
+    /// The entries it shows.
+    fn range(self) -> std::ops::Range<usize> {
+        match self {
+            Item::Entry(index) => index..index + 1,
+            Item::Group { start, end } => start..end,
+        }
+    }
+
+    /// The entry, when the item is one.
+    fn kind(self, entries: &[Entry]) -> Option<&EntryKind> {
+        match self {
+            Item::Entry(index) => entries.get(index).map(|entry| &entry.kind),
+            Item::Group { .. } => None,
+        }
+    }
+}
+
+/// A step that folds into a group: thinking, and the tools that only look around (read, search,
+/// fetch) or keep notes (tasks), the skills and other tools' calls.
+fn is_minor(kind: &EntryKind) -> bool {
+    match kind {
+        EntryKind::Thinking { .. } => true,
+        EntryKind::Tool(tool) => matches!(
+            tool.call,
+            ToolCall::Read { .. }
+                | ToolCall::Grep { .. }
+                | ToolCall::Glob { .. }
+                | ToolCall::WebFetch { .. }
+                | ToolCall::WebSearch { .. }
+                | ToolCall::TaskCreate { .. }
+                | ToolCall::TaskUpdate { .. }
+                | ToolCall::TodoWrite { .. }
+                | ToolCall::Skill { .. }
+                | ToolCall::Mcp { .. }
+                | ToolCall::EnterPlanMode
+                | ToolCall::Other
+        ),
+        _ => false,
+    }
+}
+
+/// The user's side of the conversation: their messages and `!` commands.
+fn is_user_side(kind: &EntryKind) -> bool {
+    matches!(kind, EntryKind::User(_) | EntryKind::Shell(_))
+}
+
+/// The item starts a turn of Claude's — after the user's message, a turn's end or a compaction —
+/// and gets the avatar. The end of a turn and a separator never carry it.
+fn leads_turn(entries: &[Entry], items: &[Item], index: usize) -> bool {
+    let carries = match items[index].kind(entries) {
+        None => true,
+        Some(kind) => !is_user_side(kind) && !is_turn_break(kind),
+    };
+    carries
+        && match index.checked_sub(1) {
+            None => true,
+            Some(previous) => items[previous]
+                .kind(entries)
+                .is_some_and(|kind| is_user_side(kind) || is_turn_break(kind)),
+        }
+}
+
+/// The end of a turn, or a line across the conversation (a compaction).
+fn is_turn_break(kind: &EntryKind) -> bool {
+    matches!(
+        kind,
+        EntryKind::TurnEnd(_) | EntryKind::Notice(Notice::Compacted { .. })
+    )
+}
+
+/// The space above an item: wide between the user's messages and Claude's turns, tight within a
+/// turn.
+fn top_gap(entries: &[Entry], items: &[Item], index: usize) -> f32 {
+    let Some(previous) = index.checked_sub(1).map(|previous| items[previous]) else {
+        return 14.;
+    };
+    let user = |item: Item| item.kind(entries).is_some_and(is_user_side);
+    let current = items[index];
+    match (user(previous), user(current)) {
+        (false, true) => 20.,
+        (true, true) => 10.,
+        (true, false) => 12.,
+        (false, false) if previous.kind(entries).is_some_and(is_turn_break) => 18.,
+        (false, false) => 8.,
+    }
+}
+
+/// What an item looks like, cheaply: when it changes, the list measures the item again.
+fn item_fingerprint(
+    entries: &[Entry],
+    items: &[Item],
+    index: usize,
+    working: bool,
+    state: &TranscriptState,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    leads_turn(entries, items, index).hash(&mut hasher);
+    top_gap(entries, items, index).to_bits().hash(&mut hasher);
+    if let Some(search) = &state.search {
+        (&search.needle, search.current).hash(&mut hasher);
+    }
+    match items[index] {
+        Item::Entry(entry) => hash_entry(&entries[entry], state, &mut hasher),
+        Item::Group { start, end } => {
+            7u8.hash(&mut hasher);
+            (working && index + 1 == items.len()).hash(&mut hasher);
+            state.opened.get(&entries[start].id).hash(&mut hasher);
+            for entry in &entries[start..end] {
+                hash_entry(entry, state, &mut hasher);
+            }
+        }
+    }
+    hasher.finish()
 }
 
 /// A text of Claude's to parse.
@@ -294,13 +592,6 @@ fn collect_texts(entries: &[Entry], parsed: &HashMap<EntryId, Parsed>, jobs: &mu
     }
 }
 
-/// What an entry looks like, cheaply: when it changes, the list measures the entry again.
-fn fingerprint(entry: &Entry, state: &TranscriptState) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hash_entry(entry, state, &mut hasher);
-    hasher.finish()
-}
-
 fn hash_entry(entry: &Entry, state: &TranscriptState, hasher: &mut DefaultHasher) {
     entry.id.hash(hasher);
     state.toggled.contains(&entry.id).hash(hasher);
@@ -311,6 +602,7 @@ fn hash_entry(entry: &Entry, state: &TranscriptState, hasher: &mut DefaultHasher
             user.images.len(),
             user.queued,
             user.cancelled,
+            user.at,
         )
             .hash(hasher),
         EntryKind::Text { text, streaming } => (1u8, text.len(), streaming).hash(hasher),
@@ -346,6 +638,14 @@ fn hash_entry(entry: &Entry, state: &TranscriptState, hasher: &mut DefaultHasher
         }
         EntryKind::Notice(notice) => (4u8, std::mem::discriminant(notice)).hash(hasher),
         EntryKind::TurnEnd(summary) => (5u8, summary.is_error).hash(hasher),
+        EntryKind::Shell(shell) => (
+            6u8,
+            shell.output.len(),
+            shell.state as u8,
+            shell.exit_code,
+            shell.delivered,
+        )
+            .hash(hasher),
     }
 }
 
@@ -360,7 +660,7 @@ fn expand_all() -> bool {
     false
 }
 
-fn image_format(media_type: &str) -> ImageFormat {
+pub(crate) fn image_format(media_type: &str) -> ImageFormat {
     match media_type {
         "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
         "image/gif" => ImageFormat::Gif,
@@ -371,14 +671,44 @@ fn image_format(media_type: &str) -> ImageFormat {
 
 // --- The view ---
 
+/// The conversation's column around `child`: centered, at most [`COLUMN_MAX_WIDTH`] wide, inset
+/// from the island's edges. The chat puts its cards and field in the same column.
+pub fn column(child: impl IntoElement) -> Div {
+    div().w_full().flex().justify_center().child(
+        div()
+            .w_full()
+            .max_w(px(COLUMN_MAX_WIDTH))
+            .px(px(COLUMN_INSET))
+            .child(child),
+    )
+}
+
 /// The conversation filling the chat (the "↓" button over it while scrolled up), and the line of
 /// what Claude does now under it; tips in an empty session.
 pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeChat>) -> AnyElement {
     let ui = Theme::ui(cx);
     let weak = cx.weak_entity();
-    let state = &chat.transcript;
+    let state = chat.shown_transcript();
     let model = chat.session().read(cx).model();
-    let activity = activity_line(model, ui);
+    let agent = state.scope.and_then(|tool| find_tool(&model.entries, tool));
+    let activity = match agent {
+        None => activity_line(model, ui),
+        Some(tool) => agent_activity_line(tool, ui),
+    };
+    if let Some(tool) = agent
+        && scope_entries(model, state.scope).is_empty()
+    {
+        // The subagent hasn't said anything yet: its task, and that it starts.
+        return div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .justify_end()
+            .child(column(agent_task(tool, ui)).pb(px(8.)))
+            .children(activity)
+            .into_any_element();
+    }
     if model.entries.is_empty() {
         let starting = matches!(model.status, Status::Starting);
         return div()
@@ -410,7 +740,7 @@ pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeCh
                 .child(icon(IconName::ArrowDown, ui.text_muted).size(px(14.)))
                 .on_click(move |_, _, cx| {
                     weak.update(cx, |chat, cx| {
-                        chat.transcript.scroll_to_bottom();
+                        chat.shown_transcript().scroll_to_bottom();
                         cx.notify();
                     })
                     .ok();
@@ -429,6 +759,7 @@ pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeCh
         .min_h_0()
         .flex()
         .flex_col()
+        .text_size(px(CHAT_TEXT))
         .child(
             div()
                 .relative()
@@ -441,7 +772,7 @@ pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeCh
         .into_any_element()
 }
 
-/// One entry of the main conversation, with the space above it.
+/// One item of the main conversation, in the column, with the space above it.
 fn render_item(chat: &WeakEntity<ClaudeChat>, index: usize, cx: &mut App) -> AnyElement {
     let Some(entity) = chat.upgrade() else {
         return div().into_any_element();
@@ -449,61 +780,75 @@ fn render_item(chat: &WeakEntity<ClaudeChat>, index: usize, cx: &mut App) -> Any
     let chat_view = entity.read(cx);
     let session = chat_view.session().clone();
     let model = session.read(cx).model();
-    let Some(entry) = model.entries.get(index) else {
+    let state = chat_view.shown_transcript();
+    let agent = state.scope.and_then(|tool| find_tool(&model.entries, tool));
+    let entries = scope_entries(model, state.scope);
+    let Some(item) = state
+        .items
+        .get(index)
+        .copied()
+        .filter(|item| item.range().end <= entries.len())
+    else {
         return div().into_any_element();
     };
     let theme = Theme::get(cx);
     let renderer = Renderer {
         ui: theme.ui,
         theme,
-        state: &chat_view.transcript,
+        state,
         chat: chat.clone(),
         session: &session,
+        model,
         root: &model.info.cwd,
         tasks: &model.tasks,
+        agent: agent.is_some(),
+        marks: RefCell::new(HashMap::new()),
     };
-    if is_hidden(&entry.kind) {
-        return div().into_any_element();
-    }
-    let previous = model.entries[..index]
-        .iter()
-        .rev()
-        .find(|entry| !is_hidden(&entry.kind));
-    let last = index + 1 == model.entries.len();
-    div()
-        .px(px(INSET))
-        .pt(px(top_gap(previous.map(|entry| &entry.kind), &entry.kind)))
-        .when(last, |item| item.pb(px(10.)))
-        .child(renderer.entry(entry, 0))
+    let lead = leads_turn(entries, &state.items, index);
+    let last = index + 1 == state.items.len();
+    let working = match agent {
+        None => model.status.is_working(),
+        Some(tool) => agent_running(tool),
+    };
+    let body = match item {
+        Item::Entry(entry) => renderer.top_entry(&entries[entry], lead),
+        Item::Group { start, end } => {
+            let live = last && working;
+            renderer.claude(lead, renderer.group(&entries[start..end], live))
+        }
+    };
+    // A subagent's conversation starts with its task (part 10.2).
+    let body = match agent.filter(|_| index == 0) {
+        Some(tool) => div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(agent_task(tool, theme.ui))
+            .child(body)
+            .into_any_element(),
+        None => body,
+    };
+    column(body)
+        .pt(px(top_gap(entries, &state.items, index)))
+        .when(last, |item| item.pb(px(12.)))
         .into_any_element()
 }
 
-/// Thinking that is over and has no text to show (the CLI didn't summarize it): no row, the
-/// activity line said it while it lasted.
+/// Thinking that is over with nothing to show — no text (the CLI didn't summarize it) and no
+/// known time — and an empty text: no row, the activity line said it while it lasted.
 fn is_hidden(kind: &EntryKind) -> bool {
     match kind {
         EntryKind::Thinking {
             text,
             streaming: false,
+            duration,
             ..
-        }
-        | EntryKind::Text {
+        } => text.trim().is_empty() && duration.is_none_or(|duration| duration.as_secs() == 0),
+        EntryKind::Text {
             text,
             streaming: false,
         } => text.trim().is_empty(),
         _ => false,
-    }
-}
-
-/// The space above an entry: tight between a turn's steps, wider before the user's messages.
-fn top_gap(previous: Option<&EntryKind>, current: &EntryKind) -> f32 {
-    match (previous, current) {
-        (None, _) => 12.,
-        (_, EntryKind::User(_)) => 14.,
-        (Some(EntryKind::TurnEnd(_)), _) => 8.,
-        (Some(EntryKind::Tool(_) | EntryKind::Thinking { .. }), EntryKind::Tool(_))
-        | (Some(EntryKind::Tool(_)), EntryKind::Thinking { .. }) => 2.,
-        _ => 8.,
     }
 }
 
@@ -514,12 +859,81 @@ struct Renderer<'a> {
     state: &'a TranscriptState,
     chat: WeakEntity<ClaudeChat>,
     session: &'a Entity<ClaudeSession>,
+    model: &'a Session,
     root: &'a Path,
     /// Claude's task list: a task update names its task.
     tasks: &'a [flux_claude::TaskItem],
+    /// A subagent's conversation (its avatar instead of Claude's).
+    agent: bool,
+    /// The search's marks by entry, made on first use: an entry's texts share its count.
+    marks: RefCell<HashMap<EntryId, Rc<Marks>>>,
 }
 
 impl Renderer<'_> {
+    /// A top-level entry on its side of the conversation.
+    fn top_entry(&self, entry: &Entry, lead: bool) -> AnyElement {
+        match &entry.kind {
+            EntryKind::User(user) => self.user(entry.id, user),
+            EntryKind::Shell(shell) => self.shell(entry.id, shell),
+            EntryKind::Notice(notice @ Notice::Compacted { .. }) => self.notice(notice),
+            _ => self.claude(lead, self.entry(entry, 0)),
+        }
+    }
+
+    /// Claude's side: the avatar's column (the avatar where a turn starts), then the content.
+    fn claude(&self, lead: bool, content: AnyElement) -> AnyElement {
+        div()
+            .flex()
+            .gap(px(AVATAR_GAP))
+            .child(
+                div().flex_none().w(px(AVATAR)).children(lead.then(|| {
+                    if self.agent {
+                        agent_avatar(self.ui)
+                    } else {
+                        avatar(self.ui)
+                    }
+                })),
+            )
+            .child(div().flex_1().min_w_0().child(content))
+            .into_any_element()
+    }
+
+    /// The search's marks for the texts of the entry `id` (none while nothing is searched).
+    fn marks(&self, id: EntryId) -> Option<Rc<Marks>> {
+        let search = self.state.search.as_ref().filter(|search| !search.needle.is_empty())?;
+        let mut marks = self.marks.borrow_mut();
+        let marks = marks.entry(id).or_insert_with(|| {
+            Rc::new(Marks {
+                needle: search.needle.clone(),
+                active: search
+                    .current
+                    .filter(|(entry, _)| *entry == id)
+                    .map(|(_, index)| index),
+                count: Cell::new(0),
+                color: self.ui.search_match,
+                active_color: self.ui.search_match_active,
+            })
+        });
+        Some(marks.clone())
+    }
+
+    /// A line of text with the search's matches in it marked.
+    fn marked(&self, id: EntryId, text: String) -> AnyElement {
+        match self.marks(id) {
+            Some(marks) => {
+                let highlights = marks.highlights(&text);
+                if highlights.is_empty() {
+                    text.into_any_element()
+                } else {
+                    StyledText::new(text)
+                        .with_highlights(highlights)
+                        .into_any_element()
+                }
+            }
+            None => text.into_any_element(),
+        }
+    }
+
     fn entry(&self, entry: &Entry, depth: usize) -> AnyElement {
         match &entry.kind {
             EntryKind::User(user) => self.user(entry.id, user),
@@ -531,37 +945,100 @@ impl Renderer<'_> {
                 duration,
                 ..
             } => self.thinking(entry.id, text, *tokens, *streaming, *duration),
-            EntryKind::Tool(tool) => self.tool(entry.id, tool, depth),
+            EntryKind::Tool(tool) => self.tool_entry(entry.id, tool, depth),
             EntryKind::Notice(notice) => self.notice(notice),
             EntryKind::TurnEnd(summary) => self.turn_end(entry.id, summary),
+            EntryKind::Shell(shell) => self.shell(entry.id, shell),
         }
     }
 
-    // --- The user's messages ---
+    /// A tool call that isn't a minor step: a card for a command, an edit, a subagent; a row with
+    /// its details for the rest (a question, the plan).
+    fn tool_entry(&self, id: EntryId, tool: &ToolEntry, depth: usize) -> AnyElement {
+        match &tool.call {
+            ToolCall::Bash { .. } => self.bash_card(id, tool),
+            ToolCall::Edit { .. } | ToolCall::Write { .. } | ToolCall::NotebookEdit { .. } => {
+                self.edit_card(id, tool)
+            }
+            ToolCall::Agent { .. } if depth == 0 => self.agent_card(id, tool),
+            _ => self.tool(id, tool, depth),
+        }
+    }
 
+    // --- The user's side ---
+
+    /// The user's message: mentions at its ends and pictures as chips above a bubble on the
+    /// right, the time (or Queued, Cancelled) under it, Copy / Edit and resend / Rewind the code on
+    /// hover.
     fn user(&self, id: EntryId, user: &UserEntry) -> AnyElement {
         let ui = self.ui;
-        let thumbnails = (0..user.images.len()).filter_map(|index| {
-            self.state.images.get(&(id, index)).map(|image| {
-                div()
-                    .size(px(56.))
-                    .rounded(px(RADIUS_SM))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(ui.divider)
-                    .child(
-                        img(image.clone())
-                            .size_full()
-                            .object_fit(gpui::ObjectFit::Cover),
-                    )
+        let (chips, text) = edge_mentions(&user.text);
+        let thumbnails: Vec<AnyElement> = (0..user.images.len())
+            .filter_map(|index| {
+                let image = self.state.images.get(&(id, index))?.clone();
+                let attachment = user.images.get(index)?;
+                let source = ImageSource::Bytes {
+                    name: format!("image-{}.{}", index + 1, image_extension(&attachment.media_type)),
+                    media_type: attachment.media_type.clone(),
+                    data: Arc::from(attachment.data.as_slice()),
+                };
+                let chat = self.chat.clone();
+                Some(
+                    div()
+                        .id(("claude-user-image", (id as usize) * 16 + index))
+                        .w(px(64.))
+                        .h(px(48.))
+                        .rounded(px(RADIUS_SM))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(UiColors::tint(ui.foreground, 0.14))
+                        .cursor_pointer()
+                        .hover(move |style| style.border_color(ui.accent))
+                        .tooltip(ui::tooltip(tr("Preview"), None))
+                        .child(img(image).size_full().object_fit(gpui::ObjectFit::Cover))
+                        .on_click(move |_, _, cx| {
+                            let source = source.clone();
+                            chat.update(cx, |chat, cx| chat.preview_image(source, cx)).ok();
+                        })
+                        .into_any_element(),
+                )
             })
+            .collect();
+        let chips: Vec<AnyElement> = chips
+            .into_iter()
+            .enumerate()
+            .map(|(index, chip)| self.mention_chip(id, index, chip))
+            .collect();
+        let above = (!chips.is_empty() || !thumbnails.is_empty()).then(|| {
+            div()
+                .max_w(gpui::relative(BUBBLE_SHARE))
+                .flex()
+                .flex_wrap()
+                .justify_end()
+                .items_end()
+                .gap_1p5()
+                .children(chips)
+                .children(thumbnails)
+        });
+        let bubble = (!text.trim().is_empty()).then(|| {
+            div()
+                .max_w(gpui::relative(BUBBLE_SHARE))
+                .px(px(14.))
+                .pt(px(8.))
+                .pb(px(9.))
+                .rounded(px(16.))
+                .rounded_br(px(5.))
+                .bg(UiColors::tint(ui.accent, 0.17))
+                .border_1()
+                .border_color(UiColors::tint(ui.accent, 0.26))
+                .child(self.user_text(id, text, user.cancelled))
         });
         let status = if user.cancelled {
-            Some(tr("Cancelled"))
+            Some(tr("Cancelled").to_string())
         } else if user.queued {
-            Some(tr("Queued"))
+            Some(tr("Queued").to_string())
         } else {
-            None
+            user.at.map(time_label)
         };
         let cancel = user
             .uuid
@@ -569,41 +1046,137 @@ impl Renderer<'_> {
             .filter(|_| user.queued)
             .map(|uuid: String| {
                 let session = self.session.clone();
-                ui::icon_button(("claude-cancel-queued", id), IconName::Close, ui)
+                small_button(("claude-cancel-queued", id), IconName::Close, ui)
                     .tooltip(ui::tooltip(tr("Don't Send"), None))
                     .on_click(move |_, _, cx| {
                         session.update(cx, |session, cx| session.cancel_queued(&uuid, cx))
                     })
             });
+        let group: SharedString = format!("claude-user-{id}").into();
+        let actions = (!user.queued && !user.cancelled).then(|| {
+            let prompt = !user.text.trim_start().starts_with('/');
+            let copied = self.state.just_copied(id);
+            let chat = self.chat.clone();
+            let copy = small_button(
+                ("claude-user-copy", id),
+                if copied { IconName::Check } else { IconName::Copy },
+                ui,
+            )
+            .tooltip(ui::tooltip(tr("Copy"), None))
+            .on_click(move |_, _, cx| {
+                chat.update(cx, |chat, cx| {
+                    chat.copy_message(id, cx);
+                    chat.shown_transcript_mut().copied = Some((id, Instant::now()));
+                    cx.notify();
+                    cx.spawn(async move |chat, cx| {
+                        cx.background_executor().timer(COPIED_FOR).await;
+                        chat.update(cx, |_, cx| cx.notify()).ok();
+                    })
+                    .detach();
+                })
+                .ok();
+            });
+            let edit = prompt.then(|| {
+                let chat = self.chat.clone();
+                small_button(("claude-user-edit", id), IconName::Pencil, ui)
+                    .tooltip(ui::tooltip(tr("Edit and Resend"), None))
+                    .on_click(move |_, window, cx| {
+                        chat.update(cx, |chat, cx| chat.edit_message(id, window, cx))
+                            .ok();
+                    })
+            });
+            let rewind = prompt.then(|| {
+                let chat = self.chat.clone();
+                small_button(("claude-user-rewind", id), IconName::Rollback, ui)
+                    .tooltip(ui::tooltip(tr("Rewind Code to Before This Message"), None))
+                    .on_click(move |_, window, cx| {
+                        chat.update(cx, |chat, cx| chat.rewind_code(id, window, cx))
+                            .ok();
+                    })
+            });
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .when(!copied, |row| {
+                    row.invisible()
+                        .group_hover(group.clone(), |style| style.visible())
+                })
+                .child(copy)
+                .children(edit)
+                .children(rewind)
+        });
+        let footer = div()
+            .h(px(20.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .text_size(px(theme::TEXT_XS))
+            .text_color(ui.dim)
+            .children(actions)
+            .when(user.queued, |row| {
+                row.child(icon(IconName::Clock, ui.dim).size(px(12.)))
+            })
+            .children(status)
+            .children(cancel);
         div()
+            .group(group.clone())
             .flex()
             .flex_col()
-            .gap_1p5()
-            .px(px(10.))
-            .py(px(8.))
-            .rounded(px(RADIUS_MD))
-            .bg(UiColors::tint(ui.foreground, 0.05))
+            .items_end()
+            .gap(px(5.))
+            .when(user.queued || user.cancelled, |column| column.opacity(0.65))
+            .children(above)
+            .children(bubble)
+            .child(footer)
+            .into_any_element()
+    }
+
+    /// A mention at an end of the message, as a chip: the file's icon, its name and lines; a
+    /// click opens it there.
+    fn mention_chip(&self, id: EntryId, index: usize, chip: Mention<'_>) -> AnyElement {
+        let ui = self.ui;
+        let name = Path::new(chip.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(chip.path)
+            .to_string();
+        let label = match chip.lines {
+            Some((first, last)) if first == last => format!("{name}:{first}"),
+            Some((first, last)) => format!("{name}:{first}–{last}"),
+            None => name.clone(),
+        };
+        let location = Location {
+            path: self.root.join(chip.path),
+            line: chip.lines.map_or(0, |(first, _)| first.saturating_sub(1)),
+            start: 0,
+            end: 0,
+        };
+        let chat = self.chat.clone();
+        let file = file_icon(&name, &ui);
+        div()
+            .id(("claude-mention-chip", (id as usize) * 16 + index))
+            .h(px(22.))
+            .px(px(7.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .rounded(px(RADIUS_SM))
+            .bg(UiColors::tint(ui.foreground, 0.06))
             .border_1()
-            .border_color(UiColors::tint(ui.foreground, 0.07))
-            .when(user.queued || user.cancelled, |bubble| bubble.opacity(0.6))
-            .when(!user.text.is_empty(), |bubble| {
-                bubble.child(self.user_text(id, &user.text, user.cancelled))
+            .border_color(UiColors::tint(ui.foreground, 0.08))
+            .text_size(px(theme::TEXT_SM))
+            .text_color(ui.foreground)
+            .cursor_pointer()
+            .hover(move |style| style.border_color(ui.accent))
+            .tooltip(ui::tooltip(chip.raw.trim_start_matches('@').to_string(), None))
+            .child(file.render().size(px(13.)))
+            .child(label)
+            .on_click(move |_, _, cx| {
+                let location = location.clone();
+                chat.update(cx, |_, cx| cx.emit(ClaudeChatEvent::OpenLocation(location)))
+                    .ok();
             })
-            .when(!user.images.is_empty(), |bubble| {
-                bubble.child(div().flex().flex_wrap().gap_1p5().children(thumbnails))
-            })
-            .children(status.map(|status| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_size(px(theme::TEXT_XS))
-                    .text_color(ui.dim)
-                    .child(icon(IconName::Clock, ui.dim).size(px(12.)))
-                    .child(status)
-                    .child(div().flex_1())
-                    .children(cancel)
-            }))
             .into_any_element()
     }
 
@@ -655,6 +1228,10 @@ impl Renderer<'_> {
                 }
             }
         }
+        let runs = match self.marks(id) {
+            Some(marks) => marks.mark(&display, runs),
+            None => runs,
+        };
         let styled = StyledText::new(display).with_runs(runs);
         if ranges.is_empty() {
             return div().child(styled).into_any_element();
@@ -667,6 +1244,131 @@ impl Renderer<'_> {
                         .ok();
                 }
             })
+            .into_any_element()
+    }
+
+    /// A `!` command: a terminal card on the user's side — the command, how it ended (or a clock
+    /// and Stop while it runs), its output; under it, whether Claude got the output.
+    fn shell(&self, id: EntryId, shell: &ShellEntry) -> AnyElement {
+        let ui = self.ui;
+        let running = shell.state == ShellState::Running;
+        let output = shell.output.trim_end();
+        let expandable = !output.is_empty();
+        let expanded = expandable && self.state.expanded(id, true);
+        let status: Option<AnyElement> = match shell.state {
+            ShellState::Running => {
+                let chat = self.chat.clone();
+                Some(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .children(shell.started.map(|started| {
+                            div()
+                                .text_size(px(theme::TEXT_XS))
+                                .text_color(ui.dim)
+                                .child(format_elapsed(started.elapsed()))
+                        }))
+                        .child(
+                            ui::text_button(("claude-shell-stop", id), tr("Stop"), true, ui)
+                                .h(px(22.))
+                                .on_click(move |_, _, cx| {
+                                    chat.update(cx, |chat, cx| chat.stop_shell(id, cx)).ok();
+                                }),
+                        )
+                        .into_any_element(),
+                )
+            }
+            ShellState::Done => {
+                let mut parts = Vec::new();
+                if let Some(code) = shell.exit_code {
+                    parts.push(trf("exit {0}", &[&code]));
+                }
+                if let Some(duration) = shell.duration {
+                    parts.push(format_duration(duration));
+                }
+                let failed = shell.exit_code.is_some_and(|code| code != 0);
+                (!parts.is_empty()).then(|| {
+                    div()
+                        .flex_none()
+                        .text_size(px(theme::TEXT_XS))
+                        .text_color(if failed { ui.error } else { ui.dim })
+                        .child(parts.join(" · "))
+                        .into_any_element()
+                })
+            }
+            ShellState::Stopped => state_mark(ToolState::Interrupted, ui),
+            ShellState::Failed => Some(ui::badge(tr("failed"), ui.error).into_any_element()),
+        };
+        let header = div()
+            .id(("claude-shell", id))
+            .h(px(32.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .rounded(px(CARD_RADIUS - 1.))
+            .child(bang_badge(ui))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(theme::code_font())
+                    .text_size(px(12.))
+                    .text_color(ui.foreground)
+                    .child(self.marked(id, first_line(&shell.command))),
+            )
+            .when(running, |row| row.child(pulse(("claude-shell-pulse", id), ui)))
+            .children(status)
+            .when(expandable, |row| {
+                row.cursor_pointer()
+                    .hover(move |style| style.bg(ui.hover))
+                    .child(chevron(expanded, ui))
+                    .on_click(self.toggle(id))
+            });
+        let body = expanded.then(|| {
+            let color = if shell.state == ShellState::Failed {
+                ui.error
+            } else {
+                ui.text_muted
+            };
+            div()
+                .border_t_1()
+                .border_color(ui.divider)
+                .px(px(10.))
+                .py(px(8.))
+                .child(self.marked_output_lines(id, output, color))
+        });
+        let note = if shell.delivered {
+            tr("Claude got the output")
+        } else {
+            tr("Claude will get the output")
+        };
+        div()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(5.))
+            .child(
+                div()
+                    .w(gpui::relative(BUBBLE_SHARE))
+                    .flex()
+                    .flex_col()
+                    .rounded(px(CARD_RADIUS))
+                    .border_1()
+                    .border_color(UiColors::tint(ui.success, 0.28))
+                    .bg(UiColors::tint(ui.success, 0.04))
+                    .child(header)
+                    .children(body),
+            )
+            .child(
+                div()
+                    .h(px(16.))
+                    .text_size(px(theme::TEXT_XS))
+                    .text_color(ui.dim)
+                    .child(note),
+            )
             .into_any_element()
     }
 
@@ -689,6 +1391,7 @@ impl Renderer<'_> {
                 ui.foreground,
                 self.theme,
                 format!("claude-code-{id}"),
+                self.marks(id).as_deref(),
             ))
             .children(copy.map(|copy| {
                 div()
@@ -737,7 +1440,7 @@ impl Renderer<'_> {
             .on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 chat.update(cx, |chat, cx| {
-                    chat.transcript.copied = Some((id, Instant::now()));
+                    chat.shown_transcript_mut().copied = Some((id, Instant::now()));
                     cx.notify();
                     cx.spawn(async move |chat, cx| {
                         cx.background_executor().timer(COPIED_FOR).await;
@@ -765,21 +1468,32 @@ impl Renderer<'_> {
         let row = div()
             .id(("claude-thinking", id))
             .h(px(ROW_HEIGHT))
+            .px(px(4.))
+            .mx(px(-4.))
+            .rounded(px(RADIUS_SM))
             .flex()
             .items_center()
             .gap(px(6.))
             .text_size(px(theme::TEXT_SM))
             .text_color(ui.dim)
-            .child(if streaming {
-                pulse(("claude-thinking-pulse", id), ui).into_any_element()
-            } else {
-                icon(IconName::Claude, ui.dim)
-                    .size(px(13.))
-                    .into_any_element()
-            })
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(16.))
+                    .flex()
+                    .justify_center()
+                    .child(if streaming {
+                        pulse(("claude-thinking-pulse", id), ui).into_any_element()
+                    } else {
+                        icon(IconName::Sparkle, ui.dim)
+                            .size(px(13.))
+                            .into_any_element()
+                    }),
+            )
             .child(label)
             .when(expandable, |row| {
                 row.cursor_pointer()
+                    .hover(move |style| style.bg(ui.hover))
                     .child(chevron(expanded, ui))
                     .on_click(self.toggle(id))
             });
@@ -790,8 +1504,9 @@ impl Renderer<'_> {
                 .get(&id)
                 .map(|parsed| parsed.blocks.clone());
             div()
-                .ml(px(6.))
-                .pl(px(DETAIL_INSET - 6.))
+                .ml(px(7.))
+                .pl(px(DETAIL_INSET - 7.))
+                .pb(px(4.))
                 .border_l_1()
                 .border_color(ui.divider)
                 .text_size(px(theme::TEXT_SM))
@@ -809,17 +1524,606 @@ impl Renderer<'_> {
             .into_any_element()
     }
 
-    // --- Claude's actions ---
+    // --- Claude's steps ---
 
+    /// Minor steps in a row: one line that sums them up ("Thought for 6 s · read 2 files ·
+    /// searched 3 times"), and opened — a row per step. Open while its turn runs (`live`: the
+    /// last item of a working session) or while a step waits for the user; closed after.
+    fn group(&self, entries: &[Entry], live: bool) -> AnyElement {
+        let ui = self.ui;
+        let Some(first) = entries.first() else {
+            return div().into_any_element();
+        };
+        let id = first.id;
+        let shown: Vec<&Entry> = entries
+            .iter()
+            .filter(|entry| !is_hidden(&entry.kind))
+            .collect();
+        let tool_state = |entry: &&Entry| match &entry.kind {
+            EntryKind::Tool(tool) => Some(tool.state),
+            _ => None,
+        };
+        let waiting = shown
+            .iter()
+            .any(|entry| tool_state(entry) == Some(ToolState::Waiting));
+        let failed = shown
+            .iter()
+            .filter(|entry| tool_state(entry) == Some(ToolState::Failed))
+            .count();
+        let open = self.state.group_open(id, live || waiting);
+        let leading = if live {
+            pulse(("claude-group-pulse", id), ui).into_any_element()
+        } else {
+            icon(IconName::Sparkle, ui.dim)
+                .size(px(13.))
+                .into_any_element()
+        };
+        let chat = self.chat.clone();
+        let header = div()
+            .id(("claude-group", id))
+            .h(px(28.))
+            .m(px(1.))
+            .px(px(9.))
+            .rounded(px(CARD_RADIUS - 2.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .text_size(px(theme::TEXT_SM))
+            .text_color(ui.text_muted)
+            .cursor_pointer()
+            .hover(move |style| style.bg(ui.hover))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(14.))
+                    .flex()
+                    .justify_center()
+                    .child(leading),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(group_summary(&shown)),
+            )
+            .when(failed > 0, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(theme::TEXT_XS))
+                        .text_color(ui.error)
+                        .child(trn(failed, "{n} error", "{n} errors")),
+                )
+            })
+            .when(waiting, |row| row.children(state_mark(ToolState::Waiting, ui)))
+            .child(chevron(open, ui))
+            .on_click(move |_, _, cx| {
+                chat.update(cx, |chat, cx| {
+                    chat.shown_transcript_mut().opened.insert(id, !open);
+                    chat.shown_transcript_mut().invalidate();
+                    cx.notify();
+                })
+                .ok();
+            });
+        let rows = open.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .px(px(10.))
+                .pb(px(5.))
+                .children(shown.iter().map(|entry| match &entry.kind {
+                    EntryKind::Tool(tool) => self.tool(entry.id, tool, 1),
+                    _ => self.entry(entry, 1),
+                }))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .rounded(px(CARD_RADIUS))
+            .bg(UiColors::tint(ui.foreground, 0.03))
+            .border_1()
+            .border_color(UiColors::tint(ui.foreground, 0.07))
+            .child(header)
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// A card: a frame with a header (a tile with the step's icon, its title, what's at the end)
+    /// and, opened, a body under a line.
+    fn card(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        header: Vec<AnyElement>,
+        body: Option<AnyElement>,
+        toggle: Option<bool>,
+        accent: Option<Hsla>,
+    ) -> AnyElement {
+        let ui = self.ui;
+        let border = accent.map_or(UiColors::tint(ui.foreground, 0.09), |color| {
+            UiColors::tint(color, 0.3)
+        });
+        let background = accent.map_or(UiColors::tint(ui.foreground, 0.025), |color| {
+            UiColors::tint(color, 0.06)
+        });
+        let header = div()
+            .id(id)
+            .h(px(34.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .rounded(px(CARD_RADIUS - 1.))
+            .text_size(px(theme::TEXT_SM))
+            .children(header);
+        let header = match toggle {
+            Some(expanded) => header
+                .cursor_pointer()
+                .hover(move |style| style.bg(ui.hover))
+                .child(chevron(expanded, ui))
+                .into_any_element(),
+            None => header.into_any_element(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .rounded(px(CARD_RADIUS))
+            .border_1()
+            .border_color(border)
+            .bg(background)
+            .child(header)
+            .children(body.map(|body| {
+                div()
+                    .border_t_1()
+                    .border_color(ui.divider)
+                    .child(body)
+            }))
+            .into_any_element()
+    }
+
+    /// A command Claude ran: a terminal card — the command, how it ended, its output (open when it
+    /// failed or was refused).
+    fn bash_card(&self, id: EntryId, tool: &ToolEntry) -> AnyElement {
+        let ui = self.ui;
+        let ToolCall::Bash {
+            command,
+            background,
+            ..
+        } = &tool.call
+        else {
+            return self.tool(id, tool, 0);
+        };
+        let running = matches!(tool.state, ToolState::Streaming | ToolState::Running);
+        let exit = exit_code(tool);
+        let failed = tool.state == ToolState::Failed
+            || exit.is_some_and(|code| code != 0)
+            || tool.result.as_ref().is_some_and(|result| result.is_error);
+        let color = match tool.state {
+            ToolState::Streaming | ToolState::Running => ui.accent_text,
+            ToolState::Denied | ToolState::Waiting => ui.warning,
+            ToolState::Interrupted => ui.dim,
+            _ if failed => ui.error,
+            _ => ui.success,
+        };
+        let body = self.details_body(id, tool, 0).map(|body| {
+            div()
+                .px(px(10.))
+                .py(px(8.))
+                .child(body)
+                .into_any_element()
+        });
+        let expanded = body.is_some()
+            && self
+                .state
+                .expanded(id, failed || tool.state == ToolState::Denied);
+        let end: Option<AnyElement> = match (tool.state, exit) {
+            (ToolState::Waiting | ToolState::Denied | ToolState::Interrupted, _) => {
+                state_mark(tool.state, ui)
+            }
+            (_, Some(code)) if code != 0 => {
+                Some(ui::badge(trf("exit {0}", &[&code]), ui.error).into_any_element())
+            }
+            (ToolState::Failed, _) => Some(ui::badge(tr("failed"), ui.error).into_any_element()),
+            _ => None,
+        };
+        let mut header = vec![
+            tile(IconName::Terminal, color, running, ("claude-bash-pulse", id), ui),
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(theme::code_font())
+                .text_size(px(12.))
+                .text_color(ui.foreground)
+                .child(self.marked(id, first_line(command)))
+                .into_any_element(),
+        ];
+        if *background {
+            header.push(ui::badge(tr("in the background"), ui.dim).into_any_element());
+        }
+        header.extend(end);
+        let toggle = body.is_some().then_some(expanded);
+        let card = self.card(
+            ("claude-bash", id),
+            header,
+            body.filter(|_| expanded),
+            toggle,
+            None,
+        );
+        self.clickable_card(id, card, toggle.is_some())
+    }
+
+    /// A card whose header flips its body.
+    fn clickable_card(&self, id: EntryId, card: AnyElement, toggles: bool) -> AnyElement {
+        if !toggles {
+            return card;
+        }
+        div()
+            .id(("claude-card-toggle", id))
+            .on_click(self.toggle(id))
+            .child(card)
+            .into_any_element()
+    }
+
+    /// An edit of Claude's: a file card — the path (a link to the change), +N −M, Diff and
+    /// Rollback, and the change itself (its first lines; all of them on "Show more").
+    fn edit_card(&self, id: EntryId, tool: &ToolEntry) -> AnyElement {
+        let ui = self.ui;
+        let structured = tool
+            .result
+            .as_ref()
+            .and_then(|result| result.structured.as_ref());
+        let created = matches!(tool.call, ToolCall::Write { .. })
+            && structured.is_some_and(|result| result["type"] == "create");
+        let summary = tool_summary(tool, self.root, self.tasks);
+        let running = matches!(tool.state, ToolState::Streaming | ToolState::Running);
+        let color = match tool.state {
+            ToolState::Streaming | ToolState::Running => ui.accent_text,
+            ToolState::Denied | ToolState::Waiting => ui.warning,
+            ToolState::Failed => ui.error,
+            ToolState::Interrupted => ui.dim,
+            ToolState::Done if created => ui.vcs_added,
+            ToolState::Done => ui.orange,
+        };
+        let path = tool.call_path().map(|path| Location {
+            path: path.to_path_buf(),
+            line: summary.line.unwrap_or(0),
+            start: 0,
+            end: 0,
+        });
+        let label = {
+            let text = div()
+                .min_w_0()
+                .truncate()
+                .font_family(theme::code_font())
+                .text_size(px(12.))
+                .text_color(ui.accent_text)
+                .child(summary.detail.clone());
+            match path {
+                Some(location) => {
+                    let chat = self.chat.clone();
+                    text.id(("claude-edit-path", id))
+                        .cursor_pointer()
+                        .hover(|style| style.underline())
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            let location = location.clone();
+                            chat.update(cx, |_, cx| {
+                                cx.emit(ClaudeChatEvent::OpenLocation(location))
+                            })
+                            .ok();
+                        })
+                        .into_any_element()
+                }
+                None => text.into_any_element(),
+            }
+        };
+        let counts = match (structured.and_then(patch_counts), &tool.call) {
+            (Some((added, removed)), _) if added > 0 || removed > 0 => Some((added, removed)),
+            (_, ToolCall::Write { content, .. }) if created => Some((content.lines().count(), 0)),
+            _ => None,
+        };
+        let mut header = vec![
+            tile(
+                if created {
+                    IconName::FilePlus
+                } else {
+                    IconName::Pencil
+                },
+                color,
+                running,
+                ("claude-edit-pulse", id),
+                ui,
+            ),
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(label)
+                .children(counts.map(|(added, removed)| counts_label(added, removed, ui)))
+                .into_any_element(),
+        ];
+        header.extend(state_mark(tool.state, ui));
+        // Icons, not labels: every edit has them, and the island is narrow.
+        if tool.state == ToolState::Done && tool.call_path().is_some() {
+            let chat = self.chat.clone();
+            header.push(
+                small_button(("claude-edit-diff", id), IconName::Diff, ui)
+                    .tooltip(ui::tooltip(tr("Show Diff"), None))
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        chat.update(cx, |chat, cx| chat.diff_edit(id, window, cx))
+                            .ok();
+                    })
+                    .into_any_element(),
+            );
+            let chat = self.chat.clone();
+            header.push(
+                small_button(("claude-edit-rollback", id), IconName::Rollback, ui)
+                    .tooltip(ui::tooltip(tr("Rollback"), None))
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        chat.update(cx, |chat, cx| chat.rollback_edit(id, window, cx))
+                            .ok();
+                    })
+                    .into_any_element(),
+            );
+        }
+        let body = self.edit_body(id, tool, structured).map(|body| {
+            div()
+                .px(px(4.))
+                .py(px(4.))
+                .child(body)
+                .into_any_element()
+        });
+        let expanded = body.is_some() && self.state.expanded(id, true);
+        let toggle = body.is_some().then_some(expanded);
+        let card = self.card(
+            ("claude-edit", id),
+            header,
+            body.filter(|_| expanded),
+            toggle,
+            None,
+        );
+        self.clickable_card(id, card, toggle.is_some())
+    }
+
+    /// What an edit card opens to: the change, or why it didn't happen.
+    fn edit_body(&self, id: EntryId, tool: &ToolEntry, structured: Option<&Value>) -> Option<AnyElement> {
+        // A refused or failed edit changed nothing: its reason, not a diff.
+        if matches!(tool.state, ToolState::Denied | ToolState::Failed) {
+            return self.result_body(id, tool);
+        }
+        let lines = structured.map(patch_lines).unwrap_or_default();
+        let lines = if lines.is_empty() {
+            // A new file: its text as added lines.
+            match &tool.call {
+                ToolCall::Write { content, .. } if tool.state == ToolState::Done => content
+                    .lines()
+                    .enumerate()
+                    .map(|(index, text)| PatchLine {
+                        kind: LineKind::Added,
+                        old: None,
+                        new: Some(index + 1),
+                        text: text.to_string(),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            lines
+        };
+        if lines.is_empty() {
+            return self.result_body(id, tool);
+        }
+        Some(self.diff_lines(id, &lines, DIFF_PREVIEW_LINES))
+    }
+
+    /// A subagent: a card with what it does and how far it got — its latest steps while it runs,
+    /// its answer when done — and Watch / Open for its whole conversation.
+    fn agent_card(&self, id: EntryId, tool: &ToolEntry) -> AnyElement {
+        let ui = self.ui;
+        let ToolCall::Agent {
+            description,
+            subagent_type,
+            prompt,
+            background,
+        } = &tool.call
+        else {
+            return self.tool(id, tool, 0);
+        };
+        let running = agent_running(tool);
+        let structured = tool
+            .result
+            .as_ref()
+            .and_then(|result| result.structured.as_ref())
+            .filter(|result| result["status"] == "completed");
+        // The title keeps the first line; how far it got goes under it, next to Watch / Open.
+        let mark: Option<AnyElement> = if running {
+            Some(pulse(("claude-agent-pulse", id), ui).into_any_element())
+        } else {
+            match tool.state {
+                ToolState::Done => Some(
+                    icon(IconName::CheckCircle, ui.success)
+                        .size(px(14.))
+                        .into_any_element(),
+                ),
+                state => state_mark(state, ui),
+            }
+        };
+        let meta = if running {
+            agent_progress(tool)
+        } else {
+            structured.and_then(agent_totals)
+        };
+        let kind = subagent_type
+            .clone()
+            .filter(|kind| kind != "general-purpose");
+        let title = div()
+            .id(("claude-agent-title", id))
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .tooltip(ui::tooltip(clip_chars(prompt, 400), None))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ui.foreground)
+                    .child(description.clone()),
+            )
+            .children(kind.map(|kind| {
+                div()
+                    .flex_none()
+                    .text_size(px(theme::TEXT_XS))
+                    .text_color(ui.dim)
+                    .child(kind)
+            }))
+            .when(*background, |row| {
+                row.child(ui::badge(tr("in the background"), ui.dim))
+            });
+        let first = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .text_size(px(theme::TEXT_SM))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(22.))
+                    .rounded(px(6.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(UiColors::tint(ui.accent, 0.2))
+                    .child(icon(IconName::Agent, ui.accent_text).size(px(13.))),
+            )
+            .child(title)
+            .children(mark);
+        // While it runs: its latest steps; done: its answer, in short.
+        let steps: Vec<AnyElement> = if running {
+            let shown: Vec<&Entry> = tool
+                .children
+                .iter()
+                .filter(|child| {
+                    matches!(child.kind, EntryKind::Tool(_) | EntryKind::Text { .. })
+                        && !is_hidden(&child.kind)
+                })
+                .collect();
+            shown[shown.len().saturating_sub(AGENT_STEPS)..]
+                .iter()
+                .map(|child| self.agent_step(child))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let answer = agent_card_answer(tool).map(|answer| {
+            div()
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.text_muted)
+                .child(self.marked(id, answer))
+                .into_any_element()
+        });
+        let open = (running || !tool.children.is_empty() || answer.is_some()).then(|| {
+            let chat = self.chat.clone();
+            div()
+                .id(("claude-agent-open", id))
+                .flex_none()
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.accent_text)
+                .cursor_pointer()
+                .hover(|style| style.underline())
+                .child(if running { tr("Watch") } else { tr("Open") })
+                .on_click(move |_, window, cx| {
+                    chat.update(cx, |chat, cx| chat.open_agent(id, window, cx))
+                        .ok();
+                })
+        });
+        let footer = (meta.is_some() || open.is_some()).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(theme::TEXT_XS))
+                        .text_color(ui.dim)
+                        .children(meta),
+                )
+                .children(open)
+        });
+        let second = (!steps.is_empty() || answer.is_some() || footer.is_some()).then(|| {
+            div()
+                .ml(px(30.))
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .children(steps)
+                .children(answer)
+                .children(footer)
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .px(px(10.))
+            .py(px(9.))
+            .rounded(px(CARD_RADIUS))
+            .border_1()
+            .border_color(UiColors::tint(ui.accent, 0.28))
+            .bg(UiColors::tint(ui.accent, 0.07))
+            .child(first)
+            .children(second)
+            .into_any_element()
+    }
+
+    /// A step of a running subagent on its card: quiet, one line.
+    fn agent_step(&self, entry: &Entry) -> AnyElement {
+        let ui = self.ui;
+        let (icon_name, title, detail, running) = match &entry.kind {
+            EntryKind::Tool(tool) => {
+                let summary = tool_summary(tool, self.root, self.tasks);
+                (
+                    summary.icon,
+                    summary.title.to_string(),
+                    summary.detail,
+                    matches!(tool.state, ToolState::Streaming | ToolState::Running),
+                )
+            }
+            EntryKind::Text { text, .. } => (IconName::Claude, String::new(), first_line(text), false),
+            _ => (IconName::Claude, String::new(), String::new(), false),
+        };
+        div()
+            .h(px(20.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .text_size(px(theme::TEXT_XS))
+            .text_color(ui.text_muted)
+            .child(icon(icon_name, if running { ui.accent_text } else { ui.dim }).size(px(12.)))
+            .when(!title.is_empty(), |row| {
+                row.child(div().flex_none().text_color(ui.foreground).child(title))
+            })
+            .child(div().min_w_0().truncate().child(detail))
+            .into_any_element()
+    }
+
+    /// A row of a tool call (in a group, or for the calls without a card): its icon, name and
+    /// detail, a note at the end; a click opens its details.
     fn tool(&self, id: EntryId, tool: &ToolEntry, depth: usize) -> AnyElement {
         let ui = self.ui;
         let summary = tool_summary(tool, self.root, self.tasks);
         let running = matches!(tool.state, ToolState::Streaming | ToolState::Running);
-        let is_agent = matches!(tool.call, ToolCall::Agent { .. });
         let details = self.details(id, tool, depth);
-        // A running subagent shows its steps; a finished one folds them away.
-        let default_open = is_agent && running;
-        let expanded = details.is_some() && self.state.expanded(id, default_open);
+        let expanded = details.is_some() && self.state.expanded(id, false);
         let mark = state_mark(tool.state, ui);
         // A file's row has the file type's icon (in the row's quiet color).
         let icon_source = match &tool.call {
@@ -852,7 +2156,7 @@ impl Renderer<'_> {
                 .when(summary.code, |label| {
                     label.font_family(theme::code_font()).text_size(px(12.))
                 })
-                .child(summary.detail.clone());
+                .child(self.marked(id, summary.detail.clone()));
             match path {
                 Some(location) => {
                     let chat = self.chat.clone();
@@ -939,15 +2243,21 @@ impl Renderer<'_> {
         let chat = self.chat.clone();
         move |_, _, cx| {
             chat.update(cx, |chat, cx| {
-                chat.transcript.toggle(id);
+                chat.shown_transcript_mut().toggle(id);
                 cx.notify();
             })
             .ok();
         }
     }
 
-    /// What a row shows when expanded; `None` — nothing to show.
+    /// What a row shows when expanded, under it with a guide line; `None` — nothing to show.
     fn details(&self, id: EntryId, tool: &ToolEntry, depth: usize) -> Option<AnyElement> {
+        self.details_body(id, tool, depth)
+            .map(|body| self.detail_box(body))
+    }
+
+    /// What a tool call has to show besides its row (a card's body, a row's details).
+    fn details_body(&self, id: EntryId, tool: &ToolEntry, depth: usize) -> Option<AnyElement> {
         let ui = self.ui;
         let structured = tool
             .result
@@ -958,20 +2268,13 @@ impl Renderer<'_> {
                 if tool.children.is_empty() && tool.result.is_none() {
                     return None;
                 }
-                let progress = self.agent_progress(tool);
-                // The subagent's own answer, when its messages didn't come (the result's text is
-                // framed for the main model, not for the user).
-                let summary = structured
-                    .filter(|_| tool.children.is_empty())
-                    .and_then(|result| result["content"].as_array())
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|part| part["text"].as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .filter(|text| !text.trim().is_empty());
+                let progress = agent_progress(tool).map(|progress| {
+                    div()
+                        .mt_1()
+                        .text_size(px(theme::TEXT_XS))
+                        .text_color(ui.dim)
+                        .child(progress)
+                });
                 div()
                     .flex()
                     .flex_col()
@@ -989,45 +2292,19 @@ impl Renderer<'_> {
                             .map(|child| self.entry(child, depth + 1)),
                     )
                     .children(progress)
-                    .children(summary.map(|summary| {
-                        div()
-                            .mt_1()
-                            .text_size(px(theme::TEXT_SM))
-                            .text_color(ui.text_muted)
-                            .child(clip_chars(&summary, 600))
-                    }))
+                    .children(agent_answer(tool).filter(|_| tool.children.is_empty()).map(
+                        |answer| {
+                            div()
+                                .mt_1()
+                                .text_size(px(theme::TEXT_SM))
+                                .text_color(ui.text_muted)
+                                .child(clip_chars(&answer, 600))
+                        },
+                    ))
                     .into_any_element()
             }
             ToolCall::Edit { .. } | ToolCall::Write { .. } | ToolCall::NotebookEdit { .. } => {
-                // A refused or failed edit changed nothing: its reason, not a diff.
-                if matches!(tool.state, ToolState::Denied | ToolState::Failed) {
-                    return self.result_text(id, tool);
-                }
-                let lines = structured.map(patch_lines).unwrap_or_default();
-                let lines = if lines.is_empty() {
-                    // A new file: its text as added lines.
-                    match (&tool.call, structured) {
-                        (ToolCall::Write { content, .. }, _) if tool.state == ToolState::Done => {
-                            content
-                                .lines()
-                                .enumerate()
-                                .map(|(index, text)| PatchLine {
-                                    kind: LineKind::Added,
-                                    old: None,
-                                    new: Some(index + 1),
-                                    text: text.to_string(),
-                                })
-                                .collect()
-                        }
-                        _ => Vec::new(),
-                    }
-                } else {
-                    lines
-                };
-                if lines.is_empty() {
-                    return self.result_text(id, tool);
-                }
-                return self.diff(id, &lines);
+                return self.edit_body(id, tool, structured);
             }
             ToolCall::Bash { command, .. } => {
                 let (stdout, stderr) = match structured {
@@ -1046,18 +2323,30 @@ impl Renderer<'_> {
                 let interrupted = structured
                     .and_then(|result| result["interrupted"].as_bool())
                     .unwrap_or(false);
+                let long_command = command.contains('\n') || command.len() > 60;
+                if stdout.trim().is_empty()
+                    && stderr.trim().is_empty()
+                    && !interrupted
+                    && !long_command
+                {
+                    // Nothing came out: the reason it didn't run, if any.
+                    return self.result_body(id, tool);
+                }
                 div()
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .when(command.contains('\n') || command.len() > 60, |column| {
-                        column.child(code_box(command, ui.text_muted, ui))
+                    .when(long_command, |column| {
+                        column.child(
+                            code_box("", ui.text_muted, ui)
+                                .child(self.marked(id, command.to_string())),
+                        )
                     })
                     .when(!stdout.trim().is_empty(), |column| {
-                        column.child(self.output(id, stdout.trim_end(), ui.foreground))
+                        column.child(self.marked_output_lines(id, stdout.trim_end(), ui.foreground))
                     })
                     .when(!stderr.trim().is_empty(), |column| {
-                        column.child(self.output(id, stderr.trim_end(), ui.warning))
+                        column.child(self.marked_output_lines(id, stderr.trim_end(), ui.warning))
                     })
                     .when(interrupted, |column| {
                         column.child(note(tr("The command was interrupted"), ui.warning))
@@ -1092,7 +2381,7 @@ impl Renderer<'_> {
                     })
                     .collect();
                 if links.is_empty() {
-                    return self.result_text(id, tool);
+                    return self.result_body(id, tool);
                 }
                 div()
                     .flex()
@@ -1128,7 +2417,7 @@ impl Renderer<'_> {
                     Some(answer) if !answer.trim().is_empty() => {
                         markdown::render(&markdown::parse(&answer), ui.text_muted, self.theme)
                     }
-                    _ => return self.result_text(id, tool),
+                    _ => return self.result_body(id, tool),
                 }
             }
             ToolCall::AskUserQuestion { .. } => {
@@ -1175,7 +2464,7 @@ impl Renderer<'_> {
                 if tool.state != ToolState::Failed {
                     return None;
                 }
-                return self.result_text(id, tool);
+                return self.result_body(id, tool);
             }
             ToolCall::TodoWrite { todos } => div()
                 .flex()
@@ -1198,9 +2487,9 @@ impl Renderer<'_> {
             ToolCall::Grep { .. }
             | ToolCall::Glob { .. }
             | ToolCall::Mcp { .. }
-            | ToolCall::Other => return self.result_text(id, tool),
+            | ToolCall::Other => return self.result_body(id, tool),
         };
-        Some(self.detail_box(body))
+        Some(body)
     }
 
     /// The details' frame: under the row, past its icon, with a guide line.
@@ -1217,7 +2506,7 @@ impl Renderer<'_> {
     }
 
     /// What the tool returned, as text (clipped); `None` — nothing.
-    fn result_text(&self, id: EntryId, tool: &ToolEntry) -> Option<AnyElement> {
+    fn result_body(&self, id: EntryId, tool: &ToolEntry) -> Option<AnyElement> {
         let result = tool.result.as_ref()?;
         let text = result.text.trim_end();
         if text.trim().is_empty() {
@@ -1226,13 +2515,11 @@ impl Renderer<'_> {
         // A refusal is the user's (or a rule's) words: prose, not output.
         if tool.state == ToolState::Denied {
             return Some(
-                self.detail_box(
-                    div()
-                        .text_size(px(theme::TEXT_SM))
-                        .text_color(self.ui.text_muted)
-                        .child(clip_chars(text.trim_start_matches("Error: "), 600))
-                        .into_any_element(),
-                ),
+                div()
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(self.ui.text_muted)
+                    .child(clip_chars(text.trim_start_matches("Error: "), 600))
+                    .into_any_element(),
             );
         }
         let color = if result.is_error {
@@ -1240,22 +2527,37 @@ impl Renderer<'_> {
         } else {
             self.ui.text_muted
         };
-        Some(self.detail_box(self.output(id, text, color)))
+        Some(self.output_lines(id, text, color))
     }
 
     /// Output in the code font, clipped to a few lines with "Show more".
-    fn output(&self, id: EntryId, text: &str, color: Hsla) -> AnyElement {
+    fn output_lines(&self, id: EntryId, text: &str, color: Hsla) -> AnyElement {
+        self.output_lines_with(id, text, color, false)
+    }
+
+    /// Output a search goes through (a command's): its matches marked.
+    fn marked_output_lines(&self, id: EntryId, text: &str, color: Hsla) -> AnyElement {
+        self.output_lines_with(id, text, color, true)
+    }
+
+    fn output_lines_with(&self, id: EntryId, text: &str, color: Hsla, marked: bool) -> AnyElement {
         let ui = self.ui;
-        let unclipped = self.state.unclipped.contains(&id);
+        let unclipped =
+            self.state.unclipped.contains(&id) || self.state.search_current() == Some(id);
         let (shown, hidden) = if unclipped {
             (text, 0)
         } else {
             clip_lines(text, CLIP_LINES)
         };
+        let text_box = if marked && self.state.search.is_some() {
+            code_box("", color, ui).child(self.marked(id, shown.to_string()))
+        } else {
+            code_box(shown, color, ui)
+        };
         div()
             .flex()
             .flex_col()
-            .child(code_box(shown, color, ui))
+            .child(text_box)
             .children((hidden > 0).then(|| self.show_more(id, hidden)))
             .into_any_element()
     }
@@ -1272,9 +2574,10 @@ impl Renderer<'_> {
             .hover(|style| style.underline())
             .child(trn(hidden, "Show {n} more line", "Show {n} more lines"))
             .on_click(move |_, _, cx| {
+                cx.stop_propagation();
                 chat.update(cx, |chat, cx| {
-                    chat.transcript.unclipped.insert(id);
-                    chat.transcript.invalidate();
+                    chat.shown_transcript_mut().unclipped.insert(id);
+                    chat.shown_transcript_mut().invalidate();
                     cx.notify();
                 })
                 .ok();
@@ -1282,14 +2585,15 @@ impl Renderer<'_> {
             .into_any_element()
     }
 
-    /// An edit's change: removed and added lines with their numbers, hunks apart.
-    fn diff(&self, id: EntryId, lines: &[PatchLine]) -> Option<AnyElement> {
+    /// An edit's change: removed and added lines with their numbers, hunks apart; the first `max`
+    /// lines until the user asks for all.
+    fn diff_lines(&self, id: EntryId, lines: &[PatchLine], max: usize) -> AnyElement {
         let ui = self.ui;
         let unclipped = self.state.unclipped.contains(&id);
         let shown = if unclipped {
             lines.len()
         } else {
-            lines.len().min(DIFF_LINES)
+            lines.len().min(max)
         };
         let number = |value: Option<usize>| value.map(|n| n.to_string()).unwrap_or_default();
         let rows = lines[..shown].iter().map(|line| {
@@ -1335,7 +2639,7 @@ impl Renderer<'_> {
                         .child(line.text.replace('\t', "    ")),
                 )
         });
-        let body = div()
+        div()
             .flex()
             .flex_col()
             .child(
@@ -1343,63 +2647,18 @@ impl Renderer<'_> {
                     .flex()
                     .flex_col()
                     .py_1()
-                    .rounded(px(RADIUS_SM))
-                    .overflow_hidden()
-                    .bg(UiColors::tint(ui.foreground, 0.03))
-                    .border_1()
-                    .border_color(ui.divider)
                     .font_family(theme::code_font())
                     .text_size(px(12.))
                     .line_height(px(18.))
                     .children(rows),
             )
-            .children((shown < lines.len()).then(|| self.show_more(id, lines.len() - shown)))
-            .into_any_element();
-        Some(self.detail_box(body))
-    }
-
-    /// A subagent's progress while it runs (its last tool, tool calls, tokens), its totals when it
-    /// is done.
-    fn agent_progress(&self, tool: &ToolEntry) -> Option<AnyElement> {
-        let ui = self.ui;
-        let structured = tool
-            .result
-            .as_ref()
-            .and_then(|result| result.structured.as_ref());
-        let mut parts = Vec::new();
-        match structured.filter(|result| result["status"] == "completed") {
-            Some(result) => {
-                if let Some(uses) = result["totalToolUseCount"].as_u64() {
-                    parts.push(trn(uses as usize, "{n} tool use", "{n} tool uses"));
-                }
-                if let Some(tokens) = result["totalTokens"].as_u64() {
-                    parts.push(trf("{0} tokens", &[&format_tokens(tokens)]));
-                }
-                if let Some(ms) = result["totalDurationMs"].as_u64() {
-                    parts.push(format_duration(Duration::from_millis(ms)));
-                }
-            }
-            None => {
-                let task: &TaskProgress = tool.task.as_ref()?;
-                if let Some(last) = &task.last_tool {
-                    parts.push(last.clone());
-                }
-                if let Some(uses) = task.tool_uses {
-                    parts.push(trn(uses as usize, "{n} tool use", "{n} tool uses"));
-                }
-                if let Some(tokens) = task.tokens {
-                    parts.push(trf("{0} tokens", &[&format_tokens(tokens)]));
-                }
-            }
-        }
-        (!parts.is_empty()).then(|| {
-            div()
-                .mt_1()
-                .text_size(px(theme::TEXT_XS))
-                .text_color(ui.dim)
-                .child(parts.join(" · "))
-                .into_any_element()
-        })
+            .children((shown < lines.len()).then(|| {
+                div()
+                    .px(px(8.))
+                    .pb(px(4.))
+                    .child(self.show_more(id, lines.len() - shown))
+            }))
+            .into_any_element()
     }
 
     // --- Notices and the ends of turns ---
@@ -1536,9 +2795,10 @@ impl Renderer<'_> {
                 .flex_col()
                 .gap_1p5()
                 .p(px(10.))
-                .rounded(px(RADIUS_MD))
+                .rounded(px(CARD_RADIUS))
                 .border_1()
-                .border_color(ui.divider)
+                .border_color(UiColors::tint(ui.foreground, 0.09))
+                .bg(UiColors::tint(ui.foreground, 0.025))
                 .child(
                     div()
                         .flex()
@@ -1580,41 +2840,249 @@ impl Renderer<'_> {
         code_box(text.trim_end(), ui.text_muted, ui).into_any_element()
     }
 
+    /// The end of a turn: the "Done" card when it changed files, else a quiet line — how long it
+    /// took (and why it ended, when it didn't end well), Copy for its answer.
     fn turn_end(&self, id: EntryId, summary: &TurnSummary) -> AnyElement {
-        let ui = self.ui;
-        let mut label = format_duration(summary.duration);
-        if summary.is_error {
-            let reason = match summary.reason.as_deref() {
-                Some("aborted_streaming" | "aborted_tools") => tr("stopped"),
-                Some("max_turns") => tr("the turn limit was reached"),
-                Some("prompt_too_long") => tr("the conversation is too long, /compact it"),
-                Some("budget_exhausted") => tr("the budget is spent"),
-                _ => tr("ended with an error"),
-            };
-            label = format!("{label} · {reason}");
+        let files = self.model.turn_changes(id);
+        if files.is_empty() {
+            return self.turn_footer(id, summary);
         }
-        let cost = (summary.cost_usd > 0.).then(|| {
-            trf(
-                "≈ ${0} at API prices (with a subscription, it counts towards its limits)",
-                &[&format!("{:.2}", summary.cost_usd)],
-            )
-        });
+        self.done_card(id, summary, &files)
+    }
+
+    fn turn_footer(&self, id: EntryId, summary: &TurnSummary) -> AnyElement {
+        let ui = self.ui;
+        let (name, color) = turn_mark(summary, ui);
+        let cost = turn_cost(summary);
+        let answer = self.turn_answer(id);
+        let group: SharedString = format!("claude-turn-{id}").into();
+        let copied = self.state.just_copied(id);
         div()
             .id(("claude-turn-end", id))
+            .group(group.clone())
+            .h(px(22.))
             .flex()
             .items_center()
-            .gap_2()
+            .gap(px(6.))
             .text_size(px(theme::TEXT_XS))
             .text_color(if summary.is_error && !stopped(summary) {
                 ui.warning
             } else {
                 ui.dim
             })
-            .child(div().flex_1().h(px(1.)).bg(ui.divider))
-            .child(label)
-            .child(div().flex_1().h(px(1.)).bg(ui.divider))
+            .child(icon(name, color).size(px(12.)))
+            .child(turn_label(summary))
             .when_some(cost, |line, cost| line.tooltip(ui::tooltip(cost, None)))
+            .child(div().flex_1())
+            .children(answer.map(|answer| {
+                div()
+                    .when(!copied, |corner| {
+                        corner
+                            .invisible()
+                            .group_hover(group.clone(), |style| style.visible())
+                    })
+                    .child(self.copy_button(id, answer))
+            }))
             .into_any_element()
+    }
+
+    /// A turn that changed files ends with a card, as an agent's task in JetBrains: how it went,
+    /// the files it changed and created with their counts; Review and Rollback for all of them,
+    /// and for each (on hover).
+    fn done_card(&self, id: EntryId, summary: &TurnSummary, files: &[TurnFile]) -> AnyElement {
+        let ui = self.ui;
+        let (name, color) = turn_mark(summary, ui);
+        let title = if summary.is_error {
+            turn_label(summary)
+        } else {
+            trf("Done in {0}", &[&format_duration(summary.duration)])
+        };
+        // Links, as the "Done" card of JetBrains has them: room for the title in a narrow island.
+        let chat = self.chat.clone();
+        let review = link(("claude-done-review", id), tr("Review"), ui).on_click(
+            move |_, window, cx| {
+                chat.update(cx, |chat, cx| chat.review_turn(id, None, window, cx))
+                    .ok();
+            },
+        );
+        let chat = self.chat.clone();
+        let rollback = link(("claude-done-rollback", id), tr("Rollback"), ui).on_click(
+            move |_, window, cx| {
+                chat.update(cx, |chat, cx| chat.rollback_turn(id, None, window, cx))
+                    .ok();
+            },
+        );
+        let header = div()
+            .id(("claude-done", id))
+            .h(px(34.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .text_size(px(theme::TEXT_SM))
+            .child(icon(name, color).size(px(15.)))
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ui.foreground)
+                    .child(title),
+            )
+            .when_some(turn_cost(summary), |row, cost| {
+                row.tooltip(ui::tooltip(cost, None))
+            })
+            .child(div().flex_1())
+            .child(review)
+            .child(rollback);
+        let section = |label: SharedString, files: Vec<(usize, &TurnFile)>| {
+            (!files.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .px(px(12.))
+                            .pt(px(4.))
+                            .pb(px(2.))
+                            .child(ui::section_label(label, ui)),
+                    )
+                    .children(
+                        files
+                            .into_iter()
+                            .map(|(index, file)| self.done_file(id, index, file)),
+                    )
+            })
+        };
+        let changed: Vec<(usize, &TurnFile)> = files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| !file.created)
+            .collect();
+        let created: Vec<(usize, &TurnFile)> = files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| file.created)
+            .collect();
+        div()
+            .flex()
+            .flex_col()
+            .pb(px(5.))
+            .rounded(px(CARD_RADIUS))
+            .border_1()
+            .border_color(UiColors::tint(ui.foreground, 0.09))
+            .bg(UiColors::tint(ui.foreground, 0.03))
+            .child(header)
+            .children(section(tr("Changed Files").into(), changed))
+            .children(section(tr("New Files").into(), created))
+            .into_any_element()
+    }
+
+    /// A file of the "Done" card: its icon and path (a link), the counts; diff and rollback on
+    /// hover.
+    fn done_file(&self, turn_end: EntryId, index: usize, file: &TurnFile) -> AnyElement {
+        let ui = self.ui;
+        let key = (turn_end as usize) * 64 + index;
+        let group: SharedString = format!("claude-done-file-{key}").into();
+        let label = relative(&file.path, self.root);
+        let name = file
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        let location = Location {
+            path: file.path.clone(),
+            line: 0,
+            start: 0,
+            end: 0,
+        };
+        let chat = self.chat.clone();
+        let review = {
+            let chat = self.chat.clone();
+            let path = file.path.clone();
+            small_button(("claude-done-file-diff", key), IconName::Diff, ui)
+                .tooltip(ui::tooltip(tr("Show Diff"), None))
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    let path = path.clone();
+                    chat.update(cx, |chat, cx| {
+                        chat.review_turn(turn_end, Some(path), window, cx)
+                    })
+                    .ok();
+                })
+        };
+        let rollback = {
+            let chat = self.chat.clone();
+            let path = file.path.clone();
+            small_button(("claude-done-file-rollback", key), IconName::Rollback, ui)
+                .tooltip(ui::tooltip(tr("Rollback"), None))
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    let path = path.clone();
+                    chat.update(cx, |chat, cx| {
+                        chat.rollback_turn(turn_end, Some(path), window, cx)
+                    })
+                    .ok();
+                })
+        };
+        div()
+            .id(("claude-done-file", key))
+            .group(group.clone())
+            .h(px(26.))
+            .mx(px(4.))
+            .px(px(8.))
+            .rounded(px(RADIUS_SM))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .text_size(px(theme::TEXT_SM))
+            .cursor_pointer()
+            .hover(move |style| style.bg(ui.hover))
+            .child(file_icon(&name, &ui).render().size(px(14.)))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(theme::code_font())
+                    .text_size(px(12.))
+                    .text_color(if file.created {
+                        ui.vcs_added
+                    } else {
+                        ui.foreground
+                    })
+                    .child(label),
+            )
+            .child(counts_label(file.added, file.removed, ui))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .gap(px(2.))
+                    .invisible()
+                    .group_hover(group, |style| style.visible())
+                    .child(review)
+                    .child(rollback),
+            )
+            .on_click(move |_, _, cx| {
+                let location = location.clone();
+                chat.update(cx, |_, cx| cx.emit(ClaudeChatEvent::OpenLocation(location)))
+                    .ok();
+            })
+            .into_any_element()
+    }
+
+    /// The answer of the turn ending at `turn_end`: its last text, to copy.
+    fn turn_answer(&self, turn_end: EntryId) -> Option<String> {
+        let entries = &self.model.entries;
+        let end = entries.iter().position(|entry| entry.id == turn_end)?;
+        entries[..end]
+            .iter()
+            .rev()
+            .take_while(|entry| !matches!(entry.kind, EntryKind::TurnEnd(_) | EntryKind::User(_)))
+            .find_map(|entry| match &entry.kind {
+                EntryKind::Text { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+                _ => None,
+            })
     }
 }
 
@@ -1624,6 +3092,361 @@ fn stopped(summary: &TurnSummary) -> bool {
         summary.reason.as_deref(),
         Some("aborted_streaming" | "aborted_tools")
     )
+}
+
+/// How long a turn took, and why it ended when it didn't end well.
+fn turn_label(summary: &TurnSummary) -> String {
+    let mut label = format_duration(summary.duration);
+    if summary.is_error {
+        let reason = match summary.reason.as_deref() {
+            Some("aborted_streaming" | "aborted_tools") => tr("stopped"),
+            Some("max_turns") => tr("the turn limit was reached"),
+            Some("prompt_too_long") => tr("the conversation is too long, /compact it"),
+            Some("budget_exhausted") => tr("the budget is spent"),
+            _ => tr("ended with an error"),
+        };
+        label = format!("{label} · {reason}");
+    }
+    label
+}
+
+/// The icon of a turn's end: done, stopped or failed.
+fn turn_mark(summary: &TurnSummary, ui: UiColors) -> (IconName, Hsla) {
+    if !summary.is_error {
+        (IconName::CheckCircle, ui.success)
+    } else if stopped(summary) {
+        (IconName::Stop, ui.dim)
+    } else {
+        (IconName::Warning, ui.warning)
+    }
+}
+
+/// What a turn would have cost at the API's prices (a tooltip).
+fn turn_cost(summary: &TurnSummary) -> Option<String> {
+    (summary.cost_usd > 0.).then(|| {
+        trf(
+            "≈ ${0} at API prices (with a subscription, it counts towards its limits)",
+            &[&format!("{:.2}", summary.cost_usd)],
+        )
+    })
+}
+
+/// A subagent still works: its call runs, or it went to the background and its task isn't over.
+fn agent_running(tool: &ToolEntry) -> bool {
+    matches!(tool.state, ToolState::Streaming | ToolState::Running)
+        || tool.task.as_ref().is_some_and(|task| {
+            task.background
+                && !matches!(
+                    task.status.as_deref(),
+                    Some("completed" | "failed" | "killed" | "stopped")
+                )
+        })
+}
+
+/// A running subagent's progress: its last tool, tool calls, tokens.
+fn agent_progress(tool: &ToolEntry) -> Option<String> {
+    let task: &TaskProgress = tool.task.as_ref()?;
+    let mut parts = Vec::new();
+    if let Some(last) = &task.last_tool {
+        parts.push(tool_display_name(last));
+    }
+    if let Some(uses) = task.tool_uses {
+        parts.push(trn(uses as usize, "{n} tool use", "{n} tool uses"));
+    }
+    if let Some(tokens) = task.tokens {
+        parts.push(trf("{0} tokens", &[&format_tokens(tokens)]));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// A finished subagent's totals: tool calls and how long it took.
+fn agent_totals(result: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(uses) = result["totalToolUseCount"].as_u64() {
+        parts.push(trn(uses as usize, "{n} tool use", "{n} tool uses"));
+    }
+    if let Some(ms) = result["totalDurationMs"].as_u64() {
+        parts.push(format_duration(Duration::from_millis(ms)));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// A subagent's answer: its last text, else the summary of its task, else the call's result.
+fn agent_answer(tool: &ToolEntry) -> Option<String> {
+    let last_text = tool.children.iter().rev().find_map(|child| match &child.kind {
+        EntryKind::Text { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+        _ => None,
+    });
+    last_text
+        .or_else(|| tool.task.as_ref().and_then(|task| task.summary.clone()))
+        .or_else(|| {
+            tool.result
+                .as_ref()
+                .and_then(|result| result.structured.as_ref())
+                .and_then(|result| result["content"].as_array())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|part| part["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+        })
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// A subagent still works (the subagent's view, part 10.2).
+pub(crate) fn agent_is_running(tool: &ToolEntry) -> bool {
+    agent_running(tool)
+}
+
+/// A subagent's totals for its view's bar: how far it got while it works, what it took when done.
+pub(crate) fn agent_totals_label(tool: &ToolEntry) -> Option<String> {
+    if agent_running(tool) {
+        return agent_progress(tool);
+    }
+    tool.result
+        .as_ref()
+        .and_then(|result| result.structured.as_ref())
+        .filter(|result| result["status"] == "completed")
+        .and_then(agent_totals)
+}
+
+/// The answer a finished subagent's card shows: its first lines, plain, clipped.
+pub(crate) fn agent_card_answer(tool: &ToolEntry) -> Option<String> {
+    (!agent_running(tool))
+        .then(|| agent_answer(tool))
+        .flatten()
+        .map(|answer| clip_chars(&plain_text(&first_lines(&answer, 2)), 280))
+}
+
+/// The texts a command's card shows opened, as the search marks them: a long command whole, then
+/// its output and its errors (part 10.2).
+pub(crate) fn bash_body_texts(tool: &ToolEntry, command: &str) -> Vec<String> {
+    let structured = tool
+        .result
+        .as_ref()
+        .and_then(|result| result.structured.as_ref());
+    let (stdout, stderr) = match structured {
+        Some(result) if result.is_object() => (
+            result["stdout"].as_str().unwrap_or("").to_string(),
+            result["stderr"].as_str().unwrap_or("").to_string(),
+        ),
+        _ => (
+            tool.result
+                .as_ref()
+                .map(|result| result.text.clone())
+                .unwrap_or_default(),
+            String::new(),
+        ),
+    };
+    let interrupted = structured
+        .and_then(|result| result["interrupted"].as_bool())
+        .unwrap_or(false);
+    let long_command = command.contains('\n') || command.len() > 60;
+    if stdout.trim().is_empty() && stderr.trim().is_empty() && !interrupted && !long_command {
+        return Vec::new();
+    }
+    let mut texts = Vec::new();
+    if long_command {
+        texts.push(command.to_string());
+    }
+    for output in [stdout, stderr] {
+        if !output.trim().is_empty() {
+            texts.push(output.trim_end().to_string());
+        }
+    }
+    texts
+}
+
+/// The exit code a failed command reported ("Exit code 101" at the start of its result).
+fn exit_code(tool: &ToolEntry) -> Option<i32> {
+    let result = tool.result.as_ref()?;
+    let text = result.text.trim_start().trim_start_matches("Error: ");
+    let rest = text.strip_prefix("Exit code ")?;
+    rest.split(|c: char| !c.is_ascii_digit() && c != '-')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// What a group of steps did, in short: "Thought for 6 s · read 2 files · searched 3 times".
+fn group_summary(entries: &[&Entry]) -> String {
+    let mut thought: Option<Duration> = None;
+    let mut thinking = false;
+    let mut streaming = false;
+    let mut files: HashSet<&Path> = HashSet::new();
+    let (mut searches, mut web, mut pages, mut tasks, mut tools) = (0, 0, 0, 0, 0);
+    for entry in entries {
+        match &entry.kind {
+            EntryKind::Thinking {
+                streaming: live,
+                duration,
+                ..
+            } => {
+                thinking = true;
+                streaming |= *live;
+                if let Some(duration) = duration {
+                    thought = Some(thought.unwrap_or_default() + *duration);
+                }
+            }
+            EntryKind::Tool(tool) => match &tool.call {
+                ToolCall::Read { path, .. } => {
+                    files.insert(path.as_path());
+                }
+                ToolCall::Grep { .. } | ToolCall::Glob { .. } => searches += 1,
+                ToolCall::WebSearch { .. } => web += 1,
+                ToolCall::WebFetch { .. } => pages += 1,
+                ToolCall::TaskCreate { .. }
+                | ToolCall::TaskUpdate { .. }
+                | ToolCall::TodoWrite { .. } => tasks += 1,
+                _ => tools += 1,
+            },
+            _ => {}
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if thinking {
+        parts.push(if streaming {
+            tr("Thinking…").to_string()
+        } else {
+            thinking_label(false, 0, thought)
+        });
+    }
+    if !files.is_empty() {
+        parts.push(trn(files.len(), "read {n} file", "read {n} files"));
+    }
+    if searches > 0 {
+        parts.push(trn(searches, "searched {n} time", "searched {n} times"));
+    }
+    if web > 0 {
+        parts.push(trn(
+            web,
+            "searched the web {n} time",
+            "searched the web {n} times",
+        ));
+    }
+    if pages > 0 {
+        parts.push(trn(pages, "fetched {n} page", "fetched {n} pages"));
+    }
+    if tasks > 0 {
+        parts.push(tr("updated the tasks").to_string());
+    }
+    if tools > 0 {
+        parts.push(trn(tools, "used {n} tool", "used {n} tools"));
+    }
+    capitalized(&parts.join(" · "))
+}
+
+/// The text with its first letter capitalized.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// When the user sent a message: "12:41" today, "Yesterday 12:41", else the date and time.
+fn time_label(at: SystemTime) -> String {
+    let seconds = |time: SystemTime| {
+        time.duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64)
+    };
+    let local = |seconds: i64| seconds + crate::git_log::local_offset(seconds);
+    clock_label(local(seconds(at)), local(seconds(SystemTime::now())))
+}
+
+/// [`time_label`] on local seconds since the epoch.
+fn clock_label(at: i64, now: i64) -> String {
+    let minutes = at.rem_euclid(86_400) / 60;
+    let clock = format!("{:02}:{:02}", minutes / 60, minutes % 60);
+    let day = at.div_euclid(86_400);
+    let today = now.div_euclid(86_400);
+    if day == today {
+        clock
+    } else if day + 1 == today {
+        trf("Yesterday {0}", &[&clock])
+    } else {
+        format!("{} {clock}", crate::blame::date(at))
+    }
+}
+
+/// A file name's extension for a picture's media type.
+fn image_extension(media_type: &str) -> &'static str {
+    match media_type {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "png",
+    }
+}
+
+/// A mention at an end of a message (a chip above the bubble).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Mention<'a> {
+    pub raw: &'a str,
+    pub path: &'a str,
+    pub lines: Option<(usize, usize)>,
+}
+
+/// The mentions at the start and the end of a message, and the text between them: ⌥⌘K and "Fix
+/// with Claude" put the file and the lines first; mentions inside a sentence stay in it.
+pub(crate) fn edge_mentions(text: &str) -> (Vec<Mention<'_>>, &str) {
+    let segments = split_mentions(text);
+    let is_space = |segment: &Segment| matches!(segment, Segment::Text(text) if text.trim().is_empty());
+    let mut start = 0;
+    let mut chips = Vec::new();
+    while start < segments.len() {
+        if let Some(chip) = mention(&segments[start]) {
+            chips.push(chip);
+        } else if !is_space(&segments[start]) {
+            break;
+        }
+        start += 1;
+    }
+    let mut end = segments.len();
+    let mut tail = Vec::new();
+    while end > start {
+        if let Some(chip) = mention(&segments[end - 1]) {
+            tail.push(chip);
+        } else if !is_space(&segments[end - 1]) {
+            break;
+        }
+        end -= 1;
+    }
+    tail.reverse();
+    chips.extend(tail);
+    // The text between the first and the last segment kept, as it is in the message.
+    let rest = match (segments.get(start), end.checked_sub(1).and_then(|last| segments.get(last))) {
+        (Some(first), Some(last)) if start < end => {
+            let from = segment_offset(text, first);
+            let to = segment_offset(text, last) + segment_text(last).len();
+            &text[from..to]
+        }
+        _ => "",
+    };
+    (chips, rest.trim())
+}
+
+/// A segment as a chip, when it is a mention.
+fn mention<'a>(segment: &Segment<'a>) -> Option<Mention<'a>> {
+    match *segment {
+        Segment::Mention { raw, path, lines } => Some(Mention { raw, path, lines }),
+        Segment::Text(_) => None,
+    }
+}
+
+fn segment_text<'a>(segment: &Segment<'a>) -> &'a str {
+    match *segment {
+        Segment::Text(text) => text,
+        Segment::Mention { raw, .. } => raw,
+    }
+}
+
+/// Where a segment (a slice of `text`) starts in it.
+fn segment_offset(text: &str, segment: &Segment) -> usize {
+    segment_text(segment).as_ptr() as usize - text.as_ptr() as usize
 }
 
 /// The file a tool call is about.
@@ -1646,6 +3469,141 @@ impl CallPath for ToolEntry {
 }
 
 // --- Small elements ---
+
+/// Claude's avatar: its spark on a circle of its own orange (the author: unmistakably Claude),
+/// a shade deeper towards the corner.
+fn avatar(ui: UiColors) -> AnyElement {
+    let deeper = gpui::Hsla {
+        l: (ui.claude.l - 0.08).max(0.),
+        ..ui.claude
+    };
+    div()
+        .size(px(AVATAR))
+        .rounded(px(AVATAR / 2.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(linear_gradient(
+            135.,
+            linear_color_stop(ui.claude, 0.),
+            linear_color_stop(deeper, 1.),
+        ))
+        .shadow(vec![BoxShadow {
+            color: UiColors::tint(ui.claude, 0.35),
+            offset: point(px(0.), px(2.)),
+            blur_radius: px(8.),
+            spread_radius: px(0.),
+        }])
+        .child(icon(IconName::Claude, ui.on_accent).size(px(14.)))
+        .into_any_element()
+}
+
+/// A subagent's avatar in its conversation: the agent icon on a blue-to-indigo gradient.
+fn agent_avatar(ui: UiColors) -> AnyElement {
+    div()
+        .size(px(AVATAR))
+        .rounded(px(AVATAR / 2.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(linear_gradient(
+            135.,
+            linear_color_stop(ui.blue, 0.),
+            linear_color_stop(ui.accent, 1.),
+        ))
+        .child(icon(IconName::Agent, ui.on_accent).size(px(14.)))
+        .into_any_element()
+}
+
+/// A card's tile: the step's icon on its tint (a pulse while it runs).
+fn tile(
+    name: IconName,
+    color: Hsla,
+    running: bool,
+    pulse_id: impl Into<gpui::ElementId>,
+    ui: UiColors,
+) -> AnyElement {
+    div()
+        .flex_none()
+        .size(px(22.))
+        .rounded(px(6.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(UiColors::tint(color, 0.14))
+        .child(if running {
+            pulse(pulse_id, ui).into_any_element()
+        } else {
+            icon(name, color).size(px(13.)).into_any_element()
+        })
+        .into_any_element()
+}
+
+/// The `!` of a shell command.
+fn bang_badge(ui: UiColors) -> AnyElement {
+    div()
+        .flex_none()
+        .h(px(20.))
+        .px(px(6.))
+        .flex()
+        .items_center()
+        .rounded(px(5.))
+        .bg(UiColors::tint(ui.success, 0.16))
+        .font_family(theme::code_font())
+        .font_weight(FontWeight::BOLD)
+        .text_size(px(12.))
+        .text_color(ui.success)
+        .child("!")
+        .into_any_element()
+}
+
+/// "+4 −1": added lines in green, removed in red.
+fn counts_label(added: usize, removed: usize, ui: UiColors) -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .gap(px(4.))
+        .text_size(px(theme::TEXT_SM))
+        .font_family(theme::code_font())
+        .when(added > 0, |row| {
+            row.child(div().text_color(ui.diff_added).child(format!("+{added}")))
+        })
+        .when(removed > 0, |row| {
+            row.child(div().text_color(ui.error).child(format!("−{removed}")))
+        })
+        .into_any_element()
+}
+
+/// A small square button with an icon (22 px), for rows and cards.
+fn small_button(id: impl Into<gpui::ElementId>, name: IconName, ui: UiColors) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(22.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(ui::RADIUS_XS + 1.))
+        .cursor_pointer()
+        .hover(move |style| style.bg(ui.hover))
+        .child(icon(name, ui.text_muted).size(px(13.)))
+}
+
+/// A link in the accent color (a card's action).
+fn link(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    ui: UiColors,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .text_size(px(theme::TEXT_SM))
+        .text_color(ui.accent_text)
+        .cursor_pointer()
+        .hover(|style| style.underline())
+        .child(label.into())
+}
 
 /// A pulsing dot: something runs.
 fn pulse(id: impl Into<gpui::ElementId>, ui: UiColors) -> impl IntoElement {
@@ -1819,61 +3777,147 @@ fn callout(
         .into_any_element()
 }
 
+
 /// The line under the conversation while Claude works: what it does, for how long, Esc to stop;
-/// while a question waits — that it waits for the user.
+/// while a question waits — that it waits for the user. It keeps to Claude's side of the column.
 fn activity_line(model: &Session, ui: UiColors) -> Option<AnyElement> {
     let row = || {
         div()
-            .flex_none()
-            .h(px(28.))
-            .px(px(INSET))
+            .flex_1()
+            .min_w_0()
+            .h(px(30.))
             .flex()
             .items_center()
-            .gap(px(6.))
+            .gap(px(8.))
             .text_size(px(theme::TEXT_SM))
             .text_color(ui.text_muted)
     };
-    match &model.status {
+    let line = match &model.status {
         Status::Working { since, activity } => {
             let (label, tokens) = activity_label(activity, model);
             let mut details = vec![format_elapsed(since.elapsed())];
             if let Some(tokens) = tokens.filter(|tokens| *tokens > 0) {
                 details.push(trf("{0} tokens", &[&format_tokens(tokens)]));
             }
-            Some(
-                row()
-                    .child(pulse("claude-activity", ui))
-                    .child(div().text_color(ui.foreground).child(label))
-                    .child(div().text_color(ui.dim).child(details.join(" · ")))
-                    .child(div().flex_1())
-                    .child(ui::keycap("Esc", ui))
-                    .child(
-                        div()
-                            .text_size(px(theme::TEXT_XS))
-                            .text_color(ui.dim)
-                            .child(tr("to stop")),
-                    )
-                    .into_any_element(),
-            )
-        }
-        Status::WaitingForUser => Some(
             row()
-                .child(icon(IconName::Question, ui.warning).size(px(14.)))
+                .child(pulse("claude-activity", ui))
+                .child(div().flex_none().text_color(ui.foreground).child(label))
                 .child(
                     div()
-                        .text_color(ui.warning)
-                        .child(tr("Waiting for your answer")),
+                        .min_w_0()
+                        .truncate()
+                        .text_color(ui.dim)
+                        .child(details.join(" · ")),
                 )
-                .into_any_element(),
-        ),
-        Status::Starting if !model.entries.is_empty() => Some(
-            row()
-                .child(pulse("claude-starting", ui))
-                .child(tr("Starting Claude…"))
-                .into_any_element(),
-        ),
-        _ => None,
+                .child(div().flex_1())
+                .child(ui::keycap("Esc", ui))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(theme::TEXT_XS))
+                        .text_color(ui.dim)
+                        .child(tr("to stop")),
+                )
+        }
+        Status::WaitingForUser => row()
+            .child(icon(IconName::Question, ui.warning).size(px(14.)))
+            .child(
+                div()
+                    .text_color(ui.warning)
+                    .child(tr("Waiting for your answer")),
+            ),
+        Status::Starting if !model.entries.is_empty() => row()
+            .child(pulse("claude-starting", ui))
+            .child(tr("Starting Claude…")),
+        _ => return None,
+    };
+    Some(
+        column(
+            div()
+                .flex()
+                .gap(px(AVATAR_GAP))
+                .child(div().flex_none().w(px(AVATAR)))
+                .child(line),
+        )
+        .flex_none()
+        .into_any_element(),
+    )
+}
+
+/// Under a subagent's conversation while it works: the tool it runs (or that it thinks), its
+/// count of tool uses and tokens so far (part 10.2).
+fn agent_activity_line(tool: &ToolEntry, ui: UiColors) -> Option<AnyElement> {
+    if !agent_running(tool) {
+        return None;
     }
+    let running = tool.children.iter().rev().find_map(|child| match &child.kind {
+        EntryKind::Tool(call) if matches!(call.state, ToolState::Streaming | ToolState::Running) => {
+            Some(call.name.clone())
+        }
+        _ => None,
+    });
+    let label = match running.or_else(|| tool.task.as_ref()?.last_tool.clone()) {
+        Some(name) => trf("Running {0}…", &[&tool_display_name(&name)]),
+        None => tr("Thinking…").to_string(),
+    };
+    let details = agent_progress(tool);
+    Some(
+        column(
+            div()
+                .flex()
+                .gap(px(AVATAR_GAP))
+                .child(div().flex_none().w(px(AVATAR)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(30.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(theme::TEXT_SM))
+                        .text_color(ui.text_muted)
+                        .child(pulse("claude-agent-activity", ui))
+                        .child(div().flex_none().text_color(ui.foreground).child(label))
+                        .children(details.map(|details| {
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(ui.dim)
+                                .child(details)
+                        })),
+                ),
+        )
+        .flex_none()
+        .into_any_element(),
+    )
+}
+
+/// The task Claude gave a subagent, on top of the subagent's conversation (part 10.2).
+fn agent_task(tool: &ToolEntry, ui: UiColors) -> AnyElement {
+    let prompt = match &tool.call {
+        ToolCall::Agent { prompt, .. } => prompt.as_str(),
+        _ => "",
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .px(px(12.))
+        .py(px(9.))
+        .rounded(px(CARD_RADIUS))
+        .border_1()
+        .border_dashed()
+        .border_color(UiColors::tint(ui.accent, 0.35))
+        .bg(UiColors::tint(ui.accent, 0.05))
+        .child(ui::section_label(tr("Task from Claude"), ui))
+        .child(
+            div()
+                .text_size(px(theme::TEXT_MD))
+                .text_color(ui.foreground)
+                .child(clip_chars(prompt.trim(), 2000)),
+        )
+        .into_any_element()
 }
 
 /// What Claude does, and the tokens to show next to it.
@@ -2430,7 +4474,25 @@ fn clip_chars(text: &str, max: usize) -> String {
     }
 }
 
-fn first_line(text: &str) -> String {
+/// Markdown as plain text: the text of its spans, without the markers (`**kiwi**` → `kiwi`).
+fn plain_text(markdown: &str) -> String {
+    markdown::parse_inline(markdown)
+        .into_iter()
+        .map(|span| span.text)
+        .collect()
+}
+
+/// The first `count` lines, joined (an answer in short).
+fn first_lines(text: &str, count: usize) -> String {
+    text.trim()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(count)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(crate) fn first_line(text: &str) -> String {
     let line = text.lines().next().unwrap_or("").trim();
     if text.trim().lines().nth(1).is_some() {
         format!("{line} …")
@@ -2613,6 +4675,56 @@ mod tests {
             thinking_label(false, 0, Some(Duration::from_millis(2))),
             "Thought"
         );
+    }
+
+    #[test]
+    fn mentions_at_the_ends_become_chips() {
+        let (chips, text) = edge_mentions("@src/a.rs#L3-9 why does @b.rs fail? @c.rs");
+        let paths: Vec<&str> = chips.iter().map(|chip| chip.path).collect();
+        assert_eq!(paths, ["src/a.rs", "c.rs"]);
+        assert_eq!(chips[0].lines, Some((3, 9)));
+        assert_eq!(text, "why does @b.rs fail?");
+        let (chips, text) = edge_mentions("@only.rs");
+        assert_eq!(chips.len(), 1);
+        assert_eq!(text, "");
+        let (chips, text) = edge_mentions("plain text");
+        assert!(chips.is_empty());
+        assert_eq!(text, "plain text");
+    }
+
+    #[test]
+    fn minor_steps_fold_into_groups() {
+        let read = |id: EntryId| Entry {
+            id,
+            kind: EntryKind::Tool(Box::new(tool(
+                "Read",
+                json!({ "file_path": "/p/a.rs" }),
+                None,
+            ))),
+        };
+        let text = |id: EntryId, text: &str| Entry {
+            id,
+            kind: EntryKind::Text {
+                text: text.into(),
+                streaming: false,
+            },
+        };
+        let bash = Entry {
+            id: 9,
+            kind: EntryKind::Tool(Box::new(tool("Bash", json!({ "command": "ls" }), None))),
+        };
+        let entries = vec![read(1), text(2, ""), read(3), text(4, "Done."), bash, read(6)];
+        assert_eq!(
+            items(&entries),
+            [
+                Item::Group { start: 0, end: 3 },
+                Item::Entry(3),
+                Item::Entry(4),
+                Item::Group { start: 5, end: 6 },
+            ]
+        );
+        let shown: Vec<&Entry> = entries[..3].iter().collect();
+        assert_eq!(group_summary(&shown), "Read 1 file");
     }
 
     #[test]

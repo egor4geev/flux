@@ -6,12 +6,15 @@
 //!
 //! - The popup ([`open`], [`open_at`]): a [`Picker`] — a search over the titles and the first
 //!   prompts, rows with the time of the last activity and the branch; the sessions open in this
-//!   window are marked, choosing one of them brings its chat into sight where it is.
+//!   window are marked, choosing one of them brings its chat into sight where it is. A session is
+//!   deleted with the trash on its row or ⌘⌫ (part 10.2): after a question, its transcript and its
+//!   folder (subagents, tool results) go to the Trash; an open one is closed first.
 //! - The open sessions of a project ([`OpenSessions`]: the Claude window's pills, then the chats in
 //!   the editor's tabs) are kept in `~/Library/Application Support/flux/claude-sessions.json`
 //!   (`FLUX_CLAUDE_SESSIONS_FILE`; in scenarios without it — neither read nor written), written
 //!   whenever they change ([`crate::claude::ClaudeStore::persist`]).
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
@@ -22,8 +25,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flux_claude::SavedSession;
 use flux_search::{FuzzyMatch, match_list};
 use gpui::{
-    Action, AnyElement, Context, DismissEvent, Div, Entity, Pixels, Point, SharedString, Window,
-    div, prelude::*, px,
+    Action, AnyElement, App, Context, DismissEvent, Div, Entity, KeyBinding, MouseButton, Pixels,
+    Point, SharedString, Window, div, prelude::*, px,
 };
 use serde_json::{Value, json};
 
@@ -31,7 +34,8 @@ use crate::claude::{self, ClaudeStore};
 use crate::git_log::local_offset;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, icon};
-use crate::picker::{Picker, PickerDelegate, highlighted_text};
+use crate::dialog::Dialog;
+use crate::picker::{self, Picker, PickerDelegate, highlighted_text};
 use crate::theme::{self, Theme, UiColors};
 use crate::workspace::Workspace;
 
@@ -39,6 +43,26 @@ use crate::workspace::Workspace;
 const MAX_OPEN: usize = 20;
 /// The Claude window without sessions lists this many recent ones.
 pub const RECENT_COUNT: usize = 5;
+
+/// The popup's own key context: ⌘⌫ deletes the selected session (in the query field too — the
+/// binding comes after the field's own ⌘⌫).
+const CONTEXT: &str = "Picker ClaudeHistory";
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new(
+            "cmd-backspace",
+            picker::DeleteSelected,
+            Some("ClaudeHistory > TextInput"),
+        ),
+        KeyBinding::new("cmd-backspace", picker::DeleteSelected, Some("ClaudeHistory")),
+    ]);
+}
+
+thread_local! {
+    /// The row the history comes back on after a deletion (it closes for the question).
+    static RESELECT: Cell<Option<usize>> = const { Cell::new(None) };
+}
 
 // --- The popup ---
 
@@ -58,6 +82,7 @@ pub fn open_at(
     let store = workspace.claude.clone();
     let open = open_ids(&store, cx);
     let history = store.update(cx, |store, cx| store.history(cx));
+    let reselect = RESELECT.with(Cell::take);
     workspace.toggle_modal(window, cx, move |window, cx| {
         let picker = Picker::new(HistoryDelegate::new(store, open), window, cx);
         cx.spawn(async move |picker, cx| {
@@ -65,6 +90,9 @@ pub fn open_at(
             picker
                 .update(cx, |picker, cx| {
                     picker.delegate.set_sessions(sessions);
+                    if let Some(index) = reselect {
+                        picker.set_selected(index, cx);
+                    }
                     cx.notify();
                 })
                 .ok();
@@ -172,7 +200,7 @@ impl PickerDelegate for HistoryDelegate {
     fn render_match(
         &mut self,
         index: usize,
-        _selected: bool,
+        selected: bool,
         _: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> AnyElement {
@@ -197,7 +225,21 @@ impl PickerDelegate for HistoryDelegate {
         });
         // Without a prompt of its own, the title takes the row (a long first prompt as a title).
         let alone = prompt.is_none();
+        // The trash shows on the row under the mouse and on the selected one.
+        let delete = crate::ui::icon_button(("history-delete", index), IconName::Trash, ui)
+            .flex_none()
+            .tooltip(crate::ui::tooltip(tr("Delete Session"), Some("⌘⌫".into())))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |picker, _, window, cx| {
+                picker.delegate.delete(index, window, cx)
+            }))
+            .when(!selected, |button| {
+                button
+                    .invisible()
+                    .group_hover("history-row", |style| style.visible())
+            });
         div()
+            .group("history-row")
             .w_full()
             .min_w_0()
             .flex()
@@ -234,6 +276,7 @@ impl PickerDelegate for HistoryDelegate {
                     .text_color(ui.dim)
                     .child(when(self.now, seconds(session.modified))),
             )
+            .child(delete)
             .into_any_element()
     }
 
@@ -269,6 +312,99 @@ impl PickerDelegate for HistoryDelegate {
     fn confirm_label(&self) -> &'static str {
         tr("resume")
     }
+
+    fn key_context(&self) -> &'static str {
+        CONTEXT
+    }
+
+    fn delete_label(&self) -> Option<&'static str> {
+        Some(tr("delete"))
+    }
+
+    /// Deletes a session after a question: its transcript and folder go to the Trash, an open one
+    /// is closed first. The popup closes for the question and comes back on the same row.
+    fn delete(&mut self, index: usize, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(saved) = self.session(index).cloned() else {
+            return;
+        };
+        let session = self.store.read(cx).sessions().iter().find(|session| {
+            session.read(cx).session_id() == Some(saved.id.as_str())
+        });
+        let session = session.cloned();
+        let dialog = match &session {
+            Some(_) => Dialog::warning(trf("The session “{0}” is open", &[&saved.title]))
+                .message(tr("It closes, and its transcript goes to the Trash."))
+                .danger(tr("Close and Delete"))
+                .cancel(tr("Cancel")),
+            None => Dialog::warning(trf("Delete the session “{0}”?", &[&saved.title]))
+                .message(tr("Its transcript goes to the Trash."))
+                .danger(tr("Delete"))
+                .cancel(tr("Cancel")),
+        };
+        let answer = dialog.show(window, cx);
+        let store = self.store.clone();
+        cx.spawn_in(window, async move |picker, cx| {
+            let confirmed = answer.await == Some(0);
+            if confirmed {
+                if let Some(session) = &session {
+                    store
+                        .update(cx, |store, cx| store.close_session(session, cx))
+                        .ok();
+                }
+                let paths = transcript_files(&saved.path);
+                let trashed = cx
+                    .background_spawn(async move { flux_fs::trash(&paths) })
+                    .await;
+                if let Err(error) = trashed {
+                    let shown = cx.update(|window, cx| {
+                        Dialog::warning(tr("Couldn't delete the session"))
+                            .details(error.to_string())
+                            .primary(tr("OK"))
+                            .show(window, cx)
+                    });
+                    if let Ok(shown) = shown {
+                        shown.await;
+                    }
+                }
+            }
+            // Back to the history, on the row that took the deleted one's place: the popup read
+            // again if the question left it open, otherwise opened anew.
+            let refreshed = picker.update(cx, |picker, cx| {
+                picker.delegate.open.remove(&saved.id);
+                let history = store.update(cx, |store, cx| store.history(cx));
+                cx.spawn(async move |picker, cx| {
+                    let sessions = history.await;
+                    picker
+                        .update(cx, |picker, cx| {
+                            picker.delegate.set_sessions(sessions);
+                            picker.set_selected(index, cx);
+                        })
+                        .ok();
+                })
+                .detach();
+            });
+            if refreshed.is_err() {
+                RESELECT.with(|reselect| reselect.set(Some(index)));
+                cx.update(|window, cx| {
+                    window.dispatch_action(Box::new(claude::ResumeSession), cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+}
+
+/// What deleting a session moves to the Trash: its transcript and, if it has one, its folder of
+/// subagents and tool results (`<id>/` next to `<id>.jsonl`).
+fn transcript_files(transcript: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![transcript.to_path_buf()];
+    let folder = transcript.with_extension("");
+    if folder.is_dir() {
+        paths.push(folder);
+    }
+    paths.retain(|path| path.symlink_metadata().is_ok());
+    paths
 }
 
 /// What the search matches: the title, then the first prompt when it says more.

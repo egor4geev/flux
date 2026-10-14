@@ -14,6 +14,8 @@ mod server;
 mod timers;
 mod window;
 
+pub use process::login_env;
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;

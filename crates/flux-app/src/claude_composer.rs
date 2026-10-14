@@ -8,8 +8,12 @@
 //!   mention unless removed), pictures pasted (⌘V) or dropped on the field.
 //! - `@` lists the project's files (fuzzy, as ⌘P), `/` at the start the session's slash commands;
 //!   the list opens above the field, ↑ ↓ ↵ ⇥ Esc drive it.
-//! - Under the field: the model, effort and permission mode pickers (⇧⇥ cycles Ask before edits →
-//!   Accept edits → Plan mode, as in the CLI) and the context meter.
+//! - The card's bottom row: the model, effort and permission mode pickers (⇧⇥ cycles Ask before
+//!   edits → Accept edits → Plan mode, as in the CLI), the context ring, attach, Send / Stop
+//!   (part 10.2, the chat's new look).
+//! - `!` typed first in the empty field: shell mode (part 10.2) — a green `!` badge, ↵ runs the
+//!   command in the project's root ([`ClaudeSession::run_shell`]), its output goes to Claude; ⌫ in
+//!   the empty field or Esc leaves the mode.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,7 +34,7 @@ use gpui::{
     canvas, deferred, div, img, point, prelude::*, px,
 };
 
-use crate::claude_session::{ClaudeSession, SessionEvent};
+use crate::claude_session::{ClaudeSession, EditPoint, SessionEvent};
 use crate::context_menu::ContextMenu;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, file_icon, icon};
@@ -40,6 +44,7 @@ use crate::prompt_input::{self, PromptInput, PromptInputEvent};
 use crate::settings;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_LG, RADIUS_SM};
+use gpui::PathBuilder;
 
 actions!(
     claude_composer,
@@ -83,7 +88,15 @@ const LIST_ROW_HEIGHT: f32 = 28.;
 /// A picture larger than this isn't attached (the API's limit is lower; the CLI scales).
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const THUMBNAIL_SIZE: f32 = 44.;
-const FOOTER_HEIGHT: f32 = 26.;
+const FOOTER_HEIGHT: f32 = 28.;
+/// A card narrower than this (the island at its default width) shortens the bottom row: the
+/// model without its version, the effort as the CLI writes it, the context without its percent.
+const NARROW_CARD: f32 = 380.;
+/// Send / Stop: a rounded square in the card's corner.
+const SEND_SIZE: f32 = 28.;
+/// The context ring: diameter and line.
+const RING_SIZE: f32 = 14.;
+const RING_LINE: f32 = 2.;
 /// Redraws on nucleo's signals happen at most once per frame (as in ⌘P).
 const REFRESH_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -421,7 +434,21 @@ pub struct Composer {
     /// Where the card and the pickers were drawn: the list and the menus open above them.
     card_bounds: Option<Bounds<Pixels>>,
     picker_bounds: HashMap<Picker, Bounds<Pixels>>,
+    /// `!` typed first in the empty field: what's typed is a shell command (part 10.2).
+    shell_mode: bool,
+    /// The field was empty before the last change: a `!` typed into it starts shell mode.
+    was_empty: bool,
+    /// A sent message being edited (part 10.2): sending continues the conversation from just
+    /// before it.
+    editing: Option<Editing>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A sent message back in the field (part 10.2), and what the field held before it — back on Esc.
+struct Editing {
+    point: EditPoint,
+    draft: String,
+    draft_images: Vec<Arc<Image>>,
 }
 
 impl Composer {
@@ -433,11 +460,19 @@ impl Composer {
             cx.subscribe(&input, |this, _, event: &PromptInputEvent, cx| match event {
                 PromptInputEvent::Changed => {
                     this.notice = None;
+                    this.enter_shell_mode(cx);
                     this.update_suggestions(cx);
                     cx.notify();
                 }
                 PromptInputEvent::SelectionChanged => this.update_suggestions(cx),
-                PromptInputEvent::ImagePasted(image) => this.attach(image.clone(), cx),
+                PromptInputEvent::ImagePasted(image) if !this.shell_mode => {
+                    this.attach(image.clone(), cx)
+                }
+                PromptInputEvent::ImagePasted(_) => {}
+                PromptInputEvent::BackspaceAtStart if this.shell_mode => {
+                    this.leave_shell_mode(cx)
+                }
+                PromptInputEvent::BackspaceAtStart => {}
             }),
             // The session refreshes the context meter after each turn itself.
             cx.subscribe(&session, |_, _, _: &SessionEvent, cx| cx.notify()),
@@ -460,6 +495,9 @@ impl Composer {
             menu: None,
             card_bounds: None,
             picker_bounds: HashMap::new(),
+            shell_mode: false,
+            was_empty: true,
+            editing: None,
             _subscriptions: subscriptions,
         };
         #[cfg(feature = "scenario")]
@@ -494,6 +532,72 @@ impl Composer {
         window.focus(&self.input.focus_handle(cx));
     }
 
+    /// A `!` typed (or pasted) first into the empty field: shell mode, the `!` becomes its badge.
+    fn enter_shell_mode(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text();
+        let was_empty = std::mem::replace(&mut self.was_empty, text.is_empty());
+        if self.shell_mode || self.editing.is_some() || !was_empty || !text.starts_with('!') {
+            return;
+        }
+        self.shell_mode = true;
+        let rest = text[1..].to_string();
+        self.was_empty = rest.is_empty();
+        self.input.update(cx, |input, cx| input.set_text(&rest, cx));
+        self.close_suggestions(cx);
+        cx.notify();
+    }
+
+    /// Back to a message for Claude (⌫ in the empty field, Esc); the text stays.
+    fn leave_shell_mode(&mut self, cx: &mut Context<Self>) {
+        self.shell_mode = false;
+        cx.notify();
+    }
+
+    /// A sent message back in the field, to change and send again (part 10.2): its text and
+    /// pictures under a banner; sending continues the conversation from just before it, Esc puts
+    /// the field's draft back.
+    pub fn start_edit(
+        &mut self,
+        point: EditPoint,
+        text: &str,
+        images: Vec<Arc<Image>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let draft = self.input.read(cx).text();
+        let draft_images = std::mem::replace(&mut self.images, images);
+        // Editing another message keeps the draft from before the first one.
+        let (draft, draft_images) = match self.editing.take() {
+            Some(previous) => (previous.draft, previous.draft_images),
+            None => (draft, draft_images),
+        };
+        self.editing = Some(Editing {
+            point,
+            draft,
+            draft_images,
+        });
+        self.shell_mode = false;
+        // The message's mentions are in its text already.
+        self.context_hidden = true;
+        self.was_empty = text.is_empty();
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+        self.close_suggestions(cx);
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Esc on an edit: the field gets back what it held before.
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(editing) = self.editing.take() else {
+            return;
+        };
+        self.images = editing.draft_images;
+        self.was_empty = editing.draft.is_empty();
+        self.input
+            .update(cx, |input, cx| input.set_text(&editing.draft, cx));
+        cx.notify();
+    }
+
     /// Nothing is typed: a new question card may take the keyboard from the field.
     pub fn is_empty(&self, cx: &App) -> bool {
         self.input.read(cx).is_empty()
@@ -525,6 +629,12 @@ impl Composer {
     /// The workspace tells the field which file and lines the user works in (when sharing the
     /// selection is on in the settings).
     pub fn set_editor_context(&mut self, context: Option<EditorContext>, cx: &mut Context<Self>) {
+        // UI scenarios: the chip of `FLUX_SCENARIO_CLAUDE_CONTEXT` stays — no editor is open
+        // there to give it, and the window's update would take it away.
+        #[cfg(feature = "scenario")]
+        if std::env::var_os("FLUX_SCENARIO_CLAUDE_CONTEXT").is_some() {
+            return;
+        }
         if self.editor_context != context {
             self.editor_context = context;
             self.context_hidden = false;
@@ -559,9 +669,22 @@ impl Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.add_paths(paths.paths().to_vec(), window, cx)
+    }
+
+    /// Pictures attached, other files and folders mentioned.
+    fn add_paths(
+        &mut self,
+        paths: Vec<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shell_mode {
+            return;
+        }
         let root = self.session.read(cx).model().info.cwd.clone();
         let mut mentions = Vec::new();
-        for path in paths.paths() {
+        for path in &paths {
             if path.is_dir() {
                 mentions.push(crate::claude_actions::path_mention(path, Some(&root)));
                 continue;
@@ -592,11 +715,26 @@ impl Composer {
     fn send(&mut self, priority: Option<Priority>, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text();
         let body = text.trim();
+        if self.shell_mode {
+            if body.is_empty() {
+                return;
+            }
+            let command = body.to_string();
+            self.session
+                .update(cx, |session, cx| session.run_shell(command, cx));
+            self.shell_mode = false;
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+            self.was_empty = true;
+            self.focus(window, cx);
+            cx.notify();
+            return;
+        }
         if body.is_empty() && self.images.is_empty() {
             return;
         }
         // `/resume` is Flux's: the project's saved sessions in the history popup.
         if is_resume(body) {
+            self.editing = None;
             self.input.update(cx, |input, cx| input.set_text("", cx));
             self.close_suggestions(cx);
             window.dispatch_action(Box::new(crate::claude::ResumeSession), cx);
@@ -625,6 +763,24 @@ impl Composer {
             images,
             priority: priority.filter(|_| working),
         };
+        // An edited message: the conversation goes on from just before the old one.
+        if let Some(editing) = self.editing.take() {
+            let input = UserInput {
+                priority: None,
+                ..input
+            };
+            self.session
+                .update(cx, |session, cx| session.send_edited(editing.point, input, cx));
+            self.images = editing.draft_images;
+            self.was_empty = editing.draft.is_empty();
+            self.input
+                .update(cx, |input, cx| input.set_text(&editing.draft, cx));
+            self.notice = None;
+            self.close_suggestions(cx);
+            self.focus(window, cx);
+            cx.notify();
+            return;
+        }
         let before = self.session.read(cx).model().entries.len();
         self.session
             .update(cx, |session, cx| session.send(input, cx));
@@ -641,12 +797,43 @@ impl Composer {
         cx.notify();
     }
 
+    /// Esc: cancels editing a sent message; otherwise stops Claude's turn; otherwise leaves shell
+    /// mode; otherwise stops the running `!` command.
     fn stop(&mut self, _: &Stop, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.session.read(cx).model().is_working() {
+        let running_shell = self.session.read(cx).running_shell();
+        if self.editing.is_some() {
+            self.cancel_edit(cx);
+        } else if self.session.read(cx).model().is_working() {
             self.session.update(cx, |session, cx| session.interrupt(cx));
+        } else if self.shell_mode {
+            self.leave_shell_mode(cx);
+        } else if let Some(id) = running_shell {
+            self.session.update(cx, |session, cx| session.stop_shell(id, cx));
         } else {
             cx.propagate();
         }
+    }
+
+    /// The attach button: pictures to attach, other files to mention.
+    fn choose_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: true,
+            prompt: Some(tr("Attach").into()),
+        });
+        let this = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let Ok(Ok(Some(paths))) = paths.await else {
+                    return;
+                };
+                this.update_in(cx, |this, window, cx| {
+                    this.add_paths(paths, window, cx)
+                })
+                .ok();
+            })
+            .detach();
     }
 
     fn cycle_mode(&mut self, _: &CycleMode, _window: &mut Window, cx: &mut Context<Self>) {
@@ -661,7 +848,10 @@ impl Composer {
             let input = self.input.read(cx);
             (input.text(), input.cursor(), input.has_selection())
         };
-        let token = (!selection).then(|| token_at(&text, caret)).flatten();
+        // A shell command: no mentions, no slash commands.
+        let token = (!selection && !self.shell_mode)
+            .then(|| token_at(&text, caret))
+            .flatten();
         let Some(token) = token else {
             self.dismissed = None;
             return self.close_suggestions(cx);
@@ -1149,6 +1339,12 @@ impl Composer {
     }
 
     /// A picker under the field: its label and a chevron; the menu opens above it.
+    /// The card is narrower than [`NARROW_CARD`] (as last drawn): the bottom row is shortened.
+    fn narrow(&self) -> bool {
+        self.card_bounds
+            .is_some_and(|bounds| bounds.size.width < px(NARROW_CARD))
+    }
+
     fn render_picker(
         &self,
         picker: Picker,
@@ -1174,7 +1370,7 @@ impl Composer {
             })
             .relative()
             .h(px(22.))
-            .px(px(6.))
+            .px(px(if self.narrow() { 4. } else { 6. }))
             .flex()
             .when(shrink, |button| button.min_w_0())
             .when(!shrink, |button| button.flex_none())
@@ -1214,10 +1410,62 @@ impl Composer {
             )
     }
 
-    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// The card's bottom row: the pickers, the context ring, attach, Send / Stop; in shell mode —
+    /// what the command does with its output, and Run.
+    fn render_footer(&self, has_message: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
+        let send = self.render_send(ui, has_message, cx);
+        let row = div()
+            .h(px(FOOTER_HEIGHT))
+            .flex()
+            .items_center()
+            .gap(px(1.));
+        if self.shell_mode {
+            let note = if settings::claude(cx).respond_to_commands {
+                tr("Claude answers the output")
+            } else {
+                tr("the output goes to Claude")
+            };
+            return row
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(5.))
+                        .px(px(6.))
+                        .text_size(px(theme::TEXT_SM))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(ui.success)
+                        .child(icon(IconName::Terminal, ui.success).size(px(13.)))
+                        // In a narrow card the badge and the icon say it: room for the note.
+                        .when(!self.narrow(), |label| label.child(tr("Shell command"))),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(theme::TEXT_SM))
+                        .text_color(ui.dim)
+                        .child(if self.narrow() {
+                            note.to_string()
+                        } else {
+                            format!("· {note}")
+                        }),
+                )
+                .child(div().flex_1())
+                .child(send);
+        }
         let models = self.session.read(cx).model().models.clone();
-        let model_name = self.model_name(&models, cx);
+        let narrow = self.narrow();
+        let mut model_name = self.model_name(&models, cx);
+        // "Opus 5.5" → "Opus": the version is in the menu.
+        let family = model_name
+            .split_once(' ')
+            .map(|(family, _)| SharedString::from(family.to_string()));
+        if narrow && let Some(family) = family {
+            model_name = family;
+        }
         let efforts = self
             .current_model(&models, cx)
             .map(|info| info.efforts.clone())
@@ -1226,75 +1474,47 @@ impl Composer {
         let mode = self.shown_mode(cx);
         let context = self.session.read(cx).model().context;
         let effort_picker = (!efforts.is_empty()).then(|| {
-            let label = effort.map_or(tr("Effort"), effort_short);
+            let label = match effort {
+                // The CLI's word ("xhigh"): short in any language.
+                Some(effort) if narrow => effort.wire(),
+                Some(effort) => effort_short(effort),
+                None => tr("Effort"),
+            };
             self.render_picker(Picker::Effort, label.into(), ui.text_muted, tr("Effort"), false, cx)
         });
-        let meter = context.map(|usage| {
-            let fraction = usage.fraction();
-            let color = if fraction >= 0.9 {
-                ui.error
-            } else if fraction >= 0.7 {
-                ui.warning
-            } else {
-                ui.dim
-            };
-            const BAR: f32 = 20.;
-            div()
-                .id("claude-context-meter")
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(5.))
-                .pl(px(4.))
-                .text_size(px(theme::TEXT_XS))
-                .text_color(color)
-                .tooltip(ui::tooltip(
-                    trf(
-                        "{0} / {1} tokens in the context",
-                        &[&short_tokens(usage.used), &short_tokens(usage.max)],
-                    ),
-                    None,
-                ))
-                .child(
-                    div()
-                        .w(px(BAR))
-                        .h(px(4.))
-                        .rounded(px(2.))
-                        .bg(ui.divider)
-                        .child(
-                            div()
-                                .h_full()
-                                .w(px((BAR * fraction).max(2.)))
-                                .rounded(px(2.))
-                                .bg(if fraction >= 0.7 { color } else { ui.text_muted }),
-                        ),
-                )
-                .child(format!("{:.0}%", fraction * 100.))
+        let ring = context.map(|usage| {
+            context_ring(usage.fraction(), !narrow, ui).tooltip(ui::tooltip(
+                trf(
+                    "{0} / {1} tokens in the context",
+                    &[&short_tokens(usage.used), &short_tokens(usage.max)],
+                ),
+                None,
+            ))
         });
-        div()
-            .h(px(FOOTER_HEIGHT))
-            .flex()
-            .items_center()
-            .gap(px(1.))
-            .child(self.render_picker(
-                Picker::Model,
-                model_name,
-                ui.text_muted,
-                tr("Model"),
-                false,
-                cx,
-            ))
-            .children(effort_picker)
-            .child(self.render_picker(
-                Picker::Mode,
-                mode_label(mode).into(),
-                mode_color(mode, &ui),
-                tr("Permission mode (⇧⇥)"),
-                true,
-                cx,
-            ))
-            .child(div().flex_1())
-            .children(meter)
+        let attach = ui::icon_button("claude-attach", IconName::Paperclip, ui)
+            .tooltip(ui::tooltip(tr("Attach pictures or files"), None))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.choose_files(window, cx)));
+        row.child(self.render_picker(
+            Picker::Model,
+            model_name,
+            ui.text_muted,
+            tr("Model"),
+            false,
+            cx,
+        ))
+        .children(effort_picker)
+        .child(self.render_picker(
+            Picker::Mode,
+            mode_label(mode).into(),
+            mode_color(mode, &ui),
+            tr("Permission mode (⇧⇥)"),
+            true,
+            cx,
+        ))
+        .child(div().flex_1())
+        .children(ring)
+        .child(attach)
+        .child(send)
     }
 
     fn render_list(&mut self, ui: UiColors, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1402,58 +1622,136 @@ impl Composer {
         )
     }
 
-    fn render_send(&self, ui: UiColors, working: bool, has_message: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let button = |id: &'static str, name: IconName, accent: bool| {
+    /// Send (an accent square; green in shell mode — Run) and Stop: Claude's turn, or the running
+    /// `!` command when Claude is idle.
+    fn render_send(&self, ui: UiColors, has_message: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let session = self.session.read(cx);
+        let working = session.model().is_working();
+        let shell_running = session.running_shell().is_some();
+        let button = |id: &'static str, name: IconName, fill: Option<Hsla>| {
             div()
                 .id(id)
-                .size(px(26.))
+                .size(px(SEND_SIZE))
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .rounded(px(RADIUS_SM))
+                .rounded(px(ui::RADIUS_MD))
                 .cursor_pointer()
-                .when(accent, |button| {
+                .when_some(fill, |button, fill| {
                     button
-                        .bg(UiColors::tint(ui.accent, 0.85))
-                        .hover(move |style| style.bg(ui.accent))
+                        .bg(UiColors::tint(fill, 0.85))
+                        .hover(move |style| style.bg(fill))
                 })
-                .when(!accent, |button| {
+                .when(fill.is_none(), |button| {
                     button
                         .bg(ui.hover)
                         .border_1()
                         .border_color(ui.input_border)
                         .hover(move |style| style.bg(ui.pressed))
                 })
-                .child(icon(name, if accent { ui.on_accent } else { ui.text_muted }).size(px(14.)))
+                .child(
+                    icon(name, if fill.is_some() { ui.on_accent } else { ui.foreground })
+                        .size(px(14.)),
+                )
         };
+        if self.shell_mode {
+            return div().flex().flex_none().child(
+                button("claude-run", IconName::ArrowUp, Some(ui.success))
+                    .when(!has_message, |button| button.opacity(0.5).cursor_default())
+                    .tooltip(ui::tooltip(tr("Run"), Some("↵".into())))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.send(None, window, cx)
+                    })),
+            );
+        }
+        let stop = (working || shell_running && !has_message).then(|| {
+            let label = if working { tr("Stop") } else { tr("Stop the command") };
+            button("claude-stop", IconName::Stop, None)
+                .tooltip(ui::tooltip(label, Some("Esc".into())))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.stop(&Stop, window, cx)
+                }))
+        });
+        let send = (has_message || stop.is_none()).then(|| {
+            button("claude-send", IconName::ArrowUp, Some(ui.accent))
+                .when(!has_message, |button| button.opacity(0.5).cursor_default())
+                .tooltip(ui::tooltip(
+                    if working { tr("Send after the turn") } else { tr("Send") },
+                    Some("↵".into()),
+                ))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.send(None, window, cx)
+                }))
+        });
         div()
             .flex()
             .flex_none()
             .gap(px(4.))
-            .when(working, |row| {
-                row.child(
-                    button("claude-stop", IconName::Stop, false)
-                        .tooltip(ui::tooltip(tr("Stop"), Some("Esc".into())))
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.stop(&Stop, window, cx)
-                        })),
-                )
-            })
-            .when(has_message || !working, |row| {
-                row.child(
-                    button("claude-send", IconName::ArrowUp, has_message)
-                        .when(!has_message, |button| button.opacity(0.5).cursor_default())
-                        .tooltip(ui::tooltip(
-                            if working { tr("Send after the turn") } else { tr("Send") },
-                            Some("↵".into()),
-                        ))
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.send(None, window, cx)
-                        })),
-                )
-            })
+            .pl(px(2.))
+            .children(stop)
+            .children(send)
     }
+}
+
+/// How full the context is: a ring that fills clockwise from the top, and the percentage.
+fn context_ring(fraction: f32, percent: bool, ui: UiColors) -> gpui::Stateful<gpui::Div> {
+    let fraction = fraction.clamp(0., 1.);
+    let color = if fraction >= 0.9 {
+        ui.error
+    } else if fraction >= 0.7 {
+        ui.warning
+    } else {
+        ui.accent_text
+    };
+    let track = ui.divider;
+    let ring = canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let center = bounds.center();
+            let radius = px((RING_SIZE - RING_LINE) / 2.);
+            let top = point(center.x, center.y - radius);
+            let bottom = point(center.x, center.y + radius);
+            let circle = |path: &mut PathBuilder| {
+                path.move_to(top);
+                path.arc_to(point(radius, radius), px(0.), false, true, bottom);
+                path.arc_to(point(radius, radius), px(0.), false, true, top);
+            };
+            let mut back = PathBuilder::stroke(px(RING_LINE));
+            circle(&mut back);
+            if let Ok(path) = back.build() {
+                window.paint_path(path, track);
+            }
+            if fraction < 0.005 {
+                return;
+            }
+            let mut arc = PathBuilder::stroke(px(RING_LINE));
+            if fraction >= 0.995 {
+                circle(&mut arc);
+            } else {
+                let angle = fraction * std::f32::consts::TAU;
+                let end = point(center.x + radius * angle.sin(), center.y - radius * angle.cos());
+                arc.move_to(top);
+                arc.arc_to(point(radius, radius), px(0.), fraction > 0.5, true, end);
+            }
+            if let Ok(path) = arc.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .size(px(RING_SIZE))
+    .flex_none();
+    div()
+        .id("claude-context-meter")
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(5.))
+        .px(px(4.))
+        .text_size(px(theme::TEXT_XS))
+        .text_color(if fraction >= 0.7 { color } else { ui.text_muted })
+        .child(ring)
+        .when(percent, |meter| meter.child(format!("{:.0}%", fraction * 100.)))
 }
 
 /// The byte offset of character `index` in `text`.
@@ -1480,7 +1778,9 @@ impl Render for Composer {
                 matches!(model.status, Status::Exited { .. }),
             )
         };
-        let placeholder = if waiting {
+        let placeholder = if self.shell_mode {
+            tr("A command, e.g. git status")
+        } else if waiting {
             tr("Answer Claude above, or write here")
         } else if working {
             tr("Claude is working — your message will wait")
@@ -1491,11 +1791,71 @@ impl Render for Composer {
         };
         self.input
             .update(cx, |input, _| input.set_placeholder(placeholder));
-        let has_message = !self.input.read(cx).is_empty() || !self.images.is_empty();
+        let has_message = !self.input.read(cx).is_empty()
+            || !self.shell_mode && !self.images.is_empty();
         let focused = self.input.focus_handle(cx).is_focused(window);
-        let chips = self.render_chips(ui, cx);
-        let send = self.render_send(ui, working, has_message, cx);
-        let footer = self.render_footer(cx);
+        let chips = (!self.shell_mode).then(|| self.render_chips(ui, cx)).flatten();
+        let footer = self.render_footer(has_message, cx);
+        let (border, ring) = if self.shell_mode {
+            (ui.success, UiColors::tint(ui.success, 0.2))
+        } else if focused {
+            (ui.focus_border, ui.focus_ring)
+        } else {
+            (ui.input_border, ui.focus_ring)
+        };
+        // The `!` of shell mode: a badge in front of the command.
+        let badge = self.shell_mode.then(|| {
+            div()
+                .flex_none()
+                .h(px(20.))
+                .px(px(6.))
+                .mt(px(1.))
+                .flex()
+                .items_center()
+                .rounded(px(RADIUS_SM))
+                .bg(UiColors::tint(ui.success, 0.16))
+                .font_family(theme::code_font())
+                .text_size(px(theme::TEXT_SM))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(ui.success)
+                .child("!")
+        });
+        let banner = self.editing.as_ref().map(|_| {
+            div()
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(theme::TEXT_SM))
+                .child(icon(IconName::Pencil, ui.accent_text).size(px(12.)).flex_none())
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(ui.accent_text)
+                        .child(tr("Editing a message")),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("claude-cancel-edit")
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(4.))
+                        .px(px(4.))
+                        .rounded(px(RADIUS_SM))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(ui.hover))
+                        .text_color(ui.dim)
+                        .child(ui::keys("Esc", ui))
+                        .child(tr("cancel"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.cancel_edit(cx)
+                        })),
+                )
+        });
         let list = self.render_list(ui, cx);
         let menu = self.menu.as_ref().map(|open| {
             deferred(
@@ -1513,13 +1873,23 @@ impl Render for Composer {
             .relative()
             .flex()
             .flex_col()
-            .gap(px(6.))
-            .p(px(8.))
+            .gap(px(4.))
+            .pt(px(8.))
+            .pb(px(6.))
+            .pl(px(12.))
+            .pr(px(8.))
             .rounded(px(RADIUS_LG))
             .bg(ui.input_background)
             .border_1()
-            .border_color(if focused { ui.focus_border } else { ui.input_border })
-            .when(focused, |card| card.shadow(ui::focus_ring(ui)))
+            .border_color(border)
+            .when(focused || self.shell_mode, |card| {
+                card.shadow(vec![gpui::BoxShadow {
+                    color: ring,
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(3.),
+                }])
+            })
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                 style.border_color(ui.focus_border).bg(ui.drop_target)
             })
@@ -1528,19 +1898,33 @@ impl Render for Composer {
             }))
             // A click on the card's padding goes to the field.
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.focus(window, cx)))
+            // Editing a sent message (part 10.2).
+            .children(banner)
             .children(chips)
             .child(
                 div()
                     .flex()
-                    .items_end()
+                    .items_start()
                     .gap(px(6.))
-                    .child(div().flex_1().min_w_0().child(self.input.clone()))
-                    .child(send),
+                    .children(badge)
+                    .child(div().flex_1().min_w_0().child(self.input.clone())),
             )
+            .child(div().ml(px(-6.)).child(footer))
             .child(
                 canvas(
                     move |bounds, _, cx| {
-                        this.update(cx, |this, _| this.card_bounds = Some(bounds)).ok();
+                        this.update(cx, |this, cx| {
+                            let narrow = |bounds: Option<Bounds<Pixels>>| {
+                                bounds.is_some_and(|bounds| bounds.size.width < px(NARROW_CARD))
+                            };
+                            let was = narrow(this.card_bounds);
+                            this.card_bounds = Some(bounds);
+                            // The bottom row follows the card's width: the next frame, at once.
+                            if narrow(Some(bounds)) != was {
+                                cx.notify();
+                            }
+                        })
+                        .ok();
                     },
                     |_, _, _, _| {},
                 )
@@ -1597,14 +1981,12 @@ impl Render for Composer {
             }))
             .flex()
             .flex_col()
-            .gap(px(4.))
             .px(px(10.))
             .pt(px(8.))
-            .pb(px(6.))
+            .pb(px(10.))
             .font_family(theme::UI_FONT)
             .text_size(px(theme::TEXT_MD))
             .child(card)
-            .child(footer)
             .children(list)
             .children(menu)
     }

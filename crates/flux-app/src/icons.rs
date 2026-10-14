@@ -89,6 +89,7 @@ icons! {
     File => "file",
     FilePlus => "file-plus",
     FindInFiles => "find-in-files",
+    Fit => "fit",
     Folder => "folder",
     FolderOpen => "folder-open",
     FolderPlus => "folder-plus",

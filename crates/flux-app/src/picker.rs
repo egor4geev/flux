@@ -38,6 +38,9 @@ actions!(
         SelectPreviousPage,
         Confirm,
         Dismiss,
+        /// The selected row removed, if the list can do it ([`PickerDelegate::delete`]): ⌘⌫ in the
+        /// history of Claude's sessions (part 10.2); lists bind it in their own key context.
+        DeleteSelected,
     ]
 );
 
@@ -102,6 +105,19 @@ pub trait PickerDelegate: Sized + 'static {
     fn confirm_label(&self) -> &'static str {
         tr("open")
     }
+
+    /// The key context of the list: "Picker" plus the list's own name, for keys of its own.
+    fn key_context(&self) -> &'static str {
+        "Picker"
+    }
+
+    /// [`DeleteSelected`] on row `index`; lists that can't remove rows ignore it.
+    fn delete(&mut self, _index: usize, _window: &mut Window, _cx: &mut Context<Picker<Self>>) {}
+
+    /// What ⌘⌫ does, for the footer hint; `None` — the list doesn't remove rows.
+    fn delete_label(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 pub struct Picker<D: PickerDelegate> {
@@ -115,6 +131,24 @@ pub struct Picker<D: PickerDelegate> {
 impl<D: PickerDelegate> EventEmitter<DismissEvent> for Picker<D> {}
 
 impl<D: PickerDelegate> Picker<D> {
+    /// Selects row `index` (clamped) and scrolls to it.
+    pub fn set_selected(&mut self, index: usize, cx: &mut Context<Self>) {
+        let count = self.delegate.match_count();
+        if count == 0 {
+            return;
+        }
+        self.selected = index.min(count - 1);
+        self.scroll
+            .scroll_to_item(self.selected, gpui::ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    fn delete_selected(&mut self, _: &DeleteSelected, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected < self.delegate.match_count() {
+            self.delegate.delete(self.selected, window, cx);
+        }
+    }
+
     pub fn new(mut delegate: D, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| {
             TextInput::new(delegate.placeholder(), cx)
@@ -274,8 +308,9 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .into_any_element()
         };
         let footer = self.delegate.render_footer(window, cx);
+        let delete_label = self.delegate.delete_label();
         ui::popover(ui)
-            .key_context("Picker")
+            .key_context(self.delegate.key_context())
             .w(px(PICKER_WIDTH))
             .flex()
             .flex_col()
@@ -285,6 +320,7 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .on_action(cx.listener(Self::select_previous_page))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(|_, _: &Dismiss, _, cx| cx.emit(DismissEvent)))
+            .on_action(cx.listener(Self::delete_selected))
             .child(
                 div()
                     .flex_none()
@@ -315,8 +351,11 @@ impl<D: PickerDelegate> Render for Picker<D> {
                         &[
                             ("↑↓", tr("navigate")),
                             ("↵", self.delegate.confirm_label()),
-                            ("esc", tr("close")),
-                        ],
+                        ]
+                        .into_iter()
+                        .chain(delete_label.map(|label| ("⌘⌫", label)))
+                        .chain([("esc", tr("close"))])
+                        .collect::<Vec<_>>(),
                         ui,
                     )),
             )

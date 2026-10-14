@@ -129,6 +129,12 @@ pub struct ClaudeSettings {
     pub flux_tools: bool,
     /// After an edit of Claude, the problems language servers find in the file go back to Claude.
     pub report_problems: bool,
+    /// After a `!` command, Claude answers its output at once (a turn starts); off — the output
+    /// only goes to Claude as context for the next message (part 10.2).
+    pub respond_to_commands: bool,
+    /// A macOS notification when a session finishes or waits for an answer while Flux isn't the
+    /// active app (part 10.2).
+    pub system_notifications: bool,
 }
 
 impl Default for ClaudeSettings {
@@ -146,6 +152,8 @@ impl Default for ClaudeSettings {
             restore_sessions: true,
             flux_tools: true,
             report_problems: true,
+            respond_to_commands: false,
+            system_notifications: true,
         }
     }
 }
@@ -615,6 +623,12 @@ fn parse_claude(value: &Value) -> ClaudeSettings {
         report_problems: value["report_problems"]
             .as_bool()
             .unwrap_or(defaults.report_problems),
+        respond_to_commands: value["respond_to_commands"]
+            .as_bool()
+            .unwrap_or(defaults.respond_to_commands),
+        system_notifications: value["system_notifications"]
+            .as_bool()
+            .unwrap_or(defaults.system_notifications),
     }
 }
 
@@ -663,6 +677,8 @@ fn to_json(settings: &Settings) -> String {
             "restore_sessions": settings.claude.restore_sessions,
             "flux_tools": settings.claude.flux_tools,
             "report_problems": settings.claude.report_problems,
+            "respond_to_commands": settings.claude.respond_to_commands,
+            "system_notifications": settings.claude.system_notifications,
         },
         "projects": {
             "open_in": settings.projects.open_in.key(),
@@ -718,6 +734,8 @@ mod tests {
                 restore_sessions: false,
                 flux_tools: false,
                 report_problems: false,
+                respond_to_commands: true,
+                system_notifications: false,
             },
             appearance: AppearanceSettings {
                 theme: Some("Flux Day".to_string()),

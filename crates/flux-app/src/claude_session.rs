@@ -8,6 +8,10 @@
 //! (the chat answers them through [`ClaudeSession::answer`]), Flux's tools wait for the window
 //! ([`SessionEvent::ToolCall`] → [`ClaudeSession::answer_tool`]), the rest at once.
 //!
+//! Part 10.2: `!` commands ([`ClaudeSession::run_shell`]) run here, in the project's root with the
+//! login shell's environment; when one ends and Claude is idle, its records go to the CLI as
+//! context only (or as a message Claude answers — a setting).
+//!
 //! Part 9.2: a saved session comes back in a tab without a process ([`ClaudeSession::resumed`]:
 //! the conversation from its transcript); the process starts with `--resume` when the chat is in
 //! sight ([`ClaudeSession::ensure_started`]) or the user writes. Flux's MCP server (`flux`, the
@@ -26,9 +30,10 @@ use flux_claude::mcp::{self, McpReply, McpServer, ToolOutput};
 use flux_claude::process::ProcessEvent;
 use flux_claude::protocol::{CliRequest, HostRequest, Incoming};
 use flux_claude::session::EDIT_HOOK;
+use flux_claude::shell::{self, ShellCommand, ShellEvent};
 use flux_claude::{
-    Answer, Change, Cli, Effort, LaunchOptions, PermissionMode, Process, Session, Status,
-    UserInput,
+    Answer, Change, Cli, Effort, EntryId, LaunchOptions, PermissionMode, Process, Session,
+    ShellState, Status, UserInput,
 };
 
 use crate::i18n::tr;
@@ -40,6 +45,11 @@ const USAGE_RETRY: Duration = Duration::from_secs(3);
 /// How long an edit's hook waits for the window to say what the language server found: then the
 /// CLI gets the answer without it (Claude waits for the hook).
 const EDIT_HOOK_WAIT: Duration = Duration::from_secs(4);
+/// While a `!` command runs, the chat is redrawn this often (its clock).
+const SHELL_TICK: Duration = Duration::from_secs(1);
+/// What a `!` command keeps of each stream for Claude, at most: past it the middle goes (Claude
+/// gets [`shell::OUTPUT_LIMIT`] characters of it anyway).
+const SHELL_KEEP: usize = 1 << 20;
 
 /// What changed in the session.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +93,22 @@ pub enum SessionEvent {
 /// The PreToolUse hook that lets Flux's own tools run without a permission card.
 const TOOLS_HOOK: &str = "flux-tools";
 
+/// Where an edited message goes back to (part 10.2): the conversation from the message `from` on
+/// is dropped; the process continues the session at the entry `resume_at` of its transcript (the
+/// message's parent), or starts a new session when the message opened the conversation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditPoint {
+    pub from: EntryId,
+    pub resume_at: Option<String>,
+}
+
+/// A restart waiting for the old process to end: then the new one starts at `resume_at` with the
+/// edited message.
+struct Restart {
+    resume_at: Option<String>,
+    input: UserInput,
+}
+
 pub struct ClaudeSession {
     model: Session,
     cli: Cli,
@@ -99,6 +125,29 @@ pub struct ClaudeSession {
     /// A resumed session's transcript is being read.
     loading: bool,
     _load: Option<Task<()>>,
+    /// `!` commands, running or ended and not handed to Claude yet (part 10.2).
+    shells: HashMap<EntryId, ShellRun>,
+    /// Ended `!` commands whose records wait for Claude to be idle, in the order they ended.
+    held: Vec<EntryId>,
+    /// Redraws the chat each second while a `!` command runs.
+    shell_ticker: Option<Task<()>>,
+    /// An edited message waits for the old process to end (part 10.2); its frames are ignored
+    /// meanwhile.
+    restart: Option<Restart>,
+}
+
+/// A `!` command: its process and what it printed, for Claude.
+struct ShellRun {
+    command: String,
+    /// `None` while it starts (the login shell's environment is read first) and when it couldn't.
+    process: Option<ShellCommand>,
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    /// The user stopped it.
+    stopped: bool,
+    ended: bool,
+    _pump: Option<Task<()>>,
 }
 
 impl EventEmitter<SessionEvent> for ClaudeSession {}
@@ -147,6 +196,10 @@ impl ClaudeSession {
             edit_hooks: HashMap::new(),
             loading: false,
             _load: None,
+            shells: HashMap::new(),
+            held: Vec::new(),
+            shell_ticker: None,
+            restart: None,
         }
     }
 
@@ -271,12 +324,127 @@ impl ClaudeSession {
             self.options.resume = self.model.info.session_id.clone();
             self.start(cx);
         }
+        // The output of `!` commands that waited goes before the message: Claude reads it with it.
+        self.deliver_held(false, cx);
         let Some(process) = &self.process else {
             return;
         };
         let uuid = process.send_user(&input);
         let changes = self.model.push_user(Some(uuid), &input);
         self.emit(changes, cx);
+    }
+
+    /// Where the message `id` can be edited from (part 10.2): its parent in the CLI's transcript.
+    /// An error says why it can't — the message isn't in the record (it went in while Claude
+    /// worked), the record can't be read.
+    pub fn edit_point(
+        &self,
+        id: EntryId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<EditPoint, String>> {
+        let uuid = self.model.entries.iter().find_map(|entry| match &entry.kind {
+            flux_claude::EntryKind::User(user) if entry.id == id => Some(user.uuid.clone()),
+            _ => None,
+        });
+        let Some(uuid) = uuid else {
+            return Task::ready(Err(tr("The message isn't in the conversation").to_string()));
+        };
+        // A session that never started has no record: the message opened it.
+        let Some(session_id) = self.model.info.session_id.clone() else {
+            return Task::ready(Ok(EditPoint {
+                from: id,
+                resume_at: None,
+            }));
+        };
+        let missing = tr("The session's record doesn't have this message").to_string();
+        let Some((uuid, path)) = uuid.zip(flux_claude::transcript::transcript_path(
+            &self.options.cwd,
+            &session_id,
+        )) else {
+            return Task::ready(Err(missing));
+        };
+        cx.background_spawn(async move {
+            match flux_claude::transcript::parent_of(&path, &uuid) {
+                Ok(Some(resume_at)) => Ok(EditPoint { from: id, resume_at }),
+                Ok(None) => Err(missing),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(missing),
+                Err(err) => Err(err.to_string()),
+            }
+        })
+    }
+
+    /// Sends an edited message (part 10.2): the conversation from the old message on goes, and the
+    /// process starts again on the session cut at the message's parent (`--resume-session-at`).
+    /// A running turn is interrupted first, `!` commands after that point are dropped.
+    pub fn send_edited(&mut self, point: EditPoint, input: UserInput, cx: &mut Context<Self>) {
+        self.held.retain(|id| *id < point.from);
+        let dropped: Vec<EntryId> = self
+            .shells
+            .keys()
+            .filter(|id| **id >= point.from)
+            .copied()
+            .collect();
+        for id in dropped {
+            if let Some(run) = self.shells.remove(&id)
+                && let Some(process) = &run.process
+            {
+                process.stop();
+            }
+        }
+        let working = self.model.is_working();
+        let changes = self.model.truncate_from(point.from);
+        self.emit(changes, cx);
+        self.restart = Some(Restart {
+            resume_at: point.resume_at,
+            input,
+        });
+        if self.process.is_none() {
+            return self.restart_now(cx);
+        }
+        if working {
+            // The turn stops before stdin closes: a closed stdin lets it run to its end.
+            self.request(HostRequest::Interrupt, cx);
+        }
+        if let Some(process) = &self.process {
+            process.close();
+        }
+    }
+
+    /// The old process is gone: the new one starts where the edited message goes, and gets it.
+    fn restart_now(&mut self, cx: &mut Context<Self>) {
+        let Some(restart) = self.restart.take() else {
+            return;
+        };
+        self.options.resume = restart
+            .resume_at
+            .as_ref()
+            .and_then(|_| self.model.info.session_id.clone());
+        self.options.resume_at = restart.resume_at;
+        self.options.session_id = None;
+        self.start(cx);
+        // Later starts (after the process exits) continue the session whole.
+        self.options.resume_at = None;
+        self.send(restart.input, cx);
+    }
+
+    /// Flux put files back as they were before Claude's edits (part 10.2): open documents take
+    /// them from disk; files back to their text before Claude leave the session's changelist.
+    pub fn files_restored(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let unchanged: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| {
+                self.model.changed_file(path).is_some_and(|file| {
+                    let disk = std::fs::read_to_string(path).ok();
+                    disk.as_deref() == file.original.as_deref()
+                })
+            })
+            .cloned()
+            .collect();
+        if !unchanged.is_empty() {
+            self.forget_changed_files(&unchanged, cx);
+        }
+        cx.emit(SessionEvent::FilesChanged(paths));
+        cx.notify();
     }
 
     /// Answers a question of the CLI (a permission, an edit, Claude's questions, the plan).
@@ -289,6 +457,223 @@ impl ClaudeSession {
         }
         let changes = self.model.resolve(request, &answer);
         self.emit(changes, cx);
+    }
+
+    /// Runs a `!` command (part 10.2): in the project's root, through the user's shell with the
+    /// login shell's environment (a terminal's `PATH`, also when Flux started from the Dock). Its
+    /// entry shows the output as it comes; when it ends, Claude gets it.
+    pub fn run_shell(&mut self, command: String, cx: &mut Context<Self>) {
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return;
+        }
+        let (id, changes) = self.model.start_shell(command.clone());
+        self.emit(changes, cx);
+        let cwd = self.options.cwd.clone();
+        let line = command.clone();
+        // The first command of the process waits for the login shell to tell its environment.
+        let started = cx.background_spawn(async move {
+            shell::spawn(
+                &line,
+                &cwd,
+                &shell::user_shell(),
+                Some(flux_plugin::login_env()),
+            )
+        });
+        let pump = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            match started.await {
+                Ok((process, mut events)) => {
+                    let started = this.update(cx, |this, _| match this.shells.get_mut(&id) {
+                        Some(run) => {
+                            // Stopped before it started.
+                            if run.stopped {
+                                process.stop();
+                            }
+                            run.process = Some(process);
+                            true
+                        }
+                        None => false,
+                    });
+                    if !matches!(started, Ok(true)) {
+                        return;
+                    }
+                    while let Some(event) = events.next().await {
+                        if this
+                            .update(cx, |this, cx| this.shell_event(id, event, cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    this.update(cx, |this, cx| this.shell_failed(id, err.to_string(), cx))
+                        .ok();
+                }
+            }
+        });
+        self.shells.insert(
+            id,
+            ShellRun {
+                command,
+                process: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+                stopped: false,
+                ended: false,
+                _pump: Some(pump),
+            },
+        );
+        self.update_shell_ticker(cx);
+    }
+
+    /// Stops a running `!` command and what it started; what it printed so far still goes to
+    /// Claude.
+    pub fn stop_shell(&mut self, id: EntryId, _cx: &mut Context<Self>) {
+        let Some(run) = self.shells.get_mut(&id).filter(|run| !run.ended) else {
+            return;
+        };
+        run.stopped = true;
+        if let Some(process) = &run.process {
+            process.stop();
+        }
+    }
+
+    /// The `!` command that runs, the latest one (the Stop button of the field).
+    pub fn running_shell(&self) -> Option<EntryId> {
+        self.shells
+            .iter()
+            .filter(|(_, run)| !run.ended)
+            .map(|(id, _)| *id)
+            .max()
+    }
+
+    fn shell_event(&mut self, id: EntryId, event: ShellEvent, cx: &mut Context<Self>) {
+        let Some(run) = self.shells.get_mut(&id) else {
+            return;
+        };
+        match event {
+            ShellEvent::Stdout(text) => {
+                keep(&mut run.stdout, &text);
+                let changes = self.model.shell_output(id, &text);
+                self.emit(changes, cx);
+            }
+            ShellEvent::Stderr(text) => {
+                keep(&mut run.stderr, &text);
+                let changes = self.model.shell_output(id, &text);
+                self.emit(changes, cx);
+            }
+            ShellEvent::Exited { code, duration } => {
+                run.ended = true;
+                run.exit_code = code;
+                run.process = None;
+                let state = if run.stopped {
+                    ShellState::Stopped
+                } else {
+                    ShellState::Done
+                };
+                let changes = self.model.shell_ended(id, state, code, Some(duration));
+                self.emit(changes, cx);
+                self.held.push(id);
+                self.deliver_when_idle(cx);
+            }
+        }
+    }
+
+    /// The command couldn't start (no shell, no such folder): the reason as its output, for
+    /// Claude too.
+    fn shell_failed(&mut self, id: EntryId, error: String, cx: &mut Context<Self>) {
+        let Some(run) = self.shells.get_mut(&id) else {
+            return;
+        };
+        run.ended = true;
+        run.stderr = error.clone();
+        let mut changes = self.model.shell_output(id, &error);
+        changes.extend(self.model.shell_ended(id, ShellState::Failed, None, None));
+        self.emit(changes, cx);
+        self.held.push(id);
+        self.deliver_when_idle(cx);
+    }
+
+    /// The records of the ended `!` commands go to Claude now, unless Claude works (then when it
+    /// is idle: a message of context in the middle of a turn would join the turn).
+    fn deliver_when_idle(&mut self, cx: &mut Context<Self>) {
+        let busy = matches!(
+            self.model.status,
+            Status::Working { .. } | Status::WaitingForUser | Status::Starting
+        );
+        // Without a process (a resumed session, an exited one) the records start it.
+        if self.held.is_empty() || busy && self.process.is_some() {
+            return;
+        }
+        let respond = crate::settings::claude(cx).respond_to_commands;
+        self.deliver_held(respond, cx);
+    }
+
+    /// Hands the held records to the CLI: each command — its input, then its output; `respond` —
+    /// Claude answers the last one (a turn), otherwise all are context only.
+    fn deliver_held(&mut self, respond: bool, cx: &mut Context<Self>) {
+        if self.held.is_empty() {
+            return;
+        }
+        // Taken first: starting the process reports changes, which come back here.
+        let held = std::mem::take(&mut self.held);
+        if self.process.is_none() {
+            self.options.resume = self.model.info.session_id.clone();
+            self.start(cx);
+        }
+        if self.process.is_none() {
+            self.held = held;
+            return;
+        }
+        let last = held.len() - 1;
+        for (index, id) in held.into_iter().enumerate() {
+            let Some(run) = self.shells.remove(&id) else {
+                continue;
+            };
+            let Some(process) = &self.process else {
+                return;
+            };
+            let query = respond && index == last;
+            let mut stderr = run.stderr;
+            if run.stopped {
+                if !stderr.is_empty() && !stderr.ends_with('\n') {
+                    stderr.push('\n');
+                }
+                stderr.push_str("(stopped by the user)");
+            }
+            process.send_context(&shell::input_record(&run.command), false);
+            process.send_context(&shell::output_record(&run.stdout, &stderr, run.exit_code), query);
+            let changes = self.model.shell_delivered(id, if query { 1 } else { 2 });
+            self.emit(changes, cx);
+        }
+    }
+
+    /// Redraws the chat each second while a `!` command runs (its clock), and stops when none
+    /// does.
+    fn update_shell_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.shell_ticker.is_some() {
+            return;
+        }
+        self.shell_ticker = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SHELL_TICK).await;
+                let running = this.update(cx, |this, cx| {
+                    let running = this.running_shell().is_some();
+                    if running {
+                        cx.emit(SessionEvent::Changed);
+                        cx.notify();
+                    } else {
+                        this.shell_ticker = None;
+                    }
+                    running
+                });
+                if !matches!(running, Ok(true)) {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Stops the running turn (Esc). A pending question is withdrawn by the CLI itself
@@ -398,6 +783,14 @@ impl ClaudeSession {
     pub fn shutdown(&mut self) {
         self.tool_calls.clear();
         self.edit_hooks.clear();
+        for run in self.shells.values() {
+            if let Some(process) = &run.process {
+                process.stop();
+            }
+        }
+        self.shells.clear();
+        self.held.clear();
+        self.shell_ticker = None;
         if let Some(process) = self.process.take() {
             process.close();
             // The pump stops with it: the model learns about the end here (the chat stops showing
@@ -473,6 +866,22 @@ impl ClaudeSession {
     }
 
     fn handle(&mut self, event: ProcessEvent, cx: &mut Context<Self>) {
+        // An edited message waits for this process to end: what it still says is gone with the
+        // part of the conversation the edit dropped.
+        if self.restart.is_some() {
+            if matches!(event, ProcessEvent::Exited { .. }) {
+                self.process = None;
+                self.tool_calls.clear();
+                self.edit_hooks.clear();
+                // Outside the old process's pump, which this event comes from: the new process
+                // replaces it.
+                cx.spawn(async move |this, cx| {
+                    this.update(cx, |this, cx| this.restart_now(cx)).ok();
+                })
+                .detach();
+            }
+            return;
+        }
         if let ProcessEvent::Frame(frame) = &event
             && let Incoming::Request { id, request } = frame.as_ref()
         {
@@ -571,6 +980,8 @@ impl ClaudeSession {
         }
         let mut redraw = false;
         let mut finished = false;
+        // The status moved (the process is ready, a turn ended): held `!` records may go.
+        let mut status = false;
         for change in changes {
             let event = match change {
                 Change::Entries
@@ -582,14 +993,20 @@ impl ClaudeSession {
                     redraw = true;
                     continue;
                 }
-                Change::Status => SessionEvent::Status,
+                Change::Status => {
+                    status = true;
+                    SessionEvent::Status
+                }
                 Change::PendingAdded(id) => SessionEvent::PendingAdded(id),
                 Change::PendingRemoved(id) => SessionEvent::PendingRemoved(id),
                 Change::TurnFinished { is_error } => {
                     finished = true;
                     SessionEvent::TurnFinished { is_error }
                 }
-                Change::Idle => SessionEvent::Idle,
+                Change::Idle => {
+                    status = true;
+                    SessionEvent::Idle
+                }
                 Change::Title => SessionEvent::Title,
                 Change::Limits => SessionEvent::Limits,
                 Change::FilesChanged(paths) => SessionEvent::FilesChanged(paths),
@@ -605,6 +1022,19 @@ impl ClaudeSession {
             self.refresh_context(cx);
         }
         cx.notify();
+        // Claude is idle again: the `!` commands that ended meanwhile go to it.
+        if status && !self.held.is_empty() {
+            self.deliver_when_idle(cx);
+        }
+    }
+}
+
+/// Adds output of a `!` command to what Claude will get: a lone CR rewrites the line; past
+/// [`SHELL_KEEP`] the middle goes.
+fn keep(kept: &mut String, text: &str) {
+    shell::append(kept, text);
+    if kept.len() > SHELL_KEEP {
+        *kept = shell::cut(kept, SHELL_KEEP / 2);
     }
 }
 

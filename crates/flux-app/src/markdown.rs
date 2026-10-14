@@ -9,6 +9,8 @@
 //! The Claude chat (stage 9) draws Claude's answers with it too: GitHub-style tables, and code
 //! blocks with a copy button ([`render_copyable`]).
 
+use std::cell::Cell;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -24,7 +26,7 @@ use gpui::{
 
 use crate::display::{display_line, text_runs};
 use crate::theme::{self, Theme, UiColors};
-use crate::ui::{self, RADIUS_SM};
+use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
@@ -791,18 +793,159 @@ fn entity(chars: &[char], start: usize) -> Option<(char, usize)> {
 /// The blocks as a column of elements: prose in the UI font, code in the code font with syntax
 /// colors. `color` is the color of regular text.
 pub fn render(blocks: &[Block], color: Hsla, theme: &Theme) -> AnyElement {
-    render_blocks(blocks, color, theme, None)
+    render_blocks(blocks, color, theme, None, None)
 }
 
-/// As [`render`], with a copy button on each code block (shown while the pointer is over it). `id`
-/// keeps the buttons' ids apart from those of other blocks in the window.
+/// As [`render`], in the look of Claude's chat: a code block is a card with its language and a copy
+/// button in a header, inline code is a lighter pill. `id` keeps the buttons' ids apart from those
+/// of other blocks in the window. `marks` — the matches of a search to mark (the chat's ⌘F, part
+/// 10.2), in the texts [`block_texts`] lists, in that order.
 pub fn render_copyable(
     blocks: &[Block],
     color: Hsla,
     theme: &Theme,
     id: impl Into<gpui::SharedString>,
+    marks: Option<&Marks>,
 ) -> AnyElement {
-    render_blocks(blocks, color, theme, Some(id.into()))
+    render_blocks(blocks, color, theme, Some(id.into()), marks)
+}
+
+/// The texts the blocks draw, in the order they are drawn (tables row by row, code blocks as their
+/// lines): what a search counts its matches in, so [`Marks`] mark the same ones.
+pub fn block_texts(blocks: &[Block]) -> Vec<String> {
+    let spans_text = |spans: &[Span]| spans.iter().map(|span| span.text.as_str()).collect::<String>();
+    let mut texts = Vec::new();
+    for block in blocks {
+        match block {
+            Block::Paragraph(spans) | Block::Heading(spans) | Block::Quote(spans) => {
+                texts.push(spans_text(spans))
+            }
+            Block::Item { spans, .. } => texts.push(spans_text(spans)),
+            Block::Code(code) => texts.push(code.text.clone()),
+            Block::Table(table) => {
+                for row in std::iter::once(&table.header).chain(&table.rows) {
+                    texts.extend(row.iter().map(|cell| spans_text(cell)));
+                }
+            }
+            Block::Rule => {}
+        }
+    }
+    texts
+}
+
+/// The matches of a search to mark in the texts of one entry as they are drawn (part 10.2): every
+/// match gets `color`; the `active`-th one (counted over the entry's texts in drawing order, from
+/// 0) gets `active_color`. `count` goes up as texts are marked.
+pub struct Marks {
+    /// The query, lowercased; matching is case-insensitive.
+    pub needle: Vec<char>,
+    pub active: Option<usize>,
+    pub count: Cell<usize>,
+    pub color: Hsla,
+    pub active_color: Hsla,
+}
+
+impl Marks {
+    /// `runs` (covering `text`) with the matches in `text` on their backgrounds.
+    pub fn mark(&self, text: &str, runs: Vec<TextRun>) -> Vec<TextRun> {
+        let found = occurrences(text, &self.needle);
+        if found.is_empty() {
+            return runs;
+        }
+        let mut marked = Vec::with_capacity(runs.len() + found.len() * 2);
+        let mut start = 0;
+        let mut next = 0;
+        for run in runs {
+            let end = start + run.len;
+            let mut at = start;
+            while at < end {
+                // The match touching `at`, if any; else the plain stretch up to the next one.
+                while next < found.len() && found[next].end <= at {
+                    next += 1;
+                    self.count.set(self.count.get() + 1);
+                }
+                let (until, background) = match found.get(next) {
+                    Some(range) if range.start <= at => {
+                        let index = self.count.get();
+                        let color = if self.active == Some(index) {
+                            self.active_color
+                        } else {
+                            self.color
+                        };
+                        (range.end.min(end), Some(color))
+                    }
+                    Some(range) => (range.start.min(end), run.background_color),
+                    None => (end, run.background_color),
+                };
+                marked.push(TextRun {
+                    len: until - at,
+                    background_color: background,
+                    ..run.clone()
+                });
+                at = until;
+            }
+            start = end;
+        }
+        while next < found.len() {
+            next += 1;
+            self.count.set(self.count.get() + 1);
+        }
+        marked
+    }
+}
+
+impl Marks {
+    /// The matches in `text` as highlights over the text's own style (a line drawn without runs).
+    pub fn highlights(&self, text: &str) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+        occurrences(text, &self.needle)
+            .into_iter()
+            .map(|range| {
+                let index = self.count.get();
+                self.count.set(index + 1);
+                let color = if self.active == Some(index) {
+                    self.active_color
+                } else {
+                    self.color
+                };
+                (
+                    range,
+                    gpui::HighlightStyle {
+                        background_color: Some(color),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// Where `needle` (lowercase chars) occurs in `text`, case-insensitively, without overlaps: byte
+/// ranges of `text`.
+pub fn occurrences(text: &str, needle: &[char]) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    if needle.is_empty() {
+        return found;
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let same = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    let mut index = 0;
+    while index + needle.len() <= chars.len() {
+        if needle
+            .iter()
+            .enumerate()
+            .all(|(offset, &n)| same(chars[index + offset].1, n))
+        {
+            let start = chars[index].0;
+            let end = chars
+                .get(index + needle.len())
+                .map_or(text.len(), |(byte, _)| *byte);
+            found.push(start..end);
+            index += needle.len();
+        } else {
+            index += 1;
+        }
+    }
+    found
 }
 
 fn render_blocks(
@@ -810,17 +953,22 @@ fn render_blocks(
     color: Hsla,
     theme: &Theme,
     copy: Option<gpui::SharedString>,
+    marks: Option<&Marks>,
 ) -> AnyElement {
     let ui = theme.ui;
+    // The chat's look (copyable blocks are Claude's text).
+    let chat = copy.is_some();
     div()
         .flex()
         .flex_col()
         .gap_2()
         .children(blocks.iter().enumerate().map(|(index, block)| {
             match block {
-                Block::Paragraph(spans) => div().child(styled(spans, color, ui)).into_any_element(),
+                Block::Paragraph(spans) => div()
+                    .child(styled(spans, color, ui, chat, marks))
+                    .into_any_element(),
                 Block::Heading(spans) => div()
-                    .child(styled_with(spans, color, ui, FontWeight::SEMIBOLD))
+                    .child(styled_with(spans, color, ui, FontWeight::SEMIBOLD, chat, marks))
                     .into_any_element(),
                 Block::Item {
                     depth,
@@ -831,24 +979,25 @@ fn render_blocks(
                     .gap_1p5()
                     .pl(px(*depth as f32 * 14.))
                     .child(div().flex_none().text_color(ui.dim).child(marker.clone()))
-                    .child(div().flex_1().min_w_0().child(styled(spans, color, ui)))
+                    .child(div().flex_1().min_w_0().child(styled(spans, color, ui, chat, marks)))
                     .into_any_element(),
                 Block::Quote(spans) => div()
                     .pl_2()
                     .border_l_2()
                     .border_color(ui.divider)
-                    .child(styled(spans, ui.text_muted, ui))
+                    .child(styled(spans, ui.text_muted, ui, chat, marks))
                     .into_any_element(),
                 Block::Code(code) => match &copy {
-                    Some(prefix) => copyable_code_block(
+                    Some(prefix) => chat_code_block(
                         code,
                         theme,
                         ElementId::NamedInteger(prefix.clone(), index as u64),
+                        marks,
                     ),
                     None => code_block(code, theme),
                 },
                 Block::Rule => ui::divider(ui).into_any_element(),
-                Block::Table(table) => render_table(table, color, ui),
+                Block::Table(table) => render_table(table, color, ui, chat, marks),
             }
         }))
         .into_any_element()
@@ -856,7 +1005,13 @@ fn render_blocks(
 
 /// A table: a header row on a tinted background, rows between thin lines, columns of equal share
 /// (cells wrap).
-fn render_table(table: &Table, color: Hsla, ui: UiColors) -> AnyElement {
+fn render_table(
+    table: &Table,
+    color: Hsla,
+    ui: UiColors,
+    chat: bool,
+    marks: Option<&Marks>,
+) -> AnyElement {
     let row = |cells: &[Vec<Span>], header: bool| {
         div()
             .flex()
@@ -878,9 +1033,9 @@ fn render_table(table: &Table, color: Hsla, ui: UiColors) -> AnyElement {
                         Align::Right => cell.justify_end(),
                     })
                     .child(if header {
-                        styled_with(spans, color, ui, FontWeight::SEMIBOLD)
+                        styled_with(spans, color, ui, FontWeight::SEMIBOLD, chat, marks)
                     } else {
-                        styled(spans, color, ui)
+                        styled(spans, color, ui, chat, marks)
                     })
             }))
     };
@@ -901,39 +1056,79 @@ fn render_table(table: &Table, color: Hsla, ui: UiColors) -> AnyElement {
         .into_any_element()
 }
 
-/// A code block with a copy button in its top right corner, shown while the pointer is over it.
-fn copyable_code_block(code: &CodeBlock, theme: &Theme, id: ElementId) -> AnyElement {
+/// A code block of the chat: a card with a header — the language (or "code") and a copy button —
+/// over the code.
+fn chat_code_block(
+    code: &CodeBlock,
+    theme: &Theme,
+    id: ElementId,
+    marks: Option<&Marks>,
+) -> AnyElement {
     let ui = theme.ui;
     let text = code.text.clone();
-    let group: gpui::SharedString = format!("code-{id}").into();
+    let language = code
+        .language
+        .clone()
+        .unwrap_or_else(|| crate::i18n::tr("code").to_string());
     div()
-        .relative()
-        .group(group.clone())
-        .child(code_block(code, theme))
+        .flex()
+        .flex_col()
+        .my(px(2.))
+        .rounded(px(RADIUS_MD))
+        .border_1()
+        .border_color(UiColors::tint(ui.foreground, 0.09))
+        .bg(UiColors::tint(ui.foreground, 0.035))
         .child(
             div()
-                .absolute()
-                .top(px(4.))
-                .right(px(4.))
-                .invisible()
-                .group_hover(group, |style| style.visible())
+                .h(px(28.))
+                .pl(px(10.))
+                .pr(px(3.))
+                .flex()
+                .items_center()
+                .border_b_1()
+                .border_color(ui.divider)
+                .text_size(px(theme::TEXT_XS))
+                .text_color(ui.dim)
+                .child(div().flex_1().child(language))
                 .child(
                     ui::icon_button(id, crate::icons::IconName::Copy, ui)
-                        .bg(ui.elevated)
+                        .size(px(22.))
                         .tooltip(ui::tooltip(crate::i18n::tr("Copy"), None))
                         .on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
                         }),
                 ),
         )
+        .child(
+            div()
+                .px(px(10.))
+                .py(px(8.))
+                .text_size(px(12.5))
+                .line_height(px(19.))
+                .child(code_text(code, theme, marks)),
+        )
         .into_any_element()
 }
 
-fn styled(spans: &[Span], color: Hsla, ui: UiColors) -> StyledText {
-    styled_with(spans, color, ui, FontWeight::NORMAL)
+fn styled(
+    spans: &[Span],
+    color: Hsla,
+    ui: UiColors,
+    chat: bool,
+    marks: Option<&Marks>,
+) -> StyledText {
+    styled_with(spans, color, ui, FontWeight::NORMAL, chat, marks)
 }
 
-fn styled_with(spans: &[Span], color: Hsla, ui: UiColors, weight: FontWeight) -> StyledText {
+/// Spans as styled text; in the chat (`chat`), inline code is a lighter, accent-tinted pill.
+fn styled_with(
+    spans: &[Span],
+    color: Hsla,
+    ui: UiColors,
+    weight: FontWeight,
+    chat: bool,
+    marks: Option<&Marks>,
+) -> StyledText {
     let mut text = String::new();
     let mut runs = Vec::with_capacity(spans.len());
     for span in spans.iter().filter(|span| !span.text.is_empty()) {
@@ -947,20 +1142,48 @@ fn styled_with(spans: &[Span], color: Hsla, ui: UiColors, weight: FontWeight) ->
         if style.italic {
             run_font.style = FontStyle::Italic;
         }
+        let code_color = if chat {
+            ui.accent_text.blend(UiColors::tint(ui.foreground, 0.55))
+        } else {
+            color
+        };
         runs.push(TextRun {
             len: span.text.len(),
             font: run_font,
-            color: if style.link { ui.accent_text } else { color },
+            color: if style.link {
+                ui.accent_text
+            } else if style.code {
+                code_color
+            } else {
+                color
+            },
             background_color: style.code.then(|| UiColors::tint(ui.foreground, 0.08)),
             underline: None,
             strikethrough: None,
         });
         text.push_str(&span.text);
     }
+    let runs = match marks {
+        Some(marks) => marks.mark(&text, runs),
+        None => runs,
+    };
     StyledText::new(text).with_runs(runs)
 }
 
 fn code_block(code: &CodeBlock, theme: &Theme) -> AnyElement {
+    let ui = theme.ui;
+    div()
+        .px_2()
+        .py_1p5()
+        .rounded(px(RADIUS_SM))
+        .bg(UiColors::tint(ui.foreground, 0.04))
+        .font_family(theme::code_font())
+        .child(code_text(code, theme, None))
+        .into_any_element()
+}
+
+/// A code block's text with its syntax colors, in the code font (search matches marked).
+fn code_text(code: &CodeBlock, theme: &Theme, marks: Option<&Marks>) -> StyledText {
     let ui = theme.ui;
     let text = Rope::from_str(&code.text);
     let base = TextRun {
@@ -988,14 +1211,11 @@ fn code_block(code: &CodeBlock, theme: &Theme) -> AnyElement {
         }));
         display.push_str(&line_text);
     }
-    div()
-        .px_2()
-        .py_1p5()
-        .rounded(px(RADIUS_SM))
-        .bg(UiColors::tint(ui.foreground, 0.04))
-        .font_family(theme::code_font())
-        .child(StyledText::new(display).with_runs(runs))
-        .into_any_element()
+    let runs = match marks {
+        Some(marks) => marks.mark(&display, runs),
+        None => runs,
+    };
+    StyledText::new(display).with_runs(runs)
 }
 
 #[cfg(test)]

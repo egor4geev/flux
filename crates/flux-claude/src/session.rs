@@ -62,6 +62,9 @@ pub struct Session {
     /// `session_state_changed` arrives (the CLI was started with the variable that enables it):
     /// then only it makes the session idle.
     has_state_events: bool,
+    /// Messages of context only (the records of `!` commands, part 10.2) whose empty `result`
+    /// hasn't come yet: it isn't a turn.
+    quiet: usize,
 }
 
 /// The hook Flux registers in `initialize`: after an edit ran, the CLI asks it whether Claude
@@ -76,6 +79,12 @@ pub const EDIT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// A user's version of an edit up to this size goes to Claude whole; a longer one — only the note
 /// that the file differs from the proposal.
 const MODIFIED_EDIT_TEXT_LIMIT: usize = 6_000;
+
+/// A `!` command's output shown in the chat: past this size its beginning goes, down to the last
+/// [`SHELL_SHOWN_KEEP`] bytes after a marker (Claude gets the command's output from the runner).
+const SHELL_SHOWN_LIMIT: usize = 256 * 1024;
+const SHELL_SHOWN_KEEP: usize = 192 * 1024;
+const SHELL_CUT_MARK: &str = "…\n";
 
 /// Between the texts of thinking blocks that make one thought: a paragraph break.
 const THINKING_SEPARATOR: &str = "\n\n";
@@ -173,6 +182,59 @@ pub enum EntryKind {
     Notice(Notice),
     /// The end of a turn.
     TurnEnd(TurnSummary),
+    /// A shell command the user ran with `!` in the message field (part 10.2): Flux runs it in the
+    /// project's root, and its output goes to Claude as context (or starts a turn — a setting).
+    Shell(ShellEntry),
+}
+
+/// A `!` command and what came of it (part 10.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShellEntry {
+    pub command: String,
+    /// Standard output and standard error as they came, without terminal escapes.
+    pub output: String,
+    pub state: ShellState,
+    /// The exit code, once it ended on its own.
+    pub exit_code: Option<i32>,
+    /// From start to end; `None` while it runs or when unknown (a saved conversation).
+    pub duration: Option<Duration>,
+    /// When it started (the live clock); `None` in a saved conversation.
+    pub started: Option<Instant>,
+    /// The output was handed to Claude.
+    pub delivered: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellState {
+    Running,
+    /// Ended on its own (any exit code).
+    Done,
+    /// The user stopped it.
+    Stopped,
+    /// Couldn't start (no shell, no such directory).
+    Failed,
+}
+
+/// A file as Claude's edits left it and what it was before them, to put it back (part 10.2:
+/// rewinding the code to a message, rolling back a turn or one edit).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileRestore {
+    pub path: PathBuf,
+    /// The text before the first of the edits; `None` — the first one created the file.
+    pub before: Option<String>,
+    /// The text after the last of them, when it can be worked out (the edit's input applied to its
+    /// original): a file that differs from it on disk changed since.
+    pub after: Option<String>,
+}
+
+/// A file a turn of Claude changed, for the "Done" card at the end of the turn (part 10.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnFile {
+    pub path: PathBuf,
+    pub added: usize,
+    pub removed: usize,
+    /// The turn created it (Write of a file that didn't exist).
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +247,8 @@ pub struct UserEntry {
     pub queued: bool,
     /// Taken back before it started.
     pub cancelled: bool,
+    /// When it was sent (the time under the message, part 10.2); `None` — unknown.
+    pub at: Option<SystemTime>,
 }
 
 /// A tool call and what came of it.
@@ -656,6 +720,7 @@ impl Session {
             modified_edits: HashMap::new(),
             process_cost: 0.,
             has_state_events: false,
+            quiet: 0,
         }
     }
 
@@ -740,6 +805,7 @@ impl Session {
         uuid: Option<String>,
         text: String,
         images: Vec<ImageAttachment>,
+        at: Option<SystemTime>,
     ) {
         self.push(EntryKind::User(UserEntry {
             uuid,
@@ -747,6 +813,7 @@ impl Session {
             images,
             queued: false,
             cancelled: false,
+            at,
         }));
     }
 
@@ -777,11 +844,102 @@ impl Session {
         self.status = Status::Idle;
     }
 
+    /// The files the turn ending at `turn_end` (a `TurnEnd` entry) changed, with their counts, for
+    /// the "Done" card (part 10.2): the Edit / MultiEdit / Write / NotebookEdit calls of the turn
+    /// that ran — its subagents' too — in the order the files were first changed.
+    pub fn turn_changes(&self, turn_end: EntryId) -> Vec<TurnFile> {
+        let Some(end) = self.entries.iter().position(|entry| entry.id == turn_end) else {
+            return Vec::new();
+        };
+        let start = self.entries[..end]
+            .iter()
+            .rposition(|entry| matches!(entry.kind, EntryKind::TurnEnd(_)))
+            .map_or(0, |index| index + 1);
+        let mut files = Vec::new();
+        collect_turn_changes(&self.entries[start..end], &mut files);
+        files
+    }
+
+    /// The files Claude's edits after the user message `user` changed (subagents' edits too),
+    /// with their text before the first of those edits: rewinding the code to that message.
+    pub fn restores_after(&self, user: EntryId) -> Vec<FileRestore> {
+        let Some(start) = self.entries.iter().position(|entry| entry.id == user) else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        collect_restores(&self.entries[start + 1..], &mut files);
+        files
+    }
+
+    /// The same for the turn ending at `turn_end` (a `TurnEnd` entry): its "Done" card's
+    /// Rollback.
+    pub fn turn_restores(&self, turn_end: EntryId) -> Vec<FileRestore> {
+        let Some(end) = self.entries.iter().position(|entry| entry.id == turn_end) else {
+            return Vec::new();
+        };
+        let start = self.entries[..end]
+            .iter()
+            .rposition(|entry| matches!(entry.kind, EntryKind::TurnEnd(_)))
+            .map_or(0, |index| index + 1);
+        let mut files = Vec::new();
+        collect_restores(&self.entries[start..end], &mut files);
+        files
+    }
+
+    /// One edit — the Edit / MultiEdit / Write call `tool`, a subagent's too: its file before and
+    /// after it. `None` — not an edit that ran, or its result has no original text.
+    pub fn edit_restore(&self, tool: EntryId) -> Option<FileRestore> {
+        match &self.entry(tool)?.kind {
+            EntryKind::Tool(tool) => restore_of(tool),
+            _ => None,
+        }
+    }
+
+    /// The conversation from the entry `id` on goes: a message edited and sent again continues
+    /// from just before the old one (part 10.2). The process restarts there, so nothing it ran
+    /// still waits: questions, streams, background tasks are dropped with it.
+    pub fn truncate_from(&mut self, id: EntryId) -> Vec<Change> {
+        let Some(start) = self.entries.iter().position(|entry| entry.id == id) else {
+            return Vec::new();
+        };
+        self.entries.truncate(start);
+        let mut changes: Vec<Change> = self
+            .pending
+            .drain(..)
+            .map(|pending| Change::PendingRemoved(pending.id))
+            .collect();
+        self.streaming.clear();
+        self.thinking_bases.clear();
+        self.partial_inputs.clear();
+        self.task_tools.clear();
+        self.modified_edits.clear();
+        self.background.clear();
+        self.quiet = 0;
+        self.process_cost = 0.;
+        self.status = Status::Starting;
+        changes.extend([
+            Change::Entries,
+            Change::Status,
+            Change::Background,
+            Change::Queue,
+        ]);
+        changes
+    }
+
     pub fn pending(&self, id: &str) -> Option<&Pending> {
         self.pending.iter().find(|pending| pending.id == id)
     }
 
     /// The tool call by its id, anywhere (subagents included).
+    /// The task id the CLI gave the Agent (or background Bash) call `tool_use_id`, once it said —
+    /// for `stop_task` (the subagent's view, part 10.2).
+    pub fn task_id(&self, tool_use_id: &str) -> Option<&str> {
+        self.task_tools
+            .iter()
+            .find(|(_, tool)| tool.as_str() == tool_use_id)
+            .map(|(task, _)| task.as_str())
+    }
+
     pub fn tool(&self, tool_use_id: &str) -> Option<&ToolEntry> {
         fn find<'a>(entries: &'a [Entry], id: &str) -> Option<&'a ToolEntry> {
             entries.iter().find_map(|entry| match &entry.kind {
@@ -806,6 +964,7 @@ impl Session {
                 images: input.images.clone(),
                 queued,
                 cancelled: false,
+                at: Some(SystemTime::now()),
             }),
         };
         self.next_id += 1;
@@ -818,6 +977,96 @@ impl Session {
     }
 
     /// The answer of `initialize`: the commands, the models, the account.
+    /// A `!` command starts (part 10.2): its entry, running, where the user's next message would
+    /// go (above the queued ones).
+    pub fn start_shell(&mut self, command: String) -> (EntryId, Vec<Change>) {
+        let id = self.push(EntryKind::Shell(ShellEntry {
+            command,
+            output: String::new(),
+            state: ShellState::Running,
+            exit_code: None,
+            duration: None,
+            started: Some(Instant::now()),
+            delivered: false,
+        }));
+        (id, vec![Change::Entries])
+    }
+
+    /// More output of a running `!` command (decoded by [`crate::shell::Decoder`]): a lone CR
+    /// rewrites the line; a very long output keeps its end.
+    pub fn shell_output(&mut self, id: EntryId, text: &str) -> Vec<Change> {
+        let Some(EntryKind::Shell(shell)) = self.entry_mut(id).map(|entry| &mut entry.kind) else {
+            return Vec::new();
+        };
+        crate::shell::append(&mut shell.output, text);
+        if shell.output.len() > SHELL_SHOWN_LIMIT {
+            let from = shell.output.len() - SHELL_SHOWN_KEEP;
+            let from = shell.output[from..]
+                .find('\n')
+                .map_or(from, |line| from + line + 1);
+            let from = (from..=shell.output.len())
+                .find(|at| shell.output.is_char_boundary(*at))
+                .unwrap_or(shell.output.len());
+            shell.output.replace_range(..from, SHELL_CUT_MARK);
+        }
+        vec![Change::Entries]
+    }
+
+    /// A `!` command ended: on its own ([`ShellState::Done`], any exit code), stopped, or it
+    /// couldn't start ([`ShellState::Failed`], the reason as its output).
+    pub fn shell_ended(
+        &mut self,
+        id: EntryId,
+        state: ShellState,
+        exit_code: Option<i32>,
+        duration: Option<Duration>,
+    ) -> Vec<Change> {
+        let Some(EntryKind::Shell(shell)) = self.entry_mut(id).map(|entry| &mut entry.kind) else {
+            return Vec::new();
+        };
+        shell.state = state;
+        shell.exit_code = exit_code;
+        shell.duration = duration;
+        vec![Change::Entries]
+    }
+
+    /// The records of a `!` command went to the CLI; `quiet` of them as context only — each of
+    /// those gets an empty `result`, which isn't a turn.
+    pub fn shell_delivered(&mut self, id: EntryId, quiet: usize) -> Vec<Change> {
+        self.quiet += quiet;
+        let Some(EntryKind::Shell(shell)) = self.entry_mut(id).map(|entry| &mut entry.kind) else {
+            return Vec::new();
+        };
+        shell.delivered = true;
+        vec![Change::Entries]
+    }
+
+    /// The `!` command of a saved conversation.
+    pub(crate) fn restore_shell(&mut self, command: String) {
+        self.push(EntryKind::Shell(ShellEntry {
+            command,
+            output: String::new(),
+            state: ShellState::Done,
+            exit_code: None,
+            duration: None,
+            started: None,
+            delivered: true,
+        }));
+    }
+
+    /// The output record of a saved `!` command: goes to the command right before it; `false` —
+    /// there's none (the output stands alone).
+    pub(crate) fn restore_shell_output(&mut self, output: String, exit_code: Option<i32>) -> bool {
+        match self.entries.last_mut().map(|entry| &mut entry.kind) {
+            Some(EntryKind::Shell(shell)) if shell.output.is_empty() && shell.exit_code.is_none() => {
+                shell.output = output;
+                shell.exit_code = exit_code;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn initialized(&mut self, response: &Value) -> Vec<Change> {
         self.commands = crate::protocol::commands(&response["commands"]);
         self.models = crate::protocol::models(&response["models"]);
@@ -1000,6 +1249,7 @@ impl Session {
                 self.background.clear();
                 self.partial_inputs.clear();
                 self.process_cost = 0.;
+                self.quiet = 0;
                 // A process that ends while the user works with it (not closed by Flux) says why.
                 if *code != Some(0) || self.entries.is_empty() {
                     self.push(EntryKind::Notice(Notice::Exited {
@@ -1097,10 +1347,18 @@ impl Session {
             System::State(state) => {
                 self.has_state_events = true;
                 match state {
+                    // The end of the work of `!` records only: nothing ran.
+                    SessionState::Idle if self.status == Status::Idle => Vec::new(),
                     SessionState::Idle => {
                         self.finish_streaming();
                         self.status = Status::Idle;
                         vec![Change::Status, Change::Idle]
+                    }
+                    // The CLI takes the records of a `!` command: no turn, Claude doesn't work.
+                    SessionState::Running
+                        if self.quiet > 0 && !matches!(self.status, Status::Working { .. }) =>
+                    {
+                        Vec::new()
                     }
                     SessionState::Running => {
                         if !matches!(self.status, Status::Working { .. }) {
@@ -1514,6 +1772,16 @@ impl Session {
     }
 
     fn apply_result(&mut self, result: &TurnResult) -> Vec<Change> {
+        // The CLI took a record of a `!` command (`shouldQuery: false`): no turn ran.
+        if self.quiet > 0
+            && result.num_turns == 0
+            && !result.is_error
+            && result.local_command.is_none()
+            && result.text.as_deref().unwrap_or("").is_empty()
+        {
+            self.quiet -= 1;
+            return Vec::new();
+        }
         self.finish_streaming();
         // `total_cost_usd` counts from the process's start.
         let cost = (result.total_cost_usd - self.process_cost).max(0.);
@@ -2121,6 +2389,111 @@ fn last_separator(text: &str) -> Option<usize> {
         }
     }
     last
+}
+
+/// Adds the files the edits among `entries` changed (subagents' included) to `files`.
+fn collect_turn_changes(entries: &[Entry], files: &mut Vec<TurnFile>) {
+    for entry in entries {
+        let EntryKind::Tool(tool) = &entry.kind else {
+            continue;
+        };
+        collect_turn_changes(&tool.children, files);
+        if tool.state != ToolState::Done {
+            continue;
+        }
+        let Some(path) = tool
+            .call
+            .edited_path()
+            .filter(|path| !path.as_os_str().is_empty())
+        else {
+            continue;
+        };
+        let structured = tool
+            .result
+            .as_ref()
+            .and_then(|result| result.structured.as_ref());
+        let created = matches!(tool.call, ToolCall::Write { .. })
+            && structured.is_some_and(|result| result["type"] == "create");
+        let (mut added, removed) = structured.map_or((0, 0), patch_line_counts);
+        // A new file's patch is often empty: its lines are all added.
+        if let (true, 0, ToolCall::Write { content, .. }) = (created, added, &tool.call) {
+            added = content.lines().count();
+        }
+        match files.iter_mut().find(|file| &file.path == path) {
+            Some(file) => {
+                file.added += added;
+                file.removed += removed;
+            }
+            None => files.push(TurnFile {
+                path: path.clone(),
+                added,
+                removed,
+                created,
+            }),
+        }
+    }
+}
+
+/// Claude's edits in `entries` (subagents' too), file by file in the order they ran: each file's
+/// text before its first edit and after its last.
+fn collect_restores(entries: &[Entry], files: &mut Vec<FileRestore>) {
+    for entry in entries {
+        let EntryKind::Tool(tool) = &entry.kind else {
+            continue;
+        };
+        collect_restores(&tool.children, files);
+        let Some(restore) = restore_of(tool) else {
+            continue;
+        };
+        match files.iter_mut().find(|file| file.path == restore.path) {
+            Some(file) => file.after = restore.after,
+            None => files.push(restore),
+        }
+    }
+}
+
+/// An edit that ran: its file's text before it (the result's `originalFile`; none for a file a
+/// Write created) and after it.
+fn restore_of(tool: &ToolEntry) -> Option<FileRestore> {
+    if tool.state != ToolState::Done {
+        return None;
+    }
+    let path = tool
+        .call
+        .edited_path()
+        .filter(|path| !path.as_os_str().is_empty())?;
+    let structured = tool.result.as_ref()?.structured.as_ref()?;
+    let created = matches!(tool.call, ToolCall::Write { .. }) && structured["type"] == "create";
+    let before = if created {
+        None
+    } else {
+        Some(structured["originalFile"].as_str()?.to_string())
+    };
+    let after = crate::edits::proposed_text(&tool.name, &tool.input, before.as_deref()).ok();
+    Some(FileRestore {
+        path: path.clone(),
+        before,
+        after,
+    })
+}
+
+/// How many lines a tool result's `structuredPatch` adds and removes.
+fn patch_line_counts(structured: &Value) -> (usize, usize) {
+    let mut counts = (0, 0);
+    for line in structured["structuredPatch"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|hunk| hunk["lines"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+    {
+        if line.starts_with('+') {
+            counts.0 += 1;
+        } else if line.starts_with('-') {
+            counts.1 += 1;
+        }
+    }
+    counts
 }
 
 #[cfg(test)]

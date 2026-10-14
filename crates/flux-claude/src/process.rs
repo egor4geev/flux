@@ -116,6 +116,14 @@ impl Process {
         uuid
     }
 
+    /// A message of the host's own text ([`protocol::context_message`]: a `!` command's records);
+    /// returns its uuid.
+    pub fn send_context(&self, text: &str, query: bool) -> String {
+        let uuid = new_uuid();
+        self.write(&protocol::context_message(&uuid, text, query));
+        uuid
+    }
+
     /// A control request; the answer comes through the returned channel (canceled — the process
     /// is gone).
     pub fn request(&self, request: &HostRequest) -> oneshot::Receiver<Result<Value, String>> {

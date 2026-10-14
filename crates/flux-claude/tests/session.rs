@@ -767,3 +767,91 @@ fn a_recorded_split_thought_replays_as_one() {
     assert!(thoughts[0].1.is_some());
     assert_eq!(turn_ends(&session), 1);
 }
+
+/// A frame written the way the CLI writes it.
+fn wire(json: &str) -> Incoming {
+    protocol::parse_line(json).expect(json)
+}
+
+/// What the CLI (2.1.287) answers a message of context only (`shouldQuery: false`), as recorded.
+fn context_taken(uuid: &str) -> Vec<Incoming> {
+    vec![
+        wire(&format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"queued"}}"#)),
+        wire(&format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"started"}}"#)),
+        wire(r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-haiku-4-5"}"#),
+        wire(r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":16,"num_turns":0,"result":"","total_cost_usd":0}"#),
+        wire(&format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"completed"}}"#)),
+    ]
+}
+
+#[test]
+fn a_shell_command_s_records_are_context_not_a_turn() {
+    use flux_claude::Change;
+    use flux_claude::session::ShellState;
+    let mut session = Session::new(PathBuf::from("/project"));
+    feed(&mut session, wire(r#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#));
+    let (id, _) = session.start_shell("cargo test".into());
+    session.shell_output(id, "running 3 tests\n");
+    session.shell_output(id, "10%\r50%\r100%\n");
+    session.shell_ended(id, ShellState::Done, Some(101), Some(std::time::Duration::from_secs(2)));
+    session.shell_delivered(id, 2);
+    let mut changes = Vec::new();
+    let mut frames = vec![wire(
+        r#"{"type":"system","subtype":"session_state_changed","state":"running"}"#,
+    )];
+    frames.extend(context_taken("in"));
+    frames.extend(context_taken("out"));
+    frames.push(wire(r#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#));
+    for frame in frames {
+        changes.extend(session.apply(&ProcessEvent::Frame(Box::new(frame))));
+    }
+    // Claude didn't work: no line of a turn's end, no "finished", the status never moved.
+    assert_eq!(turn_ends(&session), 0);
+    assert_eq!(session.status, Status::Idle);
+    assert!(
+        !changes
+            .iter()
+            .any(|change| matches!(change, Change::Status | Change::Idle | Change::TurnFinished { .. })),
+        "{changes:?}"
+    );
+    let EntryKind::Shell(shell) = &session.entries[0].kind else {
+        panic!("{:?}", session.entries[0].kind);
+    };
+    assert_eq!(shell.output, "running 3 tests\n100%\n");
+    assert_eq!((shell.state, shell.exit_code, shell.delivered), (ShellState::Done, Some(101), true));
+
+    // The next message is a turn as always.
+    session.push_user(Some("u1".into()), &UserInput {
+        text: "Fix the failing test".into(),
+        ..UserInput::default()
+    });
+    let mut changes = Vec::new();
+    for frame in [
+        r#"{"type":"system","subtype":"session_state_changed","state":"running"}"#,
+        r#"{"type":"system","subtype":"status","status":"requesting"}"#,
+        r#"{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"Done."}]},"parent_tool_use_id":null}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":1,"result":"Done.","total_cost_usd":0.01}"#,
+        r#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#,
+    ] {
+        changes.extend(session.apply(&ProcessEvent::Frame(Box::new(wire(frame)))));
+    }
+    assert_eq!(turn_ends(&session), 1);
+    assert!(changes.contains(&Change::Idle));
+}
+
+#[test]
+fn a_long_shell_output_keeps_its_end() {
+    let mut session = Session::new(PathBuf::from("/project"));
+    let (id, _) = session.start_shell("yes".into());
+    let line = "y".repeat(99) + "\n";
+    for _ in 0..4000 {
+        session.shell_output(id, &line);
+    }
+    session.shell_output(id, "the end\n");
+    let EntryKind::Shell(shell) = &session.entries[0].kind else {
+        unreachable!()
+    };
+    assert!(shell.output.len() < 300 * 1024, "{}", shell.output.len());
+    assert!(shell.output.starts_with("…\n"));
+    assert!(shell.output.ends_with("y\nthe end\n"));
+}

@@ -20,6 +20,7 @@ use gpui::{
 
 use crate::claude::{self, ClaudeStore, ClaudeStoreEvent};
 use crate::claude_chat::{ClaudeChat, ClaudeChatEvent};
+use crate::image_view::{self, ImageSource, ImageView, ImageViewEvent};
 use crate::claude_composer::EditorContext;
 use crate::claude_panel::{ClaudePanel, ClaudePanelEvent, DraggedClaudeChat};
 use crate::commit_panel::{CommitPanel, CommitPanelEvent};
@@ -327,6 +328,8 @@ enum TabItem {
     Log(Entity<GitLogView>),
     /// A Claude chat brought over from the Claude window.
     Claude(Entity<ClaudeChat>),
+    /// A picture: an image file, or Claude's picture from a chat (part 10.2).
+    Image(Entity<ImageView>),
 }
 
 impl TabItem {
@@ -372,6 +375,13 @@ impl TabItem {
         }
     }
 
+    fn image(&self) -> Option<&Entity<ImageView>> {
+        match self {
+            TabItem::Image(view) => Some(view),
+            _ => None,
+        }
+    }
+
     fn entity_id(&self) -> EntityId {
         match self {
             TabItem::Editor(editor) => editor.entity_id(),
@@ -380,6 +390,7 @@ impl TabItem {
             TabItem::Merge(view) => view.entity_id(),
             TabItem::Log(view) => view.entity_id(),
             TabItem::Claude(chat) => chat.entity_id(),
+            TabItem::Image(view) => view.entity_id(),
         }
     }
 
@@ -391,6 +402,7 @@ impl TabItem {
             TabItem::Terminal(group) => group.focus_handle(cx),
             TabItem::Diff(view) => view.focus_handle(cx),
             TabItem::Merge(view) => view.focus_handle(cx),
+            TabItem::Image(view) => view.focus_handle(cx),
         }
     }
 
@@ -400,7 +412,9 @@ impl TabItem {
             TabItem::Editor(editor) => is_modified(editor, cx),
             TabItem::Diff(view) => owned_editor(view, cx).is_some_and(|e| is_modified(&e, cx)),
             TabItem::Merge(view) => view.read(cx).is_modified(cx),
-            TabItem::Terminal(_) | TabItem::Log(_) | TabItem::Claude(_) => false,
+            TabItem::Terminal(_) | TabItem::Log(_) | TabItem::Claude(_) | TabItem::Image(_) => {
+                false
+            }
         }
     }
 }
@@ -833,9 +847,19 @@ impl Workspace {
         let tabs = state.tabs;
         let active = state.active;
         let paths: Vec<PathBuf> = tabs.iter().map(|tab| tab.path.clone()).collect();
-        let read = cx
-            .background_executor()
-            .spawn(async move { paths.into_iter().map(read_document).collect::<Vec<_>>() });
+        // Pictures aren't read as documents: `restore_tabs` opens them in their tabs.
+        let read = cx.background_executor().spawn(async move {
+            paths
+                .into_iter()
+                .map(|path| {
+                    if image_view::is_image(&path) {
+                        let reason = "a picture".into();
+                        return Err(OpenError { path, reason });
+                    }
+                    read_document(path)
+                })
+                .collect::<Vec<_>>()
+        });
         cx.spawn_in(window, async move |this, cx| {
             let results = read.await;
             this.update_in(cx, |this, window, cx| {
@@ -898,6 +922,30 @@ impl Workspace {
     ) {
         let mut activate = None;
         for (index, (saved, result)) in tabs.iter().zip(results).enumerate() {
+            if image_view::is_image(&saved.path) {
+                if !saved.path.is_file() {
+                    continue;
+                }
+                let source = ImageSource::File(canonical(&saved.path));
+                let open = self.tabs.iter().any(|tab| {
+                    tab.item
+                        .image()
+                        .is_some_and(|view| view.read(cx).source() == &source)
+                });
+                if open {
+                    continue;
+                }
+                let view = cx.new(|cx| ImageView::new(source, cx));
+                let subscriptions = self.image_tab_subscriptions(&view, window, cx);
+                self.tabs.push(Tab {
+                    item: TabItem::Image(view),
+                    _subscriptions: subscriptions,
+                });
+                if active == Some(index) || activate.is_none() {
+                    activate = Some(self.tabs.len() - 1);
+                }
+                continue;
+            }
             let Ok(document) = result else {
                 continue;
             };
@@ -940,6 +988,19 @@ impl Workspace {
         let mut tabs = Vec::new();
         let mut active = None;
         for (index, tab) in self.tabs.iter().enumerate() {
+            // A picture's file comes back as a picture.
+            if let Some(path) = tab.item.image().and_then(|view| view.read(cx).path()) {
+                if index == self.active {
+                    active = Some(tabs.len());
+                }
+                tabs.push(SavedTab {
+                    path: path.to_path_buf(),
+                    line: 0,
+                    column: 0,
+                    scroll: 0.,
+                });
+                continue;
+            }
             let Some(editor) = tab.item.editor() else {
                 continue;
             };
@@ -1146,7 +1207,11 @@ impl Workspace {
             let editor = match &tab.item {
                 TabItem::Editor(editor) => Some(editor.clone()),
                 TabItem::Diff(view) => owned_editor(view, cx),
-                TabItem::Terminal(_) | TabItem::Merge(_) | TabItem::Log(_) | TabItem::Claude(_) => None,
+                TabItem::Terminal(_)
+                | TabItem::Merge(_)
+                | TabItem::Log(_)
+                | TabItem::Claude(_)
+                | TabItem::Image(_) => None,
             };
             if let Some(editor) = editor
                 && !editors.contains(&editor)
@@ -1163,6 +1228,7 @@ impl Workspace {
             TabItem::Editor(editor) => editor.read(cx).document.path().map(Path::to_path_buf),
             TabItem::Diff(view) => Some(view.read(cx).path().to_path_buf()),
             TabItem::Merge(view) => Some(view.read(cx).path().to_path_buf()),
+            TabItem::Image(view) => view.read(cx).path().map(Path::to_path_buf),
             TabItem::Terminal(_) | TabItem::Log(_) | TabItem::Claude(_) => None,
         }
     }
@@ -1207,6 +1273,9 @@ impl Workspace {
         self.status_message = None;
         if let TabItem::Terminal(group) = &item {
             group.update(cx, |group, cx| group.clear_bell(cx));
+        }
+        if let TabItem::Image(view) = &item {
+            self.sync_svg_text(view, cx);
         }
         // A terminal tab has no find bar: it searches its output itself.
         let editor = item.editor().cloned();
@@ -1504,6 +1573,218 @@ impl Workspace {
         self.open_and(path, focus, window, cx, |_, _| {});
     }
 
+    // --- Pictures (part 10.2) ---
+
+    /// A file shown as a picture rather than as text: an image file — except an SVG whose text is
+    /// open in a tab (the user is editing it; Preview in its bar shows the picture).
+    fn shows_as_image(&self, path: &Path, cx: &App) -> bool {
+        if !image_view::is_image(path) || path.is_dir() {
+            return false;
+        }
+        !(image_view::is_svg(path) && self.text_tab_of(path, cx).is_some())
+    }
+
+    /// The editor tab of a file, if one is open.
+    fn text_tab_of(&self, path: &Path, cx: &App) -> Option<Entity<Editor>> {
+        let target = canonical(path);
+        self.tabs.iter().find_map(|tab| {
+            let editor = tab.item.editor()?;
+            let path = editor.read(cx).document.path().map(canonical)?;
+            (path == target).then(|| editor.clone())
+        })
+    }
+
+    /// Shows a picture in its tab: the tab it already has comes forward (the same file, the same
+    /// picture of a chat), otherwise a new one opens next to the active tab. Without `focus`, the
+    /// keyboard stays where it was.
+    pub(crate) fn open_image(
+        &mut self,
+        source: ImageSource,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source = match source {
+            ImageSource::File(path) => ImageSource::File(canonical(&path)),
+            source => source,
+        };
+        let keep_focus = window.focused(cx).filter(|_| !focus);
+        let found = self.tabs.iter().position(|tab| {
+            tab.item
+                .image()
+                .is_some_and(|view| view.read(cx).source() == &source)
+        });
+        match found {
+            Some(index) => self.activate(index, window, cx),
+            None => {
+                let view = cx.new(|cx| ImageView::new(source, cx));
+                let subscriptions = self.image_tab_subscriptions(&view, window, cx);
+                self.insert_tab(TabItem::Image(view), subscriptions, None, window, cx);
+            }
+        }
+        restore_focus(keep_focus, window);
+    }
+
+    fn image_tab_subscriptions(
+        &mut self,
+        view: &Entity<ImageView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
+        vec![
+            cx.subscribe_in(view, window, |this, _, event: &ImageViewEvent, window, cx| {
+                match event {
+                    ImageViewEvent::EditAsText(path) => this.open_text(path.clone(), window, cx),
+                }
+            }),
+            cx.observe(view, |_, _, cx| cx.notify()),
+        ]
+    }
+
+    /// An SVG file as text: its editor tab, opened or brought forward.
+    fn open_text(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.activate_path(&path, window, cx) {
+            return;
+        }
+        self.loading += 1;
+        let read = cx
+            .background_executor()
+            .spawn(async move { read_document(path) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = read.await;
+            this.update_in(cx, |this, window, cx| {
+                this.loading -= 1;
+                this.finish_open(vec![result], Source::Dialog, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// An SVG's picture shows the text being edited in its tab, unsaved changes included.
+    fn sync_svg_text(&self, view: &Entity<ImageView>, cx: &mut Context<Self>) {
+        let Some(path) = view.read(cx).path().filter(|path| image_view::is_svg(path)) else {
+            return;
+        };
+        let text = self
+            .text_tab_of(path, cx)
+            .filter(|editor| is_modified(editor, cx))
+            .map(|editor| editor.read(cx).document.text().to_string());
+        view.update(cx, |view, cx| view.set_text(text, cx));
+    }
+
+    /// The bar over an SVG's text: Text | Preview, as JetBrains IDEs have it.
+    fn svg_bar(&self, editor: &Entity<Editor>, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let path = editor.read(cx).document.path()?.to_path_buf();
+        if !image_view::is_svg(&path) {
+            return None;
+        }
+        let ui = Theme::ui(cx);
+        Some(
+            div()
+                .flex_none()
+                .h(px(34.))
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_end()
+                .border_b_1()
+                .border_color(ui.divider)
+                .child(image_view::svg_switch(
+                    "svg-editor",
+                    true,
+                    ui,
+                    |_, _, _| {},
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_image(ImageSource::File(path.clone()), true, window, cx)
+                    }),
+                )),
+        )
+    }
+
+    /// The active tab is a Claude chat: what Claude opens shouldn't cover it (part 10.2).
+    pub(crate) fn chat_in_front(&self) -> bool {
+        matches!(self.active_item(), Some(TabItem::Claude(_)))
+    }
+
+    /// Opens a file in a tab right behind the active one without bringing it forward (Claude's
+    /// `open_file` while its chat is the active tab — the chat stays in sight): its editor gets
+    /// `then` (a selection); a tab the file already has stays where it is; a picture opens in its
+    /// tab the same way.
+    pub(crate) fn open_behind(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&Entity<Editor>, &mut App) + 'static,
+    ) {
+        if self.shows_as_image(&path, cx) {
+            let source = ImageSource::File(canonical(&path));
+            let open = self.tabs.iter().any(|tab| {
+                tab.item
+                    .image()
+                    .is_some_and(|view| view.read(cx).source() == &source)
+            });
+            if !open {
+                let view = cx.new(|cx| ImageView::new(source, cx));
+                let subscriptions = self.image_tab_subscriptions(&view, window, cx);
+                self.insert_behind(TabItem::Image(view), subscriptions, cx);
+            }
+            return;
+        }
+        if let Some(editor) = self.text_tab_of(&path, cx) {
+            return then(&editor, cx);
+        }
+        self.loading += 1;
+        let read = cx
+            .background_executor()
+            .spawn(async move { read_document(path) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = read.await;
+            this.update_in(cx, |this, window, cx| {
+                this.loading -= 1;
+                match result {
+                    Ok(document) => {
+                        if let Some(path) = document.path()
+                            && let Some(editor) = this.text_tab_of(path, cx)
+                        {
+                            return then(&editor, cx);
+                        }
+                        let editor = this.new_editor(document, window, cx);
+                        then(&editor, cx);
+                        let subscriptions = this.editor_tab_subscriptions(&editor, cx);
+                        this.insert_behind(TabItem::Editor(editor), subscriptions, cx);
+                    }
+                    Err(error) => this.report_dialog(vec![error], cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A tab right after the active one; the active one stays active.
+    fn insert_behind(
+        &mut self,
+        item: TabItem,
+        subscriptions: Vec<Subscription>,
+        cx: &mut Context<Self>,
+    ) {
+        let index = if self.tabs.is_empty() {
+            0
+        } else {
+            (self.active + 1).min(self.tabs.len())
+        };
+        self.tabs.insert(
+            index,
+            Tab {
+                item,
+                _subscriptions: subscriptions,
+            },
+        );
+        cx.notify();
+    }
+
     /// Opens or activates a file, then calls `then` with it in the active tab. Without `focus`,
     /// focus returns to where it was before opening.
     pub(crate) fn open_and(
@@ -1514,6 +1795,9 @@ impl Workspace {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
     ) {
+        if self.shows_as_image(&path, cx) {
+            return self.open_image(ImageSource::File(path), focus, window, cx);
+        }
         let keep_focus = window.focused(cx).filter(|_| !focus);
         if self.activate_path(&path, window, cx) {
             then(self, cx);
@@ -1559,6 +1843,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (images, paths): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|path| self.shows_as_image(path, cx));
+        for path in images {
+            self.open_image(ImageSource::File(path), true, window, cx);
+        }
         let paths: Vec<PathBuf> = paths
             .into_iter()
             .filter(|path| !self.activate_path(path, window, cx))
@@ -1681,7 +1970,8 @@ impl Workspace {
                 | TabItem::Diff(_)
                 | TabItem::Merge(_)
                 | TabItem::Log(_)
-                | TabItem::Claude(_),
+                | TabItem::Claude(_)
+                | TabItem::Image(_),
             ) => {
                 self.status_message = Some(message);
                 self.status_message_task = Some(cx.spawn(async move |this, cx| {
@@ -1727,6 +2017,12 @@ impl Workspace {
                 }
             }
             TabItem::Claude(chat) => self.close_claude_tab(chat, window, cx),
+            TabItem::Image(view) => {
+                if let Some(index) = self.tabs.iter().position(|tab| tab.item.image() == Some(&view))
+                {
+                    self.remove_tab_at(index, window, cx);
+                }
+            }
         }
     }
 
@@ -1748,7 +2044,15 @@ impl Workspace {
                 .iter()
                 .position(|tab| tab.item.diff() == Some(&view))
             {
+                // A tab without the keyboard leaves it where it is: a proposal answered on its
+                // card closes by itself, and the chat's field has just got the keyboard back.
+                let elsewhere = (!view.focus_handle(cx).contains_focused(window, cx))
+                    .then(|| window.focused(cx))
+                    .flatten();
                 this.remove_tab_at(index, window, cx);
+                if let Some(focused) = elsewhere {
+                    window.focus(&focused);
+                }
             }
         };
         let Some(editor) = owned else {
@@ -2705,6 +3009,7 @@ impl Workspace {
     /// an open document without unsaved changes takes the new content, as one edit that ⌘Z undoes;
     /// one with unsaved changes keeps them, and the status bar says the file changed.
     pub(crate) fn sync_documents(&mut self, paths: Option<Vec<PathBuf>>, cx: &mut Context<Self>) {
+        self.sync_images(paths.as_deref(), cx);
         let editors: Vec<(Entity<Editor>, PathBuf)> = self
             .editors(cx)
             .into_iter()
@@ -2769,9 +3074,37 @@ impl Workspace {
         .detach();
     }
 
+    /// Pictures whose files changed on disk are read again (`None` — any may have).
+    fn sync_images(&mut self, paths: Option<&[PathBuf]>, cx: &mut Context<Self>) {
+        let views: Vec<Entity<ImageView>> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.item.image().cloned())
+            .collect();
+        for view in views {
+            let affected = view.read(cx).path().is_some_and(|path| {
+                paths.is_none_or(|paths| paths.iter().any(|changed| canonical(changed) == path))
+            });
+            if affected {
+                view.update(cx, |view, cx| view.reload_if_changed(cx));
+            }
+        }
+    }
+
     /// A file or directory was moved (renamed, or moved within the tree): the open documents inside
     /// it are switched to the new paths.
     pub(crate) fn documents_moved(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+        let views: Vec<Entity<ImageView>> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.item.image().cloned())
+            .collect();
+        for view in views {
+            let moved = view.read(cx).path().and_then(|path| remap(path, from, to));
+            if let Some(path) = moved {
+                view.update(cx, |view, cx| view.set_path(path, cx));
+            }
+        }
         for editor in self.editors(cx) {
             let moved = editor
                 .read(cx)
@@ -2796,6 +3129,22 @@ impl Workspace {
         // came from the tree, so focus must stay there (unless it was in the closed tab).
         let mut keep_focus = window.focused(cx);
         let mut kept = false;
+        let pictures: Vec<Entity<ImageView>> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.item.image().cloned())
+            .filter(|view| {
+                view.read(cx)
+                    .path()
+                    .is_some_and(|path| paths.iter().any(|removed| path.starts_with(removed)))
+            })
+            .collect();
+        for view in pictures {
+            if keep_focus.as_ref() == Some(&view.focus_handle(cx)) {
+                keep_focus = None;
+            }
+            self.close_item(TabItem::Image(view), window, cx);
+        }
         for editor in self.editors(cx) {
             let (removed, modified) = {
                 let document = &editor.read(cx).document;
@@ -3562,6 +3911,7 @@ impl Workspace {
             Some(TabItem::Claude(chat)) => {
                 format!("{} — {project}", chat.read(cx).session().read(cx).title())
             }
+            Some(TabItem::Image(view)) => format!("{} — {project}", view.read(cx).title()),
             None => project.clone(),
         };
         if title != self.title {
@@ -3808,6 +4158,17 @@ impl Workspace {
                     .child(div().flex_1().min_w_0().truncate().child(left))
                     .children(crate::git::status_item(self.git.read(cx), ui));
             }
+            // A picture: its file's path (a chat's picture — its name).
+            Some(TabItem::Image(view)) => {
+                let left: SharedString = match (&self.status_message, view.read(cx).path()) {
+                    (Some(message), _) => message.clone(),
+                    (None, Some(path)) => self.display_path(path).into(),
+                    (None, None) => view.read(cx).title(),
+                };
+                return bar
+                    .child(div().flex_1().min_w_0().truncate().child(left))
+                    .children(crate::git::status_item(self.git.read(cx), ui));
+            }
             None => {
                 return bar.child(div().text_color(ui.dim).child(match &self.root {
                     Some(root) => tilde(root),
@@ -3951,6 +4312,7 @@ impl Workspace {
                 TabItem::Merge(view) => self.render_merge_tab(index, view, cx).into_any_element(),
                 TabItem::Log(view) => self.render_log_tab(index, view, cx).into_any_element(),
                 TabItem::Claude(chat) => self.render_claude_tab(index, chat, cx).into_any_element(),
+                TabItem::Image(view) => self.render_image_tab(index, view, cx).into_any_element(),
             })
             .collect();
         // While a tab is dragged over the strip: a marker where it would land.
@@ -4213,6 +4575,49 @@ impl Workspace {
             )
             .child(label(&title))
             .child(close_button(TabItem::Log(view.clone()), active, None, cx))
+    }
+
+    /// A picture's tab: the file's icon and name (a chat's picture — its name).
+    fn render_image_tab(
+        &self,
+        index: usize,
+        view: &Entity<ImageView>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        let active = index == self.active;
+        let title = view.read(cx).title();
+        // An SVG open as text too: the picture's tab says it is the preview.
+        let preview = view
+            .read(cx)
+            .path()
+            .is_some_and(|path| image_view::is_svg(path) && self.text_tab_of(path, cx).is_some());
+        let (activate, close) = (view.clone(), view.clone());
+        tab_shell(view.entity_id(), active, ui)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    if let Some(index) = this
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.item.image() == Some(&activate))
+                    {
+                        this.activate(index, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    this.close_item(TabItem::Image(close.clone()), window, cx)
+                }),
+            )
+            .child(file_icon(&title, &ui).render().size(px(14.)))
+            .child(label(&title))
+            .when(preview, |tab| {
+                tab.child(div().text_color(ui.dim).child(tr("Preview")))
+            })
+            .child(close_button(TabItem::Image(view.clone()), active, None, cx))
     }
 
     /// The merge tool's tab: the file name, "merge", a dot while the result isn't applied.
@@ -4566,6 +4971,33 @@ impl Render for Workspace {
                 this.project_search
                     .update(cx, |search, cx| search.toggle(seed, window, cx))
             }));
+        // An SVG's text in front: its picture is a command away (Text | Preview's Preview).
+        let svg_text = self
+            .active_editor()
+            .and_then(|editor| editor.read(cx).document.path().map(Path::to_path_buf))
+            .filter(|path| image_view::is_svg(path));
+        let root = root.when_some(svg_text, |root, path| {
+            root.on_action(cx.listener(move |this, _: &image_view::ShowPreview, window, cx| {
+                this.open_image(ImageSource::File(path.clone()), true, window, cx)
+            }))
+        });
+        #[cfg(feature = "scenario")]
+        let root = root.on_action(cx.listener(
+            |this, _: &image_view::scenario::PreviewScenarioImage, window, cx| {
+                let Some(path) = std::env::var_os("FLUX_SCENARIO_PREVIEW_IMAGE") else {
+                    return;
+                };
+                let Ok(data) = fs::read(&path) else {
+                    return;
+                };
+                let source = ImageSource::Bytes {
+                    name: "image-1.png".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: data.into(),
+                };
+                this.open_image(source, true, window, cx)
+            },
+        ));
         #[cfg(feature = "scenario")]
         let root = root.on_action(cx.listener(
             |this, _: &notifications_panel::demo::FillDemo, _, cx| {
@@ -4629,14 +5061,17 @@ impl Render for Workspace {
                     TabItem::Merge(view) => view.clone().into_any_element(),
                     TabItem::Log(view) => view.clone().into_any_element(),
                     TabItem::Claude(chat) => chat.clone().into_any_element(),
+                    TabItem::Image(view) => view.clone().into_any_element(),
                 };
                 // A file Flux has no language for, while the catalog has one: the banner of a
                 // plugin to install, as JetBrains IDEs suggest one (stage 8.3).
                 let suggestion = item.editor().cloned().and_then(|editor| {
                     crate::plugin_suggestions::banner(self, &editor, window, cx)
                 });
+                let svg_bar = item.editor().and_then(|editor| self.svg_bar(editor, cx));
                 main.child(self.render_tab_bar(cx))
                     .children(suggestion)
+                    .children(svg_bar)
                     .when(
                         item.editor().is_some() && self.find_bar.read(cx).is_open(),
                         |main| main.child(self.find_bar.clone()),
@@ -6010,6 +6445,20 @@ impl Workspace {
             ClaudeChatEvent::OpenLocation(location) => {
                 self.open_location(location.clone(), true, window, cx)
             }
+            // The image tab comes with part 10.2.
+            ClaudeChatEvent::PreviewImage(source) => {
+                self.open_image(source.clone(), true, window, cx)
+            }
+            ClaudeChatEvent::OpenCompare { path, left, right } => {
+                let repo = self.git.read(cx).repo_index(path).unwrap_or(0);
+                self.open_compare(path.clone(), repo, left.clone(), right.clone(), window, cx)
+            }
+            ClaudeChatEvent::Notify(notification) => self.notify(
+                notification
+                    .clone()
+                    .group(crate::notification_center::NotificationGroup::Claude),
+                cx,
+            ),
         }
     }
 
@@ -6484,18 +6933,52 @@ impl Workspace {
     ) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let active = index == self.active;
-        let session = chat.read(cx).session().read(cx);
+        let session_entity = chat.read(cx).session().clone();
+        let session = session_entity.read(cx);
         let title = session.title();
-        let status = session.model().status.clone();
-        let dot = claude::status_color(&status, &ui);
-        let tooltip: SharedString = format!("{title} — {}", claude::status_label(&status)).into();
+        let glance = crate::claude_status::glance(session.model());
+        let finished = self.claude.read(cx).finished_at(session_entity.entity_id());
+        let status_tooltip = crate::claude_status::tooltip(session_entity.clone(), finished, true);
+        let tab_tooltip = crate::claude_status::tooltip(session_entity.clone(), finished, false);
+        let close = close_button(TabItem::Claude(chat.clone()), active, None, cx);
         let dragged = DraggedClaudeChat {
             chat: chat.clone(),
             title: title.clone(),
         };
-        let (activate, close) = (chat.clone(), chat.clone());
+        let (activate, middle_close) = (chat.clone(), chat.clone());
+        // The session's status (part 10.2): what works or waits; a click shows it in the chat.
+        let status = {
+            let chat = chat.clone();
+            let target = glance.target;
+            div()
+                .id(("tab-claude-status", chat.entity_id()))
+                .flex_none()
+                .child(crate::claude_status::glyph(
+                    &glance,
+                    false,
+                    ("tab-claude-dot", chat.entity_id()),
+                    ui,
+                ))
+                .tooltip(status_tooltip)
+                .when_some(target, |status, target| {
+                    status.cursor_pointer().on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            let index = this
+                                .tabs
+                                .iter()
+                                .position(|tab| tab.item.claude() == Some(&chat));
+                            if let Some(index) = index {
+                                this.activate(index, window, cx);
+                            }
+                            chat.update(cx, |chat, cx| chat.reveal_activity(target, window, cx));
+                        }),
+                    )
+                })
+        };
         tab_shell(chat.entity_id(), active, ui)
-            .tooltip(ui::tooltip(tooltip, None))
+            .tooltip(tab_tooltip)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -6508,16 +6991,23 @@ impl Workspace {
                     }
                 }),
             )
+            // A double click renames the session (as "Rename…" in its menu).
+            .on_click(|event: &ClickEvent, window, cx| {
+                if event.click_count() == 2 {
+                    window.dispatch_action(Box::new(claude::RenameSession), cx)
+                }
+            })
             .on_mouse_up(
                 MouseButton::Middle,
                 cx.listener(move |this, _: &MouseUpEvent, window, cx| {
-                    this.close_claude_chat(close.clone(), window, cx)
+                    this.close_claude_chat(middle_close.clone(), window, cx)
                 }),
             )
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .child(icon(IconName::Claude, ui.accent_text).size(px(14.)))
             .child(label(&title))
-            .child(close_button(TabItem::Claude(chat.clone()), active, dot, cx))
+            .child(status)
+            .child(close)
     }
 
     /// The status bar's Claude item: what the sessions do (working, waiting for you) and the

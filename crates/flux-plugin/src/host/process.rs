@@ -498,8 +498,9 @@ fn is_executable(file: &Path) -> bool {
 
 /// The environment of the user's login shell, as a terminal of theirs gets it: read once per Flux
 /// process — an interactive login shell first (a `.zshrc` sets `PATH` too), a non-interactive
-/// one if that fails; Flux's own environment with a usual `PATH` if both do.
-pub(crate) fn login_env() -> &'static [(String, String)] {
+/// one if that fails; Flux's own environment with a usual `PATH` if both do. Also what Claude's
+/// `!` commands run with (part 10.2).
+pub fn login_env() -> &'static [(String, String)] {
     static ENV: OnceLock<Vec<(String, String)>> = OnceLock::new();
     ENV.get_or_init(|| {
         let shell = std::env::var("SHELL")

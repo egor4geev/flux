@@ -223,6 +223,8 @@ ui_colors! {
     cyan,
     /// Directory icon.
     folder,
+    /// Claude's own orange: its avatar in the chat (part 10.2).
+    claude,
 }
 
 impl UiColors {

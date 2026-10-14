@@ -96,6 +96,23 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "≈ ${0} at API prices (with a subscription, it counts towards its limits)",
         "≈ ${0} по ценам API (с подпиской идёт в её лимиты)",
     ),
+    // Part 10.2: the chat's look — the user's messages, `!` commands, cards, the "Done" card
+    ("Preview", "Предпросмотр"),
+    ("Edit and Resend", "Изменить и отправить заново"),
+    (
+        "Rewind Code to Before This Message",
+        "Откатить код до этого сообщения",
+    ),
+    ("exit {0}", "код {0}"),
+    ("Claude got the output", "Вывод передан Claude"),
+    ("Claude will get the output", "Вывод получит Claude"),
+    ("Watch", "Смотреть"),
+    ("Done in {0}", "Готово за {0}"),
+    ("Review", "Обзор"),
+    ("Changed Files", "Изменённые файлы"),
+    ("New Files", "Новые файлы"),
+    ("updated the tasks", "обновил задачи"),
+    ("code", "код"),
     // Durations
     ("{0} ms", "{0} мс"),
     ("{0} s", "{0} с"),
@@ -104,6 +121,28 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
 ];
 
 pub(super) const PLURALS: &[(&str, [&str; 3])] = &[
+    // Part 10.2: a group of Claude's steps, in short
+    (
+        "read {n} file",
+        ["прочитал {n} файл", "прочитал {n} файла", "прочитал {n} файлов"],
+    ),
+    (
+        "searched {n} time",
+        ["искал {n} раз", "искал {n} раза", "искал {n} раз"],
+    ),
+    (
+        "searched the web {n} time",
+        ["искал в сети {n} раз", "искал в сети {n} раза", "искал в сети {n} раз"],
+    ),
+    (
+        "fetched {n} page",
+        ["открыл {n} страницу", "открыл {n} страницы", "открыл {n} страниц"],
+    ),
+    (
+        "used {n} tool",
+        ["вызвал {n} инструмент", "вызвал {n} инструмента", "вызвал {n} инструментов"],
+    ),
+    ("{n} error", ["{n} ошибка", "{n} ошибки", "{n} ошибок"]),
     (
         "Show {n} more line",
         ["Ещё {n} строка", "Ещё {n} строки", "Ещё {n} строк"],

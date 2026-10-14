@@ -7,12 +7,16 @@ mod branches;
 mod catalog;
 mod claude;
 mod claude_actions;
+mod claude_agents;
 mod claude_cards;
 mod claude_changes;
+mod claude_commands;
 mod claude_composer;
 mod claude_history;
 mod claude_session;
+mod claude_tabs;
 mod claude_transcript;
+mod claude_turns;
 mod code_actions;
 mod commands;
 mod commit;
@@ -25,6 +29,7 @@ mod git;
 mod git_gutter;
 mod git_log;
 mod icon_themes;
+mod image_view;
 mod languages;
 mod log_actions;
 mod lsp;
@@ -113,6 +118,11 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     catalog::STRINGS,
     projects::STRINGS,
     windows::STRINGS,
+    claude_commands::STRINGS,
+    claude_tabs::STRINGS,
+    claude_turns::STRINGS,
+    claude_agents::STRINGS,
+    image_view::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -151,4 +161,9 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     catalog::PLURALS,
     projects::PLURALS,
     windows::PLURALS,
+    claude_commands::PLURALS,
+    claude_tabs::PLURALS,
+    claude_turns::PLURALS,
+    claude_agents::PLURALS,
+    image_view::PLURALS,
 ];

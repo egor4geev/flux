@@ -151,7 +151,21 @@ There is **no CLI version** in this response. It does contain the account email 
 - **`priority:"now"`** aborts the running turn and runs right away. The aborted turn's `assistant` has `aborted:true`, its `result` is `subtype:"success"` with `terminal_reason:"aborted_streaming"`, and its lifecycle reaches `cancelled`.
 - **`cancel_async_message {message_uuid}`** removes a still-queued message: `{cancelled:true}` plus lifecycle `cancelled`. An unknown or already-started uuid gives `{cancelled:false}`.
 
-**Other fields.** `shouldQuery:false` appends the message without starting a turn [T]. The types recommend `origin:{kind:"human"}` for keyboard input; leaving it out caused no problems. `--replay-user-messages` echoes each accepted message back as `user` with `isReplay:true`; slash commands echo as `<command-name>/usage</command-name>…` [V l_slash].
+**Other fields.** `shouldQuery:false` appends the message without starting a turn [V 2.1.287, §3.1]. The types recommend `origin:{kind:"human"}` for keyboard input; leaving it out caused no problems. `--replay-user-messages` echoes each accepted message back as `user` with `isReplay:true`; slash commands echo as `<command-name>/usage</command-name>…` [V l_slash].
+
+### 3.1 `!` commands (bash mode) — run by the host [V 2.1.287, part 10.2]
+
+The terminal CLI's `!` mode runs a command and records it in the conversation. In host mode a message starting with `!` is **not run**: the model gets the text. So the host runs the command itself (Flux: `src/shell.rs` — the user's shell, the login shell's environment, the project's root) and sends what the CLI records:
+
+1. `{"type":"user","message":{"role":"user","content":"<bash-input>CMD</bash-input>"},"shouldQuery":false,…}`
+2. `{"type":"user","message":{"role":"user","content":"<bash-stdout>OUT</bash-stdout><bash-stderr>ERR</bash-stderr><bash-exit-code>N</bash-exit-code>"},"shouldQuery":false,…}`
+
+- **Shape.** As the CLI's own headless runner builds it (`runHeadlessBashCommand` in the 2.1.287 bundle): `&`, `<`, `>` inside the tags are written as `&amp;`, `&lt;`, `&gt;`, and `<bash-exit-code>` follows the streams. The terminal's interactive `!` writes the same two messages without the exit code. A large output the CLI saved to a file reads `<bash-stdout><persisted-output>…</persisted-output></bash-stdout>`. Flux cuts each stream to 30 000 characters, keeping the beginning and the end around `… [N characters truncated] …` (the CLI's runner keeps the beginning and adds `… [truncated]`).
+- **What a context message produces.** `session_state_changed running` (if the session was idle), lifecycle `queued` → `started`, a `system/init`, an empty `result` (`subtype:"success"`, `num_turns:0`, `result:""`, a few ms), lifecycle `completed`, and finally `session_state_changed idle`. No model call. The next prompt sees the output: Haiku, asked what the last command printed, answered with it.
+- **Claude answers at once.** Send the second record without `shouldQuery:false`: it starts a normal turn.
+- **The transcript** keeps both as ordinary `user` lines with string content and `promptSource:"sdk"`; `transcript::load` turns each pair into one `!` entry (the terminal's `!` too).
+- **The host model** (`Session::shell_delivered`) counts the context messages in flight and swallows their empty results; a `running` state while only they are in flight and an `idle` while already idle are ignored — otherwise each `!` command would look like a turn that finished (a "Claude finished" notification).
+- Flux sends the records when the command ends and Claude is idle; a message the user sends first takes the waiting records along before it.
 
 ---------------------------------------------------------------------------------------------------
 
@@ -575,7 +589,9 @@ Without `--forward-subagent-text` (or `initialize.forwardSubagentText`), only th
 
 - **Session ids.** Each process gets a new `session_id`, which appears in `init` and on every frame. `--session-id <uuid>` sets it explicitly [V n].
 - **`--resume <id>`** keeps the same `session_id`, and the model remembers the history [V n_resume_2]. **Nothing is replayed on stdout**, and not even `init` arrives before the first user message, so the host has to render history from its own store or from the transcript.
-- **Other resume flags** [T]: `--continue` (the most recent session in the cwd), `--fork-session` (a new id with a copy of the history), `--resume-session-at <message uuid>` (resume from that point).
+- **Other resume flags** [T]: `--continue` (the most recent session in the cwd), `--fork-session` (a new id with a copy of the history).
+- **`--resume <id> --resume-session-at <uuid>`** [V 2.1.287, part 10.2] continues the same session from that message: the next message gets `parentUuid` = that uuid, the session id stays (no `--fork-session` needed), and the model remembers only the branch up to it (checked on haiku: a fact from the dropped turn was forgotten). The uuid a host sends with a user message becomes the transcript line's `uuid`; an `assistant` frame's `uuid` works as a point too. Flux uses it for "Edit and Resend" (`LaunchOptions::resume_at`, the parent from `transcript::parent_of`). The bundle also has `--resume-drops-turn` [T].
+- **`rewind_files {user_message_id, dry_run}`** [V bundle, not used]: restores files to a message's checkpoint, but in SDK mode only with `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING` set from the session's start — so Flux rewinds on its own, from each edit's `originalFile` (`Session::restores_after`, `turn_restores`, `edit_restore`).
 - **Transcript path.** `~/.claude/projects/<slug>/<session_id>.jsonl`, where `<slug>` is the absolute cwd with every non-alphanumeric character replaced by `-`. Example: `/Users/me/dev/my_app` → `-Users-me-dev-my-app`.
 - **Subagent transcripts** live in `<slug>/<session_id>/subagents/agent-<id>.jsonl` plus `.meta.json` [V meta].
 
@@ -699,7 +715,7 @@ To rebuild the chat, follow `parentUuid` back from the leaf, skipping `isSidecha
 **From types or JS only:**
 - **Never seen on the wire:** prompt_suggestion (enabled, never received), api_retry, notification, informational, local_command_output, hook_* events, model_refusal_*, auth_status, conversation_reset, tool_progress, tool_use_summary, keep_alive, redacted_thinking; the CLI requests elicitation and request_user_dialog.
 - **Untested host requests:** apply_flag_settings, update_settings, get_settings, mcp_set_servers, mcp_call, mcp_read_resource, reload_plugins, reload_output_styles, get_hooks_listing, seed_read_state, register_repo_root, set_color, and a working get_task_output.
-- **Untested behaviours:** deny with `interrupt:true`, `shouldQuery:false`, `client_composed`, folding of queued messages, `--continue`, `--fork-session`, `--resume-session-at`, checkpointed rewind, `perTaskStopAffordance` semantics, `auto` mode.
+- **Untested behaviours:** deny with `interrupt:true`, `client_composed`, folding of queued messages, `--continue`, `--fork-session`, checkpointed rewind, `perTaskStopAffordance` semantics, `auto` mode. (`shouldQuery:false` — verified in §3.1; `--resume-session-at` — §11.)
 - **Tool contracts:** NotebookEdit, Monitor, TaskStop, EnterPlanMode, Skill, SendMessage, and the AskUserQuestion multiSelect separator.
 
 **Differs from the types:** see the skew list in §14.

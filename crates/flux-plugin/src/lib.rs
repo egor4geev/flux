@@ -31,5 +31,8 @@ pub mod runtime;
 #[cfg(test)]
 pub(crate) mod tests;
 
+/// The user's login shell environment (a terminal's `PATH`), read once per process.
+pub use host::login_env;
+
 /// The version of the plugin API (`flux:plugin@0.2.0`) a manifest names in `api`.
 pub const API_VERSION: &str = "0.2";

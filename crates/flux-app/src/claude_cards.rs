@@ -165,7 +165,6 @@ pub fn render(
             .flex()
             .flex_col()
             .gap(px(ui::GAP))
-            .px(px(ui::GAP))
             .pb(px(ui::GAP))
             .children(cards)
             .children(tasks)
@@ -966,7 +965,17 @@ fn render_header(
         .items_center()
         .gap(px(8.))
         .min_w_0()
-        .child(icon(icon_name, ui.accent_text).size(px(15.)))
+        .child(
+            div()
+                .flex_none()
+                .size(px(22.))
+                .rounded(px(6.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(UiColors::tint(ui.accent, 0.18))
+                .child(icon(icon_name, ui.accent_text).size(px(13.))),
+        )
         .child(
             div()
                 .min_w_0()

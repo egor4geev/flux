@@ -1611,6 +1611,22 @@ impl SettingsView {
                 current.restore_sessions,
                 |claude, on| claude.restore_sessions = on,
                 cx,
+            ))
+            .child(switch_row(
+                "claude-respond-to-commands",
+                tr("Claude answers the output of ! commands"),
+                tr("A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message."),
+                current.respond_to_commands,
+                |claude, on| claude.respond_to_commands = on,
+                cx,
+            ))
+            .child(switch_row(
+                "claude-system-notifications",
+                tr("Notify when a session finishes or waits"),
+                tr("A macOS notification while Flux isn't the active app."),
+                current.system_notifications,
+                |claude, on| claude.system_notifications = on,
+                cx,
             ));
         let tools_card = card(tr("Flux Tools for Claude"))
             .child(switch_row(

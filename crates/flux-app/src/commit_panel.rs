@@ -3194,7 +3194,7 @@ struct ClaudeTarget {
 
 /// Puts the files back as they were before Claude (on a background thread): a text is written
 /// atomically, a file Claude created goes to the Trash. The errors, as lines.
-fn restore_originals(jobs: &[(PathBuf, Option<Arc<str>>)]) -> Vec<String> {
+pub(crate) fn restore_originals(jobs: &[(PathBuf, Option<Arc<str>>)]) -> Vec<String> {
     let mut errors = Vec::new();
     let mut trash = Vec::new();
     for (path, original) in jobs {

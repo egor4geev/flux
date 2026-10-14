@@ -77,7 +77,9 @@ right there. Closing a terminal that still runs something asks first.
 
 A file tree that hides what Git ignores, follows the file you are editing and updates as files change
 on disk. Create, rename, move and delete files right in it — open tabs keep up with renamed and moved
-files, and open files pick up changes made outside Flux.
+files, and open files pick up changes made outside Flux. Pictures open in a tab of their own: fitted to
+the window or at 1:1, zoomed with <kbd>⌘</kbd><kbd>=</kbd> / <kbd>⌘</kbd><kbd>−</kbd>, with their size in
+pixels — and an SVG switches between the picture and its text.
 
 ### A window for every project
 
@@ -177,16 +179,21 @@ Flux has no language for, it tells you which plugin knows it.
 ### Claude Code, built in
 
 Talk to Claude in a window on the right (<kbd>⌘</kbd><kbd>Esc</kbd>), or move the chat to a tab next
-to your files. The answer streams in, with every file Claude reads and every command it runs shown as
-it happens. Claude asks before it changes anything: each edit opens as a diff you can trim or edit
-before you accept it — and Claude learns what you changed.
+to your files. It reads like a chat: your messages on the right, Claude's answers on the left, the quick
+steps it takes folded into a single line, and its commands, edits and subagents in cards of their own.
+Every turn that changed files ends with a summary of them — review the changes or roll them back from
+there. Claude asks before it changes anything: each edit opens as a diff you can trim or edit before you
+accept it — and Claude learns what you changed.
 
-<img src="docs/images/claude.png" alt="Claude Code in the window on the right: the conversation, an edit waiting for an answer, and the proposed change opened as a diff" width="100%">
+<img src="docs/images/claude.png" alt="A Claude chat in an editor tab: the message on the right, Claude's edit with its diff, the summary of the changed files, and a shell command run with !" width="100%">
 
 Answer Claude's questions and approve its plans with a click or a key. Mention files with `@` or send
 your selection (<kbd>⌥</kbd><kbd>⌘</kbd><kbd>K</kbd>), paste screenshots, pick the model, the effort
-and the mode, and keep an eye on your subscription's limits in the status bar. Flux runs your own
-`claude` command with your Claude subscription — no API key.
+and the mode, and keep an eye on your subscription's limits in the status bar. Start a message with `!`
+to run a shell command in the project — Claude sees its output. Open a subagent to watch it work, search
+the conversation with <kbd>⌘</kbd><kbd>F</kbd>, edit an earlier message to take the conversation another
+way, or roll back the code Claude changed since then. Flux runs your own `claude` command with your
+Claude subscription — no API key.
 
 <img src="docs/images/claude-question.png" alt="Claude asks a question with options to choose from, right in the chat" width="100%">
 
@@ -203,7 +210,9 @@ one checkbox — Claude can even write the commit message, in the style of your 
 <img src="docs/images/claude-review.png" alt="The commit window with Claude's changelist, a file compared with its text before Claude, and the session on the right" width="100%">
 
 Pick up any earlier conversation of the project — started in Flux or in the terminal — from the history
-(or type `/resume`), and the sessions you had open come back when you reopen the project.
+(or type `/resume`), and the sessions you had open come back when you reopen the project. Each session's
+tab shows what it's busy with — a command and its clock, subagents, a question for you — and macOS lets
+you know when a session finishes or waits while you're in another app.
 
 <img src="docs/images/claude-history.png" alt="The history of the project's Claude sessions with search, branch and time" width="100%">
 
@@ -267,7 +276,8 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 - [x] Plugins: web services, programs, terminals, edits to review, context menus — with your permission
 - [x] Plugins: the Marketplace, languages, themes and file icons as plugins, a light theme, Appearance settings
 - [x] Before the beta: fixes after a week of daily use, a window for every project
-- [ ] Before the beta: Claude and editor polish, updates over the air, a signed and notarized app
+- [x] Before the beta: Claude polish — a new chat, `!` commands, live subagents, search, edit and rewind
+- [ ] Before the beta: editor polish, updates over the air, a signed and notarized app
 - [ ] Public beta
 
 ## License

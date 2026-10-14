@@ -92,6 +92,8 @@ green = "#4fd18b"
 teal = "#3cd3c4"
 cyan = "#5ccfff"
 folder = "#7fa8ff"
+# Claude's own orange: its avatar in the chat
+claude = "#d97757"
 
 [syntax]
 attribute = "#79c0ff"

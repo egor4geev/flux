@@ -71,6 +71,34 @@ pub fn project_dir(projects: &Path, root: &Path) -> PathBuf {
     projects.join(slug)
 }
 
+/// A session's transcript: `<projects>/<project slug>/<id>.jsonl` (part 10.2).
+pub fn transcript_path(root: &Path, session_id: &str) -> Option<PathBuf> {
+    Some(project_dir(&projects_dir()?, root).join(format!("{session_id}.jsonl")))
+}
+
+/// Where the message `uuid` hangs in a transcript (part 10.2: a message edited and sent again
+/// continues from its parent): `Some(Some(parent))` — after the entry `parent`, `Some(None)` —
+/// it opens the conversation, `None` — the transcript has no such line (a message that went in
+/// while Claude worked becomes an attachment of the turn).
+pub fn parent_of(path: &Path, uuid: &str) -> io::Result<Option<Option<String>>> {
+    use std::io::BufRead;
+    let file = io::BufReader::new(File::open(path)?);
+    for line in file.lines() {
+        let line = line?;
+        // Most lines aren't it: no JSON for them.
+        if !line.contains(uuid) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value["uuid"].as_str() == Some(uuid) {
+            return Ok(Some(value["parentUuid"].as_str().map(str::to_string)));
+        }
+    }
+    Ok(None)
+}
+
 /// The project's saved sessions, the most recent first. Reads only the beginning and the end of
 /// each transcript: a long one is tens of megabytes. A transcript without a prompt of the user (a
 /// session that never got one) isn't listed.
@@ -218,15 +246,19 @@ fn first_prompt(line: &Value) -> Option<String> {
 
 /// What a `user` line of the conversation is.
 enum UserLine {
-    /// What the user wrote (a message, a queued one, `! command` of the terminal's bash mode).
+    /// What the user wrote (a message, a queued one).
     Prompt {
         text: String,
         images: Vec<ImageAttachment>,
     },
     /// A slash command the user ran: `/model opus`.
     Command(String),
-    /// What a local command or the terminal's bash mode printed.
+    /// What a local command printed.
     Output(String),
+    /// A `!` command: of the terminal's bash mode or of Flux (part 10.2).
+    Shell(String),
+    /// What a `!` command printed, and its exit code when the record has it.
+    ShellOutput(String, Option<i32>),
     /// Tool results (and the interruption marks): the session model pairs them with the calls.
     Frame,
 }
@@ -286,17 +318,16 @@ fn user_line(line: &Value) -> Option<UserLine> {
             format!("{name} {args}").trim_end().to_string(),
         ));
     }
+    if let Some(command) = crate::shell::parse_input_record(trimmed) {
+        return Some(UserLine::Shell(command));
+    }
+    if let Some((output, code)) = crate::shell::parse_output_record(trimmed) {
+        return Some(UserLine::ShellOutput(strip_ansi(&output), code));
+    }
     if trimmed.starts_with("<local-command-stdout>")
         || trimmed.starts_with("<local-command-stderr>")
-        || trimmed.starts_with("<bash-stdout>")
-        || trimmed.starts_with("<bash-stderr>")
     {
-        let output = [
-            "local-command-stdout",
-            "local-command-stderr",
-            "bash-stdout",
-            "bash-stderr",
-        ]
+        let output = ["local-command-stdout", "local-command-stderr"]
         .iter()
         .filter_map(|name| tag(trimmed, name))
         .filter(|part| !part.trim().is_empty())
@@ -304,10 +335,7 @@ fn user_line(line: &Value) -> Option<UserLine> {
         .join("\n");
         return Some(UserLine::Output(strip_ansi(&output)));
     }
-    let text = match tag(trimmed, "bash-input") {
-        Some(command) => format!("! {command}"),
-        None => trimmed.to_string(),
-    };
+    let text = trimmed.to_string();
     let images = blocks
         .iter()
         .filter(|block| block["type"] == "image")
@@ -512,18 +540,32 @@ impl Reader {
                         self.first_prompt = Some(text.clone());
                     }
                     let uuid = line["uuid"].as_str().map(str::to_string);
-                    self.session.restore_user(uuid, text, images);
+                    self.session.restore_user(uuid, text, images, at);
                 }
                 Some(UserLine::Command(command)) => {
                     self.start_turn(at);
                     let uuid = line["uuid"].as_str().map(str::to_string);
-                    self.session.restore_user(uuid, command, Vec::new());
+                    self.session.restore_user(uuid, command, Vec::new(), at);
                 }
                 Some(UserLine::Output(text)) => {
                     if !text.trim().is_empty() {
                         self.session
                             .restore_entry(EntryKind::Notice(Notice::LocalCommand {
                                 text,
+                                raw: Value::Null,
+                            }));
+                    }
+                }
+                // A `!` command isn't a turn of Claude: its records go into the conversation as
+                // they are (the next prompt starts the turn).
+                Some(UserLine::Shell(command)) => self.session.restore_shell(command),
+                Some(UserLine::ShellOutput(output, code)) => {
+                    if !self.session.restore_shell_output(output.clone(), code)
+                        && !output.trim().is_empty()
+                    {
+                        self.session
+                            .restore_entry(EntryKind::Notice(Notice::LocalCommand {
+                                text: output,
                                 raw: Value::Null,
                             }));
                     }
@@ -580,7 +622,7 @@ impl Reader {
                         .filter(|text| !text.is_empty())
                 {
                     let uuid = line["uuid"].as_str().map(str::to_string);
-                    self.session.restore_user(uuid, text.to_string(), Vec::new());
+                    self.session.restore_user(uuid, text.to_string(), Vec::new(), at);
                 }
             }
             _ => {}
@@ -648,8 +690,9 @@ impl Reader {
                 if let Some(name) = tag(&text, "command-name") {
                     let args = tag(&text, "command-args").unwrap_or_default();
                     let command = format!("{name} {args}").trim_end().to_string();
-                    self.start_turn(line["timestamp"].as_str().and_then(parse_time));
-                    self.session.restore_user(None, command, Vec::new());
+                    let at = line["timestamp"].as_str().and_then(parse_time);
+                    self.start_turn(at);
+                    self.session.restore_user(None, command, Vec::new(), at);
                 } else if let Some(output) = tag(&text, "local-command-stdout") {
                     let output = strip_ansi(&output);
                     if !output.trim().is_empty() {

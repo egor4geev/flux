@@ -402,7 +402,7 @@ pub fn keystroke_label(modifiers: &Modifiers, key: &str) -> String {
 fn key_label(key: &str) -> String {
     let symbol = match key {
         "enter" => "↵",
-        "escape" => "⎋",
+        "escape" => "Esc",
         "backspace" => "⌫",
         "delete" => "⌦",
         "tab" => "⇥",
@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(label("cmd-}"), "⌘}");
         assert_eq!(label("ctrl-tab"), "⌃⇥");
         assert_eq!(label("enter"), "↵");
-        assert_eq!(label("escape"), "⎋");
+        assert_eq!(label("escape"), "Esc");
         assert_eq!(label("alt-backspace"), "⌥⌫");
         assert_eq!(label("delete"), "⌦");
         assert_eq!(label("pagedown"), "PgDn");

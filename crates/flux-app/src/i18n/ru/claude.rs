@@ -135,6 +135,17 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "The sessions open when the project closed come back, their history read from Claude Code's transcripts.",
         "Сессии, открытые при закрытии проекта, возвращаются, а их история читается из записей Claude Code.",
     ),
+    // Part 10.2
+    ("Claude answers the output of ! commands", "Claude отвечает на вывод команд !"),
+    (
+        "A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message.",
+        "Команда после ! выполняется в корне проекта, её вывод получает Claude. Включено — Claude сразу отвечает на него; выключено — увидит вывод вместе с вашим следующим сообщением.",
+    ),
+    ("Notify when a session finishes or waits", "Уведомлять, когда сессия закончила или ждёт"),
+    (
+        "A macOS notification while Flux isn't the active app.",
+        "Уведомление macOS, пока Flux не активное приложение.",
+    ),
     ("Flux Tools for Claude", "Инструменты Flux для Claude"),
     ("Give Claude the tools of Flux", "Дать Claude инструменты Flux"),
     (

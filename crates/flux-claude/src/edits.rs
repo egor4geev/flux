@@ -64,6 +64,35 @@ pub fn proposed_text(tool: &str, input: &Value, original: Option<&str>) -> Resul
     }
 }
 
+/// The file with an edit of Claude undone, when the file changed after it (part 10.2): every
+/// replacement goes back if its new text is still in the file exactly once. A `Write`, a
+/// replace-all, a text that's gone or repeated can't be undone this way.
+pub fn reverted_text(tool: &str, input: &Value, current: &str) -> Result<String, String> {
+    let edits: Vec<&Value> = match tool {
+        "Edit" => vec![input],
+        "MultiEdit" => input["edits"].as_array().into_iter().flatten().collect(),
+        _ => return Err(format!("{tool} replaces the whole file")),
+    };
+    let mut text = current.to_string();
+    // The last replacement first: a later one may sit inside an earlier one's text.
+    for edit in edits.iter().rev() {
+        if edit["replace_all"].as_bool().unwrap_or(false) {
+            return Err("The edit replaced every occurrence".into());
+        }
+        let old = edit["old_string"].as_str().unwrap_or("");
+        let new = edit["new_string"].as_str().unwrap_or("");
+        if new.is_empty() {
+            return Err("The edit removed text: there is nothing to find it by".into());
+        }
+        text = match text.matches(new).count() {
+            1 => text.replacen(new, old, 1),
+            0 => return Err("The edited text isn't in the file any more".into()),
+            _ => return Err("The edited text occurs more than once".into()),
+        };
+    }
+    Ok(text)
+}
+
 fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<String, String> {
     if old.is_empty() {
         return Err("The edit has no text to replace".into());
@@ -126,6 +155,29 @@ mod tests {
         assert!(proposed_text("Edit", &input, None).is_err());
         let write = json!({ "file_path": "/x", "content": "new" });
         assert_eq!(proposed_text("Write", &write, None).unwrap(), "new");
+    }
+
+    #[test]
+    fn an_edit_is_undone_where_its_text_still_is() {
+        let edit = json!({ "file_path": "/x", "old_string": "port", "new_string": "env port" });
+        // The file changed elsewhere after the edit: the edit alone goes back.
+        assert_eq!(
+            reverted_text("Edit", &edit, "fn a() {}\nenv port = 1\n").unwrap(),
+            "fn a() {}\nport = 1\n"
+        );
+        assert!(reverted_text("Edit", &edit, "port = 1").is_err());
+        assert!(reverted_text("Edit", &edit, "env port; env port").is_err());
+        let multi = json!({ "file_path": "/x", "edits": [
+            { "old_string": "a", "new_string": "AB" },
+            { "old_string": "B", "new_string": "Bc" },
+        ]});
+        // "a" → "AB" → "ABc": undone last first.
+        assert_eq!(reverted_text("MultiEdit", &multi, "xABcx").unwrap(), "xax");
+        let write = json!({ "file_path": "/x", "content": "new" });
+        assert!(reverted_text("Write", &write, "new").is_err());
+        let all =
+            json!({ "file_path": "/x", "old_string": "b", "new_string": "B", "replace_all": true });
+        assert!(reverted_text("Edit", &all, "BB").is_err());
     }
 
     #[test]

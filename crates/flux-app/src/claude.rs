@@ -8,13 +8,13 @@
 //! JetBrains IDEs: ⌘Esc opens the Claude window or goes back to the editor, ⌥⌘K puts the
 //! selection into the message.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
-    Action, App, AppContext, Context, Entity, EntityId, EventEmitter, Hsla, KeyBinding,
-    Subscription, Task, actions,
+    Action, App, AppContext, Context, Entity, EntityId, EventEmitter, KeyBinding, Subscription,
+    Task, actions,
 };
 
 use flux_claude::{
@@ -25,7 +25,6 @@ use crate::claude_history::{self, OpenSessions, SessionPlace};
 use crate::claude_session::{ClaudeSession, SessionEvent};
 use crate::i18n::{tr, trf};
 use crate::settings;
-use crate::theme::UiColors;
 
 actions!(
     claude,
@@ -86,11 +85,15 @@ pub const INSTALL_COMMANDS: [(&str, &str); 2] = [
     ("Homebrew", "brew install --cask claude-code"),
 ];
 
+/// How often the sessions' badges redraw while one works (their clocks, part 10.2).
+const BADGE_TICK: Duration = Duration::from_secs(1);
+
 /// How often and how long the sign-in is checked after "Sign In" opened `claude auth login`.
 const SIGN_IN_POLL: Duration = Duration::from_secs(2);
 const SIGN_IN_WAIT: Duration = Duration::from_secs(300);
 
 pub fn init(cx: &mut App) {
+    crate::system_notify::init(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-escape", ToggleClaude, Some("Workspace")),
         KeyBinding::new("alt-cmd-k", AddSelectionToClaude, Some("Editor")),
@@ -224,6 +227,10 @@ pub struct ClaudeStore {
     _restore: Option<Task<()>>,
     /// What was last saved for the root: an unchanged state isn't written again.
     saved_open: Option<OpenSessions>,
+    /// When each session last finished its work: "Done · 2 min ago" in its status tooltip.
+    finished: HashMap<EntityId, Instant>,
+    /// Redraws the window each second while a session works: the clocks on the sessions' badges.
+    _ticker: Option<Task<()>>,
 }
 
 impl EventEmitter<ClaudeStoreEvent> for ClaudeStore {}
@@ -242,6 +249,8 @@ impl ClaudeStore {
             restore: Restore::Pending,
             _restore: None,
             saved_open: None,
+            finished: HashMap::new(),
+            _ticker: None,
         };
         store.check(cx);
         store
@@ -288,6 +297,42 @@ impl ClaudeStore {
             .filter(|session| session.read(cx).model().is_working())
             .cloned()
             .collect()
+    }
+
+    /// When the session last finished its work (since it was opened in this window).
+    pub fn finished_at(&self, id: EntityId) -> Option<Instant> {
+        self.finished.get(&id).copied()
+    }
+
+    /// While a session works, the window redraws each second: the clocks on its pill, its editor
+    /// tab and in their tooltips go on (part 10.2).
+    fn update_ticker(&mut self, cx: &mut Context<Self>) {
+        let live = |store: &Self, cx: &App| {
+            store
+                .sessions
+                .iter()
+                .any(|session| crate::claude_status::glance(session.read(cx).model()).is_live())
+        };
+        if !live(self, cx) {
+            self._ticker = None;
+            return;
+        }
+        if self._ticker.is_some() {
+            return;
+        }
+        self._ticker = Some(cx.spawn(async move |store, cx| {
+            loop {
+                cx.background_executor().timer(BADGE_TICK).await;
+                let going = store.update(cx, |store, cx| {
+                    cx.emit(ClaudeStoreEvent::Changed);
+                    live(store, cx)
+                });
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+            store.update(cx, |store, _| store._ticker = None).ok();
+        }));
     }
 
     /// The newest subscription limits any session reported.
@@ -545,6 +590,8 @@ impl ClaudeStore {
         self.sessions.retain(|known| known != session);
         self.subscriptions.retain(|(known, _)| known != session);
         self.busy.remove(&session.entity_id());
+        self.finished.remove(&session.entity_id());
+        crate::system_notify::withdraw(session.entity_id());
         cx.emit(ClaudeStoreEvent::SessionRemoved(session.clone()));
         cx.emit(ClaudeStoreEvent::Changed);
         cx.notify();
@@ -558,14 +605,20 @@ impl ClaudeStore {
     ) {
         let id = session.entity_id();
         match event {
-            SessionEvent::PendingAdded(request) => cx.emit(ClaudeStoreEvent::Attention {
-                session,
-                request: request.clone(),
-            }),
-            SessionEvent::PendingRemoved(request) => cx.emit(ClaudeStoreEvent::Resolved {
-                session,
-                request: request.clone(),
-            }),
+            SessionEvent::PendingAdded(request) => {
+                crate::system_notify::session_waits(&session, cx);
+                cx.emit(ClaudeStoreEvent::Attention {
+                    session,
+                    request: request.clone(),
+                })
+            }
+            SessionEvent::PendingRemoved(request) => {
+                crate::system_notify::withdraw(id);
+                cx.emit(ClaudeStoreEvent::Resolved {
+                    session,
+                    request: request.clone(),
+                })
+            }
             SessionEvent::Status => {
                 if session.read(cx).model().is_working() {
                     self.busy.insert(id);
@@ -575,6 +628,8 @@ impl ClaudeStore {
             SessionEvent::Idle => {
                 if self.busy.remove(&id) {
                     let is_error = last_turn_failed(&session, cx);
+                    self.finished.insert(id, Instant::now());
+                    crate::system_notify::session_finished(&session, is_error, cx);
                     cx.emit(ClaudeStoreEvent::Finished { session, is_error });
                 }
                 cx.emit(ClaudeStoreEvent::Changed);
@@ -603,6 +658,7 @@ impl ClaudeStore {
                             _ => None,
                         })
                         .unwrap_or_default();
+                    crate::system_notify::session_finished(&session, true, cx);
                     cx.emit(ClaudeStoreEvent::Failed {
                         session,
                         code,
@@ -629,6 +685,7 @@ impl ClaudeStore {
             }),
             SessionEvent::Changed | SessionEvent::TurnFinished { .. } => {}
         }
+        self.update_ticker(cx);
         cx.notify();
     }
 }
@@ -674,28 +731,6 @@ fn check_cli(preferred: Option<&Path>) -> CliState {
             version: Some(version),
         },
         Err(err) => CliState::Failed(err),
-    }
-}
-
-/// The label of a session's status: a tab's tooltip, the status bar.
-pub fn status_label(status: &Status) -> &'static str {
-    match status {
-        Status::Starting => tr("Starting…"),
-        Status::Idle => tr("Ready"),
-        Status::Working { .. } => tr("Working…"),
-        Status::WaitingForUser => tr("Waiting for you"),
-        Status::Exited { .. } => tr("Stopped"),
-    }
-}
-
-/// The color of a session's status dot; `None` — no dot (ready, nothing to tell).
-pub fn status_color(status: &Status, ui: &UiColors) -> Option<Hsla> {
-    match status {
-        Status::Starting | Status::Working { .. } => Some(ui.accent),
-        Status::WaitingForUser => Some(ui.warning),
-        Status::Exited { code } if *code != Some(0) => Some(ui.error),
-        Status::Exited { .. } => Some(ui.dim),
-        Status::Idle => None,
     }
 }
 

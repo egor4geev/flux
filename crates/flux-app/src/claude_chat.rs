@@ -15,8 +15,10 @@ use gpui::{
 
 use flux_claude::{Session, Status};
 
+use crate::claude_agent_view::{self, AgentView};
 use crate::claude_cards::{self, CardsState};
 use crate::claude_composer::Composer;
+use crate::claude_search::{self, ChatSearch};
 use crate::claude_session::{ClaudeSession, SessionEvent};
 use crate::claude_transcript::{self, TranscriptState};
 use crate::i18n::tr;
@@ -28,12 +30,23 @@ const TICK: Duration = Duration::from_secs(1);
 const TICK_SLACK: Duration = Duration::from_millis(15);
 
 /// What the chat asks of the window.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum ClaudeChatEvent {
     /// "Open Diff" on an edit card (the CLI's request id).
     OpenProposal(String),
     /// A file Claude read or changed, clicked in the conversation.
     OpenLocation(crate::workspace::Location),
+    /// A picture of the conversation clicked: an image tab (part 10.2).
+    PreviewImage(crate::image_view::ImageSource),
+    /// A file compared with a text of Claude's edits (part 10.2: a turn's Review, an edit's Diff).
+    OpenCompare {
+        path: PathBuf,
+        left: crate::diff_view::DiffSide,
+        right: crate::diff_view::DiffSide,
+    },
+    /// What came of an action on the conversation (a rollback): the notification center, Claude's
+    /// group.
+    Notify(crate::notifications::Notification),
 }
 
 pub struct ClaudeChat {
@@ -41,7 +54,12 @@ pub struct ClaudeChat {
     pub(crate) transcript: TranscriptState,
     pub(crate) cards: CardsState,
     composer: Entity<Composer>,
-    focus_handle: FocusHandle,
+    pub(crate) focus_handle: FocusHandle,
+    /// Subagents in sight, one per level (`claude_agent_view`, part 10.2); empty — the session's
+    /// conversation.
+    pub(crate) agents: Vec<AgentView>,
+    /// The search (⌘F) while its bar is open (`claude_search`, part 10.2).
+    pub(crate) search: Option<ChatSearch>,
     /// Redraws the chat each second while Claude works.
     ticker: Option<Task<()>>,
     /// A resumed session without a process: it starts when the chat is first drawn.
@@ -62,7 +80,7 @@ impl ClaudeChat {
             &session,
             window,
             |this: &mut Self, session, event: &SessionEvent, window, cx| {
-                this.transcript.invalidate();
+                this.invalidate_transcripts();
                 this.update_ticker(cx);
                 match event {
                     // A question takes the keyboard, unless the user is typing a message.
@@ -93,6 +111,8 @@ impl ClaudeChat {
             cards: CardsState::default(),
             composer,
             focus_handle: cx.focus_handle(),
+            agents: Vec::new(),
+            search: None,
             ticker: None,
             _subscriptions: subscriptions,
         };
@@ -209,7 +229,9 @@ impl Render for ClaudeChat {
             let session = self.session.read(cx);
             session.is_loading() && session.model().entries.is_empty()
         };
-        claude_transcript::sync(&mut self.transcript, &self.session, cx);
+        self.refresh_search(cx);
+        let session = self.session.clone();
+        claude_transcript::sync(self.shown_transcript_mut(), &session, cx);
         let transcript = if loading {
             div()
                 .flex_1()
@@ -224,14 +246,26 @@ impl Render for ClaudeChat {
         } else {
             claude_transcript::render(self, window, cx)
         };
-        let session = self.session.clone();
+        let search_bar = claude_search::render_bar(self, window, cx);
+        // A subagent in sight: its bar on top, its line at the bottom, no cards and no field.
+        let agent_header = claude_agent_view::render_header(self, cx);
+        let agent_footer = claude_agent_view::render_footer(self, cx);
+        let in_agent = !self.agents.is_empty();
         let light = without_entries(session.read(cx).model());
-        let cards = claude_cards::render(&mut self.cards, &session, &light, window, cx);
+        let cards = if in_agent {
+            None
+        } else {
+            claude_cards::render(&mut self.cards, &session, &light, window, cx)
+        };
         // Files dragged from the tree or a tab, or from the Finder onto the conversation: mentions
         // in the message (the field takes the Finder's itself, pictures as pictures).
         let drop_style = move |style: gpui::StyleRefinement| style.bg(ui.drop_target);
-        div()
-            .key_context("ClaudeChat")
+        let root = crate::claude_turns::scenario_actions(div(), cx)
+            .key_context(if in_agent {
+                "ClaudeChat ClaudeAgentView"
+            } else {
+                "ClaudeChat"
+            })
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()
@@ -252,8 +286,30 @@ impl Render for ClaudeChat {
                 this.composer
                     .update(cx, |composer, cx| composer.drop_paths(paths, window, cx))
             }))
+            .on_action(cx.listener(|this, _: &claude_agent_view::Back, window, cx| {
+                this.agent_back(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &claude_agent_view::OpenLatest, window, cx| {
+                this.open_latest_agent(window, cx)
+            }));
+        claude_search::actions(root, cx)
+            .children(agent_header)
+            .children(search_bar)
             .child(transcript)
-            .children(cards)
-            .child(self.composer.clone())
+            // The cards and the field keep to the conversation's column (centered, at most
+            // `COLUMN_MAX_WIDTH` wide in an editor tab); the field's own inset is 10 px.
+            .children(cards.map(|cards| claude_transcript::column(cards).flex_none()))
+            .children(agent_footer)
+            .when(!in_agent, |chat| {
+                chat.child(
+                    div().flex_none().w_full().flex().justify_center().child(
+                        div()
+                            .w_full()
+                            .max_w(px(claude_transcript::COLUMN_MAX_WIDTH))
+                            .px(px(claude_transcript::COLUMN_INSET - 10.))
+                            .child(self.composer.clone()),
+                    ),
+                )
+            })
     }
 }

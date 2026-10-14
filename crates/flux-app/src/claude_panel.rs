@@ -20,11 +20,12 @@ use gpui::{
     ScrollHandle, SharedString, Subscription, Task, Window, div, point, prelude::*, px,
 };
 
-use flux_claude::{SavedSession, Status};
+use flux_claude::SavedSession;
 
 use crate::claude::{self, ClaudeStore, ClaudeStoreEvent, CliState};
 use crate::claude_chat::ClaudeChat;
 use crate::claude_history;
+use crate::claude_status;
 use crate::context_menu::ContextMenu;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
@@ -385,7 +386,7 @@ impl ClaudePanel {
             .enumerate()
             .map(|(index, chat)| {
                 let session = chat.read(cx).session().read(cx);
-                let status = claude::status_label(&session.model().status);
+                let status = claude_status::summary(&claude_status::glance(session.model()));
                 let marker = if index == self.active { "● " } else { "" };
                 (index, format!("{marker}{} · {status}", session.title()))
             })
@@ -622,6 +623,8 @@ impl ClaudePanel {
     fn pills_fit(&self, cx: &App) -> bool {
         const BUTTONS: f32 = 140.;
         const PILL_CHROME: f32 = 46.;
+        /// A status badge ("⌨ 12 s") with its gap.
+        const BADGE: f32 = 44.;
         const CHAR_WIDTH: f32 = 7.6;
         let needed: f32 = self
             .chats
@@ -633,8 +636,10 @@ impl ClaudePanel {
                 } else {
                     INACTIVE_TAB_LABEL_MAX_CHARS
                 };
-                let chars = chat.read(cx).session().read(cx).title().chars().count().min(max);
-                PILL_CHROME + chars as f32 * CHAR_WIDTH
+                let session = chat.read(cx).session().read(cx);
+                let chars = session.title().chars().count().min(max);
+                let badges = claude_status::glance(session.model()).badges();
+                PILL_CHROME + chars as f32 * CHAR_WIDTH + badges as f32 * BADGE
             })
             .sum();
         needed <= self.width.get() - BUTTONS
@@ -649,11 +654,14 @@ impl ClaudePanel {
     ) -> AnyElement {
         let ui = Theme::ui(cx);
         let active = index == self.active;
-        let session = chat.read(cx).session().read(cx);
+        let session_entity = chat.read(cx).session().clone();
+        let session = session_entity.read(cx);
         let title = session.title();
-        let status = session.model().status.clone();
+        let glance = claude_status::glance(session.model());
         let unseen = self.unseen.contains(&chat.entity_id());
-        let tooltip: SharedString = format!("{title} — {}", claude::status_label(&status)).into();
+        let finished = self.store.read(cx).finished_at(session_entity.entity_id());
+        let status_tooltip = claude_status::tooltip(session_entity.clone(), finished, true);
+        let tab_tooltip = claude_status::tooltip(session_entity.clone(), finished, false);
         let dragged = DraggedClaudeChat {
             chat: chat.clone(),
             title: title.clone(),
@@ -690,6 +698,34 @@ impl ClaudePanel {
         };
         let activate = chat.clone();
         let middle_close = chat.clone();
+        // The status: what works or waits; a click shows it in the conversation (part 10.2).
+        let status = {
+            let chat = chat.clone();
+            let target = glance.target;
+            div()
+                .id(("claude-tab-status", chat.entity_id()))
+                .flex_none()
+                .rounded(px(ui::RADIUS_XS))
+                .child(claude_status::glyph(
+                    &glance,
+                    unseen,
+                    ("claude-tab-dot", chat.entity_id()),
+                    ui,
+                ))
+                .tooltip(status_tooltip)
+                .when_some(target, |status, target| {
+                    status.cursor_pointer().on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            if let Some(index) = this.index_of(&chat) {
+                                this.activate(index, window, cx);
+                            }
+                            chat.update(cx, |chat, cx| chat.reveal_activity(target, window, cx));
+                        }),
+                    )
+                })
+        };
         div()
             .id(("claude-tab", chat.entity_id()))
             .group(TAB_GROUP)
@@ -713,7 +749,7 @@ impl ClaudePanel {
                 tab.border_color(gpui::transparent_black())
                     .hover(|style| style.bg(ui.hover).text_color(ui.foreground))
             })
-            .tooltip(ui::tooltip(tooltip, None))
+            .tooltip(tab_tooltip)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -722,6 +758,12 @@ impl ClaudePanel {
                     }
                 }),
             )
+            // A double click renames the session (as "Rename…" in its menu).
+            .on_click(|event: &ClickEvent, window, cx| {
+                if event.click_count() == 2 {
+                    window.dispatch_action(Box::new(claude::RenameSession), cx)
+                }
+            })
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -746,7 +788,6 @@ impl ClaudePanel {
                 drop_index == Some(self.chats.len()) && index + 1 == self.chats.len(),
                 |tab| tab.child(drop_marker(true, ui)),
             )
-            .child(status_dot(&status, unseen, ("claude-tab-dot", chat.entity_id()), &ui))
             .child(div().whitespace_nowrap().child(shorten(
                 &title,
                 if active {
@@ -755,6 +796,7 @@ impl ClaudePanel {
                     INACTIVE_TAB_LABEL_MAX_CHARS
                 },
             )))
+            .child(status)
             .child(div().relative().flex_none().size(px(18.)).child(close))
             .into_any_element()
     }
@@ -1103,33 +1145,6 @@ fn hint(label: &'static str, keys: &str, ui: UiColors) -> gpui::Div {
         .gap_2()
         .child(label)
         .child(ui::keys(keys, ui))
-}
-
-/// A session's status: a dot (pulsing while it works), a hollow ring when ready; a session that
-/// finished out of sight gets the success color until it is shown.
-pub fn status_dot(
-    status: &Status,
-    unseen: bool,
-    id: impl Into<gpui::ElementId>,
-    ui: &UiColors,
-) -> AnyElement {
-    let dot = div().flex_none().size(px(7.)).rounded(px(4.));
-    match claude::status_color(status, ui) {
-        Some(color) if status.is_working() && *status != Status::WaitingForUser => dot
-            .bg(color)
-            .with_animation(
-                id,
-                Animation::new(Duration::from_millis(1100)).repeat(),
-                |dot, delta| dot.opacity(0.35 + 0.65 * (1. - (2. * delta - 1.).abs())),
-            )
-            .into_any_element(),
-        Some(color) => dot.bg(color).into_any_element(),
-        None if unseen => dot.bg(ui.success).into_any_element(),
-        None => dot
-            .border_1()
-            .border_color(UiColors::tint(ui.text_muted, 0.6))
-            .into_any_element(),
-    }
 }
 
 /// A pulsing dot while `claude` is looked for.

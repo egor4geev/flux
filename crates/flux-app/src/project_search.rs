@@ -585,7 +585,7 @@ impl ProjectSearch {
                     .child(tr("Find in Files")),
             );
         let close = ui::icon_button("close", IconName::Close, ui)
-            .tooltip(ui::tooltip(tr("Close"), Some("⎋".into())))
+            .tooltip(ui::tooltip(tr("Close"), Some("Esc".into())))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close(cx)));
         div()
             .flex_none()

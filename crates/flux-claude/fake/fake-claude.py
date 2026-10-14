@@ -22,8 +22,10 @@ Environment:
   instead; `FLUX_FAKE_CLAUDE_ASK_DELAY_MS`: how long it thinks (default 300).
 - `FLUX_FAKE_CLAUDE_HOOK_LOG=<file>`: every hook answer of the host (`flux-edit` after an edit —
   the problems the language server found) is appended there as a JSON line.
-- Arguments `--fake-fixture=<name>`, `--fake-delay-ms=<n>` and `--fake-hook-log=<file>` do the same
-  as the variables (tests).
+- `FLUX_FAKE_CLAUDE_INPUT_LOG=<file>`: every user message of the host is appended there as a JSON
+  line (the records of a `!` command, part 10.2).
+- Arguments `--fake-fixture=<name>`, `--fake-delay-ms=<n>`, `--fake-hook-log=<file>` and
+  `--fake-input-log=<file>` do the same as the variables (tests).
 
 Behaviour:
 - `--version` and `auth status` answer at once; anything else is host mode.
@@ -45,6 +47,9 @@ Behaviour:
   result.
 - `--resume <id>` / `--session-id <id>`: the frames carry that session id instead of the
   recording's.
+- A user message with `shouldQuery: false` (context only — a `!` command's records) is answered
+  as the CLI 2.1.287 does: lifecycle frames, `init` and an empty `result` with `num_turns: 0`, no
+  turn and no frame of the recording.
 """
 import copy
 import itertools
@@ -77,6 +82,8 @@ def main():
             os.environ["FLUX_FAKE_CLAUDE_DELAY_MS"] = arg.split("=", 1)[1]
         elif arg.startswith("--fake-hook-log="):
             os.environ["FLUX_FAKE_CLAUDE_HOOK_LOG"] = arg.split("=", 1)[1]
+        elif arg.startswith("--fake-input-log="):
+            os.environ["FLUX_FAKE_CLAUDE_INPUT_LOG"] = arg.split("=", 1)[1]
     if option(args, "--output-format") == "json":
         return ask()
     host = Host(load(os.environ.get("FLUX_FAKE_CLAUDE", "a_text")))
@@ -225,6 +232,10 @@ class Host:
                     self.answers[response.get("request_id")] = response
                     self.answered.notify_all()
             elif kind == "user":
+                log = os.environ.get("FLUX_FAKE_CLAUDE_INPUT_LOG")
+                if log:
+                    with open(log, "a") as file:
+                        file.write(json.dumps(message, ensure_ascii=False) + "\n")
                 with self.turn_ready:
                     self.turns.append(message)
                     self.turn_ready.notify_all()
@@ -410,8 +421,31 @@ class Host:
                 while not self.turns:
                     self.turn_ready.wait()
                 message = self.turns.pop(0)
+            if message.get("shouldQuery") is False:
+                self.take_context(message.get("uuid"))
+                continue
             self.interrupted.clear()
             self.play_turn(message.get("uuid"))
+
+    def take_context(self, uuid):
+        """A message of context only: what the CLI 2.1.287 writes for it — no turn."""
+        init = next((f for f in self.frames if f.get("type") == "system" and f.get("subtype") == "init"),
+                    {"type": "system", "subtype": "init", "session_id": "fake", "model": "fake"})
+        # State events only as the recording has them: a host that saw one waits for `idle`.
+        states = any(f.get("type") == "system" and f.get("subtype") == "session_state_changed"
+                     for f in self.frames)
+        if states:
+            self.write({"type": "system", "subtype": "session_state_changed", "state": "running"})
+        for state in ("queued", "started"):
+            self.write({"type": "command_lifecycle", "command_uuid": uuid, "state": state})
+        self.write(self.with_flux_server(copy.deepcopy(init)))
+        self.write({"type": "result", "subtype": "success", "is_error": False, "result": "",
+                    "duration_ms": 2, "num_turns": 0, "total_cost_usd": 0})
+        self.write({"type": "command_lifecycle", "command_uuid": uuid, "state": "completed"})
+        with self.turn_ready:
+            idle = not self.turns
+        if idle and states:
+            self.write({"type": "system", "subtype": "session_state_changed", "state": "idle"})
 
     def play_turn(self, uuid):
         while self.position < len(self.frames):

@@ -19,6 +19,18 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Resume a session of this project", "Продолжить сессию этого проекта"),
     // The command palette (action names).
     ("Resume Session", "Продолжить сессию"),
+    // Deleting a session (part 10.2).
+    ("delete", "удалить"),
+    ("Delete Session", "Удалить сессию"),
+    ("Delete the session “{0}”?", "Удалить сессию «{0}»?"),
+    ("Its transcript goes to the Trash.", "Запись уйдёт в Корзину."),
+    ("The session “{0}” is open", "Сессия «{0}» открыта"),
+    (
+        "It closes, and its transcript goes to the Trash.",
+        "Она закроется, а её запись уйдёт в Корзину.",
+    ),
+    ("Close and Delete", "Закрыть и удалить"),
+    ("Couldn't delete the session", "Не удалось удалить сессию"),
 ];
 
 pub(super) const PLURALS: &[(&str, [&str; 3])] = &[(

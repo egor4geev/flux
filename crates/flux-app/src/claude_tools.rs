@@ -10,7 +10,8 @@
 //!
 //! A file nobody has open is opened on its servers in the background (`LspStore::open_background`)
 //! for as long as it is among the last few used; the answer waits for the server a few seconds.
-//! `open_file` shows the file in a tab but leaves the keyboard where it was (the chat's field).
+//! `open_file` shows the file in a tab but leaves the keyboard where it was (the chat's field); when
+//! a chat is the active editor tab, the file's tab opens behind it, so the chat stays in sight.
 //!
 //! Tool output is for the model: English, plain text, paths relative to the project root, lines and
 //! columns 1-based.
@@ -651,9 +652,8 @@ fn open_file(
             format!("Opened {shown_path} in the editor, lines {line}–{end_line} selected.")
         }
     };
-    // The keyboard stays where it was (the chat's field): the user reads the file while answering.
-    workspace.open_and(path, false, window, cx, move |workspace, cx| {
-        let (Some(line), Some(editor)) = (line, workspace.active_editor()) else {
+    let select = move |editor: &Entity<Editor>, cx: &mut App| {
+        let Some(line) = line else {
             return;
         };
         editor.update(cx, |editor, cx| {
@@ -666,6 +666,19 @@ fn open_file(
             };
             editor.select_range(start..end.max(start), cx);
         });
+    };
+    // A chat in an editor tab in front stays in front (part 10.2): the file waits in the tab
+    // next to it.
+    if workspace.chat_in_front() {
+        workspace.open_behind(path, window, cx, select);
+        let text = format!("{text} Its tab is next to the user's chat, which stays in front.");
+        return Ok(Task::ready(ToolOutput::text(text)));
+    }
+    // The keyboard stays where it was (the chat's field): the user reads the file while answering.
+    workspace.open_and(path, false, window, cx, move |workspace, cx| {
+        if let Some(editor) = workspace.active_editor() {
+            select(&editor, cx);
+        }
     });
     Ok(Task::ready(ToolOutput::text(text)))
 }

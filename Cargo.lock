@@ -2004,6 +2004,7 @@ name = "flux-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block",
  "core-foundation 0.10.0",
  "core-foundation-sys",
  "flux-claude",
@@ -2017,7 +2018,9 @@ dependencies = [
  "flux-term",
  "futures",
  "gpui",
+ "image",
  "objc",
+ "resvg",
  "serde_json",
  "toml 1.1.6+spec-1.1.0",
 ]
@@ -2028,6 +2031,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
+ "libc",
  "serde_json",
  "tempfile",
 ]

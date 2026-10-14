@@ -10,6 +10,8 @@ base64 = "0.22"
 # Channels from the CLI's reader thread to the window's UI tasks: futures, no async runtime (as
 # flux-lsp, ADR-019).
 futures = "0.3.34"
+# `!` commands (part 10.2): Stop signals the command's whole process group.
+libc = "0.2"
 serde_json = "1"
 
 [dev-dependencies]

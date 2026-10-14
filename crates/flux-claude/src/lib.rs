@@ -13,6 +13,8 @@
 //!   (possibly changed) version.
 //! - [`transcript`]: past sessions of a project from `~/.claude/projects` (part 9.2).
 //! - [`mcp`]: Flux's own MCP server for Claude — the tools of the window (part 9.2).
+//! - [`shell`]: `!` commands — run by the host in the project's root, their output for Claude in
+//!   the records of the terminal CLI's bash mode (part 10.2).
 
 pub mod cli;
 pub mod edits;
@@ -20,6 +22,7 @@ pub mod mcp;
 pub mod process;
 pub mod protocol;
 pub mod session;
+pub mod shell;
 pub mod transcript;
 mod types;
 
@@ -29,8 +32,9 @@ pub use process::{Process, ProcessEvent};
 pub use transcript::SavedSession;
 pub use protocol::{CliRequest, HostRequest, Incoming};
 pub use session::{
-    Activity, Answer, Change, ChangedFile, Entry, EntryId, EntryKind, Notice, Pending, PendingKind, Session,
-    SessionInfo, Status, TaskItem, TaskStatus, ToolCall, ToolEntry, ToolResult, ToolState,
+    Activity, Answer, Change, ChangedFile, Entry, EntryId, EntryKind, FileRestore, Notice, Pending,
+    PendingKind, Session, SessionInfo, ShellEntry, ShellState, Status, TaskItem, TaskStatus,
+    ToolCall, ToolEntry, ToolResult, ToolState, TurnFile,
 };
 pub use types::{
     BackgroundTask, ContextUsage, Effort, ImageAttachment, LimitStatus, LimitWindow, ModelInfo,

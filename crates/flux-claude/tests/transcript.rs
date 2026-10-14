@@ -54,6 +54,7 @@ fn outline(entries: &[flux_claude::Entry]) -> Vec<String> {
                 summary.duration.as_secs(),
                 if summary.is_error { " stopped" } else { "" }
             ),
+            EntryKind::Shell(shell) => format!("shell: {}", shell.command),
         })
         .collect()
 }
@@ -334,4 +335,63 @@ fn a_saved_split_thought_reads_back_as_one_without_a_time() {
             ..
         }
     )));
+}
+
+#[test]
+fn bash_mode_records_read_back_as_commands() {
+    // The terminal CLI's `!` (no exit code), then Flux's (escaped, with one), then a prompt.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bash.jsonl");
+    let user = |uuid: &str, parent: &str, content: &str| {
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","parentUuid":{parent},"timestamp":"2026-10-14T10:00:00Z","message":{{"role":"user","content":{content}}}}}"#
+        )
+    };
+    let lines = [
+        user("u1", "null", r#""<bash-input>ls</bash-input>""#),
+        user("u2", r#""u1""#, r#""<bash-stdout>a.txt\nb.txt</bash-stdout><bash-stderr></bash-stderr>""#),
+        user("u3", r#""u2""#, r#""<bash-input>cargo test &amp;&amp; echo ok</bash-input>""#),
+        user(
+            "u4",
+            r#""u3""#,
+            r#""<bash-stdout></bash-stdout><bash-stderr>error: test failed, a &lt; b</bash-stderr><bash-exit-code>101</bash-exit-code>""#,
+        ),
+        user("u5", r#""u4""#, r#"[{"type":"text","text":"Fix it"}]"#),
+        r#"{"type":"assistant","uuid":"a1","parentUuid":"u5","timestamp":"2026-10-14T10:00:05Z","message":{"id":"m1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"Fixed."}]}}"#.to_string(),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+    let session = transcript::load(&path, PathBuf::from("/project")).unwrap();
+    assert_eq!(
+        outline(&session.entries),
+        [
+            "shell: ls",
+            "shell: cargo test && echo ok",
+            "user: Fix it",
+            "text: Fixed.",
+            "turn end: 5 s",
+        ]
+    );
+    let shells: Vec<_> = session
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Shell(shell) => Some((shell.output.as_str(), shell.exit_code, shell.delivered)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        shells,
+        [
+            ("a.txt\nb.txt", None, true),
+            ("error: test failed, a < b", Some(101), true)
+        ]
+    );
+    // The history names the session by the prompt, not by a command.
+    let projects = tempfile::tempdir().unwrap();
+    let project = project_dir(projects.path(), Path::new("/project/bash"));
+    fs::create_dir_all(&project).unwrap();
+    fs::copy(&path, project.join("5f0c1d2e-0000-4000-8000-0000000000b1.jsonl")).unwrap();
+    let listed = transcript::list(projects.path(), Path::new("/project/bash"));
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].title, "Fix it");
 }

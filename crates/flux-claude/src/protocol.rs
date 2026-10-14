@@ -863,6 +863,23 @@ pub fn user_message(uuid: &str, input: &UserInput) -> Value {
     message
 }
 
+/// A user message of plain text the host composed — the records of a `!` command (part 10.2).
+/// `query: false` — context only: the CLI adds it to the conversation without a turn (it answers
+/// with an empty `result`, `num_turns: 0`); `true` — Claude answers it, as any message.
+pub fn context_message(uuid: &str, text: &str, query: bool) -> Value {
+    let mut message = json!({
+        "type": "user",
+        "message": { "role": "user", "content": text },
+        "parent_tool_use_id": null,
+        "session_id": "",
+        "uuid": uuid,
+    });
+    if !query {
+        message["shouldQuery"] = Value::Bool(false);
+    }
+    message
+}
+
 /// A control request of the host.
 pub fn control_request(id: &str, request: &HostRequest) -> Value {
     json!({ "type": "control_request", "request_id": id, "request": request.to_json() })

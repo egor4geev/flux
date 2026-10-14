@@ -142,6 +142,9 @@ pub enum PromptInputEvent {
     SelectionChanged,
     /// ⌘V with a picture on the clipboard: the parent attaches it.
     ImagePasted(Image),
+    /// ⌫ with the caret at the start and nothing selected: nothing to delete (the parent leaves a
+    /// mode of the field — the shell mode of Claude's field, part 10.2).
+    BackspaceAtStart,
 }
 
 pub struct PromptInput {
@@ -741,6 +744,10 @@ impl Render for PromptInput {
                 this.motion(cx, |t, r| movement::move_document_end(t, r, true))
             }))
             .on_action(cx.listener(|this, _: &Backspace, _, cx| {
+                if this.cursor() == 0 && !this.has_selection() {
+                    cx.emit(PromptInputEvent::BackspaceAtStart);
+                    return;
+                }
                 this.edit(EditKind::Delete, cx, edit::delete_backward)
             }))
             .on_action(cx.listener(|this, _: &Delete, _, cx| {
