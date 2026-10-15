@@ -236,7 +236,8 @@ fn store_cache(url: &str, bytes: &[u8]) {
         return;
     }
     let temp = dir.join("index.json.flux-tmp");
-    if std::fs::write(&temp, bytes).is_ok() && std::fs::rename(&temp, dir.join("index.json")).is_ok()
+    if std::fs::write(&temp, bytes).is_ok()
+        && std::fs::rename(&temp, dir.join("index.json")).is_ok()
     {
         let _ = std::fs::write(dir.join("index.url"), url);
     }
@@ -258,7 +259,11 @@ pub fn download(
 ) -> Result<PathBuf, String> {
     let dir = cache_dir().join("packages");
     std::fs::create_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-    let file_name = format!("{}-{}.tar.gz", safe_name(&entry.id), safe_name(&entry.version));
+    let file_name = format!(
+        "{}-{}.tar.gz",
+        safe_name(&entry.id),
+        safe_name(&entry.version)
+    );
     let target = dir.join(&file_name);
     let expected = entry.sha256.trim().to_ascii_lowercase();
     if let Ok(bytes) = std::fs::read(&target)
@@ -268,8 +273,8 @@ pub fn download(
         return Ok(target);
     }
     let bytes = if let Some(path) = entry.download.strip_prefix("file://") {
-        let bytes = std::fs::read(file_path(path))
-            .map_err(|err| format!("{}: {err}", entry.download))?;
+        let bytes =
+            std::fs::read(file_path(path)).map_err(|err| format!("{}: {err}", entry.download))?;
         progress(bytes.len() as u64, bytes.len() as u64);
         bytes
     } else {
@@ -297,7 +302,13 @@ pub const CANCELLED: &str = "Cancelled";
 /// A file name made of an id or a version: no path separators.
 fn safe_name(text: &str) -> String {
     text.chars()
-        .map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c == ':' {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -335,10 +346,7 @@ fn read_url(url: &str, limit: u64) -> Result<Vec<u8>, String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(format!("{url}: not an https:// or file:// address"));
     }
-    let mut response = agent()
-        .get(url)
-        .call()
-        .map_err(|err| describe(url, err))?;
+    let mut response = agent().get(url).call().map_err(|err| describe(url, err))?;
     response
         .body_mut()
         .with_config()
@@ -357,10 +365,7 @@ fn download_http(
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(format!("{url}: not an https:// or file:// address"));
     }
-    let mut response = agent()
-        .get(url)
-        .call()
-        .map_err(|err| describe(url, err))?;
+    let mut response = agent().get(url).call().map_err(|err| describe(url, err))?;
     let total = response
         .headers()
         .get("content-length")
@@ -646,7 +651,11 @@ mod tests {
         assert_eq!(id("src/MAIN.RS").as_deref(), Some("flux.rust"));
         assert_eq!(id("build/Dockerfile").as_deref(), Some("flux.dockerfile"));
         assert_eq!(id("api.dockerfile").as_deref(), Some("flux.dockerfile"));
-        assert_eq!(id("main.zig"), None, "an incompatible plugin isn't suggested");
+        assert_eq!(
+            id("main.zig"),
+            None,
+            "an incompatible plugin isn't suggested"
+        );
         assert_eq!(id("notes.txt"), None);
         let docker = index.plugin("flux.dockerfile").unwrap();
         assert_eq!(
@@ -658,7 +667,9 @@ mod tests {
             Some("*.rs")
         );
         assert_eq!(
-            docker.language_for(Path::new("Dockerfile")).map(|l| l.id.as_str()),
+            docker
+                .language_for(Path::new("Dockerfile"))
+                .map(|l| l.id.as_str()),
             Some("dockerfile")
         );
     }

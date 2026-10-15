@@ -9,7 +9,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Off", "Выключен"),
     // The badge of a server the user set up in `settings.json`.
     ("Custom", "Свои настройки"),
-    ("Turned off: Flux doesn't start it", "Выключен: Flux его не запускает"),
+    (
+        "Turned off: Flux doesn't start it",
+        "Выключен: Flux его не запускает",
+    ),
     // The user's own command (`lsp.<server>.command`) isn't there.
     ("Not found: {0}", "Не найден: {0}"),
     ("{0} not found", "{0} не найден"),
@@ -23,17 +26,32 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     // The command palette (`settings::OpenSettingsFile`).
     ("Open Settings File", "Открыть файл настроек"),
     // What the user's settings did to a running server.
-    ("{0}: new settings applied", "{0}: новые настройки применены"),
-    ("{0} restarted with new settings", "{0} перезапущен с новыми настройками"),
+    (
+        "{0}: new settings applied",
+        "{0}: новые настройки применены",
+    ),
+    (
+        "{0} restarted with new settings",
+        "{0} перезапущен с новыми настройками",
+    ),
     ("{0} is turned off", "{0} выключен"),
     // A broken `settings.json`.
-    ("Couldn't read settings.json", "Не удалось прочитать settings.json"),
-    ("{0} — line {1}, column {2}.", "{0} — строка {1}, столбец {2}."),
+    (
+        "Couldn't read settings.json",
+        "Не удалось прочитать settings.json",
+    ),
+    (
+        "{0} — line {1}, column {2}.",
+        "{0} — строка {1}, столбец {2}.",
+    ),
     (
         "Flux keeps the settings it has and won't write the file until it's fixed.",
         "Flux оставит прежние настройки и не будет записывать файл, пока его не исправят.",
     ),
-    ("The settings must be a JSON object", "Настройки должны быть объектом JSON"),
+    (
+        "The settings must be a JSON object",
+        "Настройки должны быть объектом JSON",
+    ),
     (
         "Settings aren't saved to a file in this session",
         "В этом сеансе настройки не сохраняются в файл",

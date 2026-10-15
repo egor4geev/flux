@@ -651,7 +651,11 @@ impl Render for GitWindow {
                     .pb_1p5()
                     .children(self.active_view()),
             )
-            .child(resize_handle(self.resizing, ui::resize_handle_center(ui::style(cx)), ui))
+            .child(resize_handle(
+                self.resizing,
+                ui::resize_handle_center(ui::style(cx)),
+                ui,
+            ))
             .children(
                 self.menu
                     .as_ref()

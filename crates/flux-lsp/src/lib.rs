@@ -20,9 +20,9 @@ mod transport;
 mod watch;
 
 pub use client::{ApplyEdit, Health, LanguageServer, RequestError, ServerEvent, ServerStatus};
-pub use output::{LogSource, ServerLog};
 pub use config::{Install, ServerConfig, server_for_path, servers_for_path};
 pub use lsp_types;
+pub use output::{LogSource, ServerLog};
 pub use position::Lines;
 
 /// The servers Flux had built in before stage 8.3, as fixtures of the tests.

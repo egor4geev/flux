@@ -385,12 +385,13 @@ mod tests {
             resume_at: Some("e1".into()),
             ..options.clone()
         };
-        assert!(at.args().join(" ").contains("--resume abc --resume-session-at e1"));
+        assert!(
+            at.args()
+                .join(" ")
+                .contains("--resume abc --resume-session-at e1")
+        );
         // Without a session to resume there is nothing to cut.
-        let fresh = LaunchOptions {
-            resume: None,
-            ..at
-        };
+        let fresh = LaunchOptions { resume: None, ..at };
         assert!(!fresh.args().join(" ").contains("--resume-session-at"));
     }
 
@@ -411,14 +412,21 @@ mod tests {
         assert!(!ask_args(None).iter().any(|arg| arg.starts_with("--model")));
 
         let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"  Fix the parser\n"}"#;
-        assert_eq!(ask_answer(ok, "", Some(0)), Ok("Fix the parser".to_string()));
+        assert_eq!(
+            ask_answer(ok, "", Some(0)),
+            Ok("Fix the parser".to_string())
+        );
         let failed = r#"{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}"#;
         assert_eq!(
             ask_answer(failed, "", Some(1)),
             Err("Not logged in · Please run /login".to_string())
         );
         assert_eq!(
-            ask_answer("", "warming up\nerror: unknown option '--tools='\n", Some(1)),
+            ask_answer(
+                "",
+                "warming up\nerror: unknown option '--tools='\n",
+                Some(1)
+            ),
             Err("error: unknown option '--tools='".to_string())
         );
         assert_eq!(

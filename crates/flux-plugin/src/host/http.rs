@@ -555,12 +555,7 @@ impl Line {
             .as_ref()
             .map(|via| format!(" (override: {via})"))
             .unwrap_or_default();
-        let mut text = format!(
-            "{} {}{via} → {}",
-            self.method,
-            self.url,
-            parts.join(", ")
-        );
+        let mut text = format!("{} {}{via} → {}", self.method, self.url, parts.join(", "));
         let failed = !matches!(error, None | Some(http::HttpError::Cancelled));
         let level = if failed || status.is_some_and(|status| status >= 400) {
             Level::Warn

@@ -20,7 +20,8 @@ actions!(git, [RollbackFile]);
 /// Opens the menu (or closes it, when open). Like JetBrains' quick lists, it shows where the work
 /// is: under the caret when an editor has focus, otherwise in the middle of the window.
 pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let anchor = crate::popup::where_the_work_is(workspace, context_menu::MENU_MIN_WIDTH, window, cx);
+    let anchor =
+        crate::popup::where_the_work_is(workspace, context_menu::MENU_MIN_WIDTH, window, cx);
     let git = workspace.git().read(cx);
     let has_repo = !git.repos().is_empty();
     let has_changes = !git.changes().is_empty();

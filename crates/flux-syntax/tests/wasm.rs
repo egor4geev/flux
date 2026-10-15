@@ -171,7 +171,10 @@ fn a_broken_module_says_why_and_is_not_parsed_again() {
     assert!(!syntax.needs_parse());
     let changes = ChangeSet::from_changes(text.len_chars(), [(1, 1, Some(" ".into()))]);
     syntax.edit(&text, &changes);
-    assert!(!syntax.needs_parse(), "a failed grammar is not parsed again");
+    assert!(
+        !syntax.needs_parse(),
+        "a failed grammar is not parsed again"
+    );
 
     // The wrong name: the module has no `tree_sitter_yaml`.
     let mut wrong = flux_syntax::language_by_name("zz-broken-wasm")
@@ -203,7 +206,10 @@ fn reregistering_keeps_a_loaded_grammar_until_the_config_changes() {
     register("test.wasm-reload", vec![changed]);
     let reloaded = flux_syntax::language_by_name(&config.name).unwrap();
     assert!(!Arc::ptr_eq(&reloaded, &wasm));
-    assert!(reloaded.loaded_grammar().is_none(), "a new language, a new load");
+    assert!(
+        reloaded.loaded_grammar().is_none(),
+        "a new language, a new load"
+    );
     assert!(reloaded.grammar().is_some());
     flux_syntax::unregister("test.wasm-reload");
 }
@@ -250,7 +256,10 @@ fn bench_wasm_against_native() {
     let wasm = wasm_language("bench.wasm", "rust", &bytes);
     let started = Instant::now();
     assert!(wasm.grammar().is_some(), "{:?}", wasm.grammar_error());
-    eprintln!("load rust.wasm: {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+    eprintln!(
+        "load rust.wasm: {:.1} ms",
+        started.elapsed().as_secs_f64() * 1e3
+    );
     let native = language_by_name("rust").unwrap();
     for language in [native, wasm] {
         let mut syntax = Syntax::new(language.clone());

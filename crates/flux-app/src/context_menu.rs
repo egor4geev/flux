@@ -87,7 +87,10 @@ enum Item {
 impl Item {
     /// What ↑/↓ stop at: an available entry, a submenu.
     fn selectable(&self) -> bool {
-        matches!(self, Item::Entry { enabled: true, .. } | Item::Submenu { .. })
+        matches!(
+            self,
+            Item::Entry { enabled: true, .. } | Item::Submenu { .. }
+        )
     }
 }
 
@@ -331,11 +334,7 @@ impl ContextMenu {
         {
             return;
         }
-        let index = self
-            .open
-            .as_ref()
-            .map(|open| open.index)
-            .or(self.selected);
+        let index = self.open.as_ref().map(|open| open.index).or(self.selected);
         if let Some(index) = index {
             self.open_submenu(index, true, cx);
         }
@@ -454,7 +453,13 @@ impl ContextMenu {
         self.dispatch(action, window, cx);
     }
 
-    fn run_child(&mut self, index: usize, child: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn run_child(
+        &mut self,
+        index: usize,
+        child: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(Item::Submenu { items, .. }) = self.items.get(index) else {
             return;
         };
@@ -482,7 +487,10 @@ impl ContextMenu {
     /// (without one, the window's own keys — [`ui::action_binding`]).
     fn keys_for(&self, action: &dyn Action, window: &Window, cx: &App) -> Option<SharedString> {
         let binding = match &self.previous_focus {
-            Some(focus) => window.bindings_for_action_in(action, focus).first().cloned(),
+            Some(focus) => window
+                .bindings_for_action_in(action, focus)
+                .first()
+                .cloned(),
             None => ui::action_binding(action, cx),
         };
         binding.map(|binding| ui::shortcut_label(&binding))
@@ -593,7 +601,9 @@ impl ContextMenu {
                         .p(px(MENU_PADDING))
                         .flex()
                         .flex_col()
-                        .on_hover(cx.listener(|this, hovered: &bool, _, _| this.hover_child(*hovered)))
+                        .on_hover(
+                            cx.listener(|this, hovered: &bool, _, _| this.hover_child(*hovered)),
+                        )
                         .child(
                             canvas(
                                 move |bounds, _, _| recorded.child.set(Some((index, bounds))),
@@ -693,7 +703,9 @@ fn item_row(
             ui.text_disabled
         })
         .when(enabled && selected, |item| item.bg(ui.list_selected))
-        .when(enabled && !selected, |item| item.hover(|style| style.bg(ui.hover)))
+        .when(enabled && !selected, |item| {
+            item.hover(|style| style.bg(ui.hover))
+        })
         .when(enabled, |item| item.cursor_pointer())
 }
 

@@ -214,7 +214,10 @@ mod tests {
             panic!("tools/list is answered at once");
         };
         assert_eq!(reply["result"]["tools"][0]["name"], "open_file");
-        assert_eq!(reply["result"]["tools"][0]["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            reply["result"]["tools"][0]["annotations"]["readOnlyHint"],
+            true
+        );
     }
 
     #[test]
@@ -249,7 +252,10 @@ mod tests {
     #[test]
     fn names_of_flux_tools() {
         assert_eq!(tool_name("get_diagnostics"), "mcp__flux__get_diagnostics");
-        assert_eq!(flux_tool("mcp__flux__get_diagnostics"), Some("get_diagnostics"));
+        assert_eq!(
+            flux_tool("mcp__flux__get_diagnostics"),
+            Some("get_diagnostics")
+        );
         assert_eq!(flux_tool("mcp__other__x"), None);
         assert_eq!(flux_tool("Read"), None);
     }

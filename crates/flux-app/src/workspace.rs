@@ -12,16 +12,14 @@ use flux_fs::remap;
 use gpui::{
     Action, AnyElement, AnyView, App, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, Context,
     Corner, DismissEvent, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight,
-    Global,
-    KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    Point, Render, ScrollHandle, SharedString, Subscription, Task, TitlebarOptions, WeakEntity,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowId, WindowOptions,
-    actions, anchored, deferred, div, point, prelude::*, px, relative, size,
+    Global, KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, Point, Render, ScrollHandle, SharedString, Subscription, Task, TitlebarOptions,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowId,
+    WindowOptions, actions, anchored, deferred, div, point, prelude::*, px, relative, size,
 };
 
 use crate::claude::{self, ClaudeStore, ClaudeStoreEvent};
 use crate::claude_chat::{ClaudeChat, ClaudeChatEvent};
-use crate::image_view::{self, ImageSource, ImageView, ImageViewEvent};
 use crate::claude_composer::EditorContext;
 use crate::claude_panel::{ClaudePanel, ClaudePanelEvent, DraggedClaudeChat};
 use crate::commit_panel::{CommitPanel, CommitPanelEvent};
@@ -35,6 +33,7 @@ use crate::git_log::GitLogView;
 use crate::git_window::{self, DraggedLogTab, GitWindow, GitWindowEvent};
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
+use crate::image_view::{self, ImageSource, ImageView, ImageViewEvent};
 use crate::launchpad::{self, Tool};
 use crate::lsp::LspStore;
 use crate::merge_view::{MergeView, MergeViewEvent};
@@ -802,7 +801,10 @@ impl Workspace {
             .map_or_else(|| tilde(&root), |name| name.to_string_lossy().into_owned());
         let answer = crate::dialog::ask(
             Dialog::info(tr("Open Project"))
-                .message(trf("Where would you like to open the project “{0}”?", &[&name]))
+                .message(trf(
+                    "Where would you like to open the project “{0}”?",
+                    &[&name],
+                ))
                 .normal(tr("This Window"))
                 .primary(tr("New Window"))
                 .cancel(tr("Cancel"))
@@ -923,7 +925,12 @@ impl Workspace {
 
     /// The islands as they were: the tree or the commit window, the terminal panel (a new shell in
     /// the project), the tool window on the right. The keyboard stays in the editor area.
-    fn restore_layout(&mut self, state: &ProjectState, window: &mut Window, cx: &mut Context<Self>) {
+    fn restore_layout(
+        &mut self,
+        state: &ProjectState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match state.left {
             LeftIsland::Tree => {}
             LeftIsland::Commit if self.file_tree.is_some() => {
@@ -1055,7 +1062,12 @@ impl Workspace {
                 continue;
             };
             let text = editor.document.text();
-            let head = editor.document.selection().primary().head.min(text.len_chars());
+            let head = editor
+                .document
+                .selection()
+                .primary()
+                .head
+                .min(text.len_chars());
             let line = text.char_to_line(head);
             if index == self.active {
                 active = Some(tabs.len());
@@ -1817,11 +1829,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Vec<Subscription> {
         vec![
-            cx.subscribe_in(view, window, |this, _, event: &ImageViewEvent, window, cx| {
-                match event {
+            cx.subscribe_in(
+                view,
+                window,
+                |this, _, event: &ImageViewEvent, window, cx| match event {
                     ImageViewEvent::EditAsText(path) => this.open_text(path.clone(), window, cx),
-                }
-            }),
+                },
+            ),
             cx.observe(view, |_, _, cx| cx.notify()),
         ]
     }
@@ -2028,8 +2042,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (images, paths): (Vec<PathBuf>, Vec<PathBuf>) =
-            paths.into_iter().partition(|path| self.shows_as_image(path, cx));
+        let (images, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .partition(|path| self.shows_as_image(path, cx));
         for path in images {
             self.open_image(ImageSource::File(path), true, window, cx);
         }
@@ -2204,7 +2219,10 @@ impl Workspace {
             }
             TabItem::Claude(chat) => self.close_claude_tab(chat, window, cx),
             TabItem::Image(view) => {
-                if let Some(index) = self.tabs.iter().position(|tab| tab.item.image() == Some(&view))
+                if let Some(index) = self
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.item.image() == Some(&view))
                 {
                     self.remove_tab_at(index, window, cx);
                 }
@@ -2421,7 +2439,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(index) = self.tabs.iter().position(|tab| tab.item.diff() == Some(view)) {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.item.diff() == Some(view))
+        {
             self.activate(index, window, cx);
         }
     }
@@ -3145,10 +3167,7 @@ impl Workspace {
             RightTool::Notifications => {
                 self.notification_center
                     .update(cx, |center, cx| center.set_journal_in_sight(false, cx));
-                let focused = self
-                    .notifications_panel
-                    .read(cx)
-                    .contains_focus(window, cx);
+                let focused = self.notifications_panel.read(cx).contains_focus(window, cx);
                 self.notifications_panel
                     .update(cx, |panel, cx| panel.set_visible(false, cx));
                 focused
@@ -3975,15 +3994,18 @@ impl Workspace {
         };
         let view = cx.new(|cx| build(window, cx));
         let focus_handle = view.focus_handle(cx);
-        let mut subscriptions = vec![cx.subscribe_in(
-            &view,
-            window,
-            |this, _, _: &DismissEvent, window, cx| this.dismiss_modal(window, cx),
-        )];
+        let mut subscriptions =
+            vec![
+                cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
+                    this.dismiss_modal(window, cx)
+                }),
+            ];
         if kind == ModalKind::Popup {
-            subscriptions.push(cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
-                this.dismiss_modal(window, cx)
-            }));
+            subscriptions.push(
+                cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
+                    this.dismiss_modal(window, cx)
+                }),
+            );
         }
         window.focus(&focus_handle);
         self.modal = Some(Modal {
@@ -4598,9 +4620,11 @@ impl Workspace {
                     this.drag_over_tabs(event.event.position, event.bounds, cx)
                 }),
             )
-            .on_drop(cx.listener(|this, dragged: &DraggedClaudeChat, window, cx| {
-                this.drop_claude(dragged.chat.clone(), window, cx)
-            }))
+            .on_drop(
+                cx.listener(|this, dragged: &DraggedClaudeChat, window, cx| {
+                    this.drop_claude(dragged.chat.clone(), window, cx)
+                }),
+            )
             // The line under the tabs runs from edge to edge of the island, inset from the rounded
             // corners; a Flat panel has no corners to keep away from (part 10.4).
             .child({
@@ -4757,7 +4781,9 @@ impl Workspace {
                 None => icon(IconName::Diff, ui.vcs_modified).size(px(14.)),
             })
             .child(label(&title))
-            .when(!proposal, |tab| tab.child(label(tr("diff")).text_color(ui.dim)))
+            .when(!proposal, |tab| {
+                tab.child(label(tr("diff")).text_color(ui.dim))
+            })
             .child(close_button(TabItem::Diff(view.clone()), active, dot, cx))
     }
 
@@ -5259,9 +5285,11 @@ impl Render for Workspace {
             .and_then(|editor| editor.read(cx).document.path().map(Path::to_path_buf))
             .filter(|path| image_view::is_svg(path));
         let root = root.when_some(svg_text, |root, path| {
-            root.on_action(cx.listener(move |this, _: &image_view::ShowPreview, window, cx| {
-                this.open_image(ImageSource::File(path.clone()), true, window, cx)
-            }))
+            root.on_action(
+                cx.listener(move |this, _: &image_view::ShowPreview, window, cx| {
+                    this.open_image(ImageSource::File(path.clone()), true, window, cx)
+                }),
+            )
         });
         #[cfg(feature = "scenario")]
         let root = root.on_action(cx.listener(
@@ -5463,24 +5491,26 @@ impl Render for Workspace {
                 .flex_none()
                 .h_full()
                 .when(flat, |island| island.border_l_1().border_color(line))
-                .on_action(cx.listener(|this, _: &notifications_panel::Hide, window, cx| {
-                    this.hide_right(window, cx)
-                }))
+                .on_action(
+                    cx.listener(|this, _: &notifications_panel::Hide, window, cx| {
+                        this.hide_right(window, cx)
+                    }),
+                )
                 .on_action(
                     cx.listener(|this, _: &notifications_panel::FocusEditor, window, cx| {
                         this.focus_active(window, cx)
                     }),
                 )
-                .on_action(
-                    cx.listener(|this, _: &notifications_panel::OpenSettings, window, cx| {
+                .on_action(cx.listener(
+                    |this, _: &notifications_panel::OpenSettings, window, cx| {
                         crate::settings_view::open(
                             this,
                             crate::settings_view::Section::Notifications,
                             window,
                             cx,
                         )
-                    }),
-                )
+                    },
+                ))
                 .child(content)
         });
         // The cards in the corner, unless the journal is in sight (then they go there, as in
@@ -5517,15 +5547,17 @@ impl Render for Workspace {
                     // next meeting.
                     .children(plugins::status_bar_items(self, cx))
                     .children(self.render_claude_status(cx))
+                    // An update of Flux on its way (part 10.8): the download, a restart to finish.
+                    .children(crate::updates::status_item(cx))
                     .child(self.render_bell(cx)),
             )
             .children(cards)
             .children(self.render_project_search(cx))
             .children(self.render_modal(cx))
             .children(
-                self.tab_menu
-                    .as_ref()
-                    .map(|menu| crate::context_menu::ContextMenu::overlay(&menu.menu, menu.position)),
+                self.tab_menu.as_ref().map(|menu| {
+                    crate::context_menu::ContextMenu::overlay(&menu.menu, menu.position)
+                }),
             )
     }
 }
@@ -5622,6 +5654,16 @@ fn quit_requested(cx: &mut App) {
 /// Claude at work and unsaved documents in turn; declining in any of them cancels the quit — and
 /// answers macOS's request "no", so a logout stops and Flux keeps running.
 fn start_quit(cx: &mut App) {
+    start_quit_then(cx, |_| {});
+}
+
+/// Quits as ⌘Q does, to restart into an update (part 10.8): `cancelled` runs when the user keeps
+/// Flux open in one of the questions (unsaved documents, running commands).
+pub(crate) fn quit_to_update(cx: &mut App, cancelled: impl FnOnce(&mut App) + 'static) {
+    start_quit_then(cx, cancelled);
+}
+
+fn start_quit_then(cx: &mut App, cancelled: impl FnOnce(&mut App) + 'static) {
     let quitting = cx.default_global::<Quitting>();
     // The review in progress answers macOS's request too.
     if quitting.0 {
@@ -5641,6 +5683,7 @@ fn start_quit(cx: &mut App) {
             } else {
                 cx.global_mut::<Quitting>().0 = false;
                 cx.cancel_quit();
+                cancelled(cx);
             }
         })
         .ok();
@@ -5745,7 +5788,11 @@ pub(crate) fn open_startup_windows(
     } else {
         OpenProjects::default()
     };
-    let roots: Vec<PathBuf> = open.roots.into_iter().filter(|root| root.is_dir()).collect();
+    let roots: Vec<PathBuf> = open
+        .roots
+        .into_iter()
+        .filter(|root| root.is_dir())
+        .collect();
     if roots.is_empty() {
         let bounds = window_bounds(None, None, cx);
         return open_window(None, Vec::new(), bounds, cx);
@@ -6210,46 +6257,58 @@ impl Workspace {
         if !claude::enabled(cx) {
             return root;
         }
-        root.on_action(cx.listener(|this, _: &claude::ToggleClaude, window, cx| {
-            this.toggle_claude(window, cx)
-        }))
-        .on_action(cx.listener(|this, _: &launchpad::ToggleClaude, window, cx| {
-            this.toggle_claude_icon(window, cx)
-        }))
+        root.on_action(
+            cx.listener(|this, _: &claude::ToggleClaude, window, cx| {
+                this.toggle_claude(window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &launchpad::ToggleClaude, window, cx| {
+                this.toggle_claude_icon(window, cx)
+            }),
+        )
         .on_action(cx.listener(|this, _: &claude::NewSession, window, cx| {
             this.new_claude_session(window, cx)
         }))
         .on_action(cx.listener(|this, _: &claude::CheckAgain, _, cx| {
             this.claude.update(cx, |store, cx| store.check(cx))
         }))
-        .on_action(cx.listener(|this, _: &claude::SignIn, window, cx| {
-            this.claude_sign_in(window, cx)
-        }))
+        .on_action(
+            cx.listener(|this, _: &claude::SignIn, window, cx| this.claude_sign_in(window, cx)),
+        )
         .on_action(cx.listener(|this, _: &claude::OpenSettings, window, cx| {
             crate::settings_view::open(this, crate::settings_view::Section::Claude, window, cx)
         }))
-        .on_action(cx.listener(|this, _: &claude::AddSelectionToClaude, window, cx| {
-            this.add_selection_to_claude(window, cx)
-        }))
-        .on_action(cx.listener(|this, action: &claude::ShowSession, window, cx| {
-            this.show_claude_session(action.0, window, cx)
-        }))
-        .on_action(cx.listener(|this, action: &claude::TypeInTerminal, window, cx| {
-            this.type_in_terminal(action.0.clone(), false, window, cx)
-        }))
+        .on_action(
+            cx.listener(|this, _: &claude::AddSelectionToClaude, window, cx| {
+                this.add_selection_to_claude(window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, action: &claude::ShowSession, window, cx| {
+                this.show_claude_session(action.0, window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, action: &claude::TypeInTerminal, window, cx| {
+                this.type_in_terminal(action.0.clone(), false, window, cx)
+            }),
+        )
         .on_action(cx.listener(|this, _: &claude::ResumeSession, window, cx| {
             crate::claude_history::open(this, window, cx)
         }))
         .map(|root| crate::claude_actions::actions(root, cx))
-        .on_action(cx.listener(|_, action: &claude::ShowExitDetails, window, cx| {
-            // The answer doesn't matter: the dialog only shows the output.
-            drop(
-                Dialog::info(action.title.clone())
-                    .details(action.output.clone())
-                    .primary(tr("OK"))
-                    .show(window, cx),
-            );
-        }))
+        .on_action(
+            cx.listener(|_, action: &claude::ShowExitDetails, window, cx| {
+                // The answer doesn't matter: the dialog only shows the output.
+                drop(
+                    Dialog::info(action.title.clone())
+                        .details(action.output.clone())
+                        .primary(tr("OK"))
+                        .show(window, cx),
+                );
+            }),
+        )
         .when(has_chat, |root| {
             root.on_action(cx.listener(|this, _: &claude::Interrupt, window, cx| {
                 if let Some(chat) = this.current_claude_chat(window, cx) {
@@ -6284,7 +6343,11 @@ impl Workspace {
     /// Every chat of the window: those of the Claude window, then those in the editor's tabs.
     fn claude_chats(&self, cx: &App) -> Vec<Entity<ClaudeChat>> {
         let mut chats = self.claude_panel.read(cx).chats().to_vec();
-        chats.extend(self.tabs.iter().filter_map(|tab| tab.item.claude().cloned()));
+        chats.extend(
+            self.tabs
+                .iter()
+                .filter_map(|tab| tab.item.claude().cloned()),
+        );
         chats
     }
 
@@ -6411,7 +6474,12 @@ impl Workspace {
 
     /// ⌘Esc in a chat: a chat's tab gives way ([`Self::leave_chat_tab`]); from the Claude window,
     /// the focus goes to the editor and the window stays.
-    fn leave_claude(&mut self, chat: &Entity<ClaudeChat>, window: &mut Window, cx: &mut Context<Self>) {
+    fn leave_claude(
+        &mut self,
+        chat: &Entity<ClaudeChat>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(self.active_item(), Some(TabItem::Claude(active)) if &active == chat) {
             return self.leave_chat_tab(chat, window, cx);
         }
@@ -6427,7 +6495,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(at) = self.tabs.iter().position(|tab| tab.item.claude() == Some(chat)) else {
+        let Some(at) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.item.claude() == Some(chat))
+        else {
             return;
         };
         let nearest = |accept: &dyn Fn(&TabItem) -> bool| {
@@ -6475,7 +6547,10 @@ impl Workspace {
             self.claude_panel
                 .update(cx, |panel, cx| panel.activate_chat(&chat, window, cx));
             self.show_right(RightTool::Claude, window, cx);
-        } else if let Some(index) = self.tabs.iter().position(|tab| tab.item.claude() == Some(&chat))
+        } else if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.item.claude() == Some(&chat))
         {
             self.activate(index, window, cx);
             chat.read(cx).focus_composer(window, cx);
@@ -6531,7 +6606,14 @@ impl Workspace {
                 };
                 let is_edit = matches!(pending.kind, flux_claude::PendingKind::Edit(_));
                 if is_edit && crate::settings::claude(cx).diff_tabs {
-                    crate::claude_diff::open(self, session.clone(), request.clone(), false, window, cx);
+                    crate::claude_diff::open(
+                        self,
+                        session.clone(),
+                        request.clone(),
+                        false,
+                        window,
+                        cx,
+                    );
                 }
                 let Some(chat) = self.claude_chat(session, cx) else {
                     return;
@@ -6831,7 +6913,11 @@ impl Workspace {
     /// document last active in the editor (while a chat tab is active, the one before it).
     fn claude_editor_context(&self, cx: &App) -> Option<EditorContext> {
         let editor = self.claude_last_editor.as_ref()?.upgrade()?;
-        if !self.tabs.iter().any(|tab| tab.item.editor() == Some(&editor)) {
+        if !self
+            .tabs
+            .iter()
+            .any(|tab| tab.item.editor() == Some(&editor))
+        {
             return None;
         }
         self.editor_context_of(&editor, cx)
@@ -6904,7 +6990,10 @@ impl Workspace {
             self.claude_panel
                 .update(cx, |panel, cx| panel.activate_chat(&chat, window, cx));
             self.show_right(RightTool::Claude, window, cx);
-        } else if let Some(index) = self.tabs.iter().position(|tab| tab.item.claude() == Some(&chat))
+        } else if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.item.claude() == Some(&chat))
         {
             self.remember_claude_return();
             self.activate(index, window, cx);
@@ -6939,7 +7028,10 @@ impl Workspace {
             self.claude_panel
                 .update(cx, |panel, cx| panel.activate_chat(&chat, window, cx));
             self.show_right(RightTool::Claude, window, cx);
-        } else if let Some(index) = self.tabs.iter().position(|tab| tab.item.claude() == Some(&chat))
+        } else if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.item.claude() == Some(&chat))
         {
             self.remember_claude_return();
             self.activate(index, window, cx);
@@ -6977,7 +7069,8 @@ impl Workspace {
         let claude = crate::claude_actions::offered(cx);
         let plugins = self.plugins.clone();
         let menu = cx.new(|cx| {
-            let menu = crate::context_menu::ContextMenu::new(window, cx).entry(tr("Close Tab"), CloseTab);
+            let menu =
+                crate::context_menu::ContextMenu::new(window, cx).entry(tr("Close Tab"), CloseTab);
             // The plugins' items for the tab's file (part 8.2).
             let target = crate::plugin_menus::MenuTarget {
                 location: flux_plugin::manifest::MenuLocation::Tab,
@@ -6991,7 +7084,10 @@ impl Workspace {
                 .separator()
                 .submenu(tr("Copy Path/Reference"), |copy| {
                     copy.entry(tr("Absolute Path"), crate::editor_menu::CopyAbsolutePath)
-                        .entry(tr("Path From Project Root"), crate::editor_menu::CopyPathFromRoot)
+                        .entry(
+                            tr("Path From Project Root"),
+                            crate::editor_menu::CopyPathFromRoot,
+                        )
                         .entry(tr("File Name"), crate::editor_menu::CopyFileName)
                 })
                 .entry(tr("Reveal in Finder"), crate::editor_menu::RevealInFinder);
@@ -7005,6 +7101,18 @@ impl Workspace {
             };
             crate::plugin_menus::append(menu, &plugins, &target, cx)
         });
+        self.show_menu(menu, position, window, cx);
+    }
+
+    /// Shows a context menu at a window point (a tab's, a status bar item's) until it is dismissed;
+    /// the focus comes back to the active item.
+    pub(crate) fn show_menu(
+        &mut self,
+        menu: Entity<crate::context_menu::ContextMenu>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let focus = menu.focus_handle(cx);
         let subscriptions = [
             cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
@@ -7042,7 +7150,12 @@ impl Workspace {
     }
 
     /// A new terminal in `dir` (Open In ▸ Terminal of the editor's menu).
-    pub(crate) fn open_terminal_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_terminal_in(
+        &mut self,
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let root = self.root.clone();
         match crate::terminal_group::TerminalGroup::spawn(Some(dir), root, window, cx) {
             Ok(group) => {
@@ -7092,7 +7205,13 @@ impl Workspace {
             self.hide_right(window, cx);
         }
         let subscriptions = vec![cx.observe(&chat, |_, _, cx| cx.notify())];
-        self.insert_tab(TabItem::Claude(chat.clone()), subscriptions, index, window, cx);
+        self.insert_tab(
+            TabItem::Claude(chat.clone()),
+            subscriptions,
+            index,
+            window,
+            cx,
+        );
         chat.read(cx).focus_composer(window, cx);
     }
 
@@ -7125,9 +7244,18 @@ impl Workspace {
 
     /// A chat dropped on the tab strip: one of the tabs moves along it, one from the Claude window
     /// joins the tabs where the marker shows.
-    fn drop_claude(&mut self, chat: Entity<ClaudeChat>, window: &mut Window, cx: &mut Context<Self>) {
+    fn drop_claude(
+        &mut self,
+        chat: Entity<ClaudeChat>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let index = self.tab_drop.take().unwrap_or(self.tabs.len());
-        match self.tabs.iter().position(|tab| tab.item.claude() == Some(&chat)) {
+        match self
+            .tabs
+            .iter()
+            .position(|tab| tab.item.claude() == Some(&chat))
+        {
             Some(from) => self.move_tab(from, index, window, cx),
             None => self.move_chat_to_editor(chat, Some(index), window, cx),
         }
@@ -7137,7 +7265,12 @@ impl Workspace {
 
     /// Closing a chat (its pill's ×, its tab, Close Session) ends its session; one that works is
     /// asked about first.
-    fn close_claude_chat(&mut self, chat: Entity<ClaudeChat>, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_claude_chat(
+        &mut self,
+        chat: Entity<ClaudeChat>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let session = chat.read(cx).session().clone();
         if !session.read(cx).model().is_working() {
             return self
@@ -7182,22 +7315,27 @@ impl Workspace {
         let session = chat.read(cx).session().clone();
         let old = session.read(cx).title().to_string();
         self.toggle_dialog(window, cx, move |window, cx| {
-            crate::input_dialog::InputDialog::new(tr("Rename Session"), tr("Session name"), window, cx)
-                .text(&old, cx)
-                .confirm_label(tr("Rename"))
-                .validate(
-                    |name, _, _| {
-                        if name.trim().is_empty() {
-                            Err(tr("Enter a name").into())
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    cx,
-                )
-                .on_confirm(move |name, _, _, cx| {
-                    session.update(cx, |session, cx| session.rename(name, cx));
-                })
+            crate::input_dialog::InputDialog::new(
+                tr("Rename Session"),
+                tr("Session name"),
+                window,
+                cx,
+            )
+            .text(&old, cx)
+            .confirm_label(tr("Rename"))
+            .validate(
+                |name, _, _| {
+                    if name.trim().is_empty() {
+                        Err(tr("Enter a name").into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                cx,
+            )
+            .on_confirm(move |name, _, _, cx| {
+                session.update(cx, |session, cx| session.rename(name, cx));
+            })
         });
     }
 
@@ -7245,8 +7383,9 @@ impl Workspace {
     ) {
         self.terminal_open = true;
         self.git_open = false;
-        self.terminal_panel
-            .update(cx, |panel, cx| panel.new_terminal_typing(text, run, window, cx));
+        self.terminal_panel.update(cx, |panel, cx| {
+            panel.new_terminal_typing(text, run, window, cx)
+        });
         cx.notify();
     }
 

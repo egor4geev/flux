@@ -54,7 +54,10 @@ actions!(
 );
 
 // The popup's keys (context "ContextActions").
-actions!(context_actions, [SelectNext, SelectPrevious, Confirm, Dismiss]);
+actions!(
+    context_actions,
+    [SelectNext, SelectPrevious, Confirm, Dismiss]
+);
 
 const ROW_HEIGHT: f32 = 28.;
 const MIN_WIDTH: f32 = 280.;
@@ -97,9 +100,9 @@ pub fn render(
 
 /// The window's handlers: ⌥↵ from a focused editor.
 pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
-    root.on_action(cx.listener(|workspace, _: &ShowContextActions, window, cx| {
-        show(workspace, window, cx)
-    }))
+    root.on_action(
+        cx.listener(|workspace, _: &ShowContextActions, window, cx| show(workspace, window, cx)),
+    )
 }
 
 // --- The rows ---
@@ -254,9 +257,8 @@ fn context_diagnostics(
         .filter(|diagnostic| diagnostic.owner == owner)
         .map(|diagnostic| {
             let current = position::range_to_lsp(text, diagnostic.range.clone());
-            let original = published.and_then(|published| {
-                published.iter().find(|raw| same_problem(raw, diagnostic))
-            });
+            let original = published
+                .and_then(|published| published.iter().find(|raw| same_problem(raw, diagnostic)));
             match original {
                 Some(raw) => lsp_types::Diagnostic {
                     range: current,
@@ -328,9 +330,7 @@ fn show(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
         let requests: Vec<_> = code_action_servers(state)
             .into_iter()
             .map(|(owner, server, uri)| {
-                let published = path
-                    .as_deref()
-                    .and_then(|path| lsp.published(owner, path));
+                let published = path.as_deref().and_then(|path| lsp.published(owner, path));
                 let diagnostics = context_diagnostics(state, owner, published, range.clone());
                 let params = CodeActionParams {
                     text_document: TextDocumentIdentifier { uri },
@@ -391,18 +391,18 @@ fn show(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
         for (server, response) in requests {
             popup._requests.push(cx.spawn(
                 async move |popup: WeakEntity<ContextActions>, cx: &mut gpui::AsyncApp| {
-                let items = match response.await {
-                    Ok(items) => items.unwrap_or_default(),
-                    Err(error) => {
-                        if !error.is_outdated() {
-                            eprintln!("flux: code actions of {}: {error}", server.name());
+                    let items = match response.await {
+                        Ok(items) => items.unwrap_or_default(),
+                        Err(error) => {
+                            if !error.is_outdated() {
+                                eprintln!("flux: code actions of {}: {error}", server.name());
+                            }
+                            Vec::new()
                         }
-                        Vec::new()
-                    }
-                };
-                popup
-                    .update(cx, |popup, cx| popup.add(rows_of(&server, items), cx))
-                    .ok();
+                    };
+                    popup
+                        .update(cx, |popup, cx| popup.add(rows_of(&server, items), cx))
+                        .ok();
                 },
             ));
         }
@@ -520,7 +520,9 @@ impl ContextActions {
         if let Some(reason) = &row.disabled {
             let message = trf("Not available: {0}", &[reason]);
             self.workspace
-                .update(cx, |workspace, cx| workspace.show_message(message.into(), cx))
+                .update(cx, |workspace, cx| {
+                    workspace.show_message(message.into(), cx)
+                })
                 .ok();
             return;
         }
@@ -550,9 +552,9 @@ impl Render for ContextActions {
         for (position, &index) in visible.iter().enumerate() {
             let row = &self.rows[index];
             // A thin line between Claude and the servers' actions, as JetBrains separates groups.
-            if previous_group.is_some_and(|group| {
-                (group == Group::Claude) != (row.group == Group::Claude)
-            }) {
+            if previous_group
+                .is_some_and(|group| (group == Group::Claude) != (row.group == Group::Claude))
+            {
                 items.push(ui::divider(ui).mx_1p5().my_1().into_any_element());
             }
             previous_group = Some(row.group);
@@ -574,7 +576,11 @@ impl Render for ContextActions {
                     .rounded(px(RADIUS_SM))
                     .whitespace_nowrap()
                     .cursor_pointer()
-                    .text_color(if enabled { ui.foreground } else { ui.text_disabled })
+                    .text_color(if enabled {
+                        ui.foreground
+                    } else {
+                        ui.text_disabled
+                    })
                     .when(is_selected, |row| row.bg(ui.list_selected))
                     .when(!is_selected, |row| row.hover(|style| style.bg(ui.hover)))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -692,7 +698,11 @@ fn run_action(
                 return;
             };
             if let Err(error) = applied.await {
-                report(&this, trf("Couldn't apply “{0}”: {1}", &[&action.title, &error]), cx);
+                report(
+                    &this,
+                    trf("Couldn't apply “{0}”: {1}", &[&action.title, &error]),
+                    cx,
+                );
                 return;
             }
         }
@@ -759,7 +769,9 @@ async fn execute(
 
 fn report(workspace: &WeakEntity<Workspace>, message: String, cx: &mut gpui::AsyncApp) {
     workspace
-        .update(cx, |workspace, cx| workspace.show_message(message.into(), cx))
+        .update(cx, |workspace, cx| {
+            workspace.show_message(message.into(), cx)
+        })
         .ok();
 }
 
@@ -984,10 +996,19 @@ mod tests {
     #[test]
     fn groups_follow_the_kinds() {
         let kind = |k: &str| Some(CodeActionKind::from(k.to_string()));
-        assert_eq!(Group::of(kind("quickfix").as_ref(), true), Group::PreferredFix);
+        assert_eq!(
+            Group::of(kind("quickfix").as_ref(), true),
+            Group::PreferredFix
+        );
         assert_eq!(Group::of(kind("quickfix").as_ref(), false), Group::QuickFix);
-        assert_eq!(Group::of(kind("refactor.extract").as_ref(), false), Group::Refactor);
-        assert_eq!(Group::of(kind("source.organizeImports").as_ref(), false), Group::Source);
+        assert_eq!(
+            Group::of(kind("refactor.extract").as_ref(), false),
+            Group::Refactor
+        );
+        assert_eq!(
+            Group::of(kind("source.organizeImports").as_ref(), false),
+            Group::Source
+        );
         assert_eq!(Group::of(kind("sourcery").as_ref(), false), Group::Other);
         assert_eq!(Group::of(None, true), Group::QuickFix);
         assert_eq!(Group::of(None, false), Group::Other);

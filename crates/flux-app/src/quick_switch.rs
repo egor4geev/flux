@@ -71,9 +71,11 @@ pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
         .on_action(cx.listener(|workspace, _: &SelectTheme, window, cx| {
             open(workspace, Level::Theme, window, cx)
         }))
-        .on_action(cx.listener(|workspace, _: &SelectInterfaceStyle, window, cx| {
-            open(workspace, Level::Style, window, cx)
-        }))
+        .on_action(
+            cx.listener(|workspace, _: &SelectInterfaceStyle, window, cx| {
+                open(workspace, Level::Style, window, cx)
+            }),
+        )
         .on_action(cx.listener(|workspace, _: &SelectFileIcons, window, cx| {
             open(workspace, Level::FileIcons, window, cx)
         }))
@@ -107,7 +109,12 @@ pub enum Level {
 }
 
 /// The levels the first level opens, in its order (as Settings → Appearance lists its pages).
-const LEVELS: [Level; 4] = [Level::Theme, Level::Style, Level::FileIcons, Level::Language];
+const LEVELS: [Level; 4] = [
+    Level::Theme,
+    Level::Style,
+    Level::FileIcons,
+    Level::Language,
+];
 
 /// The interface languages, in the order of the Language level and of Settings.
 const LANGUAGES: [LanguageChoice; 3] = [
@@ -446,9 +453,7 @@ impl QuickSwitch {
                     .iter()
                     .map(|choice| match choice {
                         LanguageChoice::System => Row {
-                            detail: Some(
-                                i18n::lang_name(i18n::system_lang()).into(),
-                            ),
+                            detail: Some(i18n::lang_name(i18n::system_lang()).into()),
                             checked: current == *choice,
                             ..row(tr("System").into())
                         },
@@ -539,9 +544,11 @@ impl Render for QuickSwitch {
                         .text_color(ui.foreground)
                         .child(row.label),
                 )
-                .children(row.samples.iter().map(|sample| {
-                    sample.render().size(px(14.))
-                }))
+                .children(
+                    row.samples
+                        .iter()
+                        .map(|sample| sample.render().size(px(14.))),
+                )
                 .children(row.detail.map(|detail| {
                     div()
                         .flex_none()
@@ -604,9 +611,9 @@ impl Render for QuickSwitch {
                                 .id("quick-switch-back")
                                 .flex_none()
                                 .cursor_pointer()
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.go_back(cx)
-                                }))
+                                .on_click(
+                                    cx.listener(|this, _: &ClickEvent, _, cx| this.go_back(cx)),
+                                )
                                 .child(icon(IconName::ArrowLeft, ui.text_muted).size(px(13.))),
                         )
                     })
@@ -651,9 +658,15 @@ mod tests {
         assert_eq!(theme_choice(false, Dark, Light), ThemeChoice::Select);
         assert_eq!(theme_choice(false, Light, Light), ThemeChoice::Select);
         assert_eq!(theme_choice(true, Dark, Dark), ThemeChoice::SelectFor(Dark));
-        assert_eq!(theme_choice(true, Light, Light), ThemeChoice::SelectFor(Light));
+        assert_eq!(
+            theme_choice(true, Light, Light),
+            ThemeChoice::SelectFor(Light)
+        );
         // A light theme while macOS is dark: the person wants it now.
-        assert_eq!(theme_choice(true, Dark, Light), ThemeChoice::StopSyncAndSelect);
+        assert_eq!(
+            theme_choice(true, Dark, Light),
+            ThemeChoice::StopSyncAndSelect
+        );
     }
 
     #[test]
@@ -671,7 +684,12 @@ mod tests {
     fn levels_and_languages_are_in_settings_order() {
         assert_eq!(
             LEVELS,
-            [Level::Theme, Level::Style, Level::FileIcons, Level::Language]
+            [
+                Level::Theme,
+                Level::Style,
+                Level::FileIcons,
+                Level::Language
+            ]
         );
         assert_eq!(page_of(Level::Style), Page::Interface);
         assert_eq!(page_of(Level::FileIcons), Page::FileIcons);

@@ -76,7 +76,12 @@ impl ClaudeChat {
 
     /// Shows the subagent of the Agent call `tool` on the chat's place (one level deeper when a
     /// subagent is in sight already); the keyboard goes to the chat for Esc.
-    pub(crate) fn show_agent(&mut self, tool: EntryId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_agent(
+        &mut self,
+        tool: EntryId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let known = {
             let model = self.session().read(cx).model();
             claude_transcript::find_tool(&model.entries, tool)
@@ -101,7 +106,9 @@ impl ClaudeChat {
             let model = self.session().read(cx).model();
             let entries = claude_transcript::scope_entries(model, self.shown_transcript().scope);
             entries.iter().rev().find_map(|entry| match &entry.kind {
-                flux_claude::EntryKind::Tool(tool) if matches!(tool.call, ToolCall::Agent { .. }) => {
+                flux_claude::EntryKind::Tool(tool)
+                    if matches!(tool.call, ToolCall::Agent { .. }) =>
+                {
                     Some(entry.id)
                 }
                 _ => None,
@@ -186,9 +193,9 @@ pub fn render_header(chat: &ClaudeChat, cx: &mut Context<ClaudeChat>) -> Option<
             .tooltip(ui::tooltip(tr("Back to the Session"), Some("Esc".into())))
             .child(icon(IconName::ArrowLeft, ui.text_muted).size(px(14.)))
             .child(div().min_w_0().truncate().child(title))
-            .on_click(cx.listener(|chat, _: &ClickEvent, window, cx| {
-                chat.agent_crumb(0, window, cx)
-            }))
+            .on_click(
+                cx.listener(|chat, _: &ClickEvent, window, cx| chat.agent_crumb(0, window, cx)),
+            )
             .into_any_element(),
     ];
     // Subagents above the one in sight: crumbs too.
@@ -243,9 +250,7 @@ pub fn render_header(chat: &ClaudeChat, cx: &mut Context<ClaudeChat>) -> Option<
             .hover(move |style| style.bg(ui.hover))
             .child(icon(IconName::Stop, ui.error).size(px(12.)))
             .child(tr("Stop"))
-            .on_click(cx.listener(move |chat, _: &ClickEvent, _, cx| {
-                chat.stop_agent(target, cx)
-            }))
+            .on_click(cx.listener(move |chat, _: &ClickEvent, _, cx| chat.stop_agent(target, cx)))
     });
     Some(
         div()
@@ -280,7 +285,13 @@ pub fn render_footer(chat: &ClaudeChat, cx: &mut Context<ClaudeChat>) -> Option<
     let ui = Theme::ui(cx);
     let model = chat.session().read(cx).model();
     let tool = claude_transcript::find_tool(&model.entries, current.tool)?;
-    let background = matches!(tool.call, ToolCall::Agent { background: true, .. });
+    let background = matches!(
+        tool.call,
+        ToolCall::Agent {
+            background: true,
+            ..
+        }
+    );
     let totals = claude_transcript::agent_totals_label(tool);
     let (mark, label): (AnyElement, String) = if claude_transcript::agent_is_running(tool) {
         (
@@ -298,15 +309,21 @@ pub fn render_footer(chat: &ClaudeChat, cx: &mut Context<ClaudeChat>) -> Option<
     } else {
         match tool.state {
             ToolState::Failed | ToolState::Denied => (
-                icon(IconName::Error, ui.error).size(px(14.)).into_any_element(),
+                icon(IconName::Error, ui.error)
+                    .size(px(14.))
+                    .into_any_element(),
                 tr("The agent failed").to_string(),
             ),
             ToolState::Interrupted => (
-                icon(IconName::Stop, ui.dim).size(px(13.)).into_any_element(),
+                icon(IconName::Stop, ui.dim)
+                    .size(px(13.))
+                    .into_any_element(),
                 tr("The agent was stopped").to_string(),
             ),
             _ => (
-                icon(IconName::CheckCircle, ui.success).size(px(14.)).into_any_element(),
+                icon(IconName::CheckCircle, ui.success)
+                    .size(px(14.))
+                    .into_any_element(),
                 tr("The agent is done — its answer went to Claude").to_string(),
             ),
         }

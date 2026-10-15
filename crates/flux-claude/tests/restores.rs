@@ -53,13 +53,23 @@ fn find(session: &Session, pick: impl Fn(&EntryKind) -> bool) -> u64 {
 #[test]
 fn an_edit_is_known_before_and_after() {
     let (session, prompt) = replay_after_prompt("b_edit_allow");
-    let edit = find(&session, |kind| matches!(kind, EntryKind::Tool(tool) if tool.name == "Edit"));
+    let edit = find(
+        &session,
+        |kind| matches!(kind, EntryKind::Tool(tool) if tool.name == "Edit"),
+    );
     let restore = session.edit_restore(edit).expect("the edit's texts");
-    assert!(restore.path.ends_with("greeting.txt"), "{}", restore.path.display());
+    assert!(
+        restore.path.ends_with("greeting.txt"),
+        "{}",
+        restore.path.display()
+    );
     let before = restore.before.as_deref().expect("the original");
     let after = restore.after.as_deref().expect("the result");
     assert!(before.contains("Hello world"), "{before:?}");
-    assert!(after.contains("Hello Flux") && !after.contains("Hello world"), "{after:?}");
+    assert!(
+        after.contains("Hello Flux") && !after.contains("Hello world"),
+        "{after:?}"
+    );
     // The whole turn, and everything after the prompt: the same one file.
     let end = find(&session, |kind| matches!(kind, EntryKind::TurnEnd(_)));
     assert_eq!(session.turn_restores(end), vec![restore.clone()]);
@@ -118,5 +128,8 @@ fn a_message_s_parent_is_read_from_the_transcript() {
         flux_claude::transcript::parent_of(&path, first["uuid"].as_str().unwrap()).unwrap(),
         Some(None)
     );
-    assert_eq!(flux_claude::transcript::parent_of(&path, "no-such-uuid").unwrap(), None);
+    assert_eq!(
+        flux_claude::transcript::parent_of(&path, "no-such-uuid").unwrap(),
+        None
+    );
 }

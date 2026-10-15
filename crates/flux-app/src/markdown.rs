@@ -33,8 +33,8 @@ use gpui::{
 };
 
 use crate::display::{display_line, text_runs};
-use crate::theme::{self, Theme, UiColors};
 use crate::plugin_links::Target;
+use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1214,7 +1214,12 @@ pub fn render_copyable(
 /// The texts the blocks draw, in the order they are drawn (tables row by row, code blocks as their
 /// lines): what a search counts its matches in, so [`Marks`] mark the same ones.
 pub fn block_texts(blocks: &[Block]) -> Vec<String> {
-    let spans_text = |spans: &[Span]| spans.iter().map(|span| span.text.as_str()).collect::<String>();
+    let spans_text = |spans: &[Span]| {
+        spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>()
+    };
     let mut texts = Vec::new();
     for block in blocks {
         match block {
@@ -1385,7 +1390,12 @@ fn render_blocks(
                     .gap_1p5()
                     .pl(px(*depth as f32 * 14.))
                     .child(div().flex_none().text_color(ui.dim).child(marker.clone()))
-                    .child(div().flex_1().min_w_0().child(text(spans, color, FontWeight::NORMAL)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(text(spans, color, FontWeight::NORMAL)),
+                    )
                     .into_any_element(),
                 Block::Quote(spans) => div()
                     .pl_2()
@@ -1444,7 +1454,10 @@ fn clickable(
         } else {
             for found in crate::plugin_links::web_links(&span.text) {
                 let url = span.text[found.clone()].to_string();
-                targets.push((range.start + found.start..range.start + found.end, Target::Url(url)));
+                targets.push((
+                    range.start + found.start..range.start + found.end,
+                    Target::Url(url),
+                ));
             }
         }
     }

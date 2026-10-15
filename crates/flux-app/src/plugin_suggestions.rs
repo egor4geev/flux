@@ -31,7 +31,11 @@ pub struct Suggestion {
 /// The suggestion for a file: it has no language, the catalog has a compatible plugin for it, the
 /// plugin isn't installed (an installed one turned off is the user's choice), and the kind of file
 /// isn't ignored.
-pub fn suggestion_for(path: &Path, workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<Suggestion> {
+pub fn suggestion_for(
+    path: &Path,
+    workspace: &Workspace,
+    cx: &mut Context<Workspace>,
+) -> Option<Suggestion> {
     if flux_syntax::language_for_path(path).is_some() {
         return None;
     }
@@ -173,7 +177,11 @@ fn render(suggestion: Suggestion, cx: &mut Context<Workspace>) -> AnyElement {
 }
 
 /// A link of the banner.
-fn link(id: &'static str, label: impl Into<SharedString>, ui: UiColors) -> gpui::Stateful<gpui::Div> {
+fn link(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    ui: UiColors,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex_none()

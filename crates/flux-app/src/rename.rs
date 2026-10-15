@@ -281,7 +281,9 @@ pub(crate) fn apply_workspace_edit(
 
 /// A file may come several times (`documentChanges`), each batch of edits relative to the text
 /// after the previous ones: the batches are grouped per file, in order.
-pub(crate) fn group_by_file(files: Vec<(PathBuf, Vec<TextEdit>)>) -> Vec<(PathBuf, Vec<Vec<TextEdit>>)> {
+pub(crate) fn group_by_file(
+    files: Vec<(PathBuf, Vec<TextEdit>)>,
+) -> Vec<(PathBuf, Vec<Vec<TextEdit>>)> {
     let mut grouped: Vec<(PathBuf, PathBuf, Vec<Vec<TextEdit>>)> = Vec::new();
     for (path, edits) in files {
         let key = canonical(&path);

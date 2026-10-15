@@ -65,7 +65,10 @@ pub const COLOR_RS: &[CodeLine] = &[
     ],
     &[
         (None, "    "),
-        (Some("comment"), "/// Parses `#rrggbb` and the short `#rgb`."),
+        (
+            Some("comment"),
+            "/// Parses `#rrggbb` and the short `#rgb`.",
+        ),
     ],
     &[
         (None, "    "),
@@ -144,7 +147,9 @@ fn project_rows(cx: &App) -> Vec<TreeRow<'static>> {
     let ui = Theme::ui(cx);
     vec![
         TreeRow::folder(0, "src", true),
-        TreeRow::file(1, "color.rs").selected().colored(ui.vcs_modified),
+        TreeRow::file(1, "color.rs")
+            .selected()
+            .colored(ui.vcs_modified),
         TreeRow::file(1, "lib.rs"),
         TreeRow::file(1, "theme.rs"),
         TreeRow::folder(0, "tests", false),
@@ -179,14 +184,24 @@ fn search(progress: f32, cx: &App) -> AnyElement {
     let ui = Theme::ui(cx);
     let appear = phase(progress, 0.0, 0.22);
     // A letter every 0.15 of the show after the popup is in.
-    let typed = ((progress - 0.3) / 0.15).floor().clamp(-1., QUERY.len() as f32 - 1.) as isize + 1;
+    let typed = ((progress - 0.3) / 0.15)
+        .floor()
+        .clamp(-1., QUERY.len() as f32 - 1.) as isize
+        + 1;
     let query = &QUERY[..typed as usize];
     let content = div()
         .flex_1()
         .flex()
         .gap(px(island_gap(cx)))
         .child(tree(&project_rows(cx), 150., cx))
-        .child(editor_island(&["color.rs", "lib.rs"], 0, COLOR_RS, COLOR_RS_FIRST, Some(3), cx));
+        .child(editor_island(
+            &["color.rs", "lib.rs"],
+            0,
+            COLOR_RS,
+            COLOR_RS_FIRST,
+            Some(3),
+            cx,
+        ));
     let mut picture = mini_window_with("palette", "main", &[0], content, cx);
     if appear > 0. {
         picture = picture
@@ -249,25 +264,28 @@ fn search_popup(query: &str, cx: &App) -> Div {
                 .child(div().ml(px(1.)).w(px(1.5)).h(px(14.)).bg(ui.cursor)),
         )
         .child(div().flex_1());
-    let rows = matches.iter().enumerate().map(|(index, (name, dir, marks))| {
-        let selected = index == 0;
-        div()
-            .h(px(28.))
-            .px(px(8.))
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded(px(6.))
-            .when(selected, |row| row.bg(ui.list_selected))
-            .child(file_icon(name, &ui).render().size(px(14.)))
-            .child(highlighted(name, marks, ui))
-            .child(
-                div()
-                    .text_size(px(SCENE_TEXT))
-                    .text_color(ui.dim)
-                    .child(dir.to_string()),
-            )
-    });
+    let rows = matches
+        .iter()
+        .enumerate()
+        .map(|(index, (name, dir, marks))| {
+            let selected = index == 0;
+            div()
+                .h(px(28.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(6.))
+                .when(selected, |row| row.bg(ui.list_selected))
+                .child(file_icon(name, &ui).render().size(px(14.)))
+                .child(highlighted(name, marks, ui))
+                .child(
+                    div()
+                        .text_size(px(SCENE_TEXT))
+                        .text_color(ui.dim)
+                        .child(dir.to_string()),
+                )
+        });
     let footer = div()
         .mt_1()
         .pt(px(7.))
@@ -390,10 +408,22 @@ fn problem(progress: f32, cx: &App) -> AnyElement {
             (
                 IconName::Bulb,
                 ui.amber,
-                vec![("Import ", false), ("crate::hex::", true), (PROBLEM_WORD, true)],
+                vec![
+                    ("Import ", false),
+                    ("crate::hex::", true),
+                    (PROBLEM_WORD, true),
+                ],
             ),
-            (IconName::Claude, ui.claude, vec![(tr("Fix with Claude"), false)]),
-            (IconName::Claude, ui.claude, vec![(tr("Explain with Claude"), false)]),
+            (
+                IconName::Claude,
+                ui.claude,
+                vec![(tr("Fix with Claude"), false)],
+            ),
+            (
+                IconName::Claude,
+                ui.claude,
+                vec![(tr("Explain with Claude"), false)],
+            ),
         ];
         let rows = actions
             .into_iter()
@@ -549,8 +579,14 @@ fn windows(progress: f32, cx: &App) -> AnyElement {
         let tools = [
             (ui::shortcut_for(&file_tree::ToggleOpen, cx), tr("Project")),
             (ui::shortcut_for(&git::ToggleCommitWindow, cx), tr("Commit")),
-            (ui::shortcut_for(&project_search::Toggle, cx), tr("Find in Files")),
-            (ui::shortcut_for(&terminal_panel::TogglePanel, cx), tr("Terminal")),
+            (
+                ui::shortcut_for(&project_search::Toggle, cx),
+                tr("Find in Files"),
+            ),
+            (
+                ui::shortcut_for(&terminal_panel::TogglePanel, cx),
+                tr("Terminal"),
+            ),
             (ui::shortcut_for(&git::ToggleGitWindow, cx), tr("Git")),
         ];
         for (index, (keys, name)) in tools.into_iter().enumerate() {
@@ -590,12 +626,11 @@ fn terminal_island(height: f32, cx: &App) -> Div {
     let theme = Theme::get(cx);
     let terminal = theme.terminal;
     let line = |pieces: Vec<(Hsla, &str)>| {
-        div()
-            .flex()
-            .whitespace_nowrap()
-            .children(pieces.into_iter().map(|(color, text)| {
-                div().text_color(color).child(text.to_string())
-            }))
+        div().flex().whitespace_nowrap().children(
+            pieces
+                .into_iter()
+                .map(|(color, text)| div().text_color(color).child(text.to_string())),
+        )
     };
     island(cx)
         .h(px(height))
@@ -749,9 +784,7 @@ pub fn mini_window_with(
                 .justify_center()
                 .rounded(px(5.))
                 .when(on, |button| button.bg(ui.accent_soft))
-                .child(
-                    icon(*name, if on { ui.accent_text } else { ui.text_muted }).size(px(13.)),
-                )
+                .child(icon(*name, if on { ui.accent_text } else { ui.text_muted }).size(px(13.)))
         }));
     let gap = island_gap(cx);
     div()
@@ -1004,7 +1037,9 @@ fn code_lines_marked(
                     .when(style.is_some_and(|style| style.bold), |piece| {
                         piece.font_weight(FontWeight::BOLD)
                     })
-                    .when(style.is_some_and(|style| style.italic), |piece| piece.italic())
+                    .when(style.is_some_and(|style| style.italic), |piece| {
+                        piece.italic()
+                    })
                     .when(marked, |piece| {
                         piece
                             .underline()
@@ -1113,7 +1148,10 @@ mod tests {
 
     #[test]
     fn the_problem_word_is_where_the_picture_points() {
-        let line: String = COLOR_RS[PROBLEM_LINE].iter().map(|(_, text)| *text).collect();
+        let line: String = COLOR_RS[PROBLEM_LINE]
+            .iter()
+            .map(|(_, text)| *text)
+            .collect();
         let word: String = line
             .chars()
             .skip(PROBLEM_COLUMN)

@@ -109,7 +109,9 @@ pub fn spawn(
         .stderr(Stdio::piped())
         .process_group(0);
     if let Some(env) = env {
-        process.env_clear().envs(env.iter().map(|(name, value)| (name, value)));
+        process
+            .env_clear()
+            .envs(env.iter().map(|(name, value)| (name, value)));
     }
     // Plain output: no terminal is there to draw colors or progress on.
     process.env("TERM", "dumb");
@@ -454,8 +456,13 @@ mod tests {
     fn the_command_runs_in_its_folder_with_the_given_environment() {
         let dir = tempfile::tempdir().unwrap();
         let env = [("FLUX_SHELL_PROBE".to_string(), "42".to_string())];
-        let (_, events) = spawn("pwd; echo $FLUX_SHELL_PROBE", dir.path(), "/bin/sh", Some(&env))
-            .unwrap();
+        let (_, events) = spawn(
+            "pwd; echo $FLUX_SHELL_PROBE",
+            dir.path(),
+            "/bin/sh",
+            Some(&env),
+        )
+        .unwrap();
         let stdout: String = block_on(events.collect::<Vec<_>>())
             .into_iter()
             .filter_map(|event| match event {
@@ -513,15 +520,24 @@ mod tests {
     #[test]
     fn records_read_back_as_written() {
         let input = input_record("grep '<a>' x && echo ok");
-        assert_eq!(input, "<bash-input>grep '&lt;a&gt;' x &amp;&amp; echo ok</bash-input>");
-        assert_eq!(parse_input_record(&input).as_deref(), Some("grep '<a>' x && echo ok"));
+        assert_eq!(
+            input,
+            "<bash-input>grep '&lt;a&gt;' x &amp;&amp; echo ok</bash-input>"
+        );
+        assert_eq!(
+            parse_input_record(&input).as_deref(),
+            Some("grep '<a>' x && echo ok")
+        );
         let output = output_record("a < b\n", "warning\n", Some(1));
         assert_eq!(
             output,
             "<bash-stdout>a &lt; b</bash-stdout><bash-stderr>warning</bash-stderr>\
              <bash-exit-code>1</bash-exit-code>"
         );
-        assert_eq!(parse_output_record(&output), Some(("a < b\nwarning".into(), Some(1))));
+        assert_eq!(
+            parse_output_record(&output),
+            Some(("a < b\nwarning".into(), Some(1)))
+        );
         // The terminal CLI's own record has no exit code.
         assert_eq!(
             parse_output_record("<bash-stdout>hi</bash-stdout><bash-stderr></bash-stderr>"),

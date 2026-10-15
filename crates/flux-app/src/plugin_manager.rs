@@ -21,9 +21,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use flux_plugin::catalog::IndexEntry;
 use flux_plugin::install::{Candidate, CandidateKind};
 use flux_plugin::log::{Level, LogLine, PluginLog};
-use flux_plugin::catalog::IndexEntry;
 use flux_plugin::manifest::{
     FolderAccess, GrammarSourceSpec, InstallSpec, Manifest, MenuLocation, Permissions,
     ProjectAccess,
@@ -858,7 +858,10 @@ impl PluginManager {
         let menu = cx.new(|cx| {
             ContextMenu::new(window, cx)
                 .entry(tr("Install Plugin from Disk…"), plugins::InstallFromDisk)
-                .entry(tr("Check for Updates"), crate::plugin_updates::CheckForUpdates)
+                .entry(
+                    tr("Check for Updates"),
+                    crate::plugin_updates::CheckForUpdates,
+                )
                 .separator()
                 .entry_if(
                     has_dev,
@@ -1721,28 +1724,28 @@ impl PluginManager {
 /// Permissions tab of the Installed and of the Marketplace.
 pub(crate) fn permissions_view(manifest: &Manifest, ui: UiColors) -> Div {
     let lines = permission_lines(&manifest.permissions);
-        let list = if lines.is_empty() {
-            vec![permission_row(
-                IconName::CheckCircle,
-                ui.success,
-                tr("Asks for no special permissions").into(),
-                ui.foreground,
-                ui,
-            )]
-        } else {
-            lines
-                .into_iter()
-                .map(|line| {
-                    let (glyph, text) = if line.broad {
-                        (ui.warning, ui.warning)
-                    } else {
-                        (ui.accent_text, ui.foreground)
-                    };
-                    permission_row(line.icon, glyph, line.text.into(), text, ui)
-                })
-                .collect()
-        };
-        div()
+    let list = if lines.is_empty() {
+        vec![permission_row(
+            IconName::CheckCircle,
+            ui.success,
+            tr("Asks for no special permissions").into(),
+            ui.foreground,
+            ui,
+        )]
+    } else {
+        lines
+            .into_iter()
+            .map(|line| {
+                let (glyph, text) = if line.broad {
+                    (ui.warning, ui.warning)
+                } else {
+                    (ui.accent_text, ui.foreground)
+                };
+                permission_row(line.icon, glyph, line.text.into(), text, ui)
+            })
+            .collect()
+    };
+    div()
             .flex()
             .flex_col()
             .gap_3()
@@ -1993,7 +1996,10 @@ fn unavailable_reason(entry: &PluginEntry, reason: &str) -> String {
     if !flux_plugin::supports_api(&manifest.api) {
         return trf(
             "Built for plugin API {0}; this Flux runs {1}",
-            &[&manifest.api, &flux_plugin::SUPPORTED_API_VERSIONS.join(", ")],
+            &[
+                &manifest.api,
+                &flux_plugin::SUPPORTED_API_VERSIONS.join(", "),
+            ],
         );
     }
     match &manifest.wasm {
@@ -2109,9 +2115,8 @@ pub(crate) fn contribution_sections(
 ) -> Vec<AnyElement> {
     let mut sections: Vec<AnyElement> = Vec::new();
     if !manifest.commands.is_empty() {
-        let category = |category: &Option<String>| {
-            translate(category.as_deref().unwrap_or(&manifest.name))
-        };
+        let category =
+            |category: &Option<String>| translate(category.as_deref().unwrap_or(&manifest.name));
         let rows = manifest.commands.iter().map(|command| {
             contribution_row(
                 IconName::Command,
@@ -2171,7 +2176,9 @@ pub(crate) fn contribution_sections(
                 .map(|extension| format!(".{extension}"))
                 .collect();
             files.extend(language.file_names.iter().cloned());
-            let grammar = match manifest.grammar(&language.grammar).map(|grammar| &grammar.source)
+            let grammar = match manifest
+                .grammar(&language.grammar)
+                .map(|grammar| &grammar.source)
             {
                 Some(GrammarSourceSpec::Builtin(_)) => tr("grammar built into Flux"),
                 Some(GrammarSourceSpec::Wasm { .. }) => tr("WebAssembly grammar"),
@@ -2291,14 +2298,10 @@ pub(crate) fn contributions_list(sections: Vec<AnyElement>, ui: UiColors) -> Div
 /// How Flux installs a language server, in a few words.
 fn install_label(install: &InstallSpec) -> String {
     match install {
-        InstallSpec::Npm { packages, .. } => {
-            trf("installs with npm: {0}", &[&packages.join(", ")])
-        }
+        InstallSpec::Npm { packages, .. } => trf("installs with npm: {0}", &[&packages.join(", ")]),
         InstallSpec::GitHub { repo, .. } => trf("installs from GitHub: {0}", &[repo]),
         InstallSpec::Go { package, .. } => trf("installs with go install: {0}", &[package]),
-        InstallSpec::Rustup { component, .. } => {
-            trf("installs with rustup: {0}", &[component])
-        }
+        InstallSpec::Rustup { component, .. } => trf("installs with rustup: {0}", &[component]),
     }
 }
 
@@ -2492,7 +2495,10 @@ authors = ["Someone", "Another"]
                 ("Connect to any server on the internet".into(), true),
                 ("Run any program with your rights".into(), true),
                 ("Open terminals and type commands into them".into(), true),
-                ("Open Claude Code sessions with its own requests".into(), true),
+                (
+                    "Open Claude Code sessions with its own requests".into(),
+                    true
+                ),
             ]
         );
         // A shell runs anything; so does a whole home folder.

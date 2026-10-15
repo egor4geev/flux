@@ -59,9 +59,9 @@ or a test run to jump right there.
 
 ## Install
 
-Flux is getting ready for its first public beta. From the first release on, download the `.dmg` from
-[Releases](https://github.com/egor4geev/flux/releases) and drag Flux to Applications; until then,
-[build it from source](#build-from-source).
+Download the `.dmg` from the [latest release](https://github.com/egor4geev/flux/releases/latest) —
+`macos-aarch64` for Apple silicon, `macos-x86_64` for Intel — open it and drag Flux to Applications.
+Flux needs macOS 12 or later.
 
 Flux isn't notarized by Apple, so macOS blocks the first launch of a downloaded Flux, saying it can't
 verify the app. Once:
@@ -71,8 +71,9 @@ verify the app. Once:
    **Open Anyway**.
 3. Confirm with your password or Touch ID.
 
-Since macOS 15, Control-click → Open no longer gets past this. The updates Flux downloads itself open
-without asking.
+Since macOS 15, Control-click → Open no longer gets past this. From then on Flux updates itself: it
+tells you when a new version is out, and **Update and Restart** installs it without asking again.
+Want the versions still being tried? **Settings → Updates → Channel: Beta**.
 
 On its first launch Flux opens a short guide: the interface language, the theme and the look of the
 window, the plugins of the languages you write in, Claude Code, and a few slides on working in Flux —

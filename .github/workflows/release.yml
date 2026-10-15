@@ -1,0 +1,294 @@
+# Releases (part 10.8). A tag publishes one:
+#
+#   vX.Y.Z         on main         — a stable release, GitHub's "latest" (the Stable channel)
+#   vX.Y.Z-beta.N  on pre-release  — a beta: a pre-release on GitHub (the Beta channel)
+#
+# Flux.app is built for Apple silicon and Intel, signed with the "Flux Dev" certificate (secrets
+# MACOS_CERT_P12, MACOS_CERT_PASSWORD; scripts/ci-keychain.sh) and packed as a .zip (the update
+# Flux downloads itself) and a .dmg (the first install); latest.json describes the release for
+# Flux's updater, each archive signed with Ed25519 (secret FLUX_UPDATE_PRIVATE_KEY; the public key
+# is built into Flux — crates/flux-update). Notarization: none (no Apple Developer ID, Roadmap 10.8).
+#
+# A pull request into main (a release or a hotfix) and Run workflow make a dry run: everything but
+# the release — the downloads and latest.json stay as the run's artifacts, to try before tagging.
+# How a release is cut: CONTRIBUTING.md → Releases.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build (a dry run — no release)
+        required: true
+        default: pre-release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A fork's pull request gets no secrets to sign with — and main takes none anyway (PR source).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      channel: ${{ steps.release.outputs.channel }}
+      publish: ${{ steps.release.outputs.publish }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          # The whole history: a tag's commit must be on its branch.
+          fetch-depth: 0
+
+      - name: Version, channel, branch, notes
+        id: release
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]; then
+            echo "::error title=Version::Cargo.toml's version $version is neither X.Y.Z nor X.Y.Z-beta.N."
+            exit 1
+          fi
+          if [[ "$version" == *-* ]]; then
+            channel=beta branch=pre-release
+          else
+            channel=stable branch=main
+          fi
+          sha=$(git rev-parse HEAD)
+          publish=false
+          if [ "$EVENT" = push ]; then
+            publish=true
+            if [ "$REF_NAME" != "v$version" ]; then
+              echo "::error title=Tag::The tag $REF_NAME doesn't match the version in Cargo.toml (v$version)."
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$sha" "origin/$branch"; then
+              echo "::error title=Branch::$REF_NAME is a $channel release: its commit must be on $branch."
+              exit 1
+            fi
+            if gh release view "$REF_NAME" >/dev/null 2>&1; then
+              echo "::error title=Release::$REF_NAME is released already."
+              exit 1
+            fi
+          fi
+          notes=docs/release-notes/$version.md
+          if [ ! -f "$notes" ]; then
+            if $publish; then
+              echo "::error title=Release notes::$notes is missing."
+              exit 1
+            fi
+            echo "::warning title=Release notes::$notes is missing: the dry run uses a placeholder."
+          fi
+          {
+            echo "version=$version"
+            echo "channel=$channel"
+            echo "publish=$publish"
+            echo "sha=$sha"
+          } >>"$GITHUB_OUTPUT"
+          echo "Flux $version ($channel) from ${sha:0:7}; publish: $publish" >>"$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build (macOS ${{ matrix.arch }})
+    needs: verify
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+          # Built on the Apple silicon runner too: cargo, cc and cmake cross-compile cleanly.
+          - arch: x86_64
+            target: x86_64-apple-darwin
+    env:
+      FLUX_BUILD_VERSION: ${{ needs.verify.outputs.version }}
+      FLUX_SIGN_REQUIRED: "1"
+      # The same as Info.plist's LSMinimumSystemVersion, for Rust, C and C++ alike.
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+
+      # A clean build, without caches: what users run is built from the sources alone.
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-wasip2 \
+            --target ${{ matrix.target }} --no-self-update
+          rustup default stable
+          rustc --version
+          {
+            echo "FLUX_COMMIT=$(git rev-parse --short=7 HEAD)"
+            # The temporary keychain of the signing certificate (scripts/ci-keychain.sh).
+            echo "FLUX_SIGN_KEYCHAIN=$RUNNER_TEMP/flux-signing.keychain-db"
+          } >>"$GITHUB_ENV"
+
+      - name: Signing certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: scripts/ci-keychain.sh import "$FLUX_SIGN_KEYCHAIN"
+
+      - name: Flux.app
+        run: scripts/bundle-macos.sh --target ${{ matrix.target }} --out dist/app
+
+      # The signature's designated requirement is what the Keychain's «Always Allow» and Flux's
+      # updater compare: it must be the one of the author's builds ("Flux Dev", its SHA-1), or an
+      # update would be refused and plugin secrets would ask again.
+      - name: Signature
+        env:
+          EXPECTED: identifier "dev.flux.editor" and certificate root = H"0533d3a48216eb94836d8d242d867b295cd2cd43"
+        run: |
+          codesign --verify --deep --strict dist/app/Flux.app
+          codesign -dvv dist/app/Flux.app 2>&1 | grep -E '^(Identifier|Authority|Format)='
+          requirement=$(codesign -d -r- dist/app/Flux.app 2>&1 | sed -n 's/^designated => //p')
+          echo "designated => $requirement"
+          if [ "$requirement" != "$EXPECTED" ]; then
+            echo "::error title=Certificate::Flux.app is signed with another certificate than \"Flux Dev\" (MACOS_CERT_P12): $requirement"
+            exit 1
+          fi
+          lipo -archs dist/app/Flux.app/Contents/MacOS/flux
+
+      - name: Downloads
+        run: |
+          scripts/package-macos.sh dist/app/Flux.app dist
+          /bin/ls -l dist
+
+      - name: Remove the certificate
+        if: always()
+        run: scripts/ci-keychain.sh delete "$FLUX_SIGN_KEYCHAIN"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flux-macos-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.dmg
+          if-no-files-found: error
+          # Zip and ULMO are compressed already.
+          compression-level: 0
+          retention-days: 14
+
+  manifest:
+    name: latest.json
+    needs: [verify, build]
+    # flux-release is built and checked where Flux runs.
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: flux-release
+        run: cargo build --release --locked -p flux-update --bin flux-release
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: flux-macos-*
+          path: dist
+          merge-multiple: true
+
+      # Every archive signed, and the signature checked with the public key Flux has built in: a
+      # secret that doesn't match it would publish updates no Flux accepts.
+      - name: Write and check
+        env:
+          FLUX_UPDATE_PRIVATE_KEY: ${{ secrets.FLUX_UPDATE_PRIVATE_KEY }}
+        run: |
+          notes=docs/release-notes/$VERSION.md
+          if [ ! -f "$notes" ]; then
+            notes=$RUNNER_TEMP/notes.md
+            echo "Flux $VERSION — a dry run without release notes." >"$notes"
+          fi
+          args=()
+          for arch in aarch64 x86_64; do
+            name=Flux-$VERSION-macos-$arch
+            args+=(--platform "macos-$arch=dist/$name.zip,dist/$name.dmg")
+          done
+          target/release/flux-release manifest --version "$VERSION" --date "$(date -u +%F)" \
+            --notes "$notes" \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/v$VERSION" \
+            "${args[@]}" >dist/latest.json
+          for arch in aarch64 x86_64; do
+            signature=$(jq -er --arg key "macos-$arch" '.platforms[$key].signature' dist/latest.json)
+            target/release/flux-release verify "dist/Flux-$VERSION-macos-$arch.zip" "$signature"
+          done
+          jq . dist/latest.json
+          { echo '```json'; cat dist/latest.json; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: latest-json
+          path: dist/latest.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish
+    needs: [verify, manifest]
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      CHANNEL: ${{ needs.verify.outputs.channel }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Stable: GitHub's "latest" release, which releases/latest/download/latest.json follows. Beta:
+      # a pre-release, never "latest" — only the Beta channel reads it.
+      - name: Release
+        run: |
+          flags=(--latest)
+          title="Flux $VERSION"
+          if [ "$CHANNEL" = beta ]; then
+            flags=(--prerelease --latest=false)
+          fi
+          /bin/ls -l dist
+          gh release create "v$VERSION" --verify-tag --title "$title" \
+            --notes-file "docs/release-notes/$VERSION.md" "${flags[@]}" \
+            dist/*.zip dist/*.dmg dist/latest.json
+          echo "Released: https://github.com/$GH_REPO/releases/tag/v$VERSION" >>"$GITHUB_STEP_SUMMARY"

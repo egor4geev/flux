@@ -50,7 +50,10 @@ pub(crate) fn new_session(
         .map(str::trim)
         .filter(|title| !title.is_empty())
         .map(str::to_string);
-    let prompt = spec.prompt.clone().filter(|prompt| !prompt.trim().is_empty());
+    let prompt = spec
+        .prompt
+        .clone()
+        .filter(|prompt| !prompt.trim().is_empty());
     session.update(cx, |session, cx| {
         if let Some(title) = title {
             session.rename(title, cx);
@@ -99,7 +102,10 @@ mod tests {
             not_ready(&CliState::Failed("broken".into())),
             "Claude Code doesn't answer"
         );
-        assert_eq!(not_ready(&CliState::Checking), "Claude Code isn't ready yet");
+        assert_eq!(
+            not_ready(&CliState::Checking),
+            "Claude Code isn't ready yet"
+        );
     }
 
     #[test]

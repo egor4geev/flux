@@ -8,8 +8,14 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Zoom", "Изменить масштаб"),
     ("Next Window", "Следующее окно"),
     ("Previous Window", "Предыдущее окно"),
-    ("Bring All to Front", "Переместить все окна на передний план"),
-    ("Bring All To Front", "Переместить все окна на передний план"),
+    (
+        "Bring All to Front",
+        "Переместить все окна на передний план",
+    ),
+    (
+        "Bring All To Front",
+        "Переместить все окна на передний план",
+    ),
     // Settings → System Settings.
     // «Системные настройки» doesn't fit the sidebar.
     ("System Settings", "Система"),
@@ -17,7 +23,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "How Flux opens projects: when it starts, and when the window already has one.",
         "Как Flux открывает проекты: при запуске и когда в окне уже открыт проект.",
     ),
-    ("Reopen projects on startup", "Открывать проекты при запуске"),
+    (
+        "Reopen projects on startup",
+        "Открывать проекты при запуске",
+    ),
     (
         "Flux started from the Dock or the Finder opens the projects that were open when it quit.",
         "Flux, запущенный из Dock или Finder, открывает проекты, которые были открыты при выходе.",

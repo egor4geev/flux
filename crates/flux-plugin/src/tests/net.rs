@@ -164,7 +164,14 @@ fn an_override_sends_a_service_to_a_fake_one() {
     let Some((mut probe, data)) = net_probe("test.net-override", permissions) else {
         return;
     };
-    ask(&data, "GET", "https://override.flux.test/hello", true, None, "");
+    ask(
+        &data,
+        "GET",
+        "https://override.flux.test/hello",
+        true,
+        None,
+        "",
+    );
     assert_eq!(probe.run("net:fetch"), "fetch: 200 x-test=yes hello");
     // A redirect to the fake service's own address counts as one to the service.
     ask(

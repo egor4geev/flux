@@ -249,7 +249,9 @@ impl ImageView {
         let known = self.modified;
         cx.spawn(async move |this, cx| {
             let modified = cx
-                .background_spawn(async move { std::fs::metadata(&path).and_then(|m| m.modified()) })
+                .background_spawn(
+                    async move { std::fs::metadata(&path).and_then(|m| m.modified()) },
+                )
                 .await
                 .ok();
             if modified.is_some() && modified != known {
@@ -328,7 +330,9 @@ impl ImageView {
                 };
                 let room_w = (f32::from(viewport.width) - 2. * PADDING).max(1.);
                 let room_h = (f32::from(viewport.height) - 2. * PADDING).max(1.);
-                (room_w / width.max(1.)).min(room_h / height.max(1.)).min(1.)
+                (room_w / width.max(1.))
+                    .min(room_h / height.max(1.))
+                    .min(1.)
             }
         }
     }
@@ -399,7 +403,12 @@ impl ImageView {
         window.refresh();
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus_handle);
         self.pan = Some(Pan {
             start: event.position,
@@ -485,7 +494,10 @@ impl ImageView {
         if let Some((width, height)) = self.natural_size() {
             details.push(trf(
                 "{0} × {1} px",
-                &[&format!("{}", width.round()), &format!("{}", height.round())],
+                &[
+                    &format!("{}", width.round()),
+                    &format!("{}", height.round()),
+                ],
             ));
         }
         if self.bytes > 0 {
@@ -494,7 +506,10 @@ impl ImageView {
         if !self.format.is_empty() {
             details.push(self.format.to_string());
         }
-        let svg_file = self.path().filter(|path| is_svg(path)).map(Path::to_path_buf);
+        let svg_file = self
+            .path()
+            .filter(|path| is_svg(path))
+            .map(Path::to_path_buf);
         div()
             .flex_none()
             .h(px(34.))
@@ -535,9 +550,11 @@ impl ImageView {
                     .cursor_pointer()
                     .child("1:1")
                     .tooltip(ui::tooltip(tr("Actual Size"), None))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.actual_size(&ActualSize, window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.actual_size(&ActualSize, window, cx)
+                        }),
+                    ),
             )
             .child(div().w(px(1.)).h(px(16.)).mx_1().bg(ui.divider))
             .child(
@@ -558,9 +575,7 @@ impl ImageView {
             .child(
                 ui::icon_button("image-zoom-in", IconName::Plus, ui)
                     .tooltip(ui::tooltip(tr("Zoom In"), ui::shortcut_for(&ZoomIn, cx)))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx)),
-                    ),
+                    .on_click(cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx))),
             )
             .child(div().flex_1())
             .child(
@@ -659,11 +674,10 @@ impl Render for ImageView {
         let scale = self.scale(viewport);
         let body = match &self.load {
             Load::Loading => message(tr("Loading…").to_string(), ui).into_any_element(),
-            Load::Failed(error) => message(
-                format!("{}\n{error}", tr("Couldn't show the picture")),
-                ui,
-            )
-            .into_any_element(),
+            Load::Failed(error) => {
+                message(format!("{}\n{error}", tr("Couldn't show the picture")), ui)
+                    .into_any_element()
+            }
             Load::Ready(_) => {
                 let (width, height) = self.natural_size().unwrap_or((1., 1.));
                 let shown = size(px(width * scale), px(height * scale));
@@ -938,7 +952,8 @@ fn draw_svg(tree: &usvg::Tree, scale: f32) -> Option<Arc<RenderImage>> {
         let alpha = pixel[3];
         if alpha != 0 && alpha != 255 {
             for channel in &mut pixel[..3] {
-                *channel = ((*channel as u16 * 255 + alpha as u16 / 2) / alpha as u16).min(255) as u8;
+                *channel =
+                    ((*channel as u16 * 255 + alpha as u16 / 2) / alpha as u16).min(255) as u8;
             }
         }
         pixel.swap(0, 2);
@@ -953,8 +968,9 @@ mod tests {
 
     #[test]
     fn pictures_are_told_by_their_extension() {
-        for name in ["a.png", "b.JPG", "c.jpeg", "d.gif", "e.webp", "f.bmp", "g.ico", "h.svg", "i.tiff"]
-        {
+        for name in [
+            "a.png", "b.JPG", "c.jpeg", "d.gif", "e.webp", "f.bmp", "g.ico", "h.svg", "i.tiff",
+        ] {
             assert!(is_image(Path::new(name)), "{name}");
         }
         for name in ["a.rs", "b.txt", "c", "png", "d.svgz"] {

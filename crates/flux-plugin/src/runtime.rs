@@ -38,9 +38,9 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap, Upd
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::api::bindings::Plugin;
-use crate::api::diagnostics::{Diagnostic, FileDiagnostics};
 use crate::api::claude::SessionSpec;
 use crate::api::contexts::ContextRef;
+use crate::api::diagnostics::{Diagnostic, FileDiagnostics};
 use crate::api::dialogs::{Form, Question, TextQuestion};
 use crate::api::editors::TextEdit;
 use crate::api::events::Event;
@@ -1189,9 +1189,15 @@ mod tests {
         enqueue(&mut queue, Call::Event(Event::PickerQuery((1, "t".into()))));
         enqueue(&mut queue, Call::Event(Event::Timer(9)));
         enqueue(&mut queue, Call::Event(Event::PickerQuery((2, "x".into()))));
-        enqueue(&mut queue, Call::Event(Event::PickerQuery((1, "tr".into()))));
+        enqueue(
+            &mut queue,
+            Call::Event(Event::PickerQuery((1, "tr".into()))),
+        );
         enqueue(&mut queue, Call::Event(Event::Timer(9)));
-        enqueue(&mut queue, Call::Event(Event::PickerQuery((1, "tra".into()))));
+        enqueue(
+            &mut queue,
+            Call::Event(Event::PickerQuery((1, "tra".into()))),
+        );
         assert_eq!(
             events(&queue),
             vec![

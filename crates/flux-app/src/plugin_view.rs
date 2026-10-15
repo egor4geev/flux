@@ -548,7 +548,12 @@ impl PluginView {
     }
 
     /// ⇥: the next field of the view, in the order of the elements, takes the keyboard.
-    fn focus_next_field(&mut self, _: &FocusNextField, window: &mut Window, cx: &mut Context<Self>) {
+    fn focus_next_field(
+        &mut self,
+        _: &FocusNextField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(view) = &self.view else {
             return;
         };
@@ -854,17 +859,17 @@ impl PluginView {
                     .and_then(|name| plugin_icon(&self.plugin, name, &ui));
                 let label = action.label.as_deref().map(single_line);
                 let button = match (label, action_icon) {
-                    (Some(label), action_icon) if action.primary => {
-                        ui::primary_button(id, label, true, ui)
-                            .when_some(action_icon, |button, action_icon| {
-                                button
-                                    .pl(px(7.))
-                                    .gap_1()
-                                    .flex_row_reverse()
-                                    .justify_end()
-                                    .child(action_icon.render(ui.accent_text).size(px(13.)))
-                            })
-                    }
+                    (Some(label), action_icon) if action.primary => ui::primary_button(
+                        id, label, true, ui,
+                    )
+                    .when_some(action_icon, |button, action_icon| {
+                        button
+                            .pl(px(7.))
+                            .gap_1()
+                            .flex_row_reverse()
+                            .justify_end()
+                            .child(action_icon.render(ui.accent_text).size(px(13.)))
+                    }),
                     (Some(label), Some(action_icon)) => text_button_with_icon(
                         id,
                         action_icon.render(ui.text_muted).size(px(13.)),
@@ -875,11 +880,16 @@ impl PluginView {
                     (None, Some(action_icon)) => {
                         ui::icon_button_at(id, action_icon.path(), ui).size(px(ROW_ACTION_HEIGHT))
                     }
-                    (None, None) => ui::icon_button(id, IconName::More, ui).size(px(ROW_ACTION_HEIGHT)),
+                    (None, None) => {
+                        ui::icon_button(id, IconName::More, ui).size(px(ROW_ACTION_HEIGHT))
+                    }
                 };
                 // A labelled button is a notch smaller than a toolbar's: it sits on a card.
                 let button = if action.label.is_some() {
-                    button.h(px(ROW_ACTION_HEIGHT)).px(px(8.)).text_size(px(theme::TEXT_SM))
+                    button
+                        .h(px(ROW_ACTION_HEIGHT))
+                        .px(px(8.))
+                        .text_size(px(theme::TEXT_SM))
                 } else {
                     button
                 };
@@ -978,7 +988,12 @@ impl PluginView {
                         .flex()
                         .items_center()
                         .gap(px(TAG_GAP))
-                        .children(row.tags.iter().take(LIST_TAGS).map(|tag| tag_badge(tag, ui)))
+                        .children(
+                            row.tags
+                                .iter()
+                                .take(LIST_TAGS)
+                                .map(|tag| tag_badge(tag, ui)),
+                        )
                         .when(hidden > 0, |tags| {
                             tags.child(ui::badge(format!("+{hidden}"), ui.text_muted))
                         }),
@@ -1333,7 +1348,8 @@ impl PluginView {
             // A column of cards in a row is a board's lane: a tinted surface under its heading and
             // cards, as the columns of Tracker's board.
             ElementKind::Column
-                if parent == Parent::Row && self.holds_cards.get(index).copied().unwrap_or(false) =>
+                if parent == Parent::Row
+                    && self.holds_cards.get(index).copied().unwrap_or(false) =>
             {
                 div()
                     .w_full()
@@ -1576,8 +1592,10 @@ impl PluginView {
             let ElementKind::Properties(properties) = &element.kind else {
                 continue;
             };
-            let labels: Vec<String> =
-                properties.iter().map(|property| single_line(&property.label)).collect();
+            let labels: Vec<String> = properties
+                .iter()
+                .map(|property| single_line(&property.label))
+                .collect();
             let widths: Vec<f32> = labels.iter().map(|label| measure(label)).collect();
             let column = label_column_width(&widths, room);
             self.label_widths.insert(element.id.clone(), column);
@@ -1587,13 +1605,15 @@ impl PluginView {
                 } else {
                     label
                 };
-                let chevron = if property.editable { CHEVRON_SIZE + 4. } else { 0. };
+                let chevron = if property.editable {
+                    CHEVRON_SIZE + 4.
+                } else {
+                    0.
+                };
                 let value_room = room - column - PROPERTY_COLUMN_GAP - chevron;
                 let value = cut_spans(&mut wrapper, &font, &property.value, value_room);
-                self.property_texts.insert(
-                    format!("{}/{}", element.id, property.id),
-                    (label, value),
-                );
+                self.property_texts
+                    .insert(format!("{}/{}", element.id, property.id), (label, value));
             }
         }
     }
@@ -1767,7 +1787,12 @@ impl PluginView {
         }
         // A neutral dropdown reads as a field's button; a toned one keeps its color as a chip.
         let (text_color, background, border, hover) = if neutral {
-            (ui.foreground, ui.input_background, ui.input_border, ui.hover)
+            (
+                ui.foreground,
+                ui.input_background,
+                ui.input_border,
+                ui.hover,
+            )
         } else {
             (
                 color,
@@ -1798,8 +1823,11 @@ impl PluginView {
             .hover(move |style| style.bg(hover))
             .child(div().min_w_0().truncate().child(single_line(&spec.text)))
             .child(
-                icon(IconName::ChevronDown, if neutral { ui.text_muted } else { color })
-                    .size(px(12.)),
+                icon(
+                    IconName::ChevronDown,
+                    if neutral { ui.text_muted } else { color },
+                )
+                .size(px(12.)),
             )
             .on_click(cx.listener(move |this, _, _, cx| this.emit(&element, UiEvent::Clicked, cx)))
             .into_any_element()
@@ -2002,16 +2030,16 @@ impl Render for PluginView {
             .on_action(cx.listener(Self::focus_next_field))
             .map(|frame| match self.chrome {
                 Chrome::Island => frame
-                    .on_drag_move(cx.listener(
-                        |this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
+                    .on_drag_move(
+                        cx.listener(|this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
                             // The handle sits in the gap to the left of the edge.
                             let width = f32::from(event.bounds.right() - event.event.position.x)
                                 - ui::resize_handle_center(ui::style(cx));
                             this.width.set(width);
                             this.resizing = true;
                             cx.notify();
-                        },
-                    ))
+                        }),
+                    )
                     .child(self.render_header(window, cx))
                     .child(ui::divider(ui).mx(px(GAP)))
                     .child(
@@ -2182,7 +2210,10 @@ fn fitting_tags(tags: &[BadgeSpec], width: Option<f32>, window: &mut Window) -> 
         let shaped = text_system.shape_line(text, px(TAG_TEXT_SIZE), &[run], None);
         f32::from(shaped.width) + TAG_PADDING
     };
-    let widths: Vec<f32> = tags.iter().map(|tag| tag_width(&single_line(&tag.text))).collect();
+    let widths: Vec<f32> = tags
+        .iter()
+        .map(|tag| tag_width(&single_line(&tag.text)))
+        .collect();
     fit_widths(&widths, width, |hidden| tag_width(&format!("+{hidden}")))
 }
 
@@ -2239,7 +2270,10 @@ fn keep_bytes(spans: &[Span], keep: usize) -> Vec<Span> {
         let text = single_line(&span.text);
         if left >= text.len() {
             left -= text.len();
-            kept.push(Span { text, ..span.clone() });
+            kept.push(Span {
+                text,
+                ..span.clone()
+            });
             continue;
         }
         let mut end = left;
@@ -2271,8 +2305,7 @@ fn fit_widths(widths: &[f32], room: f32, mut more: impl FnMut(usize) -> f32) -> 
         used = next;
         shown += 1;
     }
-    while shown > 0 && shown < widths.len() && used + TAG_GAP + more(widths.len() - shown) > room
-    {
+    while shown > 0 && shown < widths.len() && used + TAG_GAP + more(widths.len() - shown) > room {
         shown -= 1;
         used = widths[..shown].iter().sum::<f32>() + TAG_GAP * shown.saturating_sub(1) as f32;
     }
@@ -2357,7 +2390,10 @@ fn holds_tree(elements: &[Element]) -> Vec<bool> {
 
 /// Which elements have a tree of cards inside them.
 fn holds_cards(elements: &[Element]) -> Vec<bool> {
-    holds(elements, |kind| matches!(kind, ElementKind::Tree(spec) if spec.cards))
+    holds(
+        elements,
+        |kind| matches!(kind, ElementKind::Tree(spec) if spec.cards),
+    )
 }
 
 /// Which elements have an element of the kind `is` inside them (or are one).
@@ -2893,7 +2929,10 @@ mod tests {
 
     #[test]
     fn an_anchor_scrolled_out_of_sight_isnt_one() {
-        let area = Bounds::new(gpui::point(px(0.), px(100.)), gpui::size(px(300.), px(400.)));
+        let area = Bounds::new(
+            gpui::point(px(0.), px(100.)),
+            gpui::size(px(300.), px(400.)),
+        );
         let at = |y: f32| Bounds::new(gpui::point(px(20.), px(y)), gpui::size(px(80.), px(20.)));
         assert!(in_sight(at(120.), area));
         // Its bottom edge at the area's bottom: still in sight.
@@ -2909,9 +2948,15 @@ mod tests {
         // As wide as the longest label…
         assert_eq!(label_column_width(&[60.4, 95.2, 80.], 400.), 96.);
         // …never narrower than the least width, so short labels still line their values up…
-        assert_eq!(label_column_width(&[20., 31.], 400.), PROPERTY_LABEL_MIN_WIDTH);
+        assert_eq!(
+            label_column_width(&[20., 31.], 400.),
+            PROPERTY_LABEL_MIN_WIDTH
+        );
         // …and not wider than its share of the list: a longer label truncates.
-        assert_eq!(label_column_width(&[300.], 400.), 400. * PROPERTY_LABEL_SHARE);
+        assert_eq!(
+            label_column_width(&[300.], 400.),
+            400. * PROPERTY_LABEL_SHARE
+        );
         // A list too narrow for its share keeps the least width.
         assert_eq!(label_column_width(&[300.], 100.), PROPERTY_LABEL_MIN_WIDTH);
         assert_eq!(label_column_width(&[], 400.), PROPERTY_LABEL_MIN_WIDTH);

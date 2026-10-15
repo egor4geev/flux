@@ -272,7 +272,10 @@ impl ClaudeSession {
                 self.emit(changes, cx);
             }
             Err((path, err)) => {
-                eprintln!("flux: can't read the Claude session {}: {err}", path.display());
+                eprintln!(
+                    "flux: can't read the Claude session {}: {err}",
+                    path.display()
+                );
                 cx.emit(SessionEvent::Changed);
                 cx.notify();
             }
@@ -396,10 +399,14 @@ impl ClaudeSession {
         id: EntryId,
         cx: &mut Context<Self>,
     ) -> Task<Result<EditPoint, String>> {
-        let uuid = self.model.entries.iter().find_map(|entry| match &entry.kind {
-            flux_claude::EntryKind::User(user) if entry.id == id => Some(user.uuid.clone()),
-            _ => None,
-        });
+        let uuid = self
+            .model
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                flux_claude::EntryKind::User(user) if entry.id == id => Some(user.uuid.clone()),
+                _ => None,
+            });
         let Some(uuid) = uuid else {
             return Task::ready(Err(tr("The message isn't in the conversation").to_string()));
         };
@@ -419,7 +426,10 @@ impl ClaudeSession {
         };
         cx.background_spawn(async move {
             match flux_claude::transcript::parent_of(&path, &uuid) {
-                Ok(Some(resume_at)) => Ok(EditPoint { from: id, resume_at }),
+                Ok(Some(resume_at)) => Ok(EditPoint {
+                    from: id,
+                    resume_at,
+                }),
                 Ok(None) => Err(missing),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(missing),
                 Err(err) => Err(err.to_string()),
@@ -698,7 +708,10 @@ impl ClaudeSession {
                 stderr.push_str("(stopped by the user)");
             }
             process.send_context(&shell::input_record(&run.command), false);
-            process.send_context(&shell::output_record(&run.stdout, &stderr, run.exit_code), query);
+            process.send_context(
+                &shell::output_record(&run.stdout, &stderr, run.exit_code),
+                query,
+            );
             let changes = self.model.shell_delivered(id, if query { 1 } else { 2 });
             self.emit(changes, cx);
         }
@@ -962,8 +975,8 @@ impl ClaudeSession {
             CliRequest::CanUseTool(_) => {}
             CliRequest::HookCallback { callback_id, input } if callback_id == EDIT_HOOK => {
                 let response = self.model.hook_response(input);
-                let path = edited_path(input)
-                    .filter(|_| crate::settings::claude(cx).report_problems);
+                let path =
+                    edited_path(input).filter(|_| crate::settings::claude(cx).report_problems);
                 let Some(path) = path else {
                     return process.respond(id, response);
                 };

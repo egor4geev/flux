@@ -83,7 +83,10 @@ pub struct Selection {
 
 impl Selection {
     pub fn new(ranges: Vec<Range>, primary: usize) -> Self {
-        assert!(!ranges.is_empty(), "selection must contain at least one range");
+        assert!(
+            !ranges.is_empty(),
+            "selection must contain at least one range"
+        );
         let primary = primary.min(ranges.len() - 1);
         Self { ranges, primary }.normalize()
     }

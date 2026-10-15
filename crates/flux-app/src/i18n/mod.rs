@@ -54,7 +54,11 @@ pub fn init() {
 /// `app_menu::rebuild`).
 pub fn apply_choice(choice: LanguageChoice) {
     let override_lang = std::env::var("FLUX_LANG").ok();
-    set_lang(resolve(override_lang.as_deref(), choice, &system_languages()));
+    set_lang(resolve(
+        override_lang.as_deref(),
+        choice,
+        &system_languages(),
+    ));
 }
 
 /// The language of a choice: `FLUX_LANG` (`override_lang`) wins, then the choice; "System" is the
@@ -265,13 +269,22 @@ mod tests {
     fn a_choice_gives_its_language_unless_flux_lang_says_otherwise() {
         let system = |tags: &[&str]| tags.iter().map(|t| t.to_string()).collect::<Vec<_>>();
         let russian_mac = system(&["ru-RU", "en-US"]);
-        assert_eq!(resolve(None, LanguageChoice::System, &russian_mac), Lang::Ru);
-        assert_eq!(resolve(None, LanguageChoice::English, &russian_mac), Lang::En);
+        assert_eq!(
+            resolve(None, LanguageChoice::System, &russian_mac),
+            Lang::Ru
+        );
+        assert_eq!(
+            resolve(None, LanguageChoice::English, &russian_mac),
+            Lang::En
+        );
         assert_eq!(
             resolve(None, LanguageChoice::Russian, &system(&["en-US"])),
             Lang::Ru
         );
-        assert_eq!(resolve(None, LanguageChoice::System, &system(&["de"])), Lang::En);
+        assert_eq!(
+            resolve(None, LanguageChoice::System, &system(&["de"])),
+            Lang::En
+        );
         // FLUX_LANG wins over the choice; a value Flux doesn't speak is ignored.
         assert_eq!(
             resolve(Some("en"), LanguageChoice::Russian, &russian_mac),

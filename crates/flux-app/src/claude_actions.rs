@@ -135,7 +135,10 @@ pub fn request(ask: Ask, code: &Code, problems: &[Problem]) -> Option<Request> {
     let request = match ask {
         Ask::Explain => Request {
             title: trf("Explain {0}", &[&short]),
-            text: trf("Explain what the code in {0} does and how it works.", &[&mention]),
+            text: trf(
+                "Explain what the code in {0} does and how it works.",
+                &[&mention],
+            ),
         },
         Ask::Fix => {
             let first = problems.first()?;
@@ -229,7 +232,12 @@ pub fn selected_lines(editor: &Editor) -> Option<(usize, usize)> {
 /// The caret's line (1-based).
 fn caret_line(editor: &Editor) -> usize {
     let text = editor.document.text();
-    let head = editor.document.selection().primary().head.min(text.len_chars());
+    let head = editor
+        .document
+        .selection()
+        .primary()
+        .head
+        .min(text.len_chars());
     text.char_to_line(head) + 1
 }
 
@@ -290,18 +298,20 @@ pub fn actions(root: Div, cx: &mut Context<Workspace>) -> Div {
     .on_action(cx.listener(|this, _: &DocumentWithClaude, window, cx| {
         ask_about_editor(this, Ask::Document, window, cx)
     }))
-    .on_action(cx.listener(|this, action: &FixProblemsWithClaude, window, cx| {
-        let root = this.root().map(Path::to_path_buf);
-        let first = action.problems.iter().map(|problem| problem.line).min();
-        let last = action.problems.iter().map(|problem| problem.line).max();
-        let code = Code {
-            path: cli_path(&action.path, root.as_deref()),
-            lines: first.zip(last),
-        };
-        if let Some(request) = request(Ask::Fix, &code, &action.problems) {
-            send(this, request, window, cx);
-        }
-    }))
+    .on_action(
+        cx.listener(|this, action: &FixProblemsWithClaude, window, cx| {
+            let root = this.root().map(Path::to_path_buf);
+            let first = action.problems.iter().map(|problem| problem.line).min();
+            let last = action.problems.iter().map(|problem| problem.line).max();
+            let code = Code {
+                path: cli_path(&action.path, root.as_deref()),
+                lines: first.zip(last),
+            };
+            if let Some(request) = request(Ask::Fix, &code, &action.problems) {
+                send(this, request, window, cx);
+            }
+        }),
+    )
     .on_action(cx.listener(|this, action: &SendPathsToClaude, window, cx| {
         let root = this.root().map(Path::to_path_buf);
         let mentions = action
@@ -340,7 +350,10 @@ fn ask_about_editor(
     let request = {
         let editor = editor.read(cx);
         let Some(path) = editor.document.path() else {
-            workspace.show_message(tr("Save the file first: Claude reads it from the disk").into(), cx);
+            workspace.show_message(
+                tr("Save the file first: Claude reads it from the disk").into(),
+                cx,
+            );
             return;
         };
         let problems = if ask == Ask::Fix {
@@ -364,7 +377,12 @@ fn ask_about_editor(
 }
 
 /// The request goes to a new session, named after it.
-fn send(workspace: &mut Workspace, request: Request, window: &mut Window, cx: &mut Context<Workspace>) {
+fn send(
+    workspace: &mut Workspace,
+    request: Request,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let input = UserInput {
         text: request.text,
         images: Vec::new(),
@@ -432,7 +450,11 @@ mod tests {
         };
         let explain = request(Ask::Explain, &lines, &[]).unwrap();
         assert_eq!(explain.title, "Explain main.rs:12–20");
-        assert!(explain.text.contains("@src/main.rs#L12-20"), "{}", explain.text);
+        assert!(
+            explain.text.contains("@src/main.rs#L12-20"),
+            "{}",
+            explain.text
+        );
 
         let file = Code {
             path: "src/main.rs".into(),
@@ -491,7 +513,10 @@ mod tests {
     fn paths_are_relative_inside_the_project() {
         let root = Path::new("/p");
         assert_eq!(cli_path(Path::new("/p/src/a.rs"), Some(root)), "src/a.rs");
-        assert_eq!(cli_path(Path::new("/other/b.rs"), Some(root)), "/other/b.rs");
+        assert_eq!(
+            cli_path(Path::new("/other/b.rs"), Some(root)),
+            "/other/b.rs"
+        );
         assert_eq!(
             path_mention(Path::new("/p/My Notes.md"), Some(root)),
             "@\"My Notes.md\""

@@ -29,14 +29,12 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
     Action, AnyElement, App, Bounds, ClickEvent, Context, Corner, DismissEvent, Entity,
-    ExternalPaths, FocusHandle, Focusable, Hsla, Image, ImageFormat, KeyBinding,
-    ObjectFit, Pixels, Render, SharedString, Subscription, Task, Window, actions, anchored,
-    canvas, deferred, div, img, point, prelude::*, px,
+    ExternalPaths, FocusHandle, Focusable, Hsla, Image, ImageFormat, KeyBinding, ObjectFit, Pixels,
+    Render, SharedString, Subscription, Task, Window, actions, anchored, canvas, deferred, div,
+    img, point, prelude::*, px,
 };
 
-use crate::claude_session::{
-    Attachment, ClaudeSession, EditPoint, SessionEvent, with_attachments,
-};
+use crate::claude_session::{Attachment, ClaudeSession, EditPoint, SessionEvent, with_attachments};
 use crate::context_menu::ContextMenu;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, file_icon, icon};
@@ -456,28 +454,36 @@ struct Editing {
 }
 
 impl Composer {
-    pub fn new(session: Entity<ClaudeSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session: Entity<ClaudeSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input = cx.new(|cx| {
-            PromptInput::new(tr("Ask Claude… @ for files, / for commands"), cx).max_rows(MESSAGE_ROWS)
+            PromptInput::new(tr("Ask Claude… @ for files, / for commands"), cx)
+                .max_rows(MESSAGE_ROWS)
         });
         let subscriptions = vec![
-            cx.subscribe(&input, |this, _, event: &PromptInputEvent, cx| match event {
-                PromptInputEvent::Changed => {
-                    this.notice = None;
-                    this.enter_shell_mode(cx);
-                    this.update_suggestions(cx);
-                    cx.notify();
-                }
-                PromptInputEvent::SelectionChanged => this.update_suggestions(cx),
-                PromptInputEvent::ImagePasted(image) if !this.shell_mode => {
-                    this.attach(image.clone(), cx)
-                }
-                PromptInputEvent::ImagePasted(_) => {}
-                PromptInputEvent::BackspaceAtStart if this.shell_mode => {
-                    this.leave_shell_mode(cx)
-                }
-                PromptInputEvent::BackspaceAtStart => {}
-            }),
+            cx.subscribe(
+                &input,
+                |this, _, event: &PromptInputEvent, cx| match event {
+                    PromptInputEvent::Changed => {
+                        this.notice = None;
+                        this.enter_shell_mode(cx);
+                        this.update_suggestions(cx);
+                        cx.notify();
+                    }
+                    PromptInputEvent::SelectionChanged => this.update_suggestions(cx),
+                    PromptInputEvent::ImagePasted(image) if !this.shell_mode => {
+                        this.attach(image.clone(), cx)
+                    }
+                    PromptInputEvent::ImagePasted(_) => {}
+                    PromptInputEvent::BackspaceAtStart if this.shell_mode => {
+                        this.leave_shell_mode(cx)
+                    }
+                    PromptInputEvent::BackspaceAtStart => {}
+                },
+            ),
             // The session refreshes the context meter after each turn itself.
             cx.subscribe(&session, |_, _, _: &SessionEvent, cx| cx.notify()),
         ];
@@ -790,8 +796,9 @@ impl Composer {
                 priority: None,
                 ..input
             };
-            self.session
-                .update(cx, |session, cx| session.send_edited(editing.point, input, cx));
+            self.session.update(cx, |session, cx| {
+                session.send_edited(editing.point, input, cx)
+            });
             self.images = editing.draft_images;
             self.was_empty = editing.draft.is_empty();
             self.input
@@ -832,7 +839,8 @@ impl Composer {
         } else if self.shell_mode {
             self.leave_shell_mode(cx);
         } else if let Some(id) = running_shell {
-            self.session.update(cx, |session, cx| session.stop_shell(id, cx));
+            self.session
+                .update(cx, |session, cx| session.stop_shell(id, cx));
         } else {
             cx.propagate();
         }
@@ -852,10 +860,8 @@ impl Composer {
                 let Ok(Ok(Some(paths))) = paths.await else {
                     return;
                 };
-                this.update_in(cx, |this, window, cx| {
-                    this.add_paths(paths, window, cx)
-                })
-                .ok();
+                this.update_in(cx, |this, window, cx| this.add_paths(paths, window, cx))
+                    .ok();
             })
             .detach();
     }
@@ -1124,7 +1130,10 @@ impl Composer {
     }
 
     fn shown_effort(&self, cx: &App) -> Option<Effort> {
-        Choice::shown(&self.effort_choice, &self.session.read(cx).model().info.effort)
+        Choice::shown(
+            &self.effort_choice,
+            &self.session.read(cx).model().info.effort,
+        )
     }
 
     fn shown_mode(&self, cx: &App) -> PermissionMode {
@@ -1172,7 +1181,10 @@ impl Composer {
                     for info in &models {
                         menu = menu.entry_if(
                             !info.disabled,
-                            mark(current.as_deref() == Some(info.value.as_str()), &info.display_name),
+                            mark(
+                                current.as_deref() == Some(info.value.as_str()),
+                                &info.display_name,
+                            ),
                             ChooseModel {
                                 value: Some(info.value.clone().into()),
                             },
@@ -1213,10 +1225,8 @@ impl Composer {
                         PermissionMode::Plan,
                         PermissionMode::DontAsk,
                     ] {
-                        menu = menu.entry(
-                            mark(current == mode, mode_label(mode)),
-                            ChooseMode { mode },
-                        );
+                        menu = menu
+                            .entry(mark(current == mode, mode_label(mode)), ChooseMode { mode });
                     }
                     if bypass || current == PermissionMode::BypassPermissions {
                         menu = menu.separator().entry(
@@ -1252,7 +1262,12 @@ impl Composer {
         cx.notify();
     }
 
-    fn close_menu(&mut self, menu: &Entity<ContextMenu>, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_menu(
+        &mut self,
+        menu: &Entity<ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.menu.as_ref().is_none_or(|open| open.menu != *menu) {
             return;
         }
@@ -1277,39 +1292,43 @@ impl Composer {
         }
         // A plugin's attachment (part 10.3): its label; the whole text in the tooltip's place is
         // too long — the tooltip says it goes along.
-        let attachment_chips = self.attachments.iter().enumerate().map(|(index, attachment)| {
-            div()
-                .id(("claude-attachment-chip", index))
-                .h(px(24.))
-                .pl(px(6.))
-                .pr(px(2.))
-                .flex()
-                .items_center()
-                .gap(px(5.))
-                .rounded(px(RADIUS_SM))
-                .bg(ui.hover)
-                .border_1()
-                .border_color(ui.input_border)
-                .text_size(px(theme::TEXT_SM))
-                .text_color(ui.foreground)
-                .tooltip(ui::tooltip(
-                    trf("{0} goes with the message", &[&attachment.label]),
-                    None,
-                ))
-                .child(icon(IconName::Paperclip, ui.text_muted).size(px(13.)))
-                .child(div().whitespace_nowrap().child(attachment.label.clone()))
-                .child(
-                    ui::icon_button(("claude-attachment-remove", index), IconName::Close, ui)
-                        .size(px(18.))
-                        .tooltip(ui::tooltip(tr("Remove"), None))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            if index < this.attachments.len() {
-                                this.attachments.remove(index);
-                            }
-                            cx.notify();
-                        })),
-                )
-        });
+        let attachment_chips = self
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                div()
+                    .id(("claude-attachment-chip", index))
+                    .h(px(24.))
+                    .pl(px(6.))
+                    .pr(px(2.))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .rounded(px(RADIUS_SM))
+                    .bg(ui.hover)
+                    .border_1()
+                    .border_color(ui.input_border)
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(ui.foreground)
+                    .tooltip(ui::tooltip(
+                        trf("{0} goes with the message", &[&attachment.label]),
+                        None,
+                    ))
+                    .child(icon(IconName::Paperclip, ui.text_muted).size(px(13.)))
+                    .child(div().whitespace_nowrap().child(attachment.label.clone()))
+                    .child(
+                        ui::icon_button(("claude-attachment-remove", index), IconName::Close, ui)
+                            .size(px(18.))
+                            .tooltip(ui::tooltip(tr("Remove"), None))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                if index < this.attachments.len() {
+                                    this.attachments.remove(index);
+                                }
+                                cx.notify();
+                            })),
+                    )
+            });
         let context_chip = context.map(|context| {
             let file = file_icon(&context.path, &ui);
             div()
@@ -1354,11 +1373,7 @@ impl Composer {
                 .border_1()
                 .border_color(ui.input_border)
                 .overflow_hidden()
-                .child(
-                    img(image.clone())
-                        .size_full()
-                        .object_fit(ObjectFit::Cover),
-                )
+                .child(img(image.clone()).size_full().object_fit(ObjectFit::Cover))
                 .child(
                     div()
                         .id(("claude-image-remove", index))
@@ -1479,11 +1494,7 @@ impl Composer {
     fn render_footer(&self, has_message: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let send = self.render_send(ui, has_message, cx);
-        let row = div()
-            .h(px(FOOTER_HEIGHT))
-            .flex()
-            .items_center()
-            .gap(px(1.));
+        let row = div().h(px(FOOTER_HEIGHT)).flex().items_center().gap(px(1.));
         if self.shell_mode {
             let note = if settings::claude(cx).respond_to_commands {
                 tr("Claude answers the output")
@@ -1544,7 +1555,14 @@ impl Composer {
                 Some(effort) => effort_short(effort),
                 None => tr("Effort"),
             };
-            self.render_picker(Picker::Effort, label.into(), ui.text_muted, tr("Effort"), false, cx)
+            self.render_picker(
+                Picker::Effort,
+                label.into(),
+                ui.text_muted,
+                tr("Effort"),
+                false,
+                cx,
+            )
         });
         let ring = context.map(|usage| {
             context_ring(usage.fraction(), !narrow, ui).tooltip(ui::tooltip(
@@ -1557,7 +1575,9 @@ impl Composer {
         });
         let attach = ui::icon_button("claude-attach", IconName::Paperclip, ui)
             .tooltip(ui::tooltip(tr("Attach pictures or files"), None))
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.choose_files(window, cx)));
+            .on_click(
+                cx.listener(|this, _: &ClickEvent, window, cx| this.choose_files(window, cx)),
+            );
         row.child(self.render_picker(
             Picker::Model,
             model_name,
@@ -1584,7 +1604,11 @@ impl Composer {
     fn render_list(&mut self, ui: UiColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         let card = self.card_bounds?;
         let items = self.items(cx);
-        let selected = self.suggestions.as_ref()?.selected.min(items.len().saturating_sub(1));
+        let selected = self
+            .suggestions
+            .as_ref()?
+            .selected
+            .min(items.len().saturating_sub(1));
         if items.is_empty() {
             return None;
         }
@@ -1601,7 +1625,9 @@ impl Composer {
                 .overflow_hidden()
                 .cursor_pointer()
                 .when(index == selected, |row| row.bg(ui.list_selected))
-                .when(index != selected, |row| row.hover(|style| style.bg(ui.hover)))
+                .when(index != selected, |row| {
+                    row.hover(|style| style.bg(ui.hover))
+                })
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.accept(index, window, cx)
                 }));
@@ -1617,18 +1643,12 @@ impl Composer {
                         .map(|position| position - skip)
                         .collect();
                     row.child(file_icon(&name, &ui).render().size(px(14.)))
-                        .child(
-                            div()
-                                .flex_none()
-                                .child(highlighted_text(name, &name_positions, ui.match_text)),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(ui.dim)
-                                .child(dir),
-                        )
+                        .child(div().flex_none().child(highlighted_text(
+                            name,
+                            &name_positions,
+                            ui.match_text,
+                        )))
+                        .child(div().min_w_0().truncate().text_color(ui.dim).child(dir))
                 }
                 Item::Command {
                     name,
@@ -1688,7 +1708,12 @@ impl Composer {
 
     /// Send (an accent square; green in shell mode — Run) and Stop: Claude's turn, or the running
     /// `!` command when Claude is idle.
-    fn render_send(&self, ui: UiColors, has_message: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_send(
+        &self,
+        ui: UiColors,
+        has_message: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let session = self.session.read(cx);
         let working = session.model().is_working();
         let shell_running = session.running_shell().is_some();
@@ -1715,8 +1740,15 @@ impl Composer {
                         .hover(move |style| style.bg(ui.pressed))
                 })
                 .child(
-                    icon(name, if fill.is_some() { ui.on_accent } else { ui.foreground })
-                        .size(px(14.)),
+                    icon(
+                        name,
+                        if fill.is_some() {
+                            ui.on_accent
+                        } else {
+                            ui.foreground
+                        },
+                    )
+                    .size(px(14.)),
                 )
         };
         if self.shell_mode {
@@ -1724,29 +1756,37 @@ impl Composer {
                 button("claude-run", IconName::ArrowUp, Some(ui.success))
                     .when(!has_message, |button| button.opacity(0.5).cursor_default())
                     .tooltip(ui::tooltip(tr("Run"), Some("↵".into())))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.send(None, window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, window, cx| this.send(None, window, cx)),
+                    ),
             );
         }
         let stop = (working || shell_running && !has_message).then(|| {
-            let label = if working { tr("Stop") } else { tr("Stop the command") };
+            let label = if working {
+                tr("Stop")
+            } else {
+                tr("Stop the command")
+            };
             button("claude-stop", IconName::Stop, None)
                 .tooltip(ui::tooltip(label, Some("Esc".into())))
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.stop(&Stop, window, cx)
-                }))
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| this.stop(&Stop, window, cx)),
+                )
         });
         let send = (has_message || stop.is_none()).then(|| {
             button("claude-send", IconName::ArrowUp, Some(ui.accent))
                 .when(!has_message, |button| button.opacity(0.5).cursor_default())
                 .tooltip(ui::tooltip(
-                    if working { tr("Send after the turn") } else { tr("Send") },
+                    if working {
+                        tr("Send after the turn")
+                    } else {
+                        tr("Send")
+                    },
                     Some("↵".into()),
                 ))
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.send(None, window, cx)
-                }))
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| this.send(None, window, cx)),
+                )
         });
         div()
             .flex()
@@ -1794,7 +1834,10 @@ fn context_ring(fraction: f32, percent: bool, ui: UiColors) -> gpui::Stateful<gp
                 circle(&mut arc);
             } else {
                 let angle = fraction * std::f32::consts::TAU;
-                let end = point(center.x + radius * angle.sin(), center.y - radius * angle.cos());
+                let end = point(
+                    center.x + radius * angle.sin(),
+                    center.y - radius * angle.cos(),
+                );
                 arc.move_to(top);
                 arc.arc_to(point(radius, radius), px(0.), fraction > 0.5, true, end);
             }
@@ -1813,9 +1856,15 @@ fn context_ring(fraction: f32, percent: bool, ui: UiColors) -> gpui::Stateful<gp
         .gap(px(5.))
         .px(px(4.))
         .text_size(px(theme::TEXT_XS))
-        .text_color(if fraction >= 0.7 { color } else { ui.text_muted })
+        .text_color(if fraction >= 0.7 {
+            color
+        } else {
+            ui.text_muted
+        })
         .child(ring)
-        .when(percent, |meter| meter.child(format!("{:.0}%", fraction * 100.)))
+        .when(percent, |meter| {
+            meter.child(format!("{:.0}%", fraction * 100.))
+        })
 }
 
 /// The byte offset of character `index` in `text`.
@@ -1855,10 +1904,12 @@ impl Render for Composer {
         };
         self.input
             .update(cx, |input, _| input.set_placeholder(placeholder));
-        let has_message = !self.input.read(cx).is_empty()
-            || !self.shell_mode && !self.images.is_empty();
+        let has_message =
+            !self.input.read(cx).is_empty() || !self.shell_mode && !self.images.is_empty();
         let focused = self.input.focus_handle(cx).is_focused(window);
-        let chips = (!self.shell_mode).then(|| self.render_chips(ui, cx)).flatten();
+        let chips = (!self.shell_mode)
+            .then(|| self.render_chips(ui, cx))
+            .flatten();
         let footer = self.render_footer(has_message, cx);
         let (border, ring) = if self.shell_mode {
             (ui.success, UiColors::tint(ui.success, 0.2))
@@ -1891,7 +1942,11 @@ impl Render for Composer {
                 .items_center()
                 .gap(px(6.))
                 .text_size(px(theme::TEXT_SM))
-                .child(icon(IconName::Pencil, ui.accent_text).size(px(12.)).flex_none())
+                .child(
+                    icon(IconName::Pencil, ui.accent_text)
+                        .size(px(12.))
+                        .flex_none(),
+                )
                 .child(
                     div()
                         .min_w_0()
@@ -1925,7 +1980,10 @@ impl Render for Composer {
             deferred(
                 anchored()
                     .anchor(Corner::BottomLeft)
-                    .position(point(open.anchor.left(), open.anchor.top() - px(popup::POPUP_GAP)))
+                    .position(point(
+                        open.anchor.left(),
+                        open.anchor.top() - px(popup::POPUP_GAP),
+                    ))
                     .snap_to_window_with_margin(px(popup::WINDOW_MARGIN))
                     .child(open.menu.clone()),
             )
@@ -2005,16 +2063,18 @@ impl Render for Composer {
             }))
             .on_action(cx.listener(Self::stop))
             .on_action(cx.listener(Self::cycle_mode))
-            .on_action(cx.listener(|this, _: &prompt_input::MenuNext, _, cx| {
-                this.move_selection(1, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &prompt_input::MenuNext, _, cx| this.move_selection(1, cx)),
+            )
             .on_action(cx.listener(|this, _: &prompt_input::MenuPrevious, _, cx| {
                 this.move_selection(-1, cx)
             }))
-            .on_action(cx.listener(|this, _: &prompt_input::MenuAccept, window, cx| {
-                let selected = this.suggestions.as_ref().map_or(0, |open| open.selected);
-                this.accept(selected, window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &prompt_input::MenuAccept, window, cx| {
+                    let selected = this.suggestions.as_ref().map_or(0, |open| open.selected);
+                    this.accept(selected, window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &prompt_input::MenuDismiss, _, cx| {
                 this.dismiss_suggestions(cx)
             }))
@@ -2040,9 +2100,9 @@ impl Render for Composer {
                     .update(cx, |session, cx| session.set_effort(Some(effort), cx));
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, action: &ChooseMode, _, cx| {
-                this.choose_mode(action.mode, cx)
-            }))
+            .on_action(
+                cx.listener(|this, action: &ChooseMode, _, cx| this.choose_mode(action.mode, cx)),
+            )
             .flex()
             .flex_col()
             .px(px(10.))
@@ -2127,7 +2187,10 @@ mod tests {
 
     #[test]
     fn modes_cycle_like_the_cli() {
-        assert_eq!(next_mode(PermissionMode::Default), PermissionMode::AcceptEdits);
+        assert_eq!(
+            next_mode(PermissionMode::Default),
+            PermissionMode::AcceptEdits
+        );
         assert_eq!(next_mode(PermissionMode::AcceptEdits), PermissionMode::Plan);
         assert_eq!(next_mode(PermissionMode::Plan), PermissionMode::Default);
         assert_eq!(next_mode(PermissionMode::DontAsk), PermissionMode::Default);

@@ -527,7 +527,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("flux-projects-test-{}", std::process::id()));
         let file = dir.join("projects.json");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(&file, r#"{"future": 1, "projects": {"/other": {"tabs": []}}}"#).unwrap();
+        fs::write(
+            &file,
+            r#"{"future": 1, "projects": {"/other": {"tabs": []}}}"#,
+        )
+        .unwrap();
         let mut value = read(&file);
         put_project(&mut value, Path::new("/p"), &state(), 1);
         write(&file, &value).unwrap();

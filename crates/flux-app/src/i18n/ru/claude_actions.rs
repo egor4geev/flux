@@ -21,9 +21,15 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     // The ready requests.
     ("Explain with Claude", "Объяснить с помощью Claude"),
     ("Fix with Claude", "Исправить с помощью Claude"),
-    ("Find Problems with Claude", "Найти проблемы с помощью Claude"),
+    (
+        "Find Problems with Claude",
+        "Найти проблемы с помощью Claude",
+    ),
     ("Write Tests with Claude", "Написать тесты с помощью Claude"),
-    ("Add Documentation with Claude", "Написать документацию с помощью Claude"),
+    (
+        "Add Documentation with Claude",
+        "Написать документацию с помощью Claude",
+    ),
     ("More actions…", "Другие действия…"),
     ("No problems here", "Здесь нет проблем"),
     (

@@ -147,10 +147,7 @@ impl Rules {
         // before it, up to as many dots as the rules' extensions have.
         let mut dots = lower.rmatch_indices('.').map(|(index, _)| index);
         let mut candidates: [Option<usize>; 4] = [None; 4];
-        for slot in candidates
-            .iter_mut()
-            .take((self.extension_dots + 1).min(4))
-        {
+        for slot in candidates.iter_mut().take((self.extension_dots + 1).min(4)) {
             *slot = dots.next();
         }
         for index in candidates.iter().rev().flatten() {
@@ -190,7 +187,10 @@ pub fn load_plugin_icons(plugins: &[Arc<PluginEntry>], cx: &mut App) -> Vec<(Str
     for entry in plugins {
         let manifest = &entry.manifest;
         let has_icons = !manifest.icon_themes.is_empty()
-            || manifest.languages.iter().any(|language| language.icon.is_some());
+            || manifest
+                .languages
+                .iter()
+                .any(|language| language.icon.is_some());
         if !has_icons {
             continue;
         }
@@ -327,9 +327,9 @@ impl IconTheme {
 /// Reads an icon set's file (`docs/icon-themes.md`) of the plugin `plugin`: its SVGs become that
 /// plugin's assets.
 pub fn parse_icon_theme(plugin: &str, text: &str) -> Result<IconTheme, String> {
-    let table: toml::Table = text.parse().map_err(|err: toml::de::Error| {
-        err.message().to_string()
-    })?;
+    let table: toml::Table = text
+        .parse()
+        .map_err(|err: toml::de::Error| err.message().to_string())?;
     let mut name = None;
     let mut defaults = Defaults::default();
     let mut rules = Rules::default();
@@ -379,7 +379,8 @@ pub fn parse_icon_theme(plugin: &str, text: &str) -> Result<IconTheme, String> {
                                     "{path}: extensions go without the leading dot"
                                 ));
                             }
-                            rules.extension_dots = rules.extension_dots.max(lower.matches('.').count());
+                            rules.extension_dots =
+                                rules.extension_dots.max(lower.matches('.').count());
                             rules.extensions.insert(lower, entry);
                         }
                     }
@@ -560,7 +561,9 @@ pub fn apply(cx: &mut App) {
 
 /// Chooses a set (Settings, Quick Switch): saved in the settings and put in use.
 pub fn select(name: &str, cx: &mut App) {
-    settings::update_appearance(cx, |appearance| appearance.icon_theme = Some(name.to_string()));
+    settings::update_appearance(cx, |appearance| {
+        appearance.icon_theme = Some(name.to_string())
+    });
     apply(cx);
 }
 
@@ -679,7 +682,12 @@ pub(crate) mod tests {
     }
 
     fn icon_of(theme: &IconTheme, name: &str, ui: &UiColors) -> Option<FileIcon> {
-        resolve_with(Some(theme), &Rules::default(), &name.to_ascii_lowercase(), ui)
+        resolve_with(
+            Some(theme),
+            &Rules::default(),
+            &name.to_ascii_lowercase(),
+            ui,
+        )
     }
 
     /// The icon file a set gives a name, as `(file stem, color)`.
@@ -762,26 +770,146 @@ pub(crate) mod tests {
 
     /// Names covering every rule of the table before 8.3, and some it doesn't know.
     const NAMES: &[&str] = &[
-        "Cargo.toml", "package.json", "Cargo.lock", "package-lock.json", "yarn.lock",
-        "pnpm-lock.yaml", "bun.lockb", "poetry.lock", "Gemfile.lock", "composer.lock",
-        "flake.lock", ".gitignore", ".gitattributes", ".gitmodules", ".gitkeep", "Dockerfile",
-        ".dockerignore", "docker-compose.yml", "docker-compose.yaml", "compose.yml",
-        "compose.yaml", "README", "README.md", "readme.markdown", "README.txt", "Makefile",
-        "GNUmakefile", "justfile", "go.mod", "go.sum", "rust-toolchain", "rust-toolchain.toml",
-        "tsconfig.json", "jsconfig.json", "LICENSE", "LICENSE-MIT", "licence.txt", "COPYING",
-        ".env", ".env.local", "main.rs", "a.ts", "a.mts", "a.cts", "a.js", "a.mjs", "a.cjs",
-        "App.tsx", "App.jsx", "a.json", "a.jsonc", "a.json5", "a.md", "a.markdown", "a.mdx",
-        "config.toml", "a.yaml", "a.yml", "a.py", "a.pyi", "a.pyw", "a.go", "a.sh", "a.bash",
-        "a.zsh", "a.fish", "a.ksh", "a.swift", "a.c", "a.h", "a.cc", "a.cpp", "a.cxx", "a.hpp",
-        "a.hh", "a.m", "a.mm", "a.html", "a.htm", "a.xhtml", "a.css", "a.scss", "a.sass",
-        "a.less", "x.lock", "a.png", "a.jpg", "a.jpeg", "a.gif", "a.svg", "a.webp", "a.ico",
-        "a.bmp", "a.tiff", "a.avif", "a.icns", "a.zip", "a.tar", "archive.tar.gz", "a.tgz",
-        "a.bz2", "a.xz", "a.7z", "a.rar", "a.zst", "a.dmg", "a.txt", "a.log", "a.text",
-        "a.rst", "x.env", "a.ini", "a.cfg", "a.conf", "a.editorconfig", "a.properties",
-        "a.plist", "a.rb", "a.java", "a.xml", "a.svelte", "a.kt", "a.kts", "a.wasm", "a.wat",
-        "a.php", "a.lua", "a.dart", "a.sql", "a.vue", "a.zig", "types.d.ts", "LIB.RS",
-        "Без расширения", "trailing.", "no_extension", ".bashrc", "Dockerfile.dev",
-        "notes.md.txt", "a.unknown",
+        "Cargo.toml",
+        "package.json",
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lockb",
+        "poetry.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        "flake.lock",
+        ".gitignore",
+        ".gitattributes",
+        ".gitmodules",
+        ".gitkeep",
+        "Dockerfile",
+        ".dockerignore",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+        "README",
+        "README.md",
+        "readme.markdown",
+        "README.txt",
+        "Makefile",
+        "GNUmakefile",
+        "justfile",
+        "go.mod",
+        "go.sum",
+        "rust-toolchain",
+        "rust-toolchain.toml",
+        "tsconfig.json",
+        "jsconfig.json",
+        "LICENSE",
+        "LICENSE-MIT",
+        "licence.txt",
+        "COPYING",
+        ".env",
+        ".env.local",
+        "main.rs",
+        "a.ts",
+        "a.mts",
+        "a.cts",
+        "a.js",
+        "a.mjs",
+        "a.cjs",
+        "App.tsx",
+        "App.jsx",
+        "a.json",
+        "a.jsonc",
+        "a.json5",
+        "a.md",
+        "a.markdown",
+        "a.mdx",
+        "config.toml",
+        "a.yaml",
+        "a.yml",
+        "a.py",
+        "a.pyi",
+        "a.pyw",
+        "a.go",
+        "a.sh",
+        "a.bash",
+        "a.zsh",
+        "a.fish",
+        "a.ksh",
+        "a.swift",
+        "a.c",
+        "a.h",
+        "a.cc",
+        "a.cpp",
+        "a.cxx",
+        "a.hpp",
+        "a.hh",
+        "a.m",
+        "a.mm",
+        "a.html",
+        "a.htm",
+        "a.xhtml",
+        "a.css",
+        "a.scss",
+        "a.sass",
+        "a.less",
+        "x.lock",
+        "a.png",
+        "a.jpg",
+        "a.jpeg",
+        "a.gif",
+        "a.svg",
+        "a.webp",
+        "a.ico",
+        "a.bmp",
+        "a.tiff",
+        "a.avif",
+        "a.icns",
+        "a.zip",
+        "a.tar",
+        "archive.tar.gz",
+        "a.tgz",
+        "a.bz2",
+        "a.xz",
+        "a.7z",
+        "a.rar",
+        "a.zst",
+        "a.dmg",
+        "a.txt",
+        "a.log",
+        "a.text",
+        "a.rst",
+        "x.env",
+        "a.ini",
+        "a.cfg",
+        "a.conf",
+        "a.editorconfig",
+        "a.properties",
+        "a.plist",
+        "a.rb",
+        "a.java",
+        "a.xml",
+        "a.svelte",
+        "a.kt",
+        "a.kts",
+        "a.wasm",
+        "a.wat",
+        "a.php",
+        "a.lua",
+        "a.dart",
+        "a.sql",
+        "a.vue",
+        "a.zig",
+        "types.d.ts",
+        "LIB.RS",
+        "Без расширения",
+        "trailing.",
+        "no_extension",
+        ".bashrc",
+        "Dockerfile.dev",
+        "notes.md.txt",
+        "a.unknown",
     ];
 
     #[test]
@@ -810,15 +938,10 @@ pub(crate) mod tests {
         assert_eq!(set.name.as_ref(), FLUX_ICONS);
         let missing = set.drop_missing(|path| bundled.files.read(path).is_some());
         assert!(missing.is_empty(), "{missing:?}");
-        for (path, svg) in bundled
-            .files
-            .list("icons/")
-            .into_iter()
-            .map(|path| {
-                let svg = bundled.files.read(&path).unwrap();
-                (path, String::from_utf8(svg.into_owned()).unwrap())
-            })
-        {
+        for (path, svg) in bundled.files.list("icons/").into_iter().map(|path| {
+            let svg = bundled.files.read(&path).unwrap();
+            (path, String::from_utf8(svg.into_owned()).unwrap())
+        }) {
             assert!(svg.contains("viewBox=\"0 0 16 16\""), "{path}");
         }
     }
@@ -845,10 +968,18 @@ name = "Test"
         let ui = Theme::flux_night().ui;
         let stem = |name: &str| icon_of(&set, name, &ui).map(|icon| stem_and_color(&icon).0);
         assert_eq!(stem("special.txt").as_deref(), Some("special"));
-        assert_eq!(stem("LICENSE.txt").as_deref(), Some("long"), "the longest prefix");
+        assert_eq!(
+            stem("LICENSE.txt").as_deref(),
+            Some("long"),
+            "the longest prefix"
+        );
         assert_eq!(stem("lichen.txt").as_deref(), Some("short"));
         assert_eq!(stem("notes.txt").as_deref(), Some("text"));
-        assert_eq!(stem("index.d.ts").as_deref(), Some("dts"), "the longest extension");
+        assert_eq!(
+            stem("index.d.ts").as_deref(),
+            Some("dts"),
+            "the longest extension"
+        );
         assert_eq!(stem("index.ts").as_deref(), Some("ts"));
         assert_eq!(stem("a.b.tar.gz").as_deref(), Some("tgz"));
         assert_eq!(stem("plain.gz"), None);
@@ -893,9 +1024,17 @@ file = { icon = "icons/file.svg", color = "dim" }
                 .map(|icon| stem_and_color(&icon).0)
         };
         assert_eq!(stem("main.rs").as_deref(), Some("rust"), "the set wins");
-        assert_eq!(stem("Main.kt").as_deref(), Some("kotlin"), "then the language's");
+        assert_eq!(
+            stem("Main.kt").as_deref(),
+            Some("kotlin"),
+            "then the language's"
+        );
         assert_eq!(stem("kotlinfile").as_deref(), Some("kotlin"));
-        assert_eq!(stem("notes.xyz").as_deref(), Some("file"), "then the set's default");
+        assert_eq!(
+            stem("notes.xyz").as_deref(),
+            Some("file"),
+            "then the set's default"
+        );
         let without_set = resolve_with(None, &languages, "main.rs", &ui).unwrap();
         assert_eq!(stem_and_color(&without_set).0, "ferris");
         assert_eq!(resolve_with(None, &languages, "notes.xyz", &ui), None);
@@ -923,7 +1062,11 @@ folder = { icon = "icons/folder.svg", color = "folder" }
         other.folder = gpui::rgb(0x654321).into();
         let rust = |ui: &UiColors| icon_of(&set, "a.rs", ui).unwrap();
         assert_eq!(rust(&night).color, night.orange);
-        assert_eq!(rust(&other).color, other.orange, "a shade of the theme in use");
+        assert_eq!(
+            rust(&other).color,
+            other.orange,
+            "a shade of the theme in use"
+        );
         assert!(!rust(&night).multicolor);
         let go = icon_of(&set, "a.go", &other).unwrap();
         assert_eq!(go.color, Hsla::from(gpui::rgb(0x00add8)));
@@ -945,24 +1088,37 @@ folder = { icon = "icons/folder.svg", color = "folder" }
         let error = |text: &str| parse_icon_theme("test.set", text).unwrap_err();
         assert!(error("[extensions]\nrs = { icon = \"icons/rust.svg\" }").contains("name"));
         assert!(
-            error("name = \"T\"\n[extensions]\nrs = { icon = \"icons/rust.svg\", color = \"oranje\" }")
-                .contains("extensions.\"rs\".color")
+            error(
+                "name = \"T\"\n[extensions]\nrs = { icon = \"icons/rust.svg\", color = \"oranje\" }"
+            )
+            .contains("extensions.\"rs\".color")
         );
         assert!(
             error("name = \"T\"\n[extensions]\nrs = { icon = \"../rust.svg\", color = \"red\" }")
                 .contains("extensions.\"rs\".icon")
         );
         assert!(
-            error("name = \"T\"\n[extensions]\nrs = { icon = \"icons/rust.png\", color = \"red\" }")
-                .contains("SVG")
+            error(
+                "name = \"T\"\n[extensions]\nrs = { icon = \"icons/rust.png\", color = \"red\" }"
+            )
+            .contains("SVG")
         );
         assert!(
             error("name = \"T\"\n[extensions]\nrs = { icon = \"icons/rust.svg\", size = 3 }")
                 .contains("extensions.\"rs\".size")
         );
-        assert!(error("name = \"T\"\n[extensions]\n\".rs\" = { icon = \"icons/rust.svg\" }").contains("dot"));
-        assert!(error("name = \"T\"\n[folders]\nsrc = { icon = \"icons/src.svg\" }").contains("folders"));
-        assert!(error("name = \"T\"\n[defaults]\ndir = { icon = \"icons/d.svg\" }").contains("defaults.dir"));
+        assert!(
+            error("name = \"T\"\n[extensions]\n\".rs\" = { icon = \"icons/rust.svg\" }")
+                .contains("dot")
+        );
+        assert!(
+            error("name = \"T\"\n[folders]\nsrc = { icon = \"icons/src.svg\" }")
+                .contains("folders")
+        );
+        assert!(
+            error("name = \"T\"\n[defaults]\ndir = { icon = \"icons/d.svg\" }")
+                .contains("defaults.dir")
+        );
         assert!(
             error("name = \"T\"\n[extensions]\nrs = { icon = \"icons/r.svg\", color = \"red\", tint = \"red\" }")
                 .contains("tint")

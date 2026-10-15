@@ -28,9 +28,9 @@ use flux_lsp::lsp_types::request::{
     GotoDefinition, HoverRequest, References, WorkspaceSymbolRequest,
 };
 use flux_lsp::lsp_types::{
-    self, GotoDefinitionParams, HoverContents, HoverParams, MarkedString, OneOf,
-    ReferenceContext, ReferenceParams, SymbolKind, TextDocumentIdentifier,
-    TextDocumentPositionParams, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    self, GotoDefinitionParams, HoverContents, HoverParams, MarkedString, OneOf, ReferenceContext,
+    ReferenceParams, SymbolKind, TextDocumentIdentifier, TextDocumentPositionParams,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use flux_lsp::{LanguageServer, position};
 use futures::channel::oneshot;
@@ -182,7 +182,10 @@ pub fn call(
 
 /// The file a tool names: relative to the project root or absolute; it must exist.
 fn resolve_path(root: Option<&Path>, input: &Value) -> Result<PathBuf, String> {
-    let Some(given) = input["path"].as_str().filter(|path| !path.trim().is_empty()) else {
+    let Some(given) = input["path"]
+        .as_str()
+        .filter(|path| !path.trim().is_empty())
+    else {
         return Err("`path` is required.".into());
     };
     let path = Path::new(given.trim());
@@ -236,7 +239,9 @@ fn resolve_position(text: &Rope, input: &Value) -> Result<usize, String> {
         return Err("`line` is required (1-based).".into());
     };
     if line == 0 || line > lines {
-        return Err(format!("Line {line} is out of range: the file has {lines} lines."));
+        return Err(format!(
+            "Line {line} is out of range: the file has {lines} lines."
+        ));
     }
     let start = line_start(text, line - 1);
     let content: String = text
@@ -253,7 +258,11 @@ fn resolve_position(text: &Rope, input: &Value) -> Result<usize, String> {
         }
         return Ok(start + column - 1);
     }
-    let Some(symbol) = input["symbol"].as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(symbol) = input["symbol"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
         return Err("Give `symbol` (the name on that line) or `column`.".into());
     };
     match find_symbol(&content, symbol) {
@@ -332,7 +341,9 @@ fn server_problem(lsp: &LspStore, path: &Path, shown_path: &str) -> String {
         Some(FileServers::Starting(name)) => {
             format!("{name} is still starting for {shown_path}; try again in a moment.")
         }
-        Some(FileServers::Missing(name)) => format!("{name} is not installed, so Flux can't answer."),
+        Some(FileServers::Missing(name)) => {
+            format!("{name} is not installed, so Flux can't answer.")
+        }
         Some(FileServers::Failed(name, reason)) => format!("{name} stopped: {reason}"),
         None if !lsp.serves(path) => {
             format!("Flux has no language server for {shown_path}.")
@@ -363,7 +374,9 @@ fn file_server(
     if editor_for(workspace, path, cx).is_none()
         && !lsp.update(cx, |lsp, cx| lsp.open_background(path, cx))
     {
-        return Err(format!("Flux can't open {shown_path} on its language server (too big?)."));
+        return Err(format!(
+            "Flux can't open {shown_path} on its language server (too big?)."
+        ));
     }
     let path = path.to_path_buf();
     Ok(cx.spawn(async move |_, cx| {
@@ -442,7 +455,12 @@ impl Problem {
                 self.column,
                 cut(&message, 400)
             ),
-            None => format!("{}:{} {severity}: {}", self.line, self.column, cut(&message, 400)),
+            None => format!(
+                "{}:{} {severity}: {}",
+                self.line,
+                self.column,
+                cut(&message, 400)
+            ),
         }
     }
 }
@@ -505,8 +523,14 @@ fn format_problems(files: &[(PathBuf, Vec<Problem>)], root: Option<&Path>) -> St
     let mut listed = 0;
     let total: usize = files.iter().map(|(_, problems)| problems.len()).sum();
     for (path, problems) in files {
-        let errors = problems.iter().filter(|p| p.severity == Severity::Error).count();
-        let warnings = problems.iter().filter(|p| p.severity == Severity::Warning).count();
+        let errors = problems
+            .iter()
+            .filter(|p| p.severity == Severity::Error)
+            .count();
+        let warnings = problems
+            .iter()
+            .filter(|p| p.severity == Severity::Warning)
+            .count();
         let _ = writeln!(
             out,
             "{} — {}",
@@ -526,7 +550,8 @@ fn format_problems(files: &[(PathBuf, Vec<Problem>)], root: Option<&Path>) -> St
 }
 
 fn counts(errors: usize, warnings: usize, other: usize) -> String {
-    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut parts = Vec::new();
     if errors > 0 {
         parts.push(plural(errors, "error", "errors"));
@@ -546,7 +571,10 @@ fn get_diagnostics(
     cx: &mut Context<Workspace>,
 ) -> Result<Task<ToolOutput>, String> {
     let root = workspace.root().map(Path::to_path_buf);
-    if input["path"].as_str().is_none_or(|path| path.trim().is_empty()) {
+    if input["path"]
+        .as_str()
+        .is_none_or(|path| path.trim().is_empty())
+    {
         let files = all_problems(workspace, cx);
         let running = workspace.lsp.read(cx).running_servers();
         let text = if files.is_empty() {
@@ -570,7 +598,12 @@ fn get_diagnostics(
             return Err(server_problem(lsp, &path, &shown_path));
         }
         let problems = editor_problems(editor.read(cx));
-        return Ok(Task::ready(ToolOutput::text(one_file(&shown_path, &path, problems, root.as_deref()))));
+        return Ok(Task::ready(ToolOutput::text(one_file(
+            &shown_path,
+            &path,
+            problems,
+            root.as_deref(),
+        ))));
     }
     let lsp = workspace.lsp.clone();
     let opened_before = lsp.read(cx).file_server(&path, cx).is_some();
@@ -584,7 +617,12 @@ fn get_diagnostics(
     };
     if opened_before {
         let problems = known().iter().map(Problem::from_lsp).collect();
-        return Ok(Task::ready(ToolOutput::text(one_file(&shown_path, &path, problems, root.as_deref()))));
+        return Ok(Task::ready(ToolOutput::text(one_file(
+            &shown_path,
+            &path,
+            problems,
+            root.as_deref(),
+        ))));
     }
     let waiter = lsp.update(cx, |lsp, _| lsp.wait_diagnostics(&path));
     let server = file_server(workspace, &path, cx)?;
@@ -636,11 +674,7 @@ fn open_file(
 ) -> Result<Task<ToolOutput>, String> {
     let root = workspace.root().map(Path::to_path_buf);
     let path = resolve_path(root.as_deref(), input)?;
-    let number = |key: &str| {
-        input[key]
-            .as_u64()
-            .map(|n| (n as usize).max(1))
-    };
+    let number = |key: &str| input[key].as_u64().map(|n| (n as usize).max(1));
     let line = number("line");
     let column = number("column").unwrap_or(1);
     let end = number("end_line").map(|end_line| (end_line, number("end_column")));
@@ -721,7 +755,10 @@ fn get_open_files(workspace: &Workspace, cx: &App) -> String {
         if selection.from() != selection.to() {
             let (from_line, from_column) = line_col(text, selection.from());
             let (to_line, to_column) = line_col(text, selection.to());
-            let _ = write!(place, ", selection {from_line}:{from_column}–{to_line}:{to_column}");
+            let _ = write!(
+                place,
+                ", selection {from_line}:{from_column}–{to_line}:{to_column}"
+            );
         }
         let notes = if notes.is_empty() {
             String::new()
@@ -754,7 +791,8 @@ fn navigate(
     let text = match editor_for(workspace, &path, cx) {
         Some(editor) => editor.read(cx).document.text().clone(),
         None => Rope::from_str(
-            &std::fs::read_to_string(&path).map_err(|error| format!("Can't read the file: {error}"))?,
+            &std::fs::read_to_string(&path)
+                .map_err(|error| format!("Can't read the file: {error}"))?,
         ),
     };
     let at = resolve_position(&text, input)?;
@@ -846,7 +884,11 @@ fn word_at(text: &Rope, pos: usize) -> Option<String> {
 
 /// Places with their code: `path:line:column  code`, ordered by file and position; open
 /// documents' text from `texts`, others read from disk.
-fn format_places(targets: &[NavTarget], texts: &HashMap<PathBuf, Rope>, root: Option<&Path>) -> String {
+fn format_places(
+    targets: &[NavTarget],
+    texts: &HashMap<PathBuf, Rope>,
+    root: Option<&Path>,
+) -> String {
     let mut sorted: Vec<&NavTarget> = targets.iter().collect();
     sorted.sort_by(|a, b| {
         a.path
@@ -906,7 +948,11 @@ fn hover_text(contents: HoverContents) -> Option<String> {
     };
     let text = match contents {
         HoverContents::Scalar(scalar) => marked(scalar),
-        HoverContents::Array(items) => items.into_iter().map(marked).collect::<Vec<_>>().join("\n\n"),
+        HoverContents::Array(items) => items
+            .into_iter()
+            .map(marked)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
         HoverContents::Markup(markup) => markup.value,
     };
     let text = text.trim().to_string();
@@ -920,7 +966,11 @@ fn search_symbols(
     input: &Value,
     cx: &mut Context<Workspace>,
 ) -> Result<Task<ToolOutput>, String> {
-    let Some(query) = input["query"].as_str().map(str::trim).filter(|q| !q.is_empty()) else {
+    let Some(query) = input["query"]
+        .as_str()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    else {
         return Err("`query` is required.".into());
     };
     let query = query.to_string();
@@ -938,9 +988,11 @@ fn search_symbols(
         })
         .collect();
     if servers.is_empty() {
-        return Err("No language server that searches symbols is running yet: open a file of the \
+        return Err(
+            "No language server that searches symbols is running yet: open a file of the \
             project (or ask `get_diagnostics` for one) to start its server."
-            .into());
+                .into(),
+        );
     }
     Ok(cx.spawn(async move |_, _| {
         let requests: Vec<_> = servers
@@ -1110,9 +1162,7 @@ pub fn after_edit(
             return None;
         }
         // A second report may follow at once (rust-analyzer: its analysis, then `cargo check`).
-        let second = lsp
-            .update(cx, |lsp, _| lsp.wait_diagnostics(&path))
-            .ok()?;
+        let second = lsp.update(cx, |lsp, _| lsp.wait_diagnostics(&path)).ok()?;
         wait(second, SETTLE_WAIT, cx).await;
         let after: Vec<Problem> = this
             .update(cx, |workspace, cx| match editor_for(workspace, &path, cx) {
@@ -1197,7 +1247,10 @@ mod tests {
         assert_eq!(at(json!({ "line": 2, "column": 9 })), Ok(12 + 8));
         // Whole words only: `total` isn't found inside `subtotal`.
         let words = rope("let subtotal = total;\n");
-        assert_eq!(resolve_position(&words, &json!({ "line": 1, "symbol": "total" })), Ok(15));
+        assert_eq!(
+            resolve_position(&words, &json!({ "line": 1, "symbol": "total" })),
+            Ok(15)
+        );
         // The last part of a path.
         let path = rope("use std::fs::read;\n");
         assert_eq!(
@@ -1208,9 +1261,17 @@ mod tests {
             at(json!({ "line": 2, "symbol": "missing" })),
             Err("`missing` is not on line 2: `let total = sum(&items);`".into())
         );
-        assert!(at(json!({ "line": 9, "symbol": "sum" })).unwrap_err().contains("out of range"));
+        assert!(
+            at(json!({ "line": 9, "symbol": "sum" }))
+                .unwrap_err()
+                .contains("out of range")
+        );
         assert!(at(json!({ "line": 2 })).unwrap_err().contains("`symbol`"));
-        assert!(at(json!({ "line": 2, "column": 99 })).unwrap_err().contains("out of range"));
+        assert!(
+            at(json!({ "line": 2, "column": 99 }))
+                .unwrap_err()
+                .contains("out of range")
+        );
     }
 
     #[test]
@@ -1231,9 +1292,16 @@ mod tests {
             resolve_path(Some(&dir), &input("src/nope.rs")),
             Err("There is no file src/nope.rs.".into())
         );
-        assert!(resolve_path(Some(&dir), &input("src")).unwrap_err().contains("folder"));
+        assert!(
+            resolve_path(Some(&dir), &input("src"))
+                .unwrap_err()
+                .contains("folder")
+        );
         assert_eq!(shown(&dir.join("src/lib.rs"), Some(&dir)), "src/lib.rs");
-        assert_eq!(shown(Path::new("/elsewhere/a.rs"), Some(&dir)), "/elsewhere/a.rs");
+        assert_eq!(
+            shown(Path::new("/elsewhere/a.rs"), Some(&dir)),
+            "/elsewhere/a.rs"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1272,7 +1340,9 @@ mod tests {
             problem(7, Severity::Error, "cannot find value `totl` in this scope"),
         ];
         let note = new_errors_note("src/lib.rs", &before, &after).unwrap();
-        assert!(note.starts_with("Flux: the language server now reports 1 new error in src/lib.rs"));
+        assert!(
+            note.starts_with("Flux: the language server now reports 1 new error in src/lib.rs")
+        );
         assert!(note.contains("- 7:5 error: cannot find value `totl` in this scope"));
         assert!(note.contains("(1 other error in the file was there before the edit.)"));
         assert_eq!(new_errors_note("src/lib.rs", &after, &before), None);
@@ -1311,7 +1381,10 @@ mod tests {
             hover_text(contents).unwrap(),
             "```rust\npub fn total() -> u32\n```\n\nSums the items."
         );
-        assert_eq!(hover_text(HoverContents::Scalar(MarkedString::String(" ".into()))), None);
+        assert_eq!(
+            hover_text(HoverContents::Scalar(MarkedString::String(" ".into()))),
+            None
+        );
     }
 
     #[test]

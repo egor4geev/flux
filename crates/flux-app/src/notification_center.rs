@@ -39,13 +39,15 @@ pub enum NotificationGroup {
     Plugins,
     /// Claude Code: it waits for the user, finished, failed (stage 9).
     Claude,
+    /// Updates of Flux (part 10.8): a new version, its download, a restart to finish.
+    Updates,
     /// A plugin, by its id.
     Plugin(SharedString),
 }
 
 impl NotificationGroup {
     /// The built-in groups, in the order of the settings page.
-    pub const BUILT_IN: [NotificationGroup; 8] = [
+    pub const BUILT_IN: [NotificationGroup; 9] = [
         NotificationGroup::General,
         NotificationGroup::Git,
         NotificationGroup::LanguageServers,
@@ -54,6 +56,7 @@ impl NotificationGroup {
         NotificationGroup::Editor,
         NotificationGroup::Plugins,
         NotificationGroup::Claude,
+        NotificationGroup::Updates,
     ];
 
     /// The key in `settings.json` ("git", "plugin:claude").
@@ -67,6 +70,7 @@ impl NotificationGroup {
             NotificationGroup::Editor => "editor".into(),
             NotificationGroup::Plugins => "plugins".into(),
             NotificationGroup::Claude => "claude".into(),
+            NotificationGroup::Updates => "updates".into(),
             NotificationGroup::Plugin(id) => format!("plugin:{id}").into(),
         }
     }
@@ -92,6 +96,7 @@ impl NotificationGroup {
             NotificationGroup::Editor => tr("Editor").into(),
             NotificationGroup::Plugins => tr("Plugins").into(),
             NotificationGroup::Claude => tr("Claude Code").into(),
+            NotificationGroup::Updates => tr("Updates").into(),
             NotificationGroup::Plugin(id) => id.clone(),
         }
     }
@@ -167,11 +172,13 @@ pub fn register_group(info: GroupInfo, cx: &mut App) {
 
 /// Every group, in the order of the settings page: the built-in ones, then the plugins'.
 pub fn groups(cx: &App) -> Vec<GroupInfo> {
-    let built_in = NotificationGroup::BUILT_IN.into_iter().map(|group| GroupInfo {
-        title: group.title(),
-        default_display: Display::default(),
-        group,
-    });
+    let built_in = NotificationGroup::BUILT_IN
+        .into_iter()
+        .map(|group| GroupInfo {
+            title: group.title(),
+            default_display: Display::default(),
+            group,
+        });
     let plugins = cx
         .try_global::<PluginGroups>()
         .map(|groups| groups.0.clone())
@@ -197,7 +204,11 @@ fn default_display(group: &NotificationGroup, cx: &App) -> Display {
 /// Whether `notification` gets a card, and for how long: none in Do Not Disturb or for a group
 /// shown only in the journal; a sticky group's, an error's (unless made transient) and a running
 /// task's stay; the rest go after a few seconds — longer when they offer actions.
-pub fn card_life(notification: &Notification, display: Display, do_not_disturb: bool) -> Option<CardLife> {
+pub fn card_life(
+    notification: &Notification,
+    display: Display,
+    do_not_disturb: bool,
+) -> Option<CardLife> {
     if do_not_disturb {
         return None;
     }
@@ -291,7 +302,8 @@ impl NotificationCenter {
     pub fn set_journal_in_sight(&mut self, in_sight: bool, cx: &mut Context<Self>) {
         self.journal_in_sight = in_sight;
         if in_sight {
-            self.cards.update(cx, |cards, cx| cards.retain(|_| false, cx));
+            self.cards
+                .update(cx, |cards, cx| cards.retain(|_| false, cx));
         }
     }
 
@@ -386,11 +398,7 @@ impl NotificationCenter {
 
     /// Expires the notifications `stale` says yes to (cards offering "Continue Rebase" after the
     /// rebase is over).
-    pub fn expire_where(
-        &mut self,
-        stale: impl Fn(&Notification) -> bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn expire_where(&mut self, stale: impl Fn(&Notification) -> bool, cx: &mut Context<Self>) {
         let mut any = false;
         for entry in &mut self.entries {
             if !entry.expired && stale(&entry.notification) {
@@ -471,12 +479,18 @@ impl NotificationCenter {
         }
         let hidden: Vec<NotificationGroup> = groups(cx)
             .into_iter()
-            .filter(|info| matches!(display_of(&info.group, cx), Display::LogOnly | Display::Hidden))
+            .filter(|info| {
+                matches!(
+                    display_of(&info.group, cx),
+                    Display::LogOnly | Display::Hidden
+                )
+            })
             .map(|info| info.group)
             .collect();
         if !hidden.is_empty() {
-            self.cards
-                .update(cx, |cards, cx| cards.retain(|card| !hidden.contains(&card.group), cx));
+            self.cards.update(cx, |cards, cx| {
+                cards.retain(|card| !hidden.contains(&card.group), cx)
+            });
         }
     }
 
@@ -500,7 +514,10 @@ mod tests {
 
     #[test]
     fn group_keys_are_stable() {
-        assert_eq!(NotificationGroup::LanguageServers.key().as_ref(), "language-servers");
+        assert_eq!(
+            NotificationGroup::LanguageServers.key().as_ref(),
+            "language-servers"
+        );
         assert_eq!(
             NotificationGroup::Plugin("claude".into()).key().as_ref(),
             "plugin:claude"
@@ -512,14 +529,26 @@ mod tests {
         let info = Notification::info("Pushed");
         let with_action = Notification::info("Pushed").action("Undo", gpui::NoAction);
         let error = Notification::error("Push failed");
-        assert_eq!(card_life(&info, Display::Balloon, false), Some(CardLife::Timed(SHORT)));
-        assert_eq!(card_life(&with_action, Display::Balloon, false), Some(CardLife::Timed(LONG)));
-        assert_eq!(card_life(&error, Display::Balloon, false), Some(CardLife::Sticky));
+        assert_eq!(
+            card_life(&info, Display::Balloon, false),
+            Some(CardLife::Timed(SHORT))
+        );
+        assert_eq!(
+            card_life(&with_action, Display::Balloon, false),
+            Some(CardLife::Timed(LONG))
+        );
+        assert_eq!(
+            card_life(&error, Display::Balloon, false),
+            Some(CardLife::Sticky)
+        );
         assert_eq!(
             card_life(&error.clone().transient(), Display::Balloon, false),
             Some(CardLife::Timed(SHORT))
         );
-        assert_eq!(card_life(&info, Display::StickyBalloon, false), Some(CardLife::Sticky));
+        assert_eq!(
+            card_life(&info, Display::StickyBalloon, false),
+            Some(CardLife::Sticky)
+        );
         assert_eq!(card_life(&error, Display::LogOnly, false), None);
         assert_eq!(card_life(&error, Display::Hidden, false), None);
         assert_eq!(card_life(&error, Display::StickyBalloon, true), None);
@@ -528,9 +557,15 @@ mod tests {
     #[test]
     fn a_running_task_keeps_its_card() {
         let task = Notification::info("Installing pyright").progress(Progress::Fraction(0.3));
-        assert_eq!(card_life(&task, Display::Balloon, false), Some(CardLife::Sticky));
+        assert_eq!(
+            card_life(&task, Display::Balloon, false),
+            Some(CardLife::Sticky)
+        );
         let task = task.transient().progress(Progress::Indeterminate);
-        assert_eq!(card_life(&task, Display::Balloon, false), Some(CardLife::Sticky));
+        assert_eq!(
+            card_life(&task, Display::Balloon, false),
+            Some(CardLife::Sticky)
+        );
     }
 
     #[test]

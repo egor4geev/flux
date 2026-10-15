@@ -31,10 +31,10 @@ use gpui::{
 use serde_json::{Value, json};
 
 use crate::claude::{self, ClaudeStore};
+use crate::dialog::Dialog;
 use crate::git_log::local_offset;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, icon};
-use crate::dialog::Dialog;
 use crate::picker::{self, Picker, PickerDelegate, highlighted_text};
 use crate::theme::{self, Theme, UiColors};
 use crate::workspace::Workspace;
@@ -55,7 +55,11 @@ pub fn init(cx: &mut App) {
             picker::DeleteSelected,
             Some("ClaudeHistory > TextInput"),
         ),
-        KeyBinding::new("cmd-backspace", picker::DeleteSelected, Some("ClaudeHistory")),
+        KeyBinding::new(
+            "cmd-backspace",
+            picker::DeleteSelected,
+            Some("ClaudeHistory"),
+        ),
     ]);
 }
 
@@ -118,7 +122,12 @@ fn open_ids(store: &Entity<ClaudeStore>, cx: &gpui::App) -> HashSet<String> {
 /// A saved session chosen in the history or in the Claude window's recent list: back in a tab (an
 /// open one is brought into sight where it is); while `claude` isn't ready, the Claude window says
 /// why.
-pub fn resume(store: &Entity<ClaudeStore>, saved: &SavedSession, window: &mut Window, cx: &mut gpui::App) {
+pub fn resume(
+    store: &Entity<ClaudeStore>,
+    saved: &SavedSession,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
     let was_open = open_ids(store, cx).contains(&saved.id);
     let session = store.update(cx, |store, cx| store.resume(saved, cx));
     let action: Box<dyn Action> = match session {
@@ -160,12 +169,7 @@ impl HistoryDelegate {
     }
 
     fn refilter(&mut self) {
-        let haystacks: Vec<String> = self
-            .sessions
-            .iter()
-            .flatten()
-            .map(haystack)
-            .collect();
+        let haystacks: Vec<String> = self.sessions.iter().flatten().map(haystack).collect();
         self.matches = match_list(&self.query, &haystacks);
     }
 
@@ -230,9 +234,9 @@ impl PickerDelegate for HistoryDelegate {
             .flex_none()
             .tooltip(crate::ui::tooltip(tr("Delete Session"), Some("⌘⌫".into())))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |picker, _, window, cx| {
-                picker.delegate.delete(index, window, cx)
-            }))
+            .on_click(
+                cx.listener(move |picker, _, window, cx| picker.delegate.delete(index, window, cx)),
+            )
             .when(!selected, |button| {
                 button
                     .invisible()
@@ -246,12 +250,9 @@ impl PickerDelegate for HistoryDelegate {
             .items_center()
             .gap_2()
             .child(
-                icon(
-                    IconName::Claude,
-                    if open { ui.accent_text } else { ui.dim },
-                )
-                .size(px(14.))
-                .flex_none(),
+                icon(IconName::Claude, if open { ui.accent_text } else { ui.dim })
+                    .size(px(14.))
+                    .flex_none(),
             )
             .child(
                 div()
@@ -268,7 +269,12 @@ impl PickerDelegate for HistoryDelegate {
             )
             .children(prompt)
             .children(open.then(|| crate::ui::badge(tr("already open"), ui.accent_text)))
-            .children(session.branch.as_deref().map(|branch| branch_chip(branch, ui)))
+            .children(
+                session
+                    .branch
+                    .as_deref()
+                    .map(|branch| branch_chip(branch, ui)),
+            )
             .child(
                 div()
                     .flex_none()
@@ -280,11 +286,7 @@ impl PickerDelegate for HistoryDelegate {
             .into_any_element()
     }
 
-    fn render_footer(
-        &self,
-        _: &mut Window,
-        cx: &mut Context<Picker<Self>>,
-    ) -> Option<AnyElement> {
+    fn render_footer(&self, _: &mut Window, cx: &mut Context<Picker<Self>>) -> Option<AnyElement> {
         let ui = Theme::ui(cx);
         let text = match &self.sessions {
             None => tr("Reading the sessions…").to_string(),
@@ -302,9 +304,7 @@ impl PickerDelegate for HistoryDelegate {
     fn empty_message(&self) -> SharedString {
         match &self.sessions {
             None => tr("Loading…").into(),
-            Some(sessions) if sessions.is_empty() => {
-                tr("No saved sessions in this project").into()
-            }
+            Some(sessions) if sessions.is_empty() => tr("No saved sessions in this project").into(),
             Some(_) => tr("No matches").into(),
         }
     }
@@ -327,9 +327,12 @@ impl PickerDelegate for HistoryDelegate {
         let Some(saved) = self.session(index).cloned() else {
             return;
         };
-        let session = self.store.read(cx).sessions().iter().find(|session| {
-            session.read(cx).session_id() == Some(saved.id.as_str())
-        });
+        let session = self
+            .store
+            .read(cx)
+            .sessions()
+            .iter()
+            .find(|session| session.read(cx).session_id() == Some(saved.id.as_str()));
         let session = session.cloned();
         let dialog = match &session {
             Some(_) => Dialog::warning(trf("The session “{0}” is open", &[&saved.title]))
@@ -385,10 +388,8 @@ impl PickerDelegate for HistoryDelegate {
             });
             if refreshed.is_err() {
                 RESELECT.with(|reselect| reselect.set(Some(index)));
-                cx.update(|window, cx| {
-                    window.dispatch_action(Box::new(claude::ResumeSession), cx)
-                })
-                .ok();
+                cx.update(|window, cx| window.dispatch_action(Box::new(claude::ResumeSession), cx))
+                    .ok();
             }
         })
         .detach();
@@ -723,11 +724,13 @@ mod tests {
         write(&file, &serialize(&projects)).unwrap();
         assert_eq!(read(&file), projects);
         // An empty project isn't kept; a missing file reads as nothing.
-        assert!(parse(&serialize(&BTreeMap::from([(
-            "/x".to_string(),
-            OpenSessions::default()
-        )])))
-        .is_empty());
+        assert!(
+            parse(&serialize(&BTreeMap::from([(
+                "/x".to_string(),
+                OpenSessions::default()
+            )])))
+            .is_empty()
+        );
         assert!(read(&dir.join("missing.json")).is_empty());
         fs::remove_dir_all(dir).ok();
     }
@@ -787,11 +790,17 @@ mod tests {
     #[test]
     fn the_prompt_shows_when_it_says_more_than_the_title() {
         assert_eq!(
-            shown_prompt(&saved("Fix the login flow", Some("the login  fails\nwhen…"))),
+            shown_prompt(&saved(
+                "Fix the login flow",
+                Some("the login  fails\nwhen…")
+            )),
             Some("the login fails when…".to_string())
         );
         // A title made of the prompt.
-        assert_eq!(shown_prompt(&saved("explain main.rs", Some("explain main.rs"))), None);
+        assert_eq!(
+            shown_prompt(&saved("explain main.rs", Some("explain main.rs"))),
+            None
+        );
         assert_eq!(
             shown_prompt(&saved(
                 "a very long prompt cut…",

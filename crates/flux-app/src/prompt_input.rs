@@ -21,8 +21,8 @@ use gpui::{
     Focusable, GlobalElementId, Hsla, Image, InspectorElementId, IntoElement, KeyBinding,
     KeyContext, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels, Point,
     Render, ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, UTF16Selection,
-    UnderlineStyle, Window, WrappedLine, actions, div, fill, font, point, prelude::*, px,
-    relative, size,
+    UnderlineStyle, Window, WrappedLine, actions, div, fill, font, point, prelude::*, px, relative,
+    size,
 };
 
 use crate::theme::{self, Theme};
@@ -248,7 +248,9 @@ impl PromptInput {
     /// Types `text` at the caret (over the selection).
     pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = normalize(text);
-        self.edit(EditKind::Other, cx, |rope, sel| edit::insert_text(rope, sel, &text));
+        self.edit(EditKind::Other, cx, |rope, sel| {
+            edit::insert_text(rope, sel, &text)
+        });
     }
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
@@ -303,9 +305,7 @@ impl PromptInput {
         } else {
             primary.to()
         };
-        let goal = self
-            .goal_x
-            .unwrap_or_else(|| layout.geometry.caret(from).x);
+        let goal = self.goal_x.unwrap_or_else(|| layout.geometry.caret(from).x);
         let target = layout.geometry.vertical(from, goal, rows);
         let range = if extend {
             primary.put_cursor(target, true)
@@ -1032,13 +1032,7 @@ fn shape(
         }
         lines.push(ShapedLine { wrapped, top });
     }
-    (
-        lines,
-        Geometry {
-            rows,
-            line_height,
-        },
-    )
+    (lines, Geometry { rows, line_height })
 }
 
 /// The number of rows the text takes at `wrap_width` (the field's height).
@@ -1175,7 +1169,13 @@ impl Element for PromptElement {
                 }];
                 window
                     .text_system()
-                    .shape_text(placeholder_text, font_size, &runs, Some(wrap_width), Some(1))
+                    .shape_text(
+                        placeholder_text,
+                        font_size,
+                        &runs,
+                        Some(wrap_width),
+                        Some(1),
+                    )
                     .ok()
                     .and_then(|lines| lines.into_iter().next())
             })
@@ -1198,12 +1198,7 @@ impl Element for PromptElement {
         let selection = geometry
             .selection_rects(primary.from(), primary.to())
             .into_iter()
-            .map(|rect| {
-                fill(
-                    Bounds::new(origin + rect.origin, rect.size),
-                    ui.selection,
-                )
-            })
+            .map(|rect| fill(Bounds::new(origin + rect.origin, rect.size), ui.selection))
             .collect();
         let cursor = focused.then(|| {
             fill(
@@ -1250,7 +1245,14 @@ impl Element for PromptElement {
             match &state.placeholder {
                 Some(placeholder) => {
                     placeholder
-                        .paint(bounds.origin, line_height, TextAlign::Left, None, window, cx)
+                        .paint(
+                            bounds.origin,
+                            line_height,
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
                         .ok();
                 }
                 None => {
@@ -1371,14 +1373,23 @@ mod tests {
         let rects = g.selection_rects(3, 13);
         assert_eq!(rects.len(), 3);
         // "lo " on the first row.
-        assert_eq!(rects[0], Bounds::from_corners(point(px(30.), px(0.)), point(px(60.), px(20.))));
+        assert_eq!(
+            rects[0],
+            Bounds::from_corners(point(px(30.), px(0.)), point(px(60.), px(20.)))
+        );
         // "world" and its line break.
         assert_eq!(
             rects[1],
-            Bounds::from_corners(point(px(0.), px(20.)), point(px(50. + NEWLINE_WIDTH), px(40.)))
+            Bounds::from_corners(
+                point(px(0.), px(20.)),
+                point(px(50. + NEWLINE_WIDTH), px(40.))
+            )
         );
         // "a".
-        assert_eq!(rects[2], Bounds::from_corners(point(px(0.), px(40.)), point(px(10.), px(60.))));
+        assert_eq!(
+            rects[2],
+            Bounds::from_corners(point(px(0.), px(40.)), point(px(10.), px(60.)))
+        );
         assert!(g.selection_rects(4, 4).is_empty());
     }
 

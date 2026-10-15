@@ -778,7 +778,11 @@ impl Session {
         saved.entries.append(&mut self.entries);
         self.entries = saved.entries;
         for file in saved.changed_files {
-            if !self.changed_files.iter().any(|known| known.path == file.path) {
+            if !self
+                .changed_files
+                .iter()
+                .any(|known| known.path == file.path)
+            {
                 self.changed_files.push(file);
             }
         }
@@ -789,12 +793,7 @@ impl Session {
         info.session_id = info.session_id.take().or(saved.info.session_id);
         info.title = info.title.take().or(saved.info.title);
         info.model = info.model.take().or(saved.info.model);
-        vec![
-            Change::Entries,
-            Change::Title,
-            Change::Info,
-            Change::Tasks,
-        ]
+        vec![Change::Entries, Change::Title, Change::Info, Change::Tasks]
     }
 
     // --- Reading a saved session (`crate::transcript`) ---
@@ -1058,7 +1057,9 @@ impl Session {
     /// there's none (the output stands alone).
     pub(crate) fn restore_shell_output(&mut self, output: String, exit_code: Option<i32>) -> bool {
         match self.entries.last_mut().map(|entry| &mut entry.kind) {
-            Some(EntryKind::Shell(shell)) if shell.output.is_empty() && shell.exit_code.is_none() => {
+            Some(EntryKind::Shell(shell))
+                if shell.output.is_empty() && shell.exit_code.is_none() =>
+            {
                 shell.output = output;
                 shell.exit_code = exit_code;
                 true
@@ -2139,7 +2140,8 @@ impl Session {
             return self.tool_mut(parent)?.children.last_mut();
         }
         let at = self.queued_tail_start();
-        at.checked_sub(1).and_then(|index| self.entries.get_mut(index))
+        at.checked_sub(1)
+            .and_then(|index| self.entries.get_mut(index))
     }
 
     /// The streamed text block of a request that failed: the error notice replaces it.

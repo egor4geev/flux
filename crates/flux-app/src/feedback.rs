@@ -690,10 +690,7 @@ mod tests {
     #[test]
     fn encoding_keeps_only_unreserved_characters() {
         assert_eq!(encode("aZ09-_.~"), "aZ09-_.~");
-        assert_eq!(
-            encode("a b\n&=?#+/%"),
-            "a%20b%0A%26%3D%3F%23%2B%2F%25"
-        );
+        assert_eq!(encode("a b\n&=?#+/%"), "a%20b%0A%26%3D%3F%23%2B%2F%25");
         assert_eq!(encode("€ Ж"), "%E2%82%AC%20%D0%96");
         assert_eq!(decode(&encode("Привет, мир & co\n")), "Привет, мир & co\n");
     }
@@ -701,10 +698,17 @@ mod tests {
     #[test]
     fn the_bug_form_gets_the_facts() {
         let url = bug_report_url(&info(), None);
-        assert!(url.starts_with("https://github.com/egor4geev/flux/issues/new?template=bug_report.yml&"));
+        assert!(
+            url.starts_with(
+                "https://github.com/egor4geev/flux/issues/new?template=bug_report.yml&"
+            )
+        );
         assert_eq!(param(&url, "version").as_deref(), Some("0.1.0 (ca086c2)"));
         assert_eq!(param(&url, "macos").as_deref(), Some("macOS 26.1 (25B78)"));
-        assert_eq!(param(&url, "hardware").as_deref(), Some("Apple M3 Pro, arm64, 36 GB"));
+        assert_eq!(
+            param(&url, "hardware").as_deref(),
+            Some("Apple M3 Pro, arm64, 36 GB")
+        );
         assert_eq!(
             param(&url, "plugins").as_deref(),
             Some("flux.rust 0.1.0\nflux.yandex 0.1.0, development")
@@ -735,7 +739,10 @@ mod tests {
 
     #[test]
     fn a_crash_fills_the_title_the_story_and_the_log() {
-        let url = bug_report_url(&info(), Some(&crash("   0: flux::main\n   1: start".into())));
+        let url = bug_report_url(
+            &info(),
+            Some(&crash("   0: flux::main\n   1: start".into())),
+        );
         assert_eq!(
             param(&url, "title").as_deref(),
             Some("Crash: index out of bounds: the len is 3 but the index is 7")
@@ -809,7 +816,10 @@ mod tests {
             hardware: "Apple M3 Pro, arm64".into(),
             ..SystemInfo::default()
         };
-        assert_eq!(bare.to_text(), "Flux 0.1.0\nmacOS 26.1 (25B78)\nApple M3 Pro, arm64");
+        assert_eq!(
+            bare.to_text(),
+            "Flux 0.1.0\nmacOS 26.1 (25B78)\nApple M3 Pro, arm64"
+        );
     }
 
     fn plugin(repository: Option<&str>, bundled: bool) -> PluginReport {
@@ -845,7 +855,10 @@ mod tests {
             assert_eq!(param(&url, "plugin-version").as_deref(), Some("0.1.0"));
             assert_eq!(param(&url, "version").as_deref(), Some("0.1.0 (ca086c2)"));
             assert_eq!(param(&url, "macos").as_deref(), Some("macOS 26.1 (25B78)"));
-            assert_eq!(param(&url, "hardware").as_deref(), Some("Apple M3 Pro, arm64, 36 GB"));
+            assert_eq!(
+                param(&url, "hardware").as_deref(),
+                Some("Apple M3 Pro, arm64, 36 GB")
+            );
         }
     }
 
@@ -911,8 +924,16 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             assert!(machine.macos.starts_with("macOS "), "{}", machine.macos);
-            assert!(machine.hardware.contains(mac::arch()), "{}", machine.hardware);
-            assert!(!machine.hardware.contains("aarch64"), "{}", machine.hardware);
+            assert!(
+                machine.hardware.contains(mac::arch()),
+                "{}",
+                machine.hardware
+            );
+            assert!(
+                !machine.hardware.contains("aarch64"),
+                "{}",
+                machine.hardware
+            );
             assert!(machine.hardware.ends_with(" GB"), "{}", machine.hardware);
         }
     }

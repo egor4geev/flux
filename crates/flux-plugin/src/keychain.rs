@@ -41,7 +41,10 @@ fn with_file<T>(file: PathBuf, change: impl FnOnce(&mut Secrets) -> T) -> Result
 pub fn get(service: &str, account: &str) -> Result<Option<String>, String> {
     match secrets_file() {
         Some(file) => with_file(file, |secrets| {
-            secrets.get(service).and_then(|accounts| accounts.get(account)).cloned()
+            secrets
+                .get(service)
+                .and_then(|accounts| accounts.get(account))
+                .cloned()
         }),
         None => platform::get(service, account),
     }

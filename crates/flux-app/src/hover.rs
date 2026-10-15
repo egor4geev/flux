@@ -139,9 +139,7 @@ pub fn mouse_moved(editor: &mut Editor, event: &MouseMoveEvent, cx: &mut Context
         }
         schedule_hide(editor, cx);
     }
-    let Some((position, range)) =
-        position.and_then(|p| Some((p, hover_range(editor, p)?)))
-    else {
+    let Some((position, range)) = position.and_then(|p| Some((p, hover_range(editor, p)?))) else {
         editor.hover.pending = None;
         return;
     };
@@ -181,9 +179,11 @@ pub fn actions(root: Div, editor: &Editor, cx: &mut Context<Editor>) -> Div {
         update_link(editor, event.modifiers, cx)
     }))
     .on_action(cx.listener(|editor, _: &ShowHover, _, cx| show_at_cursor(editor, cx)))
-    .on_action(cx.listener(|editor, _: &OpenLinkAtCaret, window, cx| {
-        open_link_at_caret(editor, window, cx)
-    }))
+    .on_action(
+        cx.listener(|editor, _: &OpenLinkAtCaret, window, cx| {
+            open_link_at_caret(editor, window, cx)
+        }),
+    )
     .when(editor.hover.popup.is_some(), |root| {
         root.on_action(cx.listener(|editor, _: &HideHover, _, cx| {
             if editor.hover.popup.take().is_some() {
@@ -374,7 +374,9 @@ fn received(
     // The server knows the symbol better than our word boundaries (`r#type`, `a::b`); a plugin's
     // link keeps its own.
     if let Some(range) = range.filter(|range| {
-        !range.is_empty() && range.contains(&popup.range.start) && !popup.link_waiting
+        !range.is_empty()
+            && range.contains(&popup.range.start)
+            && !popup.link_waiting
             && popup.link_blocks.is_empty()
     }) {
         popup.range = range;
@@ -424,7 +426,9 @@ fn link_received(
         return;
     };
     popup.link_waiting = false;
-    popup.link_blocks = markdown.map(|text| markdown::parse(&text)).unwrap_or_default();
+    popup.link_blocks = markdown
+        .map(|text| markdown::parse(&text))
+        .unwrap_or_default();
     if popup.link_blocks.is_empty()
         && popup.blocks.is_empty()
         && popup.diagnostics.is_empty()
@@ -553,18 +557,15 @@ fn word_at(editor: &Editor, pos: usize) -> Option<Range<usize>> {
 fn update_link(editor: &mut Editor, modifiers: Modifiers, cx: &mut Context<Editor>) {
     let command = modifiers.platform && !modifiers.shift && !modifiers.alt && !modifiers.control;
     let mut plugin_link = None;
-    let link = editor
-        .hover
-        .mouse_over
-        .filter(|_| command)
-        .and_then(|pos| match plugin_link_at(editor, pos) {
+    let link = editor.hover.mouse_over.filter(|_| command).and_then(|pos| {
+        match plugin_link_at(editor, pos) {
             Some((range, link)) => {
                 plugin_link = Some(link);
                 Some(range)
             }
-            None => crate::lsp::document_server(editor)
-                .and_then(|_| word_at(editor, pos)),
-        });
+            None => crate::lsp::document_server(editor).and_then(|_| word_at(editor, pos)),
+        }
+    });
     if link != editor.hover.link || plugin_link != editor.hover.plugin_link {
         editor.hover.link = link;
         editor.hover.plugin_link = plugin_link;
@@ -758,11 +759,7 @@ fn render_popup(
 
 /// Under the problems: "Fix with Claude" (while Claude Code is on and the document is a file) and
 /// "More actions… ⌥↵" — the context actions at the problem (the caret goes there first).
-fn problem_actions(
-    editor: &Editor,
-    popup: &Popup,
-    cx: &mut Context<Editor>,
-) -> Option<AnyElement> {
+fn problem_actions(editor: &Editor, popup: &Popup, cx: &mut Context<Editor>) -> Option<AnyElement> {
     let problems: Vec<&Diagnostic> = popup
         .diagnostics
         .iter()

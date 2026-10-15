@@ -170,7 +170,9 @@ impl ClaudeChat {
         self.ticker = Some(cx.spawn(async move |chat, cx| {
             loop {
                 let wait = chat
-                    .read_with(cx, |chat, cx| next_tick(&chat.session.read(cx).model().status))
+                    .read_with(cx, |chat, cx| {
+                        next_tick(&chat.session.read(cx).model().status)
+                    })
                     .unwrap_or(TICK);
                 cx.background_executor().timer(wait).await;
                 let working = chat.update(cx, |chat, cx| {
@@ -272,26 +274,43 @@ impl Render for ClaudeChat {
             .flex_col()
             .text_color(ui.foreground)
             .drag_over::<crate::file_tree::DraggedEntry>(move |style, _, _, _| drop_style(style))
-            .drag_over::<crate::workspace::DraggedEditorTab>(move |style, _, _, _| drop_style(style))
+            .drag_over::<crate::workspace::DraggedEditorTab>(move |style, _, _, _| {
+                drop_style(style)
+            })
             .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| drop_style(style))
-            .on_drop(cx.listener(|this, dragged: &crate::file_tree::DraggedEntry, window, cx| {
-                let path = dragged.path.clone();
-                this.drop_mentions(vec![path], window, cx)
-            }))
-            .on_drop(cx.listener(|this, dragged: &crate::workspace::DraggedEditorTab, window, cx| {
-                let path = dragged.editor.read(cx).document.path().map(|path| path.to_path_buf());
-                this.drop_mentions(path.into_iter().collect(), window, cx)
-            }))
-            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
-                this.composer
-                    .update(cx, |composer, cx| composer.drop_paths(paths, window, cx))
-            }))
-            .on_action(cx.listener(|this, _: &claude_agent_view::Back, window, cx| {
-                this.agent_back(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &claude_agent_view::OpenLatest, window, cx| {
-                this.open_latest_agent(window, cx)
-            }));
+            .on_drop(cx.listener(
+                |this, dragged: &crate::file_tree::DraggedEntry, window, cx| {
+                    let path = dragged.path.clone();
+                    this.drop_mentions(vec![path], window, cx)
+                },
+            ))
+            .on_drop(cx.listener(
+                |this, dragged: &crate::workspace::DraggedEditorTab, window, cx| {
+                    let path = dragged
+                        .editor
+                        .read(cx)
+                        .document
+                        .path()
+                        .map(|path| path.to_path_buf());
+                    this.drop_mentions(path.into_iter().collect(), window, cx)
+                },
+            ))
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.composer
+                        .update(cx, |composer, cx| composer.drop_paths(paths, window, cx))
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &claude_agent_view::Back, window, cx| {
+                    this.agent_back(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &claude_agent_view::OpenLatest, window, cx| {
+                    this.open_latest_agent(window, cx)
+                }),
+            );
         claude_search::actions(root, cx)
             .children(agent_header)
             .children(search_bar)

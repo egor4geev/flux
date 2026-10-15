@@ -15,9 +15,9 @@ use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    Action, AnyElement, App, ClickEvent, Context, CursorStyle, DismissEvent, DragMoveEvent,
-    Entity, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, Pixels, Point,
-    Render, ScrollHandle, SharedString, Subscription, Window, actions, div, prelude::*, px,
+    Action, AnyElement, App, ClickEvent, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity,
+    FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, Pixels, Point, Render,
+    ScrollHandle, SharedString, Subscription, Window, actions, div, prelude::*, px,
 };
 
 use crate::context_menu::ContextMenu;
@@ -107,19 +107,18 @@ impl NotificationsPanel {
         width: ui::RightIslandWidth,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subscription =
-            cx.subscribe(&center, |this, _, _: &NotificationCenterEvent, cx| {
-                if this.visible {
-                    this.absorb_unread(cx);
-                }
-                // Removed or filtered out: the selection follows what is left.
-                if let Some(id) = this.selected
-                    && !this.rows(cx).contains(&id)
-                {
-                    this.selected = None;
-                }
-                cx.notify();
-            });
+        let subscription = cx.subscribe(&center, |this, _, _: &NotificationCenterEvent, cx| {
+            if this.visible {
+                this.absorb_unread(cx);
+            }
+            // Removed or filtered out: the selection follows what is left.
+            if let Some(id) = this.selected
+                && !this.rows(cx).contains(&id)
+            {
+                this.selected = None;
+            }
+            cx.notify();
+        });
         Self {
             center,
             width,
@@ -220,16 +219,20 @@ impl NotificationsPanel {
             .selected
             .and_then(|id| rows.iter().position(|row| *row == id));
         let index = match current {
-            Some(index) => index
-                .saturating_add_signed(delta)
-                .min(rows.len() - 1),
+            Some(index) => index.saturating_add_signed(delta).min(rows.len() - 1),
             None if delta > 0 => 0,
             None => rows.len() - 1,
         };
         self.select(Some(rows[index]), cx);
     }
 
-    fn run_action(&mut self, id: NotificationId, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn run_action(
+        &mut self,
+        id: NotificationId,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(entry) = self.entry(id, cx) else {
             return;
         };
@@ -239,7 +242,8 @@ impl NotificationsPanel {
         let Some((_, action)) = entry.notification.actions.get(index) else {
             return;
         };
-        self.center.update(cx, |center, cx| center.mark_read(id, cx));
+        self.center
+            .update(cx, |center, cx| center.mark_read(id, cx));
         window.dispatch_action(action.boxed_clone(), cx);
     }
 
@@ -279,7 +283,12 @@ impl NotificationsPanel {
         groups
     }
 
-    fn open_filter_menu(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_filter_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus_handle);
         let groups = self.groups(cx);
         let current = self.filter.clone();
@@ -325,7 +334,12 @@ impl NotificationsPanel {
         cx.notify();
     }
 
-    fn close_menu(&mut self, menu: &Entity<ContextMenu>, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_menu(
+        &mut self,
+        menu: &Entity<ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.menu.as_ref().is_none_or(|open| open.menu != *menu) {
             return;
         }
@@ -347,12 +361,13 @@ impl NotificationsPanel {
             Some(group) => group.title(),
             None => tr("All").into(),
         };
-        let button = |id: &'static str, glyph: IconName, label: &'static str, action: Box<dyn Action>| {
-            let keys = None::<SharedString>;
-            ui::icon_button(id, glyph, ui)
-                .tooltip(ui::tooltip(label, keys))
-                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
-        };
+        let button =
+            |id: &'static str, glyph: IconName, label: &'static str, action: Box<dyn Action>| {
+                let keys = None::<SharedString>;
+                ui::icon_button(id, glyph, ui)
+                    .tooltip(ui::tooltip(label, keys))
+                    .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+            };
         div()
             .flex_none()
             .h(px(HEADER_HEIGHT))
@@ -499,7 +514,9 @@ impl NotificationsPanel {
                     .gap_2()
                     .rounded(px(RADIUS_MD))
                     .when_some(background, |row, color| row.bg(color))
-                    .when(background.is_none(), |row| row.hover(move |style| style.bg(ui.hover)))
+                    .when(background.is_none(), |row| {
+                        row.hover(move |style| style.bg(ui.hover))
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
@@ -529,9 +546,17 @@ impl NotificationsPanel {
                                         div()
                                             .flex_1()
                                             .min_w_0()
-                                            .when(fresh, |title| title.font_weight(FontWeight::SEMIBOLD))
-                                            .when(!fresh, |title| title.font_weight(FontWeight::MEDIUM))
-                                            .text_color(if entry.expired { ui.text_muted } else { ui.foreground })
+                                            .when(fresh, |title| {
+                                                title.font_weight(FontWeight::SEMIBOLD)
+                                            })
+                                            .when(!fresh, |title| {
+                                                title.font_weight(FontWeight::MEDIUM)
+                                            })
+                                            .text_color(if entry.expired {
+                                                ui.text_muted
+                                            } else {
+                                                ui.foreground
+                                            })
                                             .child(notification.title.clone()),
                                     )
                                     .when(title_only, |row| row.child(group_label()))
@@ -552,7 +577,9 @@ impl NotificationsPanel {
                                                     .gap(px(6.))
                                                     .text_size(px(theme::TEXT_XS))
                                                     .text_color(ui.dim)
-                                                    .group_hover(group.clone(), |style| style.opacity(0.))
+                                                    .group_hover(group.clone(), |style| {
+                                                        style.opacity(0.)
+                                                    })
                                                     // A dot of a new notification, before the time.
                                                     .when(fresh, |time| {
                                                         time.child(
@@ -570,17 +597,19 @@ impl NotificationsPanel {
                                                     .top(px(-4.))
                                                     .right(px(-4.))
                                                     .opacity(0.)
-                                                    .group_hover(group.clone(), |style| style.opacity(1.))
+                                                    .group_hover(group.clone(), |style| {
+                                                        style.opacity(1.)
+                                                    })
                                                     .child(
                                                         ui::icon_button(
-                                                            ("notification-entry-remove", id as usize),
+                                                            (
+                                                                "notification-entry-remove",
+                                                                id as usize,
+                                                            ),
                                                             IconName::Close,
                                                             ui,
                                                         )
-                                                        .tooltip(ui::tooltip(
-                                                            tr("Remove"),
-                                                            None,
-                                                        ))
+                                                        .tooltip(ui::tooltip(tr("Remove"), None))
                                                         .on_click(cx.listener(
                                                             move |this, _: &ClickEvent, _, cx| {
                                                                 cx.stop_propagation();
@@ -635,15 +664,11 @@ impl NotificationsPanel {
             .gap_2()
             .text_center()
             .child(icon(IconName::Bell, ui.dim).size(px(28.)))
-            .child(
-                div()
-                    .text_color(ui.text_muted)
-                    .child(if filtered {
-                        tr("No notifications in this group")
-                    } else {
-                        tr("No notifications")
-                    }),
-            )
+            .child(div().text_color(ui.text_muted).child(if filtered {
+                tr("No notifications in this group")
+            } else {
+                tr("No notifications")
+            }))
             .child(
                 div()
                     .text_size(px(theme::TEXT_SM))
@@ -719,7 +744,8 @@ impl Render for NotificationsPanel {
             }))
             .on_action(cx.listener(|this, _: &MarkAllAsRead, _, cx| {
                 this.fresh.clear();
-                this.center.update(cx, |center, cx| center.mark_all_read(cx));
+                this.center
+                    .update(cx, |center, cx| center.mark_all_read(cx));
             }))
             .on_action(cx.listener(|this, _: &ClearAll, _, cx| {
                 this.fresh.clear();
@@ -758,7 +784,11 @@ impl Render for NotificationsPanel {
                     )
                     .child(list),
             )
-            .child(resize_handle(self.resizing, ui::resize_handle_center(ui::style(cx)), ui))
+            .child(resize_handle(
+                self.resizing,
+                ui::resize_handle_center(ui::style(cx)),
+                ui,
+            ))
             .children(
                 self.menu
                     .as_ref()

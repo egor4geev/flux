@@ -8,7 +8,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Flux works with your claude and your Claude subscription: the chat on the right or as an editor tab, edits as diffs with review and rollback, a fix for a problem with {0}.",
         "Flux работает с вашим claude и подпиской Claude: чат справа или вкладкой редактора, правки — диффом с обзором и откатом, исправление проблемы — по {0}.",
     ),
-    ("Open the chat and go back to the editor", "Открыть чат и вернуться в редактор"),
+    (
+        "Open the chat and go back to the editor",
+        "Открыть чат и вернуться в редактор",
+    ),
     ("The selection into the message", "Выделенное — в сообщение"),
     ("“{0}” on a problem", "«{0}» у проблемы"),
     ("Claude Code is ready", "Claude Code готов"),

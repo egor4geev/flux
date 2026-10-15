@@ -1,0 +1,31 @@
+[package]
+name = "flux-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+# CI's half of the updates (part 10.8): keys, signatures and `latest.json` of a release.
+name = "flux-release"
+path = "src/bin/flux-release.rs"
+
+[dependencies]
+# Ed25519 signatures of the update archives and their SHA-256 (ring is in Flux's tree already,
+# through rustls).
+ring = "0.17.14"
+base64 = "0.22"
+# Versions of releases: `0.1.0` < `0.2.0-beta.1` < `0.2.0` (pre-release ordering of SemVer).
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Same client as the plugin catalog's (flux-plugin): rustls with ring, the system's certificates.
+ureq = { version = "3.4", default-features = false, features = [
+    "_ring",
+    "gzip",
+    "platform-verifier",
+    "rustls-no-provider",
+] }
+
+# Whether Flux can replace its bundle: a writable folder, not a read-only volume (`install`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

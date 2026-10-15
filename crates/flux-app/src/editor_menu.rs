@@ -11,8 +11,9 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    App, AppContext, ClipboardItem, Context, DismissEvent, Div, Entity, Focusable, InteractiveElement,
-    KeyBinding, MouseDownEvent, Pixels, Point, Subscription, Window, actions, point,
+    App, AppContext, ClipboardItem, Context, DismissEvent, Div, Entity, Focusable,
+    InteractiveElement, KeyBinding, MouseDownEvent, Pixels, Point, Subscription, Window, actions,
+    point,
 };
 
 use flux_plugin::manifest::MenuLocation;
@@ -122,7 +123,12 @@ fn groups(facts: &Facts) -> Vec<Group> {
 
 fn facts(editor: &Editor, cx: &App) -> Facts {
     let text = editor.document.text();
-    let head = editor.document.selection().primary().head.min(text.len_chars());
+    let head = editor
+        .document
+        .selection()
+        .primary()
+        .head
+        .min(text.len_chars());
     let line = text.char_to_line(head) as u32;
     let file = editor.document.path().is_some();
     Facts {
@@ -273,12 +279,10 @@ pub fn secondary_click(
         return crate::blame::secondary_click(editor, event, window, cx);
     }
     let position = layout.position_for_point(editor.document.text(), event.position);
-    let in_selection = editor
-        .document
-        .selection()
-        .ranges()
-        .iter()
-        .any(|range| range.from() != range.to() && (range.from()..=range.to()).contains(&position));
+    let in_selection =
+        editor.document.selection().ranges().iter().any(|range| {
+            range.from() != range.to() && (range.from()..=range.to()).contains(&position)
+        });
     window.focus(&editor.focus_handle);
     if !in_selection {
         editor.select_range(position..position, cx);
@@ -299,7 +303,12 @@ fn show_at_caret(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
     open(editor, position, window, cx);
 }
 
-fn open(editor: &mut Editor, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Editor>) {
+fn open(
+    editor: &mut Editor,
+    position: Point<Pixels>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
     let facts = facts(editor, cx);
     // The plugins' items, for a document with a file (not a commit message).
     let plugins = editor
@@ -346,7 +355,12 @@ fn open(editor: &mut Editor, position: Point<Pixels>, window: &mut Window, cx: &
 }
 
 /// Closes the menu (if it is still the same one); Esc in the menu returns focus to the editor.
-fn close(editor: &mut Editor, menu: &Entity<ContextMenu>, window: &mut Window, cx: &mut Context<Editor>) {
+fn close(
+    editor: &mut Editor,
+    menu: &Entity<ContextMenu>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
     if editor
         .menu
         .open
@@ -365,9 +379,9 @@ fn close(editor: &mut Editor, menu: &Entity<ContextMenu>, window: &mut Window, c
 
 /// The editor's handlers: ⇧F10 (a preview never has the focus).
 pub fn actions(root: Div, _editor: &Editor, cx: &mut Context<Editor>) -> Div {
-    root.on_action(cx.listener(|editor, _: &ShowContextMenu, window, cx| {
-        show_at_caret(editor, window, cx)
-    }))
+    root.on_action(
+        cx.listener(|editor, _: &ShowContextMenu, window, cx| show_at_caret(editor, window, cx)),
+    )
 }
 
 /// The open menu over the window.
@@ -379,7 +393,9 @@ pub fn render(editor: &Editor) -> Option<gpui::AnyElement> {
 /// The window's handlers of the menu's file items: they act on the active document.
 pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
     root.on_action(cx.listener(|this, _: &CopyAbsolutePath, _, cx| {
-        copy(this, cx, |path, _, _| Some(path.to_string_lossy().into_owned()))
+        copy(this, cx, |path, _, _| {
+            Some(path.to_string_lossy().into_owned())
+        })
     }))
     .on_action(cx.listener(|this, _: &CopyPathFromRoot, _, cx| {
         copy(this, cx, |path, root, _| {
@@ -402,7 +418,10 @@ pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
         }
     }))
     .on_action(cx.listener(|this, _: &OpenInTerminal, window, cx| {
-        if let Some(dir) = this.active_path(cx).and_then(|path| Some(path.parent()?.to_path_buf())) {
+        if let Some(dir) = this
+            .active_path(cx)
+            .and_then(|path| Some(path.parent()?.to_path_buf()))
+        {
             this.open_terminal_in(dir, window, cx);
         }
     }))
@@ -425,7 +444,12 @@ fn copy(
     let line = workspace.active_editor().map(|editor| {
         let editor = editor.read(cx);
         let text = editor.document.text();
-        let head = editor.document.selection().primary().head.min(text.len_chars());
+        let head = editor
+            .document
+            .selection()
+            .primary()
+            .head
+            .min(text.len_chars());
         text.char_to_line(head) + 1
     });
     let root: Option<PathBuf> = workspace.root().map(Path::to_path_buf);
@@ -470,7 +494,12 @@ mod tests {
         };
         assert_eq!(
             groups(&read_only),
-            [Group::Clipboard, Group::CopyPath, Group::Code, Group::OpenIn]
+            [
+                Group::Clipboard,
+                Group::CopyPath,
+                Group::Code,
+                Group::OpenIn
+            ]
         );
         let message = Facts {
             message: true,

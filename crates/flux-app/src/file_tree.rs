@@ -1685,7 +1685,11 @@ impl Render for FileTreePanel {
                     )
                     .child(list),
             )
-            .child(resize_handle(self.resizing, ui::resize_handle_center(ui::style(cx)), ui))
+            .child(resize_handle(
+                self.resizing,
+                ui::resize_handle_center(ui::style(cx)),
+                ui,
+            ))
             .children(
                 self.menu
                     .as_ref()

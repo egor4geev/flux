@@ -6,9 +6,9 @@ use flux_core::text::line_start;
 use gpui::{App, Div, Pixels, Point, Window, div, point, prelude::*, px};
 
 use crate::editor::Editor;
-use crate::workspace::Workspace;
 use crate::theme::{self, UiColors};
 use crate::ui::{self, RADIUS_LG};
+use crate::workspace::Workspace;
 
 /// Distance between a popup and its line, and between neighboring popups.
 pub const POPUP_GAP: f32 = 4.;
@@ -41,8 +41,7 @@ pub fn anchor(editor: &Editor, pos: usize) -> Option<Anchor> {
     let bounds = layout.text_bounds;
     let x = bounds.left() + px(theme::TEXT_PADDING - editor.scroll.x) + x_in_line;
     let display_row = editor.wrap.row_of(text, pos);
-    let line_top =
-        bounds.top() + layout.line_height * display_row as f32 - px(editor.scroll.y);
+    let line_top = bounds.top() + layout.line_height * display_row as f32 - px(editor.scroll.y);
     let line_bottom = line_top + layout.line_height;
     let visible = line_bottom > bounds.top()
         && line_top < bounds.bottom()

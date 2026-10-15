@@ -6,7 +6,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Explain with Claude", "Объяснить с помощью Claude"),
     ("Not available: {0}", "Недоступно: {0}"),
     ("No actions here", "Здесь нет действий"),
-    ("Couldn't apply “{0}”: {1}", "Не удалось применить «{0}»: {1}"),
+    (
+        "Couldn't apply “{0}”: {1}",
+        "Не удалось применить «{0}»: {1}",
+    ),
     ("“{0}” failed: {1}", "«{0}» не выполнено: {1}"),
     ("Couldn't apply the edit", "Не удалось применить правку"),
     // The command palette.

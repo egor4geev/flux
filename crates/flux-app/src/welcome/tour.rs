@@ -20,8 +20,8 @@ use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
 use crate::theme::{Theme, UiColors};
 use crate::{
-    claude, code_actions, command_palette, file_finder, file_tree, git, navigation,
-    project_search, quick_switch, terminal_panel, ui,
+    claude, code_actions, command_palette, file_finder, file_tree, git, navigation, project_search,
+    quick_switch, terminal_panel, ui,
 };
 
 /// How long after a tour slide shows its picture plays by itself.
@@ -82,7 +82,11 @@ impl Tasks {
         let now = Instant::now();
         let reduce = reduce_motion();
         self.played.iter().any(|(tour, start)| {
-            let length = if reduce { Duration::ZERO } else { show_duration(*tour) };
+            let length = if reduce {
+                Duration::ZERO
+            } else {
+                show_duration(*tour)
+            };
             // A frame past the end, so the last one is drawn at 1.
             now <= *start + length + Duration::from_millis(50)
         })
@@ -242,7 +246,14 @@ pub fn render(
         .flex()
         .flex_col()
         .child(heading(eyebrow, copy.title, copy.lead, ui))
-        .child(div().mt(px(22.)).ml(px(-14.)).flex().flex_col().children(rows))
+        .child(
+            div()
+                .mt(px(22.))
+                .ml(px(-14.))
+                .flex()
+                .flex_col()
+                .children(rows),
+        )
         .children(task(tour, copy.done, done, ui, cx));
     let picture = div()
         .flex_1()
@@ -323,7 +334,11 @@ fn task(tour: Tour, done_text: &str, done: bool, ui: UiColors, cx: &App) -> Opti
     Some(if done {
         card.bg(UiColors::tint(ui.success, 0.12))
             .border_color(UiColors::tint(ui.success, 0.35))
-            .child(icon(IconName::CheckCircle, ui.success).size(px(16.)).mt(px(1.)))
+            .child(
+                icon(IconName::CheckCircle, ui.success)
+                    .size(px(16.))
+                    .mt(px(1.)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -361,13 +376,19 @@ mod tests {
         let show = show_duration(Tour::Search);
         assert_eq!(progress_at(None, show, start, false), 0.);
         // Waiting for the show that plays by itself.
-        assert_eq!(progress_at(Some(start + AUTOPLAY_DELAY), show, start, false), 0.);
+        assert_eq!(
+            progress_at(Some(start + AUTOPLAY_DELAY), show, start, false),
+            0.
+        );
         let half = progress_at(Some(start), show, start + show / 2, false);
         assert!((half - 0.5).abs() < 0.01);
         assert_eq!(progress_at(Some(start), show, start + show * 2, false), 1.);
         // "Reduce motion": no in-between.
         assert_eq!(progress_at(Some(start), show, start + show / 4, true), 1.);
-        assert_eq!(progress_at(Some(start + AUTOPLAY_DELAY), show, start, true), 0.);
+        assert_eq!(
+            progress_at(Some(start + AUTOPLAY_DELAY), show, start, true),
+            0.
+        );
         // The pictures that type and step through more get more time.
         assert!(show_duration(Tour::Git) > show_duration(Tour::Search));
         assert!(show_duration(Tour::Claude) >= Duration::from_millis(2200));

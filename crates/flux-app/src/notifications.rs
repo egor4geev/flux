@@ -368,7 +368,11 @@ impl Notifications {
                             .text_color(ui.text_muted)
                             .child(body)
                     }))
-                    .children(notification.progress.map(|progress| progress_bar(progress, ui)))
+                    .children(
+                        notification
+                            .progress
+                            .map(|progress| progress_bar(progress, ui)),
+                    )
                     .when(!actions.is_empty(), |column| {
                         column.child(
                             div()
@@ -391,12 +395,10 @@ impl Notifications {
                     .group_hover(group, |style| style.opacity(1.))
                     .child(
                         ui::icon_button(("notification-close", id as usize), IconName::Close, ui)
-                            .on_click(
-                                cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.dismiss(id, cx);
-                                    cx.emit(CardEvent::Closed(id));
-                                }),
-                            ),
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.dismiss(id, cx);
+                                cx.emit(CardEvent::Closed(id));
+                            })),
                     ),
             )
     }

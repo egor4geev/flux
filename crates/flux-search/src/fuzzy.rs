@@ -417,10 +417,28 @@ mod tests {
 
     #[test]
     fn only_queries_that_can_be_names_look_for_files() {
-        for query in ["radme.md", "Cargo.toml", "src/ui", "flux-app", "c++", "@scope", "план.md"] {
+        for query in [
+            "radme.md",
+            "Cargo.toml",
+            "src/ui",
+            "flux-app",
+            "c++",
+            "@scope",
+            "план.md",
+        ] {
             assert!(is_name_query(query), "{query}");
         }
-        let texts = ["fn render", "Ok(", "a = b", "x;", "'exact", "!skip", "^start", "end$", "ab"];
+        let texts = [
+            "fn render",
+            "Ok(",
+            "a = b",
+            "x;",
+            "'exact",
+            "!skip",
+            "^start",
+            "end$",
+            "ab",
+        ];
         for query in texts {
             assert!(!is_name_query(query), "{query}");
         }
@@ -456,7 +474,10 @@ mod tests {
             "crates/flux-app/src/ui.rs",
         ];
         assert_eq!(names("test", &paths), ["vendor/gpui/src/test.rs"]);
-        assert_eq!(names("tests/pty", &paths), ["crates/flux-term/tests/pty.rs"]);
+        assert_eq!(
+            names("tests/pty", &paths),
+            ["crates/flux-term/tests/pty.rs"]
+        );
         let (found, _) = match_file_names("src/ui", &paths, 1);
         assert_eq!(paths[found[0].index], "crates/flux-app/src/ui.rs");
         // A path query's positions start in the directories.
@@ -472,9 +493,15 @@ mod tests {
             "crates/flux-app/assets/icons/arrow-left.svg",
             "crates/flux-app/src/project_search.rs",
         ];
-        assert_eq!(names("editor.rs", &paths), ["crates/flux-app/src/editor.rs"]);
+        assert_eq!(
+            names("editor.rs", &paths),
+            ["crates/flux-app/src/editor.rs"]
+        );
         assert!(names("let", &paths).is_empty());
-        assert_eq!(names("prjsrch", &paths), ["crates/flux-app/src/project_search.rs"]);
+        assert_eq!(
+            names("prjsrch", &paths),
+            ["crates/flux-app/src/project_search.rs"]
+        );
         // Smart case, as in ⌘P: an uppercase letter wants that case.
         assert!(names("Editor", &paths).is_empty());
         // Cyrillic names: the positions are characters.

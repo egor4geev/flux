@@ -81,11 +81,14 @@ fn a_plugin_built_for_0_2_asks_the_window() {
 fn a_plugin_built_for_0_2_hears_only_what_it_knows() {
     let mut probe = start(probe_02("test.v02-events", "0.2"), None, Map::new());
     // 0.3's events don't reach it — and don't stop it.
+    probe.instance.send_event(Event::FormAnswered((
+        1,
+        Some(vec![("a".into(), "b".into())]),
+    )));
+    probe.instance.send_event(Event::PickerChosen((2, None)));
     probe
         .instance
-        .send_event(Event::FormAnswered((1, Some(vec![("a".into(), "b".into())]))));
-    probe.instance.send_event(Event::PickerChosen((2, None)));
-    probe.instance.send_event(Event::GitDone((3, Err("no".into()))));
+        .send_event(Event::GitDone((3, Err("no".into()))));
     probe
         .instance
         .set_settings(Map::from_iter([("greeting".to_string(), json!("hey"))]));
@@ -159,7 +162,9 @@ fn plugins_without_code_load_for_either_api_and_not_for_others() {
         let dir = temp_dir("declarative-api");
         std::fs::write(
             dir.join("flux-plugin.toml"),
-            format!("id = \"test.theme\"\nname = \"Theme\"\nversion = \"1.0.0\"\napi = \"{api}\"\n"),
+            format!(
+                "id = \"test.theme\"\nname = \"Theme\"\nversion = \"1.0.0\"\napi = \"{api}\"\n"
+            ),
         )
         .unwrap();
         let entry = load_dir(&dir, PluginSource::Installed).unwrap();
@@ -177,8 +182,12 @@ fn plugins_without_code_load_for_either_api_and_not_for_others() {
 #[test]
 fn a_plugin_built_for_0_2_without_new_events_stays_quiet() {
     let mut probe = start(probe_02("test.v02-quiet", "0.2"), None, Map::new());
-    probe.instance.send_event(Event::LinkHovered((1, "p".into(), "TRACK-1".into())));
-    probe.instance.send_event(Event::PickerQuery((1, "x".into())));
+    probe
+        .instance
+        .send_event(Event::LinkHovered((1, "p".into(), "TRACK-1".into())));
+    probe
+        .instance
+        .send_event(Event::PickerQuery((1, "x".into())));
     std::thread::sleep(Duration::from_millis(100));
     loop {
         match probe.messages.try_recv() {

@@ -328,11 +328,11 @@ fn user_line(line: &Value) -> Option<UserLine> {
         || trimmed.starts_with("<local-command-stderr>")
     {
         let output = ["local-command-stdout", "local-command-stderr"]
-        .iter()
-        .filter_map(|name| tag(trimmed, name))
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+            .iter()
+            .filter_map(|name| tag(trimmed, name))
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
         return Some(UserLine::Output(strip_ansi(&output)));
     }
     let text = trimmed.to_string();
@@ -349,7 +349,9 @@ fn tag(text: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = text.find(&open)? + open.len();
-    let end = text[start..].find(&close).map_or(text.len(), |end| start + end);
+    let end = text[start..]
+        .find(&close)
+        .map_or(text.len(), |end| start + end);
     Some(text[start..end].trim().to_string())
 }
 
@@ -428,7 +430,10 @@ pub fn load(path: &Path, cwd: PathBuf) -> io::Result<Session> {
             if fs::metadata(&file).is_ok_and(|meta| meta.len() <= SUBAGENT_LIMIT)
                 && let Ok(text) = fs::read_to_string(&file)
             {
-                for line in text.lines().filter_map(|line| serde_json::from_str(line).ok()) {
+                for line in text
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                {
                     reader.line(&line, Some(&tool_use_id));
                 }
             }
@@ -436,7 +441,9 @@ pub fn load(path: &Path, cwd: PathBuf) -> io::Result<Session> {
     }
     let mut session = reader.session;
     session.finish_restore();
-    session.info.title = titles.best().or_else(|| reader.first_prompt.as_deref().map(shorten));
+    session.info.title = titles
+        .best()
+        .or_else(|| reader.first_prompt.as_deref().map(shorten));
     session.info.model = reader.model;
     Ok(session)
 }
@@ -622,7 +629,8 @@ impl Reader {
                         .filter(|text| !text.is_empty())
                 {
                     let uuid = line["uuid"].as_str().map(str::to_string);
-                    self.session.restore_user(uuid, text.to_string(), Vec::new(), at);
+                    self.session
+                        .restore_user(uuid, text.to_string(), Vec::new(), at);
                 }
             }
             _ => {}
@@ -668,7 +676,13 @@ impl Reader {
     }
 
     fn system(&mut self, line: &Value) {
-        let content = || line["content"].as_str().unwrap_or_default().trim().to_string();
+        let content = || {
+            line["content"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
         match line["subtype"].as_str() {
             Some("turn_duration") => {
                 let duration = line["durationMs"].as_u64().map(Duration::from_millis);
@@ -767,15 +781,26 @@ mod tests {
     #[test]
     fn prompts_titles_and_wrappers() {
         let user = |content: Value| json!({ "type": "user", "message": { "role": "user", "content": content } });
-        assert_eq!(first_prompt(&user(json!("Fix the login"))).as_deref(), Some("Fix the login"));
+        assert_eq!(
+            first_prompt(&user(json!("Fix the login"))).as_deref(),
+            Some("Fix the login")
+        );
         assert_eq!(
             first_prompt(&user(json!([{ "type": "text", "text": "  hi  " }]))).as_deref(),
             Some("hi")
         );
-        assert_eq!(first_prompt(&user(json!("<command-name>/model</command-name>"))), None);
-        assert_eq!(first_prompt(&user(json!("<task-notification>x</task-notification>"))), None);
         assert_eq!(
-            first_prompt(&user(json!([{ "type": "tool_result", "tool_use_id": "t", "content": "ok" }]))),
+            first_prompt(&user(json!("<command-name>/model</command-name>"))),
+            None
+        );
+        assert_eq!(
+            first_prompt(&user(json!("<task-notification>x</task-notification>"))),
+            None
+        );
+        assert_eq!(
+            first_prompt(&user(
+                json!([{ "type": "tool_result", "tool_use_id": "t", "content": "ok" }])
+            )),
             None
         );
         let mut meta = user(json!("caveat"));
@@ -786,6 +811,9 @@ mod tests {
         let long = "word ".repeat(40);
         let title = shorten(&long);
         assert!(title.ends_with('…') && title.chars().count() <= TITLE_CHARS);
-        assert_eq!(strip_ansi("\u{1b}[1mTotal\u{1b}[22m: $0.10"), "Total: $0.10");
+        assert_eq!(
+            strip_ansi("\u{1b}[1mTotal\u{1b}[22m: $0.10"),
+            "Total: $0.10"
+        );
     }
 }

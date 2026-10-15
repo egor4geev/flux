@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, DismissEvent, Entity,
-    EventEmitter, FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, Render,
-    ScrollStrategy, SharedString, StyledText, Subscription, UniformListScrollHandle, Window,
-    actions, div, prelude::*, px, uniform_list,
+    EventEmitter, FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, Render, ScrollStrategy,
+    SharedString, StyledText, Subscription, UniformListScrollHandle, Window, actions, div,
+    prelude::*, px, uniform_list,
 };
 
 use crate::i18n::tr;
@@ -446,14 +446,11 @@ impl<D: PickerDelegate> Render for Picker<D> {
                 .text_color(ui.dim)
                 .child(div().min_w_0().truncate().children(footer))
                 .child(ui::hint_bar(
-                    &[
-                        ("↑↓", tr("navigate")),
-                        ("↵", self.delegate.confirm_label()),
-                    ]
-                    .into_iter()
-                    .chain(delete_label.map(|label| ("⌘⌫", label)))
-                    .chain([("esc", tr("close"))])
-                    .collect::<Vec<_>>(),
+                    &[("↑↓", tr("navigate")), ("↵", self.delegate.confirm_label())]
+                        .into_iter()
+                        .chain(delete_label.map(|label| ("⌘⌫", label)))
+                        .chain([("esc", tr("close"))])
+                        .collect::<Vec<_>>(),
                     ui,
                 ))
         });

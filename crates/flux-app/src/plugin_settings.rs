@@ -93,10 +93,14 @@ pub fn init(cx: &mut App) {
         with_open_page(cx, |page, window, cx| page.remove_record_action(window, cx))
     });
     cx.on_action(|_: &MoveRecordUp, cx| {
-        with_open_page(cx, |page, window, cx| page.move_record_action(-1, window, cx))
+        with_open_page(cx, |page, window, cx| {
+            page.move_record_action(-1, window, cx)
+        })
     });
     cx.on_action(|_: &MoveRecordDown, cx| {
-        with_open_page(cx, |page, window, cx| page.move_record_action(1, window, cx))
+        with_open_page(cx, |page, window, cx| {
+            page.move_record_action(1, window, cx)
+        })
     });
     cx.on_action(|_: &ToggleRecord, cx| {
         with_open_page(cx, |page, window, cx| page.toggle_record_action(window, cx))
@@ -127,7 +131,9 @@ fn with_open_page(
             return;
         };
         handle
-            .update(cx, |_, window, cx| page.update(cx, |page, cx| f(page, window, cx)))
+            .update(cx, |_, window, cx| {
+                page.update(cx, |page, cx| f(page, window, cx))
+            })
             .ok();
     });
 }
@@ -306,12 +312,9 @@ impl PluginSettingsPage {
                 saved: None,
                 generation: Rc::new(Cell::new(0)),
             }),
-            SettingKind::Text => FieldState::Lines(self.lines(
-                index,
-                value.as_str().unwrap_or(""),
-                TEXT_ROWS,
-                cx,
-            )),
+            SettingKind::Text => {
+                FieldState::Lines(self.lines(index, value.as_str().unwrap_or(""), TEXT_ROWS, cx))
+            }
             SettingKind::Records(fields) => {
                 let records: Vec<&Value> = value.as_array().into_iter().flatten().collect();
                 // A single record shows its fields at once; more — their names.
@@ -532,7 +535,8 @@ impl PluginSettingsPage {
             }
             let plugin = self.plugin.to_string();
             let key = self.fields[index].spec.key.clone();
-            let read = cx.background_spawn(async move { flux_plugin::plugin_secret(&plugin, &key) });
+            let read =
+                cx.background_spawn(async move { flux_plugin::plugin_secret(&plugin, &key) });
             cx.spawn(async move |this, cx| {
                 let result = read.await;
                 this.update(cx, |this, cx| {
@@ -607,7 +611,10 @@ impl PluginSettingsPage {
         if let FieldState::Secret(secret) = &self.fields[index].state {
             // A save still waiting for the typing to stop doesn't come after the removal.
             secret.generation.set(secret.generation.get() + 1);
-            secret.row.input.update(cx, |input, cx| input.set_text("", cx));
+            secret
+                .row
+                .input
+                .update(cx, |input, cx| input.set_text("", cx));
         }
         self.write_secret(index, None, cx);
     }
@@ -723,7 +730,13 @@ impl PluginSettingsPage {
     }
 
     /// Remove of a card: asks first when something is typed in the record.
-    fn remove_record(&mut self, index: usize, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+    fn remove_record(
+        &mut self,
+        index: usize,
+        id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let field = &self.fields[index];
         let (SettingKind::Records(fields), FieldState::Records(cards)) =
             (&field.spec.kind, &field.state)
@@ -738,13 +751,16 @@ impl PluginSettingsPage {
         }
         let name = record_name(fields, card, cx).unwrap_or_else(|| tr("Untitled").to_string());
         let answer = Dialog::warning(trf("Remove “{0}”?", &[&name]))
-            .message(tr("Its fields go with it; Reset brings back the plugin's own list."))
+            .message(tr(
+                "Its fields go with it; Reset brings back the plugin's own list.",
+            ))
             .danger(tr("Remove"))
             .cancel(tr("Cancel"))
             .show(window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if answer.await == Some(0) {
-                this.update(cx, |this, cx| this.drop_record(index, id, cx)).ok();
+                this.update(cx, |this, cx| this.drop_record(index, id, cx))
+                    .ok();
             }
         })
         .detach();
@@ -786,7 +802,13 @@ impl PluginSettingsPage {
     }
 
     /// A record's switch.
-    fn toggle_record_switch(&mut self, index: usize, id: u64, field: usize, cx: &mut Context<Self>) {
+    fn toggle_record_switch(
+        &mut self,
+        index: usize,
+        id: u64,
+        field: usize,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(RecordInput::Switch(on)) = self
             .cards_mut(index)
             .and_then(|cards| cards.iter_mut().find(|card| card.id == id))
@@ -900,7 +922,11 @@ impl PluginSettingsPage {
                 FieldState::Lines(lines) => handles.push(lines.input.focus_handle(cx)),
                 FieldState::Records(cards) => {
                     for card in cards.iter().filter(|card| card.expanded) {
-                        handles.extend(card.inputs.iter().filter_map(|input| input_focus(input, cx)));
+                        handles.extend(
+                            card.inputs
+                                .iter()
+                                .filter_map(|input| input_focus(input, cx)),
+                        );
                     }
                 }
                 FieldState::Plain => {}
@@ -1209,9 +1235,9 @@ impl PluginSettingsPage {
                         false,
                         ui,
                     )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.add_record(index, window, cx)
-                    })),
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, window, cx| this.add_record(index, window, cx),
+                    )),
                 ),
             )
     }
@@ -1256,7 +1282,9 @@ impl PluginSettingsPage {
                 .collect()
         };
         let toggle = div()
-            .id(SharedString::from(format!("plugin-record-{index}-{id}-toggle")))
+            .id(SharedString::from(format!(
+                "plugin-record-{index}-{id}-toggle"
+            )))
             .flex_1()
             .min_w_0()
             .flex()
@@ -1264,7 +1292,9 @@ impl PluginSettingsPage {
             .gap_1p5()
             .py_0p5()
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_card(index, id, cx)))
+            .on_click(
+                cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_card(index, id, cx)),
+            )
             .child(
                 crate::icons::icon(
                     if card.expanded {
@@ -1302,13 +1332,14 @@ impl PluginSettingsPage {
             .pr_1()
             .py_1()
             .child(toggle)
-            .child(
-                button("up", IconName::ArrowUp, "Move Up", place > 0).when(place > 0, |button| {
+            .child(button("up", IconName::ArrowUp, "Move Up", place > 0).when(
+                place > 0,
+                |button| {
                     button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.move_record(index, id, -1, cx)
                     }))
-                }),
-            )
+                },
+            ))
             .child(
                 button("down", IconName::ArrowDown, "Move Down", place + 1 < count).when(
                     place + 1 < count,
@@ -1319,9 +1350,13 @@ impl PluginSettingsPage {
                     },
                 ),
             )
-            .child(button("remove", IconName::Trash, "Remove", true).on_click(cx.listener(
-                move |this, _: &ClickEvent, window, cx| this.remove_record(index, id, window, cx),
-            )));
+            .child(
+                button("remove", IconName::Trash, "Remove", true).on_click(cx.listener(
+                    move |this, _: &ClickEvent, window, cx| {
+                        this.remove_record(index, id, window, cx)
+                    },
+                )),
+            );
         div()
             .id(SharedString::from(format!("plugin-record-{index}-{id}")))
             .key_context(RECORD_CONTEXT)
@@ -1342,7 +1377,9 @@ impl PluginSettingsPage {
                         .pb_3()
                         .children(fields.iter().zip(&card.inputs).enumerate().map(
                             |(position, (field, input))| {
-                                self.render_record_field(index, id, position, field, input, window, cx)
+                                self.render_record_field(
+                                    index, id, position, field, input, window, cx,
+                                )
                             },
                         )),
                 )
@@ -1386,7 +1423,9 @@ impl PluginSettingsPage {
                 .child(render_lines(lines, window, cx))
                 .into_any_element(),
             (RecordInput::Switch(on), _) => div()
-                .id(SharedString::from(format!("plugin-record-{index}-{id}-{position}")))
+                .id(SharedString::from(format!(
+                    "plugin-record-{index}-{id}-{position}"
+                )))
                 .flex()
                 .items_center()
                 .gap_2()
@@ -1437,7 +1476,14 @@ impl PluginSettingsPage {
                     .flex_col()
                     .gap_1()
                     .child(caption())
-                    .child(div().flex().flex_wrap().gap_x_3().gap_y_1().children(options))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_x_3()
+                            .gap_y_1()
+                            .children(options),
+                    )
                     .into_any_element()
             }
             (RecordInput::Choice(_), _) => div().into_any_element(),
@@ -1564,9 +1610,9 @@ impl PluginSettingsPage {
                                 false,
                                 ui,
                             )
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.clear_secret(index, cx)
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _: &ClickEvent, _, cx| this.clear_secret(index, cx),
+                            )),
                         )
                     }),
             )
@@ -1578,7 +1624,9 @@ impl PluginSettingsPage {
                     .text_size(px(theme::TEXT_SM))
                     .text_color(ui.dim)
                     .when(saved, |line| {
-                        line.child(crate::icons::icon(IconName::CheckCircle, ui.success).size(px(12.)))
+                        line.child(
+                            crate::icons::icon(IconName::CheckCircle, ui.success).size(px(12.)),
+                        )
                     })
                     .child(hint)
             }))
@@ -1738,15 +1786,17 @@ impl Render for PluginSettingsPage {
         OPEN_PAGE.with(|open| *open.borrow_mut() = Some((page, handle)));
         div()
             .key_context(PAGE_CONTEXT)
-            .on_action(cx.listener(|this, _: &NextField, window, cx| {
-                this.focus_step(true, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &PreviousField, window, cx| {
-                this.focus_step(false, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &AddRecord, window, cx| {
-                this.add_record_action(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &NextField, window, cx| this.focus_step(true, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PreviousField, window, cx| {
+                    this.focus_step(false, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &AddRecord, window, cx| this.add_record_action(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &RemoveRecord, window, cx| {
                 this.remove_record_action(window, cx)
             }))
@@ -1817,10 +1867,10 @@ fn render_lines(lines: &Lines, window: &Window, cx: &mut Context<PluginSettingsP
             field.hover(move |style| style.border_color(ui.elevated_border))
         })
         .cursor(CursorStyle::IBeam)
-        .on_mouse_down(gpui::MouseButton::Left, move |_, window, _| window.focus(&focus))
-        .on_action(move |_: &NewLine, _, cx| {
-            input.update(cx, |input, cx| input.insert("\n", cx))
+        .on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
+            window.focus(&focus)
         })
+        .on_action(move |_: &NewLine, _, cx| input.update(cx, |input, cx| input.insert("\n", cx)))
         .child(lines.input.clone())
 }
 

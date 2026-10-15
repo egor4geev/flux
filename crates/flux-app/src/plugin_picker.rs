@@ -234,8 +234,7 @@ fn anchor_point(
         PickerAnchor::Window => None,
         // Above the item, from its left edge, as JetBrains' status bar popups.
         PickerAnchor::StatusItem(item) => {
-            let bounds =
-                status_item_bounds(window.window_handle().window_id(), plugin, item, cx)?;
+            let bounds = status_item_bounds(window.window_handle().window_id(), plugin, item, cx)?;
             Some((
                 point(bounds.left(), bounds.top() - px(ANCHOR_GAP)),
                 Corner::BottomLeft,
@@ -357,13 +356,11 @@ impl PluginPicker {
             .gap_2()
             .whitespace_nowrap()
             .children(item_icon.map(|item_icon| item_icon.render(ui.text_muted)))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_shrink()
-                    .truncate()
-                    .child(label_text(&item.label, positions, ui)),
-            )
+            .child(div().min_w_0().flex_shrink().truncate().child(label_text(
+                &item.label,
+                positions,
+                ui,
+            )))
             // A detail keeps a part of the row; the label gives way first.
             .children(item.detail.as_deref().map(|detail| {
                 div()
@@ -495,10 +492,19 @@ impl PickerDelegate for PluginPicker {
             .iter()
             .map(|item| {
                 let row = label_of(item).chars().count()
-                    + item.detail.as_deref().map_or(0, |detail| detail.chars().count() + 2)
-                    + item.badge.as_deref().map_or(0, |badge| badge.chars().count() + 3)
+                    + item
+                        .detail
+                        .as_deref()
+                        .map_or(0, |detail| detail.chars().count() + 2)
+                    + item
+                        .badge
+                        .as_deref()
+                        .map_or(0, |badge| badge.chars().count() + 3)
                     + if item.icon.is_some() { 3 } else { 0 };
-                let heading = item.group.as_deref().map_or(0, |group| group.chars().count());
+                let heading = item
+                    .group
+                    .as_deref()
+                    .map_or(0, |group| group.chars().count());
                 row.max(heading)
             })
             .max()
@@ -666,7 +672,10 @@ mod tests {
             ["# Today", "0", "2", "# Tomorrow", "1", "3"]
         );
         // A query keeps the groups with matches, in the same order.
-        assert_eq!(shape(&rows(&items, "re")), ["# Today", "2", "# Tomorrow", "1"]);
+        assert_eq!(
+            shape(&rows(&items, "re")),
+            ["# Today", "2", "# Tomorrow", "1"]
+        );
     }
 
     #[test]

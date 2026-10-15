@@ -158,20 +158,16 @@ struct Reply {
 
 impl Reply {
     fn send(&self, applied: bool, failure: Option<String>) {
-        let Some(writer) = self
-            .writer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        else {
+        let Some(writer) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return;
         };
         let mut result = json!({ "applied": applied });
         if let Some(reason) = failure {
             result["failureReason"] = Value::String(reason);
         }
-        let body = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": self.id, "result": result }))
-            .expect("JSON values serialize");
+        let body =
+            serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": self.id, "result": result }))
+                .expect("JSON values serialize");
         if self.log {
             eprintln!("[lsp {}] --> {}", self.name, abbreviate(&body));
         }
@@ -759,10 +755,9 @@ impl Shared {
             .map_or(&[][..], Vec::as_slice);
         let mut changed = false;
         for registration in registrations {
-            let (Some(id), Some(watch::METHOD)) = (
-                registration["id"].as_str(),
-                registration["method"].as_str(),
-            ) else {
+            let (Some(id), Some(watch::METHOD)) =
+                (registration["id"].as_str(), registration["method"].as_str())
+            else {
                 continue;
             };
             let options = registration

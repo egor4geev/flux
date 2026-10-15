@@ -7,6 +7,7 @@ use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use flux_lsp::lsp_types::FileChangeType;
 use flux_lsp::lsp_types::notification::{DidOpenTextDocument, Notification};
 use flux_lsp::lsp_types::request::{Completion, HoverRequest, Request};
 use flux_lsp::lsp_types::{
@@ -14,7 +15,6 @@ use flux_lsp::lsp_types::{
     MessageType, Position, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
     Uri,
 };
-use flux_lsp::lsp_types::FileChangeType;
 use flux_lsp::{Health, LanguageServer, RequestError, ServerConfig, ServerEvent, ServerStatus};
 use futures::channel::mpsc::{TryRecvError, UnboundedReceiver};
 use serde_json::{Value, json};
@@ -274,7 +274,8 @@ fn lifecycle_requests_and_notifications() {
 
     // An applyEdit request nobody answers is answered "not applied" when dropped.
     server.notify::<AskApply>(());
-    let ServerEvent::ApplyEdit(apply) = wait_event(&mut events, |e| matches!(e, ServerEvent::ApplyEdit(_)))
+    let ServerEvent::ApplyEdit(apply) =
+        wait_event(&mut events, |e| matches!(e, ServerEvent::ApplyEdit(_)))
     else {
         unreachable!()
     };
@@ -352,7 +353,10 @@ fn server_status_watched_files_and_the_log() {
     assert!(matches!(next_event(&mut events), ServerEvent::Initialized));
     let initialize = &fake.received()[1];
     let capabilities = &initialize["params"]["capabilities"];
-    assert_eq!(capabilities["experimental"]["serverStatusNotification"], true);
+    assert_eq!(
+        capabilities["experimental"]["serverStatusNotification"],
+        true
+    );
     assert_eq!(
         capabilities["workspace"]["didChangeWatchedFiles"],
         json!({ "dynamicRegistration": true, "relativePatternSupport": true })
@@ -416,7 +420,10 @@ fn server_status_watched_files_and_the_log() {
     let log = server.log().text();
     assert!(log.contains("flux    started python3"), "{log}");
     assert!(log.contains("log     ignored"), "{log}");
-    assert!(log.contains("status: error Failed to load workspaces."), "{log}");
+    assert!(
+        log.contains("status: error Failed to load workspaces."),
+        "{log}"
+    );
 }
 
 /// A custom request: the fake server exits on it with a message on stderr.

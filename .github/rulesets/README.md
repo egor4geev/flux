@@ -7,6 +7,7 @@ Import a ruleset).
 - `main.json` — the released version: no deletion, no force pushes, changes only through a pull
   request, merged with a merge commit (a release keeps the commits of `pre-release`, so the two
   branches' histories don't drift apart), and the required check `PR source`
-  (`.github/workflows/pr-source.yml`): pull requests come only from `pre-release` or `hotfix/*`. No
-  one bypasses it. `integration_id` 15368 is GitHub Actions: no one else can report that check.
+  (`.github/workflows/pr-source.yml`): pull requests come only from `pre-release` or `hotfix/*`; and
+  the CI checks `Format` and `Clippy and tests (macOS)` (`.github/workflows/ci.yml`, part 10.8). No
+  one bypasses them. `integration_id` 15368 is GitHub Actions: no one else can report those checks.
 - `pre-release.json` — development: no deletion, no force pushes; direct pushes are fine.

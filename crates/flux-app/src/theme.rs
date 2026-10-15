@@ -393,10 +393,12 @@ fn read_theme_file(text: &str) -> Result<ThemeFile, String> {
     let mut table: toml::Table = text
         .parse()
         .map_err(|err: toml::de::Error| err.message().trim().to_string())?;
-    if let Some(key) = table
-        .keys()
-        .find(|key| !matches!(key.as_str(), "name" | "appearance" | "ui" | "syntax" | "terminal"))
-    {
+    if let Some(key) = table.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "name" | "appearance" | "ui" | "syntax" | "terminal"
+        )
+    }) {
         return Err(format!(
             "unknown key `{key}` (name, appearance, [ui], [syntax], [terminal])"
         ));
@@ -442,9 +444,9 @@ fn apply_theme_file(file: ThemeFile, theme: &mut Theme, complete: bool) -> Resul
     }
     for (scope, value) in &file.syntax {
         let valid = !scope.is_empty()
-            && scope
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
+            && scope.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+            });
         if !valid {
             return Err(format!(
                 "syntax: `{scope}` — a highlight scope, like \"keyword\" or \"function.method\""
@@ -766,7 +768,9 @@ pub fn apply(cx: &mut App) {
     #[cfg(not(target_os = "macos"))]
     let _ = following;
     // The whole theme: a theme file edited in a plugin under development may change any part.
-    let same = cx.try_global::<Theme>().is_some_and(|current| *current == theme);
+    let same = cx
+        .try_global::<Theme>()
+        .is_some_and(|current| *current == theme);
     if !same {
         cx.set_global(theme);
         cx.refresh_windows();
@@ -979,21 +983,28 @@ mod tests {
             find_plugin_theme(themes, name).map(|theme| theme.name.to_string())
         };
         assert_eq!(found(&updated, "Darcula").as_deref(), Some("Classic Dark"));
-        assert_eq!(found(&updated, "IntelliJ Light").as_deref(), Some("Classic Light"));
-        assert_eq!(found(&updated, "Classic Dark").as_deref(), Some("Classic Dark"));
+        assert_eq!(
+            found(&updated, "IntelliJ Light").as_deref(),
+            Some("Classic Light")
+        );
+        assert_eq!(
+            found(&updated, "Classic Dark").as_deref(),
+            Some("Classic Dark")
+        );
         let old = [named("Darcula", Appearance::Dark)];
         assert_eq!(found(&old, "Classic Dark").as_deref(), Some("Darcula"));
         assert_eq!(found(&old, "Solarized Dark"), None);
         // Both installed (a plugin under development next to the catalog's): the very name wins.
-        let both = [named("Darcula", Appearance::Dark), named("Classic Dark", Appearance::Dark)];
+        let both = [
+            named("Darcula", Appearance::Dark),
+            named("Classic Dark", Appearance::Dark),
+        ];
         assert_eq!(found(&both, "Darcula").as_deref(), Some("Darcula"));
         assert!(same_theme("Darcula", "Classic Dark"));
         assert!(same_theme("Classic Light", "IntelliJ Light"));
         assert!(same_theme("Flux Night", "Flux Night"));
         assert!(!same_theme("Darcula", "Classic Light"));
     }
-
-
 
     /// Every capture of every language resolves to a scope of both bundled themes: its own or a
     /// more general one, by falling back along the dots. `none` (an internal one in markdown) is
@@ -1046,7 +1057,10 @@ mod tests {
         assert_eq!(night.ui.accent, Hsla::from(rgb(0x8590ff)));
         assert_eq!(night.ui.graph_lanes[2], Hsla::from(rgb(0xb48cff)));
         assert_eq!(night.terminal.ansi[15], Hsla::from(rgb(0xf0f6fc)));
-        assert_eq!(night.style_for("keyword").unwrap().color, Hsla::from(rgb(0xff7b72)));
+        assert_eq!(
+            night.style_for("keyword").unwrap().color,
+            Hsla::from(rgb(0xff7b72))
+        );
         assert!(night.style_for("text.title").unwrap().bold);
         let day = Theme::flux_day();
         assert_eq!(day.name.as_ref(), FLUX_DAY);
@@ -1104,7 +1118,10 @@ mod tests {
     #[test]
     fn styles_fall_back_along_the_dots() {
         let theme = Theme::flux_day();
-        assert_eq!(theme.style_for("function.method"), theme.style_for("function"));
+        assert_eq!(
+            theme.style_for("function.method"),
+            theme.style_for("function")
+        );
         assert!(theme.style_for("no.such.scope").is_none());
         assert!(UI_TOKENS.contains(&"on_accent"));
     }

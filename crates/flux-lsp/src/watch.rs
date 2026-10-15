@@ -92,7 +92,8 @@ impl Watchers {
     /// (rust-analyzer registers again under the same id after it reloads the project). Watchers
     /// whose glob can't be read are skipped. `false` — the options aren't watchers at all.
     pub(crate) fn register(&mut self, id: &str, options: Value) -> bool {
-        let Ok(options) = serde_json::from_value::<DidChangeWatchedFilesRegistrationOptions>(options)
+        let Ok(options) =
+            serde_json::from_value::<DidChangeWatchedFilesRegistrationOptions>(options)
         else {
             return false;
         };
@@ -157,9 +158,21 @@ mod tests {
         let changed = FileChangeType::CHANGED;
         assert!(matches(&watchers, "/work/proj/src/main.rs", changed));
         assert!(matches(&watchers, "/work/proj/main.rs", changed));
-        assert!(matches(&watchers, "/work/proj/crates/a/Cargo.toml", changed));
-        assert!(matches(&watchers, "/work/proj/Cargo.lock", FileChangeType::CREATED));
-        assert!(matches(&watchers, "/work/proj/Cargo.toml", FileChangeType::DELETED));
+        assert!(matches(
+            &watchers,
+            "/work/proj/crates/a/Cargo.toml",
+            changed
+        ));
+        assert!(matches(
+            &watchers,
+            "/work/proj/Cargo.lock",
+            FileChangeType::CREATED
+        ));
+        assert!(matches(
+            &watchers,
+            "/work/proj/Cargo.toml",
+            FileChangeType::DELETED
+        ));
         assert!(matches(
             &watchers,
             "/Users/me/Library/Application Support/rust-analyzer",
@@ -193,22 +206,53 @@ mod tests {
         let watchers = watchers(json!({ "watchers": [
             { "globPattern": "**/*.py", "kind": 1 | 4 },
         ]}));
-        assert!(matches(&watchers, "/work/proj/a.py", FileChangeType::CREATED));
-        assert!(matches(&watchers, "/work/proj/a.py", FileChangeType::DELETED));
-        assert!(!matches(&watchers, "/work/proj/a.py", FileChangeType::CHANGED));
+        assert!(matches(
+            &watchers,
+            "/work/proj/a.py",
+            FileChangeType::CREATED
+        ));
+        assert!(matches(
+            &watchers,
+            "/work/proj/a.py",
+            FileChangeType::DELETED
+        ));
+        assert!(!matches(
+            &watchers,
+            "/work/proj/a.py",
+            FileChangeType::CHANGED
+        ));
     }
 
     #[test]
     fn a_registration_replaces_one_with_its_id_and_goes_away() {
         let mut watchers = watchers(json!({ "watchers": [{ "globPattern": "**/*.rs" }] }));
         assert!(watchers.register("w", json!({ "watchers": [{ "globPattern": "**/*.go" }] })));
-        assert!(!matches(&watchers, "/work/proj/a.rs", FileChangeType::CHANGED));
-        assert!(matches(&watchers, "/work/proj/a.go", FileChangeType::CHANGED));
-        assert!(watchers.register("other", json!({ "watchers": [{ "globPattern": "**/*.rs" }] })));
-        assert!(matches(&watchers, "/work/proj/a.rs", FileChangeType::CHANGED));
+        assert!(!matches(
+            &watchers,
+            "/work/proj/a.rs",
+            FileChangeType::CHANGED
+        ));
+        assert!(matches(
+            &watchers,
+            "/work/proj/a.go",
+            FileChangeType::CHANGED
+        ));
+        assert!(watchers.register(
+            "other",
+            json!({ "watchers": [{ "globPattern": "**/*.rs" }] })
+        ));
+        assert!(matches(
+            &watchers,
+            "/work/proj/a.rs",
+            FileChangeType::CHANGED
+        ));
         assert!(watchers.unregister("w"));
         assert!(!watchers.unregister("w"));
-        assert!(!matches(&watchers, "/work/proj/a.go", FileChangeType::CHANGED));
+        assert!(!matches(
+            &watchers,
+            "/work/proj/a.go",
+            FileChangeType::CHANGED
+        ));
         assert!(watchers.unregister("other"));
         assert!(watchers.is_empty());
     }
@@ -221,6 +265,10 @@ mod tests {
             "w",
             json!({ "watchers": [{ "globPattern": "[" }, { "globPattern": "**/*.rs" }] })
         ));
-        assert!(matches(&watchers, "/work/proj/x.rs", FileChangeType::CHANGED));
+        assert!(matches(
+            &watchers,
+            "/work/proj/x.rs",
+            FileChangeType::CHANGED
+        ));
     }
 }

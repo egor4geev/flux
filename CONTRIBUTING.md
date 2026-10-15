@@ -41,8 +41,10 @@ release too.
   `PR source` check: change its base with **Edit** next to the title.
 - Keep it to one change, and say what changes for someone using Flux and why; link the issue or the
   discussion ("Fixes #123"). For a bigger change, please start a discussion or an issue first.
-- Before sending: `cargo test --workspace` passes and `cargo clippy --workspace --all-targets` is
-  clean. For a change in the interface, add screenshots — before and after.
+- Before sending: `cargo fmt --all`, `cargo test --workspace` passes and
+  `cargo clippy --workspace --all-targets -- -D warnings` is clean. CI checks the same on every pull
+  request (**Format** and **Clippy and tests (macOS)**); a release or a hotfix merges into `main`
+  only when they pass. For a change in the interface, add screenshots — before and after.
 
 ## Building
 
@@ -57,6 +59,7 @@ Flux runs on macOS. You need:
 cargo run -p flux-app -- ~/some/project       # Flux on a project (a debug build)
 cargo test --workspace                        # the tests
 cargo clippy --workspace --all-targets        # should be clean
+cargo fmt --all                               # the format CI checks
 scripts/bundle-macos.sh                       # target/release/Flux.app
 ```
 
@@ -71,8 +74,9 @@ The first build takes a while: tree-sitter's grammars are C code.
 - Code, comments and docs are in English. Every string the interface shows goes through `tr`,
   `trf` or `trn` (`crates/flux-app/src/i18n`) and gets its Russian translation in
   `crates/flux-app/src/i18n/ru/` — a test checks that none is missing.
-- The code isn't entirely rustfmt-clean yet: format what you change in the style around it, and
-  please don't run `cargo fmt` over the whole workspace — it would touch hundreds of unrelated lines.
+- The code is formatted by rustfmt with its defaults: run `cargo fmt --all` before committing (CI
+  fails otherwise). The commit that formatted everything at once is in `.git-blame-ignore-revs`:
+  `git config blame.ignoreRevsFile .git-blame-ignore-revs` makes `git blame` look past it.
 - Shortcuts: look through the existing keymap before picking one, and keep the IDE conventions it
   follows (⌘B goes to a definition, ⌥↵ shows the context actions, ⌘K commits).
 - Plugins: [`docs/plugins.md`](docs/plugins.md). Plugins for everyone go to the
@@ -90,3 +94,30 @@ By contributing, you agree that your work is licensed under the [MIT license](LI
   merged, `main` comes into `pre-release` by itself — on a conflict the `Sync pre-release` workflow
   fails and says what to merge by hand.
 - The repository's settings and its branch rules (`.github/rulesets/`): `scripts/github-setup.sh`.
+
+### Cutting a release
+
+A tag publishes a release (`.github/workflows/release.yml`): `vX.Y.Z` on `main` — a stable one,
+`vX.Y.Z-beta.N` on `pre-release` — a beta (a pre-release on GitHub, for the Beta channel). CI builds
+Flux for Apple silicon and Intel, signs it with the "Flux Dev" certificate, packs a `.dmg` (the
+first install) and a `.zip` (the update Flux downloads itself) and writes `latest.json` — the
+release for Flux's updater, each archive signed with the update key.
+
+1. On `pre-release`: the version in `Cargo.toml` (`[workspace.package]`, then `cargo check` to update
+   `Cargo.lock`), the release notes in `docs/release-notes/<version>.md` (Markdown, English — the
+   release's page and Flux's update notification show them) and, for a new minor version, What's New
+   in `crates/flux-app/assets/whats-new/<version>.toml` with the release date.
+2. **A beta**: tag the commit on `pre-release` — `git tag v0.2.0-beta.1 && git push origin
+   v0.2.0-beta.1`.
+3. **A stable release**: a pull request `pre-release → main`. Besides CI it gets a dry run of the
+   release (the `Release` workflow): the `.dmg`, the `.zip` and `latest.json` as the run's artifacts —
+   try them before merging. Merge it, then tag the merge commit on `main`:
+   `git switch main && git pull && git tag v0.2.0 && git push origin v0.2.0`.
+4. The workflow checks that the tag matches `Cargo.toml`'s version, sits on its branch and has
+   release notes, then publishes the release. Flux finds it at its next check (on start and once a
+   day; Flux → Check for Updates… at once).
+
+A dry run of any branch: Actions → Release → Run workflow. The secrets the workflow needs:
+`MACOS_CERT_P12` (the `.p12` of "Flux Dev", base64), `MACOS_CERT_PASSWORD`,
+`FLUX_UPDATE_PRIVATE_KEY` (the update key's seed, base64; its public half is built into Flux —
+`crates/flux-update`). Updates without GitHub, on this Mac: `scripts/update-test.sh`.

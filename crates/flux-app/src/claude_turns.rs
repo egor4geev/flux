@@ -46,27 +46,25 @@ impl ClaudeChat {
         let point = self
             .session()
             .update(cx, |session, cx| session.edit_point(id, cx));
-        cx.spawn_in(window, async move |chat, cx| {
-            match point.await {
-                Ok(point) => {
-                    chat.update_in(cx, |chat, window, cx| {
-                        let images = images
-                            .into_iter()
-                            .map(|(format, bytes)| Arc::new(Image::from_bytes(format, bytes)))
-                            .collect();
-                        chat.composer().update(cx, |composer, cx| {
-                            composer.start_edit(point, &text, images, window, cx)
-                        });
-                    })
-                    .ok();
-                }
-                Err(reason) => {
-                    Dialog::warning(tr("This message can't be edited"))
-                        .message(reason)
-                        .primary(tr("OK"))
-                        .show_async(cx)
-                        .await;
-                }
+        cx.spawn_in(window, async move |chat, cx| match point.await {
+            Ok(point) => {
+                chat.update_in(cx, |chat, window, cx| {
+                    let images = images
+                        .into_iter()
+                        .map(|(format, bytes)| Arc::new(Image::from_bytes(format, bytes)))
+                        .collect();
+                    chat.composer().update(cx, |composer, cx| {
+                        composer.start_edit(point, &text, images, window, cx)
+                    });
+                })
+                .ok();
+            }
+            Err(reason) => {
+                Dialog::warning(tr("This message can't be edited"))
+                    .message(reason)
+                    .primary(tr("OK"))
+                    .show_async(cx)
+                    .await;
             }
         })
         .detach();
@@ -126,7 +124,10 @@ impl ClaudeChat {
             .filter(|file| path.as_ref().is_none_or(|path| *path == file.path))
             .collect();
         let question = match files.as_slice() {
-            [file] => trf("Roll back Claude's changes to {0}?", &[&file_name(&file.path)]),
+            [file] => trf(
+                "Roll back Claude's changes to {0}?",
+                &[&file_name(&file.path)],
+            ),
             _ => tr("Roll back the changes of this turn?").to_string(),
         };
         self.restore(files, question, window, cx);
@@ -164,7 +165,10 @@ impl ClaudeChat {
         let Some(file) = model.edit_restore(tool) else {
             return;
         };
-        let call = model.entries.iter().find_map(|entry| find_tool(entry, tool));
+        let call = model
+            .entries
+            .iter()
+            .find_map(|entry| find_tool(entry, tool));
         let disk = std::fs::read_to_string(&file.path).ok();
         if disk == file.before {
             cx.emit(ClaudeChatEvent::Notify(Notification::info(tr(
@@ -177,7 +181,9 @@ impl ClaudeChat {
         } else {
             match (&disk, &call) {
                 (Some(text), Some((name, input))) => {
-                    flux_claude::edits::reverted_text(name, input, text).ok().map(Some)
+                    flux_claude::edits::reverted_text(name, input, text)
+                        .ok()
+                        .map(Some)
                 }
                 _ => None,
             }
@@ -368,8 +374,10 @@ fn find_tool(entry: &flux_claude::Entry, id: EntryId) -> Option<(String, serde_j
 }
 
 fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// A path for the question: from the project's root when it's inside.
@@ -403,9 +411,7 @@ pub(crate) fn scenario_actions(element: gpui::Div, cx: &mut Context<ClaudeChat>)
     use scenario::*;
     let user = |kind: &EntryKind| matches!(kind, EntryKind::User(_));
     let turn = |kind: &EntryKind| matches!(kind, EntryKind::TurnEnd(_));
-    let edit = |kind: &EntryKind| {
-        matches!(kind, EntryKind::Tool(tool) if flux_claude::edits::is_edit_tool(&tool.name))
-    };
+    let edit = |kind: &EntryKind| matches!(kind, EntryKind::Tool(tool) if flux_claude::edits::is_edit_tool(&tool.name));
     element
         .on_action(cx.listener(move |chat, _: &EditLastMessage, window, cx| {
             if let Some(id) = chat.last_entry(user, cx) {

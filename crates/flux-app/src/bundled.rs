@@ -103,7 +103,9 @@ mod tests {
         assert_eq!(resolved.server_plugins[&server.name], "flux.javascript");
         assert!(server.install.is_some());
         let configs = std::slice::from_ref(server);
-        for path in ["a.js", "b.mjs", "c.cjs", "App.jsx", "d.ts", "e.d.mts", "f.cts", "App.tsx"] {
+        for path in [
+            "a.js", "b.mjs", "c.cjs", "App.jsx", "d.ts", "e.d.mts", "f.cts", "App.tsx",
+        ] {
             assert!(
                 flux_lsp::server_for_path(configs, Path::new(path)).is_some(),
                 "{path}"
@@ -134,8 +136,15 @@ mod tests {
         let scopes = theme.syntax_scopes();
         for name in ["javascript", "jsx", "typescript", "tsx"] {
             let language = flux_syntax::language_by_name(&format!("zz-{name}")).unwrap();
-            assert!(language.grammar().is_some(), "{name}: {:?}", language.grammar_error());
-            assert!(language.query().is_some(), "{name}: the query doesn't compile");
+            assert!(
+                language.grammar().is_some(),
+                "{name}: {:?}",
+                language.grammar_error()
+            );
+            assert!(
+                language.query().is_some(),
+                "{name}: the query doesn't compile"
+            );
             let map = flux_syntax::HighlightMap::new(&language, &scopes);
             for (i, capture) in language.capture_names().iter().enumerate() {
                 assert!(

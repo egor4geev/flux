@@ -394,9 +394,8 @@ pub(crate) fn web_links(text: &str) -> Vec<Range<usize>> {
                     let Some(last) = address.chars().last() else {
                         break;
                     };
-                    let unopened = |open: char| {
-                        address.matches(open).count() < address.matches(last).count()
-                    };
+                    let unopened =
+                        |open: char| address.matches(open).count() < address.matches(last).count();
                     let trim = match last {
                         '.' | ',' | ';' | ':' | '!' | '?' | '*' | '_' => true,
                         ')' => unopened('('),
@@ -604,7 +603,11 @@ mod tests {
         let texts: Vec<_> = found.iter().map(|link| link.text.as_str()).collect();
         assert_eq!(texts, vec!["TRACK-142", "WEB-7"]);
         assert_eq!(&text[found[0].range.clone()], "TRACK-142");
-        assert_eq!(find_in(&patterns, None, text).len(), 2, "every window's, once");
+        assert_eq!(
+            find_in(&patterns, None, text).len(),
+            2,
+            "every window's, once"
+        );
         assert!(find_in(&patterns, Some(EntityId::from(9u64)), text).is_empty());
 
         // A plugin's links leave out what is clickable already.
@@ -619,8 +622,14 @@ mod tests {
     #[test]
     fn bare_web_addresses_end_where_the_sentence_goes_on() {
         let text = "See https://x.y/a_(b). And (http://c.d/e), or https://, https://f.g?h=1!";
-        let found: Vec<_> = web_links(text).into_iter().map(|range| &text[range]).collect();
-        assert_eq!(found, vec!["https://x.y/a_(b)", "http://c.d/e", "https://f.g?h=1"]);
+        let found: Vec<_> = web_links(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(
+            found,
+            vec!["https://x.y/a_(b)", "http://c.d/e", "https://f.g?h=1"]
+        );
         assert!(web_links("no links here").is_empty());
     }
 
@@ -628,7 +637,11 @@ mod tests {
     fn link_ranges_cut_the_runs() {
         let accent = gpui::red();
         // "Fix TRACK-142 now": a run of 4, then one of 13 holding the link at 4..13.
-        let runs = link_runs(vec![run(4), run(13)], &[Range { start: 4, end: 13 }], accent);
+        let runs = link_runs(
+            vec![run(4), run(13)],
+            &[Range { start: 4, end: 13 }],
+            accent,
+        );
         let lens: Vec<_> = runs.iter().map(|run| run.len).collect();
         assert_eq!(lens, vec![4, 9, 4]);
         assert_eq!(runs[1].color, accent);

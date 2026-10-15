@@ -55,7 +55,9 @@ pub(crate) fn propose(
             state.entry.manifest.permissions.folders.clone(),
         )
     };
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     allowed(&path, root.as_deref(), &folders, &home, proposal.apply)?;
     let original = match open_editor(workspace, &path, cx) {
         Some(editor) => Some(editor.read(cx).document.text().to_string()),
@@ -95,7 +97,12 @@ pub(crate) fn plugin_stopped(
 }
 
 /// `review.withdraw`: closes the proposal's tab without an answer (the plugin hears `closed`).
-pub(crate) fn withdraw(workspace: &mut Workspace, plugin: &str, id: u64, cx: &mut Context<Workspace>) {
+pub(crate) fn withdraw(
+    workspace: &mut Workspace,
+    plugin: &str,
+    id: u64,
+    cx: &mut Context<Workspace>,
+) {
     for view in plugin_views(workspace, plugin, Some(id), cx) {
         view.update(cx, |view, cx| view.withdraw_proposal(cx));
     }
@@ -160,10 +167,10 @@ fn answered(workspace: &mut Workspace, answer: &PluginProposalAnswer, cx: &mut C
             }
         },
     };
-    workspace
-        .plugins
-        .read(cx)
-        .send_to(&proposal.plugin, Event::ProposalAnswered((proposal.id, outcome)));
+    workspace.plugins.read(cx).send_to(
+        &proposal.plugin,
+        Event::ProposalAnswered((proposal.id, outcome)),
+    );
 }
 
 /// Writes an accepted text: into the open document (only what changed, one undo step, then
@@ -401,9 +408,15 @@ mod tests {
     #[test]
     fn paths_resolve_against_the_project() {
         let root = Path::new("/work/app");
-        assert_eq!(resolve(Some(root), "src/main.rs"), Ok(root.join("src/main.rs")));
+        assert_eq!(
+            resolve(Some(root), "src/main.rs"),
+            Ok(root.join("src/main.rs"))
+        );
         assert_eq!(resolve(Some(root), "./a/../b.rs"), Ok(root.join("b.rs")));
-        assert_eq!(resolve(Some(root), "/etc/hosts"), Ok(PathBuf::from("/etc/hosts")));
+        assert_eq!(
+            resolve(Some(root), "/etc/hosts"),
+            Ok(PathBuf::from("/etc/hosts"))
+        );
         assert!(resolve(Some(root), "  ").is_err());
         assert!(resolve(None, "src/main.rs").is_err());
         assert_eq!(resolve(None, "/tmp/x"), Ok(PathBuf::from("/tmp/x")));
@@ -466,7 +479,10 @@ mod tests {
         let dir = temp("read");
         assert_eq!(read_file(&dir.join("new.rs")), Ok(None));
         fs::write(dir.join("text.rs"), "fn main() {}\n").unwrap();
-        assert_eq!(read_file(&dir.join("text.rs")), Ok(Some("fn main() {}\n".into())));
+        assert_eq!(
+            read_file(&dir.join("text.rs")),
+            Ok(Some("fn main() {}\n".into()))
+        );
         fs::write(dir.join("bin"), [0u8, 1, 2]).unwrap();
         assert!(read_file(&dir.join("bin")).is_err());
         assert!(read_file(&dir).is_err());

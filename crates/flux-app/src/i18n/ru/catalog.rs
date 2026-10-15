@@ -16,7 +16,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("uses the one on this Mac", "берётся с этого Mac"),
     ("installs with npm: {0}", "ставится через npm: {0}"),
     ("installs from GitHub: {0}", "ставится с GitHub: {0}"),
-    ("installs with go install: {0}", "ставится через go install: {0}"),
+    (
+        "installs with go install: {0}",
+        "ставится через go install: {0}",
+    ),
     ("installs with rustup: {0}", "ставится через rustup: {0}"),
     ("Color Themes", "Цветовые темы"),
     ("Icon Sets", "Наборы значков"),
@@ -60,9 +63,15 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("The window is closed", "Окно закрыто"),
     // Updates.
     ("All plugins are up to date", "Все плагины обновлены"),
-    ("Couldn't check for plugin updates", "Не удалось проверить обновления плагинов"),
+    (
+        "Couldn't check for plugin updates",
+        "Не удалось проверить обновления плагинов",
+    ),
     // Suggestions.
-    ("Plugins supporting {0} files found.", "Найдены плагины для файлов {0}."),
+    (
+        "Plugins supporting {0} files found.",
+        "Найдены плагины для файлов {0}.",
+    ),
     ("Install {0}", "Установить {0}"),
     ("Installing “{0}”: {1}", "Установка «{0}»: {1}"),
     ("Ignore Extension", "Игнорировать расширение"),
@@ -70,7 +79,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
 ];
 
 pub(super) const PLURALS: &[(&str, [&str; 3])] = &[
-    ("{n} update", ["{n} обновление", "{n} обновления", "{n} обновлений"]),
+    (
+        "{n} update",
+        ["{n} обновление", "{n} обновления", "{n} обновлений"],
+    ),
     (
         "Plugin update available",
         [

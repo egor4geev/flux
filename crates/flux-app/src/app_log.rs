@@ -244,7 +244,9 @@ pub fn init(cx: &mut App) {
                 cx.spawn(async move |workspace, cx| {
                     cx.background_executor().timer(STARTUP_OFFER_DELAY).await;
                     workspace
-                        .update(cx, |workspace, cx| workspace.notify(notice(&crash, true), cx))
+                        .update(cx, |workspace, cx| {
+                            workspace.notify(notice(&crash, true), cx)
+                        })
                         .ok();
                 })
                 .detach();
@@ -353,7 +355,11 @@ impl Sink {
             return false;
         }
         rotate(&self.dir, &self.stem, self.keep);
-        let Ok(next) = OpenOptions::new().create(true).append(true).open(&self.path) else {
+        let Ok(next) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        else {
             return false;
         };
         if self.stderr {
@@ -361,11 +367,14 @@ impl Sink {
             unsafe { libc::dup2(next.as_raw_fd(), libc::STDERR_FILENO) };
         }
         *file = next;
-        let line = header_line(SystemTime::now(), &format!(
-            "the log went past {} MB: it goes on here, the earlier part is {}.1.log",
-            max / (1024 * 1024),
-            self.stem
-        ));
+        let line = header_line(
+            SystemTime::now(),
+            &format!(
+                "the log went past {} MB: it goes on here, the earlier part is {}.1.log",
+                max / (1024 * 1024),
+                self.stem
+            ),
+        );
         let _ = file.write_all(line.as_bytes());
         true
     }
@@ -477,7 +486,11 @@ fn write_header(machine: &SystemInfo, spec: &str, second: Option<&Path>) {
     let now = SystemTime::now();
     let mut text = header_line(
         now,
-        &format!("Flux {} started, pid {}", machine.version, std::process::id()),
+        &format!(
+            "Flux {} started, pid {}",
+            machine.version,
+            std::process::id()
+        ),
     );
     let mac = [machine.macos.as_str(), machine.hardware.as_str()]
         .into_iter()
@@ -592,7 +605,11 @@ impl Filter {
             other: LevelFilter::Warn,
             rules: Vec::new(),
         };
-        for part in spec.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        for part in spec
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
             match part.split_once('=') {
                 Some((target, level)) => {
                     if let Ok(level) = level.trim().parse::<LevelFilter>() {
@@ -703,7 +720,14 @@ fn on_panic(info: &PanicHookInfo) {
     let message = clip(info.payload_as_str().unwrap_or("Box<dyn Any>"), MAX_MESSAGE);
     let location = info
         .location()
-        .map(|location| format!("{}:{}:{}", location.file(), location.line(), location.column()))
+        .map(|location| {
+            format!(
+                "{}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            )
+        })
         .unwrap_or_default();
     // Unwinding reached a function that can't unwind (gpui's callbacks from macOS are such): the
     // runtime panics again and ends Flux. That belongs to this thread's report.
@@ -734,12 +758,18 @@ fn on_panic(info: &PanicHookInfo) {
         thread: thread
             .name()
             .map_or_else(|| format!("{:?}", thread.id()), str::to_string),
-        backtrace: tilde(&trim_backtrace(&Backtrace::force_capture().to_string()), home),
+        backtrace: tilde(
+            &trim_backtrace(&Backtrace::force_capture().to_string()),
+            home,
+        ),
         version: machine.version.clone(),
         time: report_time(now),
         file: PathBuf::new(),
     };
-    let tail = SINK.get().map(|sink| tilde(&log_tail(&sink.path), home)).unwrap_or_default();
+    let tail = SINK
+        .get()
+        .map(|sink| tilde(&log_tail(&sink.path), home))
+        .unwrap_or_default();
     let Some(path) = write_report(dir, now, &report_text(&crash, &machine, &tail)) else {
         return;
     };
@@ -1134,11 +1164,16 @@ fn reveal(path: &Path, cx: &mut App) {
 /// task, as a real one: Flux quits); `thread` — on a worker thread (Flux survives it).
 #[cfg(feature = "scenario")]
 fn scenario_panic(cx: &mut App) {
-    let Some(how) = std::env::var("FLUX_SCENARIO_PANIC").ok().filter(|how| !how.is_empty()) else {
+    let Some(how) = std::env::var("FLUX_SCENARIO_PANIC")
+        .ok()
+        .filter(|how| !how.is_empty())
+    else {
         return;
     };
     cx.spawn(async move |cx| {
-        cx.background_executor().timer(Duration::from_millis(1500)).await;
+        cx.background_executor()
+            .timer(Duration::from_millis(1500))
+            .await;
         if how == "thread" {
             let _ = std::thread::Builder::new()
                 .name("flux-scenario-worker".into())
@@ -1271,12 +1306,22 @@ mod tests {
             let path = dir.join(format!("flux-{pid}.log"));
             fs::write(&path, "x").unwrap();
             let at = UNIX_EPOCH + Duration::from_secs(1_000 + n as u64);
-            File::options().write(true).open(&path).unwrap().set_modified(at).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
         }
         let older = dir.join(format!("flux-{}.1.log", dead[0]));
         fs::write(&older, "x").unwrap();
         let at = UNIX_EPOCH + Duration::from_secs(1_000);
-        File::options().write(true).open(&older).unwrap().set_modified(at).unwrap();
+        File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
         fs::write(dir.join(format!("flux-{alive}.log")), "x").unwrap();
         fs::write(dir.join("flux.log"), "x").unwrap();
         prune_second_logs(&dir, 3);
@@ -1296,11 +1341,19 @@ mod tests {
     #[test]
     fn a_record_is_a_line_with_the_time_level_and_target() {
         let at = UNIX_EPOCH + Duration::from_millis(1_760_526_192_345);
-        let text = line(at, Level::Warn, "gpui::window", format_args!("no {}", "frame"));
+        let text = line(
+            at,
+            Level::Warn,
+            "gpui::window",
+            format_args!("no {}", "frame"),
+        );
         let (time, rest) = text.split_at(23);
         let bytes = time.as_bytes();
         assert!(
-            bytes[4] == b'-' && bytes[7] == b'-' && bytes[10] == b' ' && bytes[13] == b':'
+            bytes[4] == b'-'
+                && bytes[7] == b'-'
+                && bytes[10] == b' '
+                && bytes[13] == b':'
                 && bytes[19] == b'.',
             "{text}"
         );
@@ -1357,10 +1410,19 @@ mod tests {
             ..SystemInfo::default()
         };
         let text = report_text(&crash, &machine, "line one\nTime: not a fact");
-        assert!(text.starts_with("Flux crash report\n\nTime: 2026-10-15 14:03:12\n"), "{text}");
+        assert!(
+            text.starts_with("Flux crash report\n\nTime: 2026-10-15 14:03:12\n"),
+            "{text}"
+        );
         assert!(text.contains("\nmacOS: macOS 26.1 (25B78)\nHardware: Apple M3 Pro, arm64\n"));
-        assert!(text.contains("\nMessage:\n    index out of bounds"), "{text}");
-        assert!(text.contains("\n    line one\n    Time: not a fact\n"), "{text}");
+        assert!(
+            text.contains("\nMessage:\n    index out of bounds"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n    line one\n    Time: not a fact\n"),
+            "{text}"
+        );
         let read = parse_report(&text, crash.file.clone()).unwrap();
         assert_eq!(read, crash);
         // What a following panic adds doesn't change it.
@@ -1433,7 +1495,12 @@ mod tests {
             let text = report_text(&crash, &SystemInfo::default(), "");
             let path = write_report(&dir, at(n as u64), &text).unwrap();
             let modified = at([10, 5, 20][n]);
-            File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
             paths.push(path);
         }
         // Two reports of the same second don't overwrite each other.
@@ -1454,7 +1521,12 @@ mod tests {
         for n in 0..13_u64 {
             let at = UNIX_EPOCH + Duration::from_secs(1_760_000_000 + n);
             let path = write_report(&dir, at, "Flux crash report\n").unwrap();
-            File::options().write(true).open(&path).unwrap().set_modified(at).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
             if n < 4 {
                 assert!(mark_offered(&path));
             }
@@ -1494,7 +1566,10 @@ mod tests {
     fn a_report_names_the_home_folder_as_tilde() {
         let home = "/Users/someone";
         assert_eq!(
-            tilde("at /Users/someone/.cargo/registry/x.rs:1:1 and /Users/someone2/y", home),
+            tilde(
+                "at /Users/someone/.cargo/registry/x.rs:1:1 and /Users/someone2/y",
+                home
+            ),
             "at ~/.cargo/registry/x.rs:1:1 and /Users/someone2/y"
         );
         assert_eq!(tilde("/Users/someone/a", ""), "/Users/someone/a");
@@ -1520,6 +1595,9 @@ mod tests {
         );
         assert!(notification.offers(&["help::ReportCrash", "help::RevealCrash"]));
         assert!(notification.sticky);
-        assert_eq!(notice(&crash, false).title.as_ref(), "Flux ran into an error");
+        assert_eq!(
+            notice(&crash, false).title.as_ref(),
+            "Flux ran into an error"
+        );
     }
 }

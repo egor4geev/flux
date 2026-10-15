@@ -63,7 +63,7 @@ fn screen(content: &Content) -> Vec<String> {
 
 /// Waits until `done` holds, or fails after a few seconds.
 fn wait_until(what: &str, done: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(20));
@@ -355,13 +355,28 @@ fn clear_keeps_the_prompt_at_the_top() {
 
     terminal.clear();
     // The shell's own clear (ED 2) on the empty screen leaves one blank line in alacritty's history.
-    wait_until("the prompt at the top", || {
+    // A slow machine (CI's runner) redraws the prompt late: a longer wait, and the screen on failure.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
         let content = terminal.content();
         let rows = screen(&content);
-        content.history_size <= 1
-            && rows[0].ends_with('%')
-            && rows[1..].iter().all(String::is_empty)
-    });
+        // The prompt (`host%`) may wrap onto several rows: CI runners have long host names.
+        let prompt_end = rows.iter().position(|row| row.ends_with('%'));
+        if content.history_size <= 1
+            && prompt_end.is_some_and(|end| {
+                rows[..end].iter().all(|row| !row.is_empty())
+                    && rows[end + 1..].iter().all(String::is_empty)
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the prompt at the top: history {}, screen {rows:?}",
+            content.history_size
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

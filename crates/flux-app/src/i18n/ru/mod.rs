@@ -1,5 +1,6 @@
 //! Russian translations: English source string → Russian, one table per area of the UI.
 
+mod app_log;
 mod appearance;
 mod appearance_common;
 mod blame;
@@ -18,6 +19,7 @@ mod claude_tabs;
 mod claude_transcript;
 mod claude_turns;
 mod code_actions;
+mod command_usage;
 mod commands;
 mod commit;
 mod common;
@@ -25,14 +27,19 @@ mod completion;
 mod conflicts;
 mod dialog;
 mod diff;
+mod feedback;
 mod git;
 mod git_gutter;
 mod git_log;
 mod icon_themes;
 mod image_view;
+mod interface;
 mod languages;
 mod log_actions;
 mod lsp;
+mod lsp_settings;
+mod lsp_status;
+mod markdown_preview;
 mod menu;
 mod messages;
 mod navigation;
@@ -40,51 +47,45 @@ mod notification_center;
 mod notifications_panel;
 mod pickers;
 mod plugin_api;
+mod plugin_claude;
+mod plugin_form;
+mod plugin_git;
+mod plugin_links;
 mod plugin_manager;
 mod plugin_menus;
+mod plugin_picker;
 mod plugin_review;
 mod plugin_tabs;
-mod plugin_form;
-mod plugin_picker;
-mod plugin_git;
-mod plugin_claude;
-mod plugin_links;
-mod task_contexts;
 mod plugin_view;
 mod plugins;
 mod popups;
+mod project_popup;
 mod projects;
 mod rebase;
+mod scrollbar;
 mod search;
+mod search_files;
 mod settings;
+mod soft_wrap;
 mod start;
 mod stash;
 mod sync;
+mod task_contexts;
 mod terminal;
 mod terminal_panel;
 mod terminal_search;
 mod themes;
 mod tree;
+mod ui_scale;
+mod updates;
+mod welcome;
+mod welcome_claude;
+mod welcome_setup;
+mod welcome_shortcuts;
+mod welcome_tour;
+mod welcome_whats_new;
 mod windows;
 mod workspace;
-mod ui_scale;
-mod interface;
-mod project_popup;
-mod command_usage;
-mod markdown_preview;
-mod search_files;
-mod soft_wrap;
-mod scrollbar;
-mod lsp_status;
-mod lsp_settings;
-mod feedback;
-mod app_log;
-mod welcome;
-mod welcome_setup;
-mod welcome_claude;
-mod welcome_tour;
-mod welcome_shortcuts;
-mod welcome_whats_new;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
 pub(super) const STRINGS: &[&[(&str, &str)]] = &[
@@ -173,6 +174,7 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     welcome_tour::STRINGS,
     welcome_shortcuts::STRINGS,
     welcome_whats_new::STRINGS,
+    updates::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -234,6 +236,7 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     lsp_status::PLURALS,
     lsp_settings::PLURALS,
     feedback::PLURALS,
+    updates::PLURALS,
     app_log::PLURALS,
     welcome::PLURALS,
     welcome_setup::PLURALS,

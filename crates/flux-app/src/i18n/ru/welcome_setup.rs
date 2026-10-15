@@ -14,7 +14,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Всё меняется сразу — это окно уже показывает выбор. Потом: Настройки → Внешний вид.",
     ),
     ("Catalog", "Каталог"),
-    ("Couldn't install: click to try again", "Не установилась: щёлкните, чтобы повторить"),
+    (
+        "Couldn't install: click to try again",
+        "Не установилась: щёлкните, чтобы повторить",
+    ),
     ("Window Style", "Стиль окна"),
     // The languages.
     ("Setup · Languages", "Настройка · языки"),
@@ -28,7 +31,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Couldn't install", "Не установился"),
     ("Found on this Mac", "Найден на этом Mac"),
     ("In every project", "Есть в каждом проекте"),
-    ("Highlighting, errors, completion", "Подсветка, ошибки, подсказки"),
+    (
+        "Highlighting, errors, completion",
+        "Подсветка, ошибки, подсказки",
+    ),
     ("Highlighting", "Подсветка"),
     ("JavaScript · TypeScript", "JavaScript · TypeScript"),
     ("Come with Flux", "Встроены во Flux"),
