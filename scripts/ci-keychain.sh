@@ -34,6 +34,14 @@ case "$ACTION" in
         # No locking after a timeout or on sleep while the job runs.
         security set-keychain-settings "$KEYCHAIN"
         security unlock-keychain -p "$password" "$KEYCHAIN"
+        # On CI's runner (an ephemeral machine) the keychain also joins the search list: macOS 15's
+        # import of a private key into a keychain outside it fails with "The specified item could
+        # not be found in the keychain". Locally the user's list stays as it is.
+        if [ -n "${CI:-}" ]; then
+            # shellcheck disable=SC2046
+            security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+            security list-keychains -d user
+        fi
         security import "$p12" -k "$KEYCHAIN" -f pkcs12 -P "$MACOS_CERT_PASSWORD" \
             -T /usr/bin/codesign -T /usr/bin/security
         # codesign may use the key without asking (there is no one to click «Allow» in CI).
