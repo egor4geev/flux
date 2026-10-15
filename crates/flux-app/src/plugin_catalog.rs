@@ -17,13 +17,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use flux_plugin::catalog::{self, Category, Index, IndexEntry};
+use flux_plugin::install::Candidate;
 use flux_plugin::registry::{PluginFiles, PluginSource};
 use futures::StreamExt;
 use futures::channel::mpsc::unbounded;
 use gpui::{
-    AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Div, Entity,
-    FocusHandle, Focusable, FontWeight, Global, Hsla, Render, SharedString, Subscription, Task,
-    WeakEntity, Window, div, prelude::*, px, svg,
+    AnyElement, AnyWindowHandle, App, AppContext as _, AsyncApp, AsyncWindowContext, ClickEvent,
+    Context, Div, Entity, FocusHandle, Focusable, FontWeight, Global, Hsla, Render, SharedString,
+    Subscription, Task, WeakEntity, Window, div, prelude::*, px, svg,
 };
 
 use crate::dialog::Dialog;
@@ -326,56 +327,9 @@ async fn run_install(
     workspace: &WeakEntity<Workspace>,
     cx: &mut AsyncWindowContext,
 ) -> Result<bool, String> {
-    // The download, drawn as it goes.
-    let (sender, mut steps) = unbounded::<Step>();
-    {
-        let entry = entry.clone();
-        let progress = progress.clone();
-        cx.background_spawn(async move {
-            let mut last = Instant::now();
-            let result = catalog::download(&entry, &progress.cancel, &mut |done, total| {
-                progress.done.store(done, Ordering::Relaxed);
-                progress.total.store(total, Ordering::Relaxed);
-                if last.elapsed() >= Duration::from_millis(100) {
-                    last = Instant::now();
-                    let _ = sender.unbounded_send(Step::Progress);
-                }
-            });
-            let _ = sender.unbounded_send(Step::Done(result));
-        })
-        .detach();
-    }
-    let mut archive = None;
-    while let Some(step) = steps.next().await {
-        match step {
-            Step::Progress => {
-                cx.update(|_, cx| cx.refresh_windows()).ok();
-            }
-            Step::Done(result) => {
-                archive = Some(result);
-                break;
-            }
-        }
-    }
-    let archive = match archive.unwrap_or_else(|| Err("The download stopped".into())) {
-        Err(reason) if reason == catalog::CANCELLED => return Ok(false),
-        other => other?,
+    let Some(candidate) = download_and_inspect(entry, progress, cx).await? else {
+        return Ok(false);
     };
-    progress.installing.store(true, Ordering::Relaxed);
-    cx.update(|_, cx| cx.refresh_windows()).ok();
-    let candidate = cx
-        .background_spawn(async move { flux_plugin::install::inspect(&archive) })
-        .await?;
-    let manifest = &candidate.entry.manifest;
-    if manifest.id != entry.id || manifest.version != entry.version {
-        return Err(trf(
-            "The package holds “{0}” {1}, not the plugin the catalog describes",
-            &[&manifest.id, &manifest.version],
-        ));
-    }
-    if let Some(problem) = &candidate.entry.problem {
-        return Err(problem.clone());
-    }
     // A new plugin is asked about; an update only when it asks for more than the installed one.
     let permissions = workspace
         .read_with(cx, |workspace, cx| {
@@ -401,6 +355,133 @@ async fn run_install(
                 .update(cx, |store, cx| store.install(candidate, cx))
         })
         .map_err(|_| tr("The window is closed").to_string())??;
+    Ok(true)
+}
+
+/// Downloads the package of `entry` (its progress in `progress`, the windows redraw as it goes),
+/// checks it and reads the plugin in it: the candidate to install, or `None` when the download was
+/// cancelled.
+async fn download_and_inspect(
+    entry: &IndexEntry,
+    progress: &InstallProgress,
+    cx: &mut AsyncApp,
+) -> Result<Option<Candidate>, String> {
+    let (sender, mut steps) = unbounded::<Step>();
+    {
+        let entry = entry.clone();
+        let progress = progress.clone();
+        cx.background_spawn(async move {
+            let mut last = Instant::now();
+            let result = catalog::download(&entry, &progress.cancel, &mut |done, total| {
+                progress.done.store(done, Ordering::Relaxed);
+                progress.total.store(total, Ordering::Relaxed);
+                if last.elapsed() >= Duration::from_millis(100) {
+                    last = Instant::now();
+                    let _ = sender.unbounded_send(Step::Progress);
+                }
+            });
+            let _ = sender.unbounded_send(Step::Done(result));
+        })
+        .detach();
+    }
+    let mut archive = None;
+    while let Some(step) = steps.next().await {
+        match step {
+            Step::Progress => {
+                cx.update(|cx| cx.refresh_windows()).ok();
+            }
+            Step::Done(result) => {
+                archive = Some(result);
+                break;
+            }
+        }
+    }
+    let archive = match archive.unwrap_or_else(|| Err("The download stopped".into())) {
+        Err(reason) if reason == catalog::CANCELLED => return Ok(None),
+        other => other?,
+    };
+    progress.installing.store(true, Ordering::Relaxed);
+    cx.update(|cx| cx.refresh_windows()).ok();
+    let candidate = cx
+        .background_spawn(async move { flux_plugin::install::inspect(&archive) })
+        .await?;
+    let manifest = &candidate.entry.manifest;
+    if manifest.id != entry.id || manifest.version != entry.version {
+        return Err(trf(
+            "The package holds “{0}” {1}, not the plugin the catalog describes",
+            &[&manifest.id, &manifest.version],
+        ));
+    }
+    if let Some(problem) = &candidate.entry.problem {
+        return Err(problem.clone());
+    }
+    Ok(Some(candidate))
+}
+
+/// Installs a plugin of the catalog without a window's store (part 10.7: the welcome guide, the
+/// only window on the first launch): the download with its progress in [`progress`], the checksum,
+/// the question about its permissions — only when it asks for any, in `window` — the install into
+/// the plugins folder, turned on; then every window finds it
+/// ([`crate::plugins::changed_everywhere`]). Gives `Ok(true)` once installed, `Ok(false)` when
+/// cancelled, declined, or the same plugin is being installed already.
+pub fn install_quietly(
+    entry: IndexEntry,
+    window: Option<AnyWindowHandle>,
+    cx: &mut App,
+) -> Task<Result<bool, SharedString>> {
+    let id = SharedString::from(entry.id.clone());
+    let progress = {
+        let catalog = cx.default_global::<Catalog>();
+        if catalog.installs.contains_key(&id) {
+            return Task::ready(Ok(false));
+        }
+        let progress = InstallProgress::default();
+        catalog.installs.insert(id.clone(), progress.clone());
+        progress
+    };
+    cx.refresh_windows();
+    cx.spawn(async move |cx| {
+        let result = run_quiet_install(&entry, &progress, window, cx).await;
+        cx.update(|cx| {
+            cx.default_global::<Catalog>().installs.remove(&id);
+            cx.refresh_windows();
+        })
+        .ok();
+        result.map_err(SharedString::from)
+    })
+}
+
+async fn run_quiet_install(
+    entry: &IndexEntry,
+    progress: &InstallProgress,
+    window: Option<AnyWindowHandle>,
+    cx: &mut AsyncApp,
+) -> Result<bool, String> {
+    let Some(candidate) = download_and_inspect(entry, progress, cx).await? else {
+        return Ok(false);
+    };
+    // Languages and themes ask for nothing; a plugin that asks for permissions is asked about.
+    if !candidate.entry.manifest.permissions.is_empty() {
+        let window = window.ok_or_else(|| tr("The window is closed").to_string())?;
+        let answer = window
+            .update(cx, |_, window, cx| {
+                plugin_manager::install_question(&candidate).show(window, cx)
+            })
+            .map_err(|_| tr("The window is closed").to_string())?
+            .await;
+        if answer != Some(INSTALL) {
+            return Ok(false);
+        }
+    }
+    let id = candidate.entry.id().to_string();
+    // Copying the files is off the UI thread; the windows learn of the plugin after.
+    cx.background_spawn(async move { flux_plugin::install::install(candidate) })
+        .await?;
+    cx.update(|cx| {
+        crate::settings::set_plugin_enabled(&id, true, cx);
+        crate::plugins::changed_everywhere(cx);
+    })
+    .map_err(|err| err.to_string())?;
     Ok(true)
 }
 

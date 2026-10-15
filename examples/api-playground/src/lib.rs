@@ -135,7 +135,7 @@ impl Section {
                  Playground's items print what their command gets."
             }
             Section::Forms => {
-                "A dialog with fields, as JetBrains' Open Task; it asks again on a mistake."
+                "A dialog with fields, as a tracker's Open Task; it asks again on a mistake."
             }
             Section::Pickers => {
                 "Popup lists: the plugin's own search, Flux's filter, a menu at the status bar, a \

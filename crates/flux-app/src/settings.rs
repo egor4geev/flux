@@ -54,6 +54,8 @@ pub struct Settings {
     pub markdown_layout: MarkdownLayout,
     /// Settings → Editor (part 10.5): soft wraps (`editor`).
     pub editor: EditorSettings,
+    /// The welcome guide (part 10.7): What's New after an update (`welcome`).
+    pub welcome: WelcomeSettings,
     /// The user's settings of language servers (part 10.5), by server name, as written in
     /// `settings.json` (`lsp`): `settings`, `initialization_options`, the command and its arguments
     /// over what the language plugin brings ([`crate::lsp_settings`]).
@@ -119,6 +121,19 @@ impl Default for EditorSettings {
             soft_wrap_extra_indent: 0,
             soft_wrap_signs_current_line_only: true,
         }
+    }
+}
+
+/// The welcome guide (part 10.7, `crate::welcome`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WelcomeSettings {
+    /// After an update to a new minor version, What's New shows once ("Show after updates").
+    pub whats_new: bool,
+}
+
+impl Default for WelcomeSettings {
+    fn default() -> Self {
+        Self { whats_new: true }
     }
 }
 
@@ -405,6 +420,7 @@ impl Default for Settings {
             projects: ProjectSettings::default(),
             markdown_layout: MarkdownLayout::default(),
             editor: EditorSettings::default(),
+            welcome: WelcomeSettings::default(),
             lsp: serde_json::Map::new(),
             unknown: serde_json::Map::new(),
             error: None,
@@ -414,6 +430,15 @@ impl Default for Settings {
 }
 
 impl Global for Settings {}
+
+/// Flux started without `settings.json` (part 10.7): the first launch — the welcome guide opens.
+static FIRST_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This is the first launch: there was no `settings.json` when Flux started (a scenario without
+/// `FLUX_SETTINGS_FILE` has no file at all — never a first launch).
+pub fn first_run() -> bool {
+    FIRST_RUN.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 pub fn init(cx: &mut App) {
     let path = store_path_for(
@@ -432,6 +457,8 @@ pub fn init(cx: &mut App) {
         Some(Ok(settings)) => settings,
         None => Settings::default(),
     };
+    let first = path.as_deref().is_some_and(|path| !path.exists());
+    FIRST_RUN.store(first, std::sync::atomic::Ordering::Relaxed);
     settings.path = path;
     cx.set_global(settings);
 }
@@ -717,6 +744,19 @@ pub fn update_editor(cx: &mut App, change: impl FnOnce(&mut EditorSettings)) {
     save(settings);
 }
 
+/// The welcome guide's settings (part 10.7).
+pub fn welcome(cx: &App) -> WelcomeSettings {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.welcome.clone())
+        .unwrap_or_default()
+}
+
+pub fn update_welcome(cx: &mut App, change: impl FnOnce(&mut WelcomeSettings)) {
+    let settings = cx.default_global::<Settings>();
+    change(&mut settings.welcome);
+    save(settings);
+}
+
 /// The user's settings of the language server `name` (part 10.5), as written under `lsp` in
 /// `settings.json`; `None` — the language plugin's.
 pub fn lsp_server(name: &str, cx: &App) -> Option<Value> {
@@ -896,6 +936,11 @@ fn parse_value(value: &Value) -> Settings {
             .and_then(MarkdownLayout::from_key)
             .unwrap_or_default(),
         editor: parse_editor(&value["editor"]),
+        welcome: WelcomeSettings {
+            whats_new: value["welcome"]["whats_new"]
+                .as_bool()
+                .unwrap_or(defaults.welcome.whats_new),
+        },
         lsp: value["lsp"].as_object().cloned().unwrap_or_default(),
         ..defaults
     };
@@ -1124,6 +1169,7 @@ fn known_json(settings: &Settings) -> Value {
         },
         "markdown": { "layout": settings.markdown_layout.key() },
         "editor": editor_json(&settings.editor),
+        "welcome": { "whats_new": settings.welcome.whats_new },
         "lsp": settings.lsp,
     })
 }
@@ -1200,6 +1246,7 @@ mod tests {
                 soft_wrap_extra_indent: 2,
                 soft_wrap_signs_current_line_only: false,
             },
+            welcome: WelcomeSettings { whats_new: false },
             lsp: serde_json::Map::from_iter([(
                 "rust-analyzer".to_string(),
                 json!({ "settings": { "rust-analyzer": { "check": { "command": "clippy" } } } }),

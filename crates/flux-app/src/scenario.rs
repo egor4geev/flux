@@ -8,7 +8,7 @@
 //!   - `cmd-s`, `enter`, `space`, `left` — a keystroke in gpui keymap syntax;
 //!   - `type:text` — type the text character by character (a space is a separate `space` step);
 //!   - `wait:500` — a pause in ms;
-//!   - `move:x,y` — the mouse moves to a point of the frontmost Flux window (points from its top
+//!   - `move:x,y` — the mouse moves to a point of the Flux window opened last (points from its top
 //!     left corner, as `click:`); `drag:x1,y1,x2,y2` — the left button goes down at the first point,
 //!     drags to the second and goes up there (the editor's scrollbar, part 10.5);
 //!   - `action:notifications_panel::Toggle` — dispatch an action (one without data) by name on the
@@ -23,7 +23,7 @@
 //!   - `app-terminate` — macOS asks Flux to quit, as Quit in the Dock or logging out does
 //!     (`-[NSApplication terminate:]` from a run loop timer, outside gpui's tasks — the path of the
 //!     system's Apple Event; part 10.5);
-//!   - `click:x,y` — a left click at a point of the frontmost Flux window, in points from its top
+//!   - `click:x,y` — a left click at a point of the Flux window opened last, in points from its top
 //!     left corner (a shot's pixels halved): mouse events posted to Flux's own event queue, so
 //!     the window server and the background mode don't stand in the way (part 10.5).
 //!
@@ -170,7 +170,7 @@ fn keep_panels_off_the_keyboard() {
 }
 
 /// `click:x,y`: a left mouse down and up at `x, y` (points from the top left corner of the
-/// frontmost visible window's content), posted as [`post_mouse`] posts its events.
+/// visible window opened last), posted as [`post_mouse`] posts its events.
 fn post_click(x: f64, y: f64) -> bool {
     const LEFT_MOUSE_DOWN: usize = 1;
     const LEFT_MOUSE_UP: usize = 2;
@@ -220,7 +220,7 @@ fn let_the_mouse_through() {
 }
 
 /// `click:`, `move:` and `drag:`: mouse events of these types (`NSEventType`) at these points (from
-/// the top left corner of the frontmost visible window's content), posted to the app's event queue
+/// the top left corner of the visible window opened last), posted to the app's event queue
 /// in order — AppKit hands them to the window by its number, as it does the window server's events,
 /// so the window server and the background mode don't stand in the way.
 #[allow(unexpected_cfgs)] // `msg_send!` of objc 0.2 checks a `cargo-clippy` feature.
@@ -256,13 +256,16 @@ fn post_mouse(events: &[(usize, f64, f64)]) -> bool {
         let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
         let windows: *mut Object = msg_send![app, windows];
         let count: usize = msg_send![windows, count];
+        // The window opened last: the one the steps go to. Not the one in front by `orderedIndex`
+        // — in the background the panels don't come in front, and a window opened over another
+        // (the welcome guide over the project, part 10.7) would lose its clicks to it.
         let mut front: Option<(isize, *mut Object)> = None;
         for index in 0..count {
             let window: *mut Object = msg_send![windows, objectAtIndex: index];
             let visible: objc::runtime::BOOL = msg_send![window, isVisible];
-            let order: isize = msg_send![window, orderedIndex];
-            if visible != NO && front.is_none_or(|(best, _)| order < best) {
-                front = Some((order, window));
+            let number: isize = msg_send![window, windowNumber];
+            if visible != NO && front.is_none_or(|(best, _)| number > best) {
+                front = Some((number, window));
             }
         }
         let Some((_, window)) = front else {

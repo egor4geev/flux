@@ -3,7 +3,7 @@ name = "TODO"
 version = "0.1.0"
 api = "0.3"
 authors = ["Egor Ageev"]
-description = "TODO and FIXME comments of the project in a tool window, as in JetBrains IDEs: grouped by file, with a jump to the place."
+description = "TODO and FIXME comments of the project in a tool window: grouped by file, with a jump to the place."
 repository = "https://github.com/egor4geev/flux"
 icon = "icons/todo.svg"
 # Where cargo puts the component when the folder is built as a plugin under development; Flux

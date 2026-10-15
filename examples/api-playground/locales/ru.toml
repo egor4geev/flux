@@ -177,7 +177,7 @@
 "Local Time" = "Местное время"
 "Badges and Fields" = "Бейджи и поля"
 "A Window in the Editor" = "Окно в редакторе"
-"A dialog with fields, as JetBrains' Open Task; it asks again on a mistake." = "Диалог с полями, как Open Task в JetBrains; при ошибке спрашивает снова."
+"A dialog with fields, as a tracker's Open Task; it asks again on a mistake." = "Диалог с полями, как Open Task в трекере; при ошибке спрашивает снова."
 "Popup lists: the plugin's own search, Flux's filter, a menu at the status bar, a badge's menu." = "Попапы выбора: свой поиск плагина, фильтр Flux, меню у статус-бара, меню бейджа."
 "Settings → the playground: a secret, a button, a status line, a note, bookmarks." = "Настройки → песочница: секрет, кнопка, строка состояния, заметка, закладки."
 "A new branch and a checkout the way Flux does them; the commit message's template." = "Новая ветка и checkout так, как их делает Flux; шаблон сообщения коммита."

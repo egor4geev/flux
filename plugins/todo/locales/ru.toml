@@ -2,7 +2,7 @@
 # manifest's strings with this table too (the palette, Settings).
 
 # The manifest
-"TODO and FIXME comments of the project in a tool window, as in JetBrains IDEs: grouped by file, with a jump to the place." = "Комментарии TODO и FIXME проекта в окне инструмента, как в IDE JetBrains: по файлам, с переходом к месту."
+"TODO and FIXME comments of the project in a tool window: grouped by file, with a jump to the place." = "Комментарии TODO и FIXME проекта в окне инструмента: по файлам, с переходом к месту."
 "Refresh TODO" = "Обновить TODO"
 "Patterns" = "Шаблоны"
 "Regular expressions that mark a TODO item, one per row." = "Регулярные выражения, которыми отмечены TODO, по одному в строке."

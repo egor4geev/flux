@@ -683,11 +683,11 @@ diagnostics::publish(&path, &problems); // source: the plugin's name unless `.so
 
 ### Forms
 
-`dialogs.ask-form` — a dialog with several fields, as JetBrains' Open Task: a line of text, several
-lines (↵ — a new line, ⌘↵ — confirm), a dropdown, checkboxes, notes between them; the placeholder,
-the code font. A field can be enabled by a checkbox (`enabled_by`): the branch's name only while
-«Create a branch» is on. The answer comes as `form-answered`: every field's value by its key — the
-text, the chosen option's value, `"true"` / `"false"` — or none, cancelled.
+`dialogs.ask-form` — a dialog with several fields, such as a tracker's Open Task: a line of text,
+several lines (↵ — a new line, ⌘↵ — confirm), a dropdown, checkboxes, notes between them; the
+placeholder, the code font. A field can be enabled by a checkbox (`enabled_by`): the branch's name
+only while «Create a branch» is on. The answer comes as `form-answered`: every field's value by its
+key — the text, the chosen option's value, `"true"` / `"false"` — or none, cancelled.
 
 ```rust
 use flux_plugin_api::dialog::{Form, Values};
@@ -754,8 +754,8 @@ self.transitions = Some(
 ```
 
 Where it opens: under the title bar, as the command palette (the default); above one of the plugin's
-status bar items (`at_status_item`) — the day's meetings from a «Meeting in 12 min» item, as
-JetBrains' status bar popups; under an element of its tool window (`under`). An item or an element
+status bar items (`at_status_item`) — the day's meetings from a «Meeting in 12 min» item; under an
+element of its tool window (`under`). An item or an element
 that isn't on screen — under the title bar.
 
 ### The settings page
@@ -875,7 +875,7 @@ installed or not signed in: the error says which, and the Claude window shows ho
 
 ### Contexts
 
-`contexts` — the window's tabs kept under a key, as Tasks & Contexts in JetBrains: a task's
+`contexts` — the window's tabs kept under a key, one set per task: a task's
 documents (with the caret and the scroll), pictures and Claude chats come back when the user
 returns to the task. `switch(save, load)` saves the open tabs as `save` — a key and a title, which
 the user sees in **Load Context…** — closes them (documents with unsaved changes and running Claude
@@ -1033,15 +1033,15 @@ the verification page with `system::open_url`, and polls the token endpoint with
 
 ## A task tracker plugin
 
-The API is made to put a task tracker into Flux the way JetBrains IDEs do Tasks & Contexts; the
+The API is made to put a task tracker into Flux, with each task keeping its own tabs; the
 catalog's [`flux.yandex`](https://github.com/egor4geev/flux-plugins/tree/main/plugins/flux.yandex) —
 Yandex Tracker and Calendar — is built of these pieces:
 
 1. **Signing in** — [Signing in to a web service](#signing-in-to-a-web-service); the settings page is
    the account: a pasted token — a `secret` setting, Sign In and Sign Out — `button` settings, who is
    signed in — a `status` setting.
-2. **Finding a task** — a `live` [picker](#pickers) under the title bar (⌥⇧N, as Open Task in
-   JetBrains): the user's tasks at once, then the tracker's search as they type.
+2. **Finding a task** — a `live` [picker](#pickers) under the title bar (⌥⇧N): the user's tasks at
+   once, then the tracker's search as they type.
 3. **Starting it** — a [form](#forms) (the status to move to, a branch, the task's tabs), or none at
    all for a one-click action; then the tracker's transition, `git::new_branch` or `git::checkout`
    (`git-done`), `contexts::switch` (the previous task's tabs kept, this one's back),
@@ -1110,7 +1110,7 @@ set_view(
 | Element | | Events (`ui-event`) |
 |---------|-|---------------------|
 | `column`, `row` | Children top to bottom, or left to right. | |
-| `toolbar` | Buttons in a row under the window's title, as in JetBrains tool windows. | |
+| `toolbar` | Buttons in a row under the window's title, as in Flux's own tool windows. | |
 | `text` | Spans of text, each with a tone (`normal`, `muted`, `dim`, `accent`, `success`, `warning`, `error`), bold, code, highlighted. `label` is plain text. | |
 | `markdown` | Markdown, drawn as Flux draws documentation. | |
 | `button` | A label and/or an icon, a tooltip, primary, enabled. `icon_button` — the toolbar's kind. | `clicked` |
@@ -1234,7 +1234,7 @@ tar czf hello-0.1.0.tar.gz flux-plugin.toml locales icons \
 ```
 
 The plugin's data is in `~/Library/Application Support/flux/plugin-data/<id>/`; removing the plugin
-keeps it, as JetBrains IDEs keep a removed plugin's settings (its secrets in the keychain go).
+keeps it, so a reinstalled plugin finds its settings again (its secrets in the keychain go).
 
 To publish a plugin for everyone, add it to the catalog — the Marketplace of Settings → Plugins:
 [The plugin catalog](catalog.md).

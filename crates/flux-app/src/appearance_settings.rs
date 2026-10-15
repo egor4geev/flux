@@ -115,13 +115,17 @@ impl AppearancePage {
         let themes = theme::available(cx);
         let shown = Theme::get(cx).name.clone();
         // With Sync with OS, each group marks its own theme; a theme that is gone falls back to
-        // the default of its appearance, as `theme::chosen` does.
+        // the default of its appearance, as `theme::chosen` does. A theme the catalog renamed is
+        // marked under its name now, whichever name the settings hold (part 10.7).
         let preferred = |appearance_of: Appearance, setting: Option<&str>, default: &str| {
             let name = setting.unwrap_or(default);
-            let known = themes
-                .iter()
-                .any(|theme| theme.name.as_ref() == name && theme.appearance == appearance_of);
-            SharedString::from(if known { name } else { default }.to_string())
+            let known = themes.iter().find(|theme| {
+                theme::same_theme(&theme.name, name) && theme.appearance == appearance_of
+            });
+            match known {
+                Some(theme) => theme.name.clone(),
+                None => SharedString::from(default.to_string()),
+            }
         };
         let dark_choice = preferred(
             Appearance::Dark,
@@ -914,7 +918,7 @@ fn opaque(color: Hsla) -> Hsla {
 
 /// A small window in `theme`'s colors: the frame, the tree's island with a few rows (one selected,
 /// two with Git colors), and the editor's island with a few lines of code.
-fn theme_preview(theme: &Theme) -> Div {
+pub(crate) fn theme_preview(theme: &Theme) -> Div {
     let ui = theme.ui;
     let bar = |width: f32, color: Hsla| {
         div()
@@ -1006,7 +1010,7 @@ fn theme_preview(theme: &Theme) -> Div {
 /// Islands — rounded islands apart on the frame with its glow; Flat — panels edge to edge, divided
 /// by lines. The title bar with the traffic lights, the launchpad, the tree, the editor with a tab
 /// and a few lines of code, the terminal under it, the status bar.
-fn style_preview(theme: &Theme, style: UiStyle) -> Div {
+pub(crate) fn style_preview(theme: &Theme, style: UiStyle) -> Div {
     let flat = style == UiStyle::Flat;
     let ui = theme.ui;
     // The preview sits on another surface, so it is drawn opaque, as a Flat window is.
