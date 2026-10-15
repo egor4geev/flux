@@ -1,0 +1,29 @@
+# The form of the Ideas category (the file is named by the category's slug). Help → Suggest a
+# Feature… in Flux opens it: /discussions/new?category=ideas. The ids can be filled through the URL's
+# query, as in the issue forms.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Have a look at the [ideas already here](https://github.com/egor4geev/flux/discussions/categories/ideas) first — an upvote on one of them counts too.
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What Flux should do. If another editor already does it — a JetBrains IDE, Zed, Xcode — tell how it works there.
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Why
+      description: What you're trying to do, and what gets in the way today.
+
+  - type: input
+    id: version
+    attributes:
+      label: Flux version
+      description: If the idea is about something you saw in Flux — Flux → About Flux.
+      placeholder: 0.1.0 (ca086c2)

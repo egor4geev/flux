@@ -1,0 +1,82 @@
+# Flux's bug form. Help → Report a Bug… in Flux opens it with the fields filled in through the URL's
+# query, by their ids: keep the ids in step with `field` in crates/flux-app/src/feedback.rs.
+name: Bug report
+description: Something in Flux doesn't work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      # One line per paragraph: GitHub keeps line breaks inside a paragraph.
+      value: |
+        Thanks for taking the time to report a bug! **Help → Report a Bug…** in Flux opens this form with the version, macOS, the processor and the plugins already filled in.
+
+        A problem with a plugin from the Marketplace — a language, a theme, Yandex Tracker & Calendar — goes to [flux-plugins](https://github.com/egor4geev/flux-plugins/issues/new/choose). A security problem — [privately](https://github.com/egor4geev/flux/security/advisories/new), please, not here.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw. Screenshots, a screen recording or `flux.log` help — drag them in here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: From opening Flux, if you can. A small project or file that shows the problem helps a lot.
+      placeholder: |
+        1. Open a Rust project
+        2. …
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+
+  - type: input
+    id: version
+    attributes:
+      label: Flux version
+      description: Flux → About Flux → Copy takes it, along with macOS, the processor and the plugins.
+      placeholder: 0.1.0 (ca086c2)
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS
+      description: Apple menu → About This Mac.
+      placeholder: macOS 26.1 (25B78)
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Processor
+      placeholder: Apple M3 Pro, arm64
+
+  - type: textarea
+    id: plugins
+    attributes:
+      label: Installed plugins
+      description: The plugins you installed (Settings → Plugins), with their versions. The built-in ones don't count.
+      placeholder: flux.rust 0.1.0
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log or crash report
+      description: Help → Show Log in Finder opens the folder with `flux.log` — paste the lines from around the problem. After a crash, Flux offers to report it the next time it starts, with the crash report here.
+      render: text
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Before you send
+      options:
+        - label: I searched the [existing issues](https://github.com/egor4geev/flux/issues?q=is%3Aissue), and this one isn't there yet.
+          required: true

@@ -1,0 +1,86 @@
+# After every push to main — a release or a hotfix merged — main is merged into pre-release, so the
+# next release carries the hotfix and pre-release always contains main: a fast-forward when
+# pre-release has nothing of its own, a merge commit otherwise, nothing when it contains main
+# already. On a conflict the run fails with the files in its summary (GitHub mails the failure):
+# merge by hand —
+#
+#   git switch pre-release && git pull && git merge origin/main   # resolve, commit
+#   git push
+#
+# The push uses GITHUB_TOKEN: it starts no other workflow (no CI run for the merge commit).
+# pre-release's ruleset allows it: it only forbids force pushes and deletion.
+name: Sync pre-release
+
+on:
+  push:
+    branches: [main]
+  # Run workflow: after pre-release was busy, say.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-pre-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge main into pre-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The whole history: deciding between a fast-forward and a merge needs the merge base.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Merge
+        run: |
+          if ! git rev-parse --verify --quiet refs/remotes/origin/pre-release >/dev/null; then
+            echo "::notice::There is no pre-release branch: nothing to merge into."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # A push of the author's can land between the fetch and ours: then fetch and try again.
+          for attempt in 1 2 3; do
+            git fetch --quiet origin main pre-release
+            git switch --quiet --force-create pre-release origin/pre-release
+            if git merge-base --is-ancestor origin/main HEAD; then
+              echo "pre-release already contains main."
+              exit 0
+            fi
+            if git merge-base --is-ancestor HEAD origin/main; then
+              git merge --quiet --ff-only origin/main
+              echo "pre-release fast-forwarded to main ($(git rev-parse --short HEAD))."
+            elif ! git merge --quiet --no-ff -m "Merge main into pre-release" origin/main; then
+              conflicts=$(git diff --name-only --diff-filter=U)
+              git merge --abort
+              echo "::error title=main conflicts with pre-release::Merge main into pre-release by hand — the conflicts: $(echo "$conflicts" | paste -sd ',' - | sed 's/,/, /g')"
+              {
+                echo "### \`main\` can't be merged into \`pre-release\` by itself"
+                echo
+                echo "The files in conflict:"
+                echo
+                while IFS= read -r file; do echo "- \`$file\`"; done <<<"$conflicts"
+                echo
+                echo "Merge by hand:"
+                echo
+                echo '```sh'
+                echo 'git switch pre-release && git pull && git merge origin/main   # resolve, commit'
+                echo 'git push'
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            else
+              echo "main merged into pre-release ($(git rev-parse --short HEAD))."
+            fi
+            if git push --quiet origin HEAD:pre-release; then
+              exit 0
+            fi
+            echo "pre-release moved during the merge (attempt $attempt): trying again."
+            sleep 5
+          done
+          echo "::error::pre-release kept moving: run this workflow again."
+          exit 1

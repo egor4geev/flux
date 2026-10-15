@@ -458,10 +458,15 @@ fn namespace_color(namespace: &str, ui: &UiColors) -> Hsla {
     }
 }
 
-/// A command whose title isn't its action's name: as JetBrains IDEs call it.
+/// A command whose title isn't its action's name: as JetBrains IDEs call it, or as the menu bar
+/// does (the Help menu, part 10.6).
 fn own_title(action: &str) -> Option<&'static str> {
     match action {
         "editor::ToggleSoftWrap" => Some("Soft-Wrap"),
+        "help::ReportBug" => Some("Report a Bug…"),
+        "help::SuggestFeature" => Some("Suggest a Feature…"),
+        "help::AskQuestion" => Some("Ask a Question…"),
+        "help::ShowLog" => Some("Show Log in Finder"),
         _ => None,
     }
 }

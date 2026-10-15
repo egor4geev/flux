@@ -27,6 +27,7 @@ use gpui::{
 };
 
 use crate::dialog::Dialog;
+use crate::feedback;
 use crate::i18n::{lang_code, tr, trf};
 use crate::icons::{self, IconName, icon};
 use crate::input::{InputEvent, TextInput};
@@ -1275,6 +1276,20 @@ impl PluginCatalog {
                     .child(languages)
                     .into_any_element(),
             ));
+        }
+        // Where its problems go (part 10.6), with the version installed here, if it is.
+        let installed = self.plugins.read(cx).plugin(&entry.id);
+        let report = feedback::PluginReport {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            version: installed
+                .map(|plugin| plugin.entry.manifest.version.clone())
+                .unwrap_or_else(|| entry.version.clone()),
+            repository: entry.repository.clone(),
+            bundled: installed.is_some_and(|plugin| plugin.source() == PluginSource::Bundled),
+        };
+        if let Some(link) = feedback::report_issue_link("catalog-report-issue", report, ui) {
+            facts.push((tr("Feedback"), link));
         }
         column
             .child(ui::divider(ui))

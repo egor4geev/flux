@@ -1,3 +1,4 @@
+mod app_log;
 mod app_menu;
 mod appearance_settings;
 mod blame;
@@ -37,6 +38,7 @@ mod editor;
 mod editor_menu;
 mod editor_settings;
 mod element;
+mod feedback;
 mod file_finder;
 mod file_tree;
 mod find_bar;
@@ -128,6 +130,8 @@ use gpui::{App, Application};
 use theme::Theme;
 
 fn main() {
+    // Flux's log and crash reports (part 10.6), before anything can print or panic.
+    app_log::start();
     // A UI scenario doesn't touch the user's plugins, their data and logs (as it doesn't touch
     // the settings): unless given, they live in a fresh temporary folder.
     #[cfg(feature = "scenario")]
@@ -244,6 +248,8 @@ fn main() {
             lsp_status::init(cx);
             lsp_settings::init(cx);
             settings_file::init(cx);
+            feedback::init(cx);
+            app_log::init(cx);
 
             // The project of the command line, or the projects open when Flux quit (part 10.1).
             let _window = workspace::open_startup_windows(root, paths, cx)

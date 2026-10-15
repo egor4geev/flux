@@ -77,6 +77,8 @@ mod soft_wrap;
 mod scrollbar;
 mod lsp_status;
 mod lsp_settings;
+mod feedback;
+mod app_log;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
 pub(super) const STRINGS: &[&[(&str, &str)]] = &[
@@ -157,6 +159,8 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     scrollbar::STRINGS,
     lsp_status::STRINGS,
     lsp_settings::STRINGS,
+    feedback::STRINGS,
+    app_log::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -217,4 +221,6 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     scrollbar::PLURALS,
     lsp_status::PLURALS,
     lsp_settings::PLURALS,
+    feedback::PLURALS,
+    app_log::PLURALS,
 ];

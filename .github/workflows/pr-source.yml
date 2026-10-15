@@ -1,0 +1,62 @@
+# A pull request into main comes only from this repository's pre-release (a release) or a hotfix/*
+# branch (an urgent fix of the released version); everything else goes to pre-release, where Flux is
+# developed. "PR source" is a required check of main's ruleset (.github/rulesets/main.json).
+#
+# pull_request_target: the check runs as main has it, so a pull request can't change it, and a fork's
+# first pull request gets the answer at once, without waiting for approval. It never checks out or
+# runs the pull request's code and has no permissions; the branch names reach the shell only through
+# the environment. Its check run lands on the pull request's head commit, like pull_request's.
+#
+# It runs for pull requests into any branch and answers for each: a pull request moved from main to
+# pre-release (edited) gets a passing check instead of the failed one. No run is ever skipped: a
+# skipped run would count as passing.
+name: PR source
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited]
+
+permissions: {}
+
+concurrency:
+  group: pr-source-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: PR source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Where the pull request comes from
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$BASE_REF" != main ]; then
+            echo "Into $BASE_REF: any branch may come here."
+            exit 0
+          fi
+          if [ "$HEAD_REPO" = "$REPO" ]; then
+            case "$HEAD_REF" in
+              pre-release | hotfix/?*)
+                echo "Into main from $HEAD_REF: a release or a hotfix."
+                exit 0
+                ;;
+            esac
+          fi
+          from="$HEAD_REPO:$HEAD_REF"
+          if [ -z "$HEAD_REPO" ]; then
+            from="$HEAD_REF (its repository is gone)"
+          fi
+          echo "::error title=This pull request goes to pre-release::main takes pull requests only from pre-release and hotfix/* branches of $REPO, not from $from. Change the base branch to pre-release: Edit, next to the title."
+          {
+            echo "### This pull request goes to \`pre-release\`"
+            echo
+            echo "\`main\` holds the released version of Flux and takes pull requests only from this repository's \`pre-release\` (releases) and \`hotfix/*\` (urgent fixes). This one comes from \`$from\`."
+            echo
+            echo "Please change the base branch to \`pre-release\`: **Edit** next to the title, then pick \`pre-release\` as the base. See CONTRIBUTING.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
