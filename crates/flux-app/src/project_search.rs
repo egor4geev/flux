@@ -11,17 +11,25 @@
 //! selected match is in the middle. The window asks the Workspace to open a match
 //! ([`ProjectSearchEvent::Open`]): the Workspace opens the file and selects the spot in it, and the
 //! window closes.
+//!
+//! Files by name (part 10.4): a query that can be a file's name also finds files, as ⌘P does —
+//! «radme.md» gives `README.md` (`flux_search::match_file_names`: fuzzy, close matches only). They
+//! come first, under the «Files» heading (a few, «N more files» shows the rest), and the text found
+//! follows under «Text»; ↵ on a file opens it. A query with spaces or the characters of code, and a
+//! regular expression, find no files. The project's files are walked in the background when the
+//! window opens and matched off the UI thread; the text search never waits for them.
 
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flux_core::Document;
 use flux_search::{
-    FileMatches, GrepOptions, GrepSummary, LineMatch, QueryError, SearchQuery, search_project,
+    FileMatches, GrepOptions, GrepSummary, LineMatch, QueryError, SearchQuery, is_name_query,
+    match_file_names, search_project, walk_files,
 };
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -36,6 +44,7 @@ use crate::editor::Editor;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::picker::highlighted_text;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 use crate::workspace::Location;
@@ -58,6 +67,11 @@ const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
 const PAGE_MATCHES: usize = 10;
 /// The status does not stretch any wider: long text is only partly visible.
 const STATUS_MAX_WIDTH: f32 = 420.;
+/// Files found by name: shown at first, and at most (after «N more files»).
+const NAMED_FILES: usize = 5;
+const NAMED_FILES_EXPANDED: usize = 100;
+/// The width of a file header's chevron: a file found by name keeps its icon in the same column.
+const CHEVRON_WIDTH: f32 = 12.;
 
 actions!(
     project_search,
@@ -100,6 +114,8 @@ pub fn init(cx: &mut App) {
 pub enum ProjectSearchEvent {
     /// Open the file and select the match; `focus` moves focus to the editor.
     Open { location: Location, focus: bool },
+    /// Open a file found by its name (as ⌘P does: an open file keeps its cursor) and focus it.
+    OpenFile(PathBuf),
     /// Return focus to the editor (Esc, the window has closed).
     FocusEditor,
 }
@@ -107,10 +123,83 @@ pub enum ProjectSearchEvent {
 /// A row of the results list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
+    /// A group's heading, when there are files found by name: «Files» over them, «Text» over the
+    /// text found.
+    Heading(Heading),
+    /// A file found by its name (index into `NamedFiles::hits`).
+    NamedFile(usize),
+    /// «N more files»: shows the rest of the files found by name.
+    MoreFiles,
+    /// Under «Text» while no text has been found: «Searching…», «No text matches».
+    TextNote,
     /// A file header (index into `results`).
     File(usize),
     /// A line with matches: the file and the line within it.
     Line { file: usize, line: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heading {
+    Files,
+    Text,
+}
+
+/// The row the selection is on, found again when the rows change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pick {
+    Line(PathBuf, usize),
+    Named(Arc<str>),
+    More,
+}
+
+/// A file found by its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileHit {
+    /// Relative to the root, with `/`.
+    path: Arc<str>,
+    /// Matched characters: `char` indices into `path`.
+    positions: Vec<usize>,
+}
+
+/// Files by name: the project's files and those whose names look like the query.
+#[derive(Default)]
+struct NamedFiles {
+    /// Relative to the root, with `/`; `None` until the first walk ends.
+    paths: Option<Arc<Vec<Arc<str>>>>,
+    /// The best matches, best first (up to [`NAMED_FILES_EXPANDED`]).
+    hits: Vec<FileHit>,
+    /// How many files matched in all.
+    total: usize,
+    /// «N more files» was chosen: all the hits are shown.
+    expanded: bool,
+    /// Stops the walk in progress.
+    cancel: Arc<AtomicBool>,
+    /// The walk and the matching; a new one replaces (cancels) the previous one.
+    _walk: Option<Task<()>>,
+    _matching: Option<Task<()>>,
+}
+
+impl NamedFiles {
+    /// How many hits are shown.
+    fn shown(&self) -> usize {
+        if self.expanded {
+            self.hits.len()
+        } else {
+            self.hits.len().min(NAMED_FILES)
+        }
+    }
+
+    /// The hits that «N more files» would show.
+    fn more(&self) -> usize {
+        self.hits.len() - self.shown()
+    }
+
+    fn clear(&mut self) {
+        self.hits.clear();
+        self.total = 0;
+        self.expanded = false;
+        self._matching = None;
+    }
 }
 
 /// Search state, for the status in the header and for the empty list.
@@ -173,6 +262,8 @@ pub struct ProjectSearch {
     preview: Preview,
     /// The query as a single line, for the explanations in the empty list (updated on render).
     last_query: String,
+    /// Files by name, above the text found (part 10.4).
+    named: NamedFiles,
     _subscription: Subscription,
 }
 
@@ -212,6 +303,7 @@ impl ProjectSearch {
             scroll: UniformListScrollHandle::new(),
             preview: Preview::default(),
             last_query: String::new(),
+            named: NamedFiles::default(),
             _subscription: subscription,
         }
     }
@@ -220,6 +312,9 @@ impl ProjectSearch {
     pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
         self.root = root;
         self.cancel_search();
+        // The files by name go first: the rows are rebuilt without them.
+        self.named.clear();
+        self.named.paths = None;
         self.clear_results();
         self.preview = Preview::default();
         self.status = if self.root.is_some() {
@@ -228,6 +323,7 @@ impl ProjectSearch {
             Status::NoRoot
         };
         if self.open {
+            self.walk_files(cx);
             self.schedule_search(cx);
         }
         cx.notify();
@@ -247,6 +343,10 @@ impl ProjectSearch {
         }
         let reopened = !self.open;
         self.open = true;
+        // Files may have been added, removed or renamed while the window was hidden.
+        if reopened {
+            self.walk_files(cx);
+        }
         let current = self.query.read(cx).text();
         match seed {
             // The new text starts the search by itself (`InputEvent::Changed`).
@@ -293,13 +393,16 @@ impl ProjectSearch {
     fn schedule_search(&mut self, cx: &mut Context<Self>) {
         self.cancel_search();
         let query = self.search_query(cx);
+        self.named.expanded = false;
         let Some(root) = self.root.clone() else {
+            self.named.clear();
             self.clear_results();
             self.preview = Preview::default();
             self.status = Status::NoRoot;
             return cx.notify();
         };
         if query.is_empty() {
+            self.named.clear();
             self.clear_results();
             self.preview = Preview::default();
             self.status = Status::Idle;
@@ -311,6 +414,9 @@ impl ProjectSearch {
             let started = this.update(cx, |this, cx| {
                 this.clear_results();
                 this.status = Status::Searching;
+                // The files by name are matched alongside; until they come, those of the
+                // previous query stay (no flicker while typing).
+                this.match_names(cx);
                 cx.notify();
             });
             if started.is_err() {
@@ -351,40 +457,163 @@ impl ProjectSearch {
         self.search = None;
     }
 
-    /// Clears the results. The preview stays until new results arrive, so it does not flicker while
-    /// the search is running.
+    /// Clears the text results (the files by name are replaced when they are matched again). The
+    /// preview stays until new results arrive, so it does not flicker while the search is running.
     fn clear_results(&mut self) {
         self.results.clear();
         self.collapsed.clear();
-        self.rows.clear();
         self.found = (0, 0);
-        self.selected = None;
+        self.rows = self.layout();
+        self.selected = next_selectable_row(&self.rows, None, true);
         self.selection_pinned = false;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
 
     /// A batch of files from the search: they are inserted in path order; the selection stays on
-    /// the same row (if the user made it) or moves to the first match.
+    /// the same row (if the user made it) or moves to the first one.
     fn add_files(&mut self, files: Vec<FileMatches>, cx: &mut Context<Self>) {
-        let pinned = self
-            .selected_match()
-            .filter(|_| self.selection_pinned)
-            .map(|(file, line)| (self.results[file].path.clone(), line));
+        let pinned = self.pinned();
         for file in files {
             self.found.0 += match_count(&file);
             self.found.1 += 1;
             insert_sorted(&mut self.results, file);
         }
-        self.rows = flatten(&self.results, &self.collapsed);
-        self.selected = match pinned {
-            Some((path, line)) => self
-                .results
-                .iter()
-                .position(|file| file.path == path)
-                .and_then(|file| row_of(&self.rows, file, line)),
-            None => next_match_row(&self.rows, None, true),
+        self.relayout(pinned, cx);
+    }
+
+    /// The rows for the current results and files by name.
+    fn layout(&self) -> Vec<Row> {
+        layout(
+            self.named.shown(),
+            self.named.more() > 0,
+            &self.results,
+            &self.collapsed,
+        )
+    }
+
+    /// The row the user picked (arrows, click), to keep the selection on it when the rows change.
+    fn pinned(&self) -> Option<Pick> {
+        self.picked().filter(|_| self.selection_pinned)
+    }
+
+    fn picked(&self) -> Option<Pick> {
+        match *self.rows.get(self.selected?)? {
+            Row::Line { file, line } => Some(Pick::Line(self.results[file].path.clone(), line)),
+            Row::NamedFile(hit) => Some(Pick::Named(self.named.hits[hit].path.clone())),
+            Row::MoreFiles => Some(Pick::More),
+            Row::Heading(_) | Row::TextNote | Row::File(_) => None,
+        }
+    }
+
+    fn row_of_pick(&self, pick: &Pick) -> Option<usize> {
+        self.rows.iter().position(|row| match (*row, pick) {
+            (Row::Line { file, line }, Pick::Line(path, picked)) => {
+                line == *picked && self.results[file].path == *path
+            }
+            (Row::NamedFile(hit), Pick::Named(path)) => self.named.hits[hit].path == *path,
+            (Row::MoreFiles, Pick::More) => true,
+            _ => false,
+        })
+    }
+
+    /// The rows changed: the selection stays on the row the user picked, otherwise (or when it is
+    /// gone) goes to the first row that can be picked — a file found by name, if there is one.
+    fn relayout(&mut self, pinned: Option<Pick>, cx: &mut Context<Self>) {
+        self.rows = self.layout();
+        self.selected = match pinned.and_then(|pick| self.row_of_pick(&pick)) {
+            Some(row) => Some(row),
+            None => {
+                self.selection_pinned = false;
+                next_selectable_row(&self.rows, None, true)
+            }
         };
         self.sync_preview(cx);
+    }
+
+    // --- Files by name ---
+
+    /// Walks the project's files in the background (the window opens, the root changes); when the
+    /// walk ends, the query is matched against them again.
+    fn walk_files(&mut self, cx: &mut Context<Self>) {
+        self.named.cancel.store(true, Ordering::Relaxed);
+        self.named.cancel = Arc::new(AtomicBool::new(false));
+        let Some(root) = self.root.clone() else {
+            self.named._walk = None;
+            return;
+        };
+        let cancel = self.named.cancel.clone();
+        let walk = cx.background_executor().spawn(async move {
+            let paths = Mutex::new(Vec::new());
+            walk_files(&root, &cancel, |path| {
+                let path: Arc<str> = path.to_string_lossy().into();
+                paths.lock().unwrap_or_else(|e| e.into_inner()).push(path);
+            });
+            paths.into_inner().unwrap_or_else(|e| e.into_inner())
+        });
+        self.named._walk = Some(cx.spawn(async move |this, cx| {
+            let paths = walk.await;
+            this.update(cx, |this, cx| {
+                this.named.paths = Some(Arc::new(paths));
+                this.match_names(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Matches the query against the files' names in the background; a query that can't be a name
+    /// (spaces, the characters of code) and a regular expression find no files.
+    fn match_names(&mut self, cx: &mut Context<Self>) {
+        let query = self.query.read(cx).text();
+        if self.regex || !is_name_query(&query) {
+            if !self.named.hits.is_empty() {
+                let pinned = self.pinned();
+                self.named.clear();
+                self.relayout(pinned, cx);
+                cx.notify();
+            }
+            self.named._matching = None;
+            return;
+        }
+        let Some(paths) = self.named.paths.clone() else {
+            // The walk is running: it matches when it ends.
+            return;
+        };
+        let matching = cx.background_executor().spawn(async move {
+            let (found, total) = match_file_names(&query, &paths, NAMED_FILES_EXPANDED);
+            let hits: Vec<FileHit> = found
+                .into_iter()
+                .map(|found| FileHit {
+                    path: paths[found.index].clone(),
+                    positions: found.positions,
+                })
+                .collect();
+            (hits, total)
+        });
+        self.named._matching = Some(cx.spawn(async move |this, cx| {
+            let (hits, total) = matching.await;
+            this.update(cx, |this, cx| {
+                let pinned = this.pinned();
+                this.named.hits = hits;
+                this.named.total = total;
+                this.relayout(pinned, cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// «N more files»: all the files found by name; the selection goes to the first one that was
+    /// hidden.
+    fn expand_named(&mut self, cx: &mut Context<Self>) {
+        let first_hidden = self.named.shown();
+        self.named.expanded = true;
+        self.rows = self.layout();
+        if let Some(row) = row_of_named(&self.rows, first_hidden) {
+            self.selected = Some(row);
+            self.selection_pinned = true;
+        }
+        self.sync_preview(cx);
+        cx.notify();
     }
 
     fn finish(&mut self, summary: Result<GrepSummary, QueryError>, cx: &mut Context<Self>) {
@@ -400,24 +629,28 @@ impl ProjectSearch {
     fn selected_match(&self) -> Option<(usize, usize)> {
         match self.rows.get(self.selected?)? {
             Row::Line { file, line } => Some((*file, *line)),
-            Row::File(_) => None,
+            _ => None,
         }
     }
 
-    /// Selects the match `steps` steps forward or backward (at the edge of the list, the outermost
-    /// one).
+    fn selected_row(&self) -> Option<Row> {
+        self.rows.get(self.selected?).copied()
+    }
+
+    /// Selects the row `steps` steps forward or backward — a file found by name, «N more files» or
+    /// a match (at the edge of the list, the outermost one).
     fn select_match(&mut self, forward: bool, steps: usize, cx: &mut Context<Self>) {
-        let Some(row) = step_match_rows(&self.rows, self.selected, forward, steps) else {
+        let Some(row) = step_rows(&self.rows, self.selected, forward, steps) else {
             return;
         };
         self.select_row(row, cx);
         // Scrolls by the minimum amount: down, the row ends up at the bottom edge; up, at the top
-        // edge, together with the file header if the row is the first one in its file.
+        // edge, together with the file header or the heading if the row is the first under it.
         if forward {
             self.scroll.scroll_to_item(row, ScrollStrategy::Bottom);
         } else {
-            let top = match row.checked_sub(1).map(|header| self.rows[header]) {
-                Some(Row::File(_)) => row - 1,
+            let top = match row.checked_sub(1).map(|above| self.rows[above]) {
+                Some(Row::File(_) | Row::Heading(_)) => row - 1,
                 _ => row,
             };
             self.scroll.scroll_to_item(top, ScrollStrategy::Top);
@@ -435,30 +668,43 @@ impl ProjectSearch {
     /// A click on a file header: collapses or expands its rows. A selection in a collapsed file
     /// moves to the nearest visible match.
     fn toggle_file(&mut self, file: usize, cx: &mut Context<Self>) {
-        let selected = self.selected_match();
+        let picked = self.picked();
         let path = self.results[file].path.clone();
         if !self.collapsed.remove(&path) {
             self.collapsed.insert(path);
         }
-        self.rows = flatten(&self.results, &self.collapsed);
-        self.selected = selected.and_then(|(selected_file, line)| {
-            row_of(&self.rows, selected_file, line).or_else(|| fallback_row(&self.rows, file))
+        self.rows = self.layout();
+        self.selected = picked.and_then(|pick| {
+            self.row_of_pick(&pick)
+                .or_else(|| fallback_row(&self.rows, file))
         });
         self.sync_preview(cx);
         cx.notify();
     }
 
-    /// Opens the selected match in the editor and closes the window.
+    /// Opens the selected match or file in the editor and closes the window; «N more files» shows
+    /// the rest of the files.
     fn open_selected(&mut self, cx: &mut Context<Self>) {
-        let (Some(root), Some((file, line))) = (&self.root, self.selected_match()) else {
+        let Some(root) = self.root.clone() else {
             return;
         };
-        let location = location_for(root, &self.results[file], line);
-        cx.emit(ProjectSearchEvent::Open {
-            location,
-            focus: true,
-        });
-        self.close(cx);
+        match self.selected_row() {
+            Some(Row::Line { file, line }) => {
+                let location = location_for(&root, &self.results[file], line);
+                cx.emit(ProjectSearchEvent::Open {
+                    location,
+                    focus: true,
+                });
+                self.close(cx);
+            }
+            Some(Row::NamedFile(hit)) => {
+                let path = root.join(&*self.named.hits[hit].path);
+                cx.emit(ProjectSearchEvent::OpenFile(path));
+                self.close(cx);
+            }
+            Some(Row::MoreFiles) => self.expand_named(cx),
+            _ => {}
+        }
     }
 
     /// A click on a toggle or its shortcut: searches again and moves focus to the field.
@@ -482,18 +728,31 @@ impl ProjectSearch {
     /// while it is being read). With no selection the preview is removed, except during a search in
     /// progress, when a selection is about to appear.
     fn sync_preview(&mut self, cx: &mut Context<Self>) {
-        let Some((file, line)) = self.selected_match() else {
-            if self.status != Status::Searching {
-                self.preview = Preview::default();
+        let (path, selected) = match self.selected_row() {
+            Some(Row::Line { file, line }) => (self.results[file].path.clone(), Some((file, line))),
+            // A file found by name: its beginning.
+            Some(Row::NamedFile(hit)) => (PathBuf::from(&*self.named.hits[hit].path), None),
+            // «N more files»: the preview stays as it was.
+            Some(Row::MoreFiles) => return,
+            _ => {
+                if self.status != Status::Searching {
+                    self.preview = Preview::default();
+                }
+                return;
             }
-            return;
         };
-        let path = self.results[file].path.clone();
         if let Some((shown, editor)) = &self.preview.shown
             && *shown == path
         {
             self.preview.loading = None;
             self.preview.message = None;
+            let Some((file, line)) = selected else {
+                editor.update(cx, |editor, cx| {
+                    editor.clear_search_highlights(cx);
+                    editor.show_position(0, cx);
+                });
+                return;
+            };
             let (matches, active) = preview_matches(&self.results[file], line);
             let document_line = self.results[file].lines[line].line;
             editor.update(cx, |editor, cx| {
@@ -751,7 +1010,7 @@ impl ProjectSearch {
                 tr("Search across the project").into(),
                 format!(
                     "{} {}",
-                    tr("Type text to find it in every file."),
+                    tr("Type text to find it in every file, or a file’s name to open the file."),
                     tr(
                         "Match Case ⌥⌘C, Words ⌥⌘W and Regex ⌥⌘R narrow the search; ↑↓ pick a result, ↵ opens it."
                     )
@@ -782,7 +1041,110 @@ impl ProjectSearch {
     fn render_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
         let row = div().id(index).w_full().h(px(ROW_HEIGHT)).px_1p5();
+        let selected = self.selected == Some(index);
+        // A selected row has the selection color; the others light up under the mouse.
+        let pickable = move |content: gpui::Stateful<gpui::Div>| {
+            content
+                .size_full()
+                .px_1p5()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .rounded(px(ui::RADIUS_SM))
+                .whitespace_nowrap()
+                .when(selected, |content| content.bg(ui.list_selected))
+                .when(!selected, |content| {
+                    content.hover(move |style| style.bg(ui.hover))
+                })
+        };
         match self.rows[index] {
+            Row::Heading(heading) => {
+                let (label, count) = match heading {
+                    Heading::Files => (tr("Files"), Some(self.named.total)),
+                    Heading::Text => (tr("Text"), None),
+                };
+                div()
+                    .w_full()
+                    .h(px(ROW_HEIGHT))
+                    .px(px(15.))
+                    .pb(px(5.))
+                    .flex()
+                    .items_end()
+                    .gap_1p5()
+                    .child(ui::section_label(label, ui))
+                    .children(count.map(|count| {
+                        div()
+                            .text_size(px(theme::TEXT_XS))
+                            .text_color(ui.dim)
+                            .child(count.to_string())
+                    }))
+                    .into_any_element()
+            }
+            Row::NamedFile(hit) => {
+                let hit = &self.named.hits[hit];
+                let (name, name_positions, dir, dir_positions) =
+                    split_named(&hit.path, &hit.positions);
+                row.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    this.select_row(index, cx);
+                    if event.click_count() >= 2 {
+                        this.open_selected(cx);
+                    }
+                }))
+                .child(
+                    pickable(div().id(("named", index)))
+                        .child(div().flex_none().w(px(CHEVRON_WIDTH)))
+                        .child(file_icon(&name, &ui).render().size(px(14.)))
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ui.foreground)
+                                .child(highlighted_text(name, &name_positions, ui.match_text)),
+                        )
+                        .when(!dir.is_empty(), |content| {
+                            content.child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.dim)
+                                    .child(highlighted_text(dir, &dir_positions, ui.match_text)),
+                            )
+                        }),
+                )
+                .into_any_element()
+            }
+            Row::MoreFiles => row
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.expand_named(cx)))
+                .child(
+                    pickable(div().id(("more", index)))
+                        .child(div().flex_none().w(px(CHEVRON_WIDTH)))
+                        .child(icon(IconName::More, ui.dim).size(px(14.)))
+                        .child(
+                            div()
+                                .text_size(px(theme::TEXT_SM))
+                                .text_color(ui.text_muted)
+                                .child(trn(self.named.more(), "{n} more file", "{n} more files")),
+                        ),
+                )
+                .into_any_element(),
+            Row::TextNote => {
+                let note = match self.status {
+                    Status::Done(_) => tr("No text matches"),
+                    _ => tr("Searching…"),
+                };
+                div()
+                    .w_full()
+                    .h(px(ROW_HEIGHT))
+                    .px(px(15.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(ui.dim)
+                    .child(note)
+                    .into_any_element()
+            }
             Row::File(file) => {
                 let matches = &self.results[file];
                 let collapsed = self.collapsed.contains(&matches.path);
@@ -830,7 +1192,6 @@ impl ProjectSearch {
                     .into_any_element()
             }
             Row::Line { file, line } => {
-                let selected = self.selected == Some(index);
                 let found = &self.results[file].lines[line];
                 let (text, ranges) = display_text(found);
                 // In the selected row, matches use the color of the current match, as in the
@@ -900,10 +1261,15 @@ impl ProjectSearch {
         }
         let ui = Theme::ui(cx);
         let selected = self.selected_match();
-        let path = match (selected, &self.preview.shown) {
-            (Some((file, _)), _) => self.results[file].path.clone(),
-            (None, Some((path, _))) => path.clone(),
-            (None, None) => self.preview.loading.clone().unwrap_or_default(),
+        let named = match self.selected_row() {
+            Some(Row::NamedFile(hit)) => Some(PathBuf::from(&*self.named.hits[hit].path)),
+            _ => None,
+        };
+        let path = match (selected, named, &self.preview.shown) {
+            (Some((file, _)), _, _) => self.results[file].path.clone(),
+            (None, Some(named), _) => named,
+            (None, None, Some((path, _))) => path.clone(),
+            (None, None, None) => self.preview.loading.clone().unwrap_or_default(),
         };
         let (name, dir) = split_path(&path);
         let line = selected.map(|(file, line)| self.results[file].lines[line].line + 1);
@@ -1098,6 +1464,7 @@ impl Focusable for ProjectSearch {
 impl Drop for ProjectSearch {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.named.cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1159,29 +1526,55 @@ fn flatten(results: &[FileMatches], collapsed: &HashSet<PathBuf>) -> Vec<Row> {
         .collect()
 }
 
-/// The next (`forward`) or previous match row relative to `from`; with no selection, the first one
-/// in the list. File headers are skipped; at the edge of the list, `None` (the selection stays).
-fn next_match_row(rows: &[Row], from: Option<usize>, forward: bool) -> Option<usize> {
-    let is_match = |index: &usize| matches!(rows[*index], Row::Line { .. });
+/// The list: when files were found by name, their heading and rows (with «N more files» when there
+/// are more), then the text's heading — with a note while no text has been found — and the text
+/// found; otherwise just the text found.
+fn layout(
+    named: usize,
+    more: bool,
+    results: &[FileMatches],
+    collapsed: &HashSet<PathBuf>,
+) -> Vec<Row> {
+    if named == 0 {
+        return flatten(results, collapsed);
+    }
+    let mut rows = vec![Row::Heading(Heading::Files)];
+    rows.extend((0..named).map(Row::NamedFile));
+    if more {
+        rows.push(Row::MoreFiles);
+    }
+    rows.push(Row::Heading(Heading::Text));
+    if results.is_empty() {
+        rows.push(Row::TextNote);
+    }
+    rows.extend(flatten(results, collapsed));
+    rows
+}
+
+/// A row the keys and the mouse select: a file found by name, «N more files», a line with matches.
+fn selectable(row: Row) -> bool {
+    matches!(row, Row::NamedFile(_) | Row::MoreFiles | Row::Line { .. })
+}
+
+/// The next (`forward`) or previous row that can be selected relative to `from`; with no selection,
+/// the first one in the list. Headings, file headers and notes are skipped; at the edge of the
+/// list, `None` (the selection stays).
+fn next_selectable_row(rows: &[Row], from: Option<usize>, forward: bool) -> Option<usize> {
+    let is_selectable = |index: &usize| selectable(rows[*index]);
     match (from, forward) {
-        (None, _) => (0..rows.len()).find(is_match),
-        (Some(from), true) => (from + 1..rows.len()).find(is_match),
-        (Some(from), false) => (0..from.min(rows.len())).rev().find(is_match),
+        (None, _) => (0..rows.len()).find(is_selectable),
+        (Some(from), true) => (from + 1..rows.len()).find(is_selectable),
+        (Some(from), false) => (0..from.min(rows.len())).rev().find(is_selectable),
     }
 }
 
-/// Up to `steps` steps through the matches from `from`; at the edge of the list, the outermost
-/// match. `None` means there is nowhere to step (the selection stays).
-fn step_match_rows(
-    rows: &[Row],
-    from: Option<usize>,
-    forward: bool,
-    steps: usize,
-) -> Option<usize> {
+/// Up to `steps` steps through the rows that can be selected from `from`; at the edge of the list,
+/// the outermost one. `None` means there is nowhere to step (the selection stays).
+fn step_rows(rows: &[Row], from: Option<usize>, forward: bool, steps: usize) -> Option<usize> {
     let mut current = from;
     let mut moved = None;
     for _ in 0..steps.max(1) {
-        match next_match_row(rows, current, forward) {
+        match next_selectable_row(rows, current, forward) {
             Some(next) => {
                 current = Some(next);
                 moved = Some(next);
@@ -1195,16 +1588,17 @@ fn step_match_rows(
     moved
 }
 
-/// The list row with the matches of line `line` of file `file`, if it is visible.
-fn row_of(rows: &[Row], file: usize, line: usize) -> Option<usize> {
-    rows.iter().position(|row| *row == Row::Line { file, line })
+/// The list row of the file found by name `hit`, if it is shown.
+fn row_of_named(rows: &[Row], hit: usize) -> Option<usize> {
+    rows.iter().position(|row| *row == Row::NamedFile(hit))
 }
 
-/// Where the selection goes from a collapsed file `file`: to the first match after its header, or,
-/// if there is nothing below, to the last one before it.
+/// Where the selection goes from a collapsed file `file`: to the first row after its header that
+/// can be selected, or, if there is nothing below, to the last one before it.
 fn fallback_row(rows: &[Row], file: usize) -> Option<usize> {
     let header = rows.iter().position(|row| *row == Row::File(file))?;
-    next_match_row(rows, Some(header), true).or_else(|| next_match_row(rows, Some(header), false))
+    next_selectable_row(rows, Some(header), true)
+        .or_else(|| next_selectable_row(rows, Some(header), false))
 }
 
 /// The number of matches in a file.
@@ -1254,6 +1648,23 @@ fn location_for(root: &Path, file: &FileMatches, line: usize) -> Location {
         start: found.column_offset + first.start,
         end: found.column_offset + first.end,
     }
+}
+
+/// A file found by name for its row: the name and the directory (without the last `/`), each with
+/// its matched characters (`positions` are `char` indices into the whole path).
+fn split_named(path: &str, positions: &[usize]) -> (String, Vec<usize>, String, Vec<usize>) {
+    let (dir, name) = match path.rfind('/') {
+        Some(slash) => (&path[..slash], &path[slash + 1..]),
+        None => ("", path),
+    };
+    let dir_chars = dir.chars().count();
+    let name_start = path.chars().count() - name.chars().count();
+    let name_positions = positions
+        .iter()
+        .filter_map(|&p| p.checked_sub(name_start))
+        .collect();
+    let dir_positions = positions.iter().copied().filter(|&p| p < dir_chars).collect();
+    (name.to_string(), name_positions, dir.to_string(), dir_positions)
 }
 
 /// The file name and directory (relative, `/`-separated) for the header.
@@ -1373,6 +1784,11 @@ mod tests {
         start..end
     }
 
+    /// The list row with the matches of line `line` of file `file`, if it is visible.
+    fn row_of(rows: &[Row], file: usize, line: usize) -> Option<usize> {
+        rows.iter().position(|row| *row == Row::Line { file, line })
+    }
+
     fn line(line: usize, text: &str, ranges: &[Range<usize>]) -> LineMatch {
         LineMatch {
             line,
@@ -1431,35 +1847,35 @@ mod tests {
             [Row::File(0), Row::File(1), Row::Line { file: 1, line: 0 }]
         );
         // The arrows skip past a collapsed file.
-        assert_eq!(next_match_row(&rows, None, true), Some(2));
-        assert_eq!(next_match_row(&rows, Some(2), false), None);
+        assert_eq!(next_selectable_row(&rows, None, true), Some(2));
+        assert_eq!(next_selectable_row(&rows, Some(2), false), None);
     }
 
     #[test]
     fn selection_skips_headers_and_stops_at_the_edges() {
         let rows = flatten(&[file("a.rs", 2), file("b.rs", 1)], &expanded());
-        assert_eq!(next_match_row(&rows, None, true), Some(1));
-        assert_eq!(next_match_row(&rows, None, false), Some(1));
-        assert_eq!(next_match_row(&rows, Some(1), true), Some(2));
-        assert_eq!(next_match_row(&rows, Some(2), true), Some(4));
-        assert_eq!(next_match_row(&rows, Some(4), true), None);
-        assert_eq!(next_match_row(&rows, Some(4), false), Some(2));
-        assert_eq!(next_match_row(&rows, Some(1), false), None);
-        assert_eq!(next_match_row(&[], None, true), None);
+        assert_eq!(next_selectable_row(&rows, None, true), Some(1));
+        assert_eq!(next_selectable_row(&rows, None, false), Some(1));
+        assert_eq!(next_selectable_row(&rows, Some(1), true), Some(2));
+        assert_eq!(next_selectable_row(&rows, Some(2), true), Some(4));
+        assert_eq!(next_selectable_row(&rows, Some(4), true), None);
+        assert_eq!(next_selectable_row(&rows, Some(4), false), Some(2));
+        assert_eq!(next_selectable_row(&rows, Some(1), false), None);
+        assert_eq!(next_selectable_row(&[], None, true), None);
     }
 
     #[test]
     fn pages_step_over_matches_and_stop_at_the_edges() {
         // Rows: 0 is a.rs, 1..=4 are its lines, 5 is b.rs, 6..=8 are its lines.
         let rows = flatten(&[file("a.rs", 4), file("b.rs", 3)], &expanded());
-        assert_eq!(step_match_rows(&rows, Some(1), true, 3), Some(4));
-        assert_eq!(step_match_rows(&rows, Some(1), true, 4), Some(6));
-        assert_eq!(step_match_rows(&rows, Some(2), true, 10), Some(8));
-        assert_eq!(step_match_rows(&rows, Some(7), false, 10), Some(1));
-        assert_eq!(step_match_rows(&rows, Some(8), true, 10), None);
+        assert_eq!(step_rows(&rows, Some(1), true, 3), Some(4));
+        assert_eq!(step_rows(&rows, Some(1), true, 4), Some(6));
+        assert_eq!(step_rows(&rows, Some(2), true, 10), Some(8));
+        assert_eq!(step_rows(&rows, Some(7), false, 10), Some(1));
+        assert_eq!(step_rows(&rows, Some(8), true, 10), None);
         // With no selection, the first match, however many steps are requested.
-        assert_eq!(step_match_rows(&rows, None, true, 10), Some(1));
-        assert_eq!(step_match_rows(&[], None, true, 10), None);
+        assert_eq!(step_rows(&rows, None, true, 10), Some(1));
+        assert_eq!(step_rows(&[], None, true, 10), None);
     }
 
     #[test]
@@ -1619,5 +2035,103 @@ mod tests {
             split_path(Path::new("Cargo.toml")),
             ("Cargo.toml".into(), String::new())
         );
+    }
+
+    #[test]
+    fn files_by_name_come_first_under_their_heading_then_the_text() {
+        let results = [file("README.md", 2)];
+        let rows = layout(2, true, &results, &expanded());
+        assert_eq!(
+            rows,
+            [
+                Row::Heading(Heading::Files),
+                Row::NamedFile(0),
+                Row::NamedFile(1),
+                Row::MoreFiles,
+                Row::Heading(Heading::Text),
+                Row::File(0),
+                Row::Line { file: 0, line: 0 },
+                Row::Line { file: 0, line: 1 },
+            ]
+        );
+        // No text yet (or none at all): a note under the text's heading.
+        assert_eq!(
+            layout(1, false, &[], &expanded()),
+            [
+                Row::Heading(Heading::Files),
+                Row::NamedFile(0),
+                Row::Heading(Heading::Text),
+                Row::TextNote,
+            ]
+        );
+        // No files by name: the text alone, as before part 10.4.
+        assert_eq!(
+            layout(0, false, &results, &expanded()),
+            flatten(&results, &expanded())
+        );
+        assert!(layout(0, false, &[], &expanded()).is_empty());
+    }
+
+    #[test]
+    fn selection_flows_from_the_files_into_the_matches() {
+        let rows = layout(2, true, &[file("a.rs", 2)], &expanded());
+        // The first row to pick is the best file by name: ↵ right away opens it.
+        assert_eq!(next_selectable_row(&rows, None, true), Some(1));
+        assert_eq!(next_selectable_row(&rows, Some(1), true), Some(2));
+        // «N more files», then over the heading and the file header to the first match.
+        assert_eq!(next_selectable_row(&rows, Some(2), true), Some(3));
+        assert_eq!(next_selectable_row(&rows, Some(3), true), Some(6));
+        assert_eq!(next_selectable_row(&rows, Some(6), false), Some(3));
+        assert_eq!(next_selectable_row(&rows, Some(1), false), None);
+        // A page goes through both groups.
+        assert_eq!(step_rows(&rows, Some(1), true, 4), Some(7));
+        assert_eq!(step_rows(&rows, Some(7), false, 10), Some(1));
+        // Only the note under the text: the files stay selectable, the note doesn't.
+        let rows = layout(1, false, &[], &expanded());
+        assert_eq!(next_selectable_row(&rows, Some(1), true), None);
+        assert_eq!(row_of_named(&rows, 0), Some(1));
+        assert_eq!(row_of_named(&rows, 1), None);
+    }
+
+    #[test]
+    fn collapsing_the_last_text_file_moves_the_selection_up_to_the_files() {
+        let mut collapsed = HashSet::new();
+        collapsed.insert(PathBuf::from("a.rs"));
+        let rows = layout(1, false, &[file("a.rs", 1)], &collapsed);
+        // The file's lines are hidden: nothing below its header, so the selection goes up.
+        assert_eq!(fallback_row(&rows, 0), Some(1));
+    }
+
+    #[test]
+    fn named_files_show_a_few_until_expanded() {
+        let hit = |path: &str| FileHit {
+            path: path.into(),
+            positions: Vec::new(),
+        };
+        let mut named = NamedFiles {
+            hits: (0..8).map(|i| hit(&format!("f{i}.rs"))).collect(),
+            total: 8,
+            ..NamedFiles::default()
+        };
+        assert_eq!((named.shown(), named.more()), (NAMED_FILES, 3));
+        named.expanded = true;
+        assert_eq!((named.shown(), named.more()), (8, 0));
+        named.clear();
+        assert_eq!((named.shown(), named.more(), named.total), (0, 0, 0));
+        assert!(!named.expanded);
+    }
+
+    #[test]
+    fn a_named_file_splits_into_name_and_directory_with_their_matches() {
+        // README.md under docs/: «radme» in the name, a `d` in the directory (a path query).
+        let (name, name_positions, dir, dir_positions) =
+            split_named("docs/README.md", &[0, 5, 7, 8, 9]);
+        assert_eq!((name.as_str(), dir.as_str()), ("README.md", "docs"));
+        assert_eq!(name_positions, [0, 2, 3, 4]);
+        assert_eq!(dir_positions, [0]);
+        // A file in the root has no directory; Cyrillic positions are characters.
+        let (name, name_positions, dir, _) = split_named("план.md", &[0, 1]);
+        assert_eq!((name.as_str(), dir.as_str()), ("план.md", ""));
+        assert_eq!(name_positions, [0, 1]);
     }
 }

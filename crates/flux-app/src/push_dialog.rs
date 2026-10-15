@@ -1037,7 +1037,7 @@ impl Focusable for PushDialog {
 }
 
 impl Render for PushDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let can_push = self.can_push(cx);
         let repos: Vec<_> = (0..self.repos.len())
@@ -1052,7 +1052,7 @@ impl Render for PushDialog {
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_selection(1, cx)))
             .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.move_selection(-1, cx)))
             .w(px(WIDTH))
-            .h(px(HEIGHT))
+            .h(px(ui::dialog_height(HEIGHT, window)))
             .flex()
             .flex_col()
             .child(

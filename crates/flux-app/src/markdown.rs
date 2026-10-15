@@ -12,6 +12,10 @@
 //! Links click (part 10.3): a web link (`[text](https://…)`, `<https://…>`, a bare `https://…`)
 //! opens in the browser, with its address on hover; a plugin's link (`TRACK-142`) goes to its
 //! plugin, with its tooltip ([`crate::plugin_links`]).
+//!
+//! The Markdown preview (part 10.4, [`crate::markdown_preview`]) parses whole documents with its own
+//! block parser on the helpers here, and their inline text with [`parse_inline_document`]: the
+//! inline HTML of READMEs (`<kbd>`, `<b>`, `<a href>`…) and `~~strikethrough~~` on top of the rest.
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -93,6 +97,10 @@ pub struct SpanStyle {
     pub italic: bool,
     /// Link text: drawn in the accent color, the target is not shown (it is the span's `target`).
     pub link: bool,
+    /// A key (`<kbd>⌘</kbd>`, documents only): on a keycap's background.
+    pub kbd: bool,
+    /// `~~struck out~~` (documents only).
+    pub strike: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -248,39 +256,47 @@ pub fn plain(text: &str) -> Vec<Block> {
 /// and may compile a language's query: call it off the UI thread.
 pub fn highlight(blocks: &mut [Block], fallback: Option<Arc<Language>>, scopes: &[String]) {
     for block in blocks {
-        let Block::Code(code) = block else {
-            continue;
-        };
-        let language = match &code.language {
-            Some(info) => fence_language(info),
-            None => fallback.clone(),
-        };
-        let Some(language) = language else {
-            continue;
-        };
-        let text = Rope::from_str(&code.text);
-        let mut syntax = Syntax::new(language.clone());
-        let Some(job) = syntax.parse_job(&text) else {
-            continue;
-        };
-        let result = if language.is_wasm() {
-            // A plugin's grammar parses on a thread of its own: a scanner that never returns
-            // leaves that thread stuck, not this one (flux-syntax's watchdog turns the grammar off).
-            let (sender, receiver) = std::sync::mpsc::channel();
-            job.spawn(move |result| {
-                sender.send(result).ok();
-            });
-            match receiver.recv_timeout(flux_syntax::PARSE_LIMIT) {
-                Ok(result) => result,
-                Err(_) => continue,
-            }
-        } else {
-            job.run()
-        };
-        syntax.finish(result);
-        let map = HighlightMap::new(&language, scopes);
-        code.highlights = syntax.highlight_lines(&text, 0..text.len_lines(), &map);
+        if let Block::Code(code) = block {
+            highlight_code(code, fallback.clone(), scopes);
+        }
     }
+}
+
+/// Highlights one code block, as [`highlight`] does (off the UI thread).
+pub(crate) fn highlight_code(
+    code: &mut CodeBlock,
+    fallback: Option<Arc<Language>>,
+    scopes: &[String],
+) {
+    let language = match &code.language {
+        Some(info) => fence_language(info),
+        None => fallback,
+    };
+    let Some(language) = language else {
+        return;
+    };
+    let text = Rope::from_str(&code.text);
+    let mut syntax = Syntax::new(language.clone());
+    let Some(job) = syntax.parse_job(&text) else {
+        return;
+    };
+    let result = if language.is_wasm() {
+        // A plugin's grammar parses on a thread of its own: a scanner that never returns leaves
+        // that thread stuck, not this one (flux-syntax's watchdog turns the grammar off).
+        let (sender, receiver) = std::sync::mpsc::channel();
+        job.spawn(move |result| {
+            sender.send(result).ok();
+        });
+        match receiver.recv_timeout(flux_syntax::PARSE_LIMIT) {
+            Ok(result) => result,
+            Err(_) => return,
+        }
+    } else {
+        job.run()
+    };
+    syntax.finish(result);
+    let map = HighlightMap::new(&language, scopes);
+    code.highlights = syntax.highlight_lines(&text, 0..text.len_lines(), &map);
 }
 
 /// The theme's scope names, for [`highlight`] off the UI thread.
@@ -351,7 +367,7 @@ impl BlockParser<'_> {
 
 /// The lines of a paragraph as one text: a line break becomes a space, except a hard break (two
 /// spaces or a backslash at the end of the line), which stays a line break.
-fn join_lines(lines: &[&str]) -> String {
+pub(crate) fn join_lines(lines: &[&str]) -> String {
     let mut text = String::new();
     for (i, line) in lines.iter().enumerate() {
         let line = line.trim_start();
@@ -373,7 +389,7 @@ fn join_lines(lines: &[&str]) -> String {
 }
 
 /// Leading whitespace width, a tab counting as 4.
-fn indent_width(line: &str) -> usize {
+pub(crate) fn indent_width(line: &str) -> usize {
     line.chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .map(|c| if c == '\t' { 4 } else { 1 })
@@ -381,13 +397,13 @@ fn indent_width(line: &str) -> usize {
 }
 
 /// Removes up to `indent` leading spaces (the fence's own indentation) from a code line.
-fn strip_indent(line: &str, indent: usize) -> &str {
+pub(crate) fn strip_indent(line: &str, indent: usize) -> &str {
     let spaces = line.bytes().take(indent).take_while(|b| *b == b' ').count();
     &line[spaces..]
 }
 
 /// "```rust" → the fence ("```") and the info string ("rust").
-fn fence_start(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn fence_start(line: &str) -> Option<(&str, &str)> {
     let marker = line.chars().next().filter(|c| *c == '`' || *c == '~')?;
     let len = line.chars().take_while(|c| *c == marker).count();
     if len < 3 {
@@ -401,7 +417,7 @@ fn fence_start(line: &str) -> Option<(&str, &str)> {
     Some((fence, info.trim()))
 }
 
-fn is_fence_end(line: &str, fence: &str) -> bool {
+pub(crate) fn is_fence_end(line: &str, fence: &str) -> bool {
     let marker = fence.chars().next().unwrap_or('`');
     let len = line.chars().take_while(|c| *c == marker).count();
     len >= fence.len() && line[len..].trim().is_empty()
@@ -409,7 +425,7 @@ fn is_fence_end(line: &str, fence: &str) -> bool {
 
 /// The cells of a table row: `| a | b |` → ["a", "b"] (the outer pipes are optional, `\|` is a
 /// pipe inside a cell).
-fn table_cells(line: &str) -> Vec<String> {
+pub(crate) fn table_cells(line: &str) -> Vec<String> {
     let line = line.trim();
     let line = line.strip_prefix('|').unwrap_or(line);
     let line = line
@@ -435,7 +451,7 @@ fn table_cells(line: &str) -> Vec<String> {
 }
 
 /// A table's separator row (`|---|:---:|---:|`): the columns' alignment.
-fn table_separator(line: &str) -> Option<Vec<Align>> {
+pub(crate) fn table_separator(line: &str) -> Option<Vec<Align>> {
     let cells = table_cells(line);
     if cells.is_empty() || !line.contains('-') {
         return None;
@@ -457,7 +473,7 @@ fn table_separator(line: &str) -> Option<Vec<Align>> {
 }
 
 /// `---`, `***`, `___` (spaces allowed between).
-fn is_rule(line: &str) -> bool {
+pub(crate) fn is_rule(line: &str) -> bool {
     let mut chars = line.chars().filter(|c| !c.is_whitespace());
     let Some(first) = chars.next().filter(|c| matches!(c, '-' | '*' | '_')) else {
         return false;
@@ -473,6 +489,11 @@ fn is_rule(line: &str) -> bool {
 }
 
 fn heading(line: &str) -> Option<&str> {
+    heading_level(line).map(|(_, text)| text)
+}
+
+/// An ATX heading (`## Title ##`): its level (1–6) and its text.
+pub(crate) fn heading_level(line: &str) -> Option<(u8, &str)> {
     let level = line.chars().take_while(|c| *c == '#').count();
     if !(1..=6).contains(&level) {
         return None;
@@ -481,11 +502,11 @@ fn heading(line: &str) -> Option<&str> {
     if !rest.is_empty() && !rest.starts_with(' ') {
         return None;
     }
-    Some(rest.trim().trim_end_matches('#').trim_end())
+    Some((level as u8, rest.trim().trim_end_matches('#').trim_end()))
 }
 
 /// "- item", "* item", "+ item" → ("•", "item"); "1. item", "2) item" → ("1.", "item").
-fn list_marker(line: &str) -> Option<(String, &str)> {
+pub(crate) fn list_marker(line: &str) -> Option<(String, &str)> {
     if let Some(rest) = line
         .strip_prefix(['-', '*', '+'])
         .and_then(|rest| rest.strip_prefix(' '))
@@ -507,11 +528,22 @@ fn list_marker(line: &str) -> Option<(String, &str)> {
 pub fn parse_inline(text: &str) -> Vec<Span> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans = Vec::new();
-    inline(&chars, SpanStyle::default(), &mut spans);
+    inline(&chars, SpanStyle::default(), &mut spans, false);
     spans
 }
 
-fn inline(chars: &[char], style: SpanStyle, spans: &mut Vec<Span>) {
+/// As [`parse_inline`], for a document (the Markdown preview, part 10.4): also the inline HTML
+/// of READMEs — `<kbd>`, `<b>` / `<strong>`, `<i>` / `<em>`, `<code>`, `<s>` / `<del>`, `<a
+/// href>`, an `<img>` as its `alt` — and `~~strikethrough~~`. Other tags of a known kind are
+/// dropped with their text kept; anything else (`Vec<T>`) stays text.
+pub fn parse_inline_document(text: &str) -> Vec<Span> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans = Vec::new();
+    inline(&chars, SpanStyle::default(), &mut spans, true);
+    spans
+}
+
+fn inline(chars: &[char], style: SpanStyle, spans: &mut Vec<Span>, document: bool) {
     let mut text = String::new();
     let mut i = 0;
     while i < chars.len() {
@@ -553,6 +585,34 @@ fn inline(chars: &[char], style: SpanStyle, spans: &mut Vec<Span>) {
                     }
                 }
             }
+            '~' if document && run_length(chars, i, '~') == 2 => match strike_end(chars, i + 2) {
+                Some(end) => {
+                    push_span(spans, &mut text, style);
+                    let inner = SpanStyle {
+                        strike: true,
+                        ..style
+                    };
+                    inline(&chars[i + 2..end], inner, spans, document);
+                    i = end + 2;
+                }
+                None => {
+                    text.push_str("~~");
+                    i += 2;
+                }
+            },
+            // An image inside text (`![alt](src)`) reads as its description; the preview shows the
+            // images that stand alone as pictures.
+            '!' if document && chars.get(i + 1) == Some(&'[') => match link(chars, i + 1) {
+                Some((label, next)) => {
+                    let alt: String = chars[label].iter().collect();
+                    text.push_str(alt.trim());
+                    i = next;
+                }
+                None => {
+                    text.push('!');
+                    i += 1;
+                }
+            },
             '*' | '_' => {
                 let run = run_length(chars, i, c).min(3);
                 match emphasis_end(chars, i, run) {
@@ -563,7 +623,7 @@ fn inline(chars: &[char], style: SpanStyle, spans: &mut Vec<Span>) {
                             italic: style.italic || run != 2,
                             ..style
                         };
-                        inline(&chars[i + run..end], inner, spans);
+                        inline(&chars[i + run..end], inner, spans, document);
                         i = end + run;
                     }
                     None => {
@@ -585,6 +645,7 @@ fn inline(chars: &[char], style: SpanStyle, spans: &mut Vec<Span>) {
                             ..style
                         },
                         &mut label_spans,
+                        document,
                     );
                     let target = link_target(chars, label.end, next);
                     for span in &mut label_spans {
@@ -617,10 +678,16 @@ fn inline(chars: &[char], style: SpanStyle, spans: &mut Vec<Span>) {
                         text.push('\n');
                         i = next;
                     }
-                    None => {
-                        text.push('<');
-                        i += 1;
-                    }
+                    None => match document.then(|| html_inline(chars, i)).flatten() {
+                        Some(html) => {
+                            push_span(spans, &mut text, style);
+                            i = html.apply(chars, style, spans, &mut text);
+                        }
+                        None => {
+                            text.push('<');
+                            i += 1;
+                        }
+                    },
                 },
             },
             '&' => match entity(chars, i) {
@@ -659,7 +726,7 @@ fn push_span(spans: &mut Vec<Span>, text: &mut String, style: SpanStyle) {
 
 /// The target of a link whose label ends at `close` (its `]`) and which ends at `next`: what is in
 /// `(…)` — without a title (`"…"`) and `<…>` — or nothing for `[text][ref]` and `[`code`]`.
-fn link_target(chars: &[char], close: usize, next: usize) -> Option<String> {
+pub(crate) fn link_target(chars: &[char], close: usize, next: usize) -> Option<String> {
     if chars.get(close + 1) != Some(&'(') || next < close + 3 {
         return None;
     }
@@ -670,7 +737,7 @@ fn link_target(chars: &[char], close: usize, next: usize) -> Option<String> {
     (!target.is_empty()).then(|| target.to_string())
 }
 
-fn run_length(chars: &[char], start: usize, c: char) -> usize {
+pub(crate) fn run_length(chars: &[char], start: usize, c: char) -> usize {
     chars[start..].iter().take_while(|&&x| x == c).count()
 }
 
@@ -732,7 +799,7 @@ fn emphasis_end(chars: &[char], start: usize, run: usize) -> Option<usize> {
 /// `[text](target)` or `[text][ref]`: the range of the text and where the link ends. A lone
 /// `[text]` counts as a link only around code (`` [`Vec`] ``, a rustdoc intra-doc link); other
 /// brackets stay text.
-fn link(chars: &[char], start: usize) -> Option<(std::ops::Range<usize>, usize)> {
+pub(crate) fn link(chars: &[char], start: usize) -> Option<(std::ops::Range<usize>, usize)> {
     let mut depth = 0;
     let mut i = start;
     let close = loop {
@@ -808,8 +875,299 @@ fn html_break(chars: &[char], start: usize) -> Option<usize> {
     matches!(tag.to_ascii_lowercase().as_str(), "br" | "br/").then_some(end + 1)
 }
 
+/// The start of the `~~` closing a strikethrough opened before `from`.
+fn strike_end(chars: &[char], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '`' => {
+                let len = run_length(chars, i, '`');
+                i = find_backticks(chars, i + len, len).map_or(i + len, |end| end + len);
+            }
+            '~' if chars[i + 1] == '~' && i > from => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// An HTML tag at `start` (`<kbd>`, `</b>`, `<img src=… alt=…>`): its name (lowercase), whether it
+/// closes, its attributes, where it ends.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Tag {
+    pub name: String,
+    pub closing: bool,
+    pub attributes: Vec<(String, String)>,
+    pub end: usize,
+}
+
+impl Tag {
+    /// An attribute's value (`src`, `alt`, `width`).
+    pub fn attribute(&self, name: &str) -> Option<&str> {
+        self.attributes
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Parses an HTML tag at `start` (a `<`); `None` — not a tag (`a < b`, `Vec<T>` stays text only
+/// when its name isn't HTML: see [`html_inline`]).
+pub(crate) fn tag_at(chars: &[char], start: usize) -> Option<Tag> {
+    if chars.get(start) != Some(&'<') {
+        return None;
+    }
+    let mut i = start + 1;
+    let closing = chars.get(i) == Some(&'/');
+    if closing {
+        i += 1;
+    }
+    let name_start = i;
+    while chars.get(i).is_some_and(|c| c.is_ascii_alphanumeric()) {
+        i += 1;
+    }
+    if i == name_start || !chars[name_start].is_ascii_alphabetic() {
+        return None;
+    }
+    let name: String = chars[name_start..i]
+        .iter()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let mut attributes = Vec::new();
+    loop {
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i += 1;
+        }
+        match chars.get(i)? {
+            '>' => break,
+            '/' if chars.get(i + 1) == Some(&'>') => {
+                i += 1;
+                break;
+            }
+            c if c.is_ascii_alphabetic() => {
+                let key_start = i;
+                while chars.get(i).is_some_and(|c| {
+                    c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == ':'
+                }) {
+                    i += 1;
+                }
+                let key: String = chars[key_start..i]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                    i += 1;
+                }
+                let mut value = String::new();
+                if chars.get(i) == Some(&'=') {
+                    i += 1;
+                    while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                        i += 1;
+                    }
+                    match chars.get(i)? {
+                        quote @ ('"' | '\'') => {
+                            let quote = *quote;
+                            i += 1;
+                            while *chars.get(i)? != quote {
+                                value.push(chars[i]);
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                        _ => {
+                            while chars
+                                .get(i)
+                                .is_some_and(|c| !c.is_whitespace() && *c != '>')
+                            {
+                                value.push(chars[i]);
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                attributes.push((key, decode_entities(&value)));
+            }
+            _ => return None,
+        }
+    }
+    Some(Tag {
+        name,
+        closing,
+        attributes,
+        end: i + 1,
+    })
+}
+
+/// `&amp;` and the like in an attribute's value.
+fn decode_entities(value: &str) -> String {
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match (chars[i], entity(&chars, i)) {
+            ('&', Some((decoded, next))) => {
+                out.push(decoded);
+                i = next;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The HTML elements a document's text may hold (`html_inline`): the rest of `<…>` stays text.
+const INLINE_TAGS: &[&str] = &[
+    "a", "abbr", "b", "bdi", "cite", "code", "del", "dfn", "em", "font", "i", "img", "ins", "kbd",
+    "mark", "picture", "q", "s", "samp", "small", "source", "span", "strike", "strong", "sub",
+    "sup", "tt", "u", "var", "wbr",
+];
+
+/// Elements without content (`<img …>`).
+const VOID_TAGS: &[&str] = &["img", "source", "wbr"];
+
+/// An inline HTML element in a document: the tag, and where its content ends (`None` for an
+/// element without content and for a closing tag).
+struct HtmlInline {
+    tag: Tag,
+    close: Option<(usize, usize)>,
+}
+
+/// An inline HTML element at `start` the preview understands ([`INLINE_TAGS`]): written in lower
+/// case and, unless it has no content, closed — so `Option<S>` and `a <b> c` stay text.
+fn html_inline(chars: &[char], start: usize) -> Option<HtmlInline> {
+    let tag = tag_at(chars, start)?;
+    let name_at = start + 1 + usize::from(tag.closing);
+    let lowercase = chars[name_at..name_at + tag.name.chars().count()]
+        .iter()
+        .all(|c| !c.is_ascii_uppercase());
+    if !lowercase || !INLINE_TAGS.contains(&tag.name.as_str()) {
+        return None;
+    }
+    if tag.closing || VOID_TAGS.contains(&tag.name.as_str()) {
+        return Some(HtmlInline { tag, close: None });
+    }
+    let close = closing_tag(chars, tag.end, &tag.name)?;
+    Some(HtmlInline {
+        tag,
+        close: Some(close),
+    })
+}
+
+impl HtmlInline {
+    /// Applies the element: spans for its content up to the closing tag (`<kbd>…</kbd>`), the
+    /// `alt` of an image, nothing for a lone tag. Returns where the text goes on.
+    fn apply(
+        self,
+        chars: &[char],
+        style: SpanStyle,
+        spans: &mut Vec<Span>,
+        text: &mut String,
+    ) -> usize {
+        let tag = self.tag;
+        let Some(close) = self.close else {
+            // A closing tag, or an element without content: an image reads as its description.
+            if tag.name == "img"
+                && let Some(alt) = tag.attribute("alt").filter(|alt| !alt.trim().is_empty())
+            {
+                text.push_str(alt.trim());
+            }
+            return tag.end;
+        };
+        let inner = &chars[tag.end..close.0];
+        match tag.name.as_str() {
+            "kbd" => {
+                let key: String = inner.iter().collect();
+                // Keys side by side (<kbd>⇧</kbd><kbd>⌘</kbd>) stay apart.
+                if spans.last().is_some_and(|span| span.style.kbd) {
+                    spans.push(Span::plain("\u{2009}"));
+                }
+                spans.push(Span {
+                    text: format!("\u{2009}{}\u{2009}", decode_entities(key.trim())),
+                    style: SpanStyle { kbd: true, ..style },
+                    target: None,
+                });
+            }
+            "a" => {
+                let target = tag.attribute("href").map(str::to_string);
+                let mut label = Vec::new();
+                inline(
+                    inner,
+                    SpanStyle {
+                        link: true,
+                        ..style
+                    },
+                    &mut label,
+                    true,
+                );
+                for span in &mut label {
+                    span.target = target.clone();
+                }
+                spans.extend(label);
+            }
+            name => {
+                let inner_style = match name {
+                    "b" | "strong" => SpanStyle {
+                        bold: true,
+                        ..style
+                    },
+                    "i" | "em" | "cite" | "dfn" | "var" => SpanStyle {
+                        italic: true,
+                        ..style
+                    },
+                    "code" | "tt" | "samp" => SpanStyle {
+                        code: true,
+                        ..style
+                    },
+                    "s" | "del" | "strike" => SpanStyle {
+                        strike: true,
+                        ..style
+                    },
+                    _ => style,
+                };
+                inline(inner, inner_style, spans, true);
+            }
+        }
+        text.clear();
+        close.1
+    }
+}
+
+/// The closing tag of `name` after `from` (nested ones of the same name skipped): where it starts
+/// and where it ends.
+fn closing_tag(chars: &[char], from: usize, name: &str) -> Option<(usize, usize)> {
+    let mut depth = 0;
+    let mut i = from;
+    while i < chars.len() {
+        if chars[i] == '<'
+            && let Some(tag) = tag_at(chars, i)
+        {
+            if tag.name == name {
+                if tag.closing {
+                    if depth == 0 {
+                        return Some((i, tag.end));
+                    }
+                    depth -= 1;
+                } else {
+                    depth += 1;
+                }
+            }
+            i = tag.end;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// `&lt;`, `&gt;`, `&amp;`, `&quot;`, `&#39;`, `&nbsp;`, `&#NN;`, `&#xNN;`.
-fn entity(chars: &[char], start: usize) -> Option<(char, usize)> {
+pub(crate) fn entity(chars: &[char], start: usize) -> Option<(char, usize)> {
     let end = start + chars[start..].iter().take(10).position(|&c| c == ';')?;
     let name: String = chars[start + 1..end].iter().collect();
     let decoded = match name.as_str() {
@@ -1101,7 +1459,7 @@ fn clickable(
 }
 
 /// A target the browser opens.
-fn is_web_link(target: &str) -> bool {
+pub(crate) fn is_web_link(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
     lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")
 }
@@ -1168,7 +1526,7 @@ fn render_table(
 
 /// A code block of the chat: a card with a header — the language (or "code") and a copy button —
 /// over the code.
-fn chat_code_block(
+pub(crate) fn chat_code_block(
     code: &CodeBlock,
     theme: &Theme,
     id: ElementId,
@@ -1222,7 +1580,7 @@ fn chat_code_block(
 
 /// Spans as the text and the runs of styled text; in the chat (`chat`), inline code is a lighter,
 /// accent-tinted pill.
-fn styled_parts(
+pub(crate) fn styled_parts(
     spans: &[Span],
     color: Hsla,
     ui: UiColors,
@@ -1239,7 +1597,13 @@ fn styled_parts(
         } else {
             theme::UI_FONT
         });
-        run_font.weight = if style.bold { FontWeight::BOLD } else { weight };
+        run_font.weight = if style.bold {
+            FontWeight::BOLD
+        } else if style.kbd {
+            FontWeight::MEDIUM
+        } else {
+            weight
+        };
         if style.italic {
             run_font.style = FontStyle::Italic;
         }
@@ -1258,9 +1622,16 @@ fn styled_parts(
             } else {
                 color
             },
-            background_color: style.code.then(|| UiColors::tint(ui.foreground, 0.08)),
+            background_color: if style.kbd {
+                Some(ui.keycap)
+            } else {
+                style.code.then(|| UiColors::tint(ui.foreground, 0.08))
+            },
             underline: None,
-            strikethrough: None,
+            strikethrough: style.strike.then(|| gpui::StrikethroughStyle {
+                thickness: px(1.),
+                color: Some(color),
+            }),
         });
         text.push_str(&span.text);
     }
@@ -1340,11 +1711,70 @@ mod tests {
         bold: false,
         italic: false,
         link: false,
+        kbd: false,
+        strike: false,
     };
     const CODE: SpanStyle = SpanStyle {
         code: true,
         ..PLAIN
     };
+
+    #[test]
+    fn documents_read_inline_html_the_chat_keeps_it_as_text() {
+        let source = "Press <kbd>⌘</kbd><kbd>P</kbd>, <b>bold</b>, ~~old~~, <a href=\"https://x.dev\">site</a>, \
+                      ![logo](logo.png) and Option<S> or a <b> alone";
+        let doc = parse_inline_document(source);
+        let keys: Vec<&str> = doc
+            .iter()
+            .filter(|span| span.style.kbd)
+            .map(|span| span.text.trim_matches('\u{2009}'))
+            .collect();
+        assert_eq!(keys, ["⌘", "P"]);
+        assert!(
+            doc.iter()
+                .any(|span| span.text == "bold" && span.style.bold)
+        );
+        assert!(
+            doc.iter()
+                .any(|span| span.text == "old" && span.style.strike)
+        );
+        assert!(doc.iter().any(|span| {
+            span.text == "site"
+                && span.style.link
+                && span.target.as_deref() == Some("https://x.dev")
+        }));
+        let plain = text(&doc).replace('\u{2009}', "");
+        assert!(
+            plain.ends_with("site, logo and Option<S> or a <b> alone"),
+            "{plain}"
+        );
+        // The chat's flavor leaves all of it as it was.
+        let chat = parse_inline(source);
+        assert!(
+            chat.iter()
+                .all(|span| !span.style.kbd && !span.style.strike)
+        );
+        assert!(text(&chat).contains("<kbd>⌘</kbd>"));
+        assert!(text(&chat).contains("~~old~~"));
+    }
+
+    #[test]
+    fn html_tags_parse_with_their_attributes() {
+        let chars: Vec<char> = "<img src='a b.png' width=112 alt=\"Flux &amp; co\"/>"
+            .chars()
+            .collect();
+        let tag = tag_at(&chars, 0).unwrap();
+        assert_eq!(tag.name, "img");
+        assert!(!tag.closing);
+        assert_eq!(tag.attribute("src"), Some("a b.png"));
+        assert_eq!(tag.attribute("width"), Some("112"));
+        assert_eq!(tag.attribute("alt"), Some("Flux & co"));
+        assert_eq!(tag.end, chars.len());
+        let closing: Vec<char> = "</div>".chars().collect();
+        assert!(tag_at(&closing, 0).unwrap().closing);
+        let not_a_tag: Vec<char> = "a < b".chars().collect();
+        assert_eq!(tag_at(&not_a_tag, 2), None);
+    }
 
     #[test]
     fn rust_analyzer_hover_splits_into_code_rule_and_prose() {

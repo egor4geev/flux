@@ -48,7 +48,6 @@ const INACTIVE_TAB_LABEL_MAX_CHARS: usize = 16;
 /// Hover group of a pill: its × shows.
 const TAB_GROUP: &str = "claude-tab";
 const RESIZE_HANDLE_WIDTH: f32 = GAP;
-const RESIZE_HANDLE_OFFSET: f32 = 1. + RESIZE_HANDLE_WIDTH / 2.;
 /// The onboarding column's width at most: it stays readable in a wide island.
 const ONBOARDING_WIDTH: f32 = 340.;
 
@@ -1174,14 +1173,16 @@ fn drop_marker(after: bool, ui: UiColors) -> impl IntoElement {
 }
 
 /// Width handle in the gap to the left of the island: an accent line on hover and while dragged.
-fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
+/// Its middle is `center` past the edge (`ui::resize_handle_center`): in the gap between islands,
+/// or on the line between Flat panels (part 10.4).
+fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement {
     div()
         .id("claude-resize")
         .group("claude-resize")
         .absolute()
         .top_0()
         .bottom_0()
-        .left(px(-(1. + RESIZE_HANDLE_WIDTH)))
+        .left(px(-(center + RESIZE_HANDLE_WIDTH / 2.)))
         .w(px(RESIZE_HANDLE_WIDTH))
         .py(px(ui::RADIUS_LG))
         .flex()
@@ -1247,8 +1248,8 @@ impl Render for ClaudePanel {
             }))
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
                 // The handle sits in the gap to the left of the edge.
-                let width =
-                    f32::from(event.bounds.right() - event.event.position.x) - RESIZE_HANDLE_OFFSET;
+                let width = f32::from(event.bounds.right() - event.event.position.x)
+                    - ui::resize_handle_center(ui::style(cx));
                 this.width.set(width);
                 this.resizing = true;
                 cx.notify();
@@ -1256,7 +1257,7 @@ impl Render for ClaudePanel {
             .child(header)
             .child(ui::divider(ui).mx(px(GAP)))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
-            .child(resize_handle(self.resizing, ui))
+            .child(resize_handle(self.resizing, ui::resize_handle_center(ui::style(cx)), ui))
             .children(
                 self.menu
                     .as_ref()

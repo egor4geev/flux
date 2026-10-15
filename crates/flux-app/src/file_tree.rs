@@ -60,10 +60,9 @@ const TEXT_SIZE: f32 = 13.;
 /// Icon opacity in a muted row (excluded by .gitignore, or cut).
 const MUTED_ICON_ALPHA: f32 = 0.45;
 /// The width handle occupies the gap between islands to the right of the panel: from the island's
-/// border (1 px) for the width of the gap. Its center is that much to the right of the panel's
-/// edge.
+/// border (1 px) for the width of the gap; between Flat panels it straddles their line
+/// (`ui::resize_handle_center`).
 const RESIZE_HANDLE_WIDTH: f32 = ui::GAP;
-const RESIZE_HANDLE_OFFSET: f32 = 1. + RESIZE_HANDLE_WIDTH / 2.;
 /// Row hover group: the box is highlighted when the mouse is over the row, including its insets.
 const ROW_GROUP: &str = "file-tree-row";
 /// Watcher event coalescing: after the first event, wait for the rest to arrive.
@@ -1654,7 +1653,7 @@ impl Render for FileTreePanel {
                     // The handle sits in the gap to the right of the edge: the panel edge follows
                     // the mouse without jumping.
                     let width = f32::from(event.event.position.x - event.bounds.left())
-                        - RESIZE_HANDLE_OFFSET;
+                        - ui::resize_handle_center(ui::style(cx));
                     this.width.set(width);
                     this.resizing = true;
                     cx.notify();
@@ -1686,7 +1685,7 @@ impl Render for FileTreePanel {
                     )
                     .child(list),
             )
-            .child(resize_handle(self.resizing, ui))
+            .child(resize_handle(self.resizing, ui::resize_handle_center(ui::style(cx)), ui))
             .children(
                 self.menu
                     .as_ref()
@@ -1802,14 +1801,16 @@ fn drop_overlay(ui: UiColors) -> Div {
 }
 
 /// Width handle in the gap between islands: an accent line on hover and while it is being dragged.
-fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
+/// Its middle is `center` past the edge (`ui::resize_handle_center`): in the gap between islands,
+/// or on the line between Flat panels (part 10.4).
+fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement {
     div()
         .id("file-tree-resize")
         .group("file-tree-resize")
         .absolute()
         .top_0()
         .bottom_0()
-        .right(px(-(1. + RESIZE_HANDLE_WIDTH)))
+        .right(px(-(center + RESIZE_HANDLE_WIDTH / 2.)))
         .w(px(RESIZE_HANDLE_WIDTH))
         .py(px(ui::RADIUS_LG))
         .flex()

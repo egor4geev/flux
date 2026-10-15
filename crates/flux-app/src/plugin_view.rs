@@ -126,7 +126,6 @@ const TAB_PADDING: f32 = GAP;
 /// Elements nested deeper are not drawn: a broken view can't take the window down.
 const MAX_DEPTH: usize = 32;
 const RESIZE_HANDLE_WIDTH: f32 = GAP;
-const RESIZE_HANDLE_OFFSET: f32 = 1. + RESIZE_HANDLE_WIDTH / 2.;
 /// Row hover group: the box is highlighted when the mouse is over the row, including its insets.
 const ROW_GROUP: &str = "plugin-tree-row";
 /// A card of a tree of cards (a board's column): its height with the gap under it — fixed, so the
@@ -2007,7 +2006,7 @@ impl Render for PluginView {
                         |this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
                             // The handle sits in the gap to the left of the edge.
                             let width = f32::from(event.bounds.right() - event.event.position.x)
-                                - RESIZE_HANDLE_OFFSET;
+                                - ui::resize_handle_center(ui::style(cx));
                             this.width.set(width);
                             this.resizing = true;
                             cx.notify();
@@ -2024,7 +2023,11 @@ impl Render for PluginView {
                             .on_children_prepainted(record_area(&self.content_bounds))
                             .child(content),
                     )
-                    .child(resize_handle(self.resizing, ui)),
+                    .child(resize_handle(
+                        self.resizing,
+                        ui::resize_handle_center(ui::style(cx)),
+                        ui,
+                    )),
                 // A tab: the editor's island frames it, the tab names it.
                 Chrome::Tab => frame.child(
                     div()
@@ -2051,14 +2054,16 @@ impl Render for DraggedEdge {
 }
 
 /// Width handle in the gap to the left of the island: an accent line on hover and while dragged.
-fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
+/// Its middle is `center` past the edge (`ui::resize_handle_center`): in the gap between islands,
+/// or on the line between Flat panels (part 10.4).
+fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement {
     div()
         .id("plugin-view-resize")
         .group("plugin-view-resize")
         .absolute()
         .top_0()
         .bottom_0()
-        .left(px(-(1. + RESIZE_HANDLE_WIDTH)))
+        .left(px(-(center + RESIZE_HANDLE_WIDTH / 2.)))
         .w(px(RESIZE_HANDLE_WIDTH))
         .py(px(ui::RADIUS_LG))
         .flex()

@@ -81,7 +81,6 @@ const CHEVRON_SIZE: f32 = 12.;
 const MESSAGE_HEIGHT: f32 = 112.;
 /// The width handle sits in the gap to the right of the island, as the tree's does.
 const RESIZE_HANDLE_WIDTH: f32 = ui::GAP;
-const RESIZE_HANDLE_OFFSET: f32 = 1. + RESIZE_HANDLE_WIDTH / 2.;
 /// How many recent messages the history offers.
 const HISTORY_LIMIT: usize = 20;
 /// A history item shows the first line of a message, shortened to this many characters.
@@ -3518,14 +3517,16 @@ fn link(
 }
 
 /// The island's right edge, in the gap between islands: an accent line on hover and while dragged.
-fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
+/// Its middle is `center` past the edge (`ui::resize_handle_center`): in the gap between islands,
+/// or on the line between Flat panels (part 10.4).
+fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement {
     div()
         .id("commit-resize")
         .group("commit-resize")
         .absolute()
         .top_0()
         .bottom_0()
-        .right(px(-(1. + RESIZE_HANDLE_WIDTH)))
+        .right(px(-(center + RESIZE_HANDLE_WIDTH / 2.)))
         .w(px(RESIZE_HANDLE_WIDTH))
         .py(px(ui::RADIUS_LG))
         .flex()
@@ -3601,7 +3602,7 @@ impl Render for CommitPanel {
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedCommitEdge>, _, cx| {
                     let width = f32::from(event.event.position.x - event.bounds.left())
-                        - RESIZE_HANDLE_OFFSET;
+                        - ui::resize_handle_center(ui::style(cx));
                     this.width.set(width);
                     this.resizing = true;
                     cx.notify();
@@ -3613,7 +3614,8 @@ impl Render for CommitPanel {
             CommitTab::Commit => self.render_commit_tab(root, window, cx),
             CommitTab::Stash => root.child(div().flex_1().min_h_0().child(self.stash.clone())),
         };
-        root.child(resize_handle(self.resizing, ui)).children(
+        let center = ui::resize_handle_center(ui::style(cx));
+        root.child(resize_handle(self.resizing, center, ui)).children(
             self.menu
                 .as_ref()
                 .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),

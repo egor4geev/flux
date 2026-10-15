@@ -710,7 +710,8 @@ pub fn chosen(cx: &App) -> SharedString {
 }
 
 /// Puts the theme to show into the global [`Theme`]: the preview, otherwise the chosen one,
-/// otherwise Flux Night. Windows redraw; editors take the new highlighting colors.
+/// otherwise Flux Night — with the surfaces of the window's look (Flat makes them opaque, part
+/// 10.4). Windows redraw; editors take the new highlighting colors.
 pub fn apply(cx: &mut App) {
     let preview = cx
         .try_global::<Themes>()
@@ -718,6 +719,7 @@ pub fn apply(cx: &mut App) {
     let following = preview.is_none() && settings::appearance(cx).sync_with_os;
     let name = preview.unwrap_or_else(|| chosen(cx));
     let theme = by_name(&name, cx).unwrap_or_else(Theme::flux_night);
+    let theme = with_surfaces_for(settings::ui_style(cx), theme);
     // The windows' own appearance (the frame's hairline, the traffic lights, the system's file
     // panels) is the theme's; a theme that follows macOS lets macOS decide, so a change of the
     // system's appearance still reaches the windows.
@@ -731,6 +733,24 @@ pub fn apply(cx: &mut App) {
         cx.set_global(theme);
         cx.refresh_windows();
     }
+}
+
+/// A theme's surfaces for the look of the window (part 10.4). Islands keep the glass: the frame and
+/// the islands let the blurred desktop through. A Flat window is opaque, so the frame takes its own
+/// color without the transparency, the islands become their color laid over it, and the frame's
+/// glow goes; popovers (`elevated`) keep theirs — they float in both looks.
+pub fn with_surfaces_for(style: settings::UiStyle, mut theme: Theme) -> Theme {
+    if style == settings::UiStyle::Flat {
+        let ui = &mut theme.ui;
+        let frame = Hsla { a: 1., ..ui.frame };
+        ui.frame = frame;
+        ui.island = frame.blend(ui.island);
+        ui.frame_glow = Hsla {
+            a: 0.,
+            ..ui.frame_glow
+        };
+    }
+    theme
 }
 
 /// Chooses a theme (Settings, Quick Switch): saved in the settings and shown.
@@ -882,6 +902,27 @@ mod appkit {
 mod tests {
     use super::*;
     use flux_syntax::{HighlightMap, languages};
+
+    /// Flat (part 10.4) makes the glass opaque: the frame in its own color, the islands laid over
+    /// it, no glow; Islands keeps the theme as it is, and popovers keep theirs in both looks.
+    #[test]
+    fn flat_surfaces_are_opaque() {
+        use settings::UiStyle;
+        for theme in [Theme::flux_night(), Theme::flux_day()] {
+            assert_eq!(with_surfaces_for(UiStyle::Islands, theme.clone()), theme);
+            let flat = with_surfaces_for(UiStyle::Flat, theme.clone());
+            assert_eq!(flat.ui.frame.a, 1.);
+            assert_eq!(flat.ui.island.a, 1.);
+            assert_eq!(flat.ui.frame_glow.a, 0.);
+            assert_eq!(flat.ui.elevated, theme.ui.elevated);
+            assert_eq!(flat.syntax, theme.syntax);
+            // The island is its own color over the frame: closer to the island than to the frame.
+            let distance = |a: Hsla, b: Hsla| (a.l - b.l).abs();
+            assert!(
+                distance(flat.ui.island, theme.ui.island) < distance(flat.ui.island, flat.ui.frame)
+            );
+        }
+    }
 
 
 

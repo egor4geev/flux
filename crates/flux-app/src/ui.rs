@@ -5,12 +5,13 @@
 
 use gpui::{
     Action, AnyView, App, BoxShadow, Context, Div, ElementId, FocusHandle, FontWeight, Hsla,
-    IntoElement, KeyBinding, KeyContext, Keymap, Render, SharedString, Stateful, Window, div,
-    linear_color_stop, linear_gradient, point, prelude::*, px,
+    IntoElement, KeyBinding, KeyContext, Keymap, Render, SharedString, Stateful, Window,
+    WindowBackgroundAppearance, div, linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 
 use crate::command_palette::keystroke_label;
 use crate::icons::{IconName, icon};
+use crate::settings::{self, UiStyle};
 use crate::theme::{self, Theme, UiColors};
 
 /// Corner radii: keys and badges · buttons, fields, rows · cards · islands · overlay windows. A
@@ -29,6 +30,22 @@ pub const TITLE_BAR_HEIGHT: f32 = 40.;
 pub const STATUS_BAR_HEIGHT: f32 = 28.;
 /// Icon button and toggle.
 pub const ICON_BUTTON_SIZE: f32 = 26.;
+/// Dialogs and search windows open this far from the top of the window, under the title bar.
+pub const DIALOG_TOP: f32 = TITLE_BAR_HEIGHT + 32.;
+/// The margin a dialog keeps above the status bar; a dialog is never lower than the minimum.
+const DIALOG_MARGIN: f32 = 16.;
+const DIALOG_MIN_HEIGHT: f32 = 240.;
+
+/// The height of a dialog under the title bar: its own, unless a small window — or a large interface
+/// scale (part 10.4), which makes the window logically smaller — leaves less room above the status
+/// bar.
+pub fn dialog_height(preferred: f32, window: &Window) -> f32 {
+    let room = f32::from(window.viewport_size().height)
+        - DIALOG_TOP
+        - STATUS_BAR_HEIGHT
+        - DIALOG_MARGIN;
+    preferred.min(room).max(DIALOG_MIN_HEIGHT)
+}
 
 /// The width of the left island. The project tree and the commit window take turns in it and share
 /// it: dragging the edge of either resizes both, so switching between them (⌘1, ⌘0) doesn't move
@@ -124,17 +141,82 @@ impl Default for BottomIslandHeight {
     }
 }
 
+// --- The look of the window (Settings → Appearance → Interface, part 10.4) ---
+
+/// The look of the window: Islands on glass, or Flat panels edge to edge.
+pub fn style(cx: &App) -> UiStyle {
+    settings::ui_style(cx)
+}
+
+/// Chooses the look of the window (the Interface page, Quick Switch): saved and applied at once to
+/// every window — the theme's surfaces turn opaque or glass again ([`theme::apply`]), the windows'
+/// backgrounds follow.
+pub fn set_style(style: UiStyle, cx: &mut App) {
+    if settings::ui_style(cx) == style {
+        return;
+    }
+    settings::update_appearance(cx, |appearance| appearance.ui_style = style);
+    theme::apply(cx);
+    // After the event that chose it: the window it came from is being updated until then, and an
+    // update of it now would be refused.
+    cx.defer(|cx| {
+        for window in cx.windows() {
+            window
+                .update(cx, |_, window, cx| apply_window_style(window, cx))
+                .ok();
+        }
+    });
+    cx.refresh_windows();
+}
+
+/// Applies the look of the window to a window Flux is opening, or to every window when the look
+/// changes: the blurred desktop behind the glass of Islands, an opaque window for Flat.
+pub fn apply_window_style(window: &mut Window, cx: &App) {
+    window.set_background_appearance(match style(cx) {
+        UiStyle::Islands => WindowBackgroundAppearance::Blurred,
+        UiStyle::Flat => WindowBackgroundAppearance::Opaque,
+    });
+}
+
+/// The gap between islands and from the islands to the window's edges: none in Flat, where the
+/// panels meet at a line.
+pub fn island_gap(style: UiStyle) -> f32 {
+    match style {
+        UiStyle::Islands => GAP,
+        UiStyle::Flat => 0.,
+    }
+}
+
+/// The thickness of the handle on an island's edge that resizes it (an accent line on hover).
+pub const RESIZE_HANDLE: f32 = GAP;
+
+/// How far from the edge of a panel's content the middle of its resize handle is: in the gap
+/// between islands (past the island's 1 px border), or on the 1 px line between Flat panels. The
+/// handle sits `resize_handle_center + RESIZE_HANDLE / 2` out; dragging puts the edge where the
+/// middle of the handle is under the mouse, so the edge doesn't jump.
+pub fn resize_handle_center(style: UiStyle) -> f32 {
+    match style {
+        UiStyle::Islands => 1. + RESIZE_HANDLE / 2.,
+        UiStyle::Flat => 0.5,
+    }
+}
+
 /// Island: a standalone panel on the window's glass frame (tree, editor). The corner rounding
-/// doesn't clip children: their backgrounds must keep away from the edge at the corners.
-pub fn island(ui: UiColors) -> Div {
-    div()
-        .relative()
-        .rounded(px(RADIUS_LG))
-        .bg(ui.island)
-        .border_1()
-        .border_color(ui.island_border)
-        .shadow(island_shadow(ui))
-        .child(sheen(ui, RADIUS_LG))
+/// doesn't clip children: their backgrounds must keep away from the edge at the corners. In Flat
+/// it is a plain panel: no rounding, border, shadow or sheen — the window's layout draws the lines
+/// between panels (`Workspace::render`), and the theme's island color is opaque then.
+pub fn island(ui: UiColors, style: UiStyle) -> Div {
+    match style {
+        UiStyle::Islands => div()
+            .relative()
+            .rounded(px(RADIUS_LG))
+            .bg(ui.island)
+            .border_1()
+            .border_color(ui.island_border)
+            .shadow(island_shadow(ui))
+            .child(sheen(ui, RADIUS_LG)),
+        UiStyle::Flat => div().relative().bg(ui.island),
+    }
 }
 
 /// Popover: menus, pickers, project search, tooltips. Denser than an island and with a deep shadow:
@@ -716,5 +798,18 @@ mod tests {
         // Bound in a panel first, at the window's level after: the window's key is shown.
         assert_eq!(label(&NewTab).as_deref(), Some("⌃T"));
         assert_eq!(label(&Unbound), None);
+    }
+
+    /// Islands keep their resize handles in the gap, as before part 10.4 (1 px border + the gap,
+    /// the edge under the middle); Flat panels have no gap, and the handle straddles their line.
+    #[test]
+    fn resize_handles_sit_in_the_gap_or_on_the_line() {
+        assert_eq!(island_gap(UiStyle::Islands), GAP);
+        assert_eq!(island_gap(UiStyle::Flat), 0.);
+        let islands = resize_handle_center(UiStyle::Islands);
+        assert_eq!(islands, 1. + GAP / 2.);
+        assert_eq!(islands + RESIZE_HANDLE / 2., 1. + GAP);
+        let flat = resize_handle_center(UiStyle::Flat);
+        assert!(flat - RESIZE_HANDLE / 2. < 0. && flat + RESIZE_HANDLE / 2. > 1.);
     }
 }

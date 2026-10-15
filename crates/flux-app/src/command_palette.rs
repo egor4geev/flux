@@ -4,6 +4,12 @@
 //! The list is built when the palette opens, before focus moves into the palette's input field:
 //! gpui knows which actions are handled along the path from the focused element to the root. Making
 //! a choice returns focus to where it was and dispatches the action there.
+//!
+//! The palette remembers what is chosen in it (part 10.4, [`crate::command_usage`]): with an empty
+//! query the frequent and recent commands come first, under Recently Used; with a query, they rise
+//! among matches of the same quality.
+
+use std::collections::{HashMap, HashSet};
 
 use flux_search::{FuzzyMatch, match_list};
 use gpui::{
@@ -11,6 +17,7 @@ use gpui::{
     Modifiers, SharedString, Window, actions, div, prelude::*, px,
 };
 
+use crate::command_usage;
 use crate::i18n::{tr, trn};
 use crate::picker::{Picker, PickerDelegate, highlighted_text};
 use crate::plugins::{PaletteCommand, PaletteToolWindow};
@@ -38,6 +45,9 @@ pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
 }
 
 struct Command {
+    /// What the palette's memory knows it by ([`command_usage`]): the action's name, or the
+    /// plugin's command or tool window.
+    key: String,
     /// Full label, which fuzzy search matches against: "editor: move word left".
     label: String,
     /// Namespace length in characters (up to ": "): match positions are split between the chip and
@@ -52,10 +62,19 @@ struct Command {
     enabled: bool,
 }
 
+/// A row of the list: a group's heading (with an empty query and something used), translated, or
+/// a command.
+enum Row {
+    Heading(&'static str),
+    Command(FuzzyMatch),
+}
+
 pub struct CommandPalette {
     /// Alphabetical by label.
     commands: Vec<Command>,
-    matches: Vec<FuzzyMatch>,
+    rows: Vec<Row>,
+    /// How much each command is used, by key, as of the palette's opening.
+    usage: HashMap<String, f64>,
     /// If the query is empty, the footer shows the total number of commands; otherwise "N of M".
     query_empty: bool,
     /// Where focus was before opening: focus returns there, and the action is dispatched there.
@@ -93,6 +112,7 @@ impl CommandPalette {
                     format!("{chip}: {title}")
                 };
                 Command {
+                    key: action.name().to_string(),
                     namespace_chars: chip.chars().count(),
                     namespace: namespace.to_string(),
                     label,
@@ -102,24 +122,35 @@ impl CommandPalette {
                 }
             })
             .collect();
-        let plugin_command = |category: String, title: String, action: Box<dyn Action>| Command {
-            namespace_chars: category.chars().count(),
-            label: format!("{category}: {title}"),
-            namespace: PLUGIN_NAMESPACE.to_string(),
-            keys: keys_label(action.as_ref(), previous_focus.as_ref(), window, cx),
-            action,
-            enabled: true,
-        };
+        let plugin_command =
+            |key: String, category: String, title: String, action: Box<dyn Action>| Command {
+                key,
+                namespace_chars: category.chars().count(),
+                label: format!("{category}: {title}"),
+                namespace: PLUGIN_NAMESPACE.to_string(),
+                keys: keys_label(action.as_ref(), previous_focus.as_ref(), window, cx),
+                action,
+                enabled: true,
+            };
         for command in plugin_commands {
             let enabled = command.enabled;
+            let key = format!(
+                "plugin:{}/{}",
+                command.action.plugin, command.action.command
+            );
             let action = Box::new(command.action);
             commands.push(Command {
                 enabled,
-                ..plugin_command(command.category, command.title, action)
+                ..plugin_command(key, command.category, command.title, action)
             });
         }
         for tool in plugin_windows {
+            let key = format!(
+                "plugin-window:{}/{}",
+                tool.action.plugin, tool.action.window
+            );
             commands.push(plugin_command(
+                key,
                 tool.category,
                 tool.title,
                 Box::new(tool.action),
@@ -128,11 +159,86 @@ impl CommandPalette {
         commands.sort_by_cached_key(|command| command.label.to_lowercase());
         Self {
             commands,
-            matches: Vec::new(),
+            rows: Vec::new(),
+            usage: command_usage::frecencies(cx),
             query_empty: true,
             previous_focus,
         }
     }
+
+    /// How much command `index` is used.
+    fn frecency(&self, index: usize) -> f64 {
+        self.usage
+            .get(&self.commands[index].key)
+            .copied()
+            .unwrap_or(0.)
+    }
+
+    /// The matches as rows: with an empty query, Recently Used (if anything is) over the other
+    /// commands; with a query, the matches ranked with usage.
+    fn rows(&self, query: &str) -> Vec<Row> {
+        let matches = match_list(
+            query,
+            &self
+                .commands
+                .iter()
+                .map(|command| command.label.as_str())
+                .collect::<Vec<_>>(),
+        );
+        if !query.trim().is_empty() {
+            let ranked = command_usage::rank_matches(matches, |index| self.frecency(index));
+            return ranked.into_iter().map(Row::Command).collect();
+        }
+        // A grayed-out command doesn't run: it isn't offered on top.
+        let recent = command_usage::recent(
+            self.commands.len(),
+            |index| {
+                if self.commands[index].enabled {
+                    self.frecency(index)
+                } else {
+                    0.
+                }
+            },
+            command_usage::RECENT_LIMIT,
+        );
+        grouped_rows(matches, &recent)
+    }
+
+    /// The command rows: the shown commands, without the headings.
+    fn shown(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| matches!(row, Row::Command(_)))
+            .count()
+    }
+}
+
+/// With an empty query: the `recent` commands (in that order) under Recently Used, then the rest
+/// in the list's order under Other Commands; nothing used — the list as it is, without headings.
+fn grouped_rows(all: Vec<FuzzyMatch>, recent: &[usize]) -> Vec<Row> {
+    if recent.is_empty() {
+        return all.into_iter().map(Row::Command).collect();
+    }
+    let on_top: HashSet<usize> = recent.iter().copied().collect();
+    let mut rows = Vec::with_capacity(all.len() + 2);
+    rows.push(Row::Heading(tr("Recently Used")));
+    rows.extend(recent.iter().map(|&index| {
+        Row::Command(FuzzyMatch {
+            index,
+            score: 0,
+            positions: Vec::new(),
+        })
+    }));
+    let rest: Vec<Row> = all
+        .into_iter()
+        .filter(|found| !on_top.contains(&found.index))
+        .map(Row::Command)
+        .collect();
+    if !rest.is_empty() {
+        rows.push(Row::Heading(tr("Other Commands")));
+        rows.extend(rest);
+    }
+    rows
 }
 
 impl PickerDelegate for CommandPalette {
@@ -141,23 +247,28 @@ impl PickerDelegate for CommandPalette {
     }
 
     fn match_count(&self) -> usize {
-        self.matches.len()
+        self.rows.len()
     }
 
     fn update_matches(&mut self, query: &str, _: &mut Window, _: &mut Context<Picker<Self>>) {
-        let labels: Vec<&str> = self.commands.iter().map(|c| c.label.as_str()).collect();
-        self.matches = match_list(query, &labels);
+        self.rows = self.rows(query);
         self.query_empty = query.trim().is_empty();
     }
 
+    fn selectable(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::Command(_)))
+    }
+
     fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let Some(found) = self.matches.get(index) else {
+        let Some(Row::Command(found)) = self.rows.get(index) else {
             return;
         };
-        if !self.commands[found.index].enabled {
+        let command = &self.commands[found.index];
+        if !command.enabled {
             return;
         }
-        let action = self.commands[found.index].action.boxed_clone();
+        command_usage::record(&command.key, cx);
+        let action = command.action.boxed_clone();
         // `dispatch_action` takes focus at the moment of the call, so restore focus to its place
         // first.
         if let Some(focus) = &self.previous_focus {
@@ -175,7 +286,19 @@ impl PickerDelegate for CommandPalette {
         cx: &mut Context<Picker<Self>>,
     ) -> AnyElement {
         let ui = Theme::ui(cx);
-        let found = &self.matches[index];
+        let found = match &self.rows[index] {
+            Row::Command(found) => found,
+            // As the plugins' pickers draw a group's heading.
+            Row::Heading(heading) => {
+                return div()
+                    .size_full()
+                    .flex()
+                    .items_end()
+                    .pb(px(5.))
+                    .child(ui::section_label(*heading, ui).truncate())
+                    .into_any_element();
+            }
+        };
         let command = &self.commands[found.index];
         let LabelParts {
             namespace,
@@ -243,7 +366,7 @@ impl PickerDelegate for CommandPalette {
         let text = if self.query_empty {
             trn(total, "{n} command", "{n} commands")
         } else {
-            let shown = self.matches.len();
+            let shown = self.shown();
             format!(
                 "{shown} {}",
                 trn(total, "of {n} command", "of {n} commands")
@@ -475,6 +598,44 @@ mod tests {
         assert_eq!(parts.namespace, "");
         assert_eq!(parts.title, "quit");
         assert_eq!(parts.title_positions, [0, 3]);
+    }
+
+    /// Rows as text: "# Heading", or the command's index.
+    fn rows_text(rows: &[Row]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                Row::Heading(heading) => format!("# {heading}"),
+                Row::Command(found) => found.index.to_string(),
+            })
+            .collect()
+    }
+
+    fn all(count: usize) -> Vec<FuzzyMatch> {
+        flux_search::match_list("", &vec!["x"; count])
+    }
+
+    #[test]
+    fn recently_used_come_first_and_only_once() {
+        // Nothing used: the list as it is, without headings.
+        assert_eq!(rows_text(&grouped_rows(all(3), &[])), ["0", "1", "2"]);
+        // The used ones on top in their order, the rest below without them.
+        assert_eq!(
+            rows_text(&grouped_rows(all(5), &[3, 0])),
+            [
+                "# Recently Used",
+                "3",
+                "0",
+                "# Other Commands",
+                "1",
+                "2",
+                "4"
+            ]
+        );
+        // Everything used: no empty group below.
+        assert_eq!(
+            rows_text(&grouped_rows(all(2), &[1, 0])),
+            ["# Recently Used", "1", "0"]
+        );
     }
 
     fn label(keystroke: &str) -> String {

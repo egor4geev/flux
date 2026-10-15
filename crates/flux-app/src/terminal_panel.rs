@@ -61,9 +61,9 @@ const TAB_HEIGHT: f32 = 26.;
 /// Long tab labels are shortened in the middle.
 const TAB_LABEL_MAX_CHARS: usize = 28;
 /// The height handle occupies the gap between the editor island and the panel: from the island's
-/// border (1 px) for the height of the gap. Its middle is that much above the panel's top.
+/// border (1 px) for the height of the gap; between Flat panels it straddles their line
+/// (`ui::resize_handle_center`).
 const RESIZE_HANDLE_HEIGHT: f32 = GAP;
-const RESIZE_HANDLE_OFFSET: f32 = 1. + RESIZE_HANDLE_HEIGHT / 2.;
 /// How long a new shell gets to start before text is typed into it.
 const SHELL_START: std::time::Duration = std::time::Duration::from_millis(700);
 /// Hover groups: a pill (its × shows) and the resize handle (its line lights up).
@@ -889,12 +889,14 @@ fn drop_marker(after: bool, ui: UiColors) -> impl IntoElement {
 }
 
 /// The panel's top edge, in the gap between islands: an accent line on hover and while dragged.
-fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
+/// Its middle is `center` past the edge (`ui::resize_handle_center`): in the gap between islands,
+/// or on the line between Flat panels (part 10.4).
+fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement {
     div()
         .id("terminal-panel-resize")
         .group(RESIZE_GROUP)
         .absolute()
-        .top(px(-(1. + RESIZE_HANDLE_HEIGHT)))
+        .top(px(-(center + RESIZE_HANDLE_HEIGHT / 2.)))
         .left_0()
         .right_0()
         .h(px(RESIZE_HANDLE_HEIGHT))
@@ -988,7 +990,7 @@ impl Render for TerminalPanel {
                     // The handle sits in the gap above the edge: the edge follows the mouse
                     // without jumping.
                     let height = f32::from(event.bounds.bottom() - event.event.position.y)
-                        - RESIZE_HANDLE_OFFSET;
+                        - ui::resize_handle_center(ui::style(cx));
                     this.height.set_within(height, max_height);
                     this.resizing = true;
                     cx.notify();
@@ -997,7 +999,7 @@ impl Render for TerminalPanel {
             .child(self.render_header(window, cx))
             .child(ui::divider(ui).mx(px(GAP)))
             .child(body)
-            .child(resize_handle(self.resizing, ui))
+            .child(resize_handle(self.resizing, ui::resize_handle_center(ui::style(cx)), ui))
             .children(
                 self.menu
                     .as_ref()

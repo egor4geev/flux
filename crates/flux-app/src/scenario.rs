@@ -31,6 +31,10 @@
 //! - `FLUX_SCENARIO_FINDER=1` — without a folder in the arguments, Flux starts as from the Dock or
 //!   the Finder (no project from the current directory): it reopens the projects open when it quit
 //!   (`FLUX_PROJECTS_FILE`).
+//! - `FLUX_SCENARIO_HEADLESS=1` (the harness sets it when the screen is locked) — Flux draws the
+//!   frames itself on a timer and saves each `shot:` as `<FLUX_SCENARIO_OUT>/<name>-<window id>.png`,
+//!   rendered offscreen ([`headless`]): a locked screen stops gpui's display link and the window
+//!   server won't capture windows.
 //!
 //! File picker dialogs (Cmd+O, "Save As") are system panels, and the auto-responder doesn't replace
 //! them. The screenshot harness is `scripts/ui-scenario.sh`.
@@ -55,6 +59,10 @@ const START_DELAY: Duration = Duration::from_millis(1500);
 const STEP_PAUSE: Duration = Duration::from_millis(150);
 /// At a `shot:` marker and at a dialog: gives time to capture the window from outside.
 const SHOT_PAUSE: Duration = Duration::from_millis(1500);
+/// Headless: a frame every 16 ms, as the display would drive them; a shot a moment after its marker,
+/// as the harness takes it (the frame has finished drawing).
+const HEADLESS_FRAME: Duration = Duration::from_millis(16);
+const HEADLESS_SHOT_DELAY: Duration = Duration::from_millis(500);
 
 static ANSWERS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
 static PROMPTS: AtomicUsize = AtomicUsize::new(0);
@@ -182,6 +190,9 @@ pub fn run(window: AnyWindowHandle, cx: &mut App) {
     if background() {
         let_the_mouse_through();
     }
+    if headless() {
+        pump_frames(cx);
+    }
     if let Ok(answers) = std::env::var("FLUX_ANSWERS") {
         let answers = answers
             .split(',')
@@ -215,10 +226,136 @@ fn current_target(start: AnyWindowHandle, cx: &mut AsyncApp) -> AnyWindowHandle 
     windows.first().copied().unwrap_or(start)
 }
 
+/// The frames and the screenshots are Flux's own (`FLUX_SCENARIO_HEADLESS`): the screen is locked
+/// (the author is away) or the windows must not depend on the window server. gpui (Flux's patch,
+/// `vendor/gpui/FLUX-PATCH.md`) draws a frame on request and renders it offscreen.
+pub fn headless() -> bool {
+    std::env::var_os("FLUX_SCENARIO").is_some()
+        && std::env::var_os("FLUX_SCENARIO_HEADLESS").is_some_and(|value| !value.is_empty())
+}
+
+/// Headless: drives the frames of every window, as the display link would (it stops for an
+/// occluded window, and a locked screen occludes all of them).
+fn pump_frames(cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(HEADLESS_FRAME).await;
+            let Ok(windows) = cx.update(|cx| cx.windows()) else {
+                break;
+            };
+            for window in windows {
+                window
+                    .update(cx, |_, window, cx| window.headless_frame(cx))
+                    .ok();
+            }
+        }
+    })
+    .detach();
+}
+
+/// Headless: a moment later, every window rendered offscreen into
+/// `<FLUX_SCENARIO_OUT>/<name>-<window id>.png`, over a backdrop standing in for the blurred desktop.
+fn capture_later(name: String, cx: &AsyncApp) {
+    if !headless() {
+        return;
+    }
+    let Some(dir) = std::env::var_os("FLUX_SCENARIO_OUT") else {
+        eprintln!("flux: scenario: FLUX_SCENARIO_OUT isn't set, shot {name} not saved");
+        return;
+    };
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(HEADLESS_SHOT_DELAY).await;
+        let windows = cx.update(|cx| cx.windows()).unwrap_or_default();
+        for window in windows {
+            let image = window
+                .update(cx, |_, window, cx| {
+                    let dark = crate::theme::Theme::get(cx).appearance
+                        == crate::theme::Appearance::Dark;
+                    let width = f32::from(window.bounds().size.width);
+                    let ui_scale = window.ui_scale();
+                    window.render_to_image(cx).map(|image| {
+                        let device = image.width() as f32 / width.max(1.);
+                        let mut image = over_backdrop(image, dark);
+                        paint_traffic_lights(&mut image, device, ui_scale);
+                        image
+                    })
+                })
+                .ok()
+                .flatten();
+            let Some(image) = image else {
+                eprintln!("flux: scenario: shot {name}: the window wasn't rendered");
+                continue;
+            };
+            let file = format!("{name}-{}.png", window.window_id().as_u64());
+            let path = std::path::Path::new(&dir).join(file);
+            if let Err(err) = image.save(&path) {
+                eprintln!("flux: scenario: can't save {}: {err}", path.display());
+            }
+        }
+    })
+    .detach();
+}
+
+/// The offscreen render has premultiplied alpha and nothing behind the glass: it is put over a
+/// plain backdrop of the theme's appearance.
+fn over_backdrop(mut image: image::RgbaImage, dark: bool) -> image::RgbaImage {
+    let backdrop: [f32; 3] = if dark {
+        [30., 32., 38.]
+    } else {
+        [214., 218., 226.]
+    };
+    for pixel in image.pixels_mut() {
+        let alpha = f32::from(pixel[3]) / 255.;
+        for (channel, back) in pixel.0.iter_mut().take(3).zip(backdrop) {
+            *channel = (f32::from(*channel) + back * (1. - alpha)).round().min(255.) as u8;
+        }
+        pixel[3] = 255;
+    }
+    image
+}
+
+/// macOS draws the traffic lights itself, so the offscreen render hasn't got them: they are painted
+/// where Flux puts them ([`crate::ui_scale::traffic_lights`], kept inside the system's title bar as
+/// gpui keeps them), in the system's colors — a shot looks like the window (README screenshots).
+fn paint_traffic_lights(image: &mut image::RgbaImage, device: f32, ui_scale: f32) {
+    /// The button's frame, the circle in it and the step between buttons, in points (macOS 26).
+    const FRAME: f32 = 14.;
+    const DIAMETER: f32 = 13.5;
+    const STEP: f32 = 23.;
+    const SYSTEM_TITLE_BAR: f32 = 28.;
+    const COLORS: [[f32; 3]; 3] = [[255., 95., 87.], [254., 188., 46.], [40., 200., 64.]];
+    let origin = crate::ui_scale::traffic_lights(ui_scale);
+    let left = f32::from(origin.x);
+    let top = f32::from(origin.y).min(SYSTEM_TITLE_BAR - FRAME);
+    let radius = DIAMETER / 2. * device;
+    let (width, height) = image.dimensions();
+    for (index, color) in COLORS.iter().enumerate() {
+        let center_x = (left + FRAME / 2. + STEP * index as f32) * device;
+        let center_y = (top + FRAME / 2.) * device;
+        let rows = (center_y - radius - 1.).max(0.) as u32..(center_y + radius + 2.) as u32;
+        for y in rows.filter(|y| *y < height) {
+            let columns = (center_x - radius - 1.).max(0.) as u32..(center_x + radius + 2.) as u32;
+            for x in columns.filter(|x| *x < width) {
+                let distance =
+                    ((x as f32 + 0.5 - center_x).powi(2) + (y as f32 + 0.5 - center_y).powi(2)).sqrt();
+                let coverage = (radius + 0.5 - distance).clamp(0., 1.);
+                if coverage == 0. {
+                    continue;
+                }
+                let pixel = image.get_pixel_mut(x, y);
+                for (channel, value) in pixel.0.iter_mut().take(3).zip(color) {
+                    *channel = (f32::from(*channel) * (1. - coverage) + value * coverage).round() as u8;
+                }
+            }
+        }
+    }
+}
+
 /// Executes a step and returns the pause to take after it.
 fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration {
     if let Some(name) = step.strip_prefix("shot:") {
         println!("SHOT {name}");
+        capture_later(name.to_string(), cx);
         return SHOT_PAUSE;
     }
     if let Some(ms) = step.strip_prefix("wait:") {
@@ -360,6 +497,7 @@ fn auto_prompt(
     window: &mut Window,
     cx: &mut App,
 ) -> RenderablePromptHandle {
+    let mut shot = None;
     let mut choose = |dialog: &crate::dialog::Dialog| {
         let last = dialog.buttons.len().saturating_sub(1);
         let answer = ANSWERS
@@ -375,9 +513,10 @@ fn auto_prompt(
         let number = PROMPTS.fetch_add(1, Ordering::Relaxed) + 1;
         println!("PROMPT {} -> {label}", dialog.title);
         println!("SHOT prompt-{number}");
+        shot = Some(format!("prompt-{number}"));
         (answer, SHOT_PAUSE)
     };
-    crate::dialog::build_with(
+    let prompt = crate::dialog::build_with(
         level,
         message,
         detail,
@@ -386,5 +525,9 @@ fn auto_prompt(
         Some(&mut choose),
         window,
         cx,
-    )
+    );
+    if let Some(name) = shot {
+        cx.spawn(async move |cx| capture_later(name, cx)).detach();
+    }
+    prompt
 }

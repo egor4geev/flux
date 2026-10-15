@@ -64,9 +64,9 @@ const TAB_HEIGHT: f32 = 30.;
 const TAB_LABEL_MAX_CHARS: usize = 32;
 /// Offset of the overlay window (palette, file search) from the top of the window.
 const MODAL_TOP: f32 = TITLE_BAR_HEIGHT + 32.;
-/// Space for the macOS traffic lights in the title bar (the buttons are placed by `main` via
-/// `traffic_light_position`).
-const TRAFFIC_LIGHTS_WIDTH: f32 = 84.;
+/// Space for the macOS traffic lights in the title bar (the buttons are placed by `open_window` via
+/// `traffic_light_position`, and anew at another interface scale — `ui_scale::traffic_lights`).
+pub(crate) const TRAFFIC_LIGHTS_WIDTH: f32 = 84.;
 /// Project search is an overlay window: its share of the window width, and the upper limit.
 const SEARCH_WIDTH: f32 = 0.84;
 const SEARCH_MAX_WIDTH: f32 = 1080.;
@@ -593,6 +593,9 @@ impl Workspace {
                     ProjectSearchEvent::Open { location, focus } => {
                         this.open_location(location.clone(), *focus, window, cx)
                     }
+                    ProjectSearchEvent::OpenFile(path) => {
+                        this.open_file(path.clone(), true, window, cx)
+                    }
                     ProjectSearchEvent::FocusEditor => this.focus_active(window, cx),
                 },
             ),
@@ -665,6 +668,26 @@ impl Workspace {
 
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    /// Recent projects, most recent first, as the file has them now: another window may have
+    /// opened one since this window read the list (the project popup, part 10.4).
+    pub(crate) fn recent_projects(&mut self) -> &[PathBuf] {
+        if let Some(list) = recent::stored() {
+            self.recent = list;
+        }
+        &self.recent
+    }
+
+    /// Forgets a recent project (the popup's "Remove from Recent Projects"): the start screen
+    /// drops it too.
+    pub(crate) fn forget_recent(&mut self, root: &Path, cx: &mut Context<Self>) {
+        let list = recent::remove(root);
+        match recent::stored() {
+            Some(_) => self.recent = list,
+            None => self.recent.retain(|known| known != root),
+        }
+        cx.notify();
     }
 
     /// A new project root (cmd-o with a directory).
@@ -4172,50 +4195,8 @@ impl Workspace {
         } else {
             TRAFFIC_LIGHTS_WIDTH
         };
-        let project = self.root.as_deref().map(|root| {
-            let name = root
-                .file_name()
-                .map_or_else(|| tilde(root), |name| name.to_string_lossy().into_owned());
-            div()
-                .id("title-project")
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .h(px(26.))
-                .px_2()
-                .rounded(px(RADIUS_SM))
-                .cursor_pointer()
-                .hover(move |style| style.bg(ui.hover))
-                .tooltip(ui::tooltip(tilde(root), ui::shortcut_for(&Open, cx)))
-                .on_click(|_, window, cx| window.dispatch_action(Open.boxed_clone(), cx))
-                .child(icon(IconName::Folder, ui.folder).size(px(14.)))
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(ui.foreground)
-                        .child(name),
-                )
-        });
-        let open_folder = self.root.is_none().then(|| {
-            div()
-                .id("title-open-folder")
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .h(px(26.))
-                .px_2()
-                .rounded(px(RADIUS_SM))
-                .cursor_pointer()
-                .text_color(ui.text_muted)
-                .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
-                .tooltip(ui::tooltip(
-                    tr("Open Folder…"),
-                    ui::shortcut_for(&Open, cx),
-                ))
-                .on_click(|_, window, cx| window.dispatch_action(Open.boxed_clone(), cx))
-                .child(icon(IconName::FolderPlus, ui.folder).size(px(14.)))
-                .child(tr("Open Folder…"))
-        });
+        // The project and ▾: a click shows the recent projects (part 10.4).
+        let project = crate::project_popup::project_chip(self, cx);
         let branch = crate::branches_popup::branch_chip(self, cx);
         let search =
             (f32::from(window.viewport_size().width) >= TITLE_SEARCH_MIN_WINDOW).then(|| {
@@ -4279,8 +4260,7 @@ impl Workspace {
                 }
             })
             .children(search)
-            .children(project)
-            .children(open_folder)
+            .child(project)
             .children(branch)
             .child(div().flex_1())
             .child(button(
@@ -4613,16 +4593,20 @@ impl Workspace {
                 this.drop_claude(dragged.chat.clone(), window, cx)
             }))
             // The line under the tabs runs from edge to edge of the island, inset from the rounded
-            // corners.
-            .child(
+            // corners; a Flat panel has no corners to keep away from (part 10.4).
+            .child({
+                let inset = match ui::style(cx) {
+                    crate::settings::UiStyle::Islands => GAP,
+                    crate::settings::UiStyle::Flat => 0.,
+                };
                 div()
                     .absolute()
-                    .left(px(GAP))
-                    .right(px(GAP))
+                    .left(px(inset))
+                    .right(px(inset))
                     .bottom_0()
                     .h(px(1.))
-                    .bg(ui.divider),
-            )
+                    .bg(ui.divider)
+            })
             .child(
                 div()
                     .id("tabs")
@@ -5110,6 +5094,7 @@ impl Render for Workspace {
             .map(|root| crate::git::workspace_actions(root, cx))
             .map(|root| crate::vcs_menu::workspace_actions(root, cx))
             .map(|root| crate::branches_popup::workspace_actions(root, cx))
+            .map(|root| crate::project_popup::workspace_actions(root, cx))
             .map(|root| crate::branch_dialogs::workspace_actions(root, cx))
             .map(|root| crate::git_sync::workspace_actions(root, cx))
             .map(|root| crate::compare_dialog::workspace_actions(root, cx))
@@ -5299,9 +5284,15 @@ impl Render for Workspace {
         if self.tab_drop.is_some() && !cx.has_active_drag() {
             self.tab_drop = None;
         }
+        // The look of the window (part 10.4): Islands with gaps on the glass, or Flat panels edge
+        // to edge, divided by lines.
+        let style = ui::style(cx);
+        let flat = style == crate::settings::UiStyle::Flat;
+        let gap = ui::island_gap(style);
+        let line = ui.island_border;
         // The island clips what doesn't fit (the start screen above an open terminal panel);
         // popups are deferred and escape it.
-        let main = ui::island(ui)
+        let main = ui::island(ui, style)
             .flex_1()
             .min_h_0()
             .overflow_hidden()
@@ -5404,7 +5395,13 @@ impl Render for Workspace {
                 .filter(|_| self.tree_open)
                 .map(|panel| panel.into_any_element()),
         };
-        let tree = left.map(|panel| ui::island(ui).flex_none().h_full().child(panel));
+        let tree = left.map(|panel| {
+            ui::island(ui, style)
+                .flex_none()
+                .h_full()
+                .when(flat, |tree| tree.border_r_1().border_color(line))
+                .child(panel)
+        });
         // The editor island and, under it, the terminal panel; the tree stays full height. A panel
         // terminal can move to the editor area: the command is offered inside the panel.
         let git_island = self
@@ -5412,8 +5409,9 @@ impl Render for Workspace {
             .as_ref()
             .filter(|_| self.git_open)
             .map(|handle| {
-                ui::island(ui)
+                ui::island(ui, style)
                     .flex_none()
+                    .when(flat, |island| island.border_t_1().border_color(line))
                     .on_action(
                         cx.listener(|this, _: &git_window::MoveToEditor, window, cx| {
                             this.move_log_tab_to_editor(window, cx)
@@ -5422,8 +5420,9 @@ impl Render for Workspace {
                     .child(handle.window.clone())
             });
         let terminal = (self.terminal_open && git_island.is_none()).then(|| {
-            ui::island(ui)
+            ui::island(ui, style)
                 .flex_none()
+                .when(flat, |island| island.border_t_1().border_color(line))
                 .on_action(
                     cx.listener(|this, _: &terminal_panel::MoveToEditor, window, cx| {
                         this.move_to_editor(window, cx)
@@ -5437,7 +5436,7 @@ impl Render for Workspace {
             .h_full()
             .flex()
             .flex_col()
-            .gap(px(GAP))
+            .gap(px(gap))
             .child(main)
             .children(terminal)
             .children(git_island);
@@ -5451,9 +5450,10 @@ impl Render for Workspace {
                     None => div().into_any_element(),
                 },
             };
-            ui::island(ui)
+            ui::island(ui, style)
                 .flex_none()
                 .h_full()
+                .when(flat, |island| island.border_l_1().border_color(line))
                 .on_action(cx.listener(|this, _: &notifications_panel::Hide, window, cx| {
                     this.hide_right(window, cx)
                 }))
@@ -5479,18 +5479,20 @@ impl Render for Workspace {
         let cards = (self.right_tool != Some(RightTool::Notifications))
             .then(|| notifications::overlay(self.notification_center.read(cx).cards(), cx))
             .flatten();
-        // On the left, the launchpad (the tool strip) on the frame, followed by the islands.
-        root.child(ui::frame_glow(ui))
+        // On the left, the launchpad (the tool strip) on the frame, followed by the islands. Flat:
+        // no glow, and lines under the title bar and over the status bar.
+        root.when(!flat, |root| root.child(ui::frame_glow(ui)))
             .child(self.render_title_bar(window, cx))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
-                    .pl(px(2.))
-                    .pr(px(GAP))
+                    .pl(px(if flat { 0. } else { 2. }))
+                    .pr(px(gap))
                     .flex()
                     .flex_row()
-                    .gap(px(GAP))
+                    .gap(px(gap))
+                    .when(flat, |row| row.border_y_1().border_color(line))
                     .child(launchpad::render(self, cx))
                     .children(tree)
                     .child(main)
@@ -5631,13 +5633,16 @@ pub(crate) fn open_window(
     cx: &mut App,
 ) -> Option<WindowHandle<Workspace>> {
     // A custom title bar on a glass window frame: the system title bar is transparent, the traffic
-    // lights are centered in the title bar, and the desktop behind the window is blurred.
+    // lights are centered in the title bar (at the interface scale), and the desktop behind the
+    // window is blurred.
     let options = WindowOptions {
         window_bounds: Some(bounds),
         titlebar: Some(TitlebarOptions {
             title: Some("Flux".into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(16.), px(13.))),
+            traffic_light_position: Some(crate::ui_scale::traffic_lights(
+                crate::settings::ui_scale(cx),
+            )),
         }),
         window_background: WindowBackgroundAppearance::Blurred,
         window_min_size: Some(size(px(720.), px(480.))),
@@ -5646,6 +5651,9 @@ pub(crate) fn open_window(
     #[cfg(feature = "scenario")]
     let options = crate::scenario::window_options(options);
     match cx.open_window(options, |window, cx| {
+        // The look and the interface scale (part 10.4) before the first frame.
+        ui::apply_window_style(window, cx);
+        crate::ui_scale::apply(window, cx);
         cx.new(|cx| Workspace::new(root, files, window, cx))
     }) {
         Ok(handle) => {

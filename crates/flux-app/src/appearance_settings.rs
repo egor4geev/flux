@@ -1,11 +1,15 @@
 //! Settings → Appearance (stage 8.3): the pages Theme (the themes of the plugins, Sync with OS),
-//! File Icons (the sets of the plugins) and Language (System, English, Русский). Themes and icon sets
-//! of plugins are choices on these pages, not pages of their own.
+//! Interface (the look of the window and its scale, part 10.4), File Icons (the sets of the
+//! plugins) and Language (System, English, Русский). Themes and icon sets of plugins are choices on
+//! these pages, not pages of their own.
 //!
 //! - **Theme**: a card per theme, drawn in that theme's own colors (a small window with the tree and
 //!   a few lines of code), grouped into dark and light ones. A click shows the theme at once. With
 //!   Sync with OS on, each group chooses the theme for its macOS appearance (as the preferred light
 //!   and dark themes of JetBrains IDEs).
+//! - **Interface**: the look of the window — Islands or Flat, a card each with a small window drawn
+//!   that way in the theme's colors, a click applies it to every window ([`ui::set_style`]) — and
+//!   the scale of everything in it, as Zoom IDE of JetBrains IDEs ([`ui_scale`]).
 //! - **File Icons**: a row per set with a few of its icons; a click puts it in use.
 //! - **Language**: the interface language, at once ([`set_language`]).
 
@@ -19,10 +23,11 @@ use crate::i18n::{self, Lang, tr, trf};
 use crate::icon_themes::{self, IconThemeInfo};
 use crate::icons::{FileIcon, IconName, icon};
 use crate::plugins::PluginStatus;
-use crate::settings::{self, LanguageChoice};
+use crate::settings::{self, LanguageChoice, UiStyle};
 use crate::settings_view::{self, Section};
 use crate::theme::{self, Appearance, FLUX_DAY, FLUX_NIGHT, Theme, ThemeInfo, UiColors};
 use crate::ui;
+use crate::ui_scale;
 use crate::workspace::Workspace;
 
 /// A theme card: the preview window and the name under it.
@@ -32,10 +37,16 @@ const PREVIEW_HEIGHT: f32 = 84.;
 const PREVIEW_CODE_SIZE: f32 = 9.;
 const PREVIEW_LINE_HEIGHT: f32 = 12.;
 
+/// A style card: the window drawn small, its name and what it is.
+const STYLE_CARD_WIDTH: f32 = 256.;
+const STYLE_PREVIEW_HEIGHT: f32 = 120.;
+
 /// A page of Appearance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Theme,
+    /// The look of the window and its scale (part 10.4).
+    Interface,
     FileIcons,
     Language,
 }
@@ -44,10 +55,29 @@ impl Page {
     pub fn title(self) -> &'static str {
         match self {
             Page::Theme => tr("Theme"),
+            Page::Interface => tr("Interface"),
             Page::FileIcons => tr("File Icons"),
             Page::Language => tr("Language"),
         }
     }
+}
+
+/// The looks of the window, in the order of the page and of Quick Switch.
+pub const STYLES: [UiStyle; 2] = [UiStyle::Islands, UiStyle::Flat];
+
+/// A look's name.
+pub fn style_name(style: UiStyle) -> &'static str {
+    match style {
+        UiStyle::Islands => tr("Islands"),
+        UiStyle::Flat => tr("Flat"),
+    }
+}
+
+/// The step of [`ui_scale::STEPS`] a scale is, if it is one (a hand-edited file may hold another).
+fn scale_step(scale: f32) -> Option<usize> {
+    ui_scale::STEPS
+        .iter()
+        .position(|step| (step - scale).abs() < 0.001)
 }
 
 /// The page shown in Settings.
@@ -288,6 +318,188 @@ impl AppearancePage {
             )
     }
 
+    // --- Interface (part 10.4) ---
+
+    fn render_interface(&self, cx: &mut Context<Self>) -> Div {
+        let ui = Theme::ui(cx);
+        let current = ui::style(cx);
+        // The window drawn small in the theme's own colors, glass included: the global theme's
+        // surfaces are already opaque while Flat is on.
+        let shown = Theme::get(cx);
+        let theme = theme::by_name(&shown.name, cx).unwrap_or_else(|| shown.clone());
+        let cards = STYLES.into_iter().enumerate().map(|(index, style)| {
+            let selected = style == current;
+            div()
+                .id(("style-card", index))
+                .flex_none()
+                .w(px(STYLE_CARD_WIDTH))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_1p5()
+                .rounded(px(ui::RADIUS_LG))
+                .border_2()
+                .border_color(if selected { ui.accent } else { ui.island_border })
+                .cursor_pointer()
+                .hover(move |card| card.bg(ui.hover))
+                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                    ui::set_style(style, cx);
+                    cx.notify();
+                }))
+                .child(style_preview(&theme, style))
+                .child(
+                    div()
+                        .px_1()
+                        .pb_0p5()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ui.foreground)
+                                        .child(style_name(style)),
+                                )
+                                .when(selected, |row| {
+                                    row.child(icon(IconName::Check, ui.accent_text).size(px(14.)))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::TEXT_XS))
+                                .text_color(ui.dim)
+                                .child(match style {
+                                    UiStyle::Islands => tr("Rounded panels on the window’s glass"),
+                                    UiStyle::Flat => tr("Panels edge to edge, divided by lines"),
+                                }),
+                        ),
+                )
+        });
+        let scale = settings::ui_scale(cx);
+        let step = scale_step(scale);
+        let steps = ui_scale::STEPS.iter().enumerate().map(|(index, value)| {
+            let value = *value;
+            let selected = step == Some(index);
+            div()
+                .id(("scale-step", index))
+                .flex_none()
+                .min_w(px(52.))
+                .h(px(28.))
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(ui::RADIUS_SM))
+                .cursor_pointer()
+                .text_color(if selected { ui.accent_text } else { ui.text_muted })
+                .when(selected, |chip| {
+                    chip.bg(ui.list_selected).font_weight(FontWeight::SEMIBOLD)
+                })
+                .when(!selected, |chip| {
+                    chip.hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
+                })
+                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                    ui_scale::set(value, cx);
+                    cx.notify();
+                }))
+                .child(ui_scale::label(value))
+        });
+        // The keys of Zoom In / Zoom Out / Reset, as their commands have them.
+        let hints: Vec<(SharedString, &'static str)> = [
+            (
+                ui::shortcut_for(&ui_scale::ZoomIn, cx),
+                tr("Zoom In"),
+            ),
+            (
+                ui::shortcut_for(&ui_scale::ZoomOut, cx),
+                tr("Zoom Out"),
+            ),
+            (ui::shortcut_for(&ui_scale::ResetZoom, cx), tr("Reset")),
+        ]
+        .into_iter()
+        .filter_map(|(keys, label)| Some((keys?, label)))
+        .collect();
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(header(
+                tr("Interface"),
+                tr("The look of the window and its scale. Both change at once, in every window."),
+                ui,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(ui::section_label(tr("Style"), ui))
+                    .child(div().flex().flex_wrap().gap_3().children(cards)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(ui::section_label(tr("Scale"), ui))
+                            .child(
+                                div()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.dim)
+                                    .child(ui_scale::label(scale)),
+                            ),
+                    )
+                    .child(div().text_color(ui.text_muted).child(tr(
+                        "Everything in the window — panels, icons, the code — larger or smaller.",
+                    )))
+                    // The steps as one segmented control, as wide as they are (they wrap in a
+                    // narrow window: at 200 % the page has half the room).
+                    .child(
+                        div().flex().child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .p_1()
+                                .rounded(px(ui::RADIUS_MD))
+                                .border_1()
+                                .border_color(ui.island_border)
+                                .children(steps),
+                        ),
+                    )
+                    .when(!hints.is_empty(), |section| {
+                        section.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_x_4()
+                                .gap_y_1()
+                                .text_size(px(theme::TEXT_SM))
+                                .children(hints.into_iter().map(|(keys, label)| {
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(ui::keys(&keys, ui))
+                                        .child(div().text_color(ui.dim).child(label))
+                                })),
+                        )
+                    }),
+            )
+    }
+
     // --- File Icons ---
 
     fn render_file_icons(&self, window: &Window, cx: &mut Context<Self>) -> Div {
@@ -515,6 +727,7 @@ impl Render for AppearancePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.page {
             Page::Theme => self.render_theme(window, cx),
+            Page::Interface => self.render_interface(cx),
             Page::FileIcons => self.render_file_icons(window, cx),
             Page::Language => self.render_language(cx),
         }
@@ -780,4 +993,217 @@ fn theme_preview(theme: &Theme) -> Div {
         .overflow_hidden()
         .child(tree)
         .child(editor)
+}
+
+/// The window drawn small in `theme`'s colors, laid out the way `style` lays it out (part 10.4):
+/// Islands — rounded islands apart on the frame with its glow; Flat — panels edge to edge, divided
+/// by lines. The title bar with the traffic lights, the launchpad, the tree, the editor with a tab
+/// and a few lines of code, the terminal under it, the status bar.
+fn style_preview(theme: &Theme, style: UiStyle) -> Div {
+    let flat = style == UiStyle::Flat;
+    let ui = theme.ui;
+    // The preview sits on another surface, so it is drawn opaque, as a Flat window is.
+    let surfaces = theme::with_surfaces_for(UiStyle::Flat, theme.clone()).ui;
+    let line = ui.island_border;
+    let gap = if flat { 0. } else { 3. };
+    let bar = |width: f32, color: Hsla| {
+        div()
+            .flex_none()
+            .h(px(3.))
+            .w(gpui::relative(width))
+            .rounded(px(1.5))
+            .bg(UiColors::tint(color, 0.7))
+    };
+    let code = |scope: &str, width: f32| {
+        bar(
+            width,
+            theme
+                .style_for(scope)
+                .map_or(ui.foreground, |style| style.color),
+        )
+    };
+    // An island with its border and corners, or a Flat panel (its lines come from the layout).
+    let panel = || {
+        div()
+            .bg(surfaces.island)
+            .overflow_hidden()
+            .when(!flat, |panel| {
+                panel
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(line)
+            })
+    };
+    let light = |color: Hsla| div().size(px(5.)).rounded(px(2.5)).bg(UiColors::tint(color, 0.85));
+    let title = div()
+        .flex_none()
+        .h(px(15.))
+        .px(px(6.))
+        .flex()
+        .items_center()
+        .gap(px(3.))
+        .child(light(ui.red))
+        .child(light(ui.amber))
+        .child(light(ui.green));
+    let tool = |active: bool| {
+        div().size(px(6.)).rounded(px(1.5)).bg(if active {
+            ui.accent
+        } else {
+            UiColors::tint(ui.text_muted, 0.45)
+        })
+    };
+    let launchpad = div()
+        .flex_none()
+        .w(px(13.))
+        .h_full()
+        .pt(px(if flat { 3. } else { 1. }))
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(4.))
+        .when(flat, |strip| strip.border_r_1().border_color(line))
+        .child(tool(true))
+        .child(tool(false))
+        .child(tool(false));
+    let tree = panel()
+        .flex_none()
+        .w(px(52.))
+        .h_full()
+        .p(px(5.))
+        .flex()
+        .flex_col()
+        .gap(px(5.))
+        .when(flat, |tree| tree.border_r_1().border_color(line))
+        .child(bar(0.7, ui.text_muted))
+        .child(
+            div()
+                .mx(px(-3.))
+                .px(px(3.))
+                .py(px(2.))
+                .rounded(px(2.))
+                .bg(ui.list_selected)
+                .child(bar(0.8, ui.foreground)),
+        )
+        .child(bar(0.55, ui.vcs_modified))
+        .child(bar(0.75, ui.vcs_added))
+        .child(bar(0.5, ui.text_muted));
+    let line_of = |indent: f32, pieces: Vec<Div>| {
+        div()
+            .flex_none()
+            .pl(px(indent))
+            .flex()
+            .gap(px(3.))
+            .children(pieces)
+    };
+    let editor = panel()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex_none()
+                .h(px(11.))
+                .px(px(4.))
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(24.))
+                        .h(px(6.))
+                        .rounded(px(if flat { 1. } else { 3. }))
+                        .bg(ui.list_selected_inactive),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .h(px(1.))
+                .mx(px(if flat { 0. } else { 3. }))
+                .bg(ui.divider),
+        )
+        .child(
+            div()
+                .flex_1()
+                .p(px(5.))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(line_of(0., vec![code("keyword", 0.16), code("function", 0.28)]))
+                .child(line_of(8., vec![code("keyword", 0.14), code("string", 0.3)]))
+                .child(line_of(8., vec![code("comment", 0.4)]))
+                .child(line_of(0., vec![code("punctuation.bracket", 0.05)])),
+        );
+    let terminal = panel()
+        .flex_none()
+        .h(px(24.))
+        .p(px(5.))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .when(flat, |terminal| terminal.border_t_1().border_color(line))
+        .child(bar(0.45, ui.text_muted))
+        .child(bar(0.25, ui.success));
+    let main = div()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .flex()
+        .flex_col()
+        .gap(px(gap))
+        .child(editor)
+        .child(terminal);
+    let body = div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_row()
+        .gap(px(gap))
+        .pl(px(if flat { 0. } else { 1. }))
+        .pr(px(gap))
+        .when(flat, |body| body.border_y_1().border_color(line))
+        .child(launchpad)
+        .child(tree)
+        .child(main);
+    div()
+        .relative()
+        .h(px(STYLE_PREVIEW_HEIGHT))
+        .flex()
+        .flex_col()
+        .rounded(px(ui::RADIUS_MD))
+        .bg(surfaces.frame)
+        // The frame's glow, with the preview's own corners (a child's background isn't clipped by
+        // the parent's rounding).
+        .when(!flat, |window| {
+            window.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(ui::RADIUS_MD))
+                    .bg(gpui::linear_gradient(
+                        135.,
+                        gpui::linear_color_stop(ui.frame_glow, 0.),
+                        gpui::linear_color_stop(UiColors::tint(ui.frame_glow, 0.), 0.55),
+                    )),
+            )
+        })
+        .child(title)
+        .child(body)
+        .child(div().flex_none().h(px(9.)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Interface page marks the step the scale is; a scale between steps (a hand-edited
+    /// settings file) marks none.
+    #[test]
+    fn the_scale_marks_its_step() {
+        assert_eq!(scale_step(1.), ui_scale::STEPS.iter().position(|step| *step == 1.));
+        assert_eq!(scale_step(1.25), ui_scale::STEPS.iter().position(|step| *step == 1.25));
+        assert_eq!(scale_step(1.2500001), scale_step(1.25));
+        assert_eq!(scale_step(1.05), None);
+        assert_eq!(STYLES, [UiStyle::Islands, UiStyle::Flat]);
+    }
 }

@@ -21,6 +21,7 @@ mod claude_transcript;
 mod claude_turns;
 mod code_actions;
 mod command_palette;
+mod command_usage;
 mod commit_details;
 mod commit_panel;
 mod compare_dialog;
@@ -58,6 +59,7 @@ mod locations;
 mod log_actions;
 mod lsp;
 mod markdown;
+mod markdown_preview;
 mod merge_view;
 mod navigation;
 mod notification_center;
@@ -81,6 +83,7 @@ mod plugin_updates;
 mod plugin_view;
 mod plugins;
 mod popup;
+mod project_popup;
 mod project_search;
 mod project_state;
 mod prompt_input;
@@ -105,6 +108,7 @@ mod terminal_search;
 mod terminal_view;
 mod theme;
 mod ui;
+mod ui_scale;
 mod vcs_menu;
 mod workspace;
 
@@ -223,6 +227,10 @@ fn main() {
             plugin_manager::init(cx);
             plugin_settings::init(cx);
             task_contexts::init(cx);
+            ui_scale::init(cx);
+            project_popup::init(cx);
+            command_usage::init(cx);
+            markdown_preview::init(cx);
 
             // The project of the command line, or the projects open when Flux quit (part 10.1).
             let _window = workspace::open_startup_windows(root, paths, cx)

@@ -1145,7 +1145,7 @@ impl Render for ConflictsDialog {
             }))
             .on_action(cx.listener(|_, _: &Dismiss, _, cx| cx.emit(DismissEvent)))
             .w(px(WIDTH))
-            .h(px(HEIGHT))
+            .h(px(ui::dialog_height(HEIGHT, window)))
             .flex()
             .flex_col()
             .child(

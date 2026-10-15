@@ -46,13 +46,16 @@ pub struct Settings {
     /// Settings → System → Projects (part 10.1): where another project opens, reopening the
     /// projects on startup.
     pub projects: ProjectSettings,
+    /// How a Markdown file opens (part 10.4): the text, the text and its preview side by side, or
+    /// the preview; the layout chosen last becomes the default (`markdown.layout`).
+    pub markdown_layout: MarkdownLayout,
     /// Where the settings are saved; `None` — kept in memory only.
     path: Option<PathBuf>,
 }
 
 /// Settings → Appearance (stage 8.3): themes and icons are chosen by name among those the
 /// turned-on plugins bring; a name that is gone falls back to the default.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppearanceSettings {
     /// The chosen theme; `None` — Flux Night.
     pub theme: Option<String>,
@@ -67,6 +70,86 @@ pub struct AppearanceSettings {
     pub icon_theme: Option<String>,
     /// The interface language.
     pub language: LanguageChoice,
+    /// The look of the window (part 10.4): islands on glass, or flat panels edge to edge.
+    pub ui_style: UiStyle,
+    /// The interface scale (part 10.4), 1.0 — 100 %: the whole window, the code included, as Zoom
+    /// IDE of JetBrains IDEs (`crate::ui_scale`).
+    pub ui_scale: f32,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            theme: None,
+            sync_with_os: false,
+            light_theme: None,
+            dark_theme: None,
+            icon_theme: None,
+            language: LanguageChoice::default(),
+            ui_style: UiStyle::default(),
+            ui_scale: 1.,
+        }
+    }
+}
+
+/// The look of the window (Settings → Appearance → Interface, part 10.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UiStyle {
+    /// Islands on glass: rounded panels with gaps on the window's blurred frame (since the
+    /// redesign of 2026-10-08).
+    #[default]
+    Islands,
+    /// Flat panels edge to edge, divided by lines, on an opaque window (as before the redesign,
+    /// and as the classic look of JetBrains IDEs).
+    Flat,
+}
+
+impl UiStyle {
+    pub fn key(self) -> &'static str {
+        match self {
+            UiStyle::Islands => "islands",
+            UiStyle::Flat => "flat",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "islands" => Some(UiStyle::Islands),
+            "flat" => Some(UiStyle::Flat),
+            _ => None,
+        }
+    }
+}
+
+/// How a Markdown file opens (part 10.4), as the three buttons of JetBrains IDEs' Markdown editor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MarkdownLayout {
+    /// The text only.
+    Editor,
+    /// The text and its preview side by side.
+    #[default]
+    Split,
+    /// The preview only.
+    Preview,
+}
+
+impl MarkdownLayout {
+    pub fn key(self) -> &'static str {
+        match self {
+            MarkdownLayout::Editor => "editor",
+            MarkdownLayout::Split => "split",
+            MarkdownLayout::Preview => "preview",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "editor" => Some(MarkdownLayout::Editor),
+            "split" => Some(MarkdownLayout::Split),
+            "preview" => Some(MarkdownLayout::Preview),
+            _ => None,
+        }
+    }
 }
 
 /// The interface language: the system's (the first of its preferred languages Flux speaks), or one
@@ -251,6 +334,7 @@ impl Default for Settings {
             check_plugin_updates: true,
             ignored_suggestions: BTreeSet::new(),
             projects: ProjectSettings::default(),
+            markdown_layout: MarkdownLayout::default(),
             path: None,
         }
     }
@@ -422,6 +506,34 @@ pub fn update_appearance(cx: &mut App, change: impl FnOnce(&mut AppearanceSettin
     save(settings);
 }
 
+/// The look of the window (part 10.4).
+pub fn ui_style(cx: &App) -> UiStyle {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.appearance.ui_style)
+        .unwrap_or_default()
+}
+
+/// The interface scale (part 10.4), 1.0 — 100 %.
+pub fn ui_scale(cx: &App) -> f32 {
+    cx.try_global::<Settings>()
+        .map_or(1., |settings| settings.appearance.ui_scale)
+}
+
+/// How a Markdown file opens (part 10.4).
+pub fn markdown_layout(cx: &App) -> MarkdownLayout {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.markdown_layout)
+        .unwrap_or_default()
+}
+
+pub fn set_markdown_layout(layout: MarkdownLayout, cx: &mut App) {
+    let settings = cx.default_global::<Settings>();
+    if settings.markdown_layout != layout {
+        settings.markdown_layout = layout;
+        save(settings);
+    }
+}
+
 /// Whether Flux looks for plugin updates when it starts.
 pub fn check_plugin_updates(cx: &App) -> bool {
     cx.try_global::<Settings>()
@@ -561,6 +673,10 @@ fn parse(text: &str) -> Settings {
                 .as_bool()
                 .unwrap_or(defaults.projects.reopen),
         },
+        markdown_layout: value["markdown"]["layout"]
+            .as_str()
+            .and_then(MarkdownLayout::from_key)
+            .unwrap_or_default(),
         ..defaults
     }
 }
@@ -582,6 +698,15 @@ fn parse_appearance(value: &Value) -> AppearanceSettings {
             .as_str()
             .and_then(LanguageChoice::from_key)
             .unwrap_or_default(),
+        ui_style: value["ui_style"]
+            .as_str()
+            .and_then(UiStyle::from_key)
+            .unwrap_or_default(),
+        ui_scale: value["ui_scale"]
+            .as_f64()
+            .map(|scale| scale as f32)
+            .filter(|scale| scale.is_finite())
+            .map_or(1., crate::ui_scale::clamp),
     }
 }
 
@@ -663,6 +788,9 @@ fn to_json(settings: &Settings) -> String {
             "dark_theme": settings.appearance.dark_theme,
             "icon_theme": settings.appearance.icon_theme,
             "language": settings.appearance.language.key(),
+            "ui_style": settings.appearance.ui_style.key(),
+            // 0.9, not the f32's 0.8999999761581421.
+            "ui_scale": (f64::from(settings.appearance.ui_scale) * 100.).round() / 100.,
         },
         "claude": {
             "enabled": settings.claude.enabled,
@@ -684,6 +812,7 @@ fn to_json(settings: &Settings) -> String {
             "open_in": settings.projects.open_in.key(),
             "reopen": settings.projects.reopen,
         },
+        "markdown": { "layout": settings.markdown_layout.key() },
     });
     serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
 }
@@ -744,6 +873,8 @@ mod tests {
                 dark_theme: Some("Flux Night".to_string()),
                 icon_theme: Some("Flux Icons".to_string()),
                 language: LanguageChoice::Russian,
+                ui_style: UiStyle::Flat,
+                ui_scale: 1.25,
             },
             check_plugin_updates: false,
             ignored_suggestions: BTreeSet::from(["*.rs".to_string()]),
@@ -751,6 +882,7 @@ mod tests {
                 open_in: OpenProjectIn::NewWindow,
                 reopen: false,
             },
+            markdown_layout: MarkdownLayout::Preview,
             path: None,
         };
         assert_eq!(parse(&to_json(&off)), off);

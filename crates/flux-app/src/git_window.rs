@@ -39,7 +39,6 @@ const TAB_HEIGHT: f32 = 26.;
 const TAB_GROUP: &str = "git-window-tab";
 const RESIZE_GROUP: &str = "git-window-resize";
 const RESIZE_HANDLE_HEIGHT: f32 = GAP;
-const RESIZE_HANDLE_OFFSET: f32 = 1. + RESIZE_HANDLE_HEIGHT / 2.;
 
 /// A tab of the Git window being dragged: also the label next to the pointer.
 #[derive(Clone)]
@@ -572,12 +571,14 @@ fn drop_marker(after: bool, ui: UiColors) -> impl IntoElement {
         .bg(ui.accent)
 }
 
-fn resize_handle(resizing: bool, ui: UiColors) -> impl IntoElement {
+/// Its middle is `center` past the edge (`ui::resize_handle_center`): in the gap between islands,
+/// or on the line between Flat panels (part 10.4).
+fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement {
     div()
         .id("git-window-resize")
         .group(RESIZE_GROUP)
         .absolute()
-        .top(px(-(1. + RESIZE_HANDLE_HEIGHT)))
+        .top(px(-(center + RESIZE_HANDLE_HEIGHT / 2.)))
         .left_0()
         .right_0()
         .h(px(RESIZE_HANDLE_HEIGHT))
@@ -635,7 +636,7 @@ impl Render for GitWindow {
             .on_drag_move(
                 cx.listener(move |this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
                     let height = f32::from(event.bounds.bottom() - event.event.position.y)
-                        - RESIZE_HANDLE_OFFSET;
+                        - ui::resize_handle_center(ui::style(cx));
                     height_cell.set_within(height, max_height);
                     this.resizing = true;
                     cx.notify();
@@ -650,7 +651,7 @@ impl Render for GitWindow {
                     .pb_1p5()
                     .children(self.active_view()),
             )
-            .child(resize_handle(self.resizing, ui))
+            .child(resize_handle(self.resizing, ui::resize_handle_center(ui::style(cx)), ui))
             .children(
                 self.menu
                     .as_ref()

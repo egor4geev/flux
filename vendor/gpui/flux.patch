@@ -1,0 +1,480 @@
+diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
+--- a/src/platform/mac/metal_renderer.rs	2006-07-24 05:21:28
++++ b/src/platform/mac/metal_renderer.rs	2026-10-15 03:45:09
+@@ -370,8 +370,12 @@
+         loop {
+             let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
+ 
+-            let command_buffer =
+-                self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
++            let command_buffer = self.draw_primitives(
++                scene,
++                &mut instance_buffer,
++                drawable.texture(),
++                viewport_size,
++            );
+ 
+             match command_buffer {
+                 Ok(command_buffer) => {
+@@ -416,11 +420,75 @@
+         }
+     }
+ 
++    /// Flux patch (headless scenario screenshots): renders `scene` into an offscreen texture the
++    /// size of the drawable and returns its pixels — RGBA with premultiplied alpha (the glass
++    /// behind a transparent window is not there). Needs neither the window server nor a visible
++    /// window: it works on a locked screen and for an occluded window.
++    pub fn render_to_image(&mut self, scene: &Scene) -> Option<image::RgbaImage> {
++        let drawable_size = self.layer.drawable_size();
++        let (width, height) = (
++            drawable_size.width.ceil() as u64,
++            drawable_size.height.ceil() as u64,
++        );
++        if width == 0 || height == 0 {
++            return None;
++        }
++        let viewport_size: Size<DevicePixels> =
++            size((width as i32).into(), (height as i32).into());
++        let descriptor = metal::TextureDescriptor::new();
++        descriptor.set_texture_type(metal::MTLTextureType::D2);
++        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
++        descriptor.set_width(width);
++        descriptor.set_height(height);
++        descriptor.set_usage(
++            metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
++        );
++        descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
++        let texture = self.device.new_texture(&descriptor);
++        loop {
++            let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
++            match self.draw_primitives(scene, &mut instance_buffer, &texture, viewport_size) {
++                Ok(command_buffer) => {
++                    let blit = command_buffer.new_blit_command_encoder();
++                    blit.synchronize_resource(&texture);
++                    blit.end_encoding();
++                    command_buffer.commit();
++                    command_buffer.wait_until_completed();
++                    self.instance_buffer_pool.lock().release(instance_buffer);
++                    break;
++                }
++                Err(err) => {
++                    log::error!("failed to render offscreen: {err}");
++                    let mut instance_buffer_pool = self.instance_buffer_pool.lock();
++                    let buffer_size = instance_buffer_pool.buffer_size;
++                    if buffer_size >= 256 * 1024 * 1024 {
++                        return None;
++                    }
++                    instance_buffer_pool.reset(buffer_size * 2);
++                }
++            }
++        }
++        let mut bytes = vec![0u8; (width * height * 4) as usize];
++        texture.get_bytes(
++            bytes.as_mut_ptr() as *mut c_void,
++            width * 4,
++            metal::MTLRegion::new_2d(0, 0, width, height),
++            0,
++        );
++        // BGRA → RGBA.
++        for pixel in bytes.chunks_exact_mut(4) {
++            pixel.swap(0, 2);
++        }
++        image::RgbaImage::from_raw(width as u32, height as u32, bytes)
++    }
++
++    /// Flux patch: draws into `target` — the layer's drawable, or an offscreen texture
++    /// ([`Self::render_to_image`]).
+     fn draw_primitives(
+         &mut self,
+         scene: &Scene,
+         instance_buffer: &mut InstanceBuffer,
+-        drawable: &metal::MetalDrawableRef,
++        target: &metal::TextureRef,
+         viewport_size: Size<DevicePixels>,
+     ) -> Result<metal::CommandBuffer> {
+         let command_queue = self.command_queue.clone();
+@@ -430,7 +498,7 @@
+ 
+         let mut command_encoder = new_command_encoder(
+             command_buffer,
+-            drawable,
++            target,
+             viewport_size,
+             |color_attachment| {
+                 color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+@@ -467,7 +535,7 @@
+ 
+                     command_encoder = new_command_encoder(
+                         command_buffer,
+-                        drawable,
++                        target,
+                         viewport_size,
+                         |color_attachment| {
+                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
+@@ -1158,7 +1226,7 @@
+ 
+ fn new_command_encoder<'a>(
+     command_buffer: &'a metal::CommandBufferRef,
+-    drawable: &'a metal::MetalDrawableRef,
++    target: &'a metal::TextureRef,
+     viewport_size: Size<DevicePixels>,
+     configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
+ ) -> &'a metal::RenderCommandEncoderRef {
+@@ -1167,7 +1235,7 @@
+         .color_attachments()
+         .object_at(0)
+         .unwrap();
+-    color_attachment.set_texture(Some(drawable.texture()));
++    color_attachment.set_texture(Some(target));
+     color_attachment.set_store_action(metal::MTLStoreAction::Store);
+     configure_color_attachment(color_attachment);
+ 
+diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
+--- a/src/platform/mac/window.rs	2006-07-24 05:21:28
++++ b/src/platform/mac/window.rs	2026-10-15 03:46:06
+@@ -455,6 +455,12 @@
+                         - traffic_light_position.y
+                         - px(close_button_frame.size.height as f32),
+                 );
++                // Flux patch: the buttons stay inside the system title bar — below it they would
++                // be cut off and wouldn't take clicks (a title bar taller than the system's, at an
++                // interface scale above 100 %).
++                if origin.y < px(0.) {
++                    origin.y = px(0.);
++                }
+                 let button_spacing =
+                     px((min_button_frame.origin.x - close_button_frame.origin.x) as f32);
+ 
+@@ -1474,6 +1480,11 @@
+         this.renderer.draw(scene);
+     }
+ 
++    #[cfg(not(feature = "macos-blade"))]
++    fn render_to_image(&self, scene: &crate::Scene) -> Option<image::RgbaImage> {
++        self.0.lock().renderer.render_to_image(scene)
++    }
++
+     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+         self.0.lock().renderer.sprite_atlas().clone()
+     }
+@@ -1496,6 +1507,12 @@
+                 }
+             })
+             .detach()
++    }
++
++    fn set_traffic_light_position(&self, position: Option<Point<Pixels>>) {
++        let mut this = self.0.lock();
++        this.traffic_light_position = position;
++        this.move_traffic_light();
+     }
+ 
+     fn titlebar_double_click(&self) {
+diff -ruN a/src/platform.rs b/src/platform.rs
+--- a/src/platform.rs	2006-07-24 05:21:28
++++ b/src/platform.rs	2026-10-15 03:46:59
+@@ -499,6 +499,11 @@
+     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
+     fn draw(&self, scene: &Scene);
+     fn completed_frame(&self) {}
++    /// Flux patch (headless scenario screenshots): `scene` rendered offscreen, RGBA with
++    /// premultiplied alpha, if the platform can.
++    fn render_to_image(&self, _scene: &Scene) -> Option<image::RgbaImage> {
++        None
++    }
+     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+ 
+     // macOS specific methods
+@@ -514,6 +519,8 @@
+     fn set_edited(&mut self, _edited: bool) {}
+     fn show_character_palette(&self) {}
+     fn titlebar_double_click(&self) {}
++    /// Flux patch: see `Window::set_traffic_light_position`.
++    fn set_traffic_light_position(&self, _position: Option<Point<Pixels>>) {}
+     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
+     fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
+     fn on_select_previous_tab(&self, _callback: Box<dyn FnMut()>) {}
+@@ -940,7 +947,11 @@
+ 
+     fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
+         self.cx
+-            .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
++            .update(|window, cx| {
++                // Flux patch (interface scale): the platform takes window points.
++                let bounds = self.handler.bounds_for_range(range_utf16, window, cx)?;
++                Some(crate::window::scale_bounds(bounds, window.ui_scale()))
++            })
+             .ok()
+             .flatten()
+     }
+@@ -970,7 +981,11 @@
+     #[allow(unused)]
+     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
+         self.cx
+-            .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
++            .update(|window, cx| {
++                // Flux patch (interface scale): the platform gives window points.
++                let point = point * (1. / window.ui_scale());
++                self.handler.character_index_for_point(point, window, cx)
++            })
+             .ok()
+             .flatten()
+     }
+diff -ruN a/src/taffy.rs b/src/taffy.rs
+--- a/src/taffy.rs	2006-07-24 05:21:28
++++ b/src/taffy.rs	2026-10-15 03:27:31
+@@ -309,7 +309,7 @@
+             unit: &Option<u16>,
+         ) -> Vec<taffy::GridTemplateComponent<T>> {
+             // grid-template-columns: repeat(<number>, minmax(0, 1fr));
+-            unit.map(|count| vec![repeat(count, vec![minmax(length(0.0), fr(1.0))])])
++            unit.map(|count| vec![repeat(count, vec![minmax(length(0.0_f32), fr(1.0_f32))])])
+                 .unwrap_or_default()
+         }
+ 
+diff -ruN a/src/window.rs b/src/window.rs
+--- a/src/window.rs	2006-07-24 05:21:28
++++ b/src/window.rs	2026-10-15 03:46:59
+@@ -7,11 +7,12 @@
+     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
+     FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
+     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
+-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
+-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
++    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton,
++    MouseDownEvent, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton, PromptLevel, Quad,
+     Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
++    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
++    ScrollDelta, ScrollWheelEvent, Shadow,
+     SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
+     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+@@ -856,6 +857,8 @@
+     modifiers: Modifiers,
+     capslock: Capslock,
+     scale_factor: f32,
++    /// Flux patch (interface scale): see [`Window::set_ui_scale`].
++    ui_scale: f32,
+     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
+     appearance: WindowAppearance,
+     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
+@@ -1125,7 +1128,12 @@
+             let mut cx = cx.to_async();
+             Box::new(move |event| {
+                 handle
+-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
++                    .update(&mut cx, |_, window, cx| {
++                        // Flux patch (interface scale): the platform's positions are in window
++                        // points.
++                        let event = scale_platform_input(event, 1. / window.ui_scale);
++                        window.dispatch_event(event, cx)
++                    })
+                     .log_err()
+                     .unwrap_or(DispatchEventResult::default())
+             })
+@@ -1239,6 +1247,7 @@
+             modifiers,
+             capslock,
+             scale_factor,
++            ui_scale: 1.,
+             bounds_observers: SubscriberSet::new(),
+             appearance,
+             appearance_observers: SubscriberSet::new(),
+@@ -1673,8 +1682,10 @@
+     }
+ 
+     fn bounds_changed(&mut self, cx: &mut App) {
+-        self.scale_factor = self.platform_window.scale_factor();
+-        self.viewport_size = self.platform_window.content_size();
++        // Flux patch (interface scale): a viewport `ui_scale` times smaller, drawn `ui_scale` times
++        // larger.
++        self.scale_factor = self.platform_window.scale_factor() * self.ui_scale;
++        self.viewport_size = scale_size(self.platform_window.content_size(), 1. / self.ui_scale);
+         self.display_id = self.platform_window.display().map(|display| display.id());
+ 
+         self.refresh();
+@@ -1691,7 +1702,9 @@
+ 
+     /// Set the content size of the window.
+     pub fn resize(&mut self, size: Size<Pixels>) {
+-        self.platform_window.resize(size);
++        // Flux patch (interface scale): the platform takes window points.
++        self.platform_window
++            .resize(scale_size(size, self.ui_scale));
+     }
+ 
+     /// Returns whether or not the window is currently fullscreen
+@@ -1744,7 +1757,9 @@
+ 
+     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
+     pub fn show_window_menu(&self, position: Point<Pixels>) {
+-        self.platform_window.show_window_menu(position)
++        // Flux patch (interface scale): the platform takes window points.
++        self.platform_window
++            .show_window_menu(position * self.ui_scale)
+     }
+ 
+     /// Tells the compositor to take control of window movement (Wayland and X11)
+@@ -1816,6 +1831,41 @@
+         self.scale_factor
+     }
+ 
++    /// Flux patch (interface scale): how many times larger than the platform draws it the window
++    /// shows everything — 1.0 by default. See [`Window::set_ui_scale`].
++    pub fn ui_scale(&self) -> f32 {
++        self.ui_scale
++    }
++
++    /// Flux patch (interface scale): shows the whole window `scale` times larger (or smaller), as
++    /// zooming a web page: the window lays out a viewport `scale` times smaller than its content
++    /// size and draws it with the display's scale factor times `scale`, so text, images, borders
++    /// and shadows all scale together and stay sharp. Positions from the platform (the mouse, file
++    /// drops, the input method) are divided by the scale, positions given to it multiplied; the
++    /// window's bounds and the displays stay in the screen's points.
++    pub fn set_ui_scale(&mut self, scale: f32, cx: &mut App) {
++        let scale = if scale.is_finite() && scale > 0. {
++            scale
++        } else {
++            1.
++        };
++        if scale == self.ui_scale {
++            return;
++        }
++        // The pointer stays where it is on the screen.
++        self.mouse_position = self.mouse_position * (self.ui_scale / scale);
++        self.ui_scale = scale;
++        self.bounds_changed(cx);
++    }
++
++    /// Flux patch: moves the macOS traffic lights — the top-left corner of the close button, in the
++    /// window's points (not scaled by [`Window::ui_scale`]), as
++    /// [`TitlebarOptions::traffic_light_position`]; `None` — where the system puts them. A no-op
++    /// elsewhere.
++    pub fn set_traffic_light_position(&self, position: Option<Point<Pixels>>) {
++        self.platform_window.set_traffic_light_position(position);
++    }
++
+     /// The size of an em for the base font of the application. Adjusting this value allows the
+     /// UI to scale, just like zooming a web page.
+     pub fn rem_size(&self) -> Pixels {
+@@ -2010,6 +2060,29 @@
+         profiling::finish_frame!();
+     }
+ 
++    /// Flux patch (headless scenario frames): what the platform's frame callback does, without
++    /// presenting — runs the next-frame callbacks and draws the window if it is dirty. The display
++    /// link that drives frames stops for an occluded window, and a locked screen occludes all of
++    /// them; Flux's scenarios then call this on a timer.
++    pub fn headless_frame(&mut self, cx: &mut App) {
++        let callbacks = self.next_frame_callbacks.take();
++        for callback in callbacks {
++            callback(self, cx);
++        }
++        if self.invalidator.is_dirty() {
++            let arena_clear_needed = self.draw(cx);
++            arena_clear_needed.clear();
++        }
++        self.complete_frame();
++    }
++
++    /// Flux patch (headless scenario screenshots): the window's current frame rendered offscreen —
++    /// RGBA with premultiplied alpha, in device pixels — without the window server.
++    pub fn render_to_image(&mut self, cx: &mut App) -> Option<image::RgbaImage> {
++        self.headless_frame(cx);
++        self.platform_window.render_to_image(&self.rendered_frame.scene)
++    }
++
+     fn draw_roots(&mut self, cx: &mut App) {
+         self.invalidator.set_phase(DrawPhase::Prepaint);
+         self.tooltip_bounds.take();
+@@ -4128,7 +4201,10 @@
+         self.on_next_frame(|window, cx| {
+             if let Some(mut input_handler) = window.platform_window.take_input_handler() {
+                 if let Some(bounds) = input_handler.selected_bounds(window, cx) {
+-                    window.platform_window.update_ime_position(bounds);
++                    // Flux patch (interface scale): the platform takes window points.
++                    window
++                        .platform_window
++                        .update_ime_position(scale_bounds(bounds, window.ui_scale));
+                 }
+                 window.platform_window.set_input_handler(input_handler);
+             }
+@@ -5099,5 +5175,76 @@
+         border_widths: (1.).into(),
+         border_color: border_color.into(),
+         border_style,
++    }
++}
++
++/// Flux patch (interface scale): the positions of a platform event — window points — in the
++/// window's pixels at the interface scale (`factor` = 1 / [`Window::ui_scale`]); a scroll by pixels
++/// is converted too, so the content follows the fingers. Keys and modifiers are left as they are.
++fn scale_platform_input(event: PlatformInput, factor: f32) -> PlatformInput {
++    if factor == 1. {
++        return event;
++    }
++    match event {
++        PlatformInput::MouseDown(event) => PlatformInput::MouseDown(MouseDownEvent {
++            position: event.position * factor,
++            ..event
++        }),
++        PlatformInput::MouseUp(event) => PlatformInput::MouseUp(MouseUpEvent {
++            position: event.position * factor,
++            ..event
++        }),
++        PlatformInput::MouseMove(event) => PlatformInput::MouseMove(MouseMoveEvent {
++            position: event.position * factor,
++            ..event
++        }),
++        PlatformInput::MouseExited(event) => PlatformInput::MouseExited(MouseExitEvent {
++            position: event.position * factor,
++            ..event
++        }),
++        PlatformInput::ScrollWheel(event) => PlatformInput::ScrollWheel(ScrollWheelEvent {
++            position: event.position * factor,
++            delta: match event.delta {
++                ScrollDelta::Pixels(delta) => ScrollDelta::Pixels(delta * factor),
++                lines @ ScrollDelta::Lines(_) => lines,
++            },
++            ..event
++        }),
++        PlatformInput::FileDrop(FileDropEvent::Entered { position, paths }) => {
++            PlatformInput::FileDrop(FileDropEvent::Entered {
++                position: position * factor,
++                paths,
++            })
++        }
++        PlatformInput::FileDrop(FileDropEvent::Pending { position }) => {
++            PlatformInput::FileDrop(FileDropEvent::Pending {
++                position: position * factor,
++            })
++        }
++        PlatformInput::FileDrop(FileDropEvent::Submit { position }) => {
++            PlatformInput::FileDrop(FileDropEvent::Submit {
++                position: position * factor,
++            })
++        }
++        event @ (PlatformInput::FileDrop(FileDropEvent::Exited)
++        | PlatformInput::KeyDown(_)
++        | PlatformInput::KeyUp(_)
++        | PlatformInput::ModifiersChanged(_)) => event,
++    }
++}
++
++/// Flux patch (interface scale): a size `factor` times larger.
++fn scale_size(size: Size<Pixels>, factor: f32) -> Size<Pixels> {
++    Size {
++        width: size.width * factor,
++        height: size.height * factor,
++    }
++}
++
++/// Flux patch (interface scale): bounds `factor` times larger, from the window's top-left corner.
++pub(crate) fn scale_bounds(bounds: Bounds<Pixels>, factor: f32) -> Bounds<Pixels> {
++    Bounds {
++        origin: bounds.origin * factor,
++        size: scale_size(bounds.size, factor),
+     }
+ }

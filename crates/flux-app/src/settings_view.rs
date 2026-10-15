@@ -49,9 +49,8 @@ actions!(settings, [Toggle, Dismiss, About]);
 /// The window's size; a small Flux window gets a smaller one, with a margin around it.
 const WIDTH: f32 = 880.;
 const HEIGHT: f32 = 600.;
-/// The margin between Settings and the edges of a small window; the top is under the title bar.
+/// The margin between Settings and the sides of a small window (the height — `ui::dialog_height`).
 const WINDOW_MARGIN: f32 = 16.;
-const WINDOW_TOP: f32 = ui::TITLE_BAR_HEIGHT + 32.;
 const SIDEBAR_WIDTH: f32 = 180.;
 /// About: the logo tile and the column of row labels.
 const ABOUT_LOGO_SIZE: f32 = 64.;
@@ -78,6 +77,8 @@ pub fn init(cx: &mut App) {
 pub enum Section {
     /// Appearance (stage 8.3), first: its pages are listed under it.
     Theme,
+    /// The look of the window and its scale (part 10.4).
+    Interface,
     FileIcons,
     Language,
     /// System Settings: how projects open (part 10.1).
@@ -96,7 +97,12 @@ pub enum Section {
 
 impl Section {
     /// The pages of Appearance, listed under it.
-    const APPEARANCE: [Section; 3] = [Section::Theme, Section::FileIcons, Section::Language];
+    const APPEARANCE: [Section; 4] = [
+        Section::Theme,
+        Section::Interface,
+        Section::FileIcons,
+        Section::Language,
+    ];
 
     /// The sections above the plugins' pages; About goes after them.
     const BUILT_IN: [Section; 6] = [
@@ -111,6 +117,7 @@ impl Section {
     fn label(&self) -> &'static str {
         match self {
             Section::Theme => tr("Theme"),
+            Section::Interface => tr("Interface"),
             Section::FileIcons => tr("File Icons"),
             Section::Language => tr("Language"),
             Section::System => tr("System Settings"),
@@ -125,7 +132,9 @@ impl Section {
 
     fn icon(&self) -> IconName {
         match self {
-            Section::Theme | Section::FileIcons | Section::Language => IconName::Palette,
+            Section::Theme | Section::Interface | Section::FileIcons | Section::Language => {
+                IconName::Palette
+            }
             Section::System => IconName::Settings,
             Section::LanguageServers => IconName::Command,
             Section::VersionControl => IconName::Branch,
@@ -140,6 +149,7 @@ impl Section {
     fn appearance_page(&self) -> Option<Page> {
         match self {
             Section::Theme => Some(Page::Theme),
+            Section::Interface => Some(Page::Interface),
             Section::FileIcons => Some(Page::FileIcons),
             Section::Language => Some(Page::Language),
             _ => None,
@@ -150,6 +160,7 @@ impl Section {
     fn key(&self) -> SharedString {
         match self {
             Section::Theme => "theme".into(),
+            Section::Interface => "interface".into(),
             Section::FileIcons => "file-icons".into(),
             Section::Language => "language".into(),
             Section::System => "system".into(),
@@ -234,6 +245,7 @@ fn scenario_section() -> Option<Section> {
     let section = std::env::var("FLUX_SCENARIO_SETTINGS").ok()?;
     Some(match section.as_str() {
         "theme" => Section::Theme,
+        "interface" => Section::Interface,
         "file-icons" => Section::FileIcons,
         "language" => Section::Language,
         "system" => Section::System,
@@ -676,7 +688,7 @@ impl SettingsView {
                 }
                 window.focus(&self.focus_handle);
             }
-            Section::Theme | Section::FileIcons | Section::Language => {
+            Section::Theme | Section::Interface | Section::FileIcons | Section::Language => {
                 let page = section.appearance_page().unwrap_or(Page::Theme);
                 match &self.appearance {
                     Some(appearance) => {
@@ -1894,7 +1906,7 @@ impl Render for SettingsView {
         let ui = Theme::ui(cx);
         // The Plugins page scrolls its list and its details apart: it takes the whole height.
         let content = match self.section.clone() {
-            Section::Theme | Section::FileIcons | Section::Language => {
+            Section::Theme | Section::Interface | Section::FileIcons | Section::Language => {
                 Some(match &self.appearance {
                     Some(page) => page.clone().into_any_element(),
                     None => div().into_any_element(),
@@ -1932,7 +1944,7 @@ impl Render for SettingsView {
         };
         let viewport = window.viewport_size();
         let width = WIDTH.min(f32::from(viewport.width) - 2. * WINDOW_MARGIN);
-        let height = HEIGHT.min(f32::from(viewport.height) - WINDOW_TOP - WINDOW_MARGIN);
+        let height = ui::dialog_height(HEIGHT, window);
         ui::popover(ui)
             .key_context("Settings")
             .track_focus(&self.focus_handle)

@@ -19,6 +19,7 @@ use gpui::{
 use crate::element::{EditorElement, LayoutCache};
 use crate::highlighter::{self, Highlighter, ParseMode};
 use crate::i18n::{tr, trf};
+use crate::settings::MarkdownLayout;
 use crate::theme::{self, Theme};
 
 actions!(
@@ -229,6 +230,8 @@ pub struct Editor {
     /// When the file was last written as far as this editor knows (opened, saved, reloaded): a
     /// newer time on disk means someone else changed it.
     pub(crate) disk_mtime: Option<std::time::SystemTime>,
+    /// A Markdown file's layout and preview (part 10.4), once the editor has shown it in its tab.
+    pub(crate) markdown: Option<crate::markdown_preview::MarkdownState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -257,6 +260,7 @@ impl Editor {
             // A new theme means a new mapping of captures to its scopes.
             cx.observe_global::<Theme>(|this, cx| {
                 this.highlighter.refresh_map(Theme::get(cx));
+                crate::markdown_preview::theme_changed(this, cx);
                 cx.notify();
             }),
             // Plugins added or took away languages: the document's may have changed.
@@ -327,6 +331,7 @@ impl Editor {
             frame_decorations: None,
             recorded_changes: None,
             disk_mtime: None,
+            markdown: None,
             _subscriptions: subscriptions,
         };
         editor.disk_mtime = editor.document.path().and_then(file_mtime);
@@ -418,7 +423,19 @@ impl Editor {
             recorded.extend(changes.iter().cloned());
         }
         highlighter::parse(self, ParseMode::AfterEdit, cx);
+        crate::markdown_preview::text_changed(self, cx);
         cx.emit(EditorEvent::Edited);
+    }
+
+    /// Whether the editor shows a Markdown file's layouts (part 10.4): an editor of its own tab —
+    /// not the project search's preview, a message field, a side of a diff or of the merge tool
+    /// (their hosts decorate them every frame), or read-only text.
+    pub(crate) fn shows_layouts(&self) -> bool {
+        !self.preview
+            && self.message.is_none()
+            && !self.read_only
+            && self.frame_decorations.is_none()
+            && self.recorded_changes.is_none()
     }
 
     fn edit(
@@ -1086,6 +1103,11 @@ impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use Direction::{Backward, Forward};
         let ui = Theme::ui(cx);
+        // A Markdown file: Editor Only, Editor and Preview, or Preview Only (part 10.4).
+        let markdown = crate::markdown_preview::layout(self, cx);
+        if markdown == Some(MarkdownLayout::Preview) {
+            return crate::markdown_preview::render_preview_only(self, window, cx);
+        }
         // Popups take over some keys while they are shown: the completion menu (↑↓, ↵, ⇥, esc)
         // and the hover (esc).
         let mut key_context = gpui::KeyContext::default();
@@ -1225,8 +1247,11 @@ impl Render for Editor {
             .map(|root| crate::blame::actions(root, self, cx))
             .map(|root| crate::code_actions::actions(root, self, cx))
             .map(|root| crate::editor_menu::actions(root, self, cx))
-            .child(
-                div()
+            .when(markdown.is_some(), |root| {
+                crate::markdown_preview::layout_actions(root, cx)
+            })
+            .child({
+                let text_area = div()
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
@@ -1246,14 +1271,25 @@ impl Render for Editor {
                             )
                     })
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
-                    .child(EditorElement::new(cx.entity())),
-            )
+                    .child(EditorElement::new(cx.entity()));
+                match markdown {
+                    Some(layout) => crate::markdown_preview::render_with_text(
+                        self,
+                        text_area.into_any_element(),
+                        layout,
+                        window,
+                        cx,
+                    ),
+                    None => text_area.into_any_element(),
+                }
+            })
             .children(crate::completion::render(self, window, cx))
             .children(crate::hover::render(self, window, cx))
             .children(crate::git_gutter::render(self, window, cx))
             .children(crate::blame::render(self, window, cx))
             .children(crate::code_actions::render(self, window, cx))
             .children(crate::editor_menu::render(self))
+            .into_any_element()
     }
 }
 

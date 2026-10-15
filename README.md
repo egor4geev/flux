@@ -44,14 +44,38 @@ without leaving the keyboard: <kbd>⌃</kbd><kbd>`</kbd>, as in JetBrains IDEs.
 
 <img src="docs/images/appearance.png" alt="Settings → Appearance → Theme: Flux Night and Flux Day as previews, and Sync with OS" width="100%">
 
+### Islands or flat, at any size
+
+Keep the panels as islands on the glass, or set them flat — edge to edge, divided by thin lines, on a
+solid window, the classic look of JetBrains IDEs. And make the whole window larger or smaller, the code
+included, from 80 to 200 %: <kbd>⌃</kbd><kbd>⌥</kbd><kbd>=</kbd> and <kbd>⌃</kbd><kbd>⌥</kbd><kbd>-</kbd>,
+<kbd>⌃</kbd><kbd>⌥</kbd><kbd>0</kbd> to go back, as Zoom IDE does. Both change at once, in every window.
+
+<img src="docs/images/flat.png" alt="The flat look: the project tree, a Rust file and a terminal edge to edge, divided by lines" width="100%">
+
+Settings → Appearance → Interface shows both looks and the scale; Quick Switch (<kbd>⌃</kbd><kbd>`</kbd>) has
+the look too.
+
+<img src="docs/images/interface.png" alt="Settings → Appearance → Interface: Islands and Flat, and the scale from 80 to 200 %" width="100%">
+
 ### Find anything
 
 Jump to a file by a few letters of its name (<kbd>⌘</kbd><kbd>P</kbd>). Search the whole project with a
 live preview of every match, grouped by file, and open the one you need without leaving the keyboard
-(<kbd>⇧</kbd><kbd>⌘</kbd><kbd>F</kbd>). Inside a file, find and replace with case, whole-word and
-regular-expression options — and turn every match into a cursor to edit them all at once.
+(<kbd>⇧</kbd><kbd>⌘</kbd><kbd>F</kbd>) — type a file's name there, even with a typo, and the file comes
+first. Inside a file, find and replace with case, whole-word and regular-expression options — and turn
+every match into a cursor to edit them all at once.
 
-<img src="docs/images/find-in-files.png" alt="Find in Files with results and a live preview" width="100%">
+<img src="docs/images/find-in-files.png" alt="Find in Files: the file whose name matches first, then the matches in the text, and a live preview" width="100%">
+
+### Markdown, rendered
+
+A Markdown file opens with its preview beside it, as in JetBrains IDEs: the text, the text and the
+preview, or the preview alone — three buttons in the corner, and Flux remembers your choice. The preview
+follows your typing and your scrolling, shows pictures, tables and code, and its links open files in Flux
+and pages in the browser.
+
+<img src="docs/images/markdown.png" alt="README.md with its rendered preview beside the text" width="100%">
 
 ### Understands your code
 
@@ -90,6 +114,11 @@ just brings its window forward. Every project keeps its tabs, cursor positions, 
 when you start Flux from the Dock, the projects you had open come back where you left them.
 
 <img src="docs/images/open-project.png" alt="Flux asks whether to open another project in this window or a new one" width="100%">
+
+Click the project's name in the title bar for your recent projects with their branches — open one here
+or in a new window (<kbd>⌥</kbd><kbd>↵</kbd>), or forget it.
+
+<img src="docs/images/recent-projects.png" alt="The project's menu in the title bar: recent projects with their branches, and Open…" width="100%">
 
 ### Git, the way JetBrains IDEs do it
 
@@ -244,8 +273,8 @@ you know when a session finishes or waits while you're in another app.
 
 ### Keyboard first, in your language
 
-Every command is in the command palette with its shortcut, and the keys are familiar if you come from
-JetBrains IDEs. The interface speaks English or Russian — following your system, or the one you pick in
+Every command is in the command palette with its shortcut, and the commands you run most come first.
+The keys are familiar if you come from JetBrains IDEs. The interface speaks English or Russian — following your system, or the one you pick in
 Settings → Appearance, at once.
 
 ## Get started
@@ -281,7 +310,8 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 | <kbd>⌘</kbd><kbd>0</kbd> · <kbd>⌃</kbd><kbd>V</kbd> | Show or hide the commit window · Git operations |
 | <kbd>⌘</kbd><kbd>9</kbd> · <kbd>⌥</kbd><kbd>⌘</kbd><kbd>A</kbd> | Show or hide the Git log · who changed each line |
 | <kbd>⌘</kbd><kbd>Esc</kbd> · <kbd>⌥</kbd><kbd>⌘</kbd><kbd>K</kbd> | Claude · mention the selection in Claude's message |
-| <kbd>⌃</kbd><kbd>`</kbd> | Quick Switch: theme, file icons, language |
+| <kbd>⌃</kbd><kbd>`</kbd> | Quick Switch: theme, look, file icons, language |
+| <kbd>⌃</kbd><kbd>⌥</kbd><kbd>=</kbd> · <kbd>⌃</kbd><kbd>⌥</kbd><kbd>-</kbd> · <kbd>⌃</kbd><kbd>⌥</kbd><kbd>0</kbd> | Zoom in · zoom out · back to 100 % |
 | <kbd>⌘</kbd><kbd>`</kbd> · <kbd>⇧</kbd><kbd>⌘</kbd><kbd>`</kbd> | Next · previous project window |
 | <kbd>⌥</kbd><kbd>⇧</kbd><kbd>N</kbd> · <kbd>⌥</kbd><kbd>⇧</kbd><kbd>B</kbd> | Open a task · the task in the browser (Yandex Tracker plugin) |
 | <kbd>⌥</kbd><kbd>⇧</kbd><kbd>X</kbd> | Clear the context: close the tabs, keep them for later |
@@ -306,6 +336,7 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 - [x] Before the beta: fixes after a week of daily use, a window for every project
 - [x] Before the beta: Claude polish — a new chat, `!` commands, live subagents, search, edit and rewind
 - [x] Before the beta: tasks — Yandex Tracker and Calendar, task contexts, plugin API 0.3
+- [x] Before the beta: a flat look and zoom, Markdown preview, files in Find in Files, recent projects
 - [ ] Before the beta: editor polish, updates over the air, a signed and notarized app
 - [ ] Public beta
 

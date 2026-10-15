@@ -422,7 +422,8 @@ fn recent_row(index: usize, path: &Path, current: bool, ui: UiColors) -> impl In
         .items_center()
         .gap_3()
         .rounded(px(RADIUS_MD))
-        .child(tile(IconName::Folder, ui.folder))
+        // The project's own tile, as in the title bar's project popup (part 10.4).
+        .child(crate::project_popup::project_tile(path, &ui).size(px(TILE_SIZE)))
         .child(
             div()
                 .flex_1()
@@ -520,7 +521,7 @@ fn looks_like_error(message: &str) -> bool {
 /// (`~` or the first directory from the root) and as many trailing components as fit, e.g.
 /// "/private/…/scratchpad/wt-start". If the last component is longer than the limit, "…" and its
 /// tail.
-fn shorten_path(path: &str, max_chars: usize) -> String {
+pub(crate) fn shorten_path(path: &str, max_chars: usize) -> String {
     let len = |text: &str| text.chars().count();
     if len(path) <= max_chars {
         return path.to_string();
@@ -553,7 +554,7 @@ fn shorten_path(path: &str, max_chars: usize) -> String {
 }
 
 /// The directory name; for a disk root, the whole path.
-fn display_name(path: &Path) -> String {
+pub(crate) fn display_name(path: &Path) -> String {
     path.file_name()
         .map_or_else(|| tilde(path), |name| name.to_string_lossy().into_owned())
 }

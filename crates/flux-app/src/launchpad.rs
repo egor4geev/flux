@@ -13,6 +13,7 @@ use gpui::{Action, Context, IntoElement, actions, div, prelude::*, px};
 use crate::i18n::tr;
 use crate::icons::IconName;
 use crate::plugins::{ToggleToolWindow, ToolWindow};
+use crate::settings::UiStyle;
 use crate::theme::{Theme, UiColors};
 use crate::ui;
 use crate::workspace::Workspace;
@@ -31,6 +32,8 @@ actions!(
 pub const WIDTH: f32 = 40.;
 /// A tool button is larger than a regular icon button: it is the window's main navigation.
 const BUTTON_SIZE: f32 = 32.;
+/// Flat: the space between the line under the title bar and the first button.
+const FLAT_TOP_INSET: f32 = 4.;
 
 /// A launchpad tool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +119,9 @@ impl Tool {
 /// left.
 pub fn render(workspace: &Workspace, cx: &Context<Workspace>) -> impl IntoElement + use<> {
     let ui = Theme::ui(cx);
+    // Flat (part 10.4): a line divides the strip from the panels, and the first button keeps away
+    // from the line under the title bar.
+    let flat = ui::style(cx) == UiStyle::Flat;
     div()
         .flex_none()
         .w(px(WIDTH))
@@ -125,6 +131,12 @@ pub fn render(workspace: &Workspace, cx: &Context<Workspace>) -> impl IntoElemen
         .items_center()
         .gap_1p5()
         .pb(px(ui::GAP))
+        .when(flat, |strip| {
+            strip
+                .pt(px(FLAT_TOP_INSET))
+                .border_r_1()
+                .border_color(ui.island_border)
+        })
         .children(
             Tool::ALL
                 .into_iter()
@@ -220,7 +232,9 @@ fn tool_button(
                 .border_1()
                 .border_color(ui.frame)
         }))
-        .when(open, |button| button.child(open_marker(ui)))
+        .when(open, |button| {
+            button.child(open_marker(ui::style(cx) == UiStyle::Flat, ui))
+        })
 }
 
 /// A plugin's tool window: its icon from the manifest (a puzzle piece without one), its title and
@@ -250,14 +264,22 @@ fn plugin_tool_button(
                 .tooltip(ui::tooltip(tool.title.clone(), keys))
                 .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)),
         )
-        .when(open, |button| button.child(open_marker(ui)))
+        .when(open, |button| {
+            button.child(open_marker(ui::style(cx) == UiStyle::Flat, ui))
+        })
 }
 
-/// Marker of the open window: at the edge of the strip, like an IDE tool tab.
-fn open_marker(ui: UiColors) -> impl IntoElement {
+/// Marker of the open window: at the edge of the strip, like an IDE tool tab. The strip of Islands
+/// keeps 2 px from the window's edge; a Flat one starts at the edge and gives 1 px to its line.
+fn open_marker(flat: bool, ui: UiColors) -> impl IntoElement {
+    let left = if flat {
+        -(WIDTH - 1. - BUTTON_SIZE) / 2.
+    } else {
+        -(WIDTH - BUTTON_SIZE) / 2. - 1.
+    };
     div()
         .absolute()
-        .left(px(-(WIDTH - BUTTON_SIZE) / 2. - 1.))
+        .left(px(left))
         .top(px(BUTTON_SIZE / 2. - 7.))
         .w(px(3.))
         .h(px(14.))

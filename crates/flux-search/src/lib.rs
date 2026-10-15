@@ -1,6 +1,7 @@
 //! Search without a UI:
 //! - [`fuzzy`] — fuzzy search: synchronous over small lists ([`match_list`], the command palette)
-//!   and on nucleo threads over the project paths ([`PathMatcher`], file search);
+//!   and on nucleo threads over the project paths ([`PathMatcher`], file search); files by name in
+//!   Find in Files ([`match_file_names`]);
 //! - [`files`] — the project root ([`find_vcs_root`]) and a file walk that respects `.gitignore`
 //!   ([`walk_files`]);
 //! - [`buffer`] — search and replace in a document ([`find_all`], [`replace_all`]);
@@ -21,6 +22,9 @@ mod query;
 
 pub use buffer::{BufferMatches, MAX_BUFFER_MATCHES, find_all, replace_all, replacement_for};
 pub use files::{MAX_FILES, WalkSummary, find_vcs_root, walk_files};
-pub use fuzzy::{FuzzyMatch, PathInjector, PathMatch, PathMatcher, match_list};
+pub use fuzzy::{
+    FuzzyMatch, MIN_NAME_QUERY, NameMatch, PathInjector, PathMatch, PathMatcher, is_name_query,
+    match_file_names, match_list,
+};
 pub use grep::{FileMatches, GrepOptions, GrepSummary, LineMatch, search_project};
 pub use query::{QueryError, SearchQuery};

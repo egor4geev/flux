@@ -67,6 +67,12 @@ mod themes;
 mod tree;
 mod windows;
 mod workspace;
+mod ui_scale;
+mod interface;
+mod project_popup;
+mod command_usage;
+mod markdown_preview;
+mod search_files;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
 pub(super) const STRINGS: &[&[(&str, &str)]] = &[
@@ -137,6 +143,12 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     claude_turns::STRINGS,
     claude_agents::STRINGS,
     image_view::STRINGS,
+    ui_scale::STRINGS,
+    interface::STRINGS,
+    project_popup::STRINGS,
+    command_usage::STRINGS,
+    markdown_preview::STRINGS,
+    search_files::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -187,4 +199,10 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     claude_turns::PLURALS,
     claude_agents::PLURALS,
     image_view::PLURALS,
+    ui_scale::PLURALS,
+    interface::PLURALS,
+    project_popup::PLURALS,
+    command_usage::PLURALS,
+    markdown_preview::PLURALS,
+    search_files::PLURALS,
 ];

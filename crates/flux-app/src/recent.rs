@@ -28,6 +28,21 @@ pub fn record(root: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// The list as the file has it now (another window may have added a project since this one read
+/// it); `None` when there is no file to read (a scenario without `FLUX_RECENT_FILE`).
+pub fn stored() -> Option<Vec<PathBuf>> {
+    store_path().map(|file| load_from(&file))
+}
+
+/// Forgets a project ("Remove from Recent Projects" of the project popup, part 10.4); returns the
+/// new list, as [`record`] does.
+pub fn remove(root: &Path) -> Vec<PathBuf> {
+    match store_path() {
+        Some(file) => remove_in(&file, root),
+        None => Vec::new(),
+    }
+}
+
 fn store_path() -> Option<PathBuf> {
     store_path_for(
         std::env::var_os("FLUX_RECENT_FILE"),
@@ -64,6 +79,18 @@ fn record_in(file: &Path, root: &Path) -> Vec<PathBuf> {
     list.into_iter()
         .filter(|dir| dir == root || dir.is_dir())
         .collect()
+}
+
+fn remove_in(file: &Path, root: &Path) -> Vec<PathBuf> {
+    let mut list = read(file);
+    let before = list.len();
+    list.retain(|known| known != root);
+    if list.len() != before
+        && let Err(error) = write(file, &list)
+    {
+        eprintln!("flux: {}: {error}", file.display());
+    }
+    list.into_iter().filter(|dir| dir.is_dir()).collect()
 }
 
 fn read(file: &Path) -> Vec<PathBuf> {
@@ -221,6 +248,27 @@ mod tests {
         // No temporary files are left.
         let leftovers = fs::read_dir(dir.join("store")).unwrap().count();
         assert_eq!(leftovers, 1);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn removed_project_leaves_the_file() {
+        let dir = temp_dir("remove");
+        let (one, two, gone) = (dir.join("one"), dir.join("two"), dir.join("gone"));
+        fs::create_dir_all(&one).unwrap();
+        fs::create_dir_all(&two).unwrap();
+        let file = dir.join("recent-projects");
+        record_in(&file, &gone);
+        record_in(&file, &two);
+        record_in(&file, &one);
+
+        // The rest keeps its order; a directory that has disappeared stays in the file.
+        assert_eq!(remove_in(&file, &two), vec![one.clone()]);
+        assert_eq!(read(&file), vec![one.clone(), gone.clone()]);
+        // A project that isn't in the list changes nothing.
+        assert_eq!(remove_in(&file, &dir.join("other")), vec![one.clone()]);
+        assert_eq!(read(&file), vec![one.clone(), gone]);
 
         fs::remove_dir_all(&dir).ok();
     }

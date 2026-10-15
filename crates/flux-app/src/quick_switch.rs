@@ -1,11 +1,12 @@
 //! Quick Switch (⌃`, stage 8.3), as Quick Switch Scheme in JetBrains IDEs: a popup to switch the
-//! theme, the file icons or the interface language without opening Settings; moving through the
-//! themes shows each of them right away.
+//! theme, the look of the window (Islands or Flat, part 10.4), the file icons or the interface
+//! language without opening Settings; moving through the themes shows each of them right away.
 //!
 //! The first level lists what can be switched, with the current choice of each; ↵ or → opens one,
 //! ← or Esc goes back (a theme being looked at goes back to the chosen one), ↵ on a choice applies it
 //! and closes the popup. Digits pick a row, as the numbered rows of JetBrains' popup. The palette
-//! offers the levels directly: Select Theme, Select File Icons, Select Language.
+//! offers the levels directly: Select Theme, Select Interface Style, Select File Icons, Select
+//! Language.
 
 use gpui::{
     App, ClickEvent, Context, DismissEvent, Div, EventEmitter, FocusHandle, Focusable, FontWeight,
@@ -25,7 +26,13 @@ use crate::workspace::Workspace;
 
 actions!(
     quick_switch,
-    [Toggle, SelectTheme, SelectFileIcons, SelectLanguage]
+    [
+        Toggle,
+        SelectTheme,
+        SelectInterfaceStyle,
+        SelectFileIcons,
+        SelectLanguage
+    ]
 );
 
 // The popup's own keys; a namespace of their own keeps them out of the palette's names.
@@ -64,6 +71,9 @@ pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
         .on_action(cx.listener(|workspace, _: &SelectTheme, window, cx| {
             open(workspace, Level::Theme, window, cx)
         }))
+        .on_action(cx.listener(|workspace, _: &SelectInterfaceStyle, window, cx| {
+            open(workspace, Level::Style, window, cx)
+        }))
         .on_action(cx.listener(|workspace, _: &SelectFileIcons, window, cx| {
             open(workspace, Level::FileIcons, window, cx)
         }))
@@ -90,12 +100,14 @@ pub enum Level {
     /// What can be switched.
     Root,
     Theme,
+    /// The look of the window: Islands or Flat (part 10.4).
+    Style,
     FileIcons,
     Language,
 }
 
-/// The levels the first level opens, in its order.
-const LEVELS: [Level; 3] = [Level::Theme, Level::FileIcons, Level::Language];
+/// The levels the first level opens, in its order (as Settings → Appearance lists its pages).
+const LEVELS: [Level; 4] = [Level::Theme, Level::Style, Level::FileIcons, Level::Language];
 
 /// The interface languages, in the order of the Language level and of Settings.
 const LANGUAGES: [LanguageChoice; 3] = [
@@ -195,6 +207,13 @@ impl QuickSwitch {
                     .position(|theme| theme.name == self.current_theme)
                     .unwrap_or(0)
             }
+            Level::Style => {
+                let current = ui::style(cx);
+                appearance_settings::STYLES
+                    .iter()
+                    .position(|style| *style == current)
+                    .unwrap_or(0)
+            }
             Level::FileIcons => {
                 let active = icon_themes::active();
                 self.icon_sets
@@ -217,6 +236,7 @@ impl QuickSwitch {
         match self.level {
             Level::Root => LEVELS.len(),
             Level::Theme => self.themes.len(),
+            Level::Style => appearance_settings::STYLES.len(),
             Level::FileIcons => self.icon_sets.len(),
             Level::Language => LANGUAGES.len(),
         }
@@ -312,6 +332,12 @@ impl QuickSwitch {
                 }
                 cx.emit(DismissEvent);
             }
+            Level::Style => {
+                if let Some(style) = appearance_settings::STYLES.get(index) {
+                    ui::set_style(*style, cx);
+                    cx.emit(DismissEvent);
+                }
+            }
             Level::FileIcons => {
                 if let Some(set) = self.icon_sets.get(index) {
                     icon_themes::select(&set.name, cx);
@@ -358,6 +384,7 @@ impl QuickSwitch {
                 };
                 let details = [
                     Some(Theme::get(cx).name.clone()),
+                    Some(appearance_settings::style_name(ui::style(cx)).into()),
                     icon_themes::active(),
                     Some(language),
                 ];
@@ -368,10 +395,11 @@ impl QuickSwitch {
                         detail,
                         icon: Some(match level {
                             Level::Theme => IconName::Palette,
+                            Level::Style => IconName::Sidebar,
                             Level::FileIcons => IconName::File,
                             _ => IconName::Globe,
                         }),
-                        ..row(page_of(*level).title().into())
+                        ..row(level_title(*level).into())
                     })
                     .collect()
             }
@@ -387,6 +415,16 @@ impl QuickSwitch {
                     ..row(theme.name.clone())
                 })
                 .collect(),
+            Level::Style => {
+                let current = ui::style(cx);
+                appearance_settings::STYLES
+                    .iter()
+                    .map(|style| Row {
+                        checked: *style == current,
+                        ..row(appearance_settings::style_name(*style).into())
+                    })
+                    .collect()
+            }
             Level::FileIcons => {
                 let ui = Theme::ui(cx);
                 let active = icon_themes::active();
@@ -432,9 +470,19 @@ impl QuickSwitch {
 /// The page of Settings → Appearance a level switches: its title is the level's.
 fn page_of(level: Level) -> Page {
     match level {
+        Level::Style => Page::Interface,
         Level::FileIcons => Page::FileIcons,
         Level::Language => Page::Language,
         _ => Page::Theme,
+    }
+}
+
+/// A level's name in the first level: its page's title, or — for the look of the window, which
+/// shares the Interface page with the scale — what it switches.
+fn level_title(level: Level) -> &'static str {
+    match level {
+        Level::Style => tr("Interface Style"),
+        _ => page_of(level).title(),
     }
 }
 
@@ -446,7 +494,7 @@ impl Render for QuickSwitch {
         let title: SharedString = if root {
             tr("Quick Switch").into()
         } else {
-            page_of(self.level).title().into()
+            level_title(self.level).into()
         };
         let items = rows.into_iter().enumerate().map(|(index, row)| {
             let selected = index == self.selected;
@@ -621,7 +669,11 @@ mod tests {
 
     #[test]
     fn levels_and_languages_are_in_settings_order() {
-        assert_eq!(LEVELS, [Level::Theme, Level::FileIcons, Level::Language]);
+        assert_eq!(
+            LEVELS,
+            [Level::Theme, Level::Style, Level::FileIcons, Level::Language]
+        );
+        assert_eq!(page_of(Level::Style), Page::Interface);
         assert_eq!(page_of(Level::FileIcons), Page::FileIcons);
         assert_eq!(page_of(Level::Language), Page::Language);
         assert_eq!(page_of(Level::Theme), Page::Theme);

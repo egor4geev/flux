@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# gpui with Flux's patch (`vendor/gpui`, see its FLUX-PATCH.md): a dependency, not a member.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -146,3 +148,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.zstd-sys]
 opt-level = 3
+
+# gpui 0.2.2 with Flux's patch: the interface scale (Settings → Appearance → Interface, part 10.4).
+# The patch and how to carry it over to a newer gpui — vendor/gpui/FLUX-PATCH.md.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
