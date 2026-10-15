@@ -360,9 +360,13 @@ fn clear_keeps_the_prompt_at_the_top() {
     loop {
         let content = terminal.content();
         let rows = screen(&content);
+        // The prompt (`host%`) may wrap onto several rows: CI runners have long host names.
+        let prompt_end = rows.iter().position(|row| row.ends_with('%'));
         if content.history_size <= 1
-            && rows[0].ends_with('%')
-            && rows[1..].iter().all(String::is_empty)
+            && prompt_end.is_some_and(|end| {
+                rows[..end].iter().all(|row| !row.is_empty())
+                    && rows[end + 1..].iter().all(String::is_empty)
+            })
         {
             break;
         }
