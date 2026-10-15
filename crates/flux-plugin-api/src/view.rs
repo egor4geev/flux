@@ -20,8 +20,8 @@
 //! give it a new id.
 
 use crate::host::ui::{
-    ButtonSpec, Element as RawElement, ElementKind, Span, TextFieldSpec, ToggleSpec, TreeRow,
-    TreeSpec, View,
+    BadgeSpec, ButtonSpec, Element as RawElement, ElementKind, Property, RowAction, Span,
+    TextFieldSpec, ToggleSpec, TreeRow, TreeSpec, View,
 };
 pub use crate::host::ui::{ToggleStyle, Tone};
 
@@ -39,6 +39,11 @@ impl Element {
             kind,
             children: Vec::new(),
         }
+    }
+
+    /// An element of any kind, as the API has it: for what the builders here don't make.
+    pub fn raw(id: &str, kind: ElementKind) -> Self {
+        Self::new(id, kind)
     }
 
     fn with_children(mut self, children: impl IntoIterator<Item = Element>) -> Self {
@@ -181,6 +186,46 @@ pub fn text_field(id: &str, text: &str, placeholder: Option<&str>) -> Element {
             text: text.to_string(),
             placeholder: placeholder.map(str::to_string),
             code: false,
+            multiline: false,
+        }),
+    )
+}
+
+/// A field of several lines that grows with the text (API 0.3): ↵ — a new line, ⌘↵ — `submitted`;
+/// changes come as `changed`. A comment, a description.
+pub fn multiline_field(id: &str, text: &str, placeholder: Option<&str>) -> Element {
+    Element::new(
+        id,
+        ElementKind::TextField(TextFieldSpec {
+            text: text.to_string(),
+            placeholder: placeholder.map(str::to_string),
+            code: false,
+            multiline: true,
+        }),
+    )
+}
+
+/// A short colored label (API 0.3): a status, a priority, a count.
+pub fn badge(id: &str, text: &str, tone: Tone) -> Element {
+    Element::new(
+        id,
+        ElementKind::Badge(BadgeSpec {
+            text: text.to_string(),
+            tone,
+            menu: false,
+        }),
+    )
+}
+
+/// A badge with ▾ whose click comes as `clicked` (API 0.3): a status that offers its transitions —
+/// open a [`crate::picker::Picker::menu`] under it.
+pub fn menu_badge(id: &str, text: &str, tone: Tone) -> Element {
+    Element::new(
+        id,
+        ElementKind::Badge(BadgeSpec {
+            text: text.to_string(),
+            tone,
+            menu: true,
         }),
     )
 }
@@ -266,11 +311,12 @@ impl SpanStyle for Span {
     }
 }
 
-/// The rows of a tree or a list.
+/// The rows of a tree or a list — or of cards, as a board's column (`Tree::cards`).
 #[derive(Default)]
 pub struct Tree {
     rows: Vec<TreeRow>,
     empty_text: Option<String>,
+    cards: bool,
 }
 
 impl Tree {
@@ -282,6 +328,13 @@ impl Tree {
     /// The text in the middle when there are no rows.
     pub fn empty_text(mut self, text: &str) -> Self {
         self.empty_text = Some(text.to_string());
+        self
+    }
+
+    /// The rows as cards (API 0.3), as on a board: the icon, the label and the badge on the first
+    /// line, the subtitle under them (two lines at most), then the detail.
+    pub fn cards(mut self) -> Self {
+        self.cards = true;
         self
     }
 
@@ -304,6 +357,9 @@ impl Tree {
             detail: row.detail,
             badge: row.badge,
             expanded: row.expanded,
+            subtitle: row.subtitle,
+            tags: row.tags,
+            actions: row.actions,
         });
         (self.rows.len() - 1) as u32
     }
@@ -322,6 +378,7 @@ impl Tree {
             ElementKind::Tree(TreeSpec {
                 rows: self.rows,
                 empty_text: self.empty_text,
+                cards: self.cards,
             }),
         )
     }
@@ -335,6 +392,9 @@ pub struct RowSpec {
     detail: Option<String>,
     badge: Option<String>,
     expanded: bool,
+    subtitle: Option<Vec<Span>>,
+    tags: Vec<BadgeSpec>,
+    actions: Vec<RowAction>,
 }
 
 impl RowSpec {
@@ -352,6 +412,9 @@ impl RowSpec {
             detail: None,
             badge: None,
             expanded: false,
+            subtitle: None,
+            tags: Vec::new(),
+            actions: Vec::new(),
         }
     }
 
@@ -378,6 +441,67 @@ impl RowSpec {
         self.expanded = true;
         self
     }
+
+    /// A second part of the row (API 0.3): after the label in a list, under it on a card — a
+    /// task's title under its key.
+    pub fn subtitle(mut self, subtitle: Vec<Span>) -> Self {
+        self.subtitle = Some(subtitle);
+        self
+    }
+
+    /// A small colored label (API 0.3): on a card, in a line under the subtitle; in a list, after
+    /// the label — a tag, a deadline, story points.
+    pub fn tag(mut self, text: &str, tone: Tone) -> Self {
+        self.tags.push(BadgeSpec {
+            text: text.to_string(),
+            tone,
+            menu: false,
+        });
+        self
+    }
+
+    /// A button of the row (API 0.3): on a card, at its foot; in a list, at the row's end while it
+    /// is hovered or selected. A press comes as `row-action((row key, id))`.
+    pub fn action(
+        mut self,
+        id: &str,
+        label: Option<&str>,
+        icon: Option<&str>,
+        primary: bool,
+    ) -> Self {
+        self.actions.push(RowAction {
+            id: id.to_string(),
+            label: label.map(str::to_string),
+            icon: icon.map(str::to_string),
+            tooltip: None,
+            primary,
+        });
+        self
+    }
+}
+
+/// A property of [`properties`] (API 0.3): a label and its value.
+pub fn property(id: &str, label: &str, value: Vec<Span>) -> Property {
+    Property {
+        id: id.to_string(),
+        label: label.to_string(),
+        value,
+        editable: false,
+    }
+}
+
+/// An editable property: a ▾ after the value, a click comes as `activated(id)`; a picker opens
+/// under it with the anchor `element((window, "<list>/<id>"))`.
+pub fn editable_property(id: &str, label: &str, value: Vec<Span>) -> Property {
+    Property {
+        editable: true,
+        ..property(id, label, value)
+    }
+}
+
+/// Properties in two aligned columns (API 0.3): a task's fields.
+pub fn properties(id: &str, properties: Vec<Property>) -> Element {
+    Element::new(id, ElementKind::Properties(properties))
 }
 
 #[cfg(test)]

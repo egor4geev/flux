@@ -83,6 +83,7 @@ fn answer(stream: TcpStream) {
     let path = words.next().unwrap_or_default().to_string();
     let mut length = 0;
     let mut asked = String::new();
+    let mut host = String::new();
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
@@ -92,6 +93,7 @@ fn answer(stream: TcpStream) {
         match name.trim().to_ascii_lowercase().as_str() {
             "content-length" => length = value.trim().parse().unwrap_or(0),
             "x-asked" => asked = value.trim().to_string(),
+            "host" => host = value.trim().to_string(),
             _ => {}
         }
     }
@@ -111,6 +113,11 @@ fn answer(stream: TcpStream) {
         "/hello" => whole("200 OK", "X-Test: yes\r\n", b"hello"),
         "/echo" => whole("200 OK", "", format!("{method} {asked} {body}").as_bytes()),
         "/redirect-local" => whole("302 Found", "Location: /hello\r\n", b""),
+        "/redirect-self" => whole(
+            "302 Found",
+            &format!("Location: http://{host}/hello\r\n"),
+            b"",
+        ),
         "/redirect-away" => whole("302 Found", "Location: http://example.com/\r\n", b""),
         "/redirect-post" => whole("303 See Other", "Location: /echo\r\n", b""),
         "/slow" => {
@@ -145,6 +152,38 @@ fn answer(stream: TcpStream) {
 }
 
 // --- The client ---
+
+#[test]
+fn an_override_sends_a_service_to_a_fake_one() {
+    let port = test_server();
+    super::super::host::test_overrides().lock().unwrap().push((
+        "https://override.flux.test".into(),
+        format!("http://127.0.0.1:{port}"),
+    ));
+    let permissions = "project = \"none\"\nnetwork = [\"override.flux.test\"]";
+    let Some((mut probe, data)) = net_probe("test.net-override", permissions) else {
+        return;
+    };
+    ask(&data, "GET", "https://override.flux.test/hello", true, None, "");
+    assert_eq!(probe.run("net:fetch"), "fetch: 200 x-test=yes hello");
+    // A redirect to the fake service's own address counts as one to the service.
+    ask(
+        &data,
+        "GET",
+        "https://override.flux.test/redirect-self",
+        true,
+        None,
+        "",
+    );
+    assert_eq!(probe.run("net:fetch"), "fetch: 200 x-test=yes hello");
+    let log = probe.log_text();
+    assert!(
+        log.contains(&format!(
+            "GET https://override.flux.test/hello (override: http://127.0.0.1:{port}) → 200"
+        )),
+        "{log}"
+    );
+}
 
 #[test]
 fn fetches_from_allowed_hosts_only() {

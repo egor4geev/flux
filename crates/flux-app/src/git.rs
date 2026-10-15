@@ -664,6 +664,19 @@ pub struct GitStore {
     activity: Option<SharedString>,
     /// Favorite branches of the repositories (the branches popup's stars).
     favorites: Favorites,
+    /// The plugins' commit message templates (API 0.3), the latest last: the commit window offers
+    /// the latest one (part 10.3).
+    commit_templates: Vec<CommitTemplate>,
+}
+
+/// A plugin's commit message template (API 0.3): an active task's "TRACK-142 Fix the sign-in".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitTemplate {
+    pub plugin: Arc<str>,
+    /// Fills an empty message in the commit window.
+    pub text: String,
+    /// A message generated with Claude starts with it ("TRACK-142").
+    pub prefix: Option<String>,
 }
 
 impl EventEmitter<GitEvent> for GitStore {}
@@ -682,11 +695,40 @@ impl GitStore {
             inclusion: Inclusion::default(),
             activity: None,
             favorites: Favorites::load(),
+            commit_templates: Vec::new(),
         };
         if let Some(root) = root {
             store.discover(root, cx);
         }
         store
+    }
+
+    /// A plugin's commit message template (API 0.3), or none to take it away (the plugin removed
+    /// it or stopped). The commit window follows the latest one.
+    pub fn set_commit_template(
+        &mut self,
+        plugin: &str,
+        template: Option<(String, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.commit_template().cloned();
+        self.commit_templates
+            .retain(|template| &*template.plugin != plugin);
+        if let Some((text, prefix)) = template {
+            self.commit_templates.push(CommitTemplate {
+                plugin: Arc::from(plugin),
+                text,
+                prefix: prefix.filter(|prefix| !prefix.trim().is_empty()),
+            });
+        }
+        if self.commit_template() != before.as_ref() {
+            cx.notify();
+        }
+    }
+
+    /// The commit message template the commit window offers: the latest a plugin set.
+    pub fn commit_template(&self) -> Option<&CommitTemplate> {
+        self.commit_templates.last()
     }
 
     fn discover(&mut self, root: PathBuf, cx: &mut Context<Self>) {

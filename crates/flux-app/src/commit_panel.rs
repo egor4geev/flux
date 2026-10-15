@@ -676,6 +676,9 @@ pub struct CommitPanel {
     amend: bool,
     /// The message Amend put into the field: turning Amend off takes it back, if it is unchanged.
     amend_message: Option<String>,
+    /// The text of a plugin's commit message template (API 0.3) the field was offered last: it
+    /// fills an empty field and goes away with its task while unedited, as a merge's message.
+    template_offered: Option<String>,
     group_by_directory: bool,
     collapsed: HashSet<RowKey>,
     /// The changes and the visible rows, rebuilt when the git status or the view changes.
@@ -741,6 +744,7 @@ impl CommitPanel {
             merge_message: None,
             amend: false,
             amend_message: None,
+            template_offered: None,
             group_by_directory: true,
             collapsed: HashSet::new(),
             changes: Vec::new(),
@@ -850,6 +854,7 @@ impl CommitPanel {
             &self.claude_groups,
         );
         self.follow_merge(cx);
+        self.follow_template(cx);
         self.check_stopped_sessions(cx);
         // A selected file hidden in a collapsed node: the node is selected; one that went away
         // (committed, rolled back): nothing is.
@@ -1054,6 +1059,47 @@ impl CommitPanel {
                     self.set_message("", cx);
                 }
             }
+        }
+    }
+
+    /// A plugin's commit message template (API 0.3, part 10.3 — an active task's "TRACK-142 Fix the
+    /// sign-in"): it fills an empty field when it comes, changes, or after a commit, and goes away
+    /// with its task while unedited, as a merge's message. Not during a merge (its message comes
+    /// first) or Amend.
+    fn follow_template(&mut self, cx: &mut Context<Self>) {
+        if self.merge_message.is_some() || self.amend {
+            return;
+        }
+        let template = self
+            .git
+            .read(cx)
+            .commit_template()
+            .map(|template| template.text.clone());
+        if template == self.template_offered {
+            return;
+        }
+        let text = self.message_text(cx);
+        if text.trim().is_empty() || self.template_offered.as_deref() == Some(text.as_str()) {
+            self.set_message(template.as_deref().unwrap_or(""), cx);
+        }
+        self.template_offered = template;
+    }
+
+    /// The field holds the template's text as it was offered: Amend may replace it.
+    fn holds_template(&self, cx: &App) -> bool {
+        self.template_offered.as_deref() == Some(self.message_text(cx).as_str())
+    }
+
+    /// A message generated with Claude starts with the template's prefix ("TRACK-142").
+    fn with_template_prefix(&self, message: String, cx: &App) -> String {
+        let prefix = self
+            .git
+            .read(cx)
+            .commit_template()
+            .and_then(|template| template.prefix.clone());
+        match prefix {
+            Some(prefix) if !message.starts_with(prefix.as_str()) => format!("{prefix} {message}"),
+            _ => message,
         }
     }
 
@@ -1987,10 +2033,14 @@ impl CommitPanel {
         if !self.amend {
             if self.amend_message.take().as_deref() == Some(self.message_text(cx).as_str()) {
                 self.set_message("", cx);
+                // The template comes back into the emptied field.
+                self.template_offered = None;
+                self.follow_template(cx);
             }
             return;
         }
-        if !self.message_text(cx).trim().is_empty() {
+        // An unedited template gives way to the last commit's message.
+        if !self.message_text(cx).trim().is_empty() && !self.holds_template(cx) {
             return;
         }
         let Some(repo) = self.message_repo(cx) else {
@@ -2002,7 +2052,8 @@ impl CommitPanel {
                 return;
             };
             this.update(cx, |this, cx| {
-                if this.amend && this.message_text(cx).trim().is_empty() {
+                let free = this.message_text(cx).trim().is_empty() || this.holds_template(cx);
+                if this.amend && free {
                     this.set_message(&message, cx);
                     this.amend_message = Some(message);
                 }
@@ -2120,6 +2171,7 @@ impl CommitPanel {
                 this.generating = None;
                 let failure = match answer.map(|text| clean_message(&text)) {
                     Ok(message) if !message.is_empty() => {
+                        let message = this.with_template_prefix(message, cx);
                         this.set_message(&message, cx);
                         None
                     }
@@ -2236,6 +2288,9 @@ impl CommitPanel {
                         this.amend = false;
                         this.amend_message = None;
                         this.merge_message = None;
+                        // The next commit of the task gets the template again.
+                        this.template_offered = None;
+                        this.follow_template(cx);
                         let files = trn(count, "{n} file", "{n} files");
                         let title = trf("Committed {0}", &[&files]);
                         let notification = Notification::success(title).body(summary);

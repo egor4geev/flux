@@ -991,12 +991,13 @@ impl Renderer<'_> {
 
     // --- The user's side ---
 
-    /// The user's message: mentions at its ends and pictures as chips above a bubble on the
-    /// right, the time (or Queued, Cancelled) under it, Copy / Edit and resend / Rewind the code on
-    /// hover.
+    /// The user's message: a plugin's attachments, mentions at its ends and pictures as chips
+    /// above a bubble on the right, the time (or Queued, Cancelled) under it, Copy / Edit and
+    /// resend / Rewind the code on hover.
     fn user(&self, id: EntryId, user: &UserEntry) -> AnyElement {
         let ui = self.ui;
-        let (chips, text) = edge_mentions(&user.text);
+        let (attachments, text) = leading_attachments(&user.text);
+        let (chips, text) = edge_mentions(text);
         let thumbnails: Vec<AnyElement> = (0..user.images.len())
             .filter_map(|index| {
                 let image = self.state.images.get(&(id, index))?.clone();
@@ -1028,10 +1029,16 @@ impl Renderer<'_> {
                 )
             })
             .collect();
-        let chips: Vec<AnyElement> = chips
+        let chips: Vec<AnyElement> = attachments
             .into_iter()
             .enumerate()
-            .map(|(index, chip)| self.mention_chip(id, index, chip))
+            .map(|(index, block)| self.attachment_chip(id, index, block))
+            .chain(
+                chips
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, chip)| self.mention_chip(id, index, chip)),
+            )
             .collect();
         let above = (!chips.is_empty() || !thumbnails.is_empty()).then(|| {
             div()
@@ -1204,6 +1211,32 @@ impl Renderer<'_> {
             .into_any_element()
     }
 
+    /// What a plugin's session sent with the message (part 10.3: a task — its key, text, comments):
+    /// a chip with its label, the text on hover.
+    fn attachment_chip(&self, id: EntryId, index: usize, block: AttachmentBlock<'_>) -> AnyElement {
+        let ui = self.ui;
+        let preview = attachment_preview(block.text);
+        div()
+            .id(("claude-attachment-chip", (id as usize) * 16 + index))
+            .h(px(22.))
+            .px(px(7.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .rounded(px(RADIUS_SM))
+            .bg(UiColors::tint(ui.foreground, 0.06))
+            .border_1()
+            .border_color(UiColors::tint(ui.foreground, 0.08))
+            .text_size(px(theme::TEXT_SM))
+            .text_color(ui.foreground)
+            .when(!preview.is_empty(), |chip| {
+                chip.tooltip(ui::tooltip(preview, None))
+            })
+            .child(icon(IconName::Paperclip, ui.text_muted).size(px(13.)))
+            .child(block.label.to_string())
+            .into_any_element()
+    }
+
     /// The message's text; file mentions (`@src/a.rs#L3-9`) look like links and open the file.
     fn user_text(&self, id: EntryId, text: &str, cancelled: bool) -> AnyElement {
         let ui = self.ui;
@@ -1256,16 +1289,64 @@ impl Renderer<'_> {
             Some(marks) => marks.mark(&display, runs),
             None => runs,
         };
+        // Web addresses and plugins' links (part 10.3): `TRACK-142` goes to its task, with its
+        // tooltip.
+        let mut links: Vec<_> = crate::plugin_links::web_links(&display)
+            .into_iter()
+            .filter(|url| !ranges.iter().any(|r| r.start < url.end && url.start < r.end))
+            .map(|url| {
+                let target = crate::plugin_links::Target::Url(display[url.clone()].to_string());
+                (url, target)
+            })
+            .collect();
+        let taken: Vec<_> = ranges
+            .iter()
+            .cloned()
+            .chain(links.iter().map(|(range, _)| range.clone()))
+            .collect();
+        links.extend(crate::plugin_links::plugin_targets(&display, &taken));
+        links.sort_by_key(|(range, _)| range.start);
+        let link_ranges: Vec<_> = links.iter().map(|(range, _)| range.clone()).collect();
+        let runs = crate::plugin_links::link_runs(runs, &link_ranges, ui.accent_text);
         let styled = StyledText::new(display).with_runs(runs);
-        if ranges.is_empty() {
+        if ranges.is_empty() && links.is_empty() {
             return div().child(styled).into_any_element();
         }
         let chat = self.chat.clone();
+        let mentions = ranges.len();
+        let links = Rc::new(links);
+        let clicked = links.clone();
         InteractiveText::new(("claude-user-text", id), styled)
-            .on_click(ranges, move |index, _, cx| {
-                if let Some(location) = targets.get(index).cloned() {
-                    chat.update(cx, |_, cx| cx.emit(ClaudeChatEvent::OpenLocation(location)))
-                        .ok();
+            .on_click(
+                ranges.into_iter().chain(link_ranges).collect(),
+                move |index, window, cx| {
+                    if let Some(location) = targets.get(index).cloned() {
+                        chat.update(cx, |_, cx| cx.emit(ClaudeChatEvent::OpenLocation(location)))
+                            .ok();
+                    } else {
+                        match clicked.get(index - mentions) {
+                            Some((_, crate::plugin_links::Target::Plugin(link))) => {
+                                let store = crate::plugin_links::store_of(window, cx);
+                                crate::plugin_links::activate(link, store, cx);
+                            }
+                            Some((_, crate::plugin_links::Target::Url(url))) => {
+                                crate::plugin_links::open_url(url, cx)
+                            }
+                            None => {}
+                        }
+                    }
+                },
+            )
+            .tooltip(move |index, window, cx| {
+                let (_, target) = links.iter().find(|(range, _)| range.contains(&index))?;
+                match target {
+                    crate::plugin_links::Target::Plugin(link) => {
+                        let store = crate::plugin_links::store_of(window, cx);
+                        crate::plugin_links::tooltip_view(link, store, cx)
+                    }
+                    crate::plugin_links::Target::Url(url) => {
+                        Some(crate::plugin_links::url_tooltip(url, cx))
+                    }
                 }
             })
             .into_any_element()
@@ -3406,6 +3487,67 @@ fn image_extension(media_type: &str) -> &'static str {
     }
 }
 
+/// What a plugin's Claude session sends before the message (part 10.3, `claude.new-session`):
+/// `<attachment name="TRACK-142">…</attachment>` — a chip above the bubble, not text in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttachmentBlock<'a> {
+    pub label: &'a str,
+    pub text: &'a str,
+}
+
+const ATTACHMENT_OPEN: &str = "<attachment name=\"";
+const ATTACHMENT_CLOSE: &str = "</attachment>";
+
+/// The attachment blocks at the start of a message, and the text after them.
+pub(crate) fn leading_attachments(text: &str) -> (Vec<AttachmentBlock<'_>>, &str) {
+    let mut blocks = Vec::new();
+    let mut rest = text;
+    while let Some(after) = rest.trim_start().strip_prefix(ATTACHMENT_OPEN) {
+        let Some(quote) = after.find('"') else {
+            break;
+        };
+        let Some(body) = after[quote + 1..].strip_prefix('>') else {
+            break;
+        };
+        let Some(end) = body.find(ATTACHMENT_CLOSE) else {
+            break;
+        };
+        blocks.push(AttachmentBlock {
+            label: &after[..quote],
+            text: body[..end].trim(),
+        });
+        rest = &body[end + ATTACHMENT_CLOSE.len()..];
+    }
+    if blocks.is_empty() {
+        return (blocks, text);
+    }
+    (blocks, rest.trim_start())
+}
+
+/// The bubble's text of a user's message: without a plugin's attachments and the mentions at its
+/// ends (they are chips) — what the bubble shows and ⌘F searches.
+pub(crate) fn bubble_text(text: &str) -> &str {
+    edge_mentions(leading_attachments(text).1).1
+}
+
+/// The start of an attachment's text for its chip's tooltip.
+fn attachment_preview(text: &str) -> String {
+    const MAX_LINES: usize = 12;
+    const MAX_CHARS: usize = 600;
+    let mut preview = String::new();
+    for (index, line) in text.lines().enumerate() {
+        if index == MAX_LINES || preview.chars().count() + line.chars().count() > MAX_CHARS {
+            preview.push('…');
+            break;
+        }
+        if index > 0 {
+            preview.push('\n');
+        }
+        preview.push_str(line);
+    }
+    preview
+}
+
 /// A mention at an end of a message (a chip above the bubble).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Mention<'a> {
@@ -4714,6 +4856,37 @@ mod tests {
         let (chips, text) = edge_mentions("plain text");
         assert!(chips.is_empty());
         assert_eq!(text, "plain text");
+    }
+
+    #[test]
+    fn a_plugins_attachments_become_chips() {
+        // As `claude_session::with_attachments` sends them: blocks, a blank line, the message.
+        let message = "<attachment name=\"TRACK-142\">\n# Fix the sign-in\n\nSteps…\n</attachment>\n\n\
+                       <attachment name=\"TRACK-7\">\nParent\n</attachment>\n\n@src/a.rs what now?";
+        let (blocks, rest) = leading_attachments(message);
+        let labels: Vec<&str> = blocks.iter().map(|block| block.label).collect();
+        assert_eq!(labels, ["TRACK-142", "TRACK-7"]);
+        assert_eq!(blocks[0].text, "# Fix the sign-in\n\nSteps…");
+        assert_eq!(rest, "@src/a.rs what now?");
+        assert_eq!(bubble_text(message), "what now?");
+        // Only attachments: no bubble.
+        let (blocks, rest) = leading_attachments("<attachment name=\"A\">\nx\n</attachment>");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(rest, "");
+        // Not an attachment block at the start, or an unclosed one: the text as it is.
+        let text = "Look at <attachment name=\"A\">x</attachment>";
+        assert_eq!(leading_attachments(text), (Vec::new(), text));
+        let text = "<attachment name=\"A\">never closed";
+        assert_eq!(leading_attachments(text), (Vec::new(), text));
+    }
+
+    #[test]
+    fn an_attachments_tooltip_is_its_start() {
+        assert_eq!(attachment_preview("a\nb"), "a\nb");
+        let long: String = (0..20).map(|n| format!("line {n}\n")).collect();
+        let preview = attachment_preview(&long);
+        assert_eq!(preview.lines().count(), 12);
+        assert!(preview.ends_with('…'));
     }
 
     #[test]

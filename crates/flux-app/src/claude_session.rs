@@ -134,6 +134,49 @@ pub struct ClaudeSession {
     /// An edited message waits for the old process to end (part 10.2); its frames are ignored
     /// meanwhile.
     restart: Option<Restart>,
+    /// What the message field starts with (part 10.3: a plugin's session with its context); the
+    /// chat's field takes it when it is made.
+    draft: Option<SessionDraft>,
+}
+
+/// The start of a session's message field: text, and attachments as chips (part 10.3).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionDraft {
+    pub prompt: Option<String>,
+    pub attachments: Vec<Attachment>,
+}
+
+/// Something that goes along with a message (part 10.3): a chip in the field with its label, its
+/// Markdown in the message ([`attachments_text`]) — a plugin's task, say.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attachment {
+    pub label: String,
+    pub markdown: String,
+}
+
+/// The attachments as Claude reads them, before the message: each in a tag named by its label.
+pub fn attachments_text(attachments: &[Attachment]) -> String {
+    attachments
+        .iter()
+        .map(|attachment| {
+            format!(
+                "<attachment name=\"{}\">\n{}\n</attachment>",
+                attachment.label.replace('"', "'"),
+                attachment.markdown.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// A message with its attachments in front, as it goes to Claude.
+pub fn with_attachments(attachments: &[Attachment], message: &str) -> String {
+    let attachments = attachments_text(attachments);
+    match (attachments.is_empty(), message.trim().is_empty()) {
+        (true, _) => message.to_string(),
+        (false, true) => attachments,
+        (false, false) => format!("{attachments}\n\n{message}"),
+    }
 }
 
 /// A `!` command: its process and what it printed, for Claude.
@@ -200,7 +243,18 @@ impl ClaudeSession {
             held: Vec::new(),
             shell_ticker: None,
             restart: None,
+            draft: None,
         }
+    }
+
+    /// What the chat's field starts with (part 10.3), set before the chat is made.
+    pub fn set_draft(&mut self, draft: SessionDraft) {
+        self.draft = Some(draft);
+    }
+
+    /// The field's start, once: the chat's field takes it.
+    pub fn take_draft(&mut self) -> Option<SessionDraft> {
+        self.draft.take()
     }
 
     /// The transcript is read: its conversation goes before whatever happened meanwhile (a message

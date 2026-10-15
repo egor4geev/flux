@@ -3,13 +3,20 @@
 //! [`Picker`] owns the field ([`TextInput`]), the selected row, scrolling, and the keys; what to
 //! search for and how to draw a row is up to the [`PickerDelegate`]. Shown as an overlay window:
 //! `Workspace::toggle_modal(window, cx, |window, cx| Picker::new(..))`.
+//!
+//! A delegate may also (part 10.3, the plugins' popups): have rows that can't be selected (a
+//! group's heading), drop the query field (a short menu: ↑↓ ↵ Esc), say it is still looking (a
+//! pulsing dot), set its width and row height, hide the footer.
 
 use std::ops::Range;
 
+use std::time::Duration;
+
 use gpui::{
-    AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, HighlightStyle, Hsla, KeyBinding, Render, ScrollStrategy, SharedString, StyledText,
-    Subscription, UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
+    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, Render,
+    ScrollStrategy, SharedString, StyledText, Subscription, UniformListScrollHandle, Window,
+    actions, div, prelude::*, px, uniform_list,
 };
 
 use crate::i18n::tr;
@@ -19,10 +26,10 @@ use crate::theme::{self, Theme};
 use crate::ui::{self, RADIUS_MD};
 
 /// Height of a list row.
-const ROW_HEIGHT: f32 = 34.;
+pub const ROW_HEIGHT: f32 = 34.;
 /// How many rows are visible without scrolling.
 const MAX_VISIBLE_ROWS: usize = 10;
-const PICKER_WIDTH: f32 = 640.;
+pub const PICKER_WIDTH: f32 = 640.;
 /// Header with the query and footer with hints.
 const HEADER_HEIGHT: f32 = 50.;
 const FOOTER_HEIGHT: f32 = 36.;
@@ -118,11 +125,42 @@ pub trait PickerDelegate: Sized + 'static {
     fn delete_label(&self) -> Option<&'static str> {
         None
     }
+
+    /// Row `index` can be selected and chosen: a group's heading can't (the keys and the mouse
+    /// pass it by).
+    fn selectable(&self, _index: usize) -> bool {
+        true
+    }
+
+    /// The query field is shown; without it the list is a short menu (↑↓ ↵ Esc).
+    fn searchable(&self) -> bool {
+        true
+    }
+
+    /// The matches are still coming: a pulsing dot in the header (or in the empty list).
+    fn loading(&self) -> bool {
+        false
+    }
+
+    fn width(&self) -> f32 {
+        PICKER_WIDTH
+    }
+
+    fn row_height(&self) -> f32 {
+        ROW_HEIGHT
+    }
+
+    /// The footer with the key hints is shown.
+    fn show_footer(&self) -> bool {
+        true
+    }
 }
 
 pub struct Picker<D: PickerDelegate> {
     pub delegate: D,
     query: Entity<TextInput>,
+    /// The keys' focus of a list without the query field.
+    focus: FocusHandle,
     selected: usize,
     scroll: UniformListScrollHandle,
     _subscription: Subscription,
@@ -138,9 +176,39 @@ impl<D: PickerDelegate> Picker<D> {
             return;
         }
         self.selected = index.min(count - 1);
+        self.clamp_selection();
         self.scroll
             .scroll_to_item(self.selected, gpui::ScrollStrategy::Center);
         cx.notify();
+    }
+
+    /// The first row that can be selected, scrolled to the top: the delegate's matches changed
+    /// on their own (a plugin's new items).
+    pub fn select_first(&mut self, cx: &mut Context<Self>) {
+        self.selected = self.next_selectable(0).unwrap_or(0);
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// The query typed so far.
+    pub fn query(&self, cx: &App) -> String {
+        self.query.read(cx).text()
+    }
+
+    /// The first row from `index` on that can be selected.
+    fn next_selectable(&self, index: usize) -> Option<usize> {
+        (index..self.delegate.match_count()).find(|&row| self.delegate.selectable(row))
+    }
+
+    /// The last row up to `index` that can be selected.
+    fn previous_selectable(&self, index: usize) -> Option<usize> {
+        let count = self.delegate.match_count();
+        if count == 0 {
+            return None;
+        }
+        (0..=index.min(count - 1))
+            .rev()
+            .find(|&row| self.delegate.selectable(row))
     }
 
     fn delete_selected(&mut self, _: &DeleteSelected, window: &mut Window, cx: &mut Context<Self>) {
@@ -157,13 +225,16 @@ impl<D: PickerDelegate> Picker<D> {
         });
         let subscription = cx.subscribe_in(&query, window, Self::on_query_event);
         delegate.update_matches("", window, cx);
-        Self {
+        let mut picker = Self {
             delegate,
             query,
+            focus: cx.focus_handle(),
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             _subscription: subscription,
-        }
+        };
+        picker.selected = picker.next_selectable(0).unwrap_or(0);
+        picker
     }
 
     fn on_query_event(
@@ -177,7 +248,7 @@ impl<D: PickerDelegate> Picker<D> {
             InputEvent::Changed => {
                 let text = query.read(cx).text();
                 self.delegate.update_matches(&text, window, cx);
-                self.selected = 0;
+                self.selected = self.next_selectable(0).unwrap_or(0);
                 self.scroll.scroll_to_item(0, ScrollStrategy::Top);
                 cx.notify();
             }
@@ -187,6 +258,12 @@ impl<D: PickerDelegate> Picker<D> {
     fn clamp_selection(&mut self) {
         let count = self.delegate.match_count();
         self.selected = self.selected.min(count.saturating_sub(1));
+        if count > 0 && !self.delegate.selectable(self.selected) {
+            self.selected = self
+                .next_selectable(self.selected)
+                .or_else(|| self.previous_selectable(self.selected))
+                .unwrap_or(self.selected);
+        }
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -195,6 +272,17 @@ impl<D: PickerDelegate> Picker<D> {
             return;
         }
         let index = index.min(count - 1);
+        // A heading is passed by in the direction of the move; past the last row there is none.
+        let index = if index >= self.selected {
+            self.next_selectable(index)
+                .or_else(|| self.previous_selectable(index))
+        } else {
+            self.previous_selectable(index)
+                .or_else(|| self.next_selectable(index))
+        };
+        let Some(index) = index else {
+            return;
+        };
         // Scroll the minimum amount: moving up, the row snaps to the top edge; moving down, to the
         // bottom edge.
         let strategy = if index < self.selected {
@@ -202,8 +290,13 @@ impl<D: PickerDelegate> Picker<D> {
         } else {
             ScrollStrategy::Bottom
         };
+        // Going up to a group's first row shows its heading too.
+        let shown = match strategy {
+            ScrollStrategy::Top if index > 0 && !self.delegate.selectable(index - 1) => index - 1,
+            _ => index,
+        };
         self.selected = index;
-        self.scroll.scroll_to_item(index, strategy);
+        self.scroll.scroll_to_item(shown, strategy);
         cx.notify();
     }
 
@@ -229,7 +322,7 @@ impl<D: PickerDelegate> Picker<D> {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected < self.delegate.match_count() {
+        if self.selected < self.delegate.match_count() && self.delegate.selectable(self.selected) {
             self.delegate.confirm(self.selected, window, cx);
         }
     }
@@ -242,37 +335,45 @@ impl<D: PickerDelegate> Picker<D> {
     ) -> AnyElement {
         let ui = Theme::ui(cx);
         let selected = index == self.selected;
+        let selectable = self.delegate.selectable(index);
+        let content = self.delegate.render_match(index, selected, window, cx);
         // The outer block spans the full width of the list (uniform_list measures the row height
         // from it); the inner one is a rounded background inset from the panel edges.
+        let row = div()
+            .id(index)
+            .size_full()
+            .px_2p5()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .rounded(px(RADIUS_MD));
+        let row = if selectable {
+            row.cursor_pointer()
+                .when(selected, |row| row.bg(ui.list_selected))
+                .when(!selected, |row| row.hover(|style| style.bg(ui.hover)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.selected = index;
+                    this.confirm(&Confirm, window, cx);
+                }))
+        } else {
+            row
+        };
         div()
             .w_full()
-            .h(px(ROW_HEIGHT))
+            .h(px(self.delegate.row_height()))
             .px(px(LIST_INSET))
-            .child(
-                div()
-                    .id(index)
-                    .size_full()
-                    .px_2p5()
-                    .flex()
-                    .items_center()
-                    .overflow_hidden()
-                    .rounded(px(RADIUS_MD))
-                    .cursor_pointer()
-                    .when(selected, |row| row.bg(ui.list_selected))
-                    .when(!selected, |row| row.hover(|style| style.bg(ui.hover)))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.selected = index;
-                        this.confirm(&Confirm, window, cx);
-                    }))
-                    .child(self.delegate.render_match(index, selected, window, cx)),
-            )
+            .child(row.child(content))
             .into_any_element()
     }
 }
 
 impl<D: PickerDelegate> Focusable for Picker<D> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.query.focus_handle(cx)
+        if self.delegate.searchable() {
+            self.query.focus_handle(cx)
+        } else {
+            self.focus.clone()
+        }
     }
 }
 
@@ -281,19 +382,26 @@ impl<D: PickerDelegate> Render for Picker<D> {
         let ui = Theme::ui(cx);
         self.clamp_selection();
         let count = self.delegate.match_count();
+        let searchable = self.delegate.searchable();
+        let loading = self.delegate.loading();
+        let row_height = self.delegate.row_height();
         let list = if count == 0 {
             div()
                 .h(px(ROW_HEIGHT * 2.))
+                .px_4()
                 .flex()
                 .items_center()
                 .justify_center()
                 .gap_2()
                 .text_color(ui.dim)
-                .child(icon(IconName::Search, ui.dim).size(px(14.)))
-                .child(self.delegate.empty_message())
+                .when(loading, |empty| empty.child(pulse(ui.accent)))
+                .when(!loading && searchable, |empty| {
+                    empty.child(icon(IconName::Search, ui.dim).size(px(14.)))
+                })
+                .child(div().truncate().child(self.delegate.empty_message()))
                 .into_any_element()
         } else {
-            let height = ROW_HEIGHT * count.min(MAX_VISIBLE_ROWS) as f32;
+            let height = row_height * count.min(MAX_VISIBLE_ROWS) as f32;
             uniform_list(
                 "picker-matches",
                 count,
@@ -307,11 +415,52 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .h(px(height))
             .into_any_element()
         };
-        let footer = self.delegate.render_footer(window, cx);
+        let footer = self
+            .delegate
+            .show_footer()
+            .then(|| self.delegate.render_footer(window, cx))
+            .flatten();
         let delete_label = self.delegate.delete_label();
+        let header = searchable.then(|| {
+            div()
+                .flex_none()
+                .h(px(HEADER_HEIGHT))
+                .px_4()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(icon(IconName::Search, ui.text_muted))
+                .child(div().flex_1().min_w_0().child(self.query.clone()))
+                .when(loading, |header| header.child(pulse(ui.accent)))
+        });
+        let hints = self.delegate.show_footer().then(|| {
+            div()
+                .flex_none()
+                .h(px(FOOTER_HEIGHT))
+                .px_4()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.dim)
+                .child(div().min_w_0().truncate().children(footer))
+                .child(ui::hint_bar(
+                    &[
+                        ("↑↓", tr("navigate")),
+                        ("↵", self.delegate.confirm_label()),
+                    ]
+                    .into_iter()
+                    .chain(delete_label.map(|label| ("⌘⌫", label)))
+                    .chain([("esc", tr("close"))])
+                    .collect::<Vec<_>>(),
+                    ui,
+                ))
+        });
         ui::popover(ui)
             .key_context(self.delegate.key_context())
-            .w(px(PICKER_WIDTH))
+            .when(!searchable, |popover| popover.track_focus(&self.focus))
+            .w(px(self.delegate.width()))
             .flex()
             .flex_col()
             .on_action(cx.listener(Self::select_next))
@@ -321,45 +470,28 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(|_, _: &Dismiss, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(Self::delete_selected))
-            .child(
-                div()
-                    .flex_none()
-                    .h(px(HEADER_HEIGHT))
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(icon(IconName::Search, ui.text_muted))
-                    .child(div().flex_1().min_w_0().child(self.query.clone())),
-            )
-            .child(ui::divider(ui))
+            .when_some(header, |popover, header| {
+                popover.child(header).child(ui::divider(ui))
+            })
             .child(div().py(px(LIST_INSET)).child(list))
-            .child(ui::divider(ui))
-            .child(
-                div()
-                    .flex_none()
-                    .h(px(FOOTER_HEIGHT))
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .text_size(px(theme::TEXT_SM))
-                    .text_color(ui.dim)
-                    .child(div().min_w_0().truncate().children(footer))
-                    .child(ui::hint_bar(
-                        &[
-                            ("↑↓", tr("navigate")),
-                            ("↵", self.delegate.confirm_label()),
-                        ]
-                        .into_iter()
-                        .chain(delete_label.map(|label| ("⌘⌫", label)))
-                        .chain([("esc", tr("close"))])
-                        .collect::<Vec<_>>(),
-                        ui,
-                    )),
-            )
+            .when_some(hints, |popover, hints| {
+                popover.child(ui::divider(ui)).child(hints)
+            })
     }
+}
+
+/// A pulsing dot: the matches are still coming (as Find in Files' search in progress).
+fn pulse(color: Hsla) -> impl IntoElement {
+    div()
+        .flex_none()
+        .size(px(7.))
+        .rounded(px(4.))
+        .bg(color)
+        .with_animation(
+            "picker-loading",
+            Animation::new(Duration::from_millis(900)).repeat(),
+            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+        )
 }
 
 /// Text with highlighted characters: `positions` are `char` indices (as in

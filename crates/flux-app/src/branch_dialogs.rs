@@ -8,9 +8,12 @@
 //! be asked (system dialogs) and tell how it went (notifications). An operation that stops on
 //! conflicts opens the Conflicts dialog.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 
-use flux_git::{GitError, Outcome, RefKind};
+use flux_git::{GitError, Outcome, RefKind, Refs};
+use futures::channel::oneshot;
 use gpui::{
     Action, App, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle,
     Focusable, FontWeight, InteractiveElement, KeyBinding, Render, SharedString, Subscription,
@@ -133,6 +136,36 @@ pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
     )
 }
 
+/// Who waits for a flow to end — a plugin's `git.new-branch` or `git.checkout` (API 0.3, part
+/// 10.3) — and hears once how it ended: done, declined or failed (the user has been told by then,
+/// as in the window's own flows). The window's own flows have nobody waiting.
+#[derive(Clone, Default)]
+pub(crate) struct Done(Option<Waiter>);
+
+/// The waiting side of a flow: told once, then gone.
+type Waiter = Rc<RefCell<Option<oneshot::Sender<Result<(), String>>>>>;
+
+/// What a plugin hears when the user said no (Don't Checkout).
+pub(crate) const DECLINED: &str = "The user declined";
+
+impl Done {
+    pub(crate) fn new(sender: oneshot::Sender<Result<(), String>>) -> Self {
+        Done(Some(Rc::new(RefCell::new(Some(sender)))))
+    }
+
+    /// Nobody waits: the window's own flows.
+    fn none() -> Self {
+        Done(None)
+    }
+
+    pub(crate) fn finish(&self, result: Result<(), String>) {
+        let sender = self.0.as_ref().and_then(|cell| cell.borrow_mut().take());
+        if let Some(sender) = sender {
+            sender.send(result).ok();
+        }
+    }
+}
+
 // --- Helpers ---
 
 /// The repository the window works with now; without one, a message.
@@ -250,6 +283,7 @@ fn checkout_ref(
                 CheckoutTarget::Local(name),
                 CheckoutMode::Normal,
                 Then::Report,
+                Done::none(),
                 window,
                 cx,
             )
@@ -271,6 +305,7 @@ fn checkout_ref(
                 CheckoutTarget::Revision(name),
                 CheckoutMode::Normal,
                 Then::Detached(oid),
+                Done::none(),
                 window,
                 cx,
             )
@@ -316,6 +351,7 @@ fn checkout_remote(
                 CheckoutTarget::Local(local),
                 CheckoutMode::Normal,
                 then(update),
+                Done::none(),
                 window,
                 cx,
             )
@@ -329,31 +365,11 @@ fn checkout_remote(
             },
             CheckoutMode::Normal,
             then(false),
+            Done::none(),
             window,
             cx,
         ),
     }
-}
-
-/// Checks out `target` in a repository; local changes in the way → Smart Checkout / Force Checkout
-/// / Don't Checkout; the result in a notification (conflicts of the unstash — the Conflicts
-/// dialog).
-pub fn checkout(
-    workspace: &mut Workspace,
-    repo: usize,
-    target: CheckoutTarget,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    run_checkout(
-        workspace,
-        repo,
-        target,
-        CheckoutMode::Normal,
-        Then::Report,
-        window,
-        cx,
-    )
 }
 
 /// Checks out a commit (the log's Checkout Revision): HEAD is detached there, as a notification
@@ -371,17 +387,20 @@ pub fn checkout_detached(
         CheckoutTarget::Revision(oid.clone()),
         CheckoutMode::Normal,
         Then::Detached(oid),
+        Done::none(),
         window,
         cx,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_checkout(
     workspace: &mut Workspace,
     repo: usize,
     target: CheckoutTarget,
     mode: CheckoutMode,
     then: Then,
+    done: Done,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -391,8 +410,8 @@ fn run_checkout(
     cx.spawn_in(window, async move |this, cx| {
         let result = task.await;
         this.update_in(cx, |this, window, cx| match result {
-            Ok(done) => checked_out(this, repo, target, done, then, window, cx),
-            Err(err) => checkout_failed(this, repo, target, mode, then, err, window, cx),
+            Ok(checkout) => checked_out(this, repo, target, checkout, then, done, window, cx),
+            Err(err) => checkout_failed(this, repo, target, mode, then, err, done, window, cx),
         })
         .ok();
     })
@@ -407,18 +426,21 @@ fn checkout_failed(
     mode: CheckoutMode,
     then: Then,
     error: GitError,
+    done: Done,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
     if let Some(blocked) = flux_git::blocked_by(&error) {
         if !blocked.local.is_empty() && mode == CheckoutMode::Normal {
-            return ask_smart_checkout(repo, target, blocked.local, then, window, cx);
+            return ask_smart_checkout(repo, target, blocked.local, then, done, window, cx);
         }
         if !blocked.untracked.is_empty() {
+            done.finish(Err("Untracked files would be overwritten".into()));
             return untracked_in_the_way(&blocked.untracked, window, cx);
         }
     }
     notify_error(workspace, repo, tr("Checkout failed"), &error, cx);
+    done.finish(Err(error.to_string()));
 }
 
 /// JetBrains' "Git Checkout Problem": the files whose changes are in the way, and what to do.
@@ -427,6 +449,7 @@ fn ask_smart_checkout(
     target: CheckoutTarget,
     files: Vec<String>,
     then: Then,
+    done: Done,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -446,10 +469,10 @@ fn ask_smart_checkout(
         let mode = match answer.await {
             Some(0) => CheckoutMode::Smart,
             Some(1) => CheckoutMode::Force,
-            _ => return,
+            _ => return done.finish(Err(DECLINED.into())),
         };
         this.update_in(cx, |this, window, cx| {
-            run_checkout(this, repo, target, mode, then, window, cx)
+            run_checkout(this, repo, target, mode, then, done, window, cx)
         })
         .ok();
     })
@@ -468,15 +491,20 @@ fn untracked_in_the_way(files: &[String], window: &mut Window, cx: &mut Context<
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checked_out(
     workspace: &mut Workspace,
     repo: usize,
     target: CheckoutTarget,
-    done: CheckoutDone,
+    checkout: CheckoutDone,
     then: Then,
+    done: Done,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    // The branch is checked out: what follows (an update, a rebase, restored changes) is told in
+    // its own way.
+    done.finish(Ok(()));
     let name = match &target {
         CheckoutTarget::Local(name) | CheckoutTarget::Revision(name) => name.clone(),
         CheckoutTarget::Remote { local, .. } => local.clone(),
@@ -484,7 +512,7 @@ fn checked_out(
     // The stashed changes of a smart checkout came back: cleanly, or with conflicts (they wait to be
     // resolved; the stash stays — git doesn't drop it — until the user drops it). With conflicts in
     // the working tree, a follow-up merge or rebase can't run: the conflicts come first.
-    let unstash = done.unstash;
+    let unstash = checkout.unstash;
     let conflicted = matches!(unstash, Some((Outcome::Conflicts, _)));
     let restored = matches!(unstash, Some((outcome, _)) if outcome != Outcome::Conflicts);
     match then {
@@ -555,6 +583,71 @@ fn checked_out(
             .action(tr("Drop Stash"), git::DropStash { repo, oid });
         notify(workspace, notification, cx);
     }
+}
+
+// --- For plugins (API 0.3, part 10.3) ---
+
+/// A plugin's `git.new-branch`: `name` from `start` (none — the current branch), checked out as
+/// New Branch… does it — local changes come along, Smart Checkout asks when they're in the way;
+/// `done` hears how it ended.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_branch_for_plugin(
+    workspace: &mut Workspace,
+    repo: usize,
+    name: String,
+    start: Option<String>,
+    done: Done,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let start = start.unwrap_or_else(|| {
+        workspace
+            .git()
+            .read(cx)
+            .current_branch(repo)
+            .unwrap_or_else(|| "HEAD".into())
+    });
+    create_branch(workspace, repo, name, start, true, false, done, window, cx)
+}
+
+/// A plugin's `git.checkout`: a local branch; a remote one ("origin/x") as the local branch of its
+/// name — the one there is, or a new one tracking it — with the branches popup's questions and
+/// messages; `done` hears how it ended. `refs` — the repository's branches, read just now.
+pub(crate) fn checkout_for_plugin(
+    workspace: &mut Workspace,
+    repo: usize,
+    branch: String,
+    refs: &Refs,
+    done: Done,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let target = match (refs.local(&branch), refs.remote(&branch)) {
+        (Some(local), _) if local.current => return done.finish(Ok(())),
+        (Some(_), _) => CheckoutTarget::Local(branch),
+        (None, Some(remote)) => {
+            let local = remote.short_name().to_string();
+            match refs.local(&local) {
+                Some(existing) if existing.current => return done.finish(Ok(())),
+                Some(_) => CheckoutTarget::Local(local),
+                None => CheckoutTarget::Remote {
+                    remote_branch: branch,
+                    local,
+                },
+            }
+        }
+        (None, None) => return done.finish(Err(format!("No branch '{branch}'"))),
+    };
+    run_checkout(
+        workspace,
+        repo,
+        target,
+        CheckoutMode::Normal,
+        Then::Report,
+        done,
+        window,
+        cx,
+    )
 }
 
 // --- Merge and rebase ---
@@ -775,6 +868,7 @@ fn create_branch(
     start: String,
     checkout: bool,
     overwrite: bool,
+    done: Done,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -792,27 +886,33 @@ fn create_branch(
                 };
                 let title = titled(this.git().read(cx), repo, title);
                 notify(this, Notification::success(title), cx);
+                done.finish(Ok(()));
             }
             Err(error)
                 if checkout
                     && flux_git::blocked_by(&error)
                         .is_some_and(|blocked| !blocked.local.is_empty()) =>
             {
-                create_then_checkout(this, repo, name, start, overwrite, window, cx)
+                create_then_checkout(this, repo, name, start, overwrite, done, window, cx)
             }
-            Err(error) => notify_error(this, repo, tr("Branch not created"), &error, cx),
+            Err(error) => {
+                notify_error(this, repo, tr("Branch not created"), &error, cx);
+                done.finish(Err(error.to_string()));
+            }
         })
         .ok();
     })
     .detach();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_then_checkout(
     workspace: &mut Workspace,
     repo: usize,
     name: String,
     start: String,
     overwrite: bool,
+    done: Done,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -822,8 +922,20 @@ fn create_then_checkout(
     cx.spawn_in(window, async move |this, cx| {
         let result = task.await;
         this.update_in(cx, |this, window, cx| match result {
-            Ok(()) => checkout(this, repo, CheckoutTarget::Local(name), window, cx),
-            Err(error) => notify_error(this, repo, tr("Branch not created"), &error, cx),
+            Ok(()) => run_checkout(
+                this,
+                repo,
+                CheckoutTarget::Local(name),
+                CheckoutMode::Normal,
+                Then::Report,
+                done,
+                window,
+                cx,
+            ),
+            Err(error) => {
+                notify_error(this, repo, tr("Branch not created"), &error, cx);
+                done.finish(Err(error.to_string()));
+            }
         })
         .ok();
     })
@@ -997,7 +1109,15 @@ impl NewBranchDialog {
         self.workspace
             .update(cx, |workspace, cx| {
                 create_branch(
-                    workspace, repo, name, start, checkout, overwrite, window, cx,
+                    workspace,
+                    repo,
+                    name,
+                    start,
+                    checkout,
+                    overwrite,
+                    Done::none(),
+                    window,
+                    cx,
                 )
             })
             .ok();
@@ -1308,6 +1428,7 @@ fn checkout_resolved(
                 CheckoutTarget::Revision(revision),
                 CheckoutMode::Normal,
                 Then::Detached(oid),
+                Done::none(),
                 window,
                 cx,
             ),

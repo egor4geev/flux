@@ -1,0 +1,1201 @@
+// The API between Flux and its plugins, version 0.3. A plugin is a WebAssembly component of the
+// `plugin` world (target `wasm32-wasip2`); Flux is the host. Every function a plugin imports is
+// answered by Flux; the functions it exports are called by Flux on the plugin's own thread, one
+// call at a time. Documentation: docs/plugins.md.
+//
+// What a plugin may do beyond its own folder, its notifications, questions and windows is listed
+// in the manifest's `[permissions]`: the project's files, the network, a server on this Mac,
+// programs, terminals, folders outside the project, Claude Code sessions. The install question
+// shows them to the user; a call they don't allow fails with an error that names the missing
+// permission.
+//
+// Plugins built for 0.2 keep working: Flux answers their calls (`wit/v0.2`) with the same code,
+// and doesn't send them what 0.2 doesn't know.
+
+package flux:plugin@0.3.0;
+
+/// Types shared by the interfaces.
+interface types {
+    /// A place in a document: a zero-based line and a zero-based column in characters (Unicode
+    /// scalar values), as Flux counts them.
+    record position {
+        line: u32,
+        column: u32,
+    }
+
+    /// A span of a document. A selection keeps its direction: the cursor is at `end`, which may
+    /// come before `start`.
+    record range {
+        start: position,
+        end: position,
+    }
+
+    /// An open document.
+    record editor-info {
+        /// Stable while the document is open.
+        id: u64,
+        /// The absolute path; none for a new unsaved document.
+        path: option<string>,
+        /// The language as the status bar shows it: "Rust", "Plain Text".
+        language: string,
+        /// Has unsaved changes.
+        modified: bool,
+    }
+
+    /// Where a command was run from.
+    enum command-source {
+        /// The command palette.
+        palette,
+        /// The command's keys.
+        keys,
+        /// The editor's context menu.
+        editor-menu,
+        /// The context menu of the project tree.
+        tree-menu,
+        /// The context menu of a tab.
+        tab-menu,
+        /// An action of one of the plugin's notifications.
+        notification,
+        /// One of the plugin's status bar items.
+        status-bar,
+        /// A button of the plugin's settings page (`type = "button"`).
+        settings,
+    }
+
+    /// What a command acts on, as it was when the command was run.
+    record command-context {
+        source: command-source,
+        /// The document: the active one (the editor's menu, the palette, keys), or the tab's (a
+        /// tab's menu); none when it isn't a document.
+        editor: option<editor-info>,
+        /// The document's selections, the primary one first; an empty range is a cursor.
+        selections: list<range>,
+        /// The files and folders the command acts on, absolute: the rows selected in the tree, the
+        /// tab's file, the document's file.
+        paths: list<string>,
+        /// What the notification's action or the settings button carries (its `argument`): which
+        /// task, which meeting.
+        argument: option<string>,
+    }
+}
+
+/// The plugin's log: Settings → Plugins → the plugin → Log, and a file on disk. What the plugin
+/// prints to stdout and stderr goes there too.
+interface log {
+    enum level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    write: func(level: level, message: string);
+}
+
+/// The interface language and the plugin's translations: `locales/<language>.toml` in the
+/// plugin's folder, English text = translation (as Flux's own tables).
+interface i18n {
+    /// The interface language: "en", "ru".
+    language: func() -> string;
+    /// The text in the interface language; the text itself when there is no translation.
+    translate: func(text: string) -> string;
+}
+
+/// The plugin's commands, declared in the manifest (`[[commands]]`). They run from the command
+/// palette, their keys, the context menus (`[[menus]]`), notification actions and status bar
+/// items, and come to `run-command`.
+interface commands {
+    /// Grays a command out in the palette and the menus (it stops running) or brings it back.
+    set-enabled: func(command: string, enabled: bool);
+}
+
+/// Notifications: the notification center (the Notifications window and the cards), in the
+/// plugin's group of Settings → Notifications.
+interface notifications {
+    enum notification-kind {
+        info,
+        success,
+        warning,
+        error,
+    }
+
+    /// A button of a notification: runs one of the plugin's commands.
+    record action {
+        label: string,
+        command: string,
+        /// Comes to `run-command` as the context's `argument`: which of several notifications the
+        /// button belongs to ("TRACK-142").
+        argument: option<string>,
+    }
+
+    record notification {
+        kind: notification-kind,
+        title: string,
+        body: option<string>,
+        actions: list<action>,
+        /// The card stays until closed (errors always do).
+        sticky: bool,
+    }
+
+    variant progress {
+        indeterminate,
+        /// 0.0–1.0.
+        fraction(f32),
+    }
+
+    /// Shows a notification; the id updates it later.
+    notify: func(notification: notification) -> u64;
+    /// Replaces the notification's content.
+    update: func(id: u64, notification: notification);
+    /// A task in progress: the card stays while there is progress; none — the task is over.
+    set-progress: func(id: u64, value: option<progress>);
+    /// The actions stop working (what they offered is over); the entry stays in the journal.
+    expire: func(id: u64);
+    /// Removes the notification from the journal and the corner.
+    remove: func(id: u64);
+}
+
+/// Questions in Flux dialogs. A question returns an id at once; the answer comes later as the
+/// `dialog-answered` or `text-answered` event.
+interface dialogs {
+    enum dialog-level {
+        info,
+        warning,
+        critical,
+    }
+
+    enum button-role {
+        /// The default (↵), on the right.
+        primary,
+        normal,
+        /// Destructive: never the default; ⌘D.
+        danger,
+        /// Esc.
+        cancel,
+    }
+
+    record dialog-button {
+        label: string,
+        role: button-role,
+    }
+
+    record question {
+        level: dialog-level,
+        title: string,
+        message: option<string>,
+        /// Monospace details under a disclosure, with Copy: command output, a stack trace.
+        details: option<string>,
+        /// Without buttons the dialog gets "OK".
+        buttons: list<dialog-button>,
+    }
+
+    /// A dialog with a text field.
+    record text-question {
+        title: string,
+        message: option<string>,
+        /// The initial text, selected.
+        text: string,
+        placeholder: option<string>,
+        /// The confirm button's label: "Create", "Rename".
+        confirm: string,
+    }
+
+    /// An option of a `choice` field.
+    record choice-option {
+        /// What the answer carries.
+        value: string,
+        title: string,
+    }
+
+    /// What a field of a form is.
+    variant field-kind {
+        /// A line of text: the initial text.
+        text(string),
+        /// Several lines (↵ — a new line, ⌘↵ — confirm): the initial text.
+        multiline(string),
+        /// One of the options, a dropdown; the value of the chosen one (none — the first).
+        choice(tuple<list<choice-option>, option<string>>),
+        /// A checkbox: on or off.
+        toggle(bool),
+        /// Text between the fields, not a field: a hint, a warning.
+        note(string),
+    }
+
+    record form-field {
+        /// The answer names the field by it.
+        key: string,
+        /// The label: on the left of a field, the text of a checkbox.
+        label: string,
+        kind: field-kind,
+        placeholder: option<string>,
+        /// The code font (a branch's name, a query).
+        code: bool,
+        /// The key of a `toggle` field: this one is enabled only while it is on ("Create branch" →
+        /// the branch's name).
+        enabled-by: option<string>,
+    }
+
+    /// A dialog with several fields: the Open Task dialog of JetBrains, a work log entry.
+    record form {
+        level: dialog-level,
+        title: string,
+        message: option<string>,
+        fields: list<form-field>,
+        /// The confirm button's label: "Start", "Log Time".
+        confirm: string,
+        /// A problem of the previous answer, in the error tone above the buttons: the plugin asks
+        /// again with the values the user gave and says what to fix.
+        error: option<string>,
+    }
+
+    ask: func(question: question) -> u64;
+    ask-text: func(question: text-question) -> u64;
+    /// The answer comes as `form-answered`: every field's value by its key (the text, the chosen
+    /// option's value, "true" / "false"), or none — cancelled.
+    ask-form: func(form: form) -> u64;
+}
+
+/// The window's documents.
+interface editors {
+    use types.{range, editor-info};
+
+    /// A span replaced with a text.
+    record text-edit {
+        range: range,
+        text: string,
+    }
+
+    /// The active tab's document; none when the active tab is not a document (a terminal, a log).
+    active: func() -> option<editor-info>;
+    /// The open documents, in tab order.
+    %list: func() -> list<editor-info>;
+    /// The document's text; none when it is closed.
+    text: func(editor: u64) -> option<string>;
+    /// The selections, the primary one first; an empty range is a cursor.
+    selections: func(editor: u64) -> list<range>;
+    /// Replaces the selections (the first one becomes primary) and scrolls to the primary one.
+    set-selections: func(editor: u64, selections: list<range>) -> result<_, string>;
+    /// Applies the edits as one undo step. The ranges are in the current text and don't overlap.
+    edit: func(editor: u64, edits: list<text-edit>) -> result<_, string>;
+    /// Opens a file in a tab (or goes to its tab) and selects the span, if given, in the middle
+    /// of the view. Returns the document.
+    open: func(path: string, selection: option<range>) -> result<u64, string>;
+    /// Starts saving the document; the `editor-saved` event says when it is on disk.
+    save: func(editor: u64) -> result<_, string>;
+    /// Closes the document's tab. A document with unsaved changes stays open (the changes are
+    /// the user's to decide about): the error says so.
+    close: func(editor: u64) -> result<_, string>;
+}
+
+/// The window's project.
+interface project {
+    /// A search query, as in Find in Files.
+    record query {
+        text: string,
+        case-sensitive: bool,
+        whole-word: bool,
+        regex: bool,
+    }
+
+    /// A line with matches.
+    record line-match {
+        /// Zero-based.
+        line: u32,
+        /// The line's text; a long line is a window around the first match.
+        text: string,
+        /// The column in characters where `text` starts in the real line.
+        column-offset: u32,
+        /// The matches: spans of columns in characters within `text`, [start, end).
+        ranges: list<tuple<u32, u32>>,
+    }
+
+    record file-matches {
+        /// Relative to the project root.
+        path: string,
+        lines: list<line-match>,
+    }
+
+    record search-result {
+        files: list<file-matches>,
+        /// Stopped at `max-matches`.
+        truncated: bool,
+    }
+
+    /// The project root (absolute); none in a window without a project.
+    root: func() -> option<string>;
+    /// Searches the project's files by the rules of Find in Files (.gitignore, no binary or huge
+    /// files). Blocks the plugin, not Flux. Needs the `project` permission.
+    search: func(query: query, max-matches: u32) -> result<search-result, string>;
+}
+
+/// The plugin's own data, kept between launches: a small key-value store and a folder.
+interface storage {
+    get: func(key: string) -> option<string>;
+    /// None removes the key.
+    set: func(key: string, value: option<string>);
+    /// The plugin's folder (absolute), readable and writable through the file system.
+    data-dir: func() -> string;
+}
+
+/// The plugin's settings, declared in the manifest (`[[settings]]`) and edited in Settings → the
+/// plugin. A change comes as the `settings-changed` event.
+///
+/// A `secret` setting (a token, a password) is kept in the macOS keychain, not with the other
+/// settings: the plugin reads it with `secrets.get(<key>)`. A `button` runs one of the plugin's
+/// commands; a `status` is a line the plugin writes ("Signed in as …").
+interface settings {
+    use ui.{tone};
+
+    /// A `status` line of the settings page.
+    record setting-status {
+        text: string,
+        tone: tone,
+        /// Work is in progress: a spinner before the text ("Checking…").
+        busy: bool,
+    }
+
+    /// The value as JSON (`true`, `"text"`, `["a", "b"]`): the user's, or the manifest's default.
+    get: func(key: string) -> option<string>;
+    /// Writes a value as JSON — none: back to the default; the page shows it at once. The plugin
+    /// doesn't get `settings-changed` for its own write.
+    set: func(key: string, value: option<string>) -> result<_, string>;
+    /// Writes a `status` line; none — the manifest's text again.
+    set-status: func(key: string, status: option<setting-status>);
+}
+
+/// Status bar items declared in the manifest (`[[status-items]]`).
+interface status-bar {
+    record status-item {
+        text: string,
+        tooltip: option<string>,
+        /// The plugin's command a click runs.
+        command: option<string>,
+    }
+
+    /// Shows or updates the item; none hides it.
+    set: func(id: string, item: option<status-item>);
+}
+
+/// Tool windows declared in the manifest (`[[tool-windows]]`): the plugin describes their content
+/// with elements, and Flux draws them in its design system.
+///
+/// Icons are named: a built-in Flux icon ("refresh", "expand-all"), the icon of a file type by a
+/// file name ("file:main.rs"), or an SVG in the plugin's folder ("icons/todo.svg").
+interface ui {
+    /// The role of a text's color.
+    enum tone {
+        normal,
+        muted,
+        dim,
+        accent,
+        success,
+        warning,
+        error,
+    }
+
+    /// A piece of text in one style.
+    record span {
+        text: string,
+        tone: tone,
+        bold: bool,
+        /// The code font.
+        code: bool,
+        /// Marked as a match, like search results.
+        highlight: bool,
+    }
+
+    record button-spec {
+        label: option<string>,
+        icon: option<string>,
+        tooltip: option<string>,
+        /// The accent button.
+        primary: bool,
+        enabled: bool,
+    }
+
+    record text-field-spec {
+        text: string,
+        placeholder: option<string>,
+        code: bool,
+        /// Several lines, growing with the text up to a limit: ↵ — a new line, ⌘↵ — `submitted`.
+        multiline: bool,
+    }
+
+    /// A short colored label: a status, a priority, a count.
+    record badge-spec {
+        text: string,
+        tone: tone,
+        /// A ▾ after the text, and a click comes as `clicked`: a status that offers its transitions.
+        menu: bool,
+    }
+
+    enum toggle-style {
+        switch,
+        checkbox,
+    }
+
+    record toggle-spec {
+        label: string,
+        on: bool,
+        style: toggle-style,
+    }
+
+    /// A row of a tree (or of a flat list: rows without parents).
+    record tree-row {
+        /// Stable between views: the selection, the expansion and the events refer to it.
+        key: string,
+        /// The index of the parent row in `rows`; the parent comes first. None — the top level.
+        parent: option<u32>,
+        icon: option<string>,
+        label: list<span>,
+        /// Dim text after the label: a path, a line number. In a narrow row it gives way first.
+        detail: option<string>,
+        /// A count on the right.
+        badge: option<string>,
+        /// Expanded when first shown; the user's choice wins afterwards.
+        expanded: bool,
+        /// A second part of the row (0.3): in a list, after the label; on a card, under it — up to
+        /// two lines (a task's title under its key).
+        subtitle: option<list<span>>,
+        /// Small colored labels (0.3): on a card, a line of them under the subtitle; in a list,
+        /// after the label — tags, a deadline, story points.
+        tags: list<badge-spec>,
+        /// The row's buttons (0.3): on a card, at its foot on the right; in a list, at the row's
+        /// end while it is hovered or selected. A press comes as `row-action` and neither selects
+        /// nor opens the row.
+        actions: list<row-action>,
+    }
+
+    /// A property of a `properties` list (0.3): a label and its value — a task's field.
+    record property {
+        /// Names it in `activated` and in a picker's anchor: `element((window, "<list>/<id>"))`
+        /// opens the picker under this property.
+        id: string,
+        label: string,
+        /// The value; empty — a dim dash.
+        value: list<span>,
+        /// The value can be changed: a ▾ after it, the row answers the mouse and a click comes as
+        /// `activated(id)` (the plugin opens a picker or a form).
+        editable: bool,
+    }
+
+    /// A button of a tree's row.
+    record row-action {
+        /// Names it in `row-action`.
+        id: string,
+        label: option<string>,
+        icon: option<string>,
+        tooltip: option<string>,
+        /// The accent button.
+        primary: bool,
+    }
+
+    record tree-spec {
+        rows: list<tree-row>,
+        /// Shown in the middle when there are no rows.
+        empty-text: option<string>,
+        /// The rows as cards (0.3), as on a board: the icon, the label and the badge on the
+        /// first line, the subtitle under them (two lines at most), then the detail. Keys,
+        /// selection and events are those of a list.
+        cards: bool,
+    }
+
+    variant element-kind {
+        /// Children top to bottom.
+        column,
+        /// Children left to right, centered vertically.
+        row,
+        /// The window's toolbar: buttons in a row under the title, as in JetBrains tool windows.
+        toolbar,
+        text(list<span>),
+        markdown(string),
+        button(button-spec),
+        text-field(text-field-spec),
+        toggle(toggle-spec),
+        /// Takes the remaining height and scrolls; only the visible rows are drawn.
+        tree(tree-spec),
+        divider,
+        /// Takes the free space of a row or a column.
+        spacer,
+        /// A progress bar: 0.0–1.0; none — indeterminate.
+        progress(option<f32>),
+        badge(badge-spec),
+        /// Properties in two aligned columns (0.3): the labels, dim, on the left; the values on the
+        /// right, editable ones with ▾.
+        properties(list<property>),
+    }
+
+    record element {
+        /// Events name the element by it, and the element keeps its state (the field's text, the
+        /// scroll, the expanded rows) between views by it.
+        id: string,
+        kind: element-kind,
+        /// Indices of the children in the view's elements (column, row, toolbar).
+        children: list<u32>,
+    }
+
+    /// A tool window's content: the elements, the first one is the root.
+    record view {
+        elements: list<element>,
+    }
+
+    /// Replaces the content of a tool window.
+    set-view: func(window: string, view: view);
+    /// Opens the tool window and focuses it; one in the editor (`location = "editor"`) opens as a
+    /// tab, or comes forward.
+    show: func(window: string);
+    /// Hides the tool window; one in the editor closes its tab.
+    hide: func(window: string);
+    /// Renames the tool window: its header, its tab ("Board: Backend"); the manifest's title
+    /// again with an empty one.
+    set-title: func(window: string, title: string);
+}
+
+/// Requests to web services, as the manifest's `network` permission allows: a request goes only to
+/// the hosts it lists ("api.example.com"; "*.example.com" — the domain and its subdomains;
+/// "localhost"; "*" — any host), and so does every redirect. Flux makes the connection (HTTPS with
+/// the system's certificates) and keeps a line about every request in the plugin's log. Waiting
+/// for a response doesn't count toward the plugin's time limit.
+interface http {
+    record request {
+        /// "GET", "POST", "PROPFIND"…
+        method: string,
+        /// An absolute `http` or `https` URL.
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+        /// Gives up after this long: 30 s by default.
+        timeout-ms: option<u32>,
+        /// Follows redirects (up to 10), each to a host the manifest allows; without it a redirect
+        /// is the response.
+        follow-redirects: bool,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// The status and the headers of a started request (`start`), before its body.
+    record response-head {
+        request: u64,
+        status: u16,
+        headers: list<tuple<string, string>>,
+    }
+
+    variant http-error {
+        /// The manifest doesn't allow the host; the text names it.
+        denied(string),
+        /// Not a valid URL or request.
+        invalid(string),
+        /// No connection: the name isn't found, the connection is refused, TLS fails…
+        connection(string),
+        timed-out,
+        /// `cancel`, or the plugin stopped.
+        cancelled,
+        /// The body is larger than `fetch` takes (64 MB); `start` streams a body of any size.
+        too-large,
+    }
+
+    /// Makes a request and waits for the whole response. The plugin waits; Flux doesn't.
+    fetch: func(request: request) -> result<response, http-error>;
+
+    /// Starts a request in the background and returns its id at once. The response comes as
+    /// events: `http-response` (the status and the headers), `http-body` (chunks of the body as
+    /// they arrive: server-sent events, a download), then `http-done`; a request that fails
+    /// before the response gets only `http-done`. The plugin answers other calls meanwhile.
+    start: func(request: request) -> u64;
+    /// Stops a started request: `http-done` with `cancelled`.
+    cancel: func(request: u64);
+}
+
+/// The plugin's server on this Mac — on 127.0.0.1 only, as the manifest's `server` permission
+/// allows: for the sign-in of a web service (OAuth's redirect to `http://127.0.0.1:<port>/…`) and
+/// for programs that talk to the IDE over HTTP or WebSocket. Requests and WebSocket messages come
+/// as events.
+///
+/// Flux itself answers 403 to a request whose `Host` isn't the server's own (`127.0.0.1:<port>`,
+/// `localhost:<port>`): a web page can't reach the server through a name of its own.
+interface server {
+    record server-request {
+        /// Answer it with `respond` or `respond-stream`; one without an answer for 60 s gets 504.
+        id: u64,
+        method: string,
+        /// The path with the query: "/callback?code=…".
+        path: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    record server-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// A WebSocket connection opened: the upgrade is accepted (`ws-close` drops one the plugin
+    /// doesn't want, say without its token).
+    record ws-open {
+        connection: u64,
+        /// The path with the query.
+        path: string,
+        headers: list<tuple<string, string>>,
+    }
+
+    variant ws-message {
+        text(string),
+        binary(list<u8>),
+    }
+
+    /// Starts the plugin's server and returns its port: `port`, or a free one (none). A running
+    /// server is stopped first.
+    listen: func(port: option<u16>) -> result<u16, string>;
+    /// Stops the server and closes its connections.
+    stop: func();
+
+    /// Answers a request.
+    respond: func(request: u64, response: server-response);
+    /// Answers a request with a stream (server-sent events): the status and the headers now, the
+    /// body by `send-chunk`, the end by `end-stream`. A client that goes away comes as
+    /// `stream-closed`.
+    respond-stream: func(request: u64, status: u16, headers: list<tuple<string, string>>);
+    send-chunk: func(request: u64, chunk: list<u8>) -> result<_, string>;
+    end-stream: func(request: u64);
+
+    /// Sends a WebSocket message.
+    ws-send: func(connection: u64, message: ws-message) -> result<_, string>;
+    /// Closes a WebSocket connection.
+    ws-close: func(connection: u64);
+}
+
+/// Programs on this Mac, as the manifest's `processes` permission allows: the programs it lists by
+/// name ("git", "gh"), or any ("*"). They run with the user's rights and the environment of the
+/// user's login shell (its `PATH`), and end when the plugin stops.
+interface process {
+    record command {
+        /// A name looked up in `PATH` ("git") or an absolute path.
+        program: string,
+        args: list<string>,
+        /// The working folder: the project root by default.
+        cwd: option<string>,
+        /// Added to the environment.
+        env: list<tuple<string, string>>,
+    }
+
+    record output {
+        /// None — ended by a signal.
+        exit-code: option<s32>,
+        stdout: list<u8>,
+        stderr: list<u8>,
+    }
+
+    enum output-channel {
+        stdout,
+        stderr,
+    }
+
+    /// A piece of a started program's output.
+    record process-output {
+        process: u64,
+        channel: output-channel,
+        bytes: list<u8>,
+    }
+
+    /// Runs a program to its end and returns its output; `stdin` is its input. After `timeout-ms`
+    /// (60 s by default) the program is killed and the call fails. The plugin waits; Flux doesn't.
+    run: func(command: command, stdin: option<list<u8>>, timeout-ms: option<u32>) -> result<output, string>;
+
+    /// Starts a program and returns its id at once: its output comes as `process-output` events,
+    /// its end as `process-exited`.
+    spawn: func(command: command) -> result<u64, string>;
+    /// Writes to a started program's input.
+    write: func(process: u64, bytes: list<u8>) -> result<_, string>;
+    /// Closes its input: the end of input for the program.
+    close-stdin: func(process: u64);
+    /// Ends it: SIGTERM, then SIGKILL if it is still running 2 s later.
+    kill: func(process: u64);
+}
+
+/// The window's terminals, as the manifest's `terminal` permission allows: the plugin opens a tab
+/// with a command (or the user's shell), types into it, and hears when the command ends. The tab is
+/// the user's like any other: they read it, type into it, close it.
+interface terminal {
+    enum terminal-location {
+        /// The terminal panel at the bottom.
+        panel,
+        /// A tab among the editor's tabs.
+        editor,
+    }
+
+    record terminal-options {
+        /// The tab's title: the command's name by default.
+        title: option<string>,
+        /// The program and its arguments; none — the user's shell. The tab of a command stays
+        /// after the command ends, with its exit code.
+        command: option<list<string>>,
+        /// The project root by default.
+        cwd: option<string>,
+        /// Added to the environment.
+        env: list<tuple<string, string>>,
+        location: terminal-location,
+        /// The terminal takes the keyboard; without it the keyboard stays where the user is.
+        focus: bool,
+    }
+
+    /// Opens a terminal tab and returns its id.
+    open: func(options: terminal-options) -> result<u64, string>;
+    /// Types text as if the user did; "\r" presses Enter.
+    send-text: func(terminal: u64, text: string) -> result<_, string>;
+    /// Brings the terminal's tab forward; `focus` — it takes the keyboard.
+    show: func(terminal: u64, focus: bool) -> result<_, string>;
+    /// Closes the tab: what runs in it ends.
+    close: func(terminal: u64);
+}
+
+/// Edits the user reviews: the plugin proposes a file's new text, and Flux shows a diff tab — the
+/// file as it is on the left, the proposal on the right (editable; hunks can be rejected one by
+/// one), Accept (⌘↵) and Reject on a banner — as Claude's edits. The answer comes as
+/// `proposal-answered`. Needs the `project` permission (the answer carries the file's text).
+interface review {
+    record proposal {
+        /// The file: relative to the project root or absolute (in the project or a folder the
+        /// manifest allows); it may not exist yet.
+        path: string,
+        /// The whole new text of the file.
+        text: string,
+        /// The tab's title: the file's name by default.
+        title: option<string>,
+        /// On Accept Flux writes the accepted text itself: into the open document as one undo
+        /// step, saved, or into the file. Without it only the plugin hears the answer.
+        apply: bool,
+        /// The tab takes the keyboard; without it the tab opens next to the active one and the
+        /// keyboard stays where the user is.
+        focus: bool,
+    }
+
+    variant proposal-outcome {
+        /// Accepted: the text as the user left it (the proposal, or what they changed in it).
+        accepted(string),
+        rejected,
+        /// The tab was closed without an answer, or the plugin withdrew the proposal.
+        closed,
+    }
+
+    /// Opens the proposal's tab and returns its id.
+    propose: func(proposal: proposal) -> result<u64, string>;
+    /// Closes the proposal's tab without an answer.
+    withdraw: func(proposal: u64);
+}
+
+/// The project's Git repositories. Needs the `project` permission; changing them (a branch, a
+/// checkout) needs `project = "write"`. A change of a status, a branch or a HEAD comes as the
+/// `git-changed` event.
+interface git {
+    record repository {
+        /// The root of the work tree, absolute.
+        root: string,
+        /// The current branch; none — a detached HEAD.
+        branch: option<string>,
+        /// The HEAD commit's hash; none before the first commit.
+        head: option<string>,
+        /// An operation in progress: "merge", "rebase", "cherry-pick", "revert"; none.
+        operation: option<string>,
+    }
+
+    enum change-kind {
+        added,
+        modified,
+        deleted,
+        renamed,
+        untracked,
+        conflicted,
+    }
+
+    record change {
+        /// Absolute.
+        path: string,
+        /// The path before a rename, absolute.
+        old-path: option<string>,
+        kind: change-kind,
+    }
+
+    /// The repositories of the project (a project may have several).
+    repositories: func() -> list<repository>;
+    /// The changes of the working copy against HEAD, in every repository.
+    status: func() -> list<change>;
+    /// A file's changes against HEAD as a unified diff (`git diff HEAD -- <file>`, the file as it
+    /// is on disk); empty when there are none. Relative paths are in the project.
+    diff: func(path: string) -> result<string, string>;
+
+    record branch {
+        /// "main", "feature/login"; a remote one with its remote: "origin/main".
+        name: string,
+        remote: bool,
+        /// The checked-out branch.
+        current: bool,
+    }
+
+    /// What the commit window offers while one of the plugin's tasks is active.
+    record commit-template {
+        /// Fills an empty message, and replaces the previous template's text when the user hasn't
+        /// changed it: "TRACK-142 Fix the sign-in".
+        text: string,
+        /// A message generated with Claude starts with it: "TRACK-142".
+        prefix: option<string>,
+    }
+
+    /// The branches of the repository whose work tree is `root`: the local ones, then the remote
+    /// ones.
+    branches: func(root: string) -> result<list<branch>, string>;
+    /// Creates a branch from `start` (a branch, a tag, a commit; none — HEAD) and checks it out,
+    /// the way the Branches popup does: local changes come along, and Smart Checkout asks when
+    /// they'd be in the way. Returns an id at once; how it ended comes as `git-done`.
+    new-branch: func(root: string, name: string, start: option<string>) -> u64;
+    /// Checks out a branch (a remote one — as a new local branch tracking it), as the Branches
+    /// popup does. How it ended comes as `git-done`.
+    checkout: func(root: string, branch: string) -> u64;
+    /// Sets or removes (none) the plugin's commit message template.
+    set-commit-template: func(template: option<commit-template>);
+}
+
+/// Problems in files: what the language servers report, and what plugins do — a linter publishes
+/// its own, and Flux shows them as the servers': underlines, F2, the counters of the status bar.
+/// Reading needs the `project` permission; publishing doesn't.
+interface diagnostics {
+    use types.{range};
+
+    enum severity {
+        error,
+        warning,
+        info,
+        hint,
+    }
+
+    record diagnostic {
+        range: range,
+        severity: severity,
+        message: string,
+        /// Who reports it: "rust-analyzer", "shellcheck". The plugin's name by default (publish).
+        source: option<string>,
+        /// The rule: "E0308", "SC2086".
+        code: option<string>,
+    }
+
+    record file-diagnostics {
+        /// Absolute.
+        path: string,
+        diagnostics: list<diagnostic>,
+    }
+
+    /// The problems Flux knows of: in a file (relative to the project root or absolute), or in
+    /// every file with problems (none).
+    get: func(path: option<string>) -> list<file-diagnostics>;
+    /// The plugin's own problems of a file, replacing those it published before; an empty list
+    /// clears them. Positions are in the file's text as it is now (the open document's).
+    publish: func(path: string, diagnostics: list<diagnostic>);
+    /// Clears every problem the plugin published.
+    clear: func();
+}
+
+/// The plugin's secrets — tokens, passwords — in the macOS keychain rather than in files: only
+/// this plugin reads them, and they go when it is uninstalled.
+interface secrets {
+    get: func(key: string) -> option<string>;
+    /// None removes the secret.
+    set: func(key: string, value: option<string>) -> result<_, string>;
+}
+
+/// Timers: the `timer` event after a delay or periodically, while the plugin runs. A periodic
+/// timer's tick that still waits in the plugin's queue doesn't add another.
+interface timers {
+    /// One `timer` event after `ms` milliseconds; returns the timer's id.
+    after: func(ms: u32) -> u64;
+    /// A `timer` event every `ms` milliseconds (at least 100); returns the timer's id.
+    every: func(ms: u32) -> u64;
+    cancel: func(timer: u64);
+}
+
+/// What is outside the window: the browser, the clipboard, the user's home folder, the clock.
+interface system {
+    /// Opens a link in the default browser: `http`, `https` or `mailto`.
+    open-url: func(url: string) -> result<_, string>;
+    /// Puts text on the clipboard.
+    copy-text: func(text: string);
+    /// The user's home folder, absolute: where the folders the manifest allows ("~/.config/gh")
+    /// are.
+    home-dir: func() -> string;
+    /// How far the user's local time is ahead of UTC at an instant (seconds since 1970-01-01 UTC),
+    /// in seconds: 10800 in Moscow; summer time included.
+    utc-offset: func(at: s64) -> s32;
+    /// The user's time zone: "Europe/Moscow"; "UTC" when it isn't known.
+    time-zone: func() -> string;
+    /// Opens Settings on the plugin's page.
+    open-settings: func();
+}
+
+/// A popup list to choose from, drawn by Flux as its own (Open Task, the branches, the palette):
+/// a search field over grouped items, or a short menu without one. The choice comes as
+/// `picker-chosen`.
+interface picker {
+    use ui.{span};
+
+    record picker-item {
+        /// Names the item in `picker-chosen`.
+        key: string,
+        /// A named icon, as in tool windows.
+        icon: option<string>,
+        label: list<span>,
+        /// Dim text after the label.
+        detail: option<string>,
+        /// On the right: a status, a time.
+        badge: option<string>,
+        /// The heading of the item's group ("Today", "In Progress"); the items of a group come
+        /// together, in the order of their first item.
+        group: option<string>,
+    }
+
+    variant picker-anchor {
+        /// Centered under the title bar, as the command palette.
+        window,
+        /// Above one of the plugin's status bar items (its id).
+        status-item(string),
+        /// Under an element of one of the plugin's tool windows: (window, element).
+        element(tuple<string, string>),
+    }
+
+    record picker-spec {
+        /// The search field's placeholder: "Find a task by its key or words".
+        placeholder: string,
+        items: list<picker-item>,
+        /// A search field over the items; without it — a short menu (a status's transitions).
+        searchable: bool,
+        /// The plugin searches itself: every change of the query comes as `picker-query`, and the
+        /// plugin answers with `update`; otherwise Flux filters the items by the query.
+        live-query: bool,
+        /// Shown when there are no items.
+        empty-text: option<string>,
+        /// The plugin is still looking: a spinner in the field.
+        loading: bool,
+        anchor: picker-anchor,
+    }
+
+    /// Opens a picker (closing the plugin's previous one) and returns its id.
+    open: func(spec: picker-spec) -> u64;
+    /// Replaces the items of an open picker; `loading` — still looking.
+    update: func(picker: u64, items: list<picker-item>, loading: bool);
+    /// Closes it without a choice (`picker-chosen` with none).
+    close: func(picker: u64);
+}
+
+/// Links on text that names something of the plugin's — a task's key, `TRACK-142` — in the
+/// editor (⌘ + hover, ⌘-click), in commit messages (the commit window, the Git log), in Claude's
+/// chat and in the plugins' Markdown. A click comes as `link-activated`; a tooltip is asked for
+/// with `link-hovered`.
+interface links {
+    record link-pattern {
+        /// Names the pattern in the events.
+        id: string,
+        /// A regular expression (Rust `regex` syntax); the whole match is the link:
+        /// "\\b(?:TRACK|WEB)-\\d+\\b".
+        regex: string,
+        /// The plugin describes a link on hover (`link-hovered` → `describe`).
+        tooltip: bool,
+    }
+
+    /// Replaces the plugin's patterns; an empty list removes them. Fails on a regex that doesn't
+    /// compile, naming it.
+    set-patterns: func(patterns: list<link-pattern>) -> result<_, string>;
+    /// The answer to `link-hovered`: Markdown for the tooltip; none — no tooltip.
+    describe: func(request: u64, markdown: option<string>);
+}
+
+/// Claude Code sessions in Flux's chat, opened by the plugin with its context. Needs the manifest's
+/// `claude` permission: a session's requests run with the rights the user gave Claude Code.
+interface claude {
+    /// Something the session gets along with the first message: a chip in the field, its text in
+    /// the message.
+    record attachment {
+        /// The chip's text: "TRACK-142".
+        label: string,
+        /// What Claude reads: the task's text, its comments.
+        markdown: string,
+    }
+
+    record session-spec {
+        /// The session's title: "TRACK-142: Fix the sign-in".
+        title: option<string>,
+        attachments: list<attachment>,
+        /// The first message: put in the field, or sent (`send`).
+        prompt: option<string>,
+        /// Sends the prompt (with the attachments) at once; otherwise the field takes the keyboard.
+        send: bool,
+        /// Starts in plan mode: Claude studies and proposes a plan before editing.
+        plan-mode: bool,
+    }
+
+    /// Opens a new session in the Claude window (or its tab, where the user keeps it). Fails when
+    /// Claude Code is turned off or not installed.
+    new-session: func(spec: session-spec) -> result<_, string>;
+}
+
+/// Contexts, as Tasks & Contexts in JetBrains: the window's open tabs — documents, Claude chats,
+/// terminals in the editor — kept under a key, so a task's tabs come back when the user returns to
+/// the task. The keys are the plugin's own; the user sees the contexts by title in
+/// Load Context.
+interface contexts {
+    record context-ref {
+        key: string,
+        /// "TRACK-142 Fix the sign-in".
+        title: string,
+    }
+
+    /// Saves the open tabs as `save` (when given), closes them — documents with unsaved changes and
+    /// running Claude sessions stay — and opens the tabs of `load` (when it was saved).
+    switch: func(save: option<context-ref>, load: option<string>) -> result<_, string>;
+    /// Forgets a saved context.
+    remove: func(key: string);
+}
+
+/// What happens in the window, the answers to the plugin's questions, and the news of its
+/// background work: timers, requests, the server, programs, terminals, proposals.
+interface events {
+    use types.{editor-info};
+    use http.{response-head, http-error};
+    use server.{server-request, ws-open, ws-message};
+    use process.{process-output};
+    use review.{proposal-outcome};
+
+    variant ui-event {
+        /// A button was pressed.
+        clicked,
+        /// The text field's text changed.
+        changed(string),
+        /// ↵ in the text field.
+        submitted(string),
+        toggled(bool),
+        /// A row became selected: a click, the arrows.
+        selected(string),
+        /// A row was opened: ↵, a double click, a click on a row without children.
+        activated(string),
+        /// A row was expanded (true) or collapsed.
+        expanded(tuple<string, bool>),
+        /// A row's button was pressed (0.3): (the row's key, the action's id).
+        row-action(tuple<string, string>),
+    }
+
+    record ui-input {
+        window: string,
+        element: string,
+        event: ui-event,
+    }
+
+    variant event {
+        /// The active tab changed: its document, or none.
+        active-editor-changed(option<editor-info>),
+        editor-opened(editor-info),
+        editor-closed(u64),
+        /// The text changed: typing, undo, a reload from disk. One event for a burst.
+        editor-changed(u64),
+        /// The selections or the cursor moved. One event for a burst.
+        selection-changed(u64),
+        /// The document was written to disk.
+        editor-saved(editor-info),
+        /// The window's project root changed.
+        project-changed(option<string>),
+        /// The plugin's settings changed: Settings → the plugin.
+        settings-changed,
+        tool-window-shown(string),
+        tool-window-hidden(string),
+        /// The answer to `dialogs.ask`: the index of the pressed button; none — dismissed.
+        dialog-answered(tuple<u64, option<u32>>),
+        /// The answer to `dialogs.ask-text`: the text; none — cancelled.
+        text-answered(tuple<u64, option<string>>),
+        ui(ui-input),
+        /// A timer fired.
+        timer(u64),
+        /// A started request's status and headers.
+        http-response(response-head),
+        /// A chunk of a started request's body.
+        http-body(tuple<u64, list<u8>>),
+        /// A started request ended: its whole body has come, or why not.
+        http-done(tuple<u64, result<_, http-error>>),
+        /// A request to the plugin's server.
+        server-request(server-request),
+        /// The client of a streamed answer went away (the request's id).
+        stream-closed(u64),
+        ws-opened(ws-open),
+        ws-message(tuple<u64, ws-message>),
+        ws-closed(u64),
+        /// Output of a started program.
+        process-output(process-output),
+        /// A started program ended: its exit code; none — a signal.
+        process-exited(tuple<u64, option<s32>>),
+        /// The command of a terminal ended (its tab stays): the exit code, when known.
+        terminal-exited(tuple<u64, option<s32>>),
+        /// A terminal's tab was closed.
+        terminal-closed(u64),
+        /// The answer to a proposal.
+        proposal-answered(tuple<u64, proposal-outcome>),
+        /// The status, a branch or a HEAD of a repository changed.
+        git-changed,
+        /// The problems of files changed: their paths, absolute.
+        diagnostics-changed(list<string>),
+        /// The answer to `dialogs.ask-form`: the values by the fields' keys; none — cancelled.
+        form-answered(tuple<u64, option<list<tuple<string, string>>>>),
+        /// The query of a `live-query` picker changed (a burst of typing — one event).
+        picker-query(tuple<u64, string>),
+        /// A picker closed: the chosen item's key; none — dismissed.
+        picker-chosen(tuple<u64, option<string>>),
+        /// A link was clicked: (the pattern's id, the text).
+        link-activated(tuple<string, string>),
+        /// A link wants a tooltip: (the request for `links.describe`, the pattern's id, the text).
+        link-hovered(tuple<u64, string, string>),
+        /// `git.new-branch` or `git.checkout` ended: done, or why not (the user declined, git
+        /// failed — Flux has told the user).
+        git-done(tuple<u64, result<_, string>>),
+    }
+}
+
+/// A Flux plugin. Flux calls the exports on the plugin's own thread, one call at a time; a call
+/// longer than the time limit stops the plugin, and Flux tells the user. Waiting inside a call —
+/// for a response, a program, the window — doesn't count toward the limit.
+world plugin {
+    import types;
+    import log;
+    import i18n;
+    import commands;
+    import notifications;
+    import dialogs;
+    import editors;
+    import project;
+    import storage;
+    import settings;
+    import status-bar;
+    import ui;
+    import http;
+    import server;
+    import process;
+    import terminal;
+    import review;
+    import git;
+    import diagnostics;
+    import secrets;
+    import timers;
+    import system;
+    import picker;
+    import links;
+    import claude;
+    import contexts;
+
+    use types.{command-context};
+    use events.{event};
+
+    /// The plugin was loaded: the window opened, or the user turned the plugin on.
+    export activate: func();
+    /// The plugin is about to be unloaded: turned off, reloaded, the window is closing.
+    export deactivate: func();
+    /// One of the plugin's commands was run: from where, and what it acts on.
+    export run-command: func(command: string, context: command-context);
+    export on-event: func(event: event);
+}

@@ -126,7 +126,13 @@ pub struct TextInput {
     borderless: bool,
     /// Large font size: the query in the header of the palette, file search, and go to line.
     large: bool,
+    /// A password or a token (a plugin's secret setting): dots instead of the characters, and the
+    /// text can't be copied or cut.
+    masked: bool,
 }
+
+/// What a masked field shows for each character.
+const MASK: char = '•';
 
 struct InputLayout {
     line: LineLayout,
@@ -152,7 +158,20 @@ impl TextInput {
             icon: None,
             borderless: false,
             large: false,
+            masked: false,
         }
+    }
+
+    /// A password or a token: dots instead of the characters, no Copy or Cut.
+    pub fn masked(mut self) -> Self {
+        self.masked = true;
+        self
+    }
+
+    /// What the empty field says now: a secret's dots once one is saved.
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = placeholder.into();
+        cx.notify();
     }
 
     /// No background or border: the field sits in a popover header.
@@ -305,12 +324,18 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.masked {
+            return;
+        }
         if let Some(text) = self.selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        if self.masked {
+            return;
+        }
         if let Some(text) = self.selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.edit(EditKind::Other, cx, |rope, sel| {
@@ -748,6 +773,7 @@ impl Element for InputElement {
         let marked = input.marked_range.clone();
         let focused = input.focus_handle.is_focused(window);
         let placeholder_text = input.placeholder.clone();
+        let masked = input.masked;
         let family = input.font_family();
         let font_size = input.text_size();
         let mut scroll_x = input.scroll_x;
@@ -760,7 +786,11 @@ impl Element for InputElement {
             underline: None,
             strikethrough: None,
         };
-        let (display, char_to_byte) = display_line(&text, 0);
+        let (display, char_to_byte) = if masked {
+            masked_line(text.len_chars())
+        } else {
+            display_line(&text, 0)
+        };
         // The IME composition is underlined.
         let runs = match &marked {
             Some(marked) if !display.is_empty() => {
@@ -887,9 +917,23 @@ impl Element for InputElement {
     }
 }
 
+/// The line of a masked field of `chars` characters: a dot each, and the byte offsets of the dots
+/// (as [`display_line`] gives them).
+fn masked_line(chars: usize) -> (String, Vec<usize>) {
+    let display: String = std::iter::repeat_n(MASK, chars).collect();
+    let char_to_byte = (0..=chars).map(|column| column * MASK.len_utf8()).collect();
+    (display, char_to_byte)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_masked_line_is_a_dot_per_character() {
+        assert_eq!(masked_line(0), (String::new(), vec![0]));
+        assert_eq!(masked_line(3), ("•••".to_string(), vec![0, 3, 6, 9]));
+    }
 
     #[test]
     fn single_line_turns_breaks_and_tabs_into_spaces() {

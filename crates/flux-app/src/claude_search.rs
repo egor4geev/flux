@@ -260,7 +260,7 @@ pub(crate) fn find(
 pub(crate) fn entry_texts(entry: &Entry, root: &Path, tasks: &[TaskItem]) -> Vec<String> {
     match &entry.kind {
         EntryKind::User(user) => {
-            let (_, text) = claude_transcript::edge_mentions(&user.text);
+            let text = claude_transcript::bubble_text(&user.text);
             if text.trim().is_empty() {
                 Vec::new()
             } else {

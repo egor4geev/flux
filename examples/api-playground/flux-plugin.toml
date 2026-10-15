@@ -1,11 +1,11 @@
-# The API Playground: every capability of the plugin API 0.2 behind a button (docs/plugins.md). Not
-# bundled into Flux — install the folder: Settings → Plugins → ⚙ → Install Plugin from Disk….
+# The API Playground: every capability of the plugin API (0.3) behind a button (docs/plugins.md).
+# Not bundled into Flux — install the folder: Settings → Plugins → ⚙ → Install Plugin from Disk….
 id = "flux.api-playground"
 name = "API Playground"
 version = "0.1.0"
-api = "0.2"
+api = "0.3"
 authors = ["Egor Ageev"]
-description = "Every capability of the plugin API behind a button: requests, a local server, programs, terminals, proposed edits, Git, problems, secrets, timers, context menus."
+description = "Every capability of the plugin API behind a button: requests, a local server, programs, terminals, proposed edits, Git, problems, secrets, timers, context menus; forms, pickers, the settings page, branches, links, Claude sessions, contexts, a window in the editor."
 repository = "https://github.com/egor4geev/flux"
 icon = "icons/playground.svg"
 wasm = "target/wasm32-wasip2/release/flux_api_playground.wasm"
@@ -18,6 +18,7 @@ server = true
 processes = ["git"]
 terminal = true
 folders = [{ path = "~/.config", access = "read" }]
+claude = true
 
 [[commands]]
 id = "open"
@@ -49,10 +50,29 @@ id = "stop-clock"
 title = "Stop the Clock"
 category = "Playground"
 
+[[commands]]
+id = "open-board"
+title = "Open Playground Board"
+category = "Playground"
+
+# The settings page's Check button runs it, with the button's argument; not in the palette.
+[[commands]]
+id = "settings-check"
+title = "Check from Settings"
+category = "Playground"
+palette = false
+
 [[tool-windows]]
 id = "playground"
 title = "API Playground"
 icon = "icons/playground.svg"
+
+# A window among the editor's tabs: a board of tasks, as wide as the editor.
+[[tool-windows]]
+id = "board"
+title = "Playground Board"
+icon = "icons/playground.svg"
+location = "editor"
 
 # The clock of the timers' section.
 [[status-items]]
@@ -77,3 +97,78 @@ when = "folder"
 [[menus]]
 command = "show-tab-context"
 location = "tab"
+
+# The settings page's kinds (API 0.3): Settings → Plugins → API Playground.
+[[settings]]
+key = "playground"
+type = "section"
+title = "API 0.3"
+description = "A secret, a button, a status line, several lines of text and records — the Settings Page section reads and writes them."
+
+[[settings]]
+key = "playground-token"
+type = "secret"
+title = "A token"
+description = "Kept in the macOS keychain, not with the other settings; the plugin reads it with secrets.get."
+
+[[settings]]
+key = "playground-check"
+type = "button"
+title = "Check"
+command = "settings-check"
+argument = "from the settings page"
+
+[[settings]]
+key = "playground-status"
+type = "status"
+title = "Status"
+default = "Not checked yet"
+
+[[settings]]
+key = "playground-note"
+type = "text"
+title = "A note"
+default = "Several lines\nof text."
+
+[[settings]]
+key = "bookmarks"
+type = "records"
+title = "Bookmarks"
+description = "Records with the same fields: add, remove and move them."
+
+[[settings.fields]]
+key = "name"
+title = "Name"
+type = "string"
+
+[[settings.fields]]
+key = "url"
+title = "Address"
+type = "string"
+
+[[settings.fields]]
+key = "kind"
+title = "Kind"
+type = "choice"
+default = "docs"
+options = [
+    { value = "docs", title = "Documentation" },
+    { value = "code", title = "Code" },
+]
+
+[[settings.fields]]
+key = "pinned"
+title = "Pinned"
+type = "bool"
+
+[[settings.default]]
+name = "Flux"
+url = "https://github.com/egor4geev/flux"
+kind = "code"
+pinned = true
+
+[[settings.default]]
+name = "Plugins"
+url = "https://github.com/egor4geev/flux/blob/main/docs/plugins.md"
+kind = "docs"
+pinned = false

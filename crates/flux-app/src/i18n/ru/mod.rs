@@ -43,6 +43,13 @@ mod plugin_api;
 mod plugin_manager;
 mod plugin_menus;
 mod plugin_review;
+mod plugin_tabs;
+mod plugin_form;
+mod plugin_picker;
+mod plugin_git;
+mod plugin_claude;
+mod plugin_links;
+mod task_contexts;
 mod plugin_view;
 mod plugins;
 mod popups;
@@ -110,6 +117,13 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     plugin_api::STRINGS,
     plugin_menus::STRINGS,
     plugin_review::STRINGS,
+    plugin_tabs::STRINGS,
+    plugin_form::STRINGS,
+    plugin_picker::STRINGS,
+    plugin_git::STRINGS,
+    plugin_claude::STRINGS,
+    plugin_links::STRINGS,
+    task_contexts::STRINGS,
     appearance_common::STRINGS,
     languages::STRINGS,
     themes::STRINGS,
@@ -153,6 +167,13 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     plugin_api::PLURALS,
     plugin_menus::PLURALS,
     plugin_review::PLURALS,
+    plugin_tabs::PLURALS,
+    plugin_form::PLURALS,
+    plugin_picker::PLURALS,
+    plugin_git::PLURALS,
+    plugin_claude::PLURALS,
+    plugin_links::PLURALS,
+    task_contexts::PLURALS,
     appearance_common::PLURALS,
     languages::PLURALS,
     themes::PLURALS,

@@ -6,7 +6,7 @@
 //! id = "flux.todo"
 //! name = "TODO"
 //! version = "0.1.0"
-//! api = "0.2"
+//! api = "0.3"
 //! authors = ["Egor Ageev"]
 //! description = "TODO and FIXME comments of the project in a tool window."
 //! icon = "icons/todo.svg"
@@ -38,6 +38,11 @@
 //! type = "string-list"
 //! default = ["\\bTODO\\b", "\\bFIXME\\b"]
 //! ```
+//!
+//! API 0.3 adds settings that aren't values — `type = "secret"` (a token in the keychain),
+//! `"button"` (`command`, `argument`), `"status"` (a line the plugin writes), `"section"` (a
+//! heading) — commands only buttons and notifications run (`palette = false`), and the `claude`
+//! permission.
 //!
 //! Declarative contributions (stage 8.3) need no code: a language with its tree-sitter grammar and
 //! highlighting query, a language server and how Flux installs it, a color theme, a set of file
@@ -86,7 +91,8 @@ pub struct Manifest {
     pub id: String,
     pub name: String,
     pub version: String,
-    /// The plugin API version it is built for (`"0.2"`); Flux runs only the one it has.
+    /// The plugin API version it is built for (`"0.3"`); Flux runs the ones of
+    /// [`crate::SUPPORTED_API_VERSIONS`], and a component must be built for the one it names.
     pub api: String,
     pub authors: Vec<String>,
     pub description: String,
@@ -134,6 +140,9 @@ pub struct Permissions {
     pub terminal: bool,
     /// Folders outside the project, open to the plugin through the file system.
     pub folders: Vec<FolderPermission>,
+    /// Claude Code sessions the plugin opens with its own context and requests (API 0.3): they
+    /// run with the rights the user gave Claude Code.
+    pub claude: bool,
 }
 
 impl Permissions {
@@ -145,6 +154,7 @@ impl Permissions {
             && self.processes.is_empty()
             && !self.terminal
             && self.folders.is_empty()
+            && !self.claude
     }
 
     /// Whether a request may go to `host`: a name or an IP address, without the port (IPv6 with
@@ -259,9 +269,18 @@ pub struct CommandSpec {
     /// A default shortcut in gpui's notation (`alt-cmd-shift-t`); a key Flux already uses is not
     /// taken.
     pub keys: Option<String>,
+    /// Shown in the command palette (API 0.3: `palette = false` for a command only a
+    /// notification's action, a settings button or a status bar item runs).
+    #[serde(default = "shown")]
+    pub palette: bool,
 }
 
-/// A tool window in the island on the right, opened by its icon in the launchpad.
+fn shown() -> bool {
+    true
+}
+
+/// A tool window in the island on the right, opened by its icon in the launchpad — or, API 0.3,
+/// a tab among the editor's tabs (`location = "editor"`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ToolWindowSpec {
@@ -271,6 +290,22 @@ pub struct ToolWindowSpec {
     pub icon: Option<String>,
     /// A default shortcut that opens and closes the window.
     pub keys: Option<String>,
+    /// Where the window opens (API 0.3).
+    #[serde(default)]
+    pub location: ToolWindowLocation,
+}
+
+/// Where a plugin's window opens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolWindowLocation {
+    /// The island on the right, with an icon in the launchpad.
+    #[default]
+    Island,
+    /// A tab among the editor's tabs, without a launchpad icon — something wide: a board, a
+    /// preview. `ui.show` opens it (or brings it forward), `ui.hide` and the user close it; the
+    /// palette and the window's keys open it too.
+    Editor,
 }
 
 /// An item of a context menu: runs one of the plugin's commands on what the menu was opened on
@@ -464,6 +499,156 @@ pub enum SettingKind {
     Choice(Vec<ChoiceOption>),
     /// A list of strings, a row each.
     StringList,
+    /// A token or a password (API 0.3): a masked field whose value Flux keeps in the macOS keychain
+    /// — the plugin's secret named by the setting's key (`secrets.get`) — never in
+    /// `settings.json`. No default.
+    Secret,
+    /// A button (API 0.3) that runs one of the plugin's commands, with `argument` in the
+    /// command's context: "Sign In…", "Check Connection". It has no value.
+    Button {
+        command: String,
+        argument: Option<String>,
+    },
+    /// A line the plugin writes (API 0.3, `settings.set-status`): "Signed in as …". The default
+    /// is its text until the plugin writes one. It has no value.
+    Status,
+    /// A heading (API 0.3) that starts a group of the settings below it, with the description
+    /// under it. It has no value.
+    Section,
+    /// Several lines of text (API 0.3): a prompt, a template.
+    Text,
+    /// A list of records with the same fields (API 0.3), a card each, added, removed and moved by
+    /// the user: the plugin's own actions (a name, a prompt, a mode). The value is a list of
+    /// objects by the fields' keys; a missing key — the field's default.
+    Records(Vec<RecordField>),
+}
+
+/// A field of a `records` setting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordField {
+    pub key: String,
+    pub title: String,
+    pub kind: RecordFieldKind,
+    /// A new record's value.
+    pub default: Value,
+}
+
+/// What a field of a record holds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordFieldKind {
+    /// A line of text.
+    String,
+    /// Several lines.
+    Text,
+    /// A switch.
+    Bool,
+    /// One of the options.
+    Choice(Vec<ChoiceOption>),
+}
+
+impl RecordFieldKind {
+    /// Whether `value` is one the field can have.
+    pub fn fits(&self, value: &Value) -> bool {
+        match self {
+            RecordFieldKind::String | RecordFieldKind::Text => value.is_string(),
+            RecordFieldKind::Bool => value.is_boolean(),
+            RecordFieldKind::Choice(options) => value
+                .as_str()
+                .is_some_and(|value| options.iter().any(|option| option.value == value)),
+        }
+    }
+}
+
+/// Whether `value` is a list of records of `fields`: objects whose keys are the fields' and whose
+/// values fit them.
+fn records_fit(fields: &[RecordField], value: &Value) -> bool {
+    value.as_array().is_some_and(|records| {
+        records.iter().all(|record| {
+            record.as_object().is_some_and(|record| {
+                record.iter().all(|(key, value)| {
+                    fields
+                        .iter()
+                        .find(|field| field.key == *key)
+                        .is_some_and(|field| field.kind.fits(value))
+                })
+            })
+        })
+    })
+}
+
+impl SettingKind {
+    /// The setting has a value in `settings.json` (`settings.get`, `settings.set`): not a secret,
+    /// a button, a status or a section.
+    pub fn has_value(&self) -> bool {
+        matches!(
+            self,
+            SettingKind::Bool
+                | SettingKind::String
+                | SettingKind::Integer { .. }
+                | SettingKind::Choice(_)
+                | SettingKind::StringList
+                | SettingKind::Text
+                | SettingKind::Records(_)
+        )
+    }
+}
+
+impl SettingSpec {
+    /// Whether `value` is one the setting can have, as the Settings page checks what's typed: a
+    /// switch takes true or false, a text field a string, a number a whole number within its
+    /// range, a choice one of its options' values, a list strings. The error says what it should
+    /// be.
+    pub fn check_value(&self, value: &Value) -> Result<(), String> {
+        let fits = match &self.kind {
+            SettingKind::Bool => value.is_boolean(),
+            SettingKind::String => value.is_string(),
+            SettingKind::Integer { min, max } => value.as_i64().is_some_and(|n| {
+                min.is_none_or(|min| n >= min) && max.is_none_or(|max| n <= max)
+            }),
+            SettingKind::Choice(options) => value
+                .as_str()
+                .is_some_and(|value| options.iter().any(|option| option.value == value)),
+            SettingKind::StringList => value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string)),
+            SettingKind::Text => value.is_string(),
+            SettingKind::Records(fields) => records_fit(fields, value),
+            SettingKind::Secret
+            | SettingKind::Button { .. }
+            | SettingKind::Status
+            | SettingKind::Section => return Err("it has no value".into()),
+        };
+        if fits {
+            return Ok(());
+        }
+        Err(match &self.kind {
+            SettingKind::Bool => "it must be true or false".to_string(),
+            SettingKind::String | SettingKind::Text => "it must be a string".to_string(),
+            SettingKind::Records(fields) => format!(
+                "it must be a list of records with the fields {}",
+                fields
+                    .iter()
+                    .map(|field| format!("\"{}\"", field.key))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            SettingKind::Integer { min, max } => match (min, max) {
+                (Some(min), Some(max)) => format!("it must be a whole number from {min} to {max}"),
+                (Some(min), None) => format!("it must be a whole number, at least {min}"),
+                (None, Some(max)) => format!("it must be a whole number, at most {max}"),
+                (None, None) => "it must be a whole number".to_string(),
+            },
+            SettingKind::Choice(options) => format!(
+                "it must be one of {}",
+                options
+                    .iter()
+                    .map(|option| format!("\"{}\"", option.value))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            _ => "it must be a list of strings".to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -744,6 +929,8 @@ struct RawPermissions {
     terminal: bool,
     #[serde(default)]
     folders: Vec<FolderPermission>,
+    #[serde(default)]
+    claude: bool,
 }
 
 impl RawPermissions {
@@ -791,6 +978,7 @@ impl RawPermissions {
             processes: self.processes,
             terminal: self.terminal,
             folders: self.folders,
+            claude: self.claude,
         })
     }
 }
@@ -815,6 +1003,58 @@ struct RawSetting {
     max: Option<i64>,
     #[serde(default)]
     options: Vec<ChoiceOption>,
+    /// A button's command and its argument.
+    command: Option<String>,
+    argument: Option<String>,
+    /// The fields of a `records` setting.
+    #[serde(default)]
+    fields: Vec<RawRecordField>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawRecordField {
+    key: String,
+    title: String,
+    #[serde(rename = "type")]
+    kind: String,
+    default: Option<toml::Value>,
+    #[serde(default)]
+    options: Vec<ChoiceOption>,
+}
+
+impl RawRecordField {
+    fn check(self, setting: &str) -> Result<RecordField, ManifestError> {
+        let key = self.key;
+        let error = |message: String| {
+            ManifestError(format!("setting \"{setting}\", field \"{key}\": {message}"))
+        };
+        let kind = match self.kind.as_str() {
+            "string" => RecordFieldKind::String,
+            "text" => RecordFieldKind::Text,
+            "bool" => RecordFieldKind::Bool,
+            "choice" if self.options.is_empty() => return Err(error("a choice needs options".into())),
+            "choice" => RecordFieldKind::Choice(self.options),
+            other => {
+                return Err(error(format!(
+                    "unknown type \"{other}\" (string, text, bool, choice)"
+                )));
+            }
+        };
+        let default = match (self.default.map(toml_to_json), &kind) {
+            (Some(value), kind) if kind.fits(&value) => value,
+            (Some(_), _) => return Err(error("the default doesn't fit the type".into())),
+            (None, RecordFieldKind::Bool) => Value::Bool(false),
+            (None, RecordFieldKind::Choice(options)) => Value::String(options[0].value.clone()),
+            (None, _) => Value::String(String::new()),
+        };
+        Ok(RecordField {
+            key,
+            title: self.title,
+            kind,
+            default,
+        })
+    }
 }
 
 impl RawManifest {
@@ -869,6 +1109,16 @@ impl RawManifest {
             .into_iter()
             .map(RawSetting::check)
             .collect::<Result<Vec<_>, _>>()?;
+        for setting in &settings {
+            if let SettingKind::Button { command, .. } = &setting.kind
+                && !self.commands.iter().any(|known| known.id == *command)
+            {
+                return error(format!(
+                    "setting \"{}\": the button's command \"{command}\" isn't in [[commands]]",
+                    setting.key
+                ));
+            }
+        }
         let (languages, grammars, language_servers) =
             check_languages(self.languages, self.grammars, self.language_servers)?;
         for theme in &self.themes {
@@ -1087,10 +1337,66 @@ impl RawSetting {
                 }
                 Some(_) => return wrong("a list of strings"),
             },
+            "secret" => match default {
+                None => (SettingKind::Secret, Value::Null),
+                Some(_) => {
+                    return Err(ManifestError(format!(
+                        "setting \"{key}\": a secret has no default"
+                    )));
+                }
+            },
+            "button" => match self.command {
+                Some(command) => (
+                    SettingKind::Button {
+                        command,
+                        argument: self.argument,
+                    },
+                    Value::Null,
+                ),
+                None => {
+                    return Err(ManifestError(format!(
+                        "setting \"{key}\": a button needs a command"
+                    )));
+                }
+            },
+            "status" => match default {
+                None => (SettingKind::Status, Value::String(String::new())),
+                Some(value @ Value::String(_)) => (SettingKind::Status, value),
+                Some(_) => return wrong("a string"),
+            },
+            "section" => (SettingKind::Section, Value::Null),
+            "text" => match default {
+                None => (SettingKind::Text, Value::String(String::new())),
+                Some(value @ Value::String(_)) => (SettingKind::Text, value),
+                Some(_) => return wrong("a string"),
+            },
+            "records" => {
+                if self.fields.is_empty() {
+                    return Err(ManifestError(format!(
+                        "setting \"{key}\": records need fields"
+                    )));
+                }
+                let mut fields = Vec::new();
+                for field in self.fields {
+                    let field = field.check(&key)?;
+                    if fields.iter().any(|known: &RecordField| known.key == field.key) {
+                        return Err(ManifestError(format!(
+                            "setting \"{key}\": the field \"{}\" is there twice",
+                            field.key
+                        )));
+                    }
+                    fields.push(field);
+                }
+                let default = default.unwrap_or(Value::Array(Vec::new()));
+                if !records_fit(&fields, &default) {
+                    return wrong("a list of records of the fields");
+                }
+                (SettingKind::Records(fields), default)
+            }
             other => {
                 return Err(ManifestError(format!(
                     "setting \"{key}\": unknown type \"{other}\" (bool, string, integer, choice, \
-                     string-list)"
+                     string-list, text, records, secret, button, status, section)"
                 )));
             }
         };
@@ -1417,5 +1723,321 @@ file = "icon-themes/flux.toml"
         assert!(!is_valid_id("flux..todo"));
         assert!(!is_valid_id("flux todo"));
         assert!(!is_valid_id(""));
+    }
+
+    /// API 0.3: settings that aren't values, commands only buttons run, Claude.
+    const ACCOUNT: &str = r#"
+id = "flux.yandex"
+name = "Yandex"
+version = "0.1.0"
+api = "0.3"
+
+[permissions]
+claude = true
+
+[[commands]]
+id = "sign-in"
+title = "Sign In"
+palette = false
+
+[[commands]]
+id = "refresh"
+title = "Refresh"
+
+[[settings]]
+key = "account"
+type = "section"
+title = "Account"
+description = "Who is signed in."
+
+[[settings]]
+key = "account-status"
+type = "status"
+title = "Account"
+default = "Not signed in"
+
+[[settings]]
+key = "sign-in-button"
+type = "button"
+title = "Sign In…"
+command = "sign-in"
+argument = "browser"
+
+[[settings]]
+key = "token"
+type = "secret"
+title = "Token"
+
+[[settings]]
+key = "minutes"
+type = "integer"
+title = "Minutes"
+default = 5
+min = 0
+max = 60
+"#;
+
+    #[test]
+    fn reads_the_settings_of_api_0_3() {
+        let manifest = Manifest::parse(ACCOUNT).unwrap();
+        assert!(manifest.permissions.claude);
+        assert!(!manifest.permissions.is_empty());
+        assert!(!manifest.command("sign-in").unwrap().palette);
+        assert!(manifest.command("refresh").unwrap().palette);
+        let kinds: Vec<&SettingKind> = manifest.settings.iter().map(|s| &s.kind).collect();
+        assert_eq!(
+            kinds[..4],
+            [
+                &SettingKind::Section,
+                &SettingKind::Status,
+                &SettingKind::Button {
+                    command: "sign-in".into(),
+                    argument: Some("browser".into()),
+                },
+                &SettingKind::Secret,
+            ]
+        );
+        assert_eq!(
+            manifest.setting("account-status").unwrap().default,
+            Value::String("Not signed in".into())
+        );
+        assert!(!SettingKind::Secret.has_value());
+        assert!(manifest.setting("minutes").unwrap().kind.has_value());
+    }
+
+    #[test]
+    fn rejects_mistakes_in_settings_of_api_0_3() {
+        let no_command = ACCOUNT.replace("command = \"sign-in\"\n", "");
+        assert!(
+            Manifest::parse(&no_command)
+                .unwrap_err()
+                .0
+                .contains("a button needs a command")
+        );
+        let unknown = ACCOUNT.replace("command = \"sign-in\"", "command = \"log-in\"");
+        assert_eq!(
+            Manifest::parse(&unknown).unwrap_err().0,
+            "setting \"sign-in-button\": the button's command \"log-in\" isn't in [[commands]]"
+        );
+        let secret_default = ACCOUNT.replace(
+            "key = \"token\"\ntype = \"secret\"",
+            "key = \"token\"\ntype = \"secret\"\ndefault = \"x\"",
+        );
+        assert!(
+            Manifest::parse(&secret_default)
+                .unwrap_err()
+                .0
+                .contains("a secret has no default")
+        );
+        let unknown_type = ACCOUNT.replace("type = \"section\"", "type = \"heading\"");
+        assert!(
+            Manifest::parse(&unknown_type)
+                .unwrap_err()
+                .0
+                .contains("secret, button, status, section")
+        );
+    }
+
+    #[test]
+    fn checks_a_value_the_way_settings_does() {
+        let manifest = Manifest::parse(ACCOUNT).unwrap();
+        let minutes = manifest.setting("minutes").unwrap();
+        assert!(minutes.check_value(&Value::from(60)).is_ok());
+        assert_eq!(
+            minutes.check_value(&Value::from(61)).unwrap_err(),
+            "it must be a whole number from 0 to 60"
+        );
+        assert!(minutes.check_value(&Value::from("5")).is_err());
+        let todo = Manifest::parse(TODO).unwrap();
+        let scope = todo.setting("scope").unwrap();
+        assert!(scope.check_value(&Value::from("file")).is_ok());
+        assert_eq!(
+            scope.check_value(&Value::from("folder")).unwrap_err(),
+            "it must be one of \"project\", \"file\""
+        );
+        let patterns = todo.setting("patterns").unwrap();
+        assert!(patterns.check_value(&serde_json::json!(["a", "b"])).is_ok());
+        assert!(patterns.check_value(&serde_json::json!(["a", 1])).is_err());
+        let token = manifest.setting("token").unwrap();
+        assert_eq!(
+            token.check_value(&Value::from("x")).unwrap_err(),
+            "it has no value"
+        );
+    }
+
+    /// Text and records (API 0.3), in the array-of-tables form a plugin's own actions take.
+    const ACTIONS: &str = r#"
+id = "test.actions"
+name = "Actions"
+version = "0.1.0"
+api = "0.3"
+
+[[settings]]
+key = "template"
+type = "text"
+title = "Template"
+default = """
+Line one
+Line two"""
+
+[[settings]]
+key = "actions"
+type = "records"
+title = "Actions"
+
+[[settings.fields]]
+key = "name"
+title = "Name"
+type = "string"
+
+[[settings.fields]]
+key = "prompt"
+title = "Prompt"
+type = "text"
+
+[[settings.fields]]
+key = "mode"
+title = "Mode"
+type = "choice"
+default = "default"
+options = [{ value = "default", title = "Default" }, { value = "plan", title = "Plan" }]
+
+[[settings.fields]]
+key = "favorite"
+title = "On the board"
+type = "bool"
+
+[[settings.default]]
+name = "Take to Work"
+prompt = """
+Take {key} to work."""
+favorite = true
+
+[[settings.default]]
+name = "Plan"
+mode = "plan"
+
+[[settings]]
+key = "after"
+type = "bool"
+title = "After"
+"#;
+
+    #[test]
+    fn reads_text_and_records() {
+        let manifest = Manifest::parse(ACTIONS).unwrap();
+        let template = manifest.setting("template").unwrap();
+        assert_eq!(template.kind, SettingKind::Text);
+        assert_eq!(template.default, Value::from("Line one\nLine two"));
+        assert!(template.kind.has_value());
+        let actions = manifest.setting("actions").unwrap();
+        let SettingKind::Records(fields) = &actions.kind else {
+            panic!("not records: {:?}", actions.kind);
+        };
+        let kinds: Vec<(&str, &RecordFieldKind, &Value)> = fields
+            .iter()
+            .map(|field| (field.key.as_str(), &field.kind, &field.default))
+            .collect();
+        assert_eq!(kinds[0], ("name", &RecordFieldKind::String, &Value::from("")));
+        assert_eq!(kinds[1], ("prompt", &RecordFieldKind::Text, &Value::from("")));
+        assert_eq!(kinds[2].0, "mode");
+        assert_eq!(kinds[2].2, &Value::from("default"));
+        assert_eq!(kinds[3], ("favorite", &RecordFieldKind::Bool, &Value::Bool(false)));
+        assert_eq!(
+            actions.default,
+            serde_json::json!([
+                {"name": "Take to Work", "prompt": "Take {key} to work.", "favorite": true},
+                {"name": "Plan", "mode": "plan"},
+            ])
+        );
+        assert!(actions.kind.has_value());
+        // The table after the records' own tables is a setting of its own.
+        assert_eq!(manifest.setting("after").unwrap().kind, SettingKind::Bool);
+    }
+
+    #[test]
+    fn checks_text_and_records_values() {
+        let manifest = Manifest::parse(ACTIONS).unwrap();
+        let template = manifest.setting("template").unwrap();
+        assert!(template.check_value(&Value::from("a\nb")).is_ok());
+        assert_eq!(
+            template.check_value(&Value::from(1)).unwrap_err(),
+            "it must be a string"
+        );
+        let actions = manifest.setting("actions").unwrap();
+        // Missing keys are fine: the field's default.
+        assert!(
+            actions
+                .check_value(&serde_json::json!([{"name": "Review"}, {}]))
+                .is_ok()
+        );
+        assert!(actions.check_value(&serde_json::json!([])).is_ok());
+        let fields = "it must be a list of records with the fields \"name\", \"prompt\", \
+                      \"mode\", \"favorite\"";
+        for wrong in [
+            serde_json::json!({"name": "x"}),
+            serde_json::json!([{"title": "x"}]),
+            serde_json::json!([{"favorite": "yes"}]),
+            serde_json::json!([{"mode": "fast"}]),
+            serde_json::json!(["x"]),
+        ] {
+            assert_eq!(actions.check_value(&wrong).unwrap_err(), fields, "{wrong}");
+        }
+    }
+
+    #[test]
+    fn rejects_mistakes_in_text_and_records() {
+        let error = |text: &str| Manifest::parse(text).unwrap_err().0;
+        let not_a_string =
+            ACTIONS.replace("default = \"\"\"\nLine one\nLine two\"\"\"", "default = 1");
+        assert_eq!(
+            error(&not_a_string),
+            "setting \"template\": the default must be a string"
+        );
+        let no_fields = r#"
+id = "test.actions"
+name = "Actions"
+version = "0.1.0"
+api = "0.3"
+
+[[settings]]
+key = "actions"
+type = "records"
+title = "Actions"
+"#;
+        assert_eq!(error(no_fields), "setting \"actions\": records need fields");
+        let twice = ACTIONS.replacen("key = \"prompt\"", "key = \"name\"", 1);
+        assert_eq!(
+            error(&twice),
+            "setting \"actions\": the field \"name\" is there twice"
+        );
+        let wrong_default = ACTIONS.replace("favorite = true", "favorite = \"yes\"");
+        assert_eq!(
+            error(&wrong_default),
+            "setting \"actions\": the default must be a list of records of the fields"
+        );
+        let unknown_type = ACTIONS.replace(
+            "type = \"bool\"\n\n[[settings.default]]",
+            "type = \"number\"\n\n[[settings.default]]",
+        );
+        assert_eq!(
+            error(&unknown_type),
+            "setting \"actions\", field \"favorite\": unknown type \"number\" (string, text, \
+             bool, choice)"
+        );
+        let no_options = ACTIONS.replace(
+            "options = [{ value = \"default\", title = \"Default\" }, { value = \"plan\", title = \
+             \"Plan\" }]\n",
+            "",
+        );
+        assert_eq!(
+            error(&no_options),
+            "setting \"actions\", field \"mode\": a choice needs options"
+        );
+        let field_default = ACTIONS.replace("default = \"default\"", "default = \"fast\"");
+        assert_eq!(
+            error(&field_default),
+            "setting \"actions\", field \"mode\": the default doesn't fit the type"
+        );
     }
 }

@@ -16,6 +16,11 @@ mod window;
 
 pub use process::login_env;
 
+#[cfg(test)]
+pub(crate) use http::test_overrides;
+#[cfg(test)]
+pub(crate) use window::{local_time_zone, local_utc_offset};
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -263,6 +268,12 @@ impl dialogs::Host for State {
         self.host.call(HostCall::AskText { id, question });
         id
     }
+
+    fn ask_form(&mut self, form: dialogs::Form) -> u64 {
+        let id = self.host.next_id();
+        self.host.call(HostCall::AskForm { id, form });
+        id
+    }
 }
 
 impl editors::Host for State {
@@ -427,10 +438,55 @@ impl storage::Host for State {
 impl settings::Host for State {
     fn get(&mut self, key: String) -> Option<String> {
         let host = &self.host;
+        let spec = host.entry.manifest.setting(&key);
+        if spec.is_some_and(|spec| !spec.kind.has_value()) {
+            return None;
+        }
         host.settings
             .get(&key)
-            .or_else(|| host.entry.manifest.setting(&key).map(|spec| &spec.default))
+            .or(spec.map(|spec| &spec.default))
             .map(Value::to_string)
+    }
+
+    fn set(&mut self, key: String, value: Option<String>) -> Result<(), String> {
+        let Some(spec) = self.host.entry.manifest.setting(&key) else {
+            return Err(format!("settings.set: \"{key}\" isn't in flux-plugin.toml"));
+        };
+        if !spec.kind.has_value() {
+            return Err(format!("settings.set: \"{key}\" has no value"));
+        }
+        let value = match value {
+            Some(text) => {
+                let value = serde_json::from_str::<Value>(&text)
+                    .map_err(|err| format!("settings.set: \"{key}\": not JSON: {err}"))?;
+                spec.check_value(&value)
+                    .map_err(|err| format!("settings.set: \"{key}\": {err}"))?;
+                Some(value)
+            }
+            None => None,
+        };
+        // As the window stores it: a value equal to the default isn't kept.
+        let value = value.filter(|value| *value != spec.default);
+        match &value {
+            Some(value) => self.host.settings.insert(key.clone(), value.clone()),
+            None => self.host.settings.remove(&key),
+        };
+        self.host.call(HostCall::SetSetting { key, value });
+        Ok(())
+    }
+
+    fn set_status(&mut self, key: String, status: Option<settings::SettingStatus>) {
+        let manifest = &self.host.entry.manifest;
+        if !manifest
+            .setting(&key)
+            .is_some_and(|spec| spec.kind == crate::manifest::SettingKind::Status)
+        {
+            self.host.warn(&format!(
+                "settings.set-status: \"{key}\" isn't a status in flux-plugin.toml"
+            ));
+            return;
+        }
+        self.host.call(HostCall::SetSettingStatus { key, status });
     }
 }
 
@@ -471,6 +527,13 @@ impl ui::Host for State {
     fn hide(&mut self, window: String) {
         if self.host.known_window(&window, "ui.hide") {
             self.host.call(HostCall::HideToolWindow { window });
+        }
+    }
+
+    fn set_title(&mut self, window: String, title: String) {
+        if self.host.known_window(&window, "ui.set-title") {
+            self.host
+                .call(HostCall::SetToolWindowTitle { window, title });
         }
     }
 }

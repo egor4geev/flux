@@ -1,13 +1,46 @@
-//! The project's Git repositories, read-only (the `project` permission): their branches, HEADs and
+//! The project's Git repositories (the `project` permission): their branches, HEADs and
 //! operations, the changes of the working copy, a file's diff. A change of any of it comes as
-//! `Event::GitChanged`.
+//! `Event::GitChanged`. With `project = "write"` (API 0.3) — a new branch and a checkout the way
+//! the Branches popup does them (local changes come along; Smart Checkout asks when they'd be in
+//! the way), their end as `Event::GitDone((id, result))`; and the commit window's template while
+//! a task of the plugin's is active.
 //!
 //! ```ignore
 //! let branch = git::repository_of(&path).and_then(|repo| repo.branch); // "feature/TRACKER-12"
 //! let diff = git::diff(&path)?;
+//! self.branching = Some(git::new_branch(&repo.root, "TRACK-142-fix-sign-in", None));
+//! git::commit_template("TRACK-142 Fix the sign-in", Some("TRACK-142"));
 //! ```
 
-pub use crate::host::git::{Change, ChangeKind, Repository, diff, repositories, status};
+use crate::host::git as raw;
+pub use crate::host::git::{
+    Branch, Change, ChangeKind, CommitTemplate, Repository, branches, checkout, diff, new_branch,
+    repositories, status,
+};
+
+/// While a task of the plugin's is active: `text` fills an empty commit message (and replaces the
+/// previous template's text the user didn't change), and a message generated with Claude starts
+/// with `prefix`.
+pub fn commit_template(text: &str, prefix: Option<&str>) {
+    raw::set_commit_template(Some(&CommitTemplate {
+        text: text.to_string(),
+        prefix: prefix.map(str::to_string),
+    }))
+}
+
+/// No template any more: the task is over.
+pub fn clear_commit_template() {
+    raw::set_commit_template(None)
+}
+
+/// The checked-out branch of the repository whose root is `root`; none — a detached HEAD, or no
+/// such repository.
+pub fn current_branch(root: &str) -> Option<String> {
+    repositories()
+        .into_iter()
+        .find(|repo| repo.root == root)?
+        .branch
+}
 
 /// The repository of a file or a folder (absolute): the one with the deepest root that holds it.
 pub fn repository_of(path: &str) -> Option<Repository> {

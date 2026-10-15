@@ -5,24 +5,27 @@ editor, and reacts to what happens in the window: documents opened, edited and s
 changing, the project changing. With the user's permission it goes further: it talks to web
 services, runs a server on the user's Mac for them to call back, runs programs and terminals,
 proposes edits the user reviews in a diff, reads Git and the problems of the code and publishes its
-own. Plugins look like Flux itself — they describe their windows with elements, and Flux draws them
-in its own design system.
+own. It asks the user with forms and popup lists, makes a task's branch the way the Branches popup
+does, turns keys like `TRACK-142` into its links wherever they appear, opens Claude Code sessions
+with its context and keeps a task's tabs. Plugins look like Flux itself — they describe their windows
+with elements, and Flux draws them in its own design system.
 
 A plugin without code can add languages, their grammars and language servers: [Language plugins](languages.md);
 color themes: [Themes](themes.md); sets of file icons: [File icon sets](icon-themes.md).
 
 > [!NOTE]
-> The plugin API is version **0.2**. A manifest names the version it is built for
-> ([From 0.1 to 0.2](#from-01-to-02)); with the [catalog](catalog.md) open, Flux keeps running
-> plugins built for the API versions it had before.
+> The plugin API is version **0.3**. A manifest names the version it is built for; Flux keeps
+> running plugins built for **0.2**, the version the [catalog](catalog.md) opened with
+> ([From 0.2 to 0.3](#from-02-to-03)).
 
 ## How plugins run
 
 A plugin is a **WebAssembly component** of the `flux:plugin` world, run by
 [wasmtime](https://wasmtime.dev) inside Flux. The API is described in WIT —
-[`crates/flux-plugin/wit/flux-plugin.wit`](../crates/flux-plugin/wit/flux-plugin.wit) is the
-reference; this guide summarizes it. Plugins are written in Rust with the SDK
-([`crates/flux-plugin-api`](../crates/flux-plugin-api)) and built for the `wasm32-wasip2` target.
+[`crates/flux-plugin/wit/v0.3/flux-plugin.wit`](../crates/flux-plugin/wit/v0.3/flux-plugin.wit) is
+the reference (`wit/v0.2` — the previous version, which Flux still runs); this guide summarizes it.
+Plugins are written in Rust with the SDK ([`crates/flux-plugin-api`](../crates/flux-plugin-api)) and
+built for the `wasm32-wasip2` target.
 
 - **Isolated.** A plugin can't crash or freeze Flux. Each one runs on its own thread; a panic, a call
   longer than **10 seconds** of its own work or more than **512 MB** of memory stops the plugin, and
@@ -30,8 +33,8 @@ reference; this guide summarizes it. Plugins are written in Rust with the SDK
 - **Sandboxed.** A plugin sees only what its [permissions](#permissions) give it. Without any it has
   its own data folder, its settings, notifications, questions, tool windows, menu items, the open
   documents, timers, secrets, the clipboard and links in the browser. The project's files, the
-  network, a server, programs, terminals and folders outside the project need a permission each,
-  which the user sees before installing. No environment variables.
+  network, a server, programs, terminals, folders outside the project and Claude Code sessions need
+  a permission each, which the user sees before installing. No environment variables.
 - **One file for every platform.** The component is the same on macOS, Linux and Windows. Flux
   compiles it when it first loads it (tens of milliseconds) and keeps the result in a cache
   (`~/Library/Caches/flux/plugins`, the 64 most recently used).
@@ -172,6 +175,14 @@ The SDK's shortcuts:
 | `git::{repositories, status, diff, repository_of}` | The project's repositories ([Git](#git)). |
 | `diagnostics::{all, of, publish, clear}`, `Diagnostic::warning…` | Problems in files ([Problems](#problems)). |
 | `secrets::{get, set, remove}`, `timers::{after, every}`, `system::{open_url, copy_text, home_dir}` | [Secrets, timers and the system](#secrets-timers-and-the-system). |
+| `system::{now, local_time, utc_offset, time_zone, open_settings}` | The clock in the user's time zone; Settings on the plugin's page. |
+| `dialog::Form` | A dialog with fields ([Forms](#forms)). |
+| `picker::{Picker, item, update, close}` | Popup lists: a search, a menu ([Pickers](#pickers)). |
+| `settings::{set, reset, status, busy}` | Writing settings, the settings page's lines ([The settings page](#the-settings-page)). |
+| `git::{branches, new_branch, checkout, commit_template}` | Branches the way Flux makes them, the commit message's template ([Git](#git)). |
+| `links::{set, pattern, key_regex, tooltip}` | Links on keys like `TRACK-142` ([Links](#links)). |
+| `claude::session` | A Claude Code session with the plugin's context ([Claude sessions](#claude-sessions)). |
+| `contexts::{switch, remove}` | A task's tabs ([Contexts](#contexts)). |
 | `offset`, `slice`, `Position::new`, `Range::on_line`… | Positions in a document's text. |
 | `host::*` | Every interface of the API, as generated from the WIT. |
 
@@ -185,7 +196,7 @@ permissions, the palette its commands. Unknown keys are errors — a typo doesn'
 id = "someone.hello"
 name = "Hello"
 version = "0.1.0"
-api = "0.2"
+api = "0.3"
 authors = ["Someone"]
 description = "Says hello."
 repository = "https://github.com/someone/hello"
@@ -229,7 +240,7 @@ default = "Hello!"
 | `id` | required | Lowercase letters and digits, words joined by `.` or `-`: `someone.hello-world`. The plugin's key everywhere: its folder, settings, notification group, keychain items. |
 | `name` | required | Shown in the manager, the palette's chips, Settings. |
 | `version` | required | The plugin's version. |
-| `api` | required | The plugin API it is built for: `"0.2"`. Flux runs only the version it has. |
+| `api` | required | The plugin API it is built for: `"0.3"`. Flux runs 0.3 and 0.2 ([From 0.2 to 0.3](#from-02-to-03)); a plugin with code names the version of the SDK it was built with — Flux checks it against the component. |
 | `authors` | `[]` | |
 | `description` | `""` | Shown in the manager. |
 | `repository` | — | A link for the manager. |
@@ -245,12 +256,13 @@ missing permission. Ask for what the plugin needs, no more: the user decides by 
 
 | Key | Default | What it gives |
 |-----|---------|---------------|
-| `project` | `"none"` | The project's content. `"read"`: the project folder in the plugin's file system (at its real path), `project.search`, [Git](#git), reading [problems](#problems), [proposed edits](#proposed-edits) (the answer carries the file's text). `"write"`: also writing the project's files through the file system. |
+| `project` | `"none"` | The project's content. `"read"`: the project folder in the plugin's file system (at its real path), `project.search`, [Git](#git), reading [problems](#problems), [proposed edits](#proposed-edits) (the answer carries the file's text), the commit message's template, [contexts](#contexts). `"write"`: also writing the project's files through the file system and changing its Git repositories — a new branch, a checkout. |
 | `network` | `[]` | Requests to the hosts listed ([The network](#the-network)): `"api.example.com"`; `"*.example.com"` — the domain and its subdomains; `"localhost"` — with `127.0.0.1` and `::1`; `"*"` — any host, which the install question warns about. A host, not a URL: no scheme, port or path. Every redirect is checked against the list too. |
 | `server` | `false` | A server of the plugin's own on `127.0.0.1` ([A local server](#a-local-server)): a web service's sign-in redirects to it, programs talk to the IDE through it. |
 | `processes` | `[]` | Programs by name ([Programs](#programs)): `["git", "gh"]`; `["*"]` — any, which the install question warns about. A program runs with the user's rights: it can do whatever the user can. |
 | `terminal` | `false` | Terminal tabs ([Terminals](#terminals)): open them with a command or the user's shell, type into them. A shell runs whatever is typed into it, so this is as strong as any program — but the user sees every tab. |
 | `folders` | `[]` | Folders outside the project in the plugin's file system, at their real paths: `[{ path = "~/.config/gh", access = "read" }]`. `~` is the home folder ([`system.home-dir`](#secrets-timers-and-the-system)); `access` is `"read"` (the default) or `"write"`. A folder that doesn't exist is skipped. |
+| `claude` | `false` | Claude Code sessions the plugin opens with its own context and requests ([Claude sessions](#claude-sessions)). A session runs with the rights the user gave Claude Code — it can edit files and run commands — so the install question warns about it. |
 
 **`[notifications]`** — `display`: how the plugin's notifications show until the user changes it in
 Settings → Notifications: `"balloon"` (a card that goes away, the default), `"sticky"` (a card that
@@ -265,6 +277,7 @@ notification actions.
 | `title` | required | Also the label of its menu items. |
 | `category` | the plugin's name | The palette's chip. |
 | `keys` | — | A default shortcut in gpui's notation: `cmd-shift-h`, `alt-f7`. A key Flux already uses is not taken (the plugin's log says so). |
+| `palette` | `true` | `false` — not in the palette: a command only a notification's action, a settings button or a status bar item runs. |
 
 **`[[menus]]`** — an item of a context menu that runs one of the plugin's commands on what the menu
 was opened on ([Commands and their context](#commands-and-their-context)). Flux adds the plugins'
@@ -277,34 +290,103 @@ items below its own; an item shows while the plugin runs and hasn't grayed the c
 | `location` | required | `"editor"` — the editor's menu (the right button over the text, ⇧F10); `"tree"` — the project tree's; `"tab"` — a tab's. |
 | `when` | always | `"selection"` — the editor has a selection (`editor`); `"file"` — on a file (`tree`, `tab`); `"folder"` — on a folder (`tree`). |
 
-**`[[tool-windows]]`** — a window in the island on the right, opened by its icon in the launchpad.
+**`[[tool-windows]]`** — a window in the island on the right, opened by its icon in the launchpad —
+or a tab among the editor's tabs ([Tool windows](#tool-windows)).
 
 | Key | | |
 |-----|-|-|
 | `id` | required | The window the plugin fills with `ui.set-view`. |
-| `title` | required | |
+| `title` | required | `ui.set-title` changes it while the plugin runs. |
 | `icon` | a puzzle piece | A monochrome 16×16 SVG in the folder, drawn in the launchpad's colors. |
 | `keys` | — | A default shortcut that opens and hides the window. |
+| `location` | `"island"` | `"editor"` — a tab among the editor's tabs, for something wide: a board, a preview. No launchpad icon: `ui.show` and the palette open it. |
 
 **`[[status-items]]`** — `id`: an item of the status bar; the plugin sets its text with
 `status-bar.set` (`status::set`).
 
-**`[[settings]]`** — a setting; Settings → the plugin shows a form of them. Values are kept in
-`settings.json` under `plugins.settings.<id>`; a change comes as the `settings-changed` event.
+**`[[settings]]`** — a setting; Settings → the plugin shows a form of them, in their order. Values
+are kept in `settings.json` under `plugins.settings.<id>` (a secret — in the keychain); a change comes
+as the `settings-changed` event.
 
 | Key | | |
 |-----|-|-|
 | `key` | required | What `setting(key)` reads. |
 | `title` | required | |
 | `description` | — | Under the field. |
-| `type` | required | `bool` (a switch), `string` (a field), `integer` (a number field), `choice` (one of `options`), `string-list` (a list of strings, a row each). |
-| `default` | `false`, `""`, `0` or `min`, the first option, `[]` | Must fit the type. |
+| `type` | required | With a value: `bool` (a switch), `string` (a field), `text` (several lines: a prompt, a template), `integer` (a number field), `choice` (one of `options`), `string-list` (a list of strings, a row each), `records` (a list of records, below). Without one: `secret`, `button`, `status`, `section` (below). |
+| `default` | `false`, `""`, `0` or `min`, the first option, `[]` | Must fit the type. A `status`'s text until the plugin writes one. `records` — `[[settings.default]]` tables. A `secret` has none. |
 | `min`, `max` | — | For `integer`. |
 | `options` | — | For `choice`: `[{ value = "file", title = "Current File" }, …]`. |
+| `command`, `argument` | — | For `button`: one of `[[commands]]`, and what its context's `argument` carries. |
+
+The kinds without a value make the page a plugin's own place — a sign-in, an organization, what a
+plugin asks of the user once ([The settings page](#the-settings-page)):
+
+- `section` — a heading with its description; the settings below it are its group.
+- `secret` — a masked field, kept in the macOS keychain, never in `settings.json`: the plugin's
+  secret named by the setting's key (`secrets::get(key)`); `setting(key)` reads none.
+- `button` — runs the plugin's command with `argument` in its context; grayed out while the plugin
+  isn't running. Buttons in a row share a line.
+- `status` — a line the plugin writes (`settings::status`): «Signed in as anna@example.com».
+- `records` — a list of records with the same fields, a card each, which the user adds, removes and
+  moves: the plugin's own actions, bookmarks. `[[settings.fields]]` — `key`, `title`, `type`
+  (`string`, `text`, `bool`, `choice` with `options`), `default`; `[[settings.default]]` — the
+  records it starts with. The value is a list of objects by the fields' keys.
+
+```toml
+[[settings]]
+key = "account"
+type = "section"
+title = "Account"
+
+[[settings]]
+key = "token"
+type = "secret"
+title = "Token"
+description = "A personal token of the service."
+
+[[settings]]
+key = "check-button"
+type = "button"
+title = "Check Connection"
+command = "check-connection"
+
+[[settings]]
+key = "connection"
+type = "status"
+title = "Connection"
+default = "Not checked"
+
+[[settings]]
+key = "actions"
+type = "records"
+title = "Claude actions"
+
+[[settings.fields]]
+key = "name"
+title = "Name"
+type = "string"
+
+[[settings.fields]]
+key = "prompt"
+title = "Prompt"
+type = "text"
+
+[[settings.fields]]
+key = "mode"
+title = "Mode"
+type = "choice"
+options = [{ value = "default", title = "As usual" }, { value = "plan", title = "Plan mode" }]
+
+[[settings.default]]
+name = "Take to Work"
+prompt = "Implement {key}: {summary}."
+mode = "default"
+```
 
 ## The API
 
-Each interface of [the WIT](../crates/flux-plugin/wit/flux-plugin.wit) is a module of `host`
+Each interface of [the WIT](../crates/flux-plugin/wit/v0.3/flux-plugin.wit) is a module of `host`
 (`host::editors::open`); the SDK's shortcuts above cover the common cases. Positions in documents are
 zero-based lines and columns **in characters** (Unicode scalar values), as Flux counts them; lines
 end at `\n`. Documents are named by ids that stay the same while the document is open; notifications,
@@ -316,24 +398,28 @@ plugin passes are relative to the project root or absolute; paths Flux gives bac
 | `log` | `write(level, message)` — `debug`, `info`, `warn`, `error`. |
 | `i18n` | `language()` — `"en"`, `"ru"`; `translate(text)`. |
 | `commands` | `set-enabled(command, enabled)` — grays a command out in the palette and the menus (it stops running). |
-| `notifications` | `notify(notification) -> id`; `update(id, notification)`; `set-progress(id, progress)` — a task in progress (indeterminate or a fraction; none — over); `expire(id)` — its actions stop working; `remove(id)`. A notification has a kind (info, success, warning, error), a title, a body, actions (a label and one of the plugin's commands) and `sticky`. |
-| `dialogs` | `ask(question) -> id` — a question with buttons (roles: primary, normal, danger, cancel), a message and monospace details; `ask-text(question) -> id` — a question with a text field. The answers come as events. |
+| `notifications` | `notify(notification) -> id`; `update(id, notification)`; `set-progress(id, progress)` — a task in progress (indeterminate or a fraction; none — over); `expire(id)` — its actions stop working; `remove(id)`. A notification has a kind (info, success, warning, error), a title, a body, actions (a label, one of the plugin's commands and an `argument` the command gets — which of several notifications) and `sticky`. |
+| `dialogs` | `ask(question) -> id` — a question with buttons (roles: primary, normal, danger, cancel), a message and monospace details; `ask-text(question) -> id` — a question with a text field; `ask-form(form) -> id` — a dialog with fields ([Forms](#forms)). The answers come as events. |
 | `editors` | `active()`, `list()` — the documents (`id`, `path`, `language`, `modified`); `text(id)`; `selections(id)` — the primary first; `set-selections(id, ranges)`; `edit(id, edits)` — one undo step, ranges in the current text, not overlapping; `open(path, selection) -> id` — opens a file in a tab or goes to it, selects the span in the middle of the view; `save(id)` — starts saving (`editor-saved` says when it's on disk); `close(id)` — closes the tab, unless the document has unsaved changes (then an error: they are the user's to decide about). |
 | `project` | `root()`; `search(query, max-matches)` — the project's files by the rules of Find in Files (`.gitignore`, no binary or huge files): lines with matches, paths relative to the root. A query is text with `case-sensitive`, `whole-word` and `regex` (the syntax of the Rust `regex` crate). It needs the `project` permission and blocks the plugin, not Flux. |
 | `storage` | `get(key)`, `set(key, value)` — a small store kept between launches; `data-dir()` — the plugin's folder, readable and writable. |
-| `settings` | `get(key)` — the value as JSON: the user's, or the manifest's default. |
+| `settings` | `get(key)` — the value as JSON: the user's, or the manifest's default (none for a secret, a button, a status, a section); `set(key, value?)` — writes one; `set-status(key, status?)` — a `status` line ([The settings page](#the-settings-page)). |
 | `status-bar` | `set(id, item)` — the text, a tooltip and a command a click runs; none hides it. |
-| `ui` | `set-view(window, view)` — a tool window's content; `show(window)`, `hide(window)`. |
+| `ui` | `set-view(window, view)` — a tool window's content; `show(window)`, `hide(window)`; `set-title(window, title)` — its header, its tab. |
 | `http` | `fetch(request)` — a request and its whole response; `start(request) -> id` — a request in the background, its response as events; `cancel(id)`. `network` permission. |
 | `server` | `listen(port?) -> port`, `stop()`; `respond(id, response)`, `respond-stream(id, status, headers)`, `send-chunk(id, bytes)`, `end-stream(id)`; `ws-send(connection, message)`, `ws-close(connection)`. `server` permission. |
 | `process` | `run(command, stdin, timeout-ms)` — a program to its end; `spawn(command) -> id` — in the background, its output as events; `write(id, bytes)`, `close-stdin(id)`, `kill(id)`. `processes` permission. |
 | `terminal` | `open(options) -> id`, `send-text(id, text)`, `show(id, focus)`, `close(id)`. `terminal` permission. |
 | `review` | `propose(proposal) -> id`, `withdraw(id)`. `project` permission. |
-| `git` | `repositories()`, `status()`, `diff(path)`. `project` permission. |
+| `git` | `repositories()`, `status()`, `diff(path)`, `branches(root)`, `set-commit-template(template?)` — `project` permission; `new-branch(root, name, start?) -> id`, `checkout(root, branch) -> id` — `project = "write"`. |
 | `diagnostics` | `get(path?)` (`project` permission), `publish(path, diagnostics)`, `clear()`. |
 | `secrets` | `get(key)`, `set(key, value?)`. |
 | `timers` | `after(ms) -> id`, `every(ms) -> id`, `cancel(id)`. |
-| `system` | `open-url(url)`, `copy-text(text)`, `home-dir()`. |
+| `system` | `open-url(url)`, `copy-text(text)`, `home-dir()`, `utc-offset(at)`, `time-zone()`, `open-settings()`. |
+| `picker` | `open(spec) -> id`, `update(id, items, loading)`, `close(id)` ([Pickers](#pickers)). |
+| `links` | `set-patterns(patterns)`, `describe(request, markdown?)` ([Links](#links)). |
+| `claude` | `new-session(spec)`. `claude` permission ([Claude sessions](#claude-sessions)). |
+| `contexts` | `switch(save?, load?)`, `remove(key)`. `project` permission ([Contexts](#contexts)). |
 
 ### Commands and their context
 
@@ -342,10 +428,11 @@ on, as it was at that moment.
 
 | Field | |
 |-------|-|
-| `source` | `palette`, `keys`, `editor-menu`, `tree-menu`, `tab-menu`, `notification`, `status-bar` (`source.name()` gives these names). |
+| `source` | `palette`, `keys`, `editor-menu`, `tree-menu`, `tab-menu`, `notification`, `status-bar`, `settings` — a button of the settings page (`source.name()` gives these names). |
 | `editor` | The document: the active one (the editor's menu, the palette, keys), or the tab's (a tab's menu); none when it isn't a document. |
 | `selections` | The document's selections, the primary first; an empty range is a cursor. |
 | `paths` | The files and folders, absolute: the rows selected in the tree, the tab's file, the document's file. |
+| `argument` | What a notification's action or a settings button carries (`context.argument()`): which task, which meeting of several. |
 
 ```rust
 fn run_command(&mut self, command: &str, context: &CommandContext) {
@@ -535,17 +622,39 @@ permission: the answer carries the file's text.
 
 ### Git
 
-`git` — the project's repositories, read-only, with the `project` permission: `repositories()` (the
-root, the branch — none when HEAD is detached, the HEAD commit, an operation in progress: merge,
-rebase…), `status()` (the changes of the working copy against HEAD: added, modified, deleted,
-renamed, untracked, conflicted), `diff(path)` (a file's changes against HEAD as a unified diff). A
-change of any of it comes as `git-changed`.
+`git` — the project's repositories, with the `project` permission: `repositories()` (the root, the
+branch — none when HEAD is detached, the HEAD commit, an operation in progress: merge, rebase…),
+`status()` (the changes of the working copy against HEAD: added, modified, deleted, renamed,
+untracked, conflicted), `diff(path)` (a file's changes against HEAD as a unified diff),
+`branches(root)` (the local branches, then the remote ones — `origin/main`; the current one marked).
+A change of any of it comes as `git-changed`.
+
+With `project = "write"` a plugin changes them the way Flux does — the Branches popup's way:
+`new_branch(root, name, start)` creates a branch from `start` (a branch, a tag, a commit; none —
+HEAD) and checks it out; `checkout(root, branch)` checks one out (a remote one — as a new local
+branch tracking it). Local changes come along, Smart Checkout asks when they'd be in the way, and the
+messages are Flux's own; how it ended comes as `git-done`: done, or why not — the user declined, git
+failed (Flux has told the user).
+
+While a task of the plugin's is active, `commit_template(text, prefix)` fills the commit window's
+empty message — and replaces the previous template's text the user didn't change; a message
+generated with Claude starts with `prefix`. `clear_commit_template()` — the task is over.
 
 ```rust
 use flux_plugin_api::git;
 
 // A task tracker's plugin: the issue of the current branch, "feature/FLUX-12-search".
 let branch = git::repository_of(&path).and_then(|repo| repo.branch);
+
+// Starting a task: its branch (or back to it), its key in the commit message.
+let repo = git::repository_of(&root).ok_or("no repository")?;
+let exists = git::branches(&repo.root)?.iter().any(|branch| branch.name == name);
+self.branching = Some(match exists {
+    true => git::checkout(&repo.root, &name),
+    false => git::new_branch(&repo.root, &name, None),
+});
+git::commit_template(&format!("{key} {summary}"), Some(&key));
+// Event::GitDone((id, result)) if Some(id) == self.branching → on with the task, or stop
 ```
 
 ### Problems
@@ -572,6 +681,219 @@ let problems: Vec<Diagnostic> = parse(&output.stdout_text())
 diagnostics::publish(&path, &problems); // source: the plugin's name unless `.source(…)`
 ```
 
+### Forms
+
+`dialogs.ask-form` — a dialog with several fields, as JetBrains' Open Task: a line of text, several
+lines (↵ — a new line, ⌘↵ — confirm), a dropdown, checkboxes, notes between them; the placeholder,
+the code font. A field can be enabled by a checkbox (`enabled_by`): the branch's name only while
+«Create a branch» is on. The answer comes as `form-answered`: every field's value by its key — the
+text, the chosen option's value, `"true"` / `"false"` — or none, cancelled.
+
+```rust
+use flux_plugin_api::dialog::{Form, Values};
+
+let transitions = [("start", tr("Start Progress")), ("review", tr("Review"))];
+let options: Vec<(&str, &str)> =
+    transitions.iter().map(|(id, title)| (*id, title.as_str())).collect();
+self.form = Some(
+    Form::new(&tr("Open Task"), &tr("Start"))
+        .message(&format!("{key} · {summary}"))
+        .choice("status", &tr("Move to"), &options, Some("start"))
+        .toggle("branch", &tr("Create a branch"), true)
+        .text("branch-name", &tr("Branch"), &name).code().enabled_by("branch")
+        .multiline("comment", &tr("Comment"), "").placeholder(&tr("Optional"))
+        .send(),
+);
+
+// In on_event.
+Event::FormAnswered((id, answer)) if Some(id) == self.form => match answer.map(Values::from) {
+    Some(values) if values.on("branch") && values.text("branch-name").is_empty() => {
+        self.ask_again(&tr("Name the branch, or turn Create a branch off."), &values)
+    }
+    Some(values) => self.start(values.get("status"), &values.text("branch-name")),
+    None => {} // cancelled
+},
+```
+
+`Form::error` shows what was wrong with the previous answer above the buttons: ask again with the
+values the user gave — the form keeps only what the plugin passes back. A form waits while a dialog
+of the user's is open, as questions do.
+
+### Pickers
+
+`picker` — a popup list drawn as Flux's own (Open Task, the branches): a search field over items —
+an icon, a label of spans, a dim detail, a badge on the right, a group's heading — or a short menu
+without the field (`Picker::menu`). Flux filters the items by the query (fuzzily, as ⌘P); a `live`
+picker searches itself: every change of the query comes as `picker-query` (a burst of typing — one
+event), and the plugin answers with `picker::update` (a spinner while `loading`). The choice comes as
+`picker-chosen`: the item's key, or none — dismissed (Esc, a click outside). A picker gets exactly one
+answer; a plugin's new picker closes its previous one.
+
+```rust
+use flux_plugin_api::picker::{self, Picker, item};
+
+// Open Task: the user's tasks at once, then the tracker's search as they type.
+self.search = Some(
+    Picker::new(&tr("Find a task by its key or words"))
+        .live()
+        .items(self.mine.iter().map(|task| {
+            item(&task.key, &task.summary).detail(&task.key).group(&task.status)
+        }))
+        .open(),
+);
+// Event::PickerQuery((id, query)) → picker::update(id, self.find(&query), false)
+// Event::PickerChosen((id, Some(key))) → open the task
+
+// A status's transitions: a menu under the badge of the tool window.
+self.transitions = Some(
+    Picker::menu()
+        .items(transitions.iter().map(|transition| item(&transition.id, &transition.title)))
+        .under("tracker", "status")
+        .open(),
+);
+```
+
+Where it opens: under the title bar, as the command palette (the default); above one of the plugin's
+status bar items (`at_status_item`) — the day's meetings from a «Meeting in 12 min» item, as
+JetBrains' status bar popups; under an element of its tool window (`under`). An item or an element
+that isn't on screen — under the title bar.
+
+### The settings page
+
+Settings → the plugin is a form of its `[[settings]]` ([The manifest](#the-manifest)). Beyond the
+values the user types, the plugin writes to the page:
+
+- `settings::set(key, &value)` — a value, checked against the setting's kind (the error says why it
+  doesn't fit); `settings::reset(key)` — the default. An open page shows it at once; the plugin
+  doesn't get `settings-changed` about its own write.
+- `settings::status(key, text, Tone::Success)` — a `status` line: «Signed in as anna@example.com»;
+  `settings::busy(key, text)` — with a spinner: «Checking…»; `settings::clear_status(key)` — the
+  manifest's text again. The lines are kept while the plugin runs.
+- `system::open_settings()` — Settings on the plugin's page: a «Sign in» or «Set the organization»
+  link of its tool window.
+
+A `secret` setting is the plugin's secret named by the setting's key: the user types a token there,
+and the plugin reads it with `secrets::get(key)` when `settings-changed` comes. A `button` runs its
+command with the button's `argument`, from the `settings` source:
+
+```rust
+use flux_plugin_api::settings::{self, Tone};
+
+fn run_command(&mut self, command: &str, context: &CommandContext) {
+    match command {
+        // [[settings]] type = "button", command = "check-connection"
+        "check-connection" => {
+            settings::busy("connection", &tr("Checking…"));
+            match self.who_am_i() {
+                Ok(login) => {
+                    let text = trf("Signed in as {0}", &[&login]);
+                    settings::status("connection", &text, Tone::Success)
+                }
+                Err(err) => settings::status("connection", &err, Tone::Error),
+            }
+        }
+        _ => {}
+    }
+}
+```
+
+A `records` setting reads as a list of objects: give the struct's fields `#[serde(default)]`, so a
+record saved before a field was added still reads.
+
+```rust
+#[derive(serde::Deserialize)]
+struct Action {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    mode: String,
+}
+
+let actions: Vec<Action> = setting("actions").unwrap_or_default();
+```
+
+### Links
+
+`links` — the plugin's patterns of links on text that names something of its own — a task's key,
+`TRACK-142` — wherever the text is: in the editor (hold ⌘ over it: underlined, a pointing hand;
+⌘-click), in commit messages (the Git log, a commit's details), in Claude's chat, in the plugins'
+Markdown and tooltips. A click comes as `link-activated` — the pattern's id and the text. A pattern
+with `tooltip` asks the plugin when the mouse rests over a link (or F1 at the caret):
+`link-hovered` with a request, which the plugin answers with Markdown — within 3 seconds, or there
+is no tooltip.
+
+```rust
+use flux_plugin_api::links;
+
+// The keys of the user's queues — \b(?:TRACK|WEB)-\d+\b — not any CAPS-123: UTF-8 stays text.
+links::set([links::pattern("task", &links::key_regex(&["TRACK", "WEB"])).tooltip()])?;
+
+// In on_event.
+Event::LinkHovered((request, _, key)) => match self.cached(&key) {
+    Some(task) => {
+        links::tooltip(request, &format!("**{key}** {}\n\n{}", task.summary, task.status))
+    }
+    None => links::no_tooltip(request),
+},
+Event::LinkActivated((_, key)) => self.open_card(&key),
+```
+
+A pattern is a Rust `regex`, and the whole match is the link; one that doesn't compile is refused
+with an error naming it. `set` replaces the plugin's patterns; an empty list (`links::clear()`)
+removes them, and they go when the plugin stops.
+
+### Claude sessions
+
+`claude` — a Claude Code session in Flux's chat, opened by the plugin with its context: a task to
+discuss, or to work on. The manifest asks for `claude = true`: a session's requests run with the
+rights the user gave Claude Code, and the install question says so.
+
+```rust
+use flux_plugin_api::claude;
+
+// Discuss: the task attached, the field takes the keyboard — the user writes the request.
+claude::session()
+    .title(&format!("{key}: {summary}"))
+    .attach(&key, &task_markdown)
+    .start()?;
+
+// Plan: plan mode, the request sent at once.
+claude::session()
+    .title(&format!("{key}: {summary}"))
+    .attach(&key, &task_markdown)
+    .prompt(&tr("Study the task and the code it concerns, then propose a plan."))
+    .send()
+    .plan_mode()
+    .start()?;
+```
+
+An attachment is a chip in the field — its label — and its Markdown goes with the first message.
+Without `send` the prompt waits in the field. `start` fails when Claude Code is turned off, not
+installed or not signed in: the error says which, and the Claude window shows how to fix it.
+
+### Contexts
+
+`contexts` — the window's tabs kept under a key, as Tasks & Contexts in JetBrains: a task's
+documents (with the caret and the scroll), pictures and Claude chats come back when the user
+returns to the task. `switch(save, load)` saves the open tabs as `save` — a key and a title, which
+the user sees in **Load Context…** — closes them (documents with unsaved changes and running Claude
+sessions stay) and opens the tabs of `load`, if it was saved. The keys are the plugin's own: other
+plugins' and the user's contexts are apart. It needs the `project` permission.
+
+```rust
+use flux_plugin_api::contexts;
+
+// Starting TRACK-142 after TRACK-140: the old task's tabs are kept, the new one's come back.
+contexts::switch(Some(("TRACK-140", "TRACK-140 Fix the header")), Some("TRACK-142"))?;
+// The task is closed: its tabs are no longer needed.
+contexts::remove("TRACK-142");
+```
+
+The user has the same without plugins: **Save Context…**, **Load Context…** and **Clear Context**
+(⌥⇧X) in the command palette.
+
 ### Secrets, timers and the system
 
 `secrets` keeps tokens and passwords in the macOS keychain, not in files: only this plugin reads
@@ -594,7 +916,11 @@ self.poll = Some(timers::every(Duration::from_secs(60)));
 
 `system` — `open_url(url)` opens an `http`, `https` or `mailto` link in the default browser;
 `copy_text(text)` puts text on the clipboard; `home_dir()` (and `system::expand_home("~/.config/gh")`)
-— where the folders of the `folders` permission are.
+— where the folders of the `folders` permission are; `open_settings()` — Settings on the plugin's
+page. The clock in the user's time zone: `system::local_time(at)` — a moment (seconds since 1970,
+UTC; `system::now()`) with `.hm()` («11:00»), `.date()`, `.iso()` («2026-10-14T10:00:00.000+0300» —
+as Yandex Tracker takes a work log's start); `utc_offset(at)` (summer time included) and
+`time_zone()` («Europe/Moscow») underneath.
 
 ### Background work and the time limit
 
@@ -602,10 +928,11 @@ A call that waits — `fetch`, `run`, `project.search`, a document's text, Git, 
 the plugin's own thread; Flux doesn't wait for it, and the waiting doesn't count toward the 10
 seconds. But while it waits, the plugin answers nothing else: its tool window doesn't react, its
 commands queue up. Long work goes to the background — `http.start`, `process.spawn`, the server, a
-terminal, a proposal, a timer — and reports as events into the plugin's queue, between its other
-calls. Everything in the background is the plugin's: its requests are cancelled, its programs end,
-its server and timers stop when the plugin stops (turned off, reloaded, removed, the window closing;
-a plugin with the `project` permission is also restarted when the window's project changes).
+terminal, a proposal, a timer, a branch or a checkout — and reports as events into the plugin's
+queue, between its other calls; so do the user's answers to questions, forms and pickers.
+Everything in the background is the plugin's: its requests are cancelled, its programs end, its
+server and timers stop when the plugin stops (turned off, reloaded, removed, the window closing; a
+plugin with the `project` permission is also restarted when the window's project changes).
 
 ### Events
 
@@ -634,6 +961,12 @@ a plugin with the `project` permission is also restarted when the window's proje
 | `proposal-answered((id, outcome))` | `accepted(text)`, `rejected`, `closed`. |
 | `git-changed` | The status, a branch or a HEAD of a repository changed. |
 | `diagnostics-changed(paths)` | The problems of these files changed. |
+| `form-answered((id, values?))` | The answer to `ask-form`: the values by the fields' keys; none — cancelled. |
+| `picker-query((id, query))` | The query of a `live` picker changed (a burst of typing — one event). |
+| `picker-chosen((id, key?))` | A picker closed: the chosen item's key; none — dismissed. |
+| `link-activated((pattern, text))` | One of the plugin's links was clicked. |
+| `link-hovered((request, pattern, text))` | A link of a pattern with `tooltip` wants its tooltip: answer with `links.describe`. |
+| `git-done((id, result))` | `new-branch` or `checkout` ended: done, or why not. |
 
 ## Signing in to a web service
 
@@ -698,9 +1031,56 @@ to the user (`dialog::Ask` with the code in its message, `system::copy_text` for
 the verification page with `system::open_url`, and polls the token endpoint with
 `timers::every(interval)` until the user approves.
 
+## A task tracker plugin
+
+The API is made to put a task tracker into Flux the way JetBrains IDEs do Tasks & Contexts; the
+catalog's [`flux.yandex`](https://github.com/egor4geev/flux-plugins/tree/main/plugins/flux.yandex) —
+Yandex Tracker and Calendar — is built of these pieces:
+
+1. **Signing in** — [Signing in to a web service](#signing-in-to-a-web-service); the settings page is
+   the account: a pasted token — a `secret` setting, Sign In and Sign Out — `button` settings, who is
+   signed in — a `status` setting.
+2. **Finding a task** — a `live` [picker](#pickers) under the title bar (⌥⇧N, as Open Task in
+   JetBrains): the user's tasks at once, then the tracker's search as they type.
+3. **Starting it** — a [form](#forms) (the status to move to, a branch, the task's tabs), or none at
+   all for a one-click action; then the tracker's transition, `git::new_branch` or `git::checkout`
+   (`git-done`), `contexts::switch` (the previous task's tabs kept, this one's back),
+   `git::commit_template` (the key in the commit message), a status bar item with a timer whose
+   click opens a menu `at_status_item`.
+4. **The task** — a tool window: a `menu_badge` status with its transitions under it, the description
+   and comments as Markdown, a `multiline_field` for a new comment; the board — a window among the
+   editor's tabs (`location = "editor"`).
+5. **Keys in the text** — [links](#links) of the queues' keys: the tooltip from the plugin's cache, a
+   click opens the task.
+6. **Claude** — a [session](#claude-sessions) with the task attached: to discuss it, or a prompt of
+   the plugin's settings filled from the task — a `records` setting of actions, each a name, a
+   prompt and a mode.
+7. **News** — polling with `timers::every`; notifications whose actions carry the task's key
+   (`Notice::action_with`, `context.argument()`).
+
+## From 0.2 to 0.3
+
+- Plugins built for 0.2 keep working as they are: Flux answers their calls through the 0.2 interfaces
+  (`wit/v0.2`) and doesn't send them what 0.2 doesn't know — the new events; a settings button's
+  command comes to them as from the palette, without its argument. A plugin without code — a
+  language, a theme — may name either version.
+- A plugin rebuilt with the new SDK is a 0.3 component: its manifest must say `api = "0.3"`. Flux
+  checks the component against the manifest and refuses a mismatch with a message that names both
+  versions.
+- New: [forms](#forms), [pickers](#pickers), [the settings page](#the-settings-page)'s kinds (`text`,
+  `records`, `secret`, `button`, `status`, `section`) with `settings.set` and `set-status`, Git's
+  `branches`, `new-branch`, `checkout` and `set-commit-template`, [links](#links),
+  [Claude sessions](#claude-sessions) with the `claude` permission, [contexts](#contexts),
+  `system.utc-offset`, `time-zone` and `open-settings`, `ui.set-title`, windows among the editor's
+  tabs (`location = "editor"`), the badge and the multi-line field, `palette = false`, the
+  `argument` of notification actions and settings buttons.
+- Code that builds `CommandContext`, `notifications::Action` or `TextFieldSpec` itself gets the new
+  fields (`argument`, `multiline`); a `match` over `CommandSource`, `ElementKind` or `Event` gets the
+  new cases.
+
 ## From 0.1 to 0.2
 
-- Manifests say `api = "0.2"`. This Flux runs only 0.2: a 0.1 plugin is listed as built for another
+- Manifests say `api = "0.2"`. Flux doesn't run 0.1: a 0.1 plugin is listed as built for another
   version until it is rebuilt.
 - `run_command` gets the command's context: `fn run_command(&mut self, command: &str, context:
   &CommandContext)` (`run-command(command, context)` in the WIT).
@@ -736,15 +1116,52 @@ set_view(
 | `button` | A label and/or an icon, a tooltip, primary, enabled. `icon_button` — the toolbar's kind. | `clicked` |
 | `text_field` | A text field. | `changed(text)`, `submitted(text)` on ↵ |
 | `switch`, `checkbox` | A toggle with a label. | `toggled(on)` |
-| `tree` | Rows with a key, a parent, an icon, a label of spans, a dim detail, a badge; flat rows make a list. Takes the remaining height, scrolls, draws only the visible rows. | `selected(key)`; `activated(key)` — ↵, a double click, a click on a row without children; `expanded((key, expanded))` |
+| `tree` | Rows with a key, a parent, an icon, a label of spans, a dim detail, a badge; flat rows make a list. Takes the remaining height, scrolls, draws only the visible rows. API 0.3: a row's `subtitle` (spans under the label), and `cards` — each row a card: the icon, the label and the badge, the subtitle in up to two lines, the detail (`Tree::cards()`, `RowSpec::subtitle`; a board's column is a tree of cards — a row of columns of cards scrolls sideways when narrow). | `selected(key)`; `activated(key)` — ↵, a double click, a click on a row without children; `expanded((key, expanded))`; `row-action((key, id))` — a row's button (0.3) |
 | `divider`, `spacer`, `progress` | A line; the free space; a progress bar (none — indeterminate). | |
+| `badge` | A short colored label in a tone: a status, a priority, a count. `menu_badge` — with ▾: open a [menu](#pickers) under it. | `clicked` (`menu_badge`) |
+| `multiline_field` | A field of several lines that grows with the text: ↵ — a new line, ⌘↵ — `submitted`. A comment, a description. | `changed(text)`, `submitted(text)` on ⌘↵ |
+| `properties` | API 0.3: labels and their values in two aligned columns — a task's fields. The labels' column is as wide as the longest label (at most 40% of the list; a longer one truncates), a value takes one line (a longer one ends with "…" — long text belongs in Markdown), an empty one is a dim "—". An `editable_property` has a ▾ and its whole row answers the mouse. | `activated(id)` — a click on an editable property |
 
-A view without a tree scrolls as a whole; a row doesn't wrap, so keep a row's buttons few and short.
+A tree's row can carry **tags** and **buttons** (API 0.3): `RowSpec::tag(text, tone)` — small colored
+labels (a tag, a deadline, story points), on a card in a line under the subtitle (the ones that
+don't fit are counted as "+N"), in a list after the label; `RowSpec::action(id, label, icon,
+primary)` — on a card at its foot on the right (a board's "Take to Work"), in a list at the row's
+end while it is hovered or selected. A press comes as `row-action((row key, action id))` with the
+tree's element id, and neither selects nor opens the row; ⌘↵ on the selected row presses its first
+primary button. A tree of cards where some row has tags or buttons leaves room for them on every
+card (one card height per tree).
+
+**Properties** (API 0.3) are a task's fields that the user changes in place: a click on an editable
+one comes as `activated(id)` with the list's element id, and the plugin opens a picker right under
+that row — the anchor `element((window, "<list>/<id>"))` (the list itself until the row is drawn) —
+or a form:
+
+```rust
+let fields = properties("fields", vec![
+    editable_property("priority", &tr("Priority"), vec![span("Critical").tone(Tone::Error)]),
+    editable_property("assignee", &tr("Assignee"), vec![span(&assignee)]),
+    property("created", &tr("Created"), vec![span(&created).tone(Tone::Muted)]),
+]);
+// on_event: Event::Ui(UiInput { element, event: UiEvent::Activated(id), .. }) if element == "fields"
+Picker::menu().items(priorities).under(WINDOW, &format!("fields/{id}")).open();
+```
+
+A view without a tree scrolls as a whole; a row of buttons that doesn't fit wraps onto the next line
+(the toolbar doesn't: keep its buttons few).
 
 **Ids keep state.** Flux keeps an element's state between views by its id: a field's text, the
 scroll, the expanded and selected rows. A row's `expanded` applies when the row first shows; after
 that the user's choice wins. To start an element afresh — say, **Expand All** applying `expanded`
 again — give it a new id (`"items-2"`).
+
+**A window among the editor's tabs.** `location = "editor"` in `[[tool-windows]]` makes a window a
+tab of the editor — for something wide: a board of tasks in columns, a preview. It has no launchpad
+icon: `ui.show` opens the tab (or brings it forward), `ui.hide` closes it, and so can the user; the
+palette and the window's keys open it too, and `tool-window-shown` / `tool-window-hidden` say when it
+is on screen. Its content is a view like any tool window's.
+
+**Titles.** `ui.set-title(window, title)` renames a window while the plugin runs — its header in the
+island, its tab in the editor: «Board: Backend». An empty title brings back the manifest's.
 
 **Icons** are named:
 
@@ -785,6 +1202,22 @@ an archive's are, and enforced the same way.
 The log keeps the plugin's `log` lines, what it prints — stdout as information, stderr (`eprintln!`,
 a panic's message) as warnings — and what happened to it: started, stopped and why, built, its
 requests. It is also a file: `~/Library/Logs/Flux/plugins/<id>.log`.
+
+**Against a fake service.** Two variables of Flux's environment — Flux's, not the plugin's: a plugin
+can't set them — let a plugin's author check it without a real account, by hand or in Flux's UI
+scenarios (`scripts/ui-scenario.sh`):
+
+- `FLUX_PLUGIN_HTTP_OVERRIDE` — comma-separated `<prefix>=<replacement>` pairs. A request whose URL
+  starts with a prefix goes to the replacement with the rest of the URL:
+  `https://api.tracker.yandex.net=http://127.0.0.1:8765` sends the plugin's requests to a fake server
+  on the Mac. The permission is checked against the URL the plugin asked for, and so is every
+  redirect; the plugin's log shows the request with `(override: …)`.
+- `FLUX_SCENARIO_OPEN_URL=<file>` — in a build with the `scenario` feature, `system.open-url` and
+  the links of Markdown write the address into the file instead of opening the browser: a scenario
+  reads it — an OAuth sign-in's page — and plays the browser (fetch the page, follow its redirect to
+  the plugin's server).
+
+The catalog's `flux.yandex` comes with such a fake service: `mock/mock_yandex.py`.
 
 ## Packaging
 

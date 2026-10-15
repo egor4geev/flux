@@ -21,8 +21,8 @@
 //! register_plugin!(Hello);
 //! ```
 //!
-//! [`host`] has every interface of the API as generated from `crates/flux-plugin/wit/flux-plugin.wit`
-//! (the reference); the rest are shortcuts for the common cases: [`view`] builds a tool window's
+//! [`host`] has every interface of the API as generated from
+//! `crates/flux-plugin/wit/v0.3/flux-plugin.wit` (the reference); the rest are shortcuts for the common cases: [`view`] builds a tool window's
 //! content, [`notify`] and [`dialog`] talk to the user, [`editor`] reads the documents,
 //! [`storage`] keeps the plugin's data, [`log`] writes its log, [`tr`] / [`trf`] translate and
 //! [`setting`] reads its settings; [`CommandContext`] says what a command acts on.
@@ -31,16 +31,28 @@
 //! [`server`] — the plugin's server on 127.0.0.1, [`process`] — programs, [`terminal`] — terminal
 //! tabs, [`review`] — edits the user reviews in a diff, [`git`] — the repositories, [`diagnostics`]
 //! — problems in files; and for every plugin: [`secrets`] in the keychain, [`timers`],
-//! [`system`] (the browser, the clipboard, the home folder), [`status`] items. Guide:
+//! [`system`] (the browser, the clipboard, the home folder, the local time), [`status`] items.
+//!
+//! API 0.3: [`dialog::Form`] — a dialog with fields; [`picker`] — a popup list (a search, a menu
+//! at a status bar item or under an element); [`settings`] — writing settings and the settings
+//! page's lines (its `secret`, `button`, `status` and `section` kinds are in the manifest);
+//! [`links`] — links on keys like `TRACK-142` in code, commits and the chat; [`claude`] — a Claude
+//! Code session with the plugin's context; [`contexts`] — a task's tabs; [`git`] — a new branch, a
+//! checkout, the commit template; [`view::badge`], [`view::multiline_field`]. Guide:
 //! `docs/plugins.md`.
 
+pub mod claude;
+pub mod contexts;
 pub mod diagnostics;
 pub mod git;
 pub mod http;
+pub mod links;
+pub mod picker;
 pub mod process;
 pub mod review;
 pub mod secrets;
 pub mod server;
+pub mod settings;
 pub mod status;
 pub mod system;
 pub mod terminal;
@@ -53,11 +65,11 @@ mod url;
 
 pub use text::{offset, slice};
 
-/// The bindings generated from `crates/flux-plugin/wit/flux-plugin.wit`.
+/// The bindings generated from `crates/flux-plugin/wit/v0.3/flux-plugin.wit`.
 #[allow(clippy::too_many_arguments)]
 pub mod bindings {
     wit_bindgen::generate!({
-        path: "../flux-plugin/wit",
+        path: "../flux-plugin/wit/v0.3",
         world: "plugin",
         pub_export_macro: true,
         export_macro_name: "export_plugin",
@@ -71,9 +83,9 @@ pub mod bindings {
 /// `host::ui::set_view`…).
 pub mod host {
     pub use crate::bindings::flux::plugin::{
-        commands, diagnostics, dialogs, editors, events, git, http, i18n, log, notifications,
-        process, project, review, secrets, server, settings, status_bar, storage, system,
-        terminal, timers, types, ui,
+        claude, commands, contexts, diagnostics, dialogs, editors, events, git, http, i18n, links,
+        log, notifications, picker, process, project, review, secrets, server, settings,
+        status_bar, storage, system, terminal, timers, types, ui,
     };
 }
 
@@ -315,6 +327,18 @@ pub mod notify {
             self.0.actions.push(Action {
                 label: label.to_string(),
                 command: command.to_string(),
+                argument: None,
+            });
+            self
+        }
+
+        /// A button that runs one of the plugin's commands with `argument` in its context
+        /// (`context.argument`): which task, which meeting of several notifications.
+        pub fn action_with(mut self, label: &str, command: &str, argument: &str) -> Self {
+            self.0.actions.push(Action {
+                label: label.to_string(),
+                command: command.to_string(),
+                argument: Some(argument.to_string()),
             });
             self
         }
@@ -347,7 +371,8 @@ pub mod notify {
 /// ```
 pub mod dialog {
     use crate::host::dialogs::{
-        self, ButtonRole, DialogButton, DialogLevel, Question, TextQuestion,
+        self, ButtonRole, ChoiceOption, DialogButton, DialogLevel, FieldKind, Form as RawForm,
+        FormField, Question, TextQuestion,
     };
 
     /// A question with buttons; the answer is the index of the pressed one.
@@ -467,6 +492,174 @@ pub mod dialog {
             dialogs::ask_text(&self.0)
         }
     }
+
+    /// A dialog with fields (API 0.3) — a line, several lines, a dropdown, checkboxes, notes
+    /// between them — as JetBrains' Open Task. The answer, `Event::FormAnswered((id, values))`,
+    /// has every field's value by its key ([`Values`]), or none when cancelled. A field's method
+    /// ([`Form::placeholder`], [`Form::code`], [`Form::enabled_by`]) applies to the field added
+    /// last.
+    ///
+    /// ```ignore
+    /// let id = Form::new(&tr("Open Task"), &tr("Start"))
+    ///     .choice("status", &tr("Move to"), &transitions, Some("start"))
+    ///     .toggle("branch", &tr("Create a branch"), true)
+    ///     .text("branch-name", &tr("Name"), &name).code().enabled_by("branch")
+    ///     .send();
+    /// ```
+    #[derive(Debug, Clone)]
+    pub struct Form(RawForm);
+
+    impl Form {
+        /// `confirm` — the confirm button's label: "Start", "Log Time".
+        pub fn new(title: &str, confirm: &str) -> Self {
+            Form(RawForm {
+                level: DialogLevel::Info,
+                title: title.to_string(),
+                message: None,
+                fields: Vec::new(),
+                confirm: confirm.to_string(),
+                error: None,
+            })
+        }
+
+        /// A form with a risk: losing changes, overwriting.
+        pub fn warning(mut self) -> Self {
+            self.0.level = DialogLevel::Warning;
+            self
+        }
+
+        /// The text under the title.
+        pub fn message(mut self, message: &str) -> Self {
+            self.0.message = Some(message.to_string());
+            self
+        }
+
+        /// What was wrong with the previous answer, above the buttons: ask again with the values
+        /// the user gave.
+        pub fn error(mut self, error: &str) -> Self {
+            self.0.error = Some(error.to_string());
+            self
+        }
+
+        /// A line of text.
+        pub fn text(self, key: &str, label: &str, text: &str) -> Self {
+            self.field(key, label, FieldKind::Text(text.to_string()))
+        }
+
+        /// Several lines: ↵ — a new line, ⌘↵ — confirm.
+        pub fn multiline(self, key: &str, label: &str, text: &str) -> Self {
+            self.field(key, label, FieldKind::Multiline(text.to_string()))
+        }
+
+        /// A dropdown of (value, title) options; `selected` — a value (none — the first).
+        pub fn choice(
+            self,
+            key: &str,
+            label: &str,
+            options: &[(&str, &str)],
+            selected: Option<&str>,
+        ) -> Self {
+            let options = options
+                .iter()
+                .map(|(value, title)| ChoiceOption {
+                    value: value.to_string(),
+                    title: title.to_string(),
+                })
+                .collect();
+            self.field(
+                key,
+                label,
+                FieldKind::Choice((options, selected.map(str::to_string))),
+            )
+        }
+
+        /// A checkbox with its label.
+        pub fn toggle(self, key: &str, label: &str, on: bool) -> Self {
+            self.field(key, label, FieldKind::Toggle(on))
+        }
+
+        /// Text between the fields: a hint, a warning. It has no value.
+        pub fn note(self, key: &str, text: &str) -> Self {
+            self.field(key, "", FieldKind::Note(text.to_string()))
+        }
+
+        /// The last field's gray text when it is empty.
+        pub fn placeholder(mut self, placeholder: &str) -> Self {
+            if let Some(field) = self.0.fields.last_mut() {
+                field.placeholder = Some(placeholder.to_string());
+            }
+            self
+        }
+
+        /// The last field in the code font: a branch's name, a query.
+        pub fn code(mut self) -> Self {
+            if let Some(field) = self.0.fields.last_mut() {
+                field.code = true;
+            }
+            self
+        }
+
+        /// The last field is enabled only while the checkbox `toggle` is on.
+        pub fn enabled_by(mut self, toggle: &str) -> Self {
+            if let Some(field) = self.0.fields.last_mut() {
+                field.enabled_by = Some(toggle.to_string());
+            }
+            self
+        }
+
+        fn field(mut self, key: &str, label: &str, kind: FieldKind) -> Self {
+            self.0.fields.push(FormField {
+                key: key.to_string(),
+                label: label.to_string(),
+                kind,
+                placeholder: None,
+                code: false,
+                enabled_by: None,
+            });
+            self
+        }
+
+        /// Shows the dialog; returns its id.
+        pub fn send(&self) -> u64 {
+            dialogs::ask_form(&self.0)
+        }
+
+        /// What it would show.
+        pub fn spec(&self) -> &RawForm {
+            &self.0
+        }
+    }
+
+    /// The values of an answered form, by the fields' keys: `Event::FormAnswered((id,
+    /// Some(values)))` → `Values::from(values)`.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct Values(Vec<(String, String)>);
+
+    impl From<Vec<(String, String)>> for Values {
+        fn from(values: Vec<(String, String)>) -> Self {
+            Values(values)
+        }
+    }
+
+    impl Values {
+        /// A field's value: the text, the chosen option's value, "true" / "false".
+        pub fn get(&self, key: &str) -> Option<&str> {
+            self.0
+                .iter()
+                .find(|(field, _)| field == key)
+                .map(|(_, value)| value.as_str())
+        }
+
+        /// A text field's value, trimmed; empty when there is none.
+        pub fn text(&self, key: &str) -> String {
+            self.get(key).unwrap_or_default().trim().to_string()
+        }
+
+        /// A checkbox is on.
+        pub fn on(&self, key: &str) -> bool {
+            self.get(key) == Some("true")
+        }
+    }
 }
 
 /// The window's documents, the common cases of [`host::editors`].
@@ -530,7 +723,42 @@ pub mod storage {
 
 #[cfg(test)]
 mod tests {
+    use super::dialog::{Form, Values};
     use super::fill;
+    use super::host::dialogs::FieldKind;
+
+    #[test]
+    fn builds_a_form() {
+        let form = Form::new("Open Task", "Start")
+            .warning()
+            .message("TRACK-1")
+            .choice("status", "Move to", &[("1", "In Progress")], Some("1"))
+            .toggle("branch", "Create a branch", true)
+            .text("name", "Name", "TRACK-1-fix")
+            .code()
+            .enabled_by("branch")
+            .placeholder("branch")
+            .multiline("comment", "Comment", "")
+            .note("hint", "Local changes come along")
+            .error("No name");
+        let spec = form.spec();
+        assert_eq!(spec.fields.len(), 5);
+        assert_eq!(spec.error.as_deref(), Some("No name"));
+        let name = &spec.fields[2];
+        assert!(name.code);
+        assert_eq!(name.enabled_by.as_deref(), Some("branch"));
+        assert_eq!(name.placeholder.as_deref(), Some("branch"));
+        assert!(matches!(&spec.fields[0].kind, FieldKind::Choice((options, Some(value)))
+            if options[0].title == "In Progress" && value == "1"));
+        assert!(matches!(spec.fields[4].kind, FieldKind::Note(_)));
+        let values = Values::from(vec![
+            ("branch".to_string(), "true".to_string()),
+            ("name".to_string(), " TRACK-1-fix ".to_string()),
+        ]);
+        assert!(values.on("branch") && !values.on("name"));
+        assert_eq!(values.text("name"), "TRACK-1-fix");
+        assert_eq!(values.get("comment"), None);
+    }
 
     #[test]
     fn templates() {

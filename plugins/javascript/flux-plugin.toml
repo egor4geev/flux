@@ -4,7 +4,7 @@
 id = "flux.javascript"
 name = "JavaScript and TypeScript"
 version = "0.1.0"
-api = "0.2"
+api = "0.3"
 authors = ["Egor Ageev"]
 description = "JavaScript, TypeScript, JSX and TSX: highlighting, and the TypeScript language server with errors, completion, navigation and refactoring."
 repository = "https://github.com/egor4geev/flux"

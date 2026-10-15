@@ -205,8 +205,8 @@ pub(crate) fn is_essential(id: &str) -> bool {
 }
 
 /// The question before installing: who made the plugin and what it will be able to do. A plugin
-/// with a broad permission (any server, any program, terminals, a whole home folder) is asked
-/// about as a warning, and those lines are in the warning tone.
+/// with a broad permission (any server, any program, terminals, Claude Code sessions, a whole home
+/// folder) is asked about as a warning, and those lines are in the warning tone.
 pub(crate) fn install_question(candidate: &Candidate) -> Dialog {
     let entry = &candidate.entry;
     let manifest = &entry.manifest;
@@ -246,7 +246,8 @@ struct PermissionLine {
     icon: IconName,
     text: String,
     /// Broad — any server, any program (a shell counts: it runs any), terminals (typing in one runs
-    /// anything), the whole home folder or disk: drawn in the warning tone.
+    /// anything), Claude Code sessions (they run with the rights the user gave Claude), the whole
+    /// home folder or disk: drawn in the warning tone.
     broad: bool,
 }
 
@@ -275,7 +276,8 @@ const SHELLS: &[&str] = &[
 ];
 
 /// What the permissions let a plugin do, in plain words: the project's files, the network, the
-/// local server, programs, terminals, folders outside the project — a line each.
+/// local server, programs, terminals, Claude Code sessions, folders outside the project — a line
+/// each.
 fn permission_lines(permissions: &Permissions) -> Vec<PermissionLine> {
     let line = |icon, text: String, broad| PermissionLine { icon, text, broad };
     let mut lines = Vec::new();
@@ -333,6 +335,13 @@ fn permission_lines(permissions: &Permissions) -> Vec<PermissionLine> {
         lines.push(line(
             IconName::Terminal,
             tr("Open terminals and type commands into them").to_string(),
+            true,
+        ));
+    }
+    if permissions.claude {
+        lines.push(line(
+            IconName::Claude,
+            tr("Open Claude Code sessions with its own requests").to_string(),
             true,
         ));
     }
@@ -1969,10 +1978,10 @@ fn status_line(plugin: &Shown, ui: UiColors) -> (SharedString, Hsla) {
 /// Why a plugin can't run, in the interface language: the registry's reasons are English.
 fn unavailable_reason(entry: &PluginEntry, reason: &str) -> String {
     let manifest = &entry.manifest;
-    if manifest.api != flux_plugin::API_VERSION {
+    if !flux_plugin::supports_api(&manifest.api) {
         return trf(
-            "Built for plugin API {0}; this Flux has {1}",
-            &[&manifest.api, &flux_plugin::API_VERSION],
+            "Built for plugin API {0}; this Flux runs {1}",
+            &[&manifest.api, &flux_plugin::SUPPORTED_API_VERSIONS.join(", ")],
         );
     }
     match &manifest.wasm {
@@ -2463,11 +2472,15 @@ authors = ["Someone", "Another"]
     #[test]
     fn broad_permissions_are_marked() {
         assert_eq!(
-            lines("network = [\"api.github.com\", \"*\"]\nprocesses = [\"*\"]\nterminal = true"),
+            lines(
+                "network = [\"api.github.com\", \"*\"]\nprocesses = [\"*\"]\nterminal = true\n\
+                 claude = true"
+            ),
             [
                 ("Connect to any server on the internet".into(), true),
                 ("Run any program with your rights".into(), true),
                 ("Open terminals and type commands into them".into(), true),
+                ("Open Claude Code sessions with its own requests".into(), true),
             ]
         );
         // A shell runs anything; so does a whole home folder.

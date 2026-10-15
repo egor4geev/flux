@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 flux-plugin-api = { path = "../../crates/flux-plugin-api" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Plugins are small: Flux compiles the component when it loads it.

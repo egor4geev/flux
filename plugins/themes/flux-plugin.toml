@@ -4,7 +4,7 @@
 id = "flux.themes"
 name = "Flux Themes"
 version = "0.1.0"
-api = "0.2"
+api = "0.3"
 authors = ["Egor Ageev"]
 description = "Flux Night and Flux Day: the color themes of Flux, dark and light, on frosted glass."
 repository = "https://github.com/egor4geev/flux"

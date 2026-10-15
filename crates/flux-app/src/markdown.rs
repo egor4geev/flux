@@ -8,6 +8,10 @@
 //!
 //! The Claude chat (stage 9) draws Claude's answers with it too: GitHub-style tables, and code
 //! blocks with a copy button ([`render_copyable`]).
+//!
+//! Links click (part 10.3): a web link (`[text](https://…)`, `<https://…>`, a bare `https://…`)
+//! opens in the browser, with its address on hover; a plugin's link (`TRACK-142`) goes to its
+//! plugin, with its tooltip ([`crate::plugin_links`]).
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -26,6 +30,7 @@ use gpui::{
 
 use crate::display::{display_line, text_runs};
 use crate::theme::{self, Theme, UiColors};
+use crate::plugin_links::Target;
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +71,19 @@ pub enum Align {
 pub struct Span {
     pub text: String,
     pub style: SpanStyle,
+    /// A link's target (`[text](target)`, `<target>`): a web link opens when clicked.
+    pub target: Option<String>,
+}
+
+impl Span {
+    /// Text without markup.
+    pub fn plain(text: &str) -> Self {
+        Span {
+            text: text.to_string(),
+            style: SpanStyle::default(),
+            target: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,7 +91,7 @@ pub struct SpanStyle {
     pub code: bool,
     pub bold: bool,
     pub italic: bool,
-    /// Link text: drawn in the accent color, the target is not shown.
+    /// Link text: drawn in the accent color, the target is not shown (it is the span's `target`).
     pub link: bool,
 }
 
@@ -209,6 +227,7 @@ pub fn plain(text: &str) -> Vec<Block> {
             blocks.push(Block::Paragraph(vec![Span {
                 text: paragraph.join("\n"),
                 style: SpanStyle::default(),
+                target: None,
             }]));
             paragraph.clear();
         }
@@ -524,6 +543,7 @@ fn inline(chars: &[char], style: SpanStyle, spans: &mut Vec<Span>) {
                                 code: true,
                                 ..style
                             },
+                            target: None,
                         });
                         i = end + run;
                     }
@@ -556,14 +576,21 @@ fn inline(chars: &[char], style: SpanStyle, spans: &mut Vec<Span>) {
             '[' => match link(chars, i) {
                 Some((label, next)) => {
                     push_span(spans, &mut text, style);
+                    // The label's own spans, with the target: two links in a row don't merge.
+                    let mut label_spans = Vec::new();
                     inline(
-                        &chars[label],
+                        &chars[label.clone()],
                         SpanStyle {
                             link: true,
                             ..style
                         },
-                        spans,
+                        &mut label_spans,
                     );
+                    let target = link_target(chars, label.end, next);
+                    for span in &mut label_spans {
+                        span.target = target.clone();
+                    }
+                    spans.extend(label_spans);
                     i = next;
                 }
                 None => {
@@ -574,12 +601,14 @@ fn inline(chars: &[char], style: SpanStyle, spans: &mut Vec<Span>) {
             '<' => match autolink(chars, i) {
                 Some((url, next)) => {
                     push_span(spans, &mut text, style);
+                    let url: String = chars[url].iter().collect();
                     spans.push(Span {
-                        text: chars[url].iter().collect(),
+                        text: url.clone(),
                         style: SpanStyle {
                             link: true,
                             ..style
                         },
+                        target: Some(url),
                     });
                     i = next;
                 }
@@ -618,13 +647,27 @@ fn push_span(spans: &mut Vec<Span>, text: &mut String, style: SpanStyle) {
         return;
     }
     match spans.last_mut() {
-        Some(last) if last.style == style => last.text.push_str(text),
+        Some(last) if last.style == style && last.target.is_none() => last.text.push_str(text),
         _ => spans.push(Span {
             text: text.clone(),
             style,
+            target: None,
         }),
     }
     text.clear();
+}
+
+/// The target of a link whose label ends at `close` (its `]`) and which ends at `next`: what is in
+/// `(…)` — without a title (`"…"`) and `<…>` — or nothing for `[text][ref]` and `[`code`]`.
+fn link_target(chars: &[char], close: usize, next: usize) -> Option<String> {
+    if chars.get(close + 1) != Some(&'(') || next < close + 3 {
+        return None;
+    }
+    let inner: String = chars[close + 2..next - 1].iter().collect();
+    let inner = inner.trim();
+    let target = inner.split_whitespace().next().unwrap_or("");
+    let target = target.trim_start_matches('<').trim_end_matches('>');
+    (!target.is_empty()).then(|| target.to_string())
 }
 
 fn run_length(chars: &[char], start: usize, c: char) -> usize {
@@ -958,17 +1001,22 @@ fn render_blocks(
     let ui = theme.ui;
     // The chat's look (copyable blocks are Claude's text).
     let chat = copy.is_some();
+    let texts = TextIds(copy.clone());
     div()
         .flex()
         .flex_col()
         .gap_2()
         .children(blocks.iter().enumerate().map(|(index, block)| {
+            let text = |spans: &[Span], color: Hsla, weight: FontWeight| {
+                let (text, runs) = styled_parts(spans, color, ui, weight, chat, marks);
+                clickable(texts.id(index, 0), text, runs, spans, ui)
+            };
             match block {
                 Block::Paragraph(spans) => div()
-                    .child(styled(spans, color, ui, chat, marks))
+                    .child(text(spans, color, FontWeight::NORMAL))
                     .into_any_element(),
                 Block::Heading(spans) => div()
-                    .child(styled_with(spans, color, ui, FontWeight::SEMIBOLD, chat, marks))
+                    .child(text(spans, color, FontWeight::SEMIBOLD))
                     .into_any_element(),
                 Block::Item {
                     depth,
@@ -979,13 +1027,13 @@ fn render_blocks(
                     .gap_1p5()
                     .pl(px(*depth as f32 * 14.))
                     .child(div().flex_none().text_color(ui.dim).child(marker.clone()))
-                    .child(div().flex_1().min_w_0().child(styled(spans, color, ui, chat, marks)))
+                    .child(div().flex_1().min_w_0().child(text(spans, color, FontWeight::NORMAL)))
                     .into_any_element(),
                 Block::Quote(spans) => div()
                     .pl_2()
                     .border_l_2()
                     .border_color(ui.divider)
-                    .child(styled(spans, ui.text_muted, ui, chat, marks))
+                    .child(text(spans, ui.text_muted, FontWeight::NORMAL))
                     .into_any_element(),
                 Block::Code(code) => match &copy {
                     Some(prefix) => chat_code_block(
@@ -997,10 +1045,65 @@ fn render_blocks(
                     None => code_block(code, theme),
                 },
                 Block::Rule => ui::divider(ui).into_any_element(),
-                Block::Table(table) => render_table(table, color, ui, chat, marks),
+                Block::Table(table) => render_table(table, color, ui, chat, marks, &texts, index),
             }
         }))
         .into_any_element()
+}
+
+/// The ids of a render's clickable texts: by the block and the cell, under the chat's prefix.
+struct TextIds(Option<gpui::SharedString>);
+
+impl TextIds {
+    fn id(&self, block: usize, cell: usize) -> ElementId {
+        let prefix = match &self.0 {
+            Some(prefix) => gpui::SharedString::from(format!("{prefix}-text")),
+            None => gpui::SharedString::new_static("markdown-text"),
+        };
+        ElementId::NamedInteger(prefix, ((block as u64) << 16) | cell as u64)
+    }
+}
+
+/// Text whose links click: the spans' web links and bare `https://…` addresses (outside code)
+/// open in the browser, the plugins' links go to their plugins.
+fn clickable(
+    id: ElementId,
+    text: String,
+    runs: Vec<TextRun>,
+    spans: &[Span],
+    ui: UiColors,
+) -> AnyElement {
+    let mut targets = Vec::new();
+    let mut code = Vec::new();
+    let mut start = 0;
+    for span in spans.iter().filter(|span| !span.text.is_empty()) {
+        let range = start..start + span.text.len();
+        start = range.end;
+        if let Some(url) = span.target.as_ref().filter(|url| is_web_link(url)) {
+            targets.push((range, Target::Url(url.clone())));
+        } else if span.style.code || span.style.link {
+            code.push(range);
+        } else {
+            for found in crate::plugin_links::web_links(&span.text) {
+                let url = span.text[found.clone()].to_string();
+                targets.push((range.start + found.start..range.start + found.end, Target::Url(url)));
+            }
+        }
+    }
+    let taken: Vec<Range<usize>> = targets
+        .iter()
+        .map(|(range, _)| range.clone())
+        .chain(code)
+        .collect();
+    targets.extend(crate::plugin_links::plugin_targets(&text, &taken));
+    targets.sort_by_key(|(range, _)| range.start);
+    crate::plugin_links::clickable_text(id, text.into(), runs, targets, ui.accent_text)
+}
+
+/// A target the browser opens.
+fn is_web_link(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")
 }
 
 /// A table: a header row on a tinted background, rows between thin lines, columns of equal share
@@ -1011,8 +1114,11 @@ fn render_table(
     ui: UiColors,
     chat: bool,
     marks: Option<&Marks>,
+    texts: &TextIds,
+    block: usize,
 ) -> AnyElement {
-    let row = |cells: &[Vec<Span>], header: bool| {
+    let columns = table.align.len().max(1);
+    let row = |row_index: usize, cells: &[Vec<Span>], header: bool| {
         div()
             .flex()
             .when(header, |row| row.bg(UiColors::tint(ui.foreground, 0.05)))
@@ -1032,10 +1138,15 @@ fn render_table(
                         Align::Center => cell.justify_center(),
                         Align::Right => cell.justify_end(),
                     })
-                    .child(if header {
-                        styled_with(spans, color, ui, FontWeight::SEMIBOLD, chat, marks)
-                    } else {
-                        styled(spans, color, ui, chat, marks)
+                    .child({
+                        let weight = if header {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::NORMAL
+                        };
+                        let (text, runs) = styled_parts(spans, color, ui, weight, chat, marks);
+                        let id = texts.id(block, 1 + row_index * columns + column);
+                        clickable(id, text, runs, spans, ui)
                     })
             }))
     };
@@ -1046,13 +1157,12 @@ fn render_table(
         .border_1()
         .border_color(ui.divider)
         .overflow_hidden()
-        .child(row(&table.header, true))
-        .children(
-            table
-                .rows
-                .iter()
-                .map(|cells| row(cells, false).border_t_1().border_color(ui.divider)),
-        )
+        .child(row(0, &table.header, true))
+        .children(table.rows.iter().enumerate().map(|(index, cells)| {
+            row(index + 1, cells, false)
+                .border_t_1()
+                .border_color(ui.divider)
+        }))
         .into_any_element()
 }
 
@@ -1110,25 +1220,16 @@ fn chat_code_block(
         .into_any_element()
 }
 
-fn styled(
-    spans: &[Span],
-    color: Hsla,
-    ui: UiColors,
-    chat: bool,
-    marks: Option<&Marks>,
-) -> StyledText {
-    styled_with(spans, color, ui, FontWeight::NORMAL, chat, marks)
-}
-
-/// Spans as styled text; in the chat (`chat`), inline code is a lighter, accent-tinted pill.
-fn styled_with(
+/// Spans as the text and the runs of styled text; in the chat (`chat`), inline code is a lighter,
+/// accent-tinted pill.
+fn styled_parts(
     spans: &[Span],
     color: Hsla,
     ui: UiColors,
     weight: FontWeight,
     chat: bool,
     marks: Option<&Marks>,
-) -> StyledText {
+) -> (String, Vec<TextRun>) {
     let mut text = String::new();
     let mut runs = Vec::with_capacity(spans.len());
     for span in spans.iter().filter(|span| !span.text.is_empty()) {
@@ -1167,7 +1268,7 @@ fn styled_with(
         Some(marks) => marks.mark(&text, runs),
         None => runs,
     };
-    StyledText::new(text).with_runs(runs)
+    (text, runs)
 }
 
 fn code_block(code: &CodeBlock, theme: &Theme) -> AnyElement {
@@ -1230,6 +1331,7 @@ mod tests {
         Span {
             text: text.to_string(),
             style,
+            target: None,
         }
     }
 
@@ -1351,6 +1453,12 @@ mod tests {
         let spans = parse_inline("see [the docs](https://x.y/(a)) and <https://x.y> or [ref][1]");
         assert_eq!(text(&spans), "see the docs and https://x.y or ref");
         assert!(spans.iter().filter(|s| s.style.link).count() == 3);
+        // Their targets, for a click (part 10.3).
+        let targets: Vec<_> = spans.iter().filter_map(|s| s.target.as_deref()).collect();
+        assert_eq!(targets, vec!["https://x.y/(a)", "https://x.y"]);
+        let spans = parse_inline("[a](https://a.b \"Title\")[b](<https://c.d>)");
+        let targets: Vec<_> = spans.iter().map(|s| s.target.as_deref()).collect();
+        assert_eq!(targets, vec![Some("https://a.b"), Some("https://c.d")]);
         // Plain brackets are not links; brackets around code are (rustdoc).
         assert_eq!(text(&parse_inline("[1, 2] [`Vec`]")), "[1, 2] Vec");
         assert_eq!(text(&parse_inline("a<br>b <T>")), "a\nb <T>");

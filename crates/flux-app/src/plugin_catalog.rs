@@ -1147,8 +1147,8 @@ impl PluginCatalog {
                 )),
                 Offer::Incompatible => items.push(note(
                     trf(
-                        "Built for plugin API {0}; this Flux has {1}",
-                        &[&entry.api, &flux_plugin::API_VERSION],
+                        "Built for plugin API {0}; this Flux runs {1}",
+                        &[&entry.api, &flux_plugin::SUPPORTED_API_VERSIONS.join(", ")],
                     ),
                     ui.warning,
                 )),

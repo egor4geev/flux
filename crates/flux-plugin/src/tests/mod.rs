@@ -2,6 +2,10 @@
 //! `wasm32-wasip2` by the first test that needs it (a test is skipped, with a note, when it can't
 //! be built). Everything the plugins write goes into a temporary folder of this run.
 
+/// The API 0.3's new calls (part 10.3).
+mod api03;
+/// Plugins built for the API 0.2 (part 10.3).
+mod compat;
 /// Requests and the plugin's server (part 8.2, agent A).
 mod net;
 /// Programs, timers, secrets, folders, the time limit (part 8.2, agent F).
@@ -87,7 +91,38 @@ fn probe(id: &str, project: &str) -> Option<PluginEntry> {
 /// The probe with `permissions` (the lines of `[permissions]`) and more commands (`net:…`,
 /// `proc:…`).
 fn probe_with(id: &str, permissions: &str, more_commands: &[&str]) -> Option<PluginEntry> {
+    probe_manifest(id, permissions, more_commands, "")
+}
+
+/// The probe with `extra` at the end of its manifest: tool windows, status bar items, settings
+/// (part 10.3).
+fn probe_manifest(
+    id: &str,
+    permissions: &str,
+    more_commands: &[&str],
+    extra: &str,
+) -> Option<PluginEntry> {
     let wasm = probe_wasm()?;
+    Some(plugin_folder(
+        id,
+        crate::API_VERSION,
+        wasm,
+        permissions,
+        more_commands,
+        extra,
+    ))
+}
+
+/// A plugin folder: the component `wasm`, a manifest for the API `api` with `permissions`, the
+/// probe's commands and more, a `greeting` setting and `extra`; a Russian table.
+fn plugin_folder(
+    id: &str,
+    api: &str,
+    wasm: &[u8],
+    permissions: &str,
+    more_commands: &[&str],
+    extra: &str,
+) -> PluginEntry {
     let dir = temp_dir(id);
     let commands = [
         "context",
@@ -110,16 +145,16 @@ fn probe_with(id: &str, permissions: &str, more_commands: &[&str]) -> Option<Plu
     .collect::<Vec<_>>()
     .join("\n");
     let manifest = format!(
-        "id = \"{id}\"\nname = \"Probe\"\nversion = \"0.1.0\"\napi = \"0.2\"\nwasm = \
+        "id = \"{id}\"\nname = \"Probe\"\nversion = \"0.1.0\"\napi = \"{api}\"\nwasm = \
          \"probe.wasm\"\n\n[permissions]\n{permissions}\n\n{commands}\n\
          [[settings]]\nkey = \"greeting\"\ntitle = \"Greeting\"\ntype = \"string\"\ndefault = \
-         \"hello from the manifest\"\n"
+         \"hello from the manifest\"\n\n{extra}\n"
     );
     std::fs::write(dir.join("flux-plugin.toml"), manifest).unwrap();
     std::fs::write(dir.join("probe.wasm"), wasm).unwrap();
     std::fs::create_dir_all(dir.join("locales")).unwrap();
     std::fs::write(dir.join("locales/ru.toml"), "\"Hello\" = \"Привет\"\n").unwrap();
-    Some(load_dir(&dir, PluginSource::Installed).unwrap())
+    load_dir(&dir, PluginSource::Installed).unwrap()
 }
 
 /// The context of a command run from the palette, with no document.
@@ -129,6 +164,7 @@ fn palette() -> crate::api::types::CommandContext {
         editor: None,
         selections: Vec::new(),
         paths: Vec::new(),
+        argument: None,
     }
 }
 
@@ -416,7 +452,7 @@ fn a_plugin_without_code_starts_and_ignores_calls() {
     let dir = temp_dir("declarative");
     std::fs::write(
         dir.join("flux-plugin.toml"),
-        "id = \"test.theme\"\nname = \"Theme\"\nversion = \"1.0.0\"\napi = \"0.2\"\n",
+        "id = \"test.theme\"\nname = \"Theme\"\nversion = \"1.0.0\"\napi = \"0.3\"\n",
     )
     .unwrap();
     let entry = load_dir(&dir, PluginSource::Installed).unwrap();

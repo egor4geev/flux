@@ -412,11 +412,24 @@ impl ClaudeStore {
     /// Starts a session in the project root (the home folder without a project) with the defaults
     /// of the settings; `None` while `claude` isn't ready.
     pub fn new_session(&mut self, cx: &mut Context<Self>) -> Option<Entity<ClaudeSession>> {
+        self.new_session_in_mode(None, cx)
+    }
+
+    /// [`Self::new_session`] in `mode` rather than the settings' (part 10.3: a plugin's "Plan with
+    /// Claude" starts in plan mode).
+    pub fn new_session_in_mode(
+        &mut self,
+        mode: Option<flux_claude::PermissionMode>,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ClaudeSession>> {
         let CliState::Ready { cli, .. } = &self.cli else {
             return None;
         };
         let cli = cli.clone();
-        let options = self.launch_options(cx);
+        let mut options = self.launch_options(cx);
+        if mode.is_some() {
+            options.permission_mode = mode;
+        }
         let session = cx.new(|cx| ClaudeSession::new(cli, options, cx));
         self.add(session.clone(), cx);
         Some(session)
@@ -486,6 +499,32 @@ impl ClaudeStore {
         let session = self.resumed_session(saved, cx)?;
         self.add(session.clone(), cx);
         Some(session)
+    }
+
+    /// A saved session back in the editor's tabs, where a context keeps it (part 10.3): as the
+    /// sessions a project reopens with — its process starts once its chat is shown. An open one
+    /// stays where it is. False while `claude` isn't ready.
+    pub(crate) fn reopen(
+        &mut self,
+        saved: &SavedSession,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.open_session(&saved.id, cx).is_some() {
+            return true;
+        }
+        let Some(session) = self.resumed_session(saved, cx) else {
+            return false;
+        };
+        self.track(session.clone(), cx);
+        cx.emit(ClaudeStoreEvent::SessionRestored {
+            session,
+            place: SessionPlace::Editor,
+            active,
+        });
+        cx.emit(ClaudeStoreEvent::Changed);
+        cx.notify();
+        true
     }
 
     /// The open session with this id.

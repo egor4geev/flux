@@ -11,12 +11,15 @@
 //! hop by hop, so that each one goes through the permission check; credentials don't follow a
 //! redirect to another host. A cancel reaches a blocked read within [`SLICE`]: the connection is
 //! read in slices that look at the request's cancel flag ([`Cancellable`]).
+//!
+//! Tests and UI scenarios send a plugin's requests to a fake service: `FLUX_PLUGIN_HTTP_OVERRIDE`
+//! ([`overridden`]). The plugin and the permission check see the URL it asked for.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ureq::http::{HeaderName, HeaderValue, Method, Request, Response};
@@ -329,6 +332,8 @@ fn call(
                 "More than {MAX_REDIRECTS} redirects"
             ))));
         }
+        // A fake service's own address in a redirect stands for the service's.
+        let location = original_location(&location);
         let next = hop.url.join(&location).map_err(|err| {
             Failure::Api(http::HttpError::Invalid(format!(
                 "Not a URL to redirect to: \"{location}\" ({err})"
@@ -372,9 +377,10 @@ fn send(
     left: Duration,
     streaming: bool,
 ) -> Result<Response<Body>, ureq::Error> {
+    let target = overridden(&hop.url);
     let mut builder = Request::builder()
         .method(hop.method.clone())
-        .uri(hop.url.as_str());
+        .uri(target.as_ref().unwrap_or(&hop.url).as_str());
     for (name, value) in &hop.headers {
         builder = builder.header(name, value);
     }
@@ -496,11 +502,20 @@ impl Stream {
 struct Line {
     method: String,
     url: String,
+    /// Where `FLUX_PLUGIN_HTTP_OVERRIDE` sends it instead: the replacement.
+    via: Option<String>,
 }
 
 impl Line {
     fn of(request: &http::Request) -> Self {
-        let url = match Url::parse(request.url.trim()) {
+        let parsed = Url::parse(request.url.trim());
+        let via = parsed.as_ref().ok().and_then(|url| {
+            overrides()
+                .into_iter()
+                .find(|(from, _)| matches_prefix(url.as_str(), from))
+                .map(|(_, to)| to)
+        });
+        let url = match parsed {
             Ok(mut url) => {
                 url.set_query(None);
                 url.set_fragment(None);
@@ -513,6 +528,7 @@ impl Line {
         Line {
             method: request.method.trim().to_ascii_uppercase(),
             url,
+            via,
         }
     }
 
@@ -534,7 +550,17 @@ impl Line {
         if let Some(error) = error {
             parts.push(describe(error));
         }
-        let mut text = format!("{} {} → {}", self.method, self.url, parts.join(", "));
+        let via = self
+            .via
+            .as_ref()
+            .map(|via| format!(" (override: {via})"))
+            .unwrap_or_default();
+        let mut text = format!(
+            "{} {}{via} → {}",
+            self.method,
+            self.url,
+            parts.join(", ")
+        );
         let failed = !matches!(error, None | Some(http::HttpError::Cancelled));
         let level = if failed || status.is_some_and(|status| status >= 400) {
             Level::Warn
@@ -573,6 +599,69 @@ fn bytes(size: usize) -> String {
 }
 
 // --- The client ---
+
+/// The fake services of tests and UI scenarios: `FLUX_PLUGIN_HTTP_OVERRIDE` — comma-separated
+/// `<prefix>=<replacement>` pairs (`https://api.tracker.yandex.net=http://127.0.0.1:8765`); a
+/// request whose URL starts with a prefix goes to the replacement with the rest of the URL. Read
+/// once, from the environment only (a plugin can't set it).
+fn overrides() -> Vec<(String, String)> {
+    static FROM_ENV: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    #[allow(unused_mut)]
+    let mut list = FROM_ENV
+        .get_or_init(|| {
+            parse_overrides(&std::env::var("FLUX_PLUGIN_HTTP_OVERRIDE").unwrap_or_default())
+        })
+        .clone();
+    #[cfg(test)]
+    list.extend(test_overrides().lock().unwrap().iter().cloned());
+    list
+}
+
+/// More overrides for tests: the environment of a test run can't change safely.
+#[cfg(test)]
+pub(crate) fn test_overrides() -> &'static Mutex<Vec<(String, String)>> {
+    static OVERRIDES: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+    OVERRIDES.get_or_init(Default::default)
+}
+
+fn parse_overrides(text: &str) -> Vec<(String, String)> {
+    text.split(',')
+        .filter_map(|pair| {
+            let (from, to) = pair.split_once('=')?;
+            let from = from.trim().trim_end_matches('/');
+            let to = to.trim().trim_end_matches('/');
+            (!from.is_empty() && !to.is_empty()).then(|| (from.to_string(), to.to_string()))
+        })
+        .collect()
+}
+
+/// `url` starts with `prefix` at a boundary: "https://a.b" is a prefix of "https://a.b/x", not
+/// of "https://a.bc".
+fn matches_prefix(url: &str, prefix: &str) -> bool {
+    url.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '?', '#', ':']))
+}
+
+/// Where a request really goes when an override covers its URL.
+fn overridden(url: &Url) -> Option<Url> {
+    let text = url.as_str();
+    overrides().into_iter().find_map(|(from, to)| {
+        if !matches_prefix(text, &from) {
+            return None;
+        }
+        Url::parse(&format!("{to}{}", &text[from.len()..])).ok()
+    })
+}
+
+/// A redirect to a replacement's own address is a redirect to its prefix's: the permission check
+/// sees the service the plugin asked for.
+fn original_location(location: &str) -> String {
+    overrides()
+        .into_iter()
+        .find(|(_, to)| matches_prefix(location, to))
+        .map(|(from, to)| format!("{from}{}", &location[to.len()..]))
+        .unwrap_or_else(|| location.to_string())
+}
 
 /// A client of one plugin: redirects are followed by [`call`], statuses are responses, any
 /// method goes (WebDAV's PROPFIND), the system's certificates, connections read in slices
@@ -710,6 +799,47 @@ mod tests {
         let line = Line::of(&request);
         assert_eq!(line.method, "GET");
         assert_eq!(line.url, "https://api.example.com/v1/issues");
+    }
+
+    #[test]
+    fn overrides_send_a_service_elsewhere() {
+        assert_eq!(
+            parse_overrides(" https://a.b/ = http://127.0.0.1:1 ,bad, =x"),
+            vec![("https://a.b".to_string(), "http://127.0.0.1:1".to_string())]
+        );
+        assert!(matches_prefix("https://a.b/x", "https://a.b"));
+        assert!(matches_prefix("https://a.b", "https://a.b"));
+        assert!(!matches_prefix("https://a.bc/x", "https://a.b"));
+        test_overrides()
+            .lock()
+            .unwrap()
+            .push(("https://unit.flux.test".into(), "http://127.0.0.1:9".into()));
+        let url = Url::parse("https://unit.flux.test/v3/x?q=1").unwrap();
+        assert_eq!(
+            overridden(&url).unwrap().as_str(),
+            "http://127.0.0.1:9/v3/x?q=1"
+        );
+        assert!(overridden(&Url::parse("https://other.flux.test/").unwrap()).is_none());
+        assert_eq!(
+            original_location("http://127.0.0.1:9/next"),
+            "https://unit.flux.test/next"
+        );
+        assert_eq!(original_location("/next"), "/next");
+        assert_eq!(
+            original_location("http://127.0.0.1:90/next"),
+            "http://127.0.0.1:90/next"
+        );
+        let request = http::Request {
+            method: "GET".into(),
+            url: "https://unit.flux.test/v3/myself?x=1".into(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: None,
+            follow_redirects: true,
+        };
+        let line = Line::of(&request);
+        assert_eq!(line.url, "https://unit.flux.test/v3/myself");
+        assert_eq!(line.via.as_deref(), Some("http://127.0.0.1:9"));
     }
 
     #[test]

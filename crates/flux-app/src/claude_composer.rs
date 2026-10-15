@@ -34,7 +34,9 @@ use gpui::{
     canvas, deferred, div, img, point, prelude::*, px,
 };
 
-use crate::claude_session::{ClaudeSession, EditPoint, SessionEvent};
+use crate::claude_session::{
+    Attachment, ClaudeSession, EditPoint, SessionEvent, with_attachments,
+};
 use crate::context_menu::ContextMenu;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, file_icon, icon};
@@ -419,6 +421,8 @@ pub struct Composer {
     editor_context: Option<EditorContext>,
     /// The chip was removed (or sent) for this context; it comes back when the context changes.
     context_hidden: bool,
+    /// What a plugin gave the session (part 10.3): chips, their text before the next message.
+    attachments: Vec<Attachment>,
     images: Vec<Arc<Image>>,
     /// Why a picture wasn't attached; goes with the next change.
     notice: Option<SharedString>,
@@ -452,7 +456,7 @@ struct Editing {
 }
 
 impl Composer {
-    pub fn new(session: Entity<ClaudeSession>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(session: Entity<ClaudeSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             PromptInput::new(tr("Ask Claude… @ for files, / for commands"), cx).max_rows(MESSAGE_ROWS)
         });
@@ -479,12 +483,24 @@ impl Composer {
         ];
         // The meter shows what the conversation starts with (the system prompt, the tools).
         session.update(cx, |session, cx| session.refresh_context(cx));
+        // A plugin's session starts with its context and text, the field taking the keyboard
+        // (part 10.3).
+        let draft = session.update(cx, |session, _| session.take_draft());
+        let mut attachments = Vec::new();
+        if let Some(draft) = draft {
+            attachments = draft.attachments;
+            if let Some(prompt) = draft.prompt {
+                input.update(cx, |input, cx| input.set_text(&prompt, cx));
+            }
+            window.focus(&input.focus_handle(cx));
+        }
         #[allow(unused_mut)]
         let mut composer = Self {
             session,
             input,
             editor_context: None,
             context_hidden: false,
+            attachments,
             images: Vec::new(),
             notice: None,
             suggestions: None,
@@ -729,7 +745,7 @@ impl Composer {
             cx.notify();
             return;
         }
-        if body.is_empty() && self.images.is_empty() {
+        if body.is_empty() && self.images.is_empty() && self.attachments.is_empty() {
             return;
         }
         // `/resume` is Flux's: the project's saved sessions in the history popup.
@@ -749,6 +765,11 @@ impl Composer {
             message.push(' ');
         }
         message.push_str(body);
+        // A plugin's attachments go first (part 10.3); a slash command keeps them for later.
+        let attach = !self.attachments.is_empty() && !body.starts_with('/');
+        if attach {
+            message = with_attachments(&self.attachments, &message);
+        }
         let images = self
             .images
             .iter()
@@ -790,6 +811,9 @@ impl Composer {
         }
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.images.clear();
+        if attach {
+            self.attachments.clear();
+        }
         self.context_hidden = true;
         self.notice = None;
         self.close_suggestions(cx);
@@ -1244,9 +1268,48 @@ impl Composer {
 
     fn render_chips(&self, ui: UiColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         let context = self.shown_context().cloned();
-        if context.is_none() && self.images.is_empty() && self.notice.is_none() {
+        if context.is_none()
+            && self.attachments.is_empty()
+            && self.images.is_empty()
+            && self.notice.is_none()
+        {
             return None;
         }
+        // A plugin's attachment (part 10.3): its label; the whole text in the tooltip's place is
+        // too long — the tooltip says it goes along.
+        let attachment_chips = self.attachments.iter().enumerate().map(|(index, attachment)| {
+            div()
+                .id(("claude-attachment-chip", index))
+                .h(px(24.))
+                .pl(px(6.))
+                .pr(px(2.))
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .rounded(px(RADIUS_SM))
+                .bg(ui.hover)
+                .border_1()
+                .border_color(ui.input_border)
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.foreground)
+                .tooltip(ui::tooltip(
+                    trf("{0} goes with the message", &[&attachment.label]),
+                    None,
+                ))
+                .child(icon(IconName::Paperclip, ui.text_muted).size(px(13.)))
+                .child(div().whitespace_nowrap().child(attachment.label.clone()))
+                .child(
+                    ui::icon_button(("claude-attachment-remove", index), IconName::Close, ui)
+                        .size(px(18.))
+                        .tooltip(ui::tooltip(tr("Remove"), None))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            if index < this.attachments.len() {
+                                this.attachments.remove(index);
+                            }
+                            cx.notify();
+                        })),
+                )
+        });
         let context_chip = context.map(|context| {
             let file = file_icon(&context.path, &ui);
             div()
@@ -1326,6 +1389,7 @@ impl Composer {
                 .flex_wrap()
                 .items_center()
                 .gap(px(6.))
+                .children(attachment_chips)
                 .children(context_chip)
                 .children(thumbnails)
                 .children(self.notice.clone().map(|notice| {

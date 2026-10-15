@@ -66,8 +66,13 @@ mod notifications_panel;
 mod picker;
 mod plugin_calls;
 mod plugin_catalog;
+mod plugin_claude;
+mod plugin_form;
+mod plugin_git;
+mod plugin_links;
 mod plugin_manager;
 mod plugin_menus;
+mod plugin_picker;
 mod plugin_review;
 mod plugin_settings;
 mod plugin_suggestions;
@@ -91,6 +96,7 @@ mod settings_view;
 mod start_screen;
 mod stash_panel;
 mod system_notify;
+mod task_contexts;
 mod terminal_element;
 mod terminal_group;
 mod terminal_links;
@@ -121,6 +127,17 @@ fn main() {
             std::env::temp_dir().join(format!("flux-scenario-plugins-{}", std::process::id()));
         // SAFETY: nothing else runs yet: no thread reads the environment.
         unsafe { std::env::set_var("FLUX_PLUGINS_HOME", home) };
+    }
+    // Nor the user's keychain: plugins' secrets go to a file in the plugins' folder (a rebuilt
+    // unsigned Flux isn't on a keychain item's access list — macOS would ask the user).
+    #[cfg(feature = "scenario")]
+    if std::env::var_os("FLUX_SCENARIO").is_some()
+        && std::env::var_os("FLUX_PLUGIN_SECRETS_FILE").is_none()
+        && let Some(home) = std::env::var_os("FLUX_PLUGINS_HOME")
+    {
+        let file = PathBuf::from(home).join("secrets.json");
+        // SAFETY: as above.
+        unsafe { std::env::set_var("FLUX_PLUGIN_SECRETS_FILE", file) };
     }
     // `flux [paths...]`: a directory among the arguments is the project root; files go into tabs.
     // Paths are absolute: tabs are compared by path, and files with the same name are told apart by
@@ -205,6 +222,7 @@ fn main() {
             prompt_input::init(cx);
             plugin_manager::init(cx);
             plugin_settings::init(cx);
+            task_contexts::init(cx);
 
             // The project of the command line, or the projects open when Flux quit (part 10.1).
             let _window = workspace::open_startup_windows(root, paths, cx)

@@ -91,7 +91,8 @@ pub fn actions(root: Div, cx: &mut Context<Workspace>) -> Div {
         }))
 }
 
-/// From `Editor::on_mouse_down`: cmd-click on a word goes to its definition. `true` if handled.
+/// From `Editor::on_mouse_down`: cmd-click on a plugin's link goes to its plugin, on a word — to
+/// its definition. `true` if handled.
 pub fn cmd_click(
     editor: &mut Editor,
     event: &MouseDownEvent,
@@ -115,6 +116,16 @@ pub fn cmd_click(
     else {
         return false;
     };
+    // A plugin's link (part 10.3, `TRACK-142`) goes to its plugin.
+    if let Some((_, link)) = crate::hover::plugin_link_at(editor, position) {
+        let store = editor
+            .plugins
+            .as_ref()
+            .map(|store| store.entity_id())
+            .or_else(|| crate::plugin_links::store_of(window, cx));
+        crate::plugin_links::activate(&link, store, cx);
+        return true;
+    }
     // Away from words (spaces, punctuation, past the end of a line) it is an ordinary click.
     let Some(word) = word_at(text, position) else {
         return false;

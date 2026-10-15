@@ -8,7 +8,9 @@
 //! movement, the editor losing focus, or Esc hide any popup; F1 again hides the one it showed.
 //!
 //! With ⌘ held, the word under the mouse is drawn as a link (underline, pointing hand): ⌘-click
-//! goes to its definition (`navigation::cmd_click`).
+//! goes to its definition (`navigation::cmd_click`). A plugin's link (part 10.3, `TRACK-142`) comes
+//! before the word: ⌘-click goes to its plugin, and the popup over it starts with the plugin's
+//! tooltip ([`crate::plugin_links`]).
 
 use std::ops::Range;
 use std::time::Duration;
@@ -33,6 +35,7 @@ use crate::editor::Editor;
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
 use crate::markdown::{self, Block, CodeBlock};
+use crate::plugin_links;
 use crate::popup::{self, POPUP_GAP, Side, WINDOW_MARGIN};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
@@ -49,7 +52,7 @@ const MIN_ROOM_ABOVE: f32 = 160.;
 /// shifted left by it, so the text lines up with the symbol.
 const TEXT_INSET: f32 = 13.;
 
-actions!(editor, [ShowHover]);
+actions!(editor, [ShowHover, OpenLinkAtCaret]);
 actions!(hover, [HideHover]);
 
 pub fn init(cx: &mut App) {
@@ -74,6 +77,8 @@ pub struct HoverState {
     next_id: usize,
     /// ⌘ is held over this word: it is drawn as a link.
     link: Option<Range<usize>>,
+    /// The plugin's link `link` is (part 10.3).
+    plugin_link: Option<plugin_links::Link>,
 }
 
 struct Pending {
@@ -98,6 +103,10 @@ struct Popup {
     blocks: Vec<Block>,
     /// The hover request in flight.
     request: Option<Task<()>>,
+    /// The tooltip of the plugin's link at the symbol, first in the popup.
+    link_blocks: Vec<Block>,
+    /// The link's plugin hasn't answered yet.
+    link_waiting: bool,
 }
 
 /// From `Editor::text_changed`: an edit hides everything and cancels the waiting.
@@ -107,6 +116,7 @@ pub fn text_changed(editor: &mut Editor) {
     hover.popup = None;
     hover.hide_task = None;
     hover.link = None;
+    hover.plugin_link = None;
 }
 
 /// From `Editor::on_mouse_move`: a pause over a symbol shows its popup; leaving the symbol of the
@@ -129,7 +139,9 @@ pub fn mouse_moved(editor: &mut Editor, event: &MouseMoveEvent, cx: &mut Context
         }
         schedule_hide(editor, cx);
     }
-    let Some((position, range)) = position.and_then(|p| Some((p, symbol_range(editor, p)?))) else {
+    let Some((position, range)) =
+        position.and_then(|p| Some((p, hover_range(editor, p)?)))
+    else {
         editor.hover.pending = None;
         return;
     };
@@ -169,6 +181,9 @@ pub fn actions(root: Div, editor: &Editor, cx: &mut Context<Editor>) -> Div {
         update_link(editor, event.modifiers, cx)
     }))
     .on_action(cx.listener(|editor, _: &ShowHover, _, cx| show_at_cursor(editor, cx)))
+    .on_action(cx.listener(|editor, _: &OpenLinkAtCaret, window, cx| {
+        open_link_at_caret(editor, window, cx)
+    }))
     .when(editor.hover.popup.is_some(), |root| {
         root.on_action(cx.listener(|editor, _: &HideHover, _, cx| {
             if editor.hover.popup.take().is_some() {
@@ -200,7 +215,10 @@ fn show_at_cursor(editor: &mut Editor, cx: &mut Context<Editor>) {
         cx.notify();
         return;
     }
-    let range = if is_word(position) {
+    // A plugin's link is the symbol whole (`TRACK-142`, not `142`).
+    let range = if let Some((range, _)) = plugin_link_at(editor, position) {
+        range
+    } else if is_word(position) {
         let word = movement::word_range_at(text, position);
         word.from()..word.to()
     } else {
@@ -240,6 +258,8 @@ pub fn show_problem(editor: &mut Editor, position: usize, cx: &mut Context<Edito
         diagnostics,
         blocks: Vec::new(),
         request: None,
+        link_blocks: Vec::new(),
+        link_waiting: false,
     });
     cx.notify();
 }
@@ -262,7 +282,8 @@ fn show(
     let id = editor.hover.next_id;
     editor.hover.next_id += 1;
     let request = request(editor, position, id, cx);
-    if request.is_none() && diagnostics.is_empty() {
+    let link_waiting = request_link_tooltip(editor, position, id, cx);
+    if request.is_none() && diagnostics.is_empty() && !link_waiting {
         editor.hover.popup = None;
         if trigger == Trigger::Keyboard {
             editor.show_status(tr("No documentation").into(), cx);
@@ -278,6 +299,8 @@ fn show(
         diagnostics,
         blocks: Vec::new(),
         request,
+        link_blocks: Vec::new(),
+        link_waiting,
     });
     hover.hide_task = None;
     hover.over_popup = false;
@@ -348,18 +371,66 @@ fn received(
     };
     popup.request = None;
     popup.blocks = blocks;
-    // The server knows the symbol better than our word boundaries (`r#type`, `a::b`).
-    if let Some(range) =
-        range.filter(|range| !range.is_empty() && range.contains(&popup.range.start))
-    {
+    // The server knows the symbol better than our word boundaries (`r#type`, `a::b`); a plugin's
+    // link keeps its own.
+    if let Some(range) = range.filter(|range| {
+        !range.is_empty() && range.contains(&popup.range.start) && !popup.link_waiting
+            && popup.link_blocks.is_empty()
+    }) {
         popup.range = range;
     }
-    if popup.blocks.is_empty() && popup.diagnostics.is_empty() {
+    if popup.blocks.is_empty()
+        && popup.diagnostics.is_empty()
+        && popup.link_blocks.is_empty()
+        && !popup.link_waiting
+    {
         let keyboard = popup.trigger == Trigger::Keyboard;
         editor.hover.popup = None;
         if keyboard {
             editor.show_status(tr("No documentation").into(), cx);
         }
+    }
+    cx.notify();
+}
+
+/// Asks the plugin of the link at `position` (one with tooltips) for its tooltip: it goes to the
+/// popup `id` when it comes. True while it is awaited.
+fn request_link_tooltip(
+    editor: &Editor,
+    position: usize,
+    id: usize,
+    cx: &mut Context<Editor>,
+) -> bool {
+    let Some((_, link)) = plugin_link_at(editor, position) else {
+        return false;
+    };
+    let store = editor.plugins.as_ref().map(|store| store.entity_id());
+    let entity = cx.entity().downgrade();
+    plugin_links::request_tooltip(&link, store, cx, move |markdown, cx| {
+        entity
+            .update(cx, |editor, cx| link_received(editor, id, markdown, cx))
+            .ok();
+    })
+}
+
+/// The plugin's tooltip for the popup `id`'s link came (none — nothing, or not in time).
+fn link_received(
+    editor: &mut Editor,
+    id: usize,
+    markdown: Option<String>,
+    cx: &mut Context<Editor>,
+) {
+    let Some(popup) = editor.hover.popup.as_mut().filter(|popup| popup.id == id) else {
+        return;
+    };
+    popup.link_waiting = false;
+    popup.link_blocks = markdown.map(|text| markdown::parse(&text)).unwrap_or_default();
+    if popup.link_blocks.is_empty()
+        && popup.blocks.is_empty()
+        && popup.diagnostics.is_empty()
+        && popup.request.is_none()
+    {
+        editor.hover.popup = None;
     }
     cx.notify();
 }
@@ -420,6 +491,69 @@ fn position_under(editor: &Editor, point: Point<Pixels>) -> Option<usize> {
     (column < line_len(text, line)).then(|| line_start(text, line) + column)
 }
 
+/// What a pause of the mouse at `pos` is about: a plugin's link with a tooltip (all of it), else
+/// the symbol there.
+fn hover_range(editor: &Editor, pos: usize) -> Option<Range<usize>> {
+    match plugin_link_at(editor, pos) {
+        Some((range, link)) if link.tooltip => Some(range),
+        _ => symbol_range(editor, pos),
+    }
+}
+
+/// The plugins' link at character `pos` of the document (part 10.3): its characters, and the
+/// link. A very long line (a minified file) isn't searched.
+pub(crate) fn plugin_link_at(
+    editor: &Editor,
+    pos: usize,
+) -> Option<(Range<usize>, plugin_links::Link)> {
+    const MAX_LINE: usize = 2000;
+    let text = editor.document.text();
+    if pos >= text.len_chars() {
+        return None;
+    }
+    let line = text.char_to_line(pos);
+    let start = line_start(text, line);
+    let len = line_len(text, line);
+    if len > MAX_LINE {
+        return None;
+    }
+    let line_text = text.slice(start..start + len).to_string();
+    let byte = line_text
+        .char_indices()
+        .nth(pos - start)
+        .map_or(line_text.len(), |(byte, _)| byte);
+    let store = editor.plugins.as_ref().map(|store| store.entity_id());
+    let link = plugin_links::find(store, &line_text)
+        .into_iter()
+        .find(|link| link.range.contains(&byte))?;
+    let from = start + line_text[..link.range.start].chars().count();
+    let to = from + link.text.chars().count();
+    Some((from..to, link))
+}
+
+/// The plugin's link at the caret goes to its plugin, as ⌘-click does (the keyboard's way, and the
+/// scenarios').
+fn open_link_at_caret(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+    let head = editor.document.selection().primary().head;
+    let found = plugin_link_at(editor, head).or_else(|| {
+        // Right after a link's last character still counts as on it.
+        head.checked_sub(1)
+            .and_then(|before| plugin_link_at(editor, before))
+            .filter(|(range, _)| range.end == head)
+    });
+    match found {
+        Some((_, link)) => {
+            let store = editor
+                .plugins
+                .as_ref()
+                .map(|store| store.entity_id())
+                .or_else(|| plugin_links::store_of(window, cx));
+            plugin_links::activate(&link, store, cx);
+        }
+        None => cx.propagate(),
+    }
+}
+
 /// The symbol at `pos`: its word, or the character itself if a diagnostic is there.
 fn symbol_range(editor: &Editor, pos: usize) -> Option<Range<usize>> {
     word_at(editor, pos)
@@ -434,17 +568,26 @@ fn word_at(editor: &Editor, pos: usize) -> Option<Range<usize>> {
     })
 }
 
-/// ⌘ alone (as for ⌘-click) over a word of a document with a language server: that word is the
-/// link.
+/// ⌘ alone (as for ⌘-click) over a plugin's link, or over a word of a document with a language
+/// server: that is the link.
 fn update_link(editor: &mut Editor, modifiers: Modifiers, cx: &mut Context<Editor>) {
     let command = modifiers.platform && !modifiers.shift && !modifiers.alt && !modifiers.control;
+    let mut plugin_link = None;
     let link = editor
         .hover
         .mouse_over
-        .filter(|_| command && crate::lsp::document_server(editor).is_some())
-        .and_then(|pos| word_at(editor, pos));
-    if link != editor.hover.link {
+        .filter(|_| command)
+        .and_then(|pos| match plugin_link_at(editor, pos) {
+            Some((range, link)) => {
+                plugin_link = Some(link);
+                Some(range)
+            }
+            None => crate::lsp::document_server(editor)
+                .and_then(|_| word_at(editor, pos)),
+        });
+    if link != editor.hover.link || plugin_link != editor.hover.plugin_link {
         editor.hover.link = link;
+        editor.hover.plugin_link = plugin_link;
         cx.notify();
     }
 }
@@ -524,7 +667,7 @@ fn is_visible(editor: &Editor, window: &Window) -> bool {
     let Some(popup) = &editor.hover.popup else {
         return false;
     };
-    (!popup.blocks.is_empty() || !popup.diagnostics.is_empty())
+    (!popup.blocks.is_empty() || !popup.diagnostics.is_empty() || !popup.link_blocks.is_empty())
         && popup.selection == *editor.document.selection()
         && editor.focus_handle.is_focused(window)
         && popup::anchor(editor, popup.range.start).is_some()
@@ -597,6 +740,14 @@ fn render_popup(
         .flex()
         .flex_col()
         .gap_2()
+        .when(!popup.link_blocks.is_empty(), |content| {
+            content
+                .child(markdown::render(&popup.link_blocks, ui.foreground, theme))
+                .when(
+                    !popup.diagnostics.is_empty() || !popup.blocks.is_empty(),
+                    |content| content.child(ui::divider(ui)),
+                )
+        })
         .children(popup.diagnostics.iter().map(|d| diagnostic_row(d, ui)))
         .children(actions)
         .when(

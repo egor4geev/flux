@@ -32,9 +32,12 @@ use std::time::{Duration, SystemTime};
 use flux_core::Rope;
 use flux_core::text::{line_len, line_start};
 use flux_plugin::api::diagnostics::Diagnostic as ApiDiagnostic;
-use flux_plugin::api::dialogs::{ButtonRole as ApiButtonRole, DialogLevel, Question, TextQuestion};
+use flux_plugin::api::dialogs::{
+    ButtonRole as ApiButtonRole, DialogLevel, Form, Question, TextQuestion,
+};
 use flux_plugin::api::editors::TextEdit;
 use flux_plugin::api::events::{Event, UiEvent};
+use flux_plugin::api::settings::SettingStatus;
 use flux_plugin::api::notifications::{
     Notification as ApiNotification, NotificationKind as ApiKind, Progress as ApiProgress,
 };
@@ -44,7 +47,7 @@ use flux_plugin::api::types::{
 use flux_plugin::api::ui::{ButtonSpec, Element, ElementKind, Span, Tone, View};
 use flux_plugin::install::{Candidate, CandidateKind};
 use flux_plugin::log::{Level, PluginLog};
-use flux_plugin::manifest::NotificationDisplay;
+use flux_plugin::manifest::{NotificationDisplay, ToolWindowLocation};
 use flux_plugin::registry::{PluginEntry, PluginSource, ScanError};
 use flux_plugin::runtime::{
     EditorCall, EditorReply, HostCall, Instance, InstanceConfig, MessageKind, PluginMessage,
@@ -67,7 +70,7 @@ use crate::notification_center::{
     Display, GroupInfo, NotificationCenter, NotificationGroup, NotificationId,
 };
 use crate::notifications::{Notification, NotificationKind, Progress};
-use crate::plugin_view::{PluginView, PluginViewEvent};
+use crate::plugin_view::{Chrome, PluginView, PluginViewEvent};
 use crate::theme::Theme;
 use crate::ui::{self, RADIUS_SM};
 use crate::workspace::Workspace;
@@ -93,6 +96,9 @@ pub struct CommandOrigin {
     /// The files and folders a menu was opened on: the rows selected in the tree, a tab's file.
     /// Empty — the active document's file.
     pub paths: Vec<PathBuf>,
+    /// What a notification's action or a settings button carries (API 0.3): the context's
+    /// `argument`.
+    pub argument: Option<String>,
 }
 
 impl CommandOrigin {
@@ -100,11 +106,25 @@ impl CommandOrigin {
         Self {
             source,
             paths: Vec::new(),
+            argument: None,
         }
     }
 
     pub fn with_paths(source: CommandSource, paths: Vec<PathBuf>) -> Self {
-        Self { source, paths }
+        Self {
+            source,
+            paths,
+            argument: None,
+        }
+    }
+
+    /// From a notification's action or a settings button, with what it carries.
+    pub fn with_argument(source: CommandSource, argument: Option<String>) -> Self {
+        Self {
+            source,
+            paths: Vec::new(),
+            argument,
+        }
     }
 }
 
@@ -215,7 +235,16 @@ pub struct ToolWindow {
     pub title: SharedString,
     /// The icon's asset path ([`crate::icons::plugin_asset`]); none — the default icon.
     pub icon: Option<SharedString>,
+    /// The island on the right (a launchpad icon), or a tab among the editor's (API 0.3).
+    pub location: ToolWindowLocation,
     pub view: Entity<PluginView>,
+}
+
+impl ToolWindow {
+    /// A window among the editor's tabs (`location = "editor"`).
+    pub fn in_editor(&self) -> bool {
+        self.location == ToolWindowLocation::Editor
+    }
 }
 
 /// A plugin's status bar item, as the plugin last set it.
@@ -264,11 +293,19 @@ pub enum PluginStoreEvent {
     PluginStopped(Arc<str>),
 }
 
-/// A plugin's question with a text field, waiting for the overlay window to free up.
-struct PendingQuestion {
-    plugin: Arc<str>,
-    id: u64,
-    question: TextQuestion,
+/// A plugin's question with a field (a text question, a form of API 0.3), waiting for the overlay
+/// window to free up.
+pub(crate) enum PendingQuestion {
+    Text {
+        plugin: Arc<str>,
+        id: u64,
+        question: TextQuestion,
+    },
+    Form {
+        plugin: Arc<str>,
+        id: u64,
+        form: Form,
+    },
 }
 
 /// The plugins of a window.
@@ -295,6 +332,8 @@ pub struct PluginStore {
     status_items: Vec<StatusItem>,
     /// Commands the plugins grayed out: (plugin, command).
     disabled_commands: HashSet<(Arc<str>, String)>,
+    /// The `status` lines the plugins wrote on their settings pages (API 0.3): (plugin, key).
+    setting_statuses: HashMap<(Arc<str>, String), SettingStatus>,
     messages: UnboundedSender<PluginMessage>,
     /// The window's notification center: the plugins' notifications and the store's own.
     center: Option<WeakEntity<NotificationCenter>>,
@@ -316,6 +355,8 @@ pub struct PluginStore {
     git_state: Option<u64>,
     /// Subscriptions to the window's Git and language servers.
     _window_parts: Vec<Subscription>,
+    /// The window's Git: a stopped plugin's commit message template goes from it (API 0.3).
+    git: Option<WeakEntity<crate::git::GitStore>>,
     /// The document the plugins were last told is active.
     active_editor: Option<u64>,
     /// The component of each plugin under development as it was when it started: a newer one is
@@ -373,6 +414,7 @@ impl PluginStore {
             _view_subscriptions: HashMap::new(),
             status_items: Vec::new(),
             disabled_commands: HashSet::new(),
+            setting_statuses: HashMap::new(),
             messages,
             center: None,
             notification_ids: HashMap::new(),
@@ -384,6 +426,7 @@ impl PluginStore {
             diagnostics_flush: None,
             git_state: None,
             _window_parts: Vec::new(),
+            git: None,
             active_editor: None,
             dev_components: HashMap::new(),
             dev_files: HashMap::new(),
@@ -637,6 +680,13 @@ impl PluginStore {
         &self.status_items
     }
 
+    /// The `status` line a plugin wrote on its settings page (`settings.set-status`); none — the
+    /// manifest's text.
+    pub fn setting_status(&self, plugin: &str, key: &str) -> Option<&SettingStatus> {
+        self.setting_statuses
+            .get(&(Arc::from(plugin), key.to_string()))
+    }
+
     /// The running plugins' commands for the palette.
     pub fn palette_commands(&self) -> Vec<PaletteCommand> {
         let mut commands = Vec::new();
@@ -645,7 +695,7 @@ impl PluginStore {
                 continue;
             }
             let manifest = &state.entry.manifest;
-            for command in &manifest.commands {
+            for command in manifest.commands.iter().filter(|command| command.palette) {
                 let category = command.category.as_deref().unwrap_or(&manifest.name);
                 commands.push(PaletteCommand {
                     action: RunCommand {
@@ -676,7 +726,12 @@ impl PluginStore {
                         window: tool.id.clone(),
                     },
                     category: state.name().to_string(),
-                    title: trf("Toggle {0} Window", &[&tool.title]),
+                    // A tab in the editor opens (or comes forward); the island's window toggles.
+                    title: if tool.in_editor() {
+                        trf("Open {0}", &[&tool.title])
+                    } else {
+                        trf("Toggle {0} Window", &[&tool.title])
+                    },
                 })
             })
             .collect()
@@ -736,6 +791,7 @@ impl PluginStore {
             editor: info,
             selections,
             paths,
+            argument: origin.and_then(|origin| origin.argument.clone()),
         }
     }
 
@@ -758,6 +814,7 @@ impl PluginStore {
         cx: &mut Context<Self>,
     ) {
         self.git_state = Some(crate::plugin_calls::git_state(git.read(cx)));
+        self.git = Some(git.downgrade());
         self._window_parts = vec![
             cx.observe(&git, |this, git, cx| {
                 let state = crate::plugin_calls::git_state(git.read(cx));
@@ -1140,11 +1197,26 @@ impl PluginStore {
             cx.emit(PluginStoreEvent::PluginStopped(Arc::from(id)));
         }
         self.clear_diagnostics(id, cx);
+        self.forget_window_state(id, cx);
         let before = self.status_items.len();
         self.status_items.retain(|item| item.plugin != id);
         self.disabled_commands.retain(|(plugin, _)| &**plugin != id);
         if self.status_items.len() != before {
             cx.notify();
+        }
+    }
+
+    /// What a stopped plugin set in the window goes (API 0.3): its settings page's status lines,
+    /// its commit message template.
+    fn forget_window_state(&mut self, plugin: &str, cx: &mut Context<Self>) {
+        let before = self.setting_statuses.len();
+        self.setting_statuses
+            .retain(|(owner, _), _| &**owner != plugin);
+        if self.setting_statuses.len() != before {
+            cx.notify();
+        }
+        if let Some(git) = self.git.as_ref().and_then(WeakEntity::upgrade) {
+            git.update(cx, |git, cx| git.set_commit_template(plugin, None, cx));
         }
     }
 
@@ -1361,10 +1433,17 @@ impl PluginStore {
         };
         let entry = self.plugins[index].entry.clone();
         let manifest = &entry.manifest;
+        // A window gone from the manifest, or moved between the island and the editor (a plugin
+        // under development), goes; a moved one comes back as new.
         let gone: Vec<ToolKey> = self
             .tool_windows
             .iter()
-            .filter(|tool| tool.plugin == id && manifest.tool_window(&tool.id).is_none())
+            .filter(|tool| {
+                tool.plugin == id
+                    && manifest
+                        .tool_window(&tool.id)
+                        .is_none_or(|spec| spec.location != tool.location)
+            })
             .map(|tool| tool.key)
             .collect();
         for key in &gone {
@@ -1392,8 +1471,12 @@ impl PluginStore {
             let plugin: SharedString = id.to_string().into();
             let window: SharedString = spec.id.clone().into();
             let width = self.width.clone();
+            let chrome = match spec.location {
+                ToolWindowLocation::Island => Chrome::Island,
+                ToolWindowLocation::Editor => Chrome::Tab,
+            };
             let view = cx.new(|cx| {
-                PluginView::new(plugin.clone(), window.clone(), title.clone(), width, cx)
+                PluginView::new(plugin.clone(), window.clone(), title.clone(), width, chrome, cx)
             });
             let subscription = cx.subscribe(&view, move |this, _, event, cx| {
                 this.on_view_event(key, event, cx)
@@ -1405,6 +1488,7 @@ impl PluginStore {
                 id: window,
                 title,
                 icon,
+                location: spec.location,
                 view,
             });
         }
@@ -1555,6 +1639,7 @@ impl PluginStore {
                 self.clear_diagnostics(&plugin, cx);
                 self.bump_generation(&plugin);
                 self.status_items.retain(|item| item.plugin != *plugin);
+                self.forget_window_state(&plugin, cx);
                 let Some(index) = self.index(&plugin) else {
                     return;
                 };
@@ -1629,6 +1714,16 @@ impl PluginStore {
                 }
             }
             HostCall::SetStatusItem { id, item } => self.set_status_item(&plugin, id, item, cx),
+            HostCall::SetSetting { key, value } => {
+                crate::plugin_settings::set_from_plugin(self, &plugin, &key, value, cx)
+            }
+            HostCall::SetSettingStatus { key, status } => {
+                match status {
+                    Some(status) => self.setting_statuses.insert((plugin, key), status),
+                    None => self.setting_statuses.remove(&(plugin, key)),
+                };
+                cx.notify();
+            }
             HostCall::SetView { window, view } => {
                 let Some(tool) = self
                     .tool_windows
@@ -1655,8 +1750,39 @@ impl PluginStore {
                     cx.emit(PluginStoreEvent::HideToolWindow(key));
                 }
             }
+            // TODO(10.3 H1): the tab's title of a window in the editor; the header's here.
+            HostCall::SetToolWindowTitle { window, title } => {
+                let Some(state) = self.plugin(&plugin) else {
+                    return;
+                };
+                let title: SharedString = match title.trim() {
+                    "" => state
+                        .entry
+                        .manifest
+                        .tool_windows
+                        .iter()
+                        .find(|tool| tool.id == window)
+                        .map(|tool| state.tr(&tool.title).to_string())
+                        .unwrap_or_default()
+                        .into(),
+                    title => title.to_string().into(),
+                };
+                if let Some(tool) = self
+                    .tool_windows
+                    .iter_mut()
+                    .find(|tool| tool.plugin == *plugin && tool.id == window)
+                {
+                    tool.title = title.clone();
+                    tool.view.update(cx, |view, cx| view.set_title(title, cx));
+                }
+                cx.notify();
+            }
             call @ (HostCall::Ask { .. }
             | HostCall::AskText { .. }
+            | HostCall::AskForm { .. }
+            | HostCall::OpenPicker { .. }
+            | HostCall::UpdatePicker { .. }
+            | HostCall::ClosePicker { .. }
             | HostCall::Editor { .. }
             | HostCall::Window { .. }) => cx.emit(PluginStoreEvent::Call { plugin, call }),
         }
@@ -1794,18 +1920,29 @@ impl PluginStore {
     fn has_pending_question(&self) -> bool {
         !self.pending_questions.is_empty()
     }
+
+    /// A question that waits for the overlay window (a dialog or a popup of the user's is open).
+    pub(crate) fn queue_question(&mut self, question: PendingQuestion) {
+        self.pending_questions.push_back(question);
+    }
 }
 
 /// The plugin's settings: the manifest's defaults with the user's values over them.
 fn settings_values(entry: &PluginEntry, cx: &App) -> Map<String, Value> {
+    // A secret, a button, a status line, a heading have no value (API 0.3).
     let mut values: Map<String, Value> = entry
         .manifest
         .settings
         .iter()
+        .filter(|setting| setting.kind.has_value())
         .map(|setting| (setting.key.clone(), setting.default.clone()))
         .collect();
     for (key, value) in settings::plugin_values(entry.id(), cx) {
-        if entry.manifest.setting(&key).is_some() {
+        if entry
+            .manifest
+            .setting(&key)
+            .is_some_and(|setting| setting.kind.has_value())
+        {
             values.insert(key, value);
         }
     }
@@ -1840,7 +1977,10 @@ fn plugin_notification(plugin: &str, notification: &ApiNotification) -> Notifica
             RunCommand {
                 plugin: plugin.to_string().into(),
                 command: action.command.clone().into(),
-                origin: Some(CommandOrigin::new(CommandSource::Notification)),
+                origin: Some(CommandOrigin::with_argument(
+                    CommandSource::Notification,
+                    action.argument.clone(),
+                )),
             },
         );
     }
@@ -2080,7 +2220,7 @@ pub(crate) fn handle_call(
     match call {
         HostCall::Ask { id, question } => ask(workspace, plugin, *id, question, window, cx),
         HostCall::AskText { id, question } => {
-            let pending = PendingQuestion {
+            let pending = PendingQuestion::Text {
                 plugin: Arc::from(plugin),
                 id: *id,
                 question: question.clone(),
@@ -2089,10 +2229,22 @@ pub(crate) fn handle_call(
                 // A dialog or a popup of the user's is open: the question waits for it.
                 workspace
                     .plugins
-                    .update(cx, |store, _| store.pending_questions.push_back(pending));
+                    .update(cx, |store, _| store.queue_question(pending));
             } else {
-                ask_text(workspace, pending, window, cx);
+                ask_queued(workspace, pending, window, cx);
             }
+        }
+        HostCall::AskForm { id, form } => {
+            crate::plugin_form::ask_form(workspace, plugin, *id, form, window, cx)
+        }
+        HostCall::OpenPicker { id, spec } => {
+            crate::plugin_picker::open(workspace, plugin, *id, spec, window, cx)
+        }
+        HostCall::UpdatePicker { id, items, loading } => {
+            crate::plugin_picker::update(workspace, plugin, *id, items, *loading, window, cx)
+        }
+        HostCall::ClosePicker { id } => {
+            crate::plugin_picker::close(workspace, plugin, *id, window, cx)
         }
         HostCall::Editor { call, reply } => editor_call(workspace, plugin, call, reply, window, cx),
         HostCall::Window { call, reply } => {
@@ -2154,15 +2306,12 @@ fn ask(
 /// dialog is dismissed).
 fn ask_text(
     workspace: &mut Workspace,
-    pending: PendingQuestion,
+    plugin: Arc<str>,
+    id: u64,
+    question: TextQuestion,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let PendingQuestion {
-        plugin,
-        id,
-        question,
-    } = pending;
     let (sender, receiver) = oneshot::channel::<String>();
     workspace.toggle_dialog(window, cx, move |window, cx| {
         let placeholder = question.placeholder.clone().unwrap_or_default();
@@ -2202,7 +2351,26 @@ pub(crate) fn ask_pending(
         .plugins
         .update(cx, |store, _| store.pending_questions.pop_front());
     if let Some(pending) = pending {
-        ask_text(workspace, pending, window, cx);
+        ask_queued(workspace, pending, window, cx);
+    }
+}
+
+/// Asks a question that may have waited: a text question or a form.
+fn ask_queued(
+    workspace: &mut Workspace,
+    pending: PendingQuestion,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    match pending {
+        PendingQuestion::Text {
+            plugin,
+            id,
+            question,
+        } => ask_text(workspace, plugin, id, question, window, cx),
+        PendingQuestion::Form { plugin, id, form } => {
+            crate::plugin_form::show_form(workspace, plugin, id, form, window, cx)
+        }
     }
 }
 
@@ -2448,40 +2616,55 @@ fn edit_ranges(
 }
 
 /// The plugins' status bar items: dim text, a tooltip, a click runs the item's command.
-pub(crate) fn status_bar_items(workspace: &Workspace, cx: &App) -> Vec<AnyElement> {
+pub(crate) fn status_bar_items(workspace: &Workspace, cx: &App) -> Option<AnyElement> {
     let ui = Theme::ui(cx);
-    workspace
-        .plugins
-        .read(cx)
-        .status_items()
+    let items = workspace.plugins.read(cx).status_items();
+    if items.is_empty() {
+        return None;
+    }
+    // Where each item was drawn: a plugin's picker opens above it (part 10.3).
+    let keys: Vec<(SharedString, SharedString)> = items
         .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let command = item.command.clone();
-            div()
-                .id(("plugin-status", index))
-                .flex_none()
-                .h(px(20.))
-                .px_1()
-                .flex()
-                .items_center()
-                .rounded(px(RADIUS_SM))
-                .whitespace_nowrap()
-                .text_color(ui.dim)
-                .when_some(item.tooltip.clone(), |item, tooltip| {
-                    item.tooltip(ui::tooltip(tooltip, None))
-                })
-                .when_some(command, |item, command| {
-                    item.cursor_pointer()
-                        .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
-                        .on_click(move |_, window, cx| {
-                            window.dispatch_action(Box::new(command.clone()), cx)
-                        })
-                })
-                .child(item.text.clone())
-                .into_any_element()
-        })
-        .collect()
+        .map(|item| (item.plugin.clone(), item.id.clone()))
+        .collect();
+    let items = items.iter().enumerate().map(|(index, item)| {
+        let command = item.command.clone();
+        div()
+            .id(("plugin-status", index))
+            .flex_none()
+            .h(px(20.))
+            .px_1()
+            .flex()
+            .items_center()
+            .rounded(px(RADIUS_SM))
+            .whitespace_nowrap()
+            .text_color(ui.dim)
+            .when_some(item.tooltip.clone(), |item, tooltip| {
+                item.tooltip(ui::tooltip(tooltip, None))
+            })
+            .when_some(command, |item, command| {
+                item.cursor_pointer()
+                    .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(command.clone()), cx)
+                    })
+            })
+            .child(item.text.clone())
+    });
+    Some(
+        div()
+            .flex_none()
+            .pr_1()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_size(px(crate::theme::TEXT_SM))
+            .on_children_prepainted(move |bounds, window, cx| {
+                crate::plugin_picker::record_status_items(&keys, &bounds, window, cx)
+            })
+            .children(items)
+            .into_any_element(),
+    )
 }
 
 #[cfg(test)]
@@ -2572,6 +2755,7 @@ mod tests {
                 actions: vec![flux_plugin::api::notifications::Action {
                     label: "Show".into(),
                     command: "show".into(),
+                    argument: None,
                 }],
                 sticky: true,
             },

@@ -1,5 +1,6 @@
 //! What a command acts on: [`CommandContext`] — where it was run from (the palette, its keys, a
-//! context menu, a notification, a status bar item), the document and its selections, the files.
+//! context menu, a notification, a status bar item, a settings button), the document and its
+//! selections, the files, and what a notification's action or a button carries.
 
 use crate::{CommandContext, CommandSource, Range};
 
@@ -25,6 +26,12 @@ impl CommandContext {
         self.paths.first().map(String::as_str)
     }
 
+    /// What the notification's action or the settings button carries (API 0.3): which task,
+    /// which meeting.
+    pub fn argument(&self) -> Option<&str> {
+        self.argument.as_deref()
+    }
+
     /// Run from a context menu (the editor's, the tree's, a tab's).
     pub fn from_menu(&self) -> bool {
         matches!(
@@ -36,7 +43,7 @@ impl CommandContext {
 
 impl CommandSource {
     /// The source as the API names it: "palette", "keys", "editor-menu", "tree-menu", "tab-menu",
-    /// "notification", "status-bar" (`Debug` gives the Rust path).
+    /// "notification", "status-bar", "settings" (`Debug` gives the Rust path).
     pub fn name(self) -> &'static str {
         match self {
             CommandSource::Palette => "palette",
@@ -46,6 +53,7 @@ impl CommandSource {
             CommandSource::TabMenu => "tab-menu",
             CommandSource::Notification => "notification",
             CommandSource::StatusBar => "status-bar",
+            CommandSource::Settings => "settings",
         }
     }
 }
@@ -66,6 +74,7 @@ mod tests {
             }),
             selections: vec![Range::new(Position::new(1, 0), Position::new(1, 4))],
             paths: vec!["/p/main.rs".into()],
+            argument: editor.then(|| "TRACK-1".into()),
         }
     }
 
@@ -80,5 +89,8 @@ mod tests {
         assert_eq!(palette.source.name(), "palette");
         assert_eq!(CommandSource::TreeMenu.name(), "tree-menu");
         assert_eq!(palette.selection().map(|range| range.end.column), Some(4));
+        assert_eq!(palette.argument(), Some("TRACK-1"));
+        assert_eq!(menu.argument(), None);
+        assert_eq!(CommandSource::Settings.name(), "settings");
     }
 }

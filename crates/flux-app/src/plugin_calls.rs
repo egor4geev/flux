@@ -1,6 +1,9 @@
-//! The calls of the plugin API 0.2 that the window does the work of (part 8.2): Git, the problems,
+//! The calls of the plugin API that the window does the work of (part 8.2): Git, the problems,
 //! closing a tab, the browser and the clipboard here; terminals ([`crate::plugin_terminals`]) and
-//! proposals ([`crate::plugin_review`]) in their own modules. The plugin's thread waits for the
+//! proposals ([`crate::plugin_review`]) in their own modules; API 0.3 (part 10.3) — branches and
+//! the commit template ([`crate::plugin_git`]), links ([`crate::plugin_links`]), Claude sessions
+//! ([`crate::plugin_claude`]), contexts ([`crate::task_contexts`]), the settings page
+//! ([`crate::plugin_settings`]). The plugin's thread waits for the
 //! reply to the calls that return something ([`WindowReply`]) — up to 10 s, so slow work (a diff,
 //! reading files) runs in the background and replies from there; the window checks that a
 //! terminal or a proposal is the plugin's own. Permissions are checked by `flux-plugin` before a
@@ -91,9 +94,75 @@ pub(crate) fn window_call(
         WindowCall::ClearDiagnostics => workspace
             .plugins
             .update(cx, |store, cx| store.clear_diagnostics(plugin, cx)),
-        WindowCall::OpenUrl(url) => cx.open_url(url),
+        WindowCall::OpenUrl(url) => open_url(url, cx),
         WindowCall::CopyText(text) => cx.write_to_clipboard(ClipboardItem::new_string(text.clone())),
+        // API 0.3 (part 10.3).
+        WindowCall::OpenSettings => crate::plugin_settings::open(workspace, plugin, window, cx),
+        WindowCall::GitBranches(root) => {
+            crate::plugin_git::branches(workspace, root, reply.clone(), cx)
+        }
+        WindowCall::GitNewBranch {
+            id,
+            root,
+            name,
+            start,
+        } => crate::plugin_git::new_branch(
+            workspace,
+            plugin,
+            *id,
+            root,
+            name,
+            start.as_deref(),
+            window,
+            cx,
+        ),
+        WindowCall::GitCheckout { id, root, branch } => {
+            crate::plugin_git::checkout(workspace, plugin, *id, root, branch, window, cx)
+        }
+        WindowCall::SetCommitTemplate(template) => {
+            crate::plugin_git::set_commit_template(workspace, plugin, template.clone(), cx)
+        }
+        WindowCall::SetLinkPatterns(patterns) => send(WindowReply::Done(
+            crate::plugin_links::set_patterns(workspace, plugin, patterns, cx),
+        )),
+        WindowCall::DescribeLink { request, markdown } => {
+            crate::plugin_links::describe(plugin, *request, markdown.clone(), cx)
+        }
+        WindowCall::NewClaudeSession(spec) => send(WindowReply::Done(
+            crate::plugin_claude::new_session(workspace, plugin, spec, window, cx),
+        )),
+        WindowCall::SwitchContext { save, load } => crate::task_contexts::switch_for_plugin(
+            workspace,
+            plugin,
+            save.clone(),
+            load.clone(),
+            reply.clone(),
+            window,
+            cx,
+        ),
+        WindowCall::RemoveContext(key) => {
+            crate::task_contexts::remove_for_plugin(workspace, plugin, key, cx)
+        }
     }
+}
+
+/// `system.open-url`: the default browser — in a scenario with `FLUX_SCENARIO_OPEN_URL=<file>`,
+/// a line in that file instead (the author's browser stays alone; a scenario reads the address,
+/// say an OAuth sign-in's, and plays the browser).
+fn open_url(url: &str, cx: &mut gpui::App) {
+    #[cfg(feature = "scenario")]
+    if let Some(file) = std::env::var_os("FLUX_SCENARIO_OPEN_URL") {
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)
+        {
+            let _ = writeln!(file, "{url}");
+        }
+        return;
+    }
+    cx.open_url(url);
 }
 
 // --- Tabs ---

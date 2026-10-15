@@ -161,7 +161,10 @@ see [Writing plugins](docs/plugins.md).
 
 A plugin can work with the world outside the editor: call a web service and sign in to it, run a
 local server for a tool or an AI agent to talk to, run programs and terminals, propose an edit you
-review as a diff, read Git and the problems in your code, and show problems of its own. It gets
+review as a diff, read Git and the problems in your code, and show problems of its own. It can ask
+in a dialog with several fields, offer a searchable popup, open a wide view as an editor tab, make
+a branch the way Flux does, turn text into links, start a Claude session with its context and
+switch the set of open tabs. It gets
 only what you allowed: when you install it, Flux lists in plain words which sites it may reach,
 which programs it may run and which folders it may read, and points out what deserves a second
 look.
@@ -175,6 +178,29 @@ Flux has no language for, it tells you which plugin knows it.
 <img src="docs/images/marketplace.png" alt="Settings → Plugins → Marketplace: languages, themes and icon sets, with the Rust plugin's details" width="100%">
 
 <img src="docs/images/plugin-suggestion.png" alt="A Rust file without its plugin: a banner over the editor offers to install Rust" width="100%">
+
+### Your tasks, next to the code
+
+The Yandex Tracker & Calendar plugin brings your work into Flux. The board of tasks opens as a tab,
+its columns side by side, as on Tracker's own board; a task opens on the right with its fields, its
+description, its links to other tasks, its comments and its history. Take a task to work with one
+button: Flux moves it to In Progress, makes its branch, opens the task's own tabs, starts a timer —
+and hands Claude your prompt, filled in from the task. Your prompts are yours to write: several
+Claude actions in the plugin's settings, with the task's key, title, description, links and comments
+put in where you say.
+
+<img src="docs/images/tracker.png" alt="The board of tasks in an editor tab, columns by status with cards, and a task on the right: its status, Take to Work and Plan, the description, links to other tasks and comments" width="100%">
+
+Task keys in code, commit messages and Claude's chat become links with a tooltip; the task you're
+working on stays in the status bar with its timer, and closing it logs the time. The next meeting of
+the day waits there too — click it for today's and tomorrow's agenda, and join a Telemost call
+from it or from the reminder.
+
+<img src="docs/images/calendar.png" alt="Today's and tomorrow's meetings in a popup over the status bar, with Telemost calls marked" width="100%">
+
+Every task has its own set of tabs, as in JetBrains IDEs: switching tasks puts your files and
+Claude chats away and brings the other task's back — and Save Context, Load Context and Clear
+Context work without a tracker too.
 
 ### Claude Code, built in
 
@@ -257,6 +283,8 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 | <kbd>⌘</kbd><kbd>Esc</kbd> · <kbd>⌥</kbd><kbd>⌘</kbd><kbd>K</kbd> | Claude · mention the selection in Claude's message |
 | <kbd>⌃</kbd><kbd>`</kbd> | Quick Switch: theme, file icons, language |
 | <kbd>⌘</kbd><kbd>`</kbd> · <kbd>⇧</kbd><kbd>⌘</kbd><kbd>`</kbd> | Next · previous project window |
+| <kbd>⌥</kbd><kbd>⇧</kbd><kbd>N</kbd> · <kbd>⌥</kbd><kbd>⇧</kbd><kbd>B</kbd> | Open a task · the task in the browser (Yandex Tracker plugin) |
+| <kbd>⌥</kbd><kbd>⇧</kbd><kbd>X</kbd> | Clear the context: close the tabs, keep them for later |
 
 ## Roadmap
 
@@ -277,6 +305,7 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 - [x] Plugins: the Marketplace, languages, themes and file icons as plugins, a light theme, Appearance settings
 - [x] Before the beta: fixes after a week of daily use, a window for every project
 - [x] Before the beta: Claude polish — a new chat, `!` commands, live subagents, search, edit and rewind
+- [x] Before the beta: tasks — Yandex Tracker and Calendar, task contexts, plugin API 0.3
 - [ ] Before the beta: editor polish, updates over the air, a signed and notarized app
 - [ ] Public beta
 

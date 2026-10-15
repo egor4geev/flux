@@ -4,6 +4,8 @@
 use flux_plugin_api::host::{editors, project, storage};
 use flux_plugin_api::{CommandContext, Event, Plugin, notify, register_plugin, setting, tr};
 
+/// Commands `v3:…`: the API 0.3's new calls (part 10.3).
+mod api03;
 /// Commands `net:…`: requests and the server (part 8.2).
 mod net;
 /// Commands `proc:…`: programs, timers, secrets, folders, the time limit (part 8.2).
@@ -31,6 +33,9 @@ impl Plugin for Probe {
         }
         if let Some(command) = command.strip_prefix("proc:") {
             return processes::run(command);
+        }
+        if let Some(command) = command.strip_prefix("v3:") {
+            return api03::run(command);
         }
         match command {
             "context" => {
@@ -121,7 +126,7 @@ impl Plugin for Probe {
     }
 
     fn on_event(&mut self, event: Event) {
-        if net::on_event(&event) || processes::on_event(&event) {
+        if net::on_event(&event) || processes::on_event(&event) || api03::on_event(&event) {
             return;
         }
         if let Event::SettingsChanged = event {

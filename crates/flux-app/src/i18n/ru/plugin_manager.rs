@@ -37,8 +37,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ),
     ("Running", "Работает"),
     (
-        "Built for plugin API {0}; this Flux has {1}",
-        "Сделан для API плагинов {0}, а у этого Flux — {1}",
+        "Built for plugin API {0}; this Flux runs {1}",
+        "Сделан для API плагинов {0}, а этот Flux запускает {1}",
     ),
     ("The component {0} is missing", "Нет компонента {0}"),
     ("Disabled", "Выключен"),

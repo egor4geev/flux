@@ -1,8 +1,12 @@
-//! The API Playground: every capability of the Flux plugin API 0.2 behind a button, with what it
+//! The API Playground: every capability of the Flux plugin API behind a button, with what it
 //! returned under the button — the manual check of the API, and an example to copy from. Each
 //! section of the tool window is one interface; background work (a started request, the server, a
 //! started program, a terminal, a proposal, a timer) reports into its section as its events come.
-//! The context menus' items print the context their command gets.
+//! The context menus' items print the context their command gets. The sections of API 0.3 (forms,
+//! pickers, the settings page, branches, links, Claude, contexts, the time, badges, a window in the
+//! editor) are in [`api03`].
+
+mod api03;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,6 +47,16 @@ enum Section {
     Timers,
     System,
     Context,
+    Forms,
+    Pickers,
+    SettingsPage,
+    Branches,
+    Links,
+    Claude,
+    Contexts,
+    Time,
+    Widgets,
+    EditorWindows,
 }
 
 impl Section {
@@ -59,6 +73,16 @@ impl Section {
             Section::Timers => "timers",
             Section::System => "system",
             Section::Context => "context",
+            Section::Forms => "forms",
+            Section::Pickers => "pickers",
+            Section::SettingsPage => "settings",
+            Section::Branches => "branches",
+            Section::Links => "links",
+            Section::Claude => "claude",
+            Section::Contexts => "contexts",
+            Section::Time => "time",
+            Section::Widgets => "widgets",
+            Section::EditorWindows => "board",
         }
     }
 
@@ -75,6 +99,16 @@ impl Section {
             Section::Timers => "Timers",
             Section::System => "System",
             Section::Context => "Context Menus",
+            Section::Forms => "Forms",
+            Section::Pickers => "Pickers",
+            Section::SettingsPage => "Settings Page",
+            Section::Branches => "Branches",
+            Section::Links => "Links",
+            Section::Claude => "Claude",
+            Section::Contexts => "Contexts",
+            Section::Time => "Local Time",
+            Section::Widgets => "Badges and Fields",
+            Section::EditorWindows => "A Window in the Editor",
         }
     }
 
@@ -99,6 +133,27 @@ impl Section {
             Section::Context => {
                 "Right-click a selection in the editor, a file or a folder in the tree, a tab: the \
                  Playground's items print what their command gets."
+            }
+            Section::Forms => {
+                "A dialog with fields, as JetBrains' Open Task; it asks again on a mistake."
+            }
+            Section::Pickers => {
+                "Popup lists: the plugin's own search, Flux's filter, a menu at the status bar, a \
+                 badge's menu."
+            }
+            Section::SettingsPage => {
+                "Settings → the playground: a secret, a button, a status line, a note, bookmarks."
+            }
+            Section::Branches => {
+                "A new branch and a checkout the way Flux does them; the commit message's template."
+            }
+            Section::Links => "PLAY-12 as a link in code, commit messages and Claude's chat.",
+            Section::Claude => "A Claude Code session with a task attached: to discuss, or to plan.",
+            Section::Contexts => "The tabs of a task: save them under a key, open another's.",
+            Section::Time => "The user's time zone and local time.",
+            Section::Widgets => "Badges in every tone; a field of several lines (⌘↵ sends it).",
+            Section::EditorWindows => {
+                "A plugin's window among the editor's tabs: a board of tasks, renamed on the fly."
             }
         }
     }
@@ -150,6 +205,8 @@ struct Playground {
     secret_question: Option<u64>,
     /// The clock: its timer and the ticks so far.
     clock: Option<(u64, u32)>,
+    /// The sections of API 0.3.
+    v3: api03::State,
 }
 
 impl Plugin for Playground {
@@ -174,6 +231,7 @@ impl Plugin for Playground {
             proposal: None,
             secret_question: None,
             clock: None,
+            v3: api03::State::default(),
         }
     }
 
@@ -184,11 +242,16 @@ impl Plugin for Playground {
                 self.show_context(command, context)
             }
             "stop-clock" if self.clock.is_some() => self.toggle_clock(),
+            "settings-check" => self.settings_check(context),
+            "open-board" => ui::show(api03::BOARD),
             _ => {}
         }
     }
 
     fn on_event(&mut self, event: Event) {
+        let Some(event) = self.handle_03(event) else {
+            return;
+        };
         match event {
             Event::ToolWindowShown(window) if window == WINDOW => {
                 self.shown = true;
@@ -395,7 +458,7 @@ impl Playground {
                 };
                 self.set(Section::System, text);
             }
-            _ => {}
+            _ => self.clicked_03(element),
         }
     }
 
@@ -999,8 +1062,10 @@ impl Playground {
 
     // --- The view ---
 
-    /// Keeps a section's result and redraws.
+    /// Keeps a section's result and redraws; the result goes to the plugin's log too (Settings →
+    /// Plugins → API Playground → Log), where the sections below the window's fold can be read.
     fn set(&mut self, section: Section, text: String) {
+        flux_plugin_api::log::info(&format!("[{}] {}", section.id(), text.replace('\n', " ⏎ ")));
         self.results.insert(section, text);
         self.render();
     }
@@ -1084,16 +1149,22 @@ impl Playground {
             "toolbar",
             [icon_button("clear", "trash", &tr("Clear Results"))],
         )];
-        for (index, (section, buttons)) in sections.into_iter().enumerate() {
+        let sections = sections
+            .into_iter()
+            .map(|(section, buttons)| (section, buttons, Vec::new()))
+            .chain(self.sections_03());
+        for (index, (section, buttons, extra)) in sections.enumerate() {
             if index > 0 {
                 children.push(divider(&format!("divider-{index}")));
             }
-            children.push(self.section(section, buttons));
+            children.push(self.section(section, buttons, extra));
         }
         set_view(WINDOW, column("root", children));
     }
 
-    fn section(&self, section: Section, buttons: Vec<Element>) -> Element {
+    /// A section: its title and what it does, its buttons, `extra` elements under them, a note
+    /// of the events that came by themselves, the last result.
+    fn section(&self, section: Section, buttons: Vec<Element>, extra: Vec<Element>) -> Element {
         let id = section.id();
         let mut children = vec![
             text(&format!("{id}-title"), [span(&tr(section.title())).bold()]),
@@ -1105,6 +1176,7 @@ impl Playground {
         if !buttons.is_empty() {
             children.push(row(&format!("{id}-buttons"), buttons));
         }
+        children.extend(extra);
         if let Some(note) = self.notes.get(&section) {
             children.push(text(&format!("{id}-note"), [span(note).tone(Tone::Muted)]));
         }

@@ -740,7 +740,14 @@ impl CommitDetailsView {
                         .font_family(theme::code_font())
                         .text_size(px(theme::TEXT_SM))
                         .text_color(ui.foreground)
-                        .child(details.message.clone()),
+                        // Plugins' links (part 10.3): `TRACK-142` goes to its task.
+                        .child(crate::plugin_links::linked_plain(
+                            "details-message",
+                            details.message.clone().into(),
+                            gpui::font(theme::code_font()),
+                            ui.foreground,
+                            cx,
+                        )),
                 )
                 .child(
                     div()

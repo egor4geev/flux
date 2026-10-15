@@ -11,7 +11,8 @@ use flux_core::{Document, Selection};
 use flux_fs::remap;
 use gpui::{
     Action, AnyElement, AnyView, App, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, Context,
-    DismissEvent, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Global,
+    Corner, DismissEvent, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight,
+    Global,
     KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels,
     Point, Render, ScrollHandle, SharedString, Subscription, Task, TitlebarOptions, WeakEntity,
     Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowId, WindowOptions,
@@ -41,6 +42,7 @@ use crate::notification_center::NotificationCenter;
 use crate::notification_center::NotificationGroup;
 use crate::notifications::{self, Notification};
 use crate::notifications_panel::{self, NotificationsPanel};
+use crate::plugin_view::PluginView;
 use crate::plugins::{self, PluginStore, PluginStoreEvent, ToolKey};
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
 use crate::project_state::{
@@ -330,6 +332,9 @@ enum TabItem {
     Claude(Entity<ClaudeChat>),
     /// A picture: an image file, or Claude's picture from a chat (part 10.2).
     Image(Entity<ImageView>),
+    /// A plugin's window that lives among the editor's tabs (`location = "editor"`, API 0.3): a
+    /// board, a preview. It stays here — no island to move it to.
+    Plugin(ToolKey, Entity<PluginView>),
 }
 
 impl TabItem {
@@ -382,6 +387,14 @@ impl TabItem {
         }
     }
 
+    /// A plugin window's tab: its tool window.
+    fn plugin_tool(&self) -> Option<ToolKey> {
+        match self {
+            TabItem::Plugin(key, _) => Some(*key),
+            _ => None,
+        }
+    }
+
     fn entity_id(&self) -> EntityId {
         match self {
             TabItem::Editor(editor) => editor.entity_id(),
@@ -391,6 +404,7 @@ impl TabItem {
             TabItem::Log(view) => view.entity_id(),
             TabItem::Claude(chat) => chat.entity_id(),
             TabItem::Image(view) => view.entity_id(),
+            TabItem::Plugin(_, view) => view.entity_id(),
         }
     }
 
@@ -403,6 +417,7 @@ impl TabItem {
             TabItem::Diff(view) => view.focus_handle(cx),
             TabItem::Merge(view) => view.focus_handle(cx),
             TabItem::Image(view) => view.focus_handle(cx),
+            TabItem::Plugin(_, view) => view.focus_handle(cx),
         }
     }
 
@@ -412,9 +427,11 @@ impl TabItem {
             TabItem::Editor(editor) => is_modified(editor, cx),
             TabItem::Diff(view) => owned_editor(view, cx).is_some_and(|e| is_modified(&e, cx)),
             TabItem::Merge(view) => view.read(cx).is_modified(cx),
-            TabItem::Terminal(_) | TabItem::Log(_) | TabItem::Claude(_) | TabItem::Image(_) => {
-                false
-            }
+            TabItem::Terminal(_)
+            | TabItem::Log(_)
+            | TabItem::Claude(_)
+            | TabItem::Image(_)
+            | TabItem::Plugin(..) => false,
         }
     }
 }
@@ -443,6 +460,9 @@ struct Modal {
     previous_focus: Option<FocusHandle>,
     /// Shown at this window point (rename, under its symbol) instead of the top center.
     anchor: Option<Point<Pixels>>,
+    /// The overlay's corner at `anchor`: its top left (under a symbol) or its bottom left (above
+    /// a status bar item, part 10.3).
+    anchor_corner: Corner,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1043,6 +1063,118 @@ impl Workspace {
         }
     }
 
+    /// The tabs a context keeps (part 10.3, [`crate::task_contexts`]): the documents and pictures,
+    /// as the project's state keeps them, and Claude's chats in the editor's tabs by their sessions.
+    pub(crate) fn context_tabs(&self, cx: &App) -> crate::task_contexts::Tabs {
+        let state = self.capture_state(cx);
+        let mut chats = Vec::new();
+        let mut active_chat = None;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let Some(chat) = tab.item.claude() else {
+                continue;
+            };
+            let session = chat.read(cx).session().read(cx);
+            let Some(id) = session.session_id() else {
+                continue;
+            };
+            if index == self.active {
+                active_chat = Some(id.to_string());
+            }
+            chats.push(crate::task_contexts::SavedChat {
+                session: id.to_string(),
+                title: session.title().to_string(),
+            });
+        }
+        crate::task_contexts::Tabs {
+            files: state.tabs,
+            active: state.active,
+            chats,
+            active_chat,
+        }
+    }
+
+    /// Closes the tabs a context switch takes away (part 10.3): documents without unsaved changes,
+    /// pictures, and Claude's chats in tabs whose sessions aren't working (they end; a context
+    /// brings them back). Documents with changes, running chats, terminals, diffs and merges stay.
+    pub(crate) fn close_context_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut sessions = Vec::new();
+        for index in (0..self.tabs.len()).rev() {
+            let close = match &self.tabs[index].item {
+                TabItem::Editor(editor) => !is_modified(editor, cx),
+                TabItem::Image(_) => true,
+                TabItem::Claude(chat) => {
+                    let session = chat.read(cx).session().clone();
+                    if !session.read(cx).model().is_working() {
+                        sessions.push(session);
+                    }
+                    false
+                }
+                _ => false,
+            };
+            if close {
+                self.remove_tab_at(index, window, cx);
+            }
+        }
+        // A chat's tab goes with its session (`ClaudeStoreEvent::SessionRemoved`).
+        for session in sessions {
+            self.claude
+                .update(cx, |store, cx| store.close_session(&session, cx));
+        }
+        self.schedule_state_save(cx);
+        cx.notify();
+    }
+
+    /// Opens a context's documents and pictures (part 10.3): read in the background, then tabs after
+    /// the open ones, with their carets and scroll; the one that was active comes forward — or the
+    /// chat of `active_chat`, when it is back already.
+    pub(crate) fn open_saved_tabs(
+        &mut self,
+        tabs: Vec<SavedTab>,
+        active: Option<usize>,
+        active_chat: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if tabs.is_empty() {
+            return;
+        }
+        self.loading += 1;
+        let paths: Vec<PathBuf> = tabs.iter().map(|tab| tab.path.clone()).collect();
+        let read = cx.background_executor().spawn(async move {
+            paths
+                .into_iter()
+                .map(|path| {
+                    if image_view::is_image(&path) {
+                        let reason = "a picture".into();
+                        return Err(OpenError { path, reason });
+                    }
+                    read_document(path)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let results = read.await;
+            this.update_in(cx, |this, window, cx| {
+                this.loading -= 1;
+                this.restore_tabs(&tabs, active, results, window, cx);
+                // A chat was the active tab: it stays so when it came back first.
+                let chat = active_chat.as_deref().and_then(|id| {
+                    this.tabs.iter().position(|tab| {
+                        tab.item.claude().is_some_and(|chat| {
+                            chat.read(cx).session().read(cx).session_id() == Some(id)
+                        })
+                    })
+                });
+                if let Some(index) = chat {
+                    this.activate(index, window, cx);
+                }
+                this.schedule_state_save(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn layout_key(&self) -> LayoutKey {
         LayoutKey {
             tabs: self.tabs.iter().map(|tab| tab.item.entity_id()).collect(),
@@ -1211,7 +1343,8 @@ impl Workspace {
                 | TabItem::Merge(_)
                 | TabItem::Log(_)
                 | TabItem::Claude(_)
-                | TabItem::Image(_) => None,
+                | TabItem::Image(_)
+                | TabItem::Plugin(..) => None,
             };
             if let Some(editor) = editor
                 && !editors.contains(&editor)
@@ -1229,7 +1362,9 @@ impl Workspace {
             TabItem::Diff(view) => Some(view.read(cx).path().to_path_buf()),
             TabItem::Merge(view) => Some(view.read(cx).path().to_path_buf()),
             TabItem::Image(view) => view.read(cx).path().map(Path::to_path_buf),
-            TabItem::Terminal(_) | TabItem::Log(_) | TabItem::Claude(_) => None,
+            TabItem::Terminal(_) | TabItem::Log(_) | TabItem::Claude(_) | TabItem::Plugin(..) => {
+                None
+            }
         }
     }
 
@@ -1269,6 +1404,16 @@ impl Workspace {
         let item = tab.item.clone();
         window.focus(&item.focus_handle(cx));
         self.active = index;
+        // A plugin's tab is drawn only while it is the active one: its elements' places (a picker
+        // under one) count then.
+        for (position, tab) in self.tabs.iter().enumerate() {
+            if let TabItem::Plugin(_, view) = &tab.item {
+                let shown = position == index;
+                if view.read(cx).is_visible() != shown {
+                    view.update(cx, |view, cx| view.set_visible(shown, cx));
+                }
+            }
+        }
         self.tab_scroll.scroll_to_item(index);
         self.status_message = None;
         if let TabItem::Terminal(group) = &item {
@@ -1495,7 +1640,15 @@ impl Workspace {
         if index >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(index);
+        let tab = self.tabs.remove(index);
+        // A plugin's window closed with its tab: the plugin hears `tool-window-hidden`.
+        if let TabItem::Plugin(key, view) = &tab.item {
+            view.update(cx, |view, cx| view.set_visible(false, cx));
+            let key = *key;
+            self.plugins
+                .update(cx, |store, _| store.tool_window_visibility(key, false));
+        }
+        drop(tab);
         if self.tabs.is_empty() {
             self.active = 0;
             window.focus(&self.focus_handle);
@@ -1971,7 +2124,8 @@ impl Workspace {
                 | TabItem::Merge(_)
                 | TabItem::Log(_)
                 | TabItem::Claude(_)
-                | TabItem::Image(_),
+                | TabItem::Image(_)
+                | TabItem::Plugin(..),
             ) => {
                 self.status_message = Some(message);
                 self.status_message_task = Some(cx.spawn(async move |this, cx| {
@@ -2023,7 +2177,48 @@ impl Workspace {
                     self.remove_tab_at(index, window, cx);
                 }
             }
+            TabItem::Plugin(key, _) => {
+                if let Some(index) = self.index_of_plugin_tab(key) {
+                    self.remove_tab_at(index, window, cx);
+                }
+            }
         }
+    }
+
+    /// The tab of a plugin's window in the editor.
+    fn index_of_plugin_tab(&self, key: ToolKey) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.item.plugin_tool() == Some(key))
+    }
+
+    /// Opens a plugin's window that lives in the editor as a tab after the active one, or brings
+    /// its tab forward; the plugin hears `tool-window-shown` when it opens.
+    fn show_plugin_tab(&mut self, key: ToolKey, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.index_of_plugin_tab(key) {
+            return self.activate(index, window, cx);
+        }
+        let Some(view) = self.plugin_tool_view(key, cx) else {
+            return;
+        };
+        self.insert_tab(TabItem::Plugin(key, view), Vec::new(), None, window, cx);
+        self.plugins
+            .update(cx, |store, _| store.tool_window_visibility(key, true));
+    }
+
+    /// Closes a plugin window's tab (`ui.hide`); the plugin hears `tool-window-hidden`.
+    fn hide_plugin_tab(&mut self, key: ToolKey, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.index_of_plugin_tab(key) {
+            self.remove_tab_at(index, window, cx);
+        }
+    }
+
+    /// Whether a plugin's tool window lives among the editor's tabs.
+    fn plugin_tool_in_editor(&self, key: ToolKey, cx: &App) -> bool {
+        self.plugins
+            .read(cx)
+            .tool_window(key)
+            .is_some_and(|tool| tool.in_editor())
     }
 
     /// Closes a diff; the working copy it opened without a tab is asked about if it has unsaved
@@ -2787,13 +2982,16 @@ impl Workspace {
     }
 
     /// A plugin's tool window: its launchpad icon, its keys, the palette — shows it focused, or
-    /// hides it.
+    /// hides it. A window in the editor opens as a tab, or its tab comes forward.
     pub(crate) fn toggle_plugin_tool(
         &mut self,
         key: ToolKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.plugin_tool_in_editor(key, cx) {
+            return self.show_plugin_tab(key, window, cx);
+        }
         if self.right_tool == Some(RightTool::Plugin(key)) {
             return self.hide_right(window, cx);
         }
@@ -2833,15 +3031,30 @@ impl Workspace {
                     self.right_tool = None;
                     self.focus_active(window, cx);
                 }
+                // And its tabs in the editor (turned off, uninstalled, a window gone from the
+                // manifest of a plugin under development).
+                let gone: Vec<ToolKey> = self
+                    .tabs
+                    .iter()
+                    .filter_map(|tab| tab.item.plugin_tool())
+                    .filter(|key| self.plugin_tool_view(*key, cx).is_none())
+                    .collect();
+                for key in gone {
+                    self.hide_plugin_tab(key, window, cx);
+                }
                 cx.notify();
             }
             PluginStoreEvent::ShowToolWindow(key) => {
-                if self.right_tool != Some(RightTool::Plugin(*key)) {
+                if self.plugin_tool_in_editor(*key, cx) {
+                    self.show_plugin_tab(*key, window, cx);
+                } else if self.right_tool != Some(RightTool::Plugin(*key)) {
                     self.show_right(RightTool::Plugin(*key), window, cx);
                 }
             }
             PluginStoreEvent::HideToolWindow(key) => {
-                if self.right_tool == Some(RightTool::Plugin(*key)) {
+                if self.plugin_tool_in_editor(*key, cx) {
+                    self.hide_plugin_tab(*key, window, cx);
+                } else if self.right_tool == Some(RightTool::Plugin(*key)) {
                     self.hide_right(window, cx);
                 }
             }
@@ -2849,8 +3062,10 @@ impl Workspace {
                 plugins::handle_call(self, plugin, call, window, cx)
             }
             PluginStoreEvent::PluginStopped(plugin) => {
+                crate::plugin_picker::plugin_stopped(self, plugin, window, cx);
                 crate::plugin_terminals::plugin_stopped(self, plugin, cx);
                 crate::plugin_review::plugin_stopped(self, plugin, window, cx);
+                crate::plugin_links::forget(self.plugins.entity_id(), plugin, cx);
             }
         }
     }
@@ -3745,6 +3960,7 @@ impl Workspace {
             focus_handle,
             previous_focus,
             anchor: None,
+            anchor_corner: Corner::TopLeft,
             _subscriptions: subscriptions,
         });
         cx.notify();
@@ -3767,9 +3983,24 @@ impl Workspace {
     /// Shows the open overlay window at a window point instead of the top center: a popover at the
     /// text it is about (rename). It stays within the window.
     pub fn anchor_modal(&mut self, anchor: Point<Pixels>) {
+        self.anchor_modal_at(anchor, Corner::TopLeft);
+    }
+
+    /// [`Self::anchor_modal`] with the overlay's `corner` at the point: `BottomLeft` opens it
+    /// above a status bar item, as JetBrains' status bar popups (part 10.3).
+    pub(crate) fn anchor_modal_at(&mut self, anchor: Point<Pixels>, corner: Corner) {
         if let Some(modal) = &mut self.modal {
             modal.anchor = Some(anchor);
+            modal.anchor_corner = corner;
         }
+    }
+
+    /// The open overlay window, when it is a `V` (a plugin's picker getting new items, part
+    /// 10.3).
+    pub(crate) fn modal_view<V: 'static>(&self) -> Option<Entity<V>> {
+        self.modal
+            .as_ref()
+            .and_then(|modal| modal.view.clone().downcast::<V>().ok())
     }
 
     /// Closes the overlay window. Focus returns to its previous place only if it was inside the
@@ -3798,7 +4029,11 @@ impl Workspace {
 
     fn render_modal(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let modal = self.modal.as_ref()?;
+        // The popup takes the mouse: a click on its row must not reach what lies under it (a
+        // plugin's board tab, a tree) — that would take the focus and close the popup before the
+        // click's mouse-up chose the row.
         let view = div()
+            .occlude()
             .when(modal.kind == ModalKind::Popup, |view| {
                 view.on_mouse_down_out(
                     cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)),
@@ -3826,6 +4061,7 @@ impl Workspace {
         Some(match modal.anchor {
             Some(anchor) => deferred(
                 anchored()
+                    .anchor(modal.anchor_corner)
                     .position(anchor)
                     .snap_to_window_with_margin(px(ui::GAP))
                     .child(view),
@@ -3912,6 +4148,7 @@ impl Workspace {
                 format!("{} — {project}", chat.read(cx).session().read(cx).title())
             }
             Some(TabItem::Image(view)) => format!("{} — {project}", view.read(cx).title()),
+            Some(TabItem::Plugin(_, view)) => format!("{} — {project}", view.read(cx).title()),
             None => project.clone(),
         };
         if title != self.title {
@@ -4142,7 +4379,7 @@ impl Workspace {
                     return bar.child(div().flex_1().min_w_0().truncate().child(path));
                 }
             },
-            Some(TabItem::Log(_) | TabItem::Claude(_)) => {
+            Some(TabItem::Log(_) | TabItem::Claude(_) | TabItem::Plugin(..)) => {
                 let left: SharedString = self.status_message.clone().unwrap_or_default();
                 return bar
                     .child(div().flex_1().min_w_0().truncate().child(left))
@@ -4234,7 +4471,6 @@ impl Workspace {
                 Some(editor_id),
                 ui,
             ))
-            .children(plugins::status_bar_items(self, cx))
             .child(item(status.line_ending.to_string()).text_color(ui.dim))
     }
 
@@ -4278,7 +4514,6 @@ impl Workspace {
                 )
                 .children(directory.map(|directory| div().truncate().child(directory))),
         )
-        .children(plugins::status_bar_items(self, cx))
     }
 
     /// Display path: relative to the project root, or with `~` outside it.
@@ -4313,6 +4548,9 @@ impl Workspace {
                 TabItem::Log(view) => self.render_log_tab(index, view, cx).into_any_element(),
                 TabItem::Claude(chat) => self.render_claude_tab(index, chat, cx).into_any_element(),
                 TabItem::Image(view) => self.render_image_tab(index, view, cx).into_any_element(),
+                TabItem::Plugin(key, view) => self
+                    .render_plugin_tab(index, *key, view, cx)
+                    .into_any_element(),
             })
             .collect();
         // While a tab is dragged over the strip: a marker where it would land.
@@ -4620,6 +4858,55 @@ impl Workspace {
             .child(close_button(TabItem::Image(view.clone()), active, None, cx))
     }
 
+    /// A plugin window's tab: the window's icon (the plugin's own, else a puzzle piece) and its
+    /// title (`ui.set-title`).
+    fn render_plugin_tab(
+        &self,
+        index: usize,
+        key: ToolKey,
+        view: &Entity<PluginView>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        let active = index == self.active;
+        let title = view.read(cx).title();
+        let icon_path = self
+            .plugins
+            .read(cx)
+            .tool_window(key)
+            .and_then(|tool| tool.icon.clone())
+            .unwrap_or_else(|| IconName::Puzzle.path().into());
+        tab_shell(view.entity_id(), active, ui)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    if let Some(index) = this.index_of_plugin_tab(key) {
+                        this.activate(index, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    this.hide_plugin_tab(key, window, cx)
+                }),
+            )
+            .child(
+                gpui::svg()
+                    .path(icon_path)
+                    .size(px(14.))
+                    .flex_none()
+                    .text_color(ui.accent),
+            )
+            .child(label(&title))
+            .child(close_button(
+                TabItem::Plugin(key, view.clone()),
+                active,
+                None,
+                cx,
+            ))
+    }
+
     /// The merge tool's tab: the file name, "merge", a dot while the result isn't applied.
     fn render_merge_tab(
         &self,
@@ -4834,6 +5121,7 @@ impl Render for Workspace {
             .map(|root| crate::plugins::workspace_actions(root, cx))
             .map(|root| crate::quick_switch::workspace_actions(root, cx))
             .map(|root| crate::editor_menu::workspace_actions(root, cx))
+            .map(|root| crate::task_contexts::workspace_actions(root, cx))
             .map(|root| Self::claude_actions(root, claude_chat, claude_in_tab, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
                 this.open_project(action.0.clone(), Vec::new(), window, cx)
@@ -5062,6 +5350,7 @@ impl Render for Workspace {
                     TabItem::Log(view) => view.clone().into_any_element(),
                     TabItem::Claude(chat) => chat.clone().into_any_element(),
                     TabItem::Image(view) => view.clone().into_any_element(),
+                    TabItem::Plugin(_, view) => view.clone().into_any_element(),
                 };
                 // A file Flux has no language for, while the catalog has one: the banner of a
                 // plugin to install, as JetBrains IDEs suggest one (stage 8.3).
@@ -5213,6 +5502,9 @@ impl Render for Workspace {
                     .flex()
                     .items_center()
                     .child(div().flex_1().min_w_0().child(self.render_status_bar(cx)))
+                    // The plugins' items stay whatever the tab (part 10.3): the active task, the
+                    // next meeting.
+                    .children(plugins::status_bar_items(self, cx))
                     .children(self.render_claude_status(cx))
                     .child(self.render_bell(cx)),
             )
@@ -6377,6 +6669,10 @@ impl Workspace {
                         item,
                         _subscriptions: subscriptions,
                     });
+                    // The active tab of a context coming back (part 10.3).
+                    if active {
+                        self.activate(self.tabs.len() - 1, window, cx);
+                    }
                 }
             }
         }

@@ -1509,7 +1509,14 @@ impl GitLogView {
                             .truncate()
                             .text_color(ui.foreground)
                             .when(head, |text| text.font_weight(FontWeight::MEDIUM))
-                            .child(commit.summary.clone()),
+                            // Plugins' links (part 10.3): `TRACK-142` goes to its task.
+                            .child(crate::plugin_links::linked_plain(
+                                ("git-log-summary", index),
+                                commit.summary.clone().into(),
+                                summary_font(head),
+                                ui.foreground,
+                                cx,
+                            )),
                     )
                     .children(renamed.map(|path| div().flex_none().text_color(ui.dim).child(path))),
             )
@@ -1690,7 +1697,7 @@ fn parse_day(text: &str) -> Option<i64> {
 }
 
 /// A commit's date in the log: "Today 14:05", "Yesterday 09:30", "2025-03-14 10:00".
-fn format_time(now: i64, time: i64) -> String {
+pub(crate) fn format_time(now: i64, time: i64) -> String {
     let local = time + local_offset(time);
     let today = (now + local_offset(now)).div_euclid(86_400);
     let day = local.div_euclid(86_400);
@@ -1823,6 +1830,15 @@ pub fn relative_in_repo(git: &GitStore, path: &std::path::Path) -> Option<(usize
     Some((repo, relative.to_string_lossy().replace('\\', "/")))
 }
 
+/// The font of a commit's summary in its row: the UI font, a little heavier for HEAD.
+fn summary_font(head: bool) -> gpui::Font {
+    let mut summary = gpui::font(theme::UI_FONT);
+    if head {
+        summary.weight = FontWeight::MEDIUM;
+    }
+    summary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1869,3 +1885,4 @@ mod tests {
         assert!(matches!(right, DiffSide::Revision { ref path, .. } if path == "docs/journal.md"));
     }
 }
+

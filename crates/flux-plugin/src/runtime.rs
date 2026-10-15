@@ -8,7 +8,9 @@
 //! [`MEMORY_LIMIT`] stops the instance: [`MessageKind::Stopped`] says why, and the window offers
 //! to restart it. The limit is on the plugin's own time: what a call waits for inside the API (a
 //! response, a program, the window — `HostState::waited`) is given back by the epoch's callback.
-//! Components are compiled by Cranelift once and cached in `paths::cache_dir()`.
+//! Components are compiled by Cranelift once and cached in `paths::cache_dir()`. A component built
+//! for an older API (0.2) is linked and called through its own bindings ([`crate::compat`]); the
+//! manifest's `api` must name the version the component imports.
 //!
 //! The sandbox is WASI 0.2: the project root (as the manifest's `project` permission says), the
 //! folders outside the project its `folders` permission lists and the plugin's data folder, each at
@@ -37,12 +39,17 @@ use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::api::bindings::Plugin;
 use crate::api::diagnostics::{Diagnostic, FileDiagnostics};
-use crate::api::dialogs::{Question, TextQuestion};
+use crate::api::claude::SessionSpec;
+use crate::api::contexts::ContextRef;
+use crate::api::dialogs::{Form, Question, TextQuestion};
 use crate::api::editors::TextEdit;
 use crate::api::events::Event;
-use crate::api::git::{Change, Repository};
+use crate::api::git::{Branch, Change, CommitTemplate, Repository};
+use crate::api::links::LinkPattern;
 use crate::api::notifications::{Notification, Progress};
+use crate::api::picker::{PickerItem, PickerSpec};
 use crate::api::review::Proposal;
+use crate::api::settings::SettingStatus;
 use crate::api::status_bar::StatusItem;
 use crate::api::terminal::TerminalOptions;
 use crate::api::types::{CommandContext, EditorInfo, Range};
@@ -213,6 +220,41 @@ pub enum HostCall {
         id: u64,
         question: TextQuestion,
     },
+    /// A dialog with fields (`dialogs.ask-form`); the answer goes back as
+    /// `Event::FormAnswered(id, …)`.
+    AskForm {
+        id: u64,
+        form: Form,
+    },
+    /// `picker.open`: a popup list; the choice goes back as `Event::PickerChosen(id, …)`, the
+    /// query of a live one as `Event::PickerQuery(id, …)`. Opening one closes the plugin's
+    /// previous picker (with `PickerChosen(previous, None)`).
+    OpenPicker {
+        id: u64,
+        spec: PickerSpec,
+    },
+    /// `picker.update`: new items of an open picker.
+    UpdatePicker {
+        id: u64,
+        items: Vec<PickerItem>,
+        loading: bool,
+    },
+    /// `picker.close`: closes it without a choice.
+    ClosePicker {
+        id: u64,
+    },
+    /// `settings.set`: the value (checked against the manifest already) for `settings.json`;
+    /// none — back to the default. The window doesn't tell the plugin `settings-changed` back.
+    SetSetting {
+        key: String,
+        value: Option<Value>,
+    },
+    /// `settings.set-status`: a `status` line of the plugin's settings page; none — the manifest's
+    /// text.
+    SetSettingStatus {
+        key: String,
+        status: Option<SettingStatus>,
+    },
     SetCommandEnabled {
         command: String,
         enabled: bool,
@@ -230,6 +272,11 @@ pub enum HostCall {
     },
     HideToolWindow {
         window: String,
+    },
+    /// `ui.set-title` (API 0.3): the window's title in its header or tab; empty — the manifest's.
+    SetToolWindowTitle {
+        window: String,
+        title: String,
     },
     /// A call about documents: the plugin's thread waits for the reply.
     Editor {
@@ -285,6 +332,43 @@ pub enum WindowCall {
     OpenUrl(String),
     /// `system.copy-text`: no reply.
     CopyText(String),
+    /// `system.open-settings`: Settings on the plugin's page; no reply.
+    OpenSettings,
+    /// `git.branches` (the work tree's root) → `Branches`.
+    GitBranches(String),
+    /// `git.new-branch` (`project = "write"` checked): no reply; how it ended goes back as
+    /// `Event::GitDone(id, …)` — after Flux's own questions (Smart Checkout) and messages.
+    GitNewBranch {
+        id: u64,
+        root: String,
+        name: String,
+        start: Option<String>,
+    },
+    /// `git.checkout`: as `GitNewBranch`.
+    GitCheckout {
+        id: u64,
+        root: String,
+        branch: String,
+    },
+    /// `git.set-commit-template`: no reply.
+    SetCommitTemplate(Option<CommitTemplate>),
+    /// `links.set-patterns` → `Done` (an error names a regex that doesn't compile).
+    SetLinkPatterns(Vec<LinkPattern>),
+    /// `links.describe`: the tooltip of a hovered link (`Event::LinkHovered`); no reply.
+    DescribeLink {
+        request: u64,
+        markdown: Option<String>,
+    },
+    /// `claude.new-session` (the `claude` permission checked) → `Done`.
+    NewClaudeSession(SessionSpec),
+    /// `contexts.switch` → `Done`. The keys are the plugin's own: the window keeps them apart
+    /// from other plugins' and the user's.
+    SwitchContext {
+        save: Option<ContextRef>,
+        load: Option<String>,
+    },
+    /// `contexts.remove`: no reply.
+    RemoveContext(String),
 }
 
 /// The window's reply to a [`WindowCall`].
@@ -297,6 +381,7 @@ pub enum WindowReply {
     Changes(Vec<Change>),
     Text(Result<String, String>),
     Diagnostics(Vec<FileDiagnostics>),
+    Branches(Result<Vec<Branch>, String>),
 }
 
 /// Posts events into a plugin's own queue: the API's background work (a started request, the
@@ -361,6 +446,8 @@ fn shared() -> Result<&'static Shared, String> {
             wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|err| format!("{err:#}"))?;
             Plugin::add_to_linker::<State, HasSelf<State>>(&mut linker, |state| state)
                 .map_err(|err| format!("{err:#}"))?;
+            // Plugins built for an older API: its names, answered by the same code.
+            crate::compat::add_to_linker(&mut linker).map_err(|err| format!("{err:#}"))?;
             // The clock of the time limit: deadlines are counted in ticks of the epoch. The engine
             // lives as long as the process, and so does its clock.
             let ticker = engine.clone();
@@ -575,9 +662,9 @@ fn run(
         };
         let result = match call {
             Call::Command(command, context) => {
-                runner.call(|plugin, store| plugin.call_run_command(store, &command, &context))
+                runner.call(|plugin, store| plugin.run_command(store, &command, &context))
             }
-            Call::Event(event) => runner.call(|plugin, store| plugin.call_on_event(store, &event)),
+            Call::Event(event) => runner.call(|plugin, store| plugin.on_event(store, &event)),
             Call::Settings(settings) => {
                 runner.store.data_mut().host.settings = settings;
                 Ok(())
@@ -602,7 +689,8 @@ fn run(
 }
 
 /// Puts a call into the queue; a document's `editor-changed` or `selection-changed`, or a timer's
-/// tick, already waiting there makes a new one unnecessary.
+/// tick, already waiting there makes a new one unnecessary; a picker's query waiting there is
+/// replaced by the newer one (the plugin searches for what the user typed last).
 fn enqueue(queue: &mut VecDeque<Call>, call: Call) {
     let waiting = |event: &Event| {
         queue.iter().any(|queued| match queued {
@@ -617,13 +705,71 @@ fn enqueue(queue: &mut VecDeque<Call>, call: Call) {
     {
         return;
     }
+    if let Call::Event(Event::PickerQuery((picker, _))) = &call {
+        let older = queue.iter_mut().find(|queued| {
+            matches!(queued, Call::Event(Event::PickerQuery((queued, _))) if queued == picker)
+        });
+        if let Some(older) = older {
+            *older = call;
+            return;
+        }
+    }
     queue.push_back(call);
+}
+
+/// The exports of a plugin's component, by the API version it was built for.
+enum Exports {
+    Current(Plugin),
+    /// Built for 0.2: called through its bindings, with the values converted
+    /// ([`crate::compat`]).
+    V0_2(crate::compat::bindings::Plugin),
+}
+
+impl Exports {
+    fn activate(&self, store: &mut Store<State>) -> wasmtime::Result<()> {
+        match self {
+            Exports::Current(plugin) => plugin.call_activate(store),
+            Exports::V0_2(plugin) => plugin.call_activate(store),
+        }
+    }
+
+    fn deactivate(&self, store: &mut Store<State>) -> wasmtime::Result<()> {
+        match self {
+            Exports::Current(plugin) => plugin.call_deactivate(store),
+            Exports::V0_2(plugin) => plugin.call_deactivate(store),
+        }
+    }
+
+    fn run_command(
+        &self,
+        store: &mut Store<State>,
+        command: &str,
+        context: &CommandContext,
+    ) -> wasmtime::Result<()> {
+        match self {
+            Exports::Current(plugin) => plugin.call_run_command(store, command, context),
+            Exports::V0_2(plugin) => {
+                plugin.call_run_command(store, command, &crate::compat::command_context(context))
+            }
+        }
+    }
+
+    fn on_event(&self, store: &mut Store<State>, event: &Event) -> wasmtime::Result<()> {
+        match self {
+            Exports::Current(plugin) => plugin.call_on_event(store, event),
+            Exports::V0_2(plugin) => match crate::compat::event(event) {
+                Some(event) => plugin.call_on_event(store, &event),
+                // A 0.3 event: the plugin can't have asked for it.
+                None => Ok(()),
+            },
+        }
+    }
 }
 
 /// The plugin's store and instance; without code — neither, and calls do nothing.
 struct Runner {
     store: Store<State>,
-    plugin: Option<Plugin>,
+    plugin: Option<Exports>,
     component: Option<Component>,
     config: Arc<RunnerConfig>,
     stdout: LogStream,
@@ -692,23 +838,50 @@ impl Runner {
         Ok(runner)
     }
 
-    /// Instantiates the component in the store and calls `activate`.
+    /// Instantiates the component in the store — through the bindings of the API version the
+    /// manifest names, which must be the one the component was built for — and calls `activate`.
     fn instantiate(&mut self) -> Result<(), Stop> {
         let Some(component) = &self.component else {
             return Ok(());
         };
         let shared = shared().map_err(|err| Stop::new("Plugins can't run", err))?;
+        let api = self.config.entry.manifest.api.as_str();
+        if !crate::supports_api(api) {
+            return Err(Stop::new(
+                format!(
+                    "Built for plugin API {api}; this Flux runs {}",
+                    crate::SUPPORTED_API_VERSIONS.join(", ")
+                ),
+                String::new(),
+            ));
+        }
+        if let Some(built) = crate::compat::built_for(component, &shared.engine)
+            && built != api
+        {
+            return Err(Stop::new(
+                format!(
+                    "The component is built for plugin API {built}, but flux-plugin.toml says \
+                     api = \"{api}\""
+                ),
+                String::new(),
+            ));
+        }
         start_clock(&mut self.store, self.config.entry.id());
-        let plugin = Plugin::instantiate(&mut self.store, component, &shared.linker)
-            .map_err(|err| self.stop(&err, "Couldn't load"))?;
+        let plugin = if api == crate::compat::API {
+            crate::compat::bindings::Plugin::instantiate(&mut self.store, component, &shared.linker)
+                .map(Exports::V0_2)
+        } else {
+            Plugin::instantiate(&mut self.store, component, &shared.linker).map(Exports::Current)
+        };
+        let plugin = plugin.map_err(|err| self.stop(&err, "Couldn't load"))?;
         self.plugin = Some(plugin);
-        self.call(|plugin, store| plugin.call_activate(store))
+        self.call(|plugin, store| plugin.activate(store))
     }
 
     /// Calls an export within the time limit; a trap ends the plugin.
     fn call(
         &mut self,
-        f: impl FnOnce(&Plugin, &mut Store<State>) -> wasmtime::Result<()>,
+        f: impl FnOnce(&Exports, &mut Store<State>) -> wasmtime::Result<()>,
     ) -> Result<(), Stop> {
         let Some(plugin) = &self.plugin else {
             return Ok(());
@@ -784,7 +957,7 @@ impl Runner {
         if self.plugin.is_none() {
             return;
         }
-        if let Err(stop) = self.call(|plugin, store| plugin.call_deactivate(store)) {
+        if let Err(stop) = self.call(|plugin, store| plugin.deactivate(store)) {
             self.config
                 .log
                 .write(Level::Warn, &format!("deactivate failed: {}", stop.error));
@@ -998,5 +1171,34 @@ mod tests {
         assert_eq!(seconds(Duration::from_secs(10)), "10 s");
         assert_eq!(seconds(Duration::from_millis(300)), "300 ms");
         assert_eq!(seconds(Duration::from_millis(1500)), "1.5 s");
+    }
+
+    fn events(queue: &VecDeque<Call>) -> Vec<Event> {
+        queue
+            .iter()
+            .filter_map(|call| match call {
+                Call::Event(event) => Some(event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pickers_newer_query_replaces_the_waiting_one() {
+        let mut queue = VecDeque::new();
+        enqueue(&mut queue, Call::Event(Event::PickerQuery((1, "t".into()))));
+        enqueue(&mut queue, Call::Event(Event::Timer(9)));
+        enqueue(&mut queue, Call::Event(Event::PickerQuery((2, "x".into()))));
+        enqueue(&mut queue, Call::Event(Event::PickerQuery((1, "tr".into()))));
+        enqueue(&mut queue, Call::Event(Event::Timer(9)));
+        enqueue(&mut queue, Call::Event(Event::PickerQuery((1, "tra".into()))));
+        assert_eq!(
+            events(&queue),
+            vec![
+                Event::PickerQuery((1, "tra".into())),
+                Event::Timer(9),
+                Event::PickerQuery((2, "x".into())),
+            ]
+        );
     }
 }

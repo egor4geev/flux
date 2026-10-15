@@ -6,7 +6,6 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use crate::API_VERSION;
 use crate::locales::Locales;
 use crate::manifest::Manifest;
 
@@ -214,10 +213,11 @@ pub fn load_bundled(bundled: &Bundled) -> Result<PluginEntry, String> {
 
 fn entry(manifest: Manifest, files: PluginFiles, source: PluginSource) -> PluginEntry {
     let locales = Locales::load(&files);
-    let problem = if manifest.api != API_VERSION {
+    let problem = if !crate::supports_api(&manifest.api) {
         Some(format!(
-            "Built for plugin API {}; this Flux has {API_VERSION}",
-            manifest.api
+            "Built for plugin API {}; this Flux runs {}",
+            manifest.api,
+            crate::SUPPORTED_API_VERSIONS.join(", ")
         ))
     } else {
         match &manifest.wasm {
@@ -253,7 +253,7 @@ mod tests {
     fn folder(parent: &Path, id: &str, name: &str, wasm: bool) -> PathBuf {
         let dir = parent.join(id);
         std::fs::create_dir_all(dir.join("locales")).unwrap();
-        std::fs::write(dir.join(MANIFEST), manifest(id, name, API_VERSION)).unwrap();
+        std::fs::write(dir.join(MANIFEST), manifest(id, name, crate::API_VERSION)).unwrap();
         if wasm {
             std::fs::write(dir.join("plugin.wasm"), b"\0asm").unwrap();
         }

@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
-use crate::API_VERSION;
 use crate::manifest::{Manifest, ManifestError};
 
 /// The version of the index's format Flux reads.
@@ -64,7 +63,7 @@ pub struct IndexEntry {
     pub id: String,
     pub name: String,
     pub version: String,
-    /// The plugin API version (`"0.2"`): Flux installs only the ones it runs.
+    /// The plugin API version (`"0.3"`): Flux installs only the ones it runs.
     pub api: String,
     #[serde(default)]
     pub description: String,
@@ -152,7 +151,7 @@ impl IndexEntry {
 
     /// Flux runs this plugin's API version.
     pub fn compatible(&self) -> bool {
-        self.api == API_VERSION
+        crate::supports_api(&self.api)
     }
 
     /// A string of the plugin (its name, its description) in `language` ("ru"); the English text
@@ -554,13 +553,14 @@ mod tests {
             id: id.into(),
             name: id.into(),
             version: version.into(),
-            api: API_VERSION.into(),
+            api: crate::API_VERSION.into(),
             description: String::new(),
             authors: Vec::new(),
             repository: None,
             categories: vec![Category::Languages],
             manifest: format!(
-                "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\napi = \"{API_VERSION}\"\n"
+                "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\napi = \"{}\"\n",
+                crate::API_VERSION
             ),
             download: String::new(),
             sha256: String::new(),

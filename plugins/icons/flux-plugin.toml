@@ -6,7 +6,7 @@
 id = "flux.icons"
 name = "Flux Icons"
 version = "0.1.0"
-api = "0.2"
+api = "0.3"
 authors = ["Egor Ageev"]
 description = "Flux's own file icons: a glyph for every common kind of file, in the colors of the theme."
 repository = "https://github.com/egor4geev/flux"

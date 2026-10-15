@@ -2020,6 +2020,7 @@ dependencies = [
  "gpui",
  "image",
  "objc",
+ "regex",
  "resvg",
  "serde_json",
  "toml 1.1.6+spec-1.1.0",
