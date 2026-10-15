@@ -5547,6 +5547,8 @@ impl Render for Workspace {
                     // next meeting.
                     .children(plugins::status_bar_items(self, cx))
                     .children(self.render_claude_status(cx))
+                    // An update of Flux on its way (part 10.8): the download, a restart to finish.
+                    .children(crate::updates::status_item(cx))
                     .child(self.render_bell(cx)),
             )
             .children(cards)
@@ -5652,6 +5654,16 @@ fn quit_requested(cx: &mut App) {
 /// Claude at work and unsaved documents in turn; declining in any of them cancels the quit — and
 /// answers macOS's request "no", so a logout stops and Flux keeps running.
 fn start_quit(cx: &mut App) {
+    start_quit_then(cx, |_| {});
+}
+
+/// Quits as ⌘Q does, to restart into an update (part 10.8): `cancelled` runs when the user keeps
+/// Flux open in one of the questions (unsaved documents, running commands).
+pub(crate) fn quit_to_update(cx: &mut App, cancelled: impl FnOnce(&mut App) + 'static) {
+    start_quit_then(cx, cancelled);
+}
+
+fn start_quit_then(cx: &mut App, cancelled: impl FnOnce(&mut App) + 'static) {
     let quitting = cx.default_global::<Quitting>();
     // The review in progress answers macOS's request too.
     if quitting.0 {
@@ -5671,6 +5683,7 @@ fn start_quit(cx: &mut App) {
             } else {
                 cx.global_mut::<Quitting>().0 = false;
                 cx.cancel_quit();
+                cancelled(cx);
             }
         })
         .ok();
@@ -7088,6 +7101,18 @@ impl Workspace {
             };
             crate::plugin_menus::append(menu, &plugins, &target, cx)
         });
+        self.show_menu(menu, position, window, cx);
+    }
+
+    /// Shows a context menu at a window point (a tab's, a status bar item's) until it is dismissed;
+    /// the focus comes back to the active item.
+    pub(crate) fn show_menu(
+        &mut self,
+        menu: Entity<crate::context_menu::ContextMenu>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let focus = menu.focus_handle(cx);
         let subscriptions = [
             cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {

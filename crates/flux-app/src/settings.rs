@@ -56,6 +56,9 @@ pub struct Settings {
     pub editor: EditorSettings,
     /// The welcome guide (part 10.7): What's New after an update (`welcome`).
     pub welcome: WelcomeSettings,
+    /// Settings → Updates (part 10.8): checking for new versions of Flux and their channel
+    /// (`updates`).
+    pub updates: UpdateSettings,
     /// The user's settings of language servers (part 10.5), by server name, as written in
     /// `settings.json` (`lsp`): `settings`, `initialization_options`, the command and its arguments
     /// over what the language plugin brings ([`crate::lsp_settings`]).
@@ -134,6 +137,25 @@ pub struct WelcomeSettings {
 impl Default for WelcomeSettings {
     fn default() -> Self {
         Self { whats_new: true }
+    }
+}
+
+/// Updates of Flux (part 10.8, `crate::updates`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateSettings {
+    /// Look for a new version a few seconds after Flux starts and then once a day
+    /// (`updates.check_automatically`).
+    pub check_automatically: bool,
+    /// Stable releases, or betas too (`updates.channel`); a beta build starts on Beta.
+    pub channel: flux_update::Channel,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            check_automatically: true,
+            channel: flux_update::Channel::of(&flux_update::current_version()),
+        }
     }
 }
 
@@ -421,6 +443,7 @@ impl Default for Settings {
             markdown_layout: MarkdownLayout::default(),
             editor: EditorSettings::default(),
             welcome: WelcomeSettings::default(),
+            updates: UpdateSettings::default(),
             lsp: serde_json::Map::new(),
             unknown: serde_json::Map::new(),
             error: None,
@@ -757,6 +780,19 @@ pub fn update_welcome(cx: &mut App, change: impl FnOnce(&mut WelcomeSettings)) {
     save(settings);
 }
 
+/// Settings → Updates (part 10.8).
+pub fn updates(cx: &App) -> UpdateSettings {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.updates.clone())
+        .unwrap_or_default()
+}
+
+pub fn update_updates(cx: &mut App, change: impl FnOnce(&mut UpdateSettings)) {
+    let settings = cx.default_global::<Settings>();
+    change(&mut settings.updates);
+    save(settings);
+}
+
 /// The user's settings of the language server `name` (part 10.5), as written under `lsp` in
 /// `settings.json`; `None` — the language plugin's.
 pub fn lsp_server(name: &str, cx: &App) -> Option<Value> {
@@ -940,6 +976,15 @@ fn parse_value(value: &Value) -> Settings {
             whats_new: value["welcome"]["whats_new"]
                 .as_bool()
                 .unwrap_or(defaults.welcome.whats_new),
+        },
+        updates: UpdateSettings {
+            check_automatically: value["updates"]["check_automatically"]
+                .as_bool()
+                .unwrap_or(defaults.updates.check_automatically),
+            channel: value["updates"]["channel"]
+                .as_str()
+                .and_then(flux_update::Channel::from_key)
+                .unwrap_or(defaults.updates.channel),
         },
         lsp: value["lsp"].as_object().cloned().unwrap_or_default(),
         ..defaults
@@ -1170,6 +1215,10 @@ fn known_json(settings: &Settings) -> Value {
         "markdown": { "layout": settings.markdown_layout.key() },
         "editor": editor_json(&settings.editor),
         "welcome": { "whats_new": settings.welcome.whats_new },
+        "updates": {
+            "check_automatically": settings.updates.check_automatically,
+            "channel": settings.updates.channel.key(),
+        },
         "lsp": settings.lsp,
     })
 }
@@ -1247,6 +1296,10 @@ mod tests {
                 soft_wrap_signs_current_line_only: false,
             },
             welcome: WelcomeSettings { whats_new: false },
+            updates: UpdateSettings {
+                check_automatically: false,
+                channel: flux_update::Channel::Beta,
+            },
             lsp: serde_json::Map::from_iter([(
                 "rust-analyzer".to_string(),
                 json!({ "settings": { "rust-analyzer": { "check": { "command": "clippy" } } } }),

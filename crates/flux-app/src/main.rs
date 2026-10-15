@@ -117,6 +117,9 @@ mod terminal_view;
 mod theme;
 mod ui;
 mod ui_scale;
+mod update_notes;
+mod update_settings;
+mod updates;
 mod vcs_menu;
 mod welcome;
 mod workspace;
@@ -252,6 +255,8 @@ fn main() {
             feedback::init(cx);
             app_log::init(cx);
             welcome::init(cx);
+            updates::init(cx);
+            update_notes::init(cx);
 
             // The project of the command line, or the projects open when Flux quit (part 10.1);
             // on the first launch the welcome guide — alone when started from the Dock — and after

@@ -473,6 +473,7 @@ fn own_title(action: &str) -> Option<&'static str> {
         "help::OpenGuide" => Some("Welcome Guide"),
         "help::ShowShortcuts" => Some("Keyboard Shortcuts"),
         "help::ShowWhatsNew" => Some("What's New"),
+        "updates::CheckForUpdates" => Some("Check for Updates…"),
         _ => None,
     }
 }

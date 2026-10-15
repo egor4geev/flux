@@ -29,7 +29,9 @@
         "strict_required_status_checks_policy": false,
         "do_not_enforce_on_create": false,
         "required_status_checks": [
-          { "context": "PR source", "integration_id": 15368 }
+          { "context": "PR source", "integration_id": 15368 },
+          { "context": "Format", "integration_id": 15368 },
+          { "context": "Clippy and tests (macOS)", "integration_id": 15368 }
         ]
       }
     }

@@ -19,6 +19,7 @@ flux-plugin = { path = "crates/flux-plugin" }
 flux-syntax = { path = "crates/flux-syntax" }
 flux-search = { path = "crates/flux-search" }
 flux-term = { path = "crates/flux-term" }
+flux-update = { path = "crates/flux-update" }
 # `wasm`: grammars compiled to WebAssembly, run on wasmtime 48 (`wasmtime-c-api-impl`); the
 # plugins' wasmtime (flux-plugin) stays on the same major, so Flux has one. Building it needs cmake.
 tree-sitter = { version = "0.27.1", features = ["wasm"] }

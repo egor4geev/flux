@@ -2,6 +2,8 @@
 //! left.
 //! - System Settings (part 10.1): reopening the projects on startup, and where another project
 //!   opens — a new window, this one, or ask (JetBrains: Appearance & Behavior → System Settings).
+//! - Updates (part 10.8): this version and its channel, Check Now, checking by itself, the channel
+//!   ([`crate::update_settings`]).
 //! - Editor (part 10.5): soft wraps ([`crate::editor_settings`]).
 //! - Language Servers: automatic installation on or off, and every server Flux knows with where it
 //!   comes from; those Flux installed can be updated and deleted, missing ones installed. Each can
@@ -50,6 +52,7 @@ use crate::plugins::{PluginStatus, PluginStore};
 use crate::settings::{self, OpenProjectIn, UpdatePreference};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
+use crate::update_settings::UpdatesSettingsPage;
 use crate::workspace::{Workspace, tilde};
 
 actions!(settings, [Toggle, Dismiss, About]);
@@ -93,6 +96,8 @@ pub enum Section {
     Language,
     /// System Settings: how projects open (part 10.1).
     System,
+    /// Updates of Flux (part 10.8).
+    Updates,
     /// Soft wraps (part 10.5).
     Editor,
     LanguageServers,
@@ -117,8 +122,9 @@ impl Section {
     ];
 
     /// The sections above the plugins' pages; About goes after them.
-    const BUILT_IN: [Section; 7] = [
+    const BUILT_IN: [Section; 8] = [
         Section::System,
+        Section::Updates,
         Section::Editor,
         Section::LanguageServers,
         Section::VersionControl,
@@ -134,6 +140,7 @@ impl Section {
             Section::FileIcons => tr("File Icons"),
             Section::Language => tr("Language"),
             Section::System => tr("System Settings"),
+            Section::Updates => tr("Updates"),
             Section::Editor => tr("Editor"),
             Section::LanguageServers => tr("Language Servers"),
             Section::VersionControl => tr("Version Control"),
@@ -150,6 +157,7 @@ impl Section {
                 IconName::Palette
             }
             Section::System => IconName::Settings,
+            Section::Updates => IconName::Update,
             Section::Editor => IconName::Pencil,
             Section::LanguageServers => IconName::Command,
             Section::VersionControl => IconName::Branch,
@@ -179,6 +187,7 @@ impl Section {
             Section::FileIcons => "file-icons".into(),
             Section::Language => "language".into(),
             Section::System => "system".into(),
+            Section::Updates => "updates".into(),
             Section::Editor => "editor".into(),
             Section::LanguageServers => "language-servers".into(),
             Section::VersionControl => "version-control".into(),
@@ -265,6 +274,7 @@ fn scenario_section() -> Option<Section> {
         "file-icons" => Section::FileIcons,
         "language" => Section::Language,
         "system" => Section::System,
+        "updates" => Section::Updates,
         "editor" => Section::Editor,
         "language-servers" => Section::LanguageServers,
         "plugins" => Section::Plugins,
@@ -315,6 +325,8 @@ pub struct SettingsView {
     appearance: Option<Entity<AppearancePage>>,
     /// Settings → Editor (part 10.5), made when first shown.
     editor: Option<Entity<EditorSettingsPage>>,
+    /// Settings → Updates (part 10.8), made when first shown.
+    updates: Option<Entity<UpdatesSettingsPage>>,
     servers: Vec<ServerRow>,
     /// Operations in progress or failed, by server name.
     jobs: HashMap<String, Job>,
@@ -420,6 +432,7 @@ impl SettingsView {
             plugin_pages: HashMap::new(),
             appearance: None,
             editor: None,
+            updates: None,
             servers,
             jobs: HashMap::new(),
             user_servers: settings::lsp(cx),
@@ -821,6 +834,14 @@ impl SettingsView {
             Section::Editor => {
                 if self.editor.is_none() {
                     self.editor = Some(cx.new(|cx| EditorSettingsPage::new(window, cx)));
+                }
+                if !self.focus_handle.is_focused(window) {
+                    window.focus(&self.focus_handle);
+                }
+            }
+            Section::Updates => {
+                if self.updates.is_none() {
+                    self.updates = Some(cx.new(|cx| UpdatesSettingsPage::new(window, cx)));
                 }
                 if !self.focus_handle.is_focused(window) {
                     window.focus(&self.focus_handle);
@@ -1950,7 +1971,13 @@ impl SettingsView {
                                     .text_color(ui.foreground)
                                     .child("Flux"),
                             )
-                            .child(ui::badge(format!("v{version}"), ui.accent_text)),
+                            .child(ui::badge(format!("v{version}"), ui.accent_text))
+                            // A beta says so (part 10.8).
+                            .when(
+                                flux_update::Channel::of(&flux_update::current_version())
+                                    == flux_update::Channel::Beta,
+                                |row| row.child(ui::badge(tr("Beta"), ui.warning)),
+                            ),
                     )
                     .child(
                         div()
@@ -2145,6 +2172,10 @@ impl Render for SettingsView {
             }
             Section::System => Some(self.render_system(cx).into_any_element()),
             Section::Editor => Some(match &self.editor {
+                Some(page) => page.clone().into_any_element(),
+                None => div().into_any_element(),
+            }),
+            Section::Updates => Some(match &self.updates {
                 Some(page) => page.clone().into_any_element(),
                 None => div().into_any_element(),
             }),

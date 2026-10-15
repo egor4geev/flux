@@ -10,11 +10,13 @@
 #   pre-release is one. A merge commit takes the pull request's title and description.
 # - Discussions on (bugs go to Issues, ideas and questions to Discussions); private vulnerability
 #   reporting on (SECURITY.md); the description and the topics.
-# - The rulesets of .github/rulesets/*.json, created or updated by name. main's required check "PR
-#   source" (.github/workflows/pr-source.yml) runs on pull_request_target, so it runs as main has
-#   it: until the workflow is on main, the check would never come and every merge would wait for it.
-#   Then main's ruleset is set without the check, and the script asks to run it again once the first
-#   pull request into main is merged.
+# - The rulesets of .github/rulesets/*.json, created or updated by name. main's required checks come
+#   from workflows: "PR source" (.github/workflows/pr-source.yml) runs on pull_request_target, so it
+#   runs as main has it; "Format" and "Clippy and tests (macOS)" (ci.yml, part 10.8) run on
+#   pull_request, as the pull request's branch has them — a hotfix branch starts from main. Until a
+#   check's workflow is on main, a pull request could wait for the check forever: then main's
+#   ruleset is set without that check, and the script asks to run it again once the first pull
+#   request into main is merged.
 #
 # Needs gh, logged in as an admin of the repository (the repo scope), and jq.
 set -euo pipefail
@@ -24,9 +26,14 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # The README's one line.
 DESCRIPTION="A fast, native code editor for macOS — a complete Git workflow and Claude Code, built in."
 TOPICS='["code-editor","editor","ide","macos","rust","gpui","tree-sitter","lsp","git","claude-code"]'
-# The check main requires, and the workflow that reports it.
-CHECK="PR source"
-CHECK_WORKFLOW=.github/workflows/pr-source.yml
+# The workflow that reports a required check of main.
+check_workflow() {
+    case "$1" in
+        "PR source") echo .github/workflows/pr-source.yml ;;
+        "Format" | "Clippy and tests ("*) echo .github/workflows/ci.yml ;;
+        *) echo "" ;;
+    esac
+}
 
 case "${1:-}" in
     --apply) APPLY=true ;;
@@ -150,21 +157,26 @@ for file in "$ROOT"/.github/rulesets/*.json; do
     ruleset=$(jq . "$file")
     name=$(jq -r .name <<<"$ruleset")
     echo "Ruleset \"$name\" (${file#"$ROOT"/})"
-    if jq -e --arg check "$CHECK" \
-        'any(.rules[]; .type == "required_status_checks"
-            and any(.parameters.required_status_checks[]; .context == $check))' \
-        <<<"$ruleset" >/dev/null &&
-        ! gh api "repos/$REPO/contents/$CHECK_WORKFLOW?ref=main" --silent 2>/dev/null; then
-        echo "  without the required check \"$CHECK\" for now: $CHECK_WORKFLOW isn't on main yet,"
-        echo "  so the check would never come. Run this script again once the first pull request"
-        echo "  into main is merged."
-        ruleset=$(jq --arg check "$CHECK" '.rules |= map(
+    # The required checks whose workflow isn't on main yet: left out for now.
+    missing=()
+    while IFS= read -r check; do
+        workflow=$(check_workflow "$check")
+        if [ -n "$workflow" ] && ! gh api "repos/$REPO/contents/$workflow?ref=main" --silent 2>/dev/null; then
+            missing+=("$check")
+        fi
+    done < <(jq -r '.rules[] | select(.type == "required_status_checks")
+        | .parameters.required_status_checks[].context' <<<"$ruleset")
+    for check in ${missing[@]+"${missing[@]}"}; do
+        echo "  without the required check \"$check\" for now: $(check_workflow "$check") isn't on"
+        echo "  main yet, so the check could never come. Run this script again once the first pull"
+        echo "  request into main is merged."
+        ruleset=$(jq --arg check "$check" '.rules |= map(
             if .type == "required_status_checks" then
                 .parameters.required_status_checks |= map(select(.context != $check))
             else . end
             | select(.type != "required_status_checks"
                 or (.parameters.required_status_checks | length) > 0))' <<<"$ruleset")
-    fi
+    done
     id=$(jq -r --arg name "$name" 'map(select(.name == $name)) | first | .id // empty' <<<"$existing")
     if [ -z "$id" ]; then
         change "create it" gh api -X POST "repos/$REPO/rulesets" --input - <<<"$ruleset"

@@ -77,6 +77,7 @@ mod terminal_search;
 mod themes;
 mod tree;
 mod ui_scale;
+mod updates;
 mod welcome;
 mod welcome_claude;
 mod welcome_setup;
@@ -173,6 +174,7 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     welcome_tour::STRINGS,
     welcome_shortcuts::STRINGS,
     welcome_whats_new::STRINGS,
+    updates::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -234,6 +236,7 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     lsp_status::PLURALS,
     lsp_settings::PLURALS,
     feedback::PLURALS,
+    updates::PLURALS,
     app_log::PLURALS,
     welcome::PLURALS,
     welcome_setup::PLURALS,

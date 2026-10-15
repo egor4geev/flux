@@ -39,13 +39,15 @@ pub enum NotificationGroup {
     Plugins,
     /// Claude Code: it waits for the user, finished, failed (stage 9).
     Claude,
+    /// Updates of Flux (part 10.8): a new version, its download, a restart to finish.
+    Updates,
     /// A plugin, by its id.
     Plugin(SharedString),
 }
 
 impl NotificationGroup {
     /// The built-in groups, in the order of the settings page.
-    pub const BUILT_IN: [NotificationGroup; 8] = [
+    pub const BUILT_IN: [NotificationGroup; 9] = [
         NotificationGroup::General,
         NotificationGroup::Git,
         NotificationGroup::LanguageServers,
@@ -54,6 +56,7 @@ impl NotificationGroup {
         NotificationGroup::Editor,
         NotificationGroup::Plugins,
         NotificationGroup::Claude,
+        NotificationGroup::Updates,
     ];
 
     /// The key in `settings.json` ("git", "plugin:claude").
@@ -67,6 +70,7 @@ impl NotificationGroup {
             NotificationGroup::Editor => "editor".into(),
             NotificationGroup::Plugins => "plugins".into(),
             NotificationGroup::Claude => "claude".into(),
+            NotificationGroup::Updates => "updates".into(),
             NotificationGroup::Plugin(id) => format!("plugin:{id}").into(),
         }
     }
@@ -92,6 +96,7 @@ impl NotificationGroup {
             NotificationGroup::Editor => tr("Editor").into(),
             NotificationGroup::Plugins => tr("Plugins").into(),
             NotificationGroup::Claude => tr("Claude Code").into(),
+            NotificationGroup::Updates => tr("Updates").into(),
             NotificationGroup::Plugin(id) => id.clone(),
         }
     }

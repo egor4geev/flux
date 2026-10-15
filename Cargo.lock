@@ -2016,6 +2016,7 @@ dependencies = [
  "flux-search",
  "flux-syntax",
  "flux-term",
+ "flux-update",
  "futures",
  "gpui",
  "image",
@@ -2157,6 +2158,19 @@ dependencies = [
  "futures",
  "libc",
  "tempfile",
+]
+
+[[package]]
+name = "flux-update"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "libc",
+ "ring",
+ "semver",
+ "serde",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

@@ -1,0 +1,102 @@
+# The checks of every change (part 10.8): the format, clippy and the tests. They run on pushes to
+# the long-lived branches and on pull requests into them; "Format" and "Clippy and tests (macOS)"
+# are required checks of main's ruleset (.github/rulesets/main.json), so a release or a hotfix
+# merges only green.
+#
+# The jobs' names are the checks' names: renaming one means changing the ruleset too. The matrix
+# gets Linux (10.9) and Windows (10.10) as they come — each a new required check.
+name: CI
+
+on:
+  push:
+    branches: [main, pre-release, "hotfix/**"]
+  pull_request:
+    branches: [main, pre-release]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request makes the older run pointless.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# bash with pipefail: a failing command in a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+          rustup default stable
+
+      - name: cargo fmt --check
+        run: |
+          if ! cargo fmt --all --check; then
+            echo "::error title=Not formatted::Run cargo fmt --all and commit the result."
+            exit 1
+          fi
+
+  check:
+    name: Clippy and tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      # wasm32-wasip2: the bundled plugins (crates/flux-app/build.rs) and the plugin tests' probe
+      # are built for it. cmake (wasmtime's C API) comes with the runner.
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy \
+            --target wasm32-wasip2 --no-self-update
+          rustup default stable
+          rustc --version
+
+      # Pull requests read the cache of their base branch; only pushes write it (a cache per
+      # pull request would push the useful ones out of the 10 GB).
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The UI check scenarios for agents (scripts/ui-scenario.sh) live behind a feature.
+      - name: Clippy (scenario feature)
+        run: cargo clippy -p flux-app --all-targets --features scenario --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      # The plugin tests quietly do without their probe component when it doesn't build (no wasm
+      # target on a developer's Mac); here it must build — and with it the bundled plugins, which
+      # need the same target.
+      - name: Plugin components built
+        run: |
+          cargo test -p flux-plugin --lib --locked -- --nocapture 2>&1 | tee plugin-tests.log
+          if grep -q '^skipped:' plugin-tests.log; then
+            echo "::error title=Plugin tests skipped::The probe plugin didn't build: see the log above."
+            exit 1
+          fi

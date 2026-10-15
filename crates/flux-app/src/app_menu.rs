@@ -1,4 +1,5 @@
-//! The menu bar: the application menu (the bold «Flux» next to the Apple menu) with About, Settings,
+//! The menu bar: the application menu (the bold «Flux» next to the Apple menu) with About, Check
+//! for Updates… (part 10.8), Settings,
 //! Services, hiding, and Quit, the Window menu (part 10.1): Minimize, Zoom, the next and the
 //! previous Flux window, Bring All to Front, and — added by macOS — the list of the windows, and the
 //! Help menu: the welcome guide, the keys to remember and What's New (part 10.7), reporting a bug,
@@ -13,7 +14,7 @@ use gpui::{AnyWindowHandle, App, KeyBinding, Menu, MenuItem, SystemMenuType, act
 
 use crate::i18n::tr;
 use crate::workspace::Workspace;
-use crate::{app_log, feedback, settings_view, welcome, workspace};
+use crate::{app_log, feedback, settings_view, updates, welcome, workspace};
 
 actions!(flux, [Hide, HideOthers, ShowAll]);
 
@@ -73,6 +74,7 @@ pub fn rebuild(cx: &mut App) {
             name: "Flux".into(),
             items: vec![
                 MenuItem::action(tr("About Flux"), settings_view::About),
+                MenuItem::action(tr("Check for Updates…"), updates::CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action(tr("Settings…"), settings_view::Toggle),
                 MenuItem::separator(),
