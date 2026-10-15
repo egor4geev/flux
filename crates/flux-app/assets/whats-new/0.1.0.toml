@@ -1,0 +1,43 @@
+# What's New in Flux 0.1 (part 10.7): the few things worth trying, shown once after an update to this
+# version (`crates/flux-app/src/welcome/whats_new.rs`). An item: an icon (a file name of
+# `assets/icons`), its tint (a shade token of the theme: blue, violet, orange, claude…), the title
+# and the text in English with their Russian under `ru`, and the action Try It runs (optional).
+# No names of other products here — Flux speaks for itself.
+version = "0.1.0"
+date = "2026-10-15"
+
+[[items]]
+icon = "sparkle"
+color = "violet"
+action = "welcome::OpenGuide"
+title = "A guide to Flux"
+text = "The first launch sets up the theme, the languages and Claude Code, then shows the ways of working in Flux — with a task to try on every slide. Again any time: Help → Welcome Guide."
+ru.title = "Гайд по Flux"
+ru.text = "Первый запуск настраивает тему, языки и Claude Code и показывает, как работать во Flux, — с заданием на каждом слайде. Снова — Справка → Гайд по Flux."
+
+[[items]]
+icon = "claude"
+color = "claude"
+action = "claude::ToggleClaude"
+title = "Claude Code in its own chat"
+text = "Sessions in tabs, edits as cards with their diff, and at the end of a turn a summary to review or roll back — with your Claude subscription."
+ru.title = "Claude Code — в своём чате"
+ru.text = "Сессии вкладками, правки — карточками с диффом, в конце хода — итог с обзором и откатом. По вашей подписке Claude."
+
+[[items]]
+icon = "commit"
+color = "orange"
+action = "git::ToggleCommitWindow"
+title = "Git, all of it"
+text = "Commit in parts, branches, the log with its graph, stash, rebase, conflicts and who changed each line — in Flux's own windows."
+ru.title = "Весь Git"
+ru.text = "Коммит частями, ветки, лог с графом, stash, rebase, конфликты и авторы строк — в окнах самого Flux."
+
+[[items]]
+icon = "puzzle"
+color = "cyan"
+action = "plugins::OpenManager"
+title = "Plugins and the catalog"
+text = "Languages, themes, file icons and tools come as plugins: Settings → Plugins → Marketplace installs them in a click."
+ru.title = "Плагины и каталог"
+ru.text = "Языки, темы, значки и инструменты — плагинами: Настройки → Плагины → Маркетплейс ставит их в один щелчок."

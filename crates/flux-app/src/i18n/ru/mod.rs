@@ -79,6 +79,12 @@ mod lsp_status;
 mod lsp_settings;
 mod feedback;
 mod app_log;
+mod welcome;
+mod welcome_setup;
+mod welcome_claude;
+mod welcome_tour;
+mod welcome_shortcuts;
+mod welcome_whats_new;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
 pub(super) const STRINGS: &[&[(&str, &str)]] = &[
@@ -161,6 +167,12 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     lsp_settings::STRINGS,
     feedback::STRINGS,
     app_log::STRINGS,
+    welcome::STRINGS,
+    welcome_setup::STRINGS,
+    welcome_claude::STRINGS,
+    welcome_tour::STRINGS,
+    welcome_shortcuts::STRINGS,
+    welcome_whats_new::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -223,4 +235,10 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     lsp_settings::PLURALS,
     feedback::PLURALS,
     app_log::PLURALS,
+    welcome::PLURALS,
+    welcome_setup::PLURALS,
+    welcome_claude::PLURALS,
+    welcome_tour::PLURALS,
+    welcome_shortcuts::PLURALS,
+    welcome_whats_new::PLURALS,
 ];

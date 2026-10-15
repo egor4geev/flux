@@ -73,7 +73,8 @@ The first build takes a while: tree-sitter's grammars are C code.
   `crates/flux-app/src/i18n/ru/` — a test checks that none is missing.
 - The code isn't entirely rustfmt-clean yet: format what you change in the style around it, and
   please don't run `cargo fmt` over the whole workspace — it would touch hundreds of unrelated lines.
-- Shortcuts follow JetBrains IDEs wherever they have one.
+- Shortcuts: look through the existing keymap before picking one, and keep the IDE conventions it
+  follows (⌘B goes to a definition, ⌥↵ shows the context actions, ⌘K commits).
 - Plugins: [`docs/plugins.md`](docs/plugins.md). Plugins for everyone go to the
   [catalog](https://github.com/egor4geev/flux-plugins).
 

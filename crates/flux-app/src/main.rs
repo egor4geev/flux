@@ -118,6 +118,7 @@ mod theme;
 mod ui;
 mod ui_scale;
 mod vcs_menu;
+mod welcome;
 mod workspace;
 mod wrap;
 
@@ -250,12 +251,14 @@ fn main() {
             settings_file::init(cx);
             feedback::init(cx);
             app_log::init(cx);
+            welcome::init(cx);
 
-            // The project of the command line, or the projects open when Flux quit (part 10.1).
-            let _window = workspace::open_startup_windows(root, paths, cx)
-                .expect("failed to open window");
+            // The project of the command line, or the projects open when Flux quit (part 10.1);
+            // on the first launch the welcome guide — alone when started from the Dock — and after
+            // an update What's New (part 10.7).
+            let _window = welcome::startup(root, paths, cx).expect("failed to open window");
             #[cfg(feature = "scenario")]
-            scenario::run(_window.into(), cx);
+            scenario::run(_window, cx);
 
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {

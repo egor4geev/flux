@@ -103,7 +103,7 @@ The tokens of the design system, by name.
 | `match_text` | the matched characters in lists (fuzzy search) |
 | `search_match` / `search_match_active` | what a search found in the text / the current match |
 
-**Version control** — as JetBrains IDEs color them
+**Version control** — the colors of changed files
 
 | Token | Colors |
 |-------|--------|

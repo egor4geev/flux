@@ -333,7 +333,7 @@ fn shade_index(path: &Path, count: usize) -> usize {
 /// The branch a project's repository is on, from its `.git/HEAD` (a worktree's `.git` file points
 /// to its git directory); a detached HEAD gives the short commit. Only a repository at the project's
 /// root counts: reading it is cheap enough to do as the popup opens.
-fn head_branch(root: &Path) -> Option<String> {
+pub(crate) fn head_branch(root: &Path) -> Option<String> {
     let dot_git = root.join(".git");
     let git_dir = if dot_git.is_file() {
         let text = fs::read_to_string(&dot_git).ok()?;
@@ -661,7 +661,7 @@ fn tile(initials: &str, hue: Hsla) -> Div {
 }
 
 /// The branch after the path: the branch glyph and its name, in the branches' violet.
-fn branch_label(branch: &str, ui: UiColors) -> Div {
+pub(crate) fn branch_label(branch: &str, ui: UiColors) -> Div {
     div()
         .flex_none()
         .max_w(px(140.))

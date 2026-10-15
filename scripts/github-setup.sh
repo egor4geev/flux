@@ -22,7 +22,7 @@ set -euo pipefail
 REPO=${FLUX_GITHUB_REPO:-egor4geev/flux}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # The README's one line.
-DESCRIPTION="A fast, native code editor for macOS — Git the way JetBrains IDEs do it, Claude Code built in."
+DESCRIPTION="A fast, native code editor for macOS — a complete Git workflow and Claude Code, built in."
 TOPICS='["code-editor","editor","ide","macos","rust","gpui","tree-sitter","lsp","git","claude-code"]'
 # The check main requires, and the workflow that reports it.
 CHECK="PR source"

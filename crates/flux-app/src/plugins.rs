@@ -167,6 +167,62 @@ pub fn init(cx: &mut App) {
     let _ = cx;
 }
 
+/// The plugins changed on disk or were turned on or off (part 10.7): an install, a removal, the
+/// switch of Settings → Plugins in any window, the welcome guide installing without a window. Every
+/// window's store follows the count ([`PluginStore::follow_changes`]).
+#[derive(Default)]
+struct PluginsChanged {
+    generation: u64,
+}
+
+impl Global for PluginsChanged {}
+
+fn changes_generation(cx: &App) -> u64 {
+    cx.try_global::<PluginsChanged>()
+        .map_or(0, |changes| changes.generation)
+}
+
+/// The plugins changed without a window's store (the welcome guide installed one, perhaps before
+/// any window opened): every window's store finds them again, and their languages, themes and
+/// icons are in place at once — a theme just installed can be chosen right away.
+pub fn changed_everywhere(cx: &mut App) {
+    cx.default_global::<PluginsChanged>().generation += 1;
+    let dev = settings::dev_plugins(cx);
+    let scan = flux_plugin::registry::scan(crate::bundled::plugins(), &dev);
+    let turned_on: Vec<Arc<PluginEntry>> = scan
+        .plugins
+        .into_iter()
+        .filter(|entry| entry.problem.is_none() && settings::plugin_enabled(entry.id(), cx))
+        .map(Arc::new)
+        .collect();
+    for (id, problem) in crate::contributions::refresh(&turned_on, cx) {
+        log::warn!("plugin {id}: {problem}");
+    }
+}
+
+/// What a store does with one of its plugins when the plugins changed elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Follow {
+    Keep,
+    /// Turned on elsewhere, or a new version of a running one: (re)start it.
+    Start,
+    /// Turned off elsewhere: stop it, its tool windows and status items go.
+    TurnOff,
+}
+
+/// [`Follow`] for a plugin in `status`, on or off in the settings now, able to run (no problem),
+/// and `replaced` by a new version.
+fn follow(status: &PluginStatus, enabled: bool, runnable: bool, replaced: bool) -> Follow {
+    match status {
+        PluginStatus::Unavailable(_) => Follow::Keep,
+        PluginStatus::Disabled if enabled && runnable => Follow::Start,
+        PluginStatus::Disabled => Follow::Keep,
+        _ if !enabled => Follow::TurnOff,
+        _ if replaced && runnable => Follow::Start,
+        _ => Follow::Keep,
+    }
+}
+
 /// The id of the element of a tool window's placeholder that restarts a stopped plugin.
 const RESTART_ELEMENT: &str = "flux.restart";
 /// How often the components of the plugins under development are looked at.
@@ -368,8 +424,11 @@ pub struct PluginStore {
     /// Plugins under development being built.
     building: HashSet<Arc<str>>,
     pending_questions: VecDeque<PendingQuestion>,
+    /// The last change of the plugins ([`PluginsChanged`]) the store has followed.
+    seen_changes: u64,
     _pump: Task<()>,
     _dev_watch: Task<()>,
+    _changes: Subscription,
 }
 
 impl EventEmitter<PluginStoreEvent> for PluginStore {}
@@ -432,8 +491,11 @@ impl PluginStore {
             dev_files: HashMap::new(),
             building: HashSet::new(),
             pending_questions: VecDeque::new(),
+            seen_changes: changes_generation(cx),
             _pump: pump,
             _dev_watch: dev_watch,
+            // Other windows and the welcome guide install, remove and turn plugins on and off.
+            _changes: cx.observe_global::<PluginsChanged>(Self::follow_changes),
         };
         // The plugins start once the window has made the store and given it its notification
         // center: a build of a plugin under development shows its progress there.
@@ -483,6 +545,7 @@ impl PluginStore {
                 .write(Level::Info, "Turned off by the user");
         }
         self.changed(cx);
+        self.announce(cx);
     }
 
     /// Starts a stopped plugin again (the Restart of its notification, the manager); a plugin
@@ -543,6 +606,7 @@ impl PluginStore {
             self.start(&id, true, cx);
         }
         self.changed(cx);
+        self.announce(cx);
         Ok(())
     }
 
@@ -568,6 +632,7 @@ impl PluginStore {
         // A bundled or installed plugin with the same id comes back from under it.
         self.rescan(cx);
         self.changed(cx);
+        self.announce(cx);
         Ok(())
     }
 
@@ -1058,8 +1123,9 @@ impl PluginStore {
     }
 
     /// Finds the plugins again (an install, a removal): new ones are added and started if on,
-    /// gone ones stopped and removed, changed ones take their new manifest.
-    fn rescan(&mut self, cx: &mut Context<Self>) {
+    /// gone ones stopped and removed, changed ones take their new manifest. Returns the plugins
+    /// that changed (a new version): a running one still runs the old one.
+    fn rescan(&mut self, cx: &mut Context<Self>) -> Vec<String> {
         let dev = settings::dev_plugins(cx);
         let scan = flux_plugin::registry::scan(crate::bundled::plugins(), &dev);
         self.scan_errors = scan.errors;
@@ -1084,6 +1150,7 @@ impl PluginStore {
             .map(|state| (state.id().to_string(), state))
             .collect();
         let mut to_start = Vec::new();
+        let mut changed = Vec::new();
         for entry in scan.plugins {
             let id = entry.id().to_string();
             icons::register_plugin_files(&id, entry.files.clone());
@@ -1093,6 +1160,7 @@ impl PluginStore {
                         || state.entry.manifest != entry.manifest
                         || state.entry.files.dir() != entry.files.dir();
                     if replaced {
+                        changed.push(id.clone());
                         state.entry = Arc::new(entry);
                         if let Some(problem) = &state.entry.problem {
                             state.status = PluginStatus::Unavailable(problem.clone().into());
@@ -1121,6 +1189,51 @@ impl PluginStore {
         }
         for id in to_start {
             self.start(&id, true, cx);
+        }
+        self.changed(cx);
+        changed
+    }
+
+    /// Tells the other windows' stores that the plugins changed (this store installed, removed or
+    /// turned one on or off): they find them again. The store itself is up to date already.
+    fn announce(&mut self, cx: &mut Context<Self>) {
+        let changes = cx.default_global::<PluginsChanged>();
+        changes.generation += 1;
+        self.seen_changes = changes.generation;
+    }
+
+    /// Another window or the welcome guide installed, removed or turned plugins on or off (part
+    /// 10.7; until then a window learned of it only when it opened again): the store finds the
+    /// plugins again — new ones start, gone ones stop, a new version replaces the running one —
+    /// and turns each one on or off as the settings say now.
+    fn follow_changes(&mut self, cx: &mut Context<Self>) {
+        let generation = changes_generation(cx);
+        if generation == self.seen_changes {
+            return;
+        }
+        self.seen_changes = generation;
+        let replaced = self.rescan(cx);
+        let plugins: Vec<(String, PluginStatus, bool)> = self
+            .plugins
+            .iter()
+            .map(|plugin| {
+                let id = plugin.id().to_string();
+                (id, plugin.status.clone(), plugin.entry.problem.is_none())
+            })
+            .collect();
+        for (id, status, runnable) in plugins {
+            let enabled = settings::plugin_enabled(&id, cx);
+            match follow(&status, enabled, runnable, replaced.contains(&id)) {
+                Follow::Keep => {}
+                Follow::Start => self.start(&id, true, cx),
+                Follow::TurnOff => {
+                    self.stop(&id, cx);
+                    self.remove_contributions(&id, cx);
+                    if let Some(index) = self.index(&id) {
+                        self.plugins[index].status = PluginStatus::Disabled;
+                    }
+                }
+            }
         }
         self.changed(cx);
     }
@@ -2670,6 +2783,30 @@ pub(crate) fn status_bar_items(workspace: &Workspace, cx: &App) -> Option<AnyEle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window follows what another window or the welcome guide did to the plugins (part 10.7).
+    #[test]
+    fn a_store_follows_changes_made_elsewhere() {
+        let stopped = PluginStatus::Stopped {
+            error: "trap".into(),
+            details: SharedString::default(),
+        };
+        // Turned on elsewhere: it starts here too; turned off: it stops.
+        assert_eq!(follow(&PluginStatus::Disabled, true, true, false), Follow::Start);
+        assert_eq!(follow(&PluginStatus::Running, false, true, false), Follow::TurnOff);
+        assert_eq!(follow(&stopped, false, true, false), Follow::TurnOff);
+        // A new version replaces the running one; a plugin that stopped by itself stays stopped.
+        assert_eq!(follow(&PluginStatus::Running, true, true, true), Follow::Start);
+        assert_eq!(follow(&PluginStatus::Running, true, true, false), Follow::Keep);
+        assert_eq!(follow(&stopped, true, true, false), Follow::Keep);
+        // A plugin that can't run doesn't start, whatever the settings say.
+        assert_eq!(follow(&PluginStatus::Disabled, true, false, false), Follow::Keep);
+        assert_eq!(
+            follow(&PluginStatus::Unavailable("api".into()), true, false, true),
+            Follow::Keep
+        );
+        assert_eq!(follow(&PluginStatus::Disabled, false, true, true), Follow::Keep);
+    }
 
     fn position(line: u32, column: u32) -> Position {
         Position { line, column }

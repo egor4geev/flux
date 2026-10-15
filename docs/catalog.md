@@ -1,10 +1,9 @@
 # The plugin catalog
 
-Flux finds plugins in a catalog, as JetBrains IDEs find them in their Marketplace: **Settings →
-Plugins → Marketplace** lists them, installs one with a click, and offers updates of the installed
-ones. The catalog is a public repository, [`egor4geev/flux-plugins`](https://github.com/egor4geev/flux-plugins):
-the plugins' sources, a build that packs them, and an index Flux reads. Plugins of other authors come
-to it as pull requests, as extensions come to Zed.
+Flux finds plugins in a catalog: **Settings → Plugins → Marketplace** lists them, installs one with
+a click, and offers updates of the installed ones. The catalog is a public repository,
+[`egor4geev/flux-plugins`](https://github.com/egor4geev/flux-plugins): the plugins' sources, a build
+that packs them, and an index Flux reads. Plugins of other authors come to it as pull requests.
 
 ## For users
 
@@ -90,8 +89,8 @@ Releases, a release per plugin version (`<plugin id>-v<version>`).
 A plugin is offered as an update when its version is newer than the installed one by SemVer
 (`1.10.0` after `1.9.2`; a pre-release before its release). Its `api` must be a plugin API this Flux
 runs — **0.2 or 0.3** now: the Marketplace shows a plugin for another API as **Needs a newer Flux**
-and doesn't install it. Flux keeps running the older versions of the API since the catalog opened,
-as Zed does: a plugin built for 0.2 works on a Flux with 0.3 as it is, through the 0.2 interfaces
+and doesn't install it. Flux keeps running the older versions of the API since the catalog opened:
+a plugin built for 0.2 works on a Flux with 0.3 as it is, through the 0.2 interfaces
 ([From 0.2 to 0.3](plugins.md#from-02-to-03)). The catalog takes plugins of every version Flux
 runs (`scripts/build.py`); a plugin with code names the version its SDK was built for, and takes
 the SDK from the Flux repository pinned to a commit of that version:

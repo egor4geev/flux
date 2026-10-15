@@ -745,7 +745,7 @@ fn last_turn_failed(session: &Entity<ClaudeSession>, cx: &App) -> bool {
 }
 
 /// Finds `claude`, asks its version and the sign-in (on a background thread: each is a process).
-fn check_cli(preferred: Option<&Path>) -> CliState {
+pub(crate) fn check_cli(preferred: Option<&Path>) -> CliState {
     // Scenarios can't uninstall `claude`: `FLUX_SCENARIO_CLAUDE_MISSING` shows the window without
     // it.
     #[cfg(feature = "scenario")]

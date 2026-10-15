@@ -1,9 +1,10 @@
 //! The menu bar: the application menu (the bold «Flux» next to the Apple menu) with About, Settings,
 //! Services, hiding, and Quit, the Window menu (part 10.1): Minimize, Zoom, the next and the
 //! previous Flux window, Bring All to Front, and — added by macOS — the list of the windows, and the
-//! Help menu (part 10.6): reporting a bug, an idea or a question on GitHub, and the log — with the
-//! search field macOS adds to it. The items dispatch the same actions as their keys; macOS shows
-//! the shortcuts from the keymap.
+//! Help menu: the welcome guide, the keys to remember and What's New (part 10.7), reporting a bug,
+//! an idea or a question on GitHub, and the log (part 10.6) — with the search field macOS adds to
+//! it. The items dispatch the same actions as their keys; macOS shows the shortcuts from the
+//! keymap.
 //!
 //! The menu's titles are in the interface language: when it changes while Flux runs (Settings →
 //! Appearance → Language), the menu is built anew ([`rebuild`]).
@@ -12,7 +13,7 @@ use gpui::{AnyWindowHandle, App, KeyBinding, Menu, MenuItem, SystemMenuType, act
 
 use crate::i18n::tr;
 use crate::workspace::Workspace;
-use crate::{app_log, feedback, settings_view, workspace};
+use crate::{app_log, feedback, settings_view, welcome, workspace};
 
 actions!(flux, [Hide, HideOthers, ShowAll]);
 
@@ -99,6 +100,10 @@ pub fn rebuild(cx: &mut App) {
         Menu {
             name: tr("Help").into(),
             items: vec![
+                MenuItem::action(tr("Welcome Guide"), welcome::OpenGuide),
+                MenuItem::action(tr("Keyboard Shortcuts"), welcome::ShowShortcuts),
+                MenuItem::action(tr("What's New"), welcome::ShowWhatsNew),
+                MenuItem::separator(),
                 MenuItem::action(tr("Report a Bug…"), feedback::ReportBug),
                 MenuItem::action(tr("Suggest a Feature…"), feedback::SuggestFeature),
                 MenuItem::action(tr("Ask a Question…"), feedback::AskQuestion),

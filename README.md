@@ -4,7 +4,7 @@
 
 # Flux
 
-**A fast, native code editor for macOS — Git the way JetBrains IDEs do it, Claude Code built in.**
+**A fast, native code editor for macOS — a complete Git workflow and Claude Code, built in.**
 
 ![status](https://img.shields.io/badge/status-early%20development-8590ff)
 ![platform](https://img.shields.io/badge/platform-macOS-a3abc3)
@@ -22,8 +22,8 @@
 
 A Mac app written in Rust and drawn by the GPU: Flux opens instantly, and typing, scrolling and
 searching never wait, even in files with tens of thousands of lines. Find a file by a few letters of
-its name, search the whole project with a live preview, run any command from the palette — with the
-keys you know from JetBrains IDEs, in English or Russian.
+its name, search the whole project with a live preview, run any command from the palette — the
+keyboard comes first and every action shows its keys, in English or Russian.
 
 ### Understands your code
 
@@ -31,7 +31,7 @@ Errors as you type, completion, go to definition, find usages and rename — fro
 installs by itself. <kbd>⌥</kbd><kbd>↵</kbd> on an error offers the quick fixes, and the scrollbar maps
 the file's errors, warnings and changes.
 
-### Git, the way JetBrains IDEs do it
+### Git, all of it
 
 A commit window with changelists and checkboxes down to single changes, a side-by-side diff you can
 edit, every branch operation in one popup, a three-way merge tool, a log with a graph and an
@@ -73,6 +73,10 @@ verify the app. Once:
 
 Since macOS 15, Control-click → Open no longer gets past this. The updates Flux downloads itself open
 without asking.
+
+On its first launch Flux opens a short guide: the interface language, the theme and the look of the
+window, the plugins of the languages you write in, Claude Code, and a few slides on working in Flux —
+each with a live task. It is always at hand in **Help → Welcome Guide**.
 
 ## Build from source
 

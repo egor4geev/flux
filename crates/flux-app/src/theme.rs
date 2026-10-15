@@ -676,16 +676,54 @@ pub fn available(cx: &App) -> Vec<ThemeInfo> {
     list
 }
 
-/// A theme by name: a plugin's, or a bundled base (previews of themes not shown).
-pub fn by_name(name: &str, cx: &App) -> Option<Theme> {
-    let from_plugin = cx.try_global::<Themes>().and_then(|themes| {
+/// Themes the catalog renamed (part 10.7): the old name and the new one. The settings may hold
+/// either — chosen before the rename or after — and the installed plugin may bring either — updated
+/// or not yet: a theme is found by both, and the user keeps their theme across the rename.
+const RENAMED: &[(&str, &str)] = &[
+    ("Darcula", "Classic Dark"),
+    ("IntelliJ Light", "Classic Light"),
+];
+
+/// The other name of a renamed theme: the new one for the old, the old one for the new.
+fn other_name(name: &str) -> Option<&'static str> {
+    RENAMED.iter().find_map(|(old, new)| {
+        if *old == name {
+            Some(*new)
+        } else if *new == name {
+            Some(*old)
+        } else {
+            None
+        }
+    })
+}
+
+/// `name` and `other` are the same theme: the same name, or the two names of a renamed one.
+pub fn same_theme(name: &str, other: &str) -> bool {
+    name == other || other_name(name) == Some(other)
+}
+
+/// The plugins' theme named `name` (or by its other name, [`RENAMED`]): the last plugin's wins, as
+/// in [`available`]; a theme under its very name wins over one under the other name.
+fn find_plugin_theme<'a>(
+    themes: &'a [(SharedString, Arc<Theme>)],
+    name: &str,
+) -> Option<&'a Theme> {
+    let by = |wanted: &str| {
         themes
-            .themes
             .iter()
             .rev()
-            .find(|(_, theme)| theme.name.as_ref() == name)
-            .map(|(_, theme)| (**theme).clone())
-    });
+            .find(|(_, theme)| theme.name.as_ref() == wanted)
+            .map(|(_, theme)| theme.as_ref())
+    };
+    by(name).or_else(|| other_name(name).and_then(by))
+}
+
+/// A theme by name (or by its other name, if the catalog renamed it): a plugin's, or a bundled base
+/// (previews of themes not shown).
+pub fn by_name(name: &str, cx: &App) -> Option<Theme> {
+    let from_plugin = cx
+        .try_global::<Themes>()
+        .and_then(|themes| find_plugin_theme(&themes.themes, name).cloned());
     from_plugin.or_else(|| match name {
         FLUX_NIGHT => Some(Theme::flux_night()),
         FLUX_DAY => Some(Theme::flux_day()),
@@ -922,6 +960,37 @@ mod tests {
                 distance(flat.ui.island, theme.ui.island) < distance(flat.ui.island, flat.ui.frame)
             );
         }
+    }
+
+    /// A renamed theme (part 10.7) is found by either name: an old setting with the updated plugin,
+    /// a new setting with the plugin not updated yet; a theme under the very name wins.
+    #[test]
+    fn renamed_themes_are_found_by_both_names() {
+        let named = |name: &str, appearance: Appearance| {
+            let mut theme = Theme::base(appearance);
+            theme.name = SharedString::from(name.to_string());
+            (SharedString::from("flux.darcula"), Arc::new(theme))
+        };
+        let updated = [
+            named("Classic Dark", Appearance::Dark),
+            named("Classic Light", Appearance::Light),
+        ];
+        let found = |themes: &[(SharedString, Arc<Theme>)], name: &str| {
+            find_plugin_theme(themes, name).map(|theme| theme.name.to_string())
+        };
+        assert_eq!(found(&updated, "Darcula").as_deref(), Some("Classic Dark"));
+        assert_eq!(found(&updated, "IntelliJ Light").as_deref(), Some("Classic Light"));
+        assert_eq!(found(&updated, "Classic Dark").as_deref(), Some("Classic Dark"));
+        let old = [named("Darcula", Appearance::Dark)];
+        assert_eq!(found(&old, "Classic Dark").as_deref(), Some("Darcula"));
+        assert_eq!(found(&old, "Solarized Dark"), None);
+        // Both installed (a plugin under development next to the catalog's): the very name wins.
+        let both = [named("Darcula", Appearance::Dark), named("Classic Dark", Appearance::Dark)];
+        assert_eq!(found(&both, "Darcula").as_deref(), Some("Darcula"));
+        assert!(same_theme("Darcula", "Classic Dark"));
+        assert!(same_theme("Classic Light", "IntelliJ Light"));
+        assert!(same_theme("Flux Night", "Flux Night"));
+        assert!(!same_theme("Darcula", "Classic Light"));
     }
 
 

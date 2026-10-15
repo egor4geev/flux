@@ -467,6 +467,9 @@ fn own_title(action: &str) -> Option<&'static str> {
         "help::SuggestFeature" => Some("Suggest a Feature…"),
         "help::AskQuestion" => Some("Ask a Question…"),
         "help::ShowLog" => Some("Show Log in Finder"),
+        "help::OpenGuide" => Some("Welcome Guide"),
+        "help::ShowShortcuts" => Some("Keyboard Shortcuts"),
+        "help::ShowWhatsNew" => Some("What's New"),
         _ => None,
     }
 }

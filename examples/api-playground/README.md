@@ -51,7 +51,7 @@ The sections of API 0.3:
 
 | Section | Buttons | What should happen |
 |---------|---------|--------------------|
-| Forms | **Open Task…** | A dialog as JetBrains' Open Task: a dropdown (Move to), a checkbox that enables the branch's name, another checkbox, a comment of several lines (↵ — a new line, ⌘↵ — Start), a note. The section shows the answer. Empty the branch's name and Start: the form comes back with the error and the values kept; Cancel — «Cancelled». |
+| Forms | **Open Task…** | A dialog as a tracker's Open Task: a dropdown (Move to), a checkbox that enables the branch's name, another checkbox, a comment of several lines (↵ — a new line, ⌘↵ — Start), a note. The section shows the answer. Empty the branch's name and Start: the form comes back with the error and the values kept; Cancel — «Cancelled». |
 | Pickers | **Search** | A picker the plugin searches itself: type «remind» — PLAY-12 under its status; ↵ chooses it. |
 | | **Filter** | The same tasks, filtered by Flux (fuzzy); Esc — «dismissed». |
 | | **At the Clock** | A menu above the clock of the Timers section (start the clock first; without it the menu opens under the title bar); **Stop the Clock** stops it. |
