@@ -5,8 +5,9 @@
 #   open target/release/Flux.app       # launch as an app (icon in the Dock and Finder)
 #   open target/release/Flux.app --args ~/dev/project
 #
-# Unsigned and not notarized: that is stage 7 (Roadmap). The icon is generated from
-# crates/flux-app/assets/brand/logo.svg (scripts/app-icon.swift + iconutil).
+# Signed with the developer's own certificate, if there is one (see the end); not notarized: that
+# is 10.7 (Roadmap). The icon is generated from crates/flux-app/assets/brand/logo.svg
+# (scripts/app-icon.swift + iconutil).
 set -euo pipefail
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -43,6 +44,19 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+# The Keychain remembers «Always Allow» for the requirement of the app's signature. The linker's
+# ad-hoc signature requires the binary's own hash, so every build is a new app to the Keychain and
+# plugin secrets ask again; a certificate's requirement (identifier + certificate) stays the same.
+# A self-signed one will do: Keychain Access → Certificate Assistant → Create a Certificate…, name
+# "Flux Dev", Self Signed Root, Code Signing. FLUX_SIGN_IDENTITY picks another one; "-" is ad-hoc.
+IDENTITY=${FLUX_SIGN_IDENTITY:-Flux Dev}
+if [ "$IDENTITY" = "-" ] || security find-identity -p codesigning | grep -qF "\"$IDENTITY\""; then
+    codesign --force --sign "$IDENTITY" --timestamp=none "$APP" ||
+        echo "warning: codesign failed — Flux.app keeps the linker's ad-hoc signature" >&2
+else
+    echo "note: no \"$IDENTITY\" certificate — Flux.app is signed ad-hoc (Keychain asks after every build)" >&2
+fi
 # Finder and the Dock cache icons: a fresh bundle date forces the icon to be re-read.
 touch "$APP"
 echo "$ROOT/$APP"
