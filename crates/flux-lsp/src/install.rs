@@ -1329,6 +1329,7 @@ mod tests {
             initialization_options: None,
             settings: None,
             install: Some(install),
+            env: Default::default(),
         }
     }
 

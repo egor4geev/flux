@@ -479,10 +479,11 @@ pub fn prepaint(
         } else {
             UiColors::tint(ui.blame_recent, ui.blame_recent.a * shade)
         };
+        // All the rows of a line that wraps (part 10.5); the labels go on its first.
         paint.quads.push(fill(
             Bounds::new(
                 point(column.left(), top),
-                size(column.size.width, line_height),
+                size(column.size.width, layout.line_bottom(line) - top),
             ),
             background,
         ));
@@ -519,11 +520,7 @@ fn hit(editor: &Editor, position: Point<Pixels>) -> Option<(usize, Option<usize>
     }
     let layout = editor.layout.as_ref()?;
     let annotations = editor.blame.annotations.as_ref()?;
-    let line = ((position.y - layout.origin.y) / layout.line_height).floor();
-    if line < 0. {
-        return None;
-    }
-    let line = line as usize;
+    let line = layout.line_at_y(position.y)?;
     Some((line, annotations.lines.get(line).copied().flatten()))
 }
 

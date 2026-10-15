@@ -5,11 +5,16 @@
 //! notifications become [`ServerEvent`]s, server requests are answered right there — except
 //! `workspace/applyEdit`, which the window answers through [`ApplyEdit`]), and a stderr reader. The process belongs to the [`LanguageServer`] handles: when the last one is dropped it
 //! is killed. Set `FLUX_LSP_LOG=1` to log the traffic and the server's stderr to our stderr.
+//!
+//! Part 10.5: rust-analyzer's `experimental/serverStatus` (a project it couldn't load) is an event,
+//! the server's stderr and messages go to its [`ServerLog`], and files it registers to watch
+//! (`workspace/didChangeWatchedFiles`) are kept here: [`LanguageServer::files_changed`] sends it
+//! the changes that match.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{self as std_mpsc, Sender};
@@ -19,18 +24,20 @@ use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
-use lsp_types::notification::Notification;
+use lsp_types::notification::{DidChangeWatchedFiles, Notification};
 use lsp_types::request::Request;
 use lsp_types::{
-    ApplyWorkspaceEditParams, InitializeResult, NumberOrString, ProgressParams,
-    ProgressParamsValue, PublishDiagnosticsParams, ServerCapabilities, ShowMessageParams,
-    WorkDoneProgress,
+    ApplyWorkspaceEditParams, DidChangeWatchedFilesParams, FileChangeType, FileEvent,
+    InitializeResult, LogMessageParams, NumberOrString, ProgressParams, ProgressParamsValue,
+    PublishDiagnosticsParams, ServerCapabilities, ShowMessageParams, WorkDoneProgress,
 };
 use serde_json::{Value, json};
 
 use crate::config::{self, ServerConfig};
+use crate::output::{LogSource, ServerLog};
 use crate::position::uri_from_path;
 use crate::transport::{self, Stderr};
+use crate::watch::{self, Watchers};
 
 /// How long `shutdown` waits for the server's answer, and then for the process to exit.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -66,6 +73,55 @@ pub enum ServerEvent {
     /// `workspace/applyEdit`: the server asks to apply an edit (mostly while it runs the command of
     /// a code action). The answer goes back through [`ApplyEdit::respond`].
     ApplyEdit(ApplyEdit),
+    /// rust-analyzer's `experimental/serverStatus`: whether it could load the project, and whether
+    /// it is busy.
+    Status(ServerStatus),
+    /// The server registered or dropped watchers of files: [`LanguageServer::watches_files`] may
+    /// have changed.
+    WatchersChanged,
+}
+
+/// rust-analyzer's `experimental/serverStatus` (part 10.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerStatus {
+    pub health: Health,
+    /// Nothing in progress: the project is loaded (or failed to load) and analysed.
+    pub quiescent: bool,
+    /// Why the health isn't ok, as the server says it (Markdown, maybe several lines).
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Health {
+    Ok,
+    /// Works with less: "Failed to discover workspace".
+    Warning,
+    /// Can't do its work: "Failed to load workspaces".
+    Error,
+}
+
+impl ServerStatus {
+    fn from_params(params: &Value) -> Option<Self> {
+        let health = match params.get("health")?.as_str()? {
+            "ok" => Health::Ok,
+            "warning" => Health::Warning,
+            "error" => Health::Error,
+            _ => return None,
+        };
+        Some(Self {
+            health,
+            quiescent: params
+                .get("quiescent")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            message: params
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_owned),
+        })
+    }
 }
 
 /// The server's request to apply a workspace edit. Answer it once with [`ApplyEdit::respond`];
@@ -210,6 +266,7 @@ impl LanguageServer {
             .args(&config.args)
             .current_dir(root)
             .env("PATH", &launch.path)
+            .envs(&config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -222,13 +279,23 @@ impl LanguageServer {
         };
 
         let log = std::env::var_os("FLUX_LSP_LOG").is_some_and(|v| !v.is_empty() && v != "0");
+        let output = Arc::new(ServerLog::new());
+        let command = [config.command.as_str()]
+            .into_iter()
+            .chain(config.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        output.push(
+            LogSource::Flux,
+            &format!("started {command} in {}", root.display()),
+        );
         let (events, receiver) = unbounded();
         let (writer, messages) = std_mpsc::channel();
         transport::spawn_writer(&config.name, stdin, messages);
-        let stderr = transport::spawn_stderr(&config.name, stderr, log);
+        let stderr = transport::spawn_stderr(&config.name, stderr, log, output.clone());
         let shared = Arc::new(Shared {
             name: config.name.clone(),
-            settings: launch.settings,
+            settings: Mutex::new(launch.settings),
             root_uri: uri_from_path(root),
             root_name: root
                 .file_name()
@@ -247,6 +314,9 @@ impl LanguageServer {
             child: Mutex::new(Some(child)),
             stderr,
             log,
+            output,
+            root: root.to_path_buf(),
+            watchers: Mutex::new(Watchers::default()),
         });
         let reader = shared.clone();
         let spawned = thread::Builder::new()
@@ -285,6 +355,42 @@ impl LanguageServer {
         self.shared.state().capabilities.clone()
     }
 
+    /// What the server said (stderr, its messages) and what Flux noted about it; it lives on after
+    /// the server is gone.
+    pub fn log(&self) -> Arc<ServerLog> {
+        self.shared.output.clone()
+    }
+
+    /// The server registered files to watch (`workspace/didChangeWatchedFiles`).
+    pub fn watches_files(&self) -> bool {
+        !self.shared.watchers().is_empty()
+    }
+
+    /// Whether the server watches this kind of change of `path`.
+    pub fn watches(&self, path: &Path, change: FileChangeType) -> bool {
+        self.shared
+            .watchers()
+            .matches(path, change, &self.shared.root)
+    }
+
+    /// Files changed on disk: those the server watches go to it in one
+    /// `workspace/didChangeWatchedFiles`. How many went.
+    pub fn files_changed(&self, changes: &[(PathBuf, FileChangeType)]) -> usize {
+        let events: Vec<FileEvent> = {
+            let watchers = self.shared.watchers();
+            changes
+                .iter()
+                .filter(|(path, change)| watchers.matches(path, *change, &self.shared.root))
+                .map(|(path, change)| FileEvent::new(uri_from_path(path), *change))
+                .collect()
+        };
+        let count = events.len();
+        if count > 0 {
+            self.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams { changes: events });
+        }
+        count
+    }
+
     /// Sends a request. Dropping the future before it resolves sends `$/cancelRequest`.
     pub fn request<R: Request>(
         &self,
@@ -312,6 +418,18 @@ impl LanguageServer {
             drop(cancel);
             serde_json::from_value(result?).map_err(|err| RequestError::Decode(err.to_string()))
         }
+    }
+
+    /// The user changed the server's settings (part 10.5): `workspace/configuration` is answered
+    /// with `settings` from now on, and `workspace/didChangeConfiguration` tells the server — one
+    /// that pulls its settings (rust-analyzer, pyright, gopls) asks again, one that takes them
+    /// pushed finds them in it.
+    pub fn set_settings(&self, settings: Value) {
+        *self.shared.settings.lock().unwrap() = settings.clone();
+        self.shared.notify(
+            "workspace/didChangeConfiguration",
+            json!({ "settings": settings }),
+        );
     }
 
     /// Sends a notification; before initialization it is queued, after exit it is dropped.
@@ -371,8 +489,9 @@ struct State {
 
 struct Shared {
     name: String,
-    /// Answers to `workspace/configuration`, by section.
-    settings: Value,
+    /// Answers to `workspace/configuration`, by section; the user may change them while the server
+    /// runs ([`LanguageServer::set_settings`]).
+    settings: Mutex<Value>,
     root_uri: lsp_types::Uri,
     root_name: String,
     writer: Sender<Vec<u8>>,
@@ -383,6 +502,12 @@ struct Shared {
     child: Mutex<Option<Child>>,
     stderr: Arc<Stderr>,
     log: bool,
+    /// What the server said, for "Show Log".
+    output: Arc<ServerLog>,
+    /// The workspace root: string globs that aren't absolute are matched under it.
+    root: PathBuf,
+    /// Files the server registered to watch.
+    watchers: Mutex<Watchers>,
 }
 
 /// Kills the process when the last [`LanguageServer`] is dropped.
@@ -419,6 +544,10 @@ impl Drop for CancelOnDrop {
 impl Shared {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn watchers(&self) -> MutexGuard<'_, Watchers> {
+        self.watchers.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn write(&self, message: &Value) {
@@ -592,13 +721,78 @@ impl Shared {
             }
             "window/showMessage" => {
                 if let Ok(ShowMessageParams { typ, message }) = serde_json::from_value(params) {
+                    self.output.push(LogSource::Message(typ), &message);
                     self.emit(ServerEvent::Message {
                         kind: typ,
                         text: message,
                     });
                 }
             }
+            "window/logMessage" => {
+                if let Ok(LogMessageParams { typ, message }) = serde_json::from_value(params) {
+                    self.output.push(LogSource::Message(typ), &message);
+                }
+            }
+            "experimental/serverStatus" => {
+                if let Some(status) = ServerStatus::from_params(&params) {
+                    let health = match status.health {
+                        Health::Ok => "ok",
+                        Health::Warning => "warning",
+                        Health::Error => "error",
+                    };
+                    let busy = if status.quiescent { "" } else { ", busy" };
+                    let message = status.message.as_deref().unwrap_or_default();
+                    let line = format!("status: {health}{busy} {message}");
+                    self.output.push(LogSource::Flux, line.trim_end());
+                    self.emit(ServerEvent::Status(status));
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// `client/registerCapability`: watchers of files are kept (other registrations are
+    /// accepted and ignored — we don't offer dynamic registration of anything else).
+    fn register(&self, params: &Value) {
+        let registrations = params["registrations"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice);
+        let mut changed = false;
+        for registration in registrations {
+            let (Some(id), Some(watch::METHOD)) = (
+                registration["id"].as_str(),
+                registration["method"].as_str(),
+            ) else {
+                continue;
+            };
+            let options = registration
+                .get("registerOptions")
+                .cloned()
+                .unwrap_or(Value::Null);
+            changed |= self.watchers().register(id, options);
+        }
+        if changed {
+            self.emit(ServerEvent::WatchersChanged);
+        }
+    }
+
+    /// `client/unregisterCapability` (the spec spells the list "unregisterations").
+    fn unregister(&self, params: &Value) {
+        let list = params
+            .get("unregisterations")
+            .or_else(|| params.get("unregistrations"))
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let mut changed = false;
+        for item in list {
+            if item["method"].as_str() == Some(watch::METHOD)
+                && let Some(id) = item["id"].as_str()
+            {
+                changed |= self.watchers().unregister(id);
+            }
+        }
+        if changed {
+            self.emit(ServerEvent::WatchersChanged);
         }
     }
 
@@ -608,18 +802,25 @@ impl Shared {
             // Each item asks for a section of the settings; `null` — the server's default.
             "workspace/configuration" => {
                 let items = params["items"].as_array().map_or(&[][..], Vec::as_slice);
+                let settings = self.settings.lock().unwrap().clone();
                 let answers = items
                     .iter()
-                    .map(|item| config::settings_section(&self.settings, item["section"].as_str()))
+                    .map(|item| config::settings_section(&settings, item["section"].as_str()))
                     .collect();
                 Ok(Value::Array(answers))
             }
             "workspace/workspaceFolders" => Ok(json!([
                 { "uri": self.root_uri, "name": self.root_name }
             ])),
-            "client/registerCapability"
-            | "client/unregisterCapability"
-            | "window/workDoneProgress/create" => Ok(Value::Null),
+            "client/registerCapability" => {
+                self.register(&params);
+                Ok(Value::Null)
+            }
+            "client/unregisterCapability" => {
+                self.unregister(&params);
+                Ok(Value::Null)
+            }
+            "window/workDoneProgress/create" => Ok(Value::Null),
             // The window applies it (open documents are its editors) and answers later.
             "workspace/applyEdit" => match serde_json::from_value(params) {
                 Ok(params) => {
@@ -636,6 +837,7 @@ impl Shared {
             },
             "window/showMessageRequest" => {
                 if let Ok(ShowMessageParams { typ, message }) = serde_json::from_value(params) {
+                    self.output.push(LogSource::Message(typ), &message);
                     self.emit(ServerEvent::Message {
                         kind: typ,
                         text: message,
@@ -674,6 +876,8 @@ impl Shared {
             callback(Err(RequestError::Exited));
         }
         let reason = failure.unwrap_or_else(|| self.exit_reason());
+        self.output
+            .push(LogSource::Flux, &format!("exited: {reason}"));
         self.emit(ServerEvent::Exited { reason });
     }
 
@@ -845,10 +1049,14 @@ fn initialize_params(
 
 /// What flux-app can do with a server's answers. Positions are UTF-16 only; the window applies
 /// workspace edits — ours and the server's own (`workspace/applyEdit`, after a code action's
-/// command), with file operations; file changes are watched by the servers themselves (no
-/// `didChangeWatchedFiles` registration).
+/// command), with file operations; files a server registers to watch get their changes from the
+/// window's watcher (part 10.5; relative patterns too); rust-analyzer tells whether it could load
+/// the project (`experimental/serverStatus`).
 fn client_capabilities() -> Value {
     json!({
+        "experimental": {
+            "serverStatusNotification": true,
+        },
         "general": {
             "positionEncodings": ["utf-16"],
         },
@@ -862,7 +1070,10 @@ fn client_capabilities() -> Value {
                 "failureHandling": "abort",
             },
             "didChangeConfiguration": { "dynamicRegistration": false },
-            "didChangeWatchedFiles": { "dynamicRegistration": false },
+            "didChangeWatchedFiles": {
+                "dynamicRegistration": true,
+                "relativePatternSupport": true,
+            },
             "executeCommand": { "dynamicRegistration": false },
             "symbol": {
                 "dynamicRegistration": false,

@@ -8,6 +8,9 @@ license.workspace = true
 flux-core.workspace = true
 # Futures for responses and the event stream: awaited by gpui tasks in flux-app, no async runtime.
 futures = "0.3.34"
+# The globs of files a server watches (`workspace/didChangeWatchedFiles`, part 10.5); already in the
+# tree through `ignore`.
+globset = "0.4"
 lsp-types = "0.97.0"
 # Fast byte search: rope-only line breaks in position conversion, line breaks in deleted text.
 memchr = "2.8.3"

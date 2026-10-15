@@ -2,8 +2,10 @@
 
 Speaks just enough LSP: answers initialize, hover, completion (always "content modified"),
 shutdown; sends server requests and progress after `initialized`; publishes a diagnostic on
-didOpen; crashes on `flux/crash`. Every message it receives is appended to the log file given as
-the first argument, one JSON per line ({"pid": ...} first).
+didOpen; asks for its settings again on `flux/askConfiguration`; crashes on `flux/crash`; on
+`flux/status`, `flux/register`, `flux/unregister` sends rust-analyzer's `experimental/serverStatus`
+and (un)registers watched files with the params given. Every message it receives is appended to the
+log file given as the first argument, one JSON per line ({"pid": ..., "env": $FLUX_FAKE_ENV} first).
 """
 
 import json
@@ -43,7 +45,7 @@ def read():
     return json.loads(stdin.read(length))
 
 
-log({"pid": os.getpid()})
+log({"pid": os.getpid(), "env": os.environ.get("FLUX_FAKE_ENV")})
 # Noise before the protocol: the client must skip it.
 stdout.write(b"fake server starting\n")
 stdout.flush()
@@ -97,8 +99,18 @@ while True:
         send({"id": id, "error": {"code": -32801, "message": "content modified"}})
     elif method == "$/cancelRequest":
         send({"id": message["params"]["id"], "error": {"code": -32800, "message": "cancelled"}})
+    elif method == "flux/status":
+        send({"method": "experimental/serverStatus", "params": message["params"]})
+    elif method == "flux/register":
+        send({"id": "reg", "method": "client/registerCapability", "params": message["params"]})
+    elif method == "flux/unregister":
+        send({"id": "unreg", "method": "client/unregisterCapability", "params": message["params"]})
     elif method == "flux/askApply":
         send({"id": 103, "method": "workspace/applyEdit", "params": {"label": "dropped", "edit": {}}})
+    elif method == "flux/askConfiguration":
+        # The settings changed: ask for them again, as rust-analyzer does.
+        send({"id": "conf-2", "method": "workspace/configuration",
+              "params": {"items": [{"section": "a"}, {"section": "a.x"}, {"section": "b"}]}})
     elif method == "flux/crash":
         sys.stderr.write("fatal: boom\n")
         sys.stderr.flush()

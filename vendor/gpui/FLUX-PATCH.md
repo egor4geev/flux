@@ -38,6 +38,27 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
   into a texture of the drawable's size, read back as RGBA with premultiplied alpha). For that
   `draw_primitives` and `new_command_encoder` take the target texture instead of the drawable.
 
+- **Quitting from the Dock and at the end of the session** (part 10.5, `crates/flux-app/src/workspace.rs`):
+  gpui 0.2.2's app delegate had no `applicationShouldTerminate:`, so Quit in the Dock or its menu,
+  logging out, restarting and shutting down terminated Flux at once — unsaved documents were lost.
+  - `src/platform.rs`: `Platform::on_quit_requested(callback)` and `Platform::cancel_quit()` (default:
+    nothing). `src/app.rs`: `App::on_quit_requested(callback)` (the callback gets `&mut App`; when the
+    app is borrowed — a nested run loop inside an update — it is asked again 50 ms later) and
+    `App::cancel_quit()`.
+  - `src/platform/mac/platform.rs`: the delegate's `applicationShouldTerminate:` returns "now" once
+    the app has decided (`Platform::quit` sets `quit_approved`) or without a callback; otherwise it
+    sets `quit_pending`, runs the callback as a separate main queue task and returns
+    `NSTerminateLater`. AppKit then runs its run loop in `NSModalPanelRunLoopMode`, where the main
+    dispatch queue (gpui's tasks, frames, timers) and window events keep working, so Flux's own
+    dialogs ask their questions. `Platform::quit` answers a pending request with
+    `replyToApplicationShouldTerminate:YES` (a `terminate:` sent during the wait would terminate at
+    once, unasked); `Platform::cancel_quit` answers `NO`. Both replies go through the main queue,
+    outside any borrow of the app (termination runs `applicationWillTerminate:` → `on_app_quit`).
+  - The wait must not start inside a main queue task (the run loop doesn't serve the main queue
+    nested in one of its tasks): the system's quit events come from the run loop, and gpui sends
+    `terminate:` only after `Platform::quit`. Flux's scenario step `app-terminate` sends it from a run
+    loop timer for the same reason.
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,
@@ -50,4 +71,5 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
    `diff -ruN ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gpui-<version>/src src > flux.patch`
    (paths relative to `vendor/gpui`).
 4. Check by hand: the mouse, scrolling, file drops and the input method (Japanese, Pinyin) at 125 %,
-   the traffic lights at 80 % and 125 %.
+   the traffic lights at 80 % and 125 %; Quit in the Dock with an unsaved document (the question,
+   Cancel keeps Flux, Don't Save quits).

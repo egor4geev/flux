@@ -739,9 +739,16 @@ impl Render for AppearancePage {
 /// when it started and translates its own strings with it: it starts again in the new one (its
 /// tool windows stay), as JetBrains IDEs restart for a new language.
 pub fn set_language(choice: LanguageChoice, cx: &mut App) {
-    let before = i18n::lang();
     settings::update_appearance(cx, |appearance| appearance.language = choice);
-    i18n::apply_choice(choice);
+    apply_language(cx);
+}
+
+/// Puts the language of the settings in use: the windows redraw in it, the menu bar is built
+/// anew, the running plugins with code start again if it changed (also after `settings.json`
+/// changed on disk, part 10.5).
+pub fn apply_language(cx: &mut App) {
+    let before = i18n::lang();
+    i18n::apply_choice(settings::appearance(cx).language);
     crate::app_menu::rebuild(cx);
     cx.refresh_windows();
     if i18n::lang() != before {

@@ -391,45 +391,45 @@ pub fn prepaint(
             continue;
         }
         let start_line = text.char_to_line(d.range.start.min(len));
-        let end_line = text.char_to_line(d.range.end.min(len));
         let Some(color) = d.severity.color(ui) else {
             continue;
         };
-        if start_line >= first_line {
+        if start_line >= first_line && start_line < last_line {
             let slot = &mut worst[start_line - first_line];
             *slot = Some(slot.map_or(d.severity, |s| s.min(d.severity)));
         }
-        for line in start_line.max(first_line)..=end_line.min(last_line - 1) {
-            let Some(line_layout) = layout.line(line) else {
+        let wave = px(UNDERLINE_THICKNESS * 3.);
+        let mut underline = |top: Pixels, left: Pixels, right: Pixels| {
+            let top = top + line_height - wave - px(1.);
+            underlines.push((d.severity, point(left, top), right - left, color));
+        };
+        let start = d.range.start.min(len);
+        let end = d.range.end.min(len).max(start);
+        let segments = layout.segments(text, start, end, px(0.));
+        // An empty range, or one that covers only a line break: one character wide, where it
+        // starts.
+        if segments.iter().all(|segment| segment.right - segment.left < px(2.)) {
+            let line = start_line;
+            let Some(index) = layout.caret_row(text, start) else {
                 continue;
             };
-            let start = line_start(text, line);
-            let line_chars = line_len(text, line);
-            let x0 = if line == start_line {
-                line_layout.x_for_column(d.range.start - start)
+            let row = &layout.rows[index];
+            let column = start - line_start(text, line);
+            let left = row.x_for_column(column);
+            let right = if column < line_len(text, line) && column < row.end {
+                row.x_for_column(column + 1)
             } else {
-                px(0.)
+                left + em
             };
-            let mut x1 = if line == end_line {
-                line_layout.x_for_column(d.range.end - start)
-            } else {
-                line_layout.shaped.width
-            };
-            // An empty range, or one that covers only a line break: one character wide.
-            if line == start_line && x1 - x0 < px(2.) {
-                let column = d.range.start - start;
-                x1 = if column < line_chars {
-                    line_layout.x_for_column(column + 1)
-                } else {
-                    x0 + em
-                };
-            }
-            if x1 <= x0 {
-                continue;
-            }
-            let wave = px(UNDERLINE_THICKNESS * 3.);
-            let top = layout.line_top(line) + line_height - wave - px(1.);
-            underlines.push((d.severity, point(layout.origin.x + x0, top), x1 - x0, color));
+            underline(
+                layout.row_top(layout.first_row + index),
+                layout.origin.x + left,
+                layout.origin.x + right.max(left + px(2.)),
+            );
+            continue;
+        }
+        for segment in segments {
+            underline(segment.top, segment.left, segment.right);
         }
     }
     underlines.sort_by_key(|&(severity, ..)| Reverse(severity));

@@ -21,6 +21,7 @@ use crate::highlighter::{self, Highlighter, ParseMode};
 use crate::i18n::{tr, trf};
 use crate::settings::MarkdownLayout;
 use crate::theme::{self, Theme};
+use crate::wrap::ToggleSoftWrap;
 
 actions!(
     editor,
@@ -232,6 +233,13 @@ pub struct Editor {
     pub(crate) disk_mtime: Option<std::time::SystemTime>,
     /// A Markdown file's layout and preview (part 10.4), once the editor has shown it in its tab.
     pub(crate) markdown: Option<crate::markdown_preview::MarkdownState>,
+    /// The display rows of the lines: soft wraps (part 10.5).
+    pub(crate) wrap: crate::wrap::WrapMap,
+    /// Soft wraps as this editor's own choice (⌃⌥W); `None` — as Settings → Editor say for the
+    /// file.
+    pub(crate) soft_wrap: Option<bool>,
+    /// The scrollbar's own state: when the thumb last showed, a drag in progress (part 10.5).
+    pub(crate) scrollbar: crate::scrollbar::ScrollbarState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -332,8 +340,12 @@ impl Editor {
             recorded_changes: None,
             disk_mtime: None,
             markdown: None,
+            wrap: Default::default(),
+            soft_wrap: None,
+            scrollbar: Default::default(),
             _subscriptions: subscriptions,
         };
+        editor.wrap.reset(editor.document.text());
         editor.disk_mtime = editor.document.path().and_then(file_mtime);
         // The first parse goes straight to the background, where the highlight query also gets
         // compiled.
@@ -407,6 +419,7 @@ impl Editor {
     /// The text changed: the highlighter shifts the tree and starts a parse; the matches are
     /// shifted until fresh results arrive; subscribers are notified of the edit.
     fn text_changed(&mut self, changes: &[TextChange], cx: &mut Context<Self>) {
+        self.wrap.edited(self.document.text(), changes);
         for change in changes {
             self.highlighter.edit(change);
             if !self.search.matches.is_empty() {
@@ -438,6 +451,55 @@ impl Editor {
             && self.recorded_changes.is_none()
     }
 
+    /// Whether this editor's long lines wrap (part 10.5): a commit message's always; a side of a
+    /// diff or of the merge tool and read-only text never (their hosts line them up by lines);
+    /// otherwise the editor's own choice (⌃⌥W), else Settings → Editor for the file's name.
+    pub(crate) fn soft_wrap_wanted(&self, cx: &App) -> bool {
+        if self.message.is_some() {
+            return true;
+        }
+        if !self.can_toggle_soft_wrap() {
+            return false;
+        }
+        if let Some(on) = self.soft_wrap {
+            return on;
+        }
+        let Some(name) = self
+            .document
+            .path()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+        else {
+            return false;
+        };
+        cx.try_global::<crate::settings::Settings>().map_or_else(
+            || {
+                let masks = crate::settings::EditorSettings::default().soft_wrap_files;
+                crate::wrap::matches_masks(&masks, name)
+            },
+            |settings| crate::wrap::matches_masks(&settings.editor.soft_wrap_files, name),
+        )
+    }
+
+    /// ⌃⌥W applies: not a commit message (it always wraps), not a side of a diff or of the merge
+    /// tool, not read-only text.
+    pub(crate) fn can_toggle_soft_wrap(&self) -> bool {
+        self.message.is_none()
+            && !self.read_only
+            && self.frame_decorations.is_none()
+            && self.recorded_changes.is_none()
+    }
+
+    /// ⌃⌥W: soft wraps on or off in this editor; the caret stays in view.
+    fn toggle_soft_wrap(&mut self, _: &ToggleSoftWrap, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_toggle_soft_wrap() {
+            return;
+        }
+        self.soft_wrap = Some(!self.soft_wrap_wanted(cx));
+        self.autoscroll = Some(Autoscroll::Fit);
+        cx.notify();
+    }
+
     fn edit(
         &mut self,
         kind: EditKind,
@@ -463,19 +525,80 @@ impl Editor {
                 Direction::Forward => delta,
             };
         }
-        self.motion(cx, |text, range| {
-            movement::move_vertically(text, range, dir, lines, false)
+        self.vertical(dir, lines, false, cx);
+    }
+
+    /// ↑ / ↓ (`count` rows, Page Up / Page Down): by display rows when the lines wrap, keeping the
+    /// caret's x; otherwise by lines, keeping its column.
+    fn vertical(&mut self, dir: Direction, count: usize, extend: bool, cx: &mut Context<Self>) {
+        if !self.wrap.laid_out() {
+            return self.motion(cx, |text, range| {
+                movement::move_vertically(text, range, dir, count, extend)
+            });
+        }
+        let text = self.document.text().clone();
+        let wrap = &mut self.wrap;
+        let selection = self
+            .document
+            .selection()
+            .transform(|range| wrap.move_vertically(&text, *range, dir, count, extend));
+        self.set_selection(selection, cx);
+    }
+
+    /// Home: on a wrapped part of a line, first to the start of its row, then as on the line
+    /// (the first non-blank character, column 0), as JetBrains IDEs do with soft wraps.
+    fn home(&mut self, extend: bool, cx: &mut Context<Self>) {
+        let text = self.document.text().clone();
+        let wrap = &self.wrap;
+        let selection = self.document.selection().transform(|range| {
+            let head = range.head.min(text.len_chars());
+            let line = text.char_to_line(head);
+            let start = line_start(&text, line);
+            let row = wrap.row_in_line(line, head - start);
+            let span = wrap.row_span(&text, line, row);
+            if row > 0 && head != start + span.start {
+                range.put_cursor(start + span.start, extend)
+            } else {
+                movement::move_line_start(&text, *range, extend)
+            }
         });
+        self.set_selection(selection, cx);
+    }
+
+    /// End: on a row the line wraps after, first to the end of the row (before the wrap), then to
+    /// the end of the line.
+    fn end(&mut self, extend: bool, cx: &mut Context<Self>) {
+        let text = self.document.text().clone();
+        let wrap = &self.wrap;
+        let selection = self.document.selection().transform(|range| {
+            let head = range.head.min(text.len_chars());
+            let line = text.char_to_line(head);
+            let start = line_start(&text, line);
+            let span = wrap.row_span(&text, line, wrap.row_in_line(line, head - start));
+            let row_end = start + span.end.saturating_sub(1).max(span.start);
+            if span.wraps && head != row_end {
+                range.put_cursor(row_end, extend)
+            } else {
+                movement::move_line_end(&text, *range, extend)
+            }
+        });
+        self.set_selection(selection, cx);
     }
 
     fn add_cursor(&mut self, dir: Direction, cx: &mut Context<Self>) {
-        let text = self.document.text();
+        let text = self.document.text().clone();
         let selection = self.document.selection();
         let edge = match dir {
             Direction::Backward => selection.ranges()[0],
             Direction::Forward => *selection.ranges().last().unwrap(),
         };
-        let new = movement::move_vertically(text, Range::point(edge.head), dir, 1, false);
+        let new = if self.wrap.laid_out() {
+            self.wrap
+                .move_vertically(&text, Range::point(edge.head), dir, 1, false)
+        } else {
+            movement::move_vertically(&text, Range::point(edge.head), dir, 1, false)
+        };
+        let selection = self.document.selection();
         if new.head == edge.head {
             return;
         }
@@ -1139,14 +1262,10 @@ impl Render for Editor {
                 this.motion(cx, |t, r| movement::move_horizontally(t, r, Forward, false))
             }))
             .on_action(cx.listener(|this, _: &MoveUp, _, cx| {
-                this.motion(cx, |t, r| {
-                    movement::move_vertically(t, r, Backward, 1, false)
-                })
+                this.vertical(Backward, 1, false, cx)
             }))
             .on_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                this.motion(cx, |t, r| {
-                    movement::move_vertically(t, r, Forward, 1, false)
-                })
+                this.vertical(Forward, 1, false, cx)
             }))
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| {
                 this.motion(cx, |t, r| movement::move_horizontally(t, r, Backward, true))
@@ -1155,12 +1274,10 @@ impl Render for Editor {
                 this.motion(cx, |t, r| movement::move_horizontally(t, r, Forward, true))
             }))
             .on_action(cx.listener(|this, _: &SelectUp, _, cx| {
-                this.motion(cx, |t, r| {
-                    movement::move_vertically(t, r, Backward, 1, true)
-                })
+                this.vertical(Backward, 1, true, cx)
             }))
             .on_action(cx.listener(|this, _: &SelectDown, _, cx| {
-                this.motion(cx, |t, r| movement::move_vertically(t, r, Forward, 1, true))
+                this.vertical(Forward, 1, true, cx)
             }))
             .on_action(cx.listener(|this, _: &MoveWordLeft, _, cx| {
                 this.motion(cx, |t, r| movement::move_word(t, r, Backward, false))
@@ -1174,18 +1291,10 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &SelectWordRight, _, cx| {
                 this.motion(cx, |t, r| movement::move_word(t, r, Forward, true))
             }))
-            .on_action(cx.listener(|this, _: &MoveLineStart, _, cx| {
-                this.motion(cx, |t, r| movement::move_line_start(t, r, false))
-            }))
-            .on_action(cx.listener(|this, _: &MoveLineEnd, _, cx| {
-                this.motion(cx, |t, r| movement::move_line_end(t, r, false))
-            }))
-            .on_action(cx.listener(|this, _: &SelectLineStart, _, cx| {
-                this.motion(cx, |t, r| movement::move_line_start(t, r, true))
-            }))
-            .on_action(cx.listener(|this, _: &SelectLineEnd, _, cx| {
-                this.motion(cx, |t, r| movement::move_line_end(t, r, true))
-            }))
+            .on_action(cx.listener(|this, _: &MoveLineStart, _, cx| this.home(false, cx)))
+            .on_action(cx.listener(|this, _: &MoveLineEnd, _, cx| this.end(false, cx)))
+            .on_action(cx.listener(|this, _: &SelectLineStart, _, cx| this.home(true, cx)))
+            .on_action(cx.listener(|this, _: &SelectLineEnd, _, cx| this.end(true, cx)))
             .on_action(cx.listener(|this, _: &MoveDocumentStart, _, cx| {
                 this.set_selection(Selection::point(0), cx)
             }))
@@ -1203,6 +1312,7 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &PageDown, _, cx| this.page(Forward, cx)))
             .on_action(cx.listener(|this, _: &AddCursorAbove, _, cx| this.add_cursor(Backward, cx)))
             .on_action(cx.listener(|this, _: &AddCursorBelow, _, cx| this.add_cursor(Forward, cx)))
+            .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 let end = this.document.text().len_chars();
@@ -1252,6 +1362,7 @@ impl Render for Editor {
             })
             .child({
                 let text_area = div()
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
@@ -1271,7 +1382,8 @@ impl Render for Editor {
                             )
                     })
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
-                    .child(EditorElement::new(cx.entity()));
+                    .child(EditorElement::new(cx.entity()))
+                    .children(crate::scrollbar::render(self, window, cx));
                 match markdown {
                     Some(layout) => crate::markdown_preview::render_with_text(
                         self,

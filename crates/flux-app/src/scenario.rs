@@ -8,6 +8,9 @@
 //!   - `cmd-s`, `enter`, `space`, `left` — a keystroke in gpui keymap syntax;
 //!   - `type:text` — type the text character by character (a space is a separate `space` step);
 //!   - `wait:500` — a pause in ms;
+//!   - `move:x,y` — the mouse moves to a point of the frontmost Flux window (points from its top
+//!     left corner, as `click:`); `drag:x1,y1,x2,y2` — the left button goes down at the first point,
+//!     drags to the second and goes up there (the editor's scrollbar, part 10.5);
 //!   - `action:notifications_panel::Toggle` — dispatch an action (one without data) by name on the
 //!     focused element, as the command palette does;
 //!   - `ui:<plugin>/<window>/<element>` — a click on an element of a plugin's tool window (the
@@ -16,7 +19,13 @@
 //!   - `shot:name` — print `SHOT name` and wait for the window to be captured from outside;
 //!   - `open-project:/path` — open a project as a recent project on the start screen opens it
 //!     (`OpenProject`: this window or a new one, as the settings say — or asking);
-//!   - `window:2` — send the next steps to the second Flux window (in the order of `cx.windows()`).
+//!   - `window:2` — send the next steps to the second Flux window (in the order of `cx.windows()`);
+//!   - `app-terminate` — macOS asks Flux to quit, as Quit in the Dock or logging out does
+//!     (`-[NSApplication terminate:]` from a run loop timer, outside gpui's tasks — the path of the
+//!     system's Apple Event; part 10.5);
+//!   - `click:x,y` — a left click at a point of the frontmost Flux window, in points from its top
+//!     left corner (a shot's pixels halved): mouse events posted to Flux's own event queue, so
+//!     the window server and the background mode don't stand in the way (part 10.5).
 //!
 //!   `END` is printed after the last step. Steps go to the window opened last (or brought forward
 //!   by opening its project again), unless `window:N` says otherwise.
@@ -160,9 +169,33 @@ fn keep_panels_off_the_keyboard() {
     });
 }
 
+/// `click:x,y`: a left mouse down and up at `x, y` (points from the top left corner of the
+/// frontmost visible window's content), posted as [`post_mouse`] posts its events.
+fn post_click(x: f64, y: f64) -> bool {
+    const LEFT_MOUSE_DOWN: usize = 1;
+    const LEFT_MOUSE_UP: usize = 2;
+    post_mouse(&[(LEFT_MOUSE_DOWN, x, y), (LEFT_MOUSE_UP, x, y)])
+}
+
+/// `app-terminate`: `terminate:` as macOS sends it for Quit in the Dock — from the run loop, not
+/// from a task on the main dispatch queue (gpui's), where AppKit's wait for Flux's answer would stop
+/// gpui.
+#[allow(unexpected_cfgs)] // `msg_send!` of objc 0.2 checks a `cargo-clippy` feature.
+fn request_terminate() {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    unsafe {
+        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let nil: *mut Object = std::ptr::null_mut();
+        let _: () =
+            msg_send![app, performSelector: sel!(terminate:) withObject: nil afterDelay: 0.0f64];
+    }
+}
+
 /// In the background the scenario's panels let the mouse through to the windows under them: the
 /// user's clicks and scrolls go to the app they work in instead of a window floating above it (a
-/// scenario can't feed the mouse anyway).
+/// scenario can't feed the mouse anyway; `click:` posts its clicks to Flux's own queue).
 #[allow(unexpected_cfgs)] // `msg_send!` of objc 0.2 checks a `cargo-clippy` feature.
 fn let_the_mouse_through() {
     use objc::runtime::{BOOL, Class, Object, YES};
@@ -184,6 +217,81 @@ fn let_the_mouse_through() {
             }
         }
     }
+}
+
+/// `click:`, `move:` and `drag:`: mouse events of these types (`NSEventType`) at these points (from
+/// the top left corner of the frontmost visible window's content), posted to the app's event queue
+/// in order — AppKit hands them to the window by its number, as it does the window server's events,
+/// so the window server and the background mode don't stand in the way.
+#[allow(unexpected_cfgs)] // `msg_send!` of objc 0.2 checks a `cargo-clippy` feature.
+fn post_mouse(events: &[(usize, f64, f64)]) -> bool {
+    use objc::runtime::{NO, Object};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Point {
+        x: f64,
+        y: f64,
+    }
+    unsafe impl objc::Encode for Point {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGPoint=dd}") }
+        }
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Rect {
+        origin: Point,
+        size: Point,
+    }
+    unsafe impl objc::Encode for Rect {
+        fn encode() -> objc::Encoding {
+            unsafe { objc::Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
+        }
+    }
+
+    // SAFETY: AppKit's own windows and events, on the main thread.
+    unsafe {
+        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let windows: *mut Object = msg_send![app, windows];
+        let count: usize = msg_send![windows, count];
+        let mut front: Option<(isize, *mut Object)> = None;
+        for index in 0..count {
+            let window: *mut Object = msg_send![windows, objectAtIndex: index];
+            let visible: objc::runtime::BOOL = msg_send![window, isVisible];
+            let order: isize = msg_send![window, orderedIndex];
+            if visible != NO && front.is_none_or(|(best, _)| order < best) {
+                front = Some((order, window));
+            }
+        }
+        let Some((_, window)) = front else {
+            return false;
+        };
+        let number: isize = msg_send![window, windowNumber];
+        let view: *mut Object = msg_send![window, contentView];
+        let frame: Rect = msg_send![view, frame];
+        let nil: *mut Object = std::ptr::null_mut();
+        for &(kind, x, y) in events {
+            // AppKit's window coordinates start at the bottom left.
+            let location = Point {
+                x,
+                y: frame.size.y - y,
+            };
+            let event: *mut Object = msg_send![class!(NSEvent),
+                mouseEventWithType: kind
+                location: location
+                modifierFlags: 0usize
+                timestamp: 0.0f64
+                windowNumber: number
+                context: nil
+                eventNumber: 0isize
+                clickCount: 1isize
+                pressure: 1.0f32];
+            let _: () = msg_send![app, postEvent: event atStart: NO];
+        }
+    }
+    true
 }
 
 pub fn run(window: AnyWindowHandle, cx: &mut App) {
@@ -391,12 +499,53 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
         );
         return STEP_PAUSE;
     }
+    if let Some(point) = step.strip_prefix("click:") {
+        let point = point
+            .split_once(',')
+            .and_then(|(x, y)| Some((x.parse::<f64>().ok()?, y.parse::<f64>().ok()?)));
+        let clicked = point.is_some_and(|(x, y)| post_click(x, y));
+        println!("CLICK {point:?} -> {}", if clicked { "posted" } else { "no window" });
+        return STEP_PAUSE;
+    }
+    if step == "app-terminate" {
+        request_terminate();
+        println!("TERMINATE requested");
+        return STEP_PAUSE;
+    }
     if let Some(target) = step.strip_prefix("ui:") {
         return plugin_ui(target, None, window, cx);
     }
     if let Some(target) = step.strip_prefix("ui-submit:") {
         let (target, text) = target.split_once('=').unwrap_or((target, ""));
         return plugin_ui(target, Some(text.to_string()), window, cx);
+    }
+    if let Some(points) = step
+        .strip_prefix("move:")
+        .or_else(|| step.strip_prefix("drag:"))
+    {
+        const LEFT_MOUSE_DOWN: usize = 1;
+        const LEFT_MOUSE_UP: usize = 2;
+        const MOUSE_MOVED: usize = 5;
+        const LEFT_MOUSE_DRAGGED: usize = 6;
+        let numbers: Vec<f64> = points.split(',').filter_map(|n| n.parse().ok()).collect();
+        let events: Vec<(usize, f64, f64)> = match numbers[..] {
+            [x, y] if step.starts_with("move:") => vec![(MOUSE_MOVED, x, y)],
+            [x1, y1, x2, y2] => {
+                // The drag in steps, as a hand moves it.
+                let steps = 8;
+                let mut events = vec![(LEFT_MOUSE_DOWN, x1, y1)];
+                events.extend((1..=steps).map(|i| {
+                    let t = i as f64 / steps as f64;
+                    (LEFT_MOUSE_DRAGGED, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)
+                }));
+                events.push((LEFT_MOUSE_UP, x2, y2));
+                events
+            }
+            _ => Vec::new(),
+        };
+        let posted = !events.is_empty() && post_mouse(&events);
+        println!("MOUSE {step} -> {}", if posted { "posted" } else { "bad step" });
+        return STEP_PAUSE;
     }
     if let Some(name) = step.strip_prefix("action:") {
         let dispatched = window

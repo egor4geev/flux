@@ -1,8 +1,9 @@
 //! Which language server serves which files, and how to start it. The configs come from the
 //! language plugins (stage 8.3: `[[language-servers]]` of their manifests, turned into a
-//! [`ServerConfig`] by the application); this module picks the servers of a file and finds their
-//! executables.
+//! [`ServerConfig`] by the application), with the user's settings over them (part 10.5:
+//! [`with_user_settings`]); this module picks the servers of a file and finds their executables.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -31,6 +32,123 @@ pub struct ServerConfig {
     pub settings: Option<serde_json::Value>,
     /// How Flux installs the server when it is not on the machine; `None` — it can't.
     pub install: Option<Install>,
+    /// More environment variables for the server's process (the user's settings, part 10.5:
+    /// `CARGO_TARGET_DIR`, `NODE_OPTIONS`); they win over Flux's own `PATH`.
+    pub env: BTreeMap<String, String>,
+}
+
+/// The plugin's `config` with the user's settings of the server over it (part 10.5: `lsp.<server>`
+/// in Flux's `settings.json`); `None` — the user turned the server off (`"enabled": false`).
+/// - `settings` (the answers to `workspace/configuration`, by section) and
+///   `initialization_options` merge into the plugin's, object by object; any other value replaces;
+///   empty objects add nothing;
+/// - `command` (a name looked up in `PATH`, or a path — `~` is the home directory) and `args`
+///   replace the plugin's; a server started with the user's own command is not installed by Flux;
+/// - `env` adds environment variables.
+///
+/// Values of the wrong type are ignored, so a typo doesn't stop the server.
+pub fn with_user_settings(mut config: ServerConfig, user: &Value) -> Option<ServerConfig> {
+    let Some(user) = user.as_object() else {
+        return Some(config);
+    };
+    if user.get("enabled") == Some(&Value::Bool(false)) {
+        return None;
+    }
+    let object = |key: &str| user.get(key).filter(|value| value.is_object()).and_then(pruned);
+    if let Some(settings) = object("settings") {
+        merge_into(&mut config.settings, settings);
+    }
+    if let Some(options) = object("initialization_options") {
+        merge_into(&mut config.initialization_options, options);
+    }
+    if let Some(command) = user
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        config.command = expand_home(command, env::var_os("HOME").as_deref());
+        config.install = None;
+    }
+    if let Some(args) = user.get("args").and_then(Value::as_array) {
+        config.args = args
+            .iter()
+            .filter_map(|arg| Some(arg.as_str()?.to_string()))
+            .collect();
+    }
+    if let Some(env) = user.get("env").and_then(Value::as_object) {
+        for (key, value) in env {
+            let value = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                Value::Bool(on) => on.to_string(),
+                _ => continue,
+            };
+            config.env.insert(key.clone(), value);
+        }
+    }
+    Some(config)
+}
+
+/// Whether `a` and `b` differ in nothing but `settings`: a running server takes new settings
+/// without a restart (`workspace/didChangeConfiguration`).
+pub fn differs_only_in_settings(a: &ServerConfig, b: &ServerConfig) -> bool {
+    a.settings != b.settings
+        && ServerConfig {
+            settings: None,
+            ..a.clone()
+        } == ServerConfig {
+            settings: None,
+            ..b.clone()
+        }
+}
+
+/// `over` merged into `base`: objects key by key (deeper objects the same way), anything else
+/// replaces.
+pub fn deep_merge(base: &mut Value, over: &Value) {
+    match (base, over) {
+        (Value::Object(base), Value::Object(over)) => {
+            for (key, value) in over {
+                match base.get_mut(key) {
+                    Some(existing) => deep_merge(existing, value),
+                    None => {
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (base, over) => *base = over.clone(),
+    }
+}
+
+fn merge_into(base: &mut Option<Value>, over: Value) {
+    match base {
+        Some(base) => deep_merge(base, &over),
+        None => *base = Some(over),
+    }
+}
+
+/// `value` without empty objects (`{"rust-analyzer": {}}` — a key "Configure…" added and nobody
+/// filled in); `None` if nothing is left.
+fn pruned(value: &Value) -> Option<Value> {
+    match value {
+        Value::Object(map) => {
+            let map: serde_json::Map<String, Value> = map
+                .iter()
+                .filter_map(|(key, value)| Some((key.clone(), pruned(value)?)))
+                .collect();
+            (!map.is_empty()).then_some(Value::Object(map))
+        }
+        other => Some(other.clone()),
+    }
+}
+
+/// `~/bin/x` → `<home>/bin/x`; other commands as they are.
+fn expand_home(command: &str, home: Option<&std::ffi::OsStr>) -> String {
+    match (command.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => Path::new(home).join(rest).to_string_lossy().into_owned(),
+        _ => command.to_string(),
+    }
 }
 
 /// Where a server comes from when Flux installs it ([`crate::install`]).
@@ -153,21 +271,17 @@ pub(crate) struct Launch {
 /// - an npm server installed by Flux runs with Flux's Node.js first in `PATH`, and the tools Flux
 ///   installed for servers (shellcheck) are at the end of it.
 pub(crate) fn launch(config: &ServerConfig, root: &Path, program: &Path) -> Launch {
-    let mut settings = match &config.settings {
-        Some(Value::Object(map)) => Value::Object(map.clone()),
-        _ => json!({}),
-    };
+    let settings = workspace_settings(config, root);
     let mut initialization_options = config.initialization_options.clone();
-    if config.name == "pyright"
-        && let Some(python) = python_interpreter(root, env::var_os("VIRTUAL_ENV").as_deref())
-    {
-        settings["python"]["pythonPath"] = json!(python);
-    }
     if config.name == "typescript-language-server"
         && let Some(lib) = typescript_beside(program)
     {
         let options = initialization_options.get_or_insert_with(|| json!({}));
-        if options.is_object() && options["tsserver"]["fallbackPath"].is_null() {
+        // The user's own options may hold anything: only an object takes the key.
+        if options.is_object()
+            && matches!(options.get("tsserver"), None | Some(Value::Object(_)))
+            && options["tsserver"]["fallbackPath"].is_null()
+        {
             options["tsserver"]["fallbackPath"] = json!(lib);
         }
     }
@@ -186,6 +300,25 @@ pub(crate) fn launch(config: &ServerConfig, root: &Path, program: &Path) -> Laun
         settings,
         initialization_options,
     }
+}
+
+/// The answers to `workspace/configuration` of `config` started in `root` (an object; sections
+/// are looked up in it): its settings, and pyright gets the project's virtual environment as
+/// `python.pythonPath` when the settings don't name an interpreter. Also what a running server
+/// takes when the user changes its settings.
+pub fn workspace_settings(config: &ServerConfig, root: &Path) -> Value {
+    let mut settings = match &config.settings {
+        Some(Value::Object(map)) => Value::Object(map.clone()),
+        _ => json!({}),
+    };
+    if config.name == "pyright"
+        && matches!(settings.get("python"), None | Some(Value::Object(_)))
+        && settings["python"]["pythonPath"].is_null()
+        && let Some(python) = python_interpreter(root, env::var_os("VIRTUAL_ENV").as_deref())
+    {
+        settings["python"]["pythonPath"] = json!(python);
+    }
+    settings
 }
 
 /// The Python interpreter of the project's virtual environment: `.venv`, `venv` or `env` in the
@@ -473,6 +606,135 @@ mod tests {
             options,
             Some(json!({ "tsserver": { "fallbackPath": lib.to_string_lossy() } }))
         );
+    }
+
+    #[test]
+    fn user_settings_merge_over_the_plugins() {
+        let plugin = ServerConfig {
+            settings: Some(json!({ "rust-analyzer": { "cargo": { "features": "all" } } })),
+            initialization_options: Some(json!({ "a": 1, "nested": { "keep": true } })),
+            ..server("rust-analyzer", "rust-analyzer", &["--x"], &["rs"], &[])
+        };
+        let user = json!({
+            "settings": { "rust-analyzer": { "check": { "command": "clippy" } } },
+            "initialization_options": { "nested": { "added": [1, 2] }, "a": "replaced" },
+            "args": ["--y", 3, "--z"],
+            "env": { "CARGO_TARGET_DIR": "/tmp/ra", "N": 2, "B": true, "X": null },
+        });
+        let merged = with_user_settings(plugin.clone(), &user).unwrap();
+        assert_eq!(
+            merged.settings,
+            Some(json!({
+                "rust-analyzer": { "cargo": { "features": "all" }, "check": { "command": "clippy" } }
+            }))
+        );
+        assert_eq!(
+            merged.initialization_options,
+            Some(json!({ "a": "replaced", "nested": { "keep": true, "added": [1, 2] } }))
+        );
+        assert_eq!(merged.args, ["--y", "--z"]);
+        assert_eq!(
+            merged.env,
+            BTreeMap::from([
+                ("B".to_string(), "true".to_string()),
+                ("CARGO_TARGET_DIR".to_string(), "/tmp/ra".to_string()),
+                ("N".to_string(), "2".to_string()),
+            ])
+        );
+        // Untouched: the command, the files, the install recipe.
+        assert_eq!(merged.command, "rust-analyzer");
+        assert_eq!(merged.extensions, plugin.extensions);
+        // Nothing, an empty object, empty sections or the wrong types change nothing.
+        for user in [
+            json!(null),
+            json!({}),
+            json!({ "settings": { "rust-analyzer": {} }, "initialization_options": {} }),
+            json!({ "settings": 5, "args": "x", "env": [1], "command": "  ", "enabled": "no" }),
+        ] {
+            assert_eq!(with_user_settings(plugin.clone(), &user), Some(plugin.clone()), "{user}");
+        }
+        // Settings where the plugin has none.
+        let bare = server("gopls", "gopls", &[], &["go"], &[]);
+        let merged = with_user_settings(bare, &json!({ "settings": { "gopls": { "a": 1 } } }));
+        assert_eq!(merged.unwrap().settings, Some(json!({ "gopls": { "a": 1 } })));
+    }
+
+    #[test]
+    fn a_server_can_be_turned_off_or_given_another_command() {
+        let plugin = ServerConfig {
+            install: Some(Install::GoInstall {
+                package: "golang.org/x/tools/gopls".into(),
+                bin: "gopls".into(),
+            }),
+            ..server("gopls", "gopls", &[], &["go"], &[])
+        };
+        assert_eq!(with_user_settings(plugin.clone(), &json!({ "enabled": false })), None);
+        assert!(with_user_settings(plugin.clone(), &json!({ "enabled": true })).is_some());
+        let custom = with_user_settings(plugin.clone(), &json!({ "command": "/opt/gopls" }));
+        let custom = custom.unwrap();
+        assert_eq!(custom.command, "/opt/gopls");
+        // Flux doesn't install the plugin's server in place of the user's own.
+        assert_eq!(custom.install, None);
+        assert_eq!(
+            expand_home("~/bin/gopls", Some(std::ffi::OsStr::new("/Users/me"))),
+            "/Users/me/bin/gopls"
+        );
+        assert_eq!(expand_home("gopls", Some(std::ffi::OsStr::new("/Users/me"))), "gopls");
+    }
+
+    #[test]
+    fn only_a_change_of_settings_is_applied_without_a_restart() {
+        let a = server("x", "x", &[], &["x"], &[]);
+        let b = ServerConfig {
+            settings: Some(json!({ "x": { "a": 1 } })),
+            ..a.clone()
+        };
+        assert!(differs_only_in_settings(&a, &b));
+        assert!(!differs_only_in_settings(&a, &a));
+        let c = ServerConfig {
+            args: vec!["--other".into()],
+            ..b.clone()
+        };
+        assert!(!differs_only_in_settings(&a, &c));
+        let d = ServerConfig {
+            env: BTreeMap::from([("A".to_string(), "1".to_string())]),
+            ..b
+        };
+        assert!(!differs_only_in_settings(&a, &d));
+    }
+
+    #[test]
+    fn deep_merge_goes_into_objects_and_replaces_the_rest() {
+        let mut base = json!({ "a": { "b": 1, "c": [1] }, "d": "x" });
+        deep_merge(&mut base, &json!({ "a": { "c": [2], "e": null }, "d": { "f": 1 } }));
+        assert_eq!(base, json!({ "a": { "b": 1, "c": [2], "e": null }, "d": { "f": 1 } }));
+        let mut scalar = json!(1);
+        deep_merge(&mut scalar, &json!({ "a": 1 }));
+        assert_eq!(scalar, json!({ "a": 1 }));
+    }
+
+    #[test]
+    fn the_users_python_interpreter_wins_over_the_projects() {
+        let root = tempfile::tempdir().unwrap();
+        let venv = root.path().join(".venv");
+        fs::create_dir_all(venv.join("bin")).unwrap();
+        fs::write(venv.join("bin/python"), "").unwrap();
+        fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin").unwrap();
+        let pyright = server("pyright", "pyright-langserver", &[], &["py"], &[]);
+        let found = workspace_settings(&pyright, root.path());
+        assert!(found["python"]["pythonPath"].as_str().unwrap().ends_with(".venv/bin/python"));
+        let own = with_user_settings(
+            pyright.clone(),
+            &json!({ "settings": { "python": { "pythonPath": "/usr/bin/python3" } } }),
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_settings(&own, root.path())["python"]["pythonPath"],
+            json!("/usr/bin/python3")
+        );
+        // A section that isn't an object is left alone (no panic).
+        let odd = with_user_settings(pyright, &json!({ "settings": { "python": "x" } })).unwrap();
+        assert_eq!(workspace_settings(&odd, root.path())["python"], json!("x"));
     }
 
     #[test]

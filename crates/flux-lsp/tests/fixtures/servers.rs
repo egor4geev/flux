@@ -152,6 +152,7 @@ pub fn server(
         initialization_options: None,
         settings: None,
         install: None,
+        env: Default::default(),
     }
 }
 

@@ -60,6 +60,9 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Submit", "Отправить"),
     ("Tasks", "Задачи"),
     ("In the background", "В фоне"),
+    // Part 10.5: the tooltips of the rows of "In the background" (a click shows the task).
+    ("Watch the agent", "Смотреть, что делает агент"),
+    ("Show the command", "Показать команду"),
     ("Stop", "Остановить"),
     // The proposal tab (`diff_view.rs`).
     ("{0} — Claude", "{0} — Claude"),

@@ -98,6 +98,11 @@ unsafe fn build_classes() {
                 sel!(applicationWillTerminate:),
                 will_terminate as extern "C" fn(&mut Object, Sel, id),
             );
+            // Flux patch (part 10.5): Quit in the Dock and the end of the session ask the app.
+            decl.add_method(
+                sel!(applicationShouldTerminate:),
+                should_terminate as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
+            );
             decl.add_method(
                 sel!(handleGPUIMenuItem:),
                 handle_menu_item as extern "C" fn(&mut Object, Sel, id),
@@ -168,6 +173,15 @@ pub(crate) struct MacPlatformState {
     reopen: Option<Box<dyn FnMut()>>,
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
     quit: Option<Box<dyn FnMut()>>,
+    /// Flux patch (part 10.5): asked when macOS wants the app to quit on its own
+    /// ([`Platform::on_quit_requested`]).
+    quit_requested: Option<Box<dyn FnMut() -> bool>>,
+    /// Flux patch: the app said it may quit ([`Platform::quit`]): `applicationShouldTerminate:`
+    /// lets the termination go without asking.
+    quit_approved: bool,
+    /// Flux patch: `applicationShouldTerminate:` answered "later" and AppKit waits for
+    /// `replyToApplicationShouldTerminate:`.
+    quit_pending: bool,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
@@ -209,6 +223,9 @@ impl MacPlatform {
             metadata_pasteboard_type: unsafe { ns_string("zed-metadata") },
             reopen: None,
             quit: None,
+            quit_requested: None,
+            quit_approved: false,
+            quit_pending: false,
             menu_command: None,
             validate_menu_command: None,
             will_open_menu: None,
@@ -509,6 +526,25 @@ impl Platform for MacPlatform {
         // the app state on the stack when we actually terminate the app.
 
         use super::dispatcher::{dispatch_get_main_queue, dispatch_sys::dispatch_async_f};
+
+        // Flux patch (part 10.5): the app has decided. A request of macOS that waits for the
+        // answer (Quit in the Dock, logging out) gets "yes"; otherwise `terminate:` goes through
+        // `applicationShouldTerminate:` without asking again.
+        let answer_request = {
+            let mut state = self.0.lock();
+            state.quit_approved = true;
+            std::mem::take(&mut state.quit_pending)
+        };
+        if answer_request {
+            unsafe {
+                dispatch_async_f(
+                    dispatch_get_main_queue(),
+                    ptr::null_mut(),
+                    Some(reply_to_should_terminate_yes),
+                );
+            }
+            return;
+        }
 
         unsafe {
             dispatch_async_f(dispatch_get_main_queue(), ptr::null_mut(), Some(quit));
@@ -877,6 +913,24 @@ impl Platform for MacPlatform {
 
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().reopen = Some(callback);
+    }
+
+    fn on_quit_requested(&self, callback: Box<dyn FnMut() -> bool>) {
+        self.0.lock().quit_requested = Some(callback);
+    }
+
+    fn cancel_quit(&self) {
+        use super::dispatcher::{dispatch_get_main_queue, dispatch_sys::dispatch_async_f};
+
+        if std::mem::take(&mut self.0.lock().quit_pending) {
+            unsafe {
+                dispatch_async_f(
+                    dispatch_get_main_queue(),
+                    ptr::null_mut(),
+                    Some(reply_to_should_terminate_no),
+                );
+            }
+        }
     }
 
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
@@ -1425,6 +1479,96 @@ extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
         drop(lock);
         callback();
         platform.0.lock().quit.get_or_insert(callback);
+    }
+}
+
+/// `NSApplicationTerminateReply`.
+const NS_TERMINATE_NOW: NSUInteger = 1;
+const NS_TERMINATE_LATER: NSUInteger = 2;
+
+/// Flux patch (part 10.5): macOS asks whether the app may quit — Quit in the Dock or its menu, the
+/// end of the user's session (logging out, restarting, shutting down), `terminate:` sent by
+/// anyone. Unless the app has decided already ([`Platform::quit`]), its callback is asked and
+/// AppKit waits ("later": a run loop in `NSModalPanelRunLoopMode`, where the main dispatch queue
+/// — gpui's tasks, frames and timers — keeps running) until the app answers with
+/// [`Platform::quit`] or [`Platform::cancel_quit`].
+///
+/// The callback runs as a separate main queue task, outside this delegate call. The wait must not
+/// start inside a main queue task, though: the run loop doesn't serve the main queue nested in one
+/// of its own tasks, and gpui would stop. The system's requests (Apple Events) never come from one;
+/// gpui itself sends `terminate:` only after [`Platform::quit`], which doesn't wait.
+///
+/// While AppKit waits, it ignores another quit event (Quit in the Dock again); a `terminate:`
+/// message sent then terminates at once, without asking — so [`Platform::quit`] answers the
+/// request instead of sending one.
+extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
+    use super::dispatcher::{dispatch_get_main_queue, dispatch_sys::dispatch_async_f};
+
+    let platform = unsafe { get_mac_platform(this) };
+    let mut state = platform.0.lock();
+    if state.quit_approved || state.quit_requested.is_none() {
+        return NS_TERMINATE_NOW;
+    }
+    // Asked already: the answer to that request is the answer to this one.
+    if !state.quit_pending {
+        state.quit_pending = true;
+        drop(state);
+        unsafe {
+            dispatch_async_f(dispatch_get_main_queue(), ptr::null_mut(), Some(ask_to_quit));
+        }
+    }
+    NS_TERMINATE_LATER
+}
+
+/// Flux patch: the app's callback for a quit macOS asked for; asked again in 50 ms if it couldn't
+/// ask now.
+unsafe extern "C" fn ask_to_quit(_: *mut c_void) {
+    use super::dispatcher::{
+        dispatch_get_main_queue,
+        dispatch_sys::{DISPATCH_TIME_NOW, dispatch_after_f, dispatch_time},
+    };
+
+    let platform = unsafe {
+        let app = NSApplication::sharedApplication(nil);
+        get_mac_platform(&mut *app)
+    };
+    let mut state = platform.0.lock();
+    // Answered in the meantime.
+    if !state.quit_pending {
+        return;
+    }
+    let Some(mut callback) = state.quit_requested.take() else {
+        return;
+    };
+    drop(state);
+    let asked = callback();
+    platform.0.lock().quit_requested.get_or_insert(callback);
+    if !asked {
+        unsafe {
+            let when = dispatch_time(DISPATCH_TIME_NOW as u64, 50_000_000);
+            dispatch_after_f(
+                when,
+                dispatch_get_main_queue(),
+                ptr::null_mut(),
+                Some(ask_to_quit),
+            );
+        }
+    }
+}
+
+/// Flux patch: AppKit may terminate the app now.
+unsafe extern "C" fn reply_to_should_terminate_yes(_: *mut c_void) {
+    unsafe {
+        let app = NSApplication::sharedApplication(nil);
+        let _: () = msg_send![app, replyToApplicationShouldTerminate: YES];
+    }
+}
+
+/// Flux patch: the app keeps running.
+unsafe extern "C" fn reply_to_should_terminate_no(_: *mut c_void) {
+    unsafe {
+        let app = NSApplication::sharedApplication(nil);
+        let _: () = msg_send![app, replyToApplicationShouldTerminate: NO];
     }
 }
 

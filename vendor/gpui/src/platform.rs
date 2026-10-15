@@ -230,6 +230,15 @@ pub(crate) trait Platform: 'static {
 
     fn on_quit(&self, callback: Box<dyn FnMut()>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
+    /// Flux patch (part 10.5): `callback` is asked when the platform wants the application to quit
+    /// on its own (macOS: Quit in the Dock, the end of the user's session). The platform waits
+    /// until the application answers with [`Platform::quit`] or [`Platform::cancel_quit`].
+    /// `callback` returns `false` when it can't ask now (the app is busy): it is asked again a
+    /// little later. Platforms without such requests ignore it.
+    fn on_quit_requested(&self, _callback: Box<dyn FnMut() -> bool>) {}
+    /// Flux patch (part 10.5): the application keeps running after a quit the platform asked for
+    /// ([`Platform::on_quit_requested`]); nothing to do without such a request.
+    fn cancel_quit(&self) {}
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {

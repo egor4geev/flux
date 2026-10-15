@@ -31,6 +31,49 @@ pub fn display_line(text: &Rope, line: usize) -> (String, Vec<usize>) {
     (display, char_to_byte)
 }
 
+/// A part of a line to draw on one display row (soft wraps, part 10.5): the columns
+/// `start..end`, tabs expanded to spaces from display column `display` (where the row starts on
+/// the line's tab stops). The second value is as for [`display_line`], for the row's columns.
+pub fn display_range(
+    text: &Rope,
+    line: usize,
+    start: usize,
+    end: usize,
+    display: usize,
+) -> (String, Vec<usize>) {
+    let line_start = line_start(text, line);
+    let slice = text.slice(line_start + start..line_start + end);
+    let mut out = String::with_capacity(slice.len_bytes());
+    let mut char_to_byte = Vec::with_capacity(slice.len_chars() + 1);
+    let mut column = display;
+    for c in slice.chars() {
+        char_to_byte.push(out.len());
+        if c == '\t' {
+            let spaces = theme::TAB_WIDTH - column % theme::TAB_WIDTH;
+            out.extend(std::iter::repeat_n(' ', spaces));
+            column += spaces;
+        } else {
+            out.push(c);
+            column += 1;
+        }
+    }
+    char_to_byte.push(out.len());
+    (out, char_to_byte)
+}
+
+/// The highlight spans of a line that fall on its columns `start..end`, relative to `start`.
+pub fn row_spans(spans: &[HighlightSpan], start: usize, end: usize) -> Vec<HighlightSpan> {
+    spans
+        .iter()
+        .filter(|span| span.end > start && span.start < end)
+        .map(|span| HighlightSpan {
+            start: span.start.max(start) - start,
+            end: span.end.min(end) - start,
+            highlight: span.highlight,
+        })
+        .collect()
+}
+
 /// Builds the `TextRun`s of a displayed line from the highlight spans. Span columns are measured in
 /// characters of the source line; `char_to_byte` (from [`display_line`]) converts them to bytes of
 /// the displayed line, so a tab under a span is colored as a whole. Gaps use the font and color of
@@ -231,6 +274,33 @@ mod tests {
                 (2, color(0xffffff))
             ]
         );
+    }
+
+    #[test]
+    fn a_row_expands_its_tabs_from_its_display_column() {
+        let text = Rope::from_str("ab\tcd\tef\nnext");
+        // The whole line, as `display_line` does.
+        assert_eq!(display_range(&text, 0, 0, 8, 0), display_line(&text, 0));
+        // "cd\tef" starts at display column 4: its tab, at column 6, goes to column 8.
+        let (row, char_to_byte) = display_range(&text, 0, 3, 8, 4);
+        assert_eq!(row, "cd  ef");
+        assert_eq!(char_to_byte, vec![0, 1, 2, 4, 5, 6]);
+        // The same characters from column 1: the tab is at column 3 and takes one.
+        assert_eq!(display_range(&text, 0, 3, 8, 1).0, "cd ef");
+    }
+
+    #[test]
+    fn spans_are_cut_to_the_row() {
+        let spans = [
+            span(0, 4, KEYWORD),
+            span(6, 12, STRING),
+            span(14, 20, TITLE),
+        ];
+        assert_eq!(
+            row_spans(&spans, 3, 15),
+            vec![span(0, 1, KEYWORD), span(3, 9, STRING), span(11, 12, TITLE)]
+        );
+        assert_eq!(row_spans(&spans, 20, 25), vec![]);
     }
 
     #[test]

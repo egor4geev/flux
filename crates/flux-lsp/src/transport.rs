@@ -8,6 +8,8 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::output::{LogSource, ServerLog};
+
 /// How many last lines of the server's stderr are kept for the exit reason.
 const STDERR_LINES: usize = 20;
 
@@ -81,7 +83,13 @@ pub(crate) struct Stderr {
     pub closed: AtomicBool,
 }
 
-pub(crate) fn spawn_stderr(name: &str, stderr: ChildStderr, log: bool) -> Arc<Stderr> {
+/// Every line also goes to the server's `output` (Show Log).
+pub(crate) fn spawn_stderr(
+    name: &str,
+    stderr: ChildStderr,
+    log: bool,
+    output: Arc<ServerLog>,
+) -> Arc<Stderr> {
     let sink = Arc::new(Stderr {
         lines: Mutex::new(VecDeque::new()),
         closed: AtomicBool::new(false),
@@ -105,6 +113,7 @@ pub(crate) fn spawn_stderr(name: &str, stderr: ChildStderr, log: bool) -> Arc<St
                 if text.is_empty() {
                     continue;
                 }
+                output.push(LogSource::Stderr, &text);
                 let mut lines = shared.lines.lock().unwrap_or_else(|e| e.into_inner());
                 if lines.len() == STDERR_LINES {
                     lines.pop_front();

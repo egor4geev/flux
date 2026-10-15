@@ -1,6 +1,9 @@
 //! User settings that persist between launches: `~/Library/Application Support/flux/settings.json`
 //! (`FLUX_SETTINGS_FILE` — another file; in a scenario without it, nothing is read or written).
-//! Edited in the Settings window ([`crate::settings_view`]).
+//! Edited in the Settings window ([`crate::settings_view`]) and, since part 10.5, in the file
+//! itself: Flux reads it again when it changes ([`reload`], [`crate::settings_file`]). Keys Flux
+//! doesn't know are kept as written; a file that isn't valid JSON is left alone — Flux keeps the
+//! settings it has and doesn't write the file until it is fixed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -49,8 +52,74 @@ pub struct Settings {
     /// How a Markdown file opens (part 10.4): the text, the text and its preview side by side, or
     /// the preview; the layout chosen last becomes the default (`markdown.layout`).
     pub markdown_layout: MarkdownLayout,
+    /// Settings → Editor (part 10.5): soft wraps (`editor`).
+    pub editor: EditorSettings,
+    /// The user's settings of language servers (part 10.5), by server name, as written in
+    /// `settings.json` (`lsp`): `settings`, `initialization_options`, the command and its arguments
+    /// over what the language plugin brings ([`crate::lsp_settings`]).
+    pub lsp: serde_json::Map<String, Value>,
+    /// Keys of the file this Flux doesn't know (a newer Flux's, the user's own), kept as written
+    /// (part 10.5): top-level keys, and keys inside the objects Flux reads (`appearance`…). The
+    /// file is written from the struct, which would lose them.
+    unknown: serde_json::Map<String, Value>,
+    /// What is wrong with the file while it can't be read (broken JSON): Flux keeps the settings it
+    /// has and doesn't write the file until it is fixed (part 10.5).
+    error: Option<FileError>,
     /// Where the settings are saved; `None` — kept in memory only.
     path: Option<PathBuf>,
+}
+
+/// Why `settings.json` can't be read: the JSON parser's message and where it stopped (1-based; 0
+/// — the file itself couldn't be read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileError {
+    pub message: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+/// [`FileError::message`] of a file that is valid JSON, but not an object (the windows show it
+/// translated).
+pub const NOT_AN_OBJECT: &str = "The settings must be a JSON object";
+
+/// What reading `settings.json` again found ([`reload`]).
+pub enum Reload {
+    /// The same settings: Flux's own write, a save without changes.
+    Unchanged,
+    /// Other settings, now in use: the previous ones, to see what changed; `fixed` — the file
+    /// couldn't be read before.
+    Changed { old: Box<Settings>, fixed: bool },
+    /// The file can't be read: the settings stay as they were. `new` — not the error known before.
+    Invalid { error: FileError, new: bool },
+}
+
+/// Settings → Editor (part 10.5), as JetBrains IDEs' Editor → General → Soft Wraps.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditorSettings {
+    /// Files whose long lines wrap by default: masks of their names (`*.md`); the editor's own
+    /// switch (⌃⌥W) overrides it for one editor.
+    pub soft_wrap_files: Vec<String>,
+    /// A wrapped part of a line starts at the line's indent ("Use original line's indent for wrapped
+    /// parts").
+    pub soft_wrap_indent: bool,
+    /// Spaces added to that indent ("Add additional indent").
+    pub soft_wrap_extra_indent: u32,
+    /// The soft-wrap signs show on the caret's line only ("Only show soft-wrap indicators for the
+    /// current line"); otherwise on every wrapped line.
+    pub soft_wrap_signs_current_line_only: bool,
+}
+
+impl Default for EditorSettings {
+    fn default() -> Self {
+        Self {
+            soft_wrap_files: ["*.md", "*.txt", "*.rst", "*.adoc"]
+                .map(String::from)
+                .to_vec(),
+            soft_wrap_indent: true,
+            soft_wrap_extra_indent: 0,
+            soft_wrap_signs_current_line_only: true,
+        }
+    }
 }
 
 /// Settings → Appearance (stage 8.3): themes and icons are chosen by name among those the
@@ -335,6 +404,10 @@ impl Default for Settings {
             ignored_suggestions: BTreeSet::new(),
             projects: ProjectSettings::default(),
             markdown_layout: MarkdownLayout::default(),
+            editor: EditorSettings::default(),
+            lsp: serde_json::Map::new(),
+            unknown: serde_json::Map::new(),
+            error: None,
             path: None,
         }
     }
@@ -347,14 +420,84 @@ pub fn init(cx: &mut App) {
         std::env::var_os("FLUX_SETTINGS_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
         std::env::var_os("HOME"),
-    );
-    let mut settings = path
-        .as_deref()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .map(|text| parse(&text))
-        .unwrap_or_default();
+    )
+    // Watched and opened in a tab: the same path wherever the current directory is.
+    .map(|path| std::path::absolute(&path).unwrap_or(path));
+    // A broken file gives the defaults, but stays as it is (the windows tell about it).
+    let mut settings = match path.as_deref().map(read_file) {
+        Some(Err(error)) => Settings {
+            error: Some(error),
+            ..Settings::default()
+        },
+        Some(Ok(settings)) => settings,
+        None => Settings::default(),
+    };
     settings.path = path;
     cx.set_global(settings);
+}
+
+/// Reads `settings.json` again (part 10.5: it changed on disk — saved in a tab of Flux, edited by
+/// another program, written by Flux itself). Valid settings replace those in use (observers of
+/// the [`Settings`] global hear of it); a broken file leaves them and blocks writing.
+pub fn reload(cx: &mut App) -> Reload {
+    let Some(path) = cx.try_global::<Settings>().and_then(|s| s.path.clone()) else {
+        return Reload::Unchanged;
+    };
+    let current = cx.global::<Settings>();
+    match read_file(&path) {
+        Err(error) => {
+            let new = current.error.as_ref() != Some(&error);
+            if new {
+                cx.global_mut::<Settings>().error = Some(error.clone());
+            }
+            Reload::Invalid { error, new }
+        }
+        Ok(mut settings) => {
+            settings.path = Some(path);
+            if *current == settings {
+                return Reload::Unchanged;
+            }
+            let old = std::mem::replace(cx.global_mut::<Settings>(), settings);
+            let fixed = old.error.is_some();
+            Reload::Changed {
+                old: Box::new(old),
+                fixed,
+            }
+        }
+    }
+}
+
+/// The settings of the file at `path`: a missing file — the defaults.
+fn read_file(path: &Path) -> Result<Settings, FileError> {
+    match fs::read_to_string(path) {
+        Ok(text) => parse_file(&text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(err) => Err(FileError {
+            message: err.to_string(),
+            line: 0,
+            column: 0,
+        }),
+    }
+}
+
+/// Where the settings are saved (`settings.json`); `None` — kept in memory only (a scenario).
+pub fn file_path(cx: &App) -> Option<PathBuf> {
+    cx.try_global::<Settings>()
+        .and_then(|settings| settings.path.clone())
+}
+
+/// What is wrong with `settings.json` while it can't be read (part 10.5).
+pub fn file_error(cx: &App) -> Option<FileError> {
+    cx.try_global::<Settings>()
+        .and_then(|settings| settings.error.clone())
+}
+
+/// Writes the settings in use to the file now (it is about to be opened in a tab and doesn't exist
+/// yet: nothing was ever changed).
+pub fn save_file(cx: &App) {
+    if let Some(settings) = cx.try_global::<Settings>() {
+        save(settings);
+    }
 }
 
 pub fn auto_install_servers(cx: &App) -> bool {
@@ -560,6 +703,42 @@ pub fn update_projects(cx: &mut App, change: impl FnOnce(&mut ProjectSettings)) 
     save(settings);
 }
 
+/// Settings → Editor (part 10.5).
+pub fn editor(cx: &App) -> EditorSettings {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.editor.clone())
+        .unwrap_or_default()
+}
+
+/// Changes the editor settings and saves them.
+pub fn update_editor(cx: &mut App, change: impl FnOnce(&mut EditorSettings)) {
+    let settings = cx.default_global::<Settings>();
+    change(&mut settings.editor);
+    save(settings);
+}
+
+/// The user's settings of the language server `name` (part 10.5), as written under `lsp` in
+/// `settings.json`; `None` — the language plugin's.
+pub fn lsp_server(name: &str, cx: &App) -> Option<Value> {
+    cx.try_global::<Settings>()
+        .and_then(|settings| settings.lsp.get(name).cloned())
+}
+
+/// The user's settings of every language server (`lsp`), by server name.
+pub fn lsp(cx: &App) -> serde_json::Map<String, Value> {
+    cx.try_global::<Settings>()
+        .map(|settings| settings.lsp.clone())
+        .unwrap_or_default()
+}
+
+/// Changes the user's settings of language servers and saves them; the window's servers follow
+/// ([`crate::lsp_settings`]).
+pub fn update_lsp(cx: &mut App, change: impl FnOnce(&mut serde_json::Map<String, Value>)) {
+    let settings = cx.default_global::<Settings>();
+    change(&mut settings.lsp);
+    save(settings);
+}
+
 /// Whether the user ignored plugin suggestions for this kind of file ("*.rs", "Dockerfile").
 pub fn suggestion_ignored(kind: &str, cx: &App) -> bool {
     cx.try_global::<Settings>()
@@ -575,6 +754,10 @@ pub fn ignore_suggestion(kind: &str, cx: &mut App) {
 }
 
 fn save(settings: &Settings) {
+    // A file the user broke stays as it is until they fix it (part 10.5).
+    if settings.error.is_some() {
+        return;
+    }
     if let Some(path) = &settings.path
         && let Err(err) = write(path, &to_json(settings))
     {
@@ -596,11 +779,46 @@ fn store_path_for(
     Some(PathBuf::from(home?).join("Library/Application Support/flux/settings.json"))
 }
 
-/// Unknown keys and broken files fall back to the defaults.
+/// Broken files fall back to the defaults.
+#[cfg(test)]
 fn parse(text: &str) -> Settings {
-    let value: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    parse_value(&serde_json::from_str(text).unwrap_or(Value::Null))
+}
+
+/// The settings `text` holds (part 10.5): a JSON object; an empty file is the defaults. Anything
+/// else is an error with the place the parser stopped at.
+pub(crate) fn parse_file(text: &str) -> Result<Settings, FileError> {
+    if text.trim().is_empty() {
+        return Ok(Settings::default());
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(value) if value.is_object() => Ok(parse_value(&value)),
+        Ok(_) => Err(FileError {
+            message: NOT_AN_OBJECT.to_string(),
+            line: 1,
+            column: 1,
+        }),
+        Err(err) => {
+            // "expected `,` or `}` at line 3 column 5" — the place goes apart.
+            let message = err.to_string();
+            let message = match message.rfind(" at line ") {
+                Some(at) => message[..at].to_string(),
+                None => message,
+            };
+            Err(FileError {
+                message,
+                line: err.line(),
+                column: err.column(),
+            })
+        }
+    }
+}
+
+/// The settings of a parsed file: values of the wrong type fall back to the defaults; keys Flux
+/// doesn't know are kept ([`Settings::unknown`]).
+fn parse_value(value: &Value) -> Settings {
     let defaults = Settings::default();
-    Settings {
+    let mut settings = Settings {
         auto_install_servers: value["language_servers"]["auto_install"]
             .as_bool()
             .unwrap_or(defaults.auto_install_servers),
@@ -677,8 +895,93 @@ fn parse(text: &str) -> Settings {
             .as_str()
             .and_then(MarkdownLayout::from_key)
             .unwrap_or_default(),
+        editor: parse_editor(&value["editor"]),
+        lsp: value["lsp"].as_object().cloned().unwrap_or_default(),
         ..defaults
+    };
+    settings.unknown = unknown_keys(value, &known_json(&settings));
+    settings
+}
+
+/// The keys of `raw` that the struct doesn't write (`known`): top-level ones, and those inside the
+/// objects both have (`appearance.something_new`).
+fn unknown_keys(raw: &Value, known: &Value) -> serde_json::Map<String, Value> {
+    let (Some(raw), Some(known)) = (raw.as_object(), known.as_object()) else {
+        return serde_json::Map::new();
+    };
+    let mut unknown = serde_json::Map::new();
+    for (key, value) in raw {
+        match (known.get(key), value) {
+            (None, _) => {
+                unknown.insert(key.clone(), value.clone());
+            }
+            (Some(Value::Object(known)), Value::Object(value)) => {
+                let inner: serde_json::Map<String, Value> = value
+                    .iter()
+                    .filter(|(key, _)| !known.contains_key(*key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                if !inner.is_empty() {
+                    unknown.insert(key.clone(), Value::Object(inner));
+                }
+            }
+            _ => {}
+        }
     }
+    unknown
+}
+
+/// Puts the kept unknown keys back among those the struct writes.
+fn restore_unknown(value: &mut Value, unknown: &serde_json::Map<String, Value>) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for (key, kept) in unknown {
+        match (object.get_mut(key), kept) {
+            (None, _) => {
+                object.insert(key.clone(), kept.clone());
+            }
+            (Some(Value::Object(inner)), Value::Object(kept)) => {
+                for (key, value) in kept {
+                    inner.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_editor(value: &Value) -> EditorSettings {
+    let defaults = EditorSettings::default();
+    EditorSettings {
+        soft_wrap_files: value["soft_wrap_files"]
+            .as_array()
+            .map(|masks| {
+                masks
+                    .iter()
+                    .filter_map(|mask| Some(mask.as_str()?.to_string()))
+                    .collect()
+            })
+            .unwrap_or(defaults.soft_wrap_files),
+        soft_wrap_indent: value["soft_wrap_indent"]
+            .as_bool()
+            .unwrap_or(defaults.soft_wrap_indent),
+        soft_wrap_extra_indent: value["soft_wrap_extra_indent"]
+            .as_u64()
+            .map_or(defaults.soft_wrap_extra_indent, |spaces| spaces.min(16) as u32),
+        soft_wrap_signs_current_line_only: value["soft_wrap_signs_current_line_only"]
+            .as_bool()
+            .unwrap_or(defaults.soft_wrap_signs_current_line_only),
+    }
+}
+
+fn editor_json(editor: &EditorSettings) -> Value {
+    json!({
+        "soft_wrap_files": editor.soft_wrap_files,
+        "soft_wrap_indent": editor.soft_wrap_indent,
+        "soft_wrap_extra_indent": editor.soft_wrap_extra_indent,
+        "soft_wrap_signs_current_line_only": editor.soft_wrap_signs_current_line_only,
+    })
 }
 
 fn parse_appearance(value: &Value) -> AppearanceSettings {
@@ -758,7 +1061,14 @@ fn parse_claude(value: &Value) -> ClaudeSettings {
 }
 
 fn to_json(settings: &Settings) -> String {
-    let value = json!({
+    let mut value = known_json(settings);
+    restore_unknown(&mut value, &settings.unknown);
+    serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
+}
+
+/// What the struct writes: every key Flux knows.
+fn known_json(settings: &Settings) -> Value {
+    json!({
         "language_servers": { "auto_install": settings.auto_install_servers },
         "git": { "update_method": settings.update_method.key() },
         "notifications": {
@@ -813,8 +1123,9 @@ fn to_json(settings: &Settings) -> String {
             "reopen": settings.projects.reopen,
         },
         "markdown": { "layout": settings.markdown_layout.key() },
-    });
-    serde_json::to_string_pretty(&value).unwrap_or_default() + "\n"
+        "editor": editor_json(&settings.editor),
+        "lsp": settings.lsp,
+    })
 }
 
 /// Through a temporary file and a `rename`: the file is never left half-written.
@@ -883,6 +1194,18 @@ mod tests {
                 reopen: false,
             },
             markdown_layout: MarkdownLayout::Preview,
+            editor: EditorSettings {
+                soft_wrap_files: vec!["*.md".to_string(), "COMMIT_EDITMSG".to_string()],
+                soft_wrap_indent: false,
+                soft_wrap_extra_indent: 2,
+                soft_wrap_signs_current_line_only: false,
+            },
+            lsp: serde_json::Map::from_iter([(
+                "rust-analyzer".to_string(),
+                json!({ "settings": { "rust-analyzer": { "check": { "command": "clippy" } } } }),
+            )]),
+            unknown: serde_json::Map::new(),
+            error: None,
             path: None,
         };
         assert_eq!(parse(&to_json(&off)), off);
@@ -922,5 +1245,85 @@ mod tests {
             store_path_for(Some("/tmp/s.json".into()), true, home),
             Some(PathBuf::from("/tmp/s.json"))
         );
+    }
+
+    #[test]
+    fn keys_flux_doesnt_know_are_kept() {
+        let text = r#"{
+            "from_the_future": { "x": [1, 2] },
+            "appearance": { "theme": "Flux Day", "glow": 0.5 },
+            "claude": { "later": true },
+            "lsp": { "gopls": { "settings": { "gopls": { "staticcheck": true } } } },
+            "notifications": { "groups": { "git": "log", "weird": "loud" } }
+        }"#;
+        let mut settings = parse_file(text).unwrap();
+        assert_eq!(settings.appearance.theme.as_deref(), Some("Flux Day"));
+        assert_eq!(
+            settings.unknown,
+            serde_json::Map::from_iter([
+                ("from_the_future".to_string(), json!({ "x": [1, 2] })),
+                ("appearance".to_string(), json!({ "glow": 0.5 })),
+                ("claude".to_string(), json!({ "later": true })),
+            ])
+        );
+        // Flux changes what it knows; the rest is written back as it was.
+        settings.appearance.theme = Some("Flux Night".to_string());
+        let written: Value = serde_json::from_str(&to_json(&settings)).unwrap();
+        assert_eq!(written["from_the_future"], json!({ "x": [1, 2] }));
+        assert_eq!(written["appearance"]["glow"], json!(0.5));
+        assert_eq!(written["appearance"]["theme"], json!("Flux Night"));
+        assert_eq!(written["claude"]["later"], json!(true));
+        assert_eq!(written["claude"]["enabled"], json!(true));
+        assert_eq!(
+            written["lsp"],
+            json!({ "gopls": { "settings": { "gopls": { "staticcheck": true } } } })
+        );
+        // A broken entry of a list Flux owns is not "unknown": it is dropped as before.
+        assert_eq!(written["notifications"]["groups"], json!({ "git": "log" }));
+        // And the round trip is stable.
+        assert_eq!(parse_file(&to_json(&settings)).unwrap(), settings);
+    }
+
+    #[test]
+    fn a_broken_file_is_an_error_with_its_place() {
+        let error = parse_file("{\n  \"git\": {\n    \"update_method\": \"merge\"\n  \n}").unwrap_err();
+        assert_eq!(error.line, 5);
+        assert!(error.message.contains("EOF"), "{}", error.message);
+        assert!(!error.message.contains(" at line "), "{}", error.message);
+        let error = parse_file("{ \"a\": 1, }").unwrap_err();
+        assert_eq!((error.line, error.column), (1, 11));
+        assert_eq!(
+            parse_file("[1, 2]").unwrap_err().message,
+            NOT_AN_OBJECT.to_string()
+        );
+        // An empty file is the defaults (the user cleared it).
+        assert_eq!(parse_file("").unwrap(), Settings::default());
+        assert_eq!(parse_file(" \n").unwrap(), Settings::default());
+    }
+
+    #[test]
+    fn a_broken_file_is_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("flux-settings-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        fs::write(&path, "{ broken").unwrap();
+        let error = read_file(&path).unwrap_err();
+        let settings = Settings {
+            error: Some(error),
+            path: Some(path.clone()),
+            ..Settings::default()
+        };
+        save(&settings);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ broken");
+        // Fixed, it is written again.
+        let settings = Settings {
+            path: Some(path.clone()),
+            ..Settings::default()
+        };
+        save(&settings);
+        assert_eq!(read_file(&path).unwrap(), Settings::default());
+        // A missing file is the defaults.
+        assert_eq!(read_file(&dir.join("none.json")).unwrap(), Settings::default());
+        fs::remove_dir_all(&dir).ok();
     }
 }

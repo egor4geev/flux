@@ -1,6 +1,42 @@
+diff -ruN a/src/app.rs b/src/app.rs
+--- a/src/app.rs	2006-07-24 05:21:28
++++ b/src/app.rs	2026-10-15 10:25:43
+@@ -750,6 +750,32 @@
+         self.platform.quit();
+     }
+ 
++    /// Flux patch (part 10.5): `callback` is asked when the platform wants the application to quit
++    /// on its own — macOS: Quit in the Dock or its menu, the end of the user's session (logging
++    /// out, restarting, shutting down) — but not after [`App::quit`]. The platform waits while the
++    /// application asks its questions: it quits on [`App::quit`] and keeps running on
++    /// [`App::cancel_quit`]. Without a callback the application quits at once, as before.
++    pub fn on_quit_requested(&mut self, mut callback: impl FnMut(&mut App) + 'static) {
++        let app = self.this.clone();
++        self.platform.on_quit_requested(Box::new(move || {
++            let Some(app) = app.upgrade() else {
++                return true;
++            };
++            // Busy (a nested run loop inside an update): the platform asks again a little later.
++            let Ok(mut cx) = app.try_borrow_mut() else {
++                return false;
++            };
++            cx.update(|cx| callback(cx));
++            true
++        }));
++    }
++
++    /// Flux patch (part 10.5): the application keeps running after a quit the platform asked for
++    /// ([`App::on_quit_requested`]); does nothing without such a request.
++    pub fn cancel_quit(&self) {
++        self.platform.cancel_quit();
++    }
++
+     /// Schedules all windows in the application to be redrawn. This can be called
+     /// multiple times in an update cycle and still result in a single redraw.
+     pub fn refresh_windows(&mut self) {
 diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
 --- a/src/platform/mac/metal_renderer.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/metal_renderer.rs	2026-10-15 03:45:09
++++ b/src/platform/mac/metal_renderer.rs	2026-10-15 03:41:33
 @@ -370,8 +370,12 @@
          loop {
              let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
@@ -129,9 +165,199 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
      color_attachment.set_store_action(metal::MTLStoreAction::Store);
      configure_color_attachment(color_attachment);
  
+diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
+--- a/src/platform/mac/platform.rs	2006-07-24 05:21:28
++++ b/src/platform/mac/platform.rs	2026-10-15 10:34:34
+@@ -98,7 +98,12 @@
+                 sel!(applicationWillTerminate:),
+                 will_terminate as extern "C" fn(&mut Object, Sel, id),
+             );
++            // Flux patch (part 10.5): Quit in the Dock and the end of the session ask the app.
+             decl.add_method(
++                sel!(applicationShouldTerminate:),
++                should_terminate as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
++            );
++            decl.add_method(
+                 sel!(handleGPUIMenuItem:),
+                 handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+             );
+@@ -168,6 +173,15 @@
+     reopen: Option<Box<dyn FnMut()>>,
+     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
+     quit: Option<Box<dyn FnMut()>>,
++    /// Flux patch (part 10.5): asked when macOS wants the app to quit on its own
++    /// ([`Platform::on_quit_requested`]).
++    quit_requested: Option<Box<dyn FnMut() -> bool>>,
++    /// Flux patch: the app said it may quit ([`Platform::quit`]): `applicationShouldTerminate:`
++    /// lets the termination go without asking.
++    quit_approved: bool,
++    /// Flux patch: `applicationShouldTerminate:` answered "later" and AppKit waits for
++    /// `replyToApplicationShouldTerminate:`.
++    quit_pending: bool,
+     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
+     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
+     will_open_menu: Option<Box<dyn FnMut()>>,
+@@ -209,6 +223,9 @@
+             metadata_pasteboard_type: unsafe { ns_string("zed-metadata") },
+             reopen: None,
+             quit: None,
++            quit_requested: None,
++            quit_approved: false,
++            quit_pending: false,
+             menu_command: None,
+             validate_menu_command: None,
+             will_open_menu: None,
+@@ -510,6 +527,25 @@
+ 
+         use super::dispatcher::{dispatch_get_main_queue, dispatch_sys::dispatch_async_f};
+ 
++        // Flux patch (part 10.5): the app has decided. A request of macOS that waits for the
++        // answer (Quit in the Dock, logging out) gets "yes"; otherwise `terminate:` goes through
++        // `applicationShouldTerminate:` without asking again.
++        let answer_request = {
++            let mut state = self.0.lock();
++            state.quit_approved = true;
++            std::mem::take(&mut state.quit_pending)
++        };
++        if answer_request {
++            unsafe {
++                dispatch_async_f(
++                    dispatch_get_main_queue(),
++                    ptr::null_mut(),
++                    Some(reply_to_should_terminate_yes),
++                );
++            }
++            return;
++        }
++
+         unsafe {
+             dispatch_async_f(dispatch_get_main_queue(), ptr::null_mut(), Some(quit));
+         }
+@@ -879,6 +915,24 @@
+         self.0.lock().reopen = Some(callback);
+     }
+ 
++    fn on_quit_requested(&self, callback: Box<dyn FnMut() -> bool>) {
++        self.0.lock().quit_requested = Some(callback);
++    }
++
++    fn cancel_quit(&self) {
++        use super::dispatcher::{dispatch_get_main_queue, dispatch_sys::dispatch_async_f};
++
++        if std::mem::take(&mut self.0.lock().quit_pending) {
++            unsafe {
++                dispatch_async_f(
++                    dispatch_get_main_queue(),
++                    ptr::null_mut(),
++                    Some(reply_to_should_terminate_no),
++                );
++            }
++        }
++    }
++
+     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
+         self.0.lock().on_keyboard_layout_change = Some(callback);
+     }
+@@ -1425,6 +1479,96 @@
+         drop(lock);
+         callback();
+         platform.0.lock().quit.get_or_insert(callback);
++    }
++}
++
++/// `NSApplicationTerminateReply`.
++const NS_TERMINATE_NOW: NSUInteger = 1;
++const NS_TERMINATE_LATER: NSUInteger = 2;
++
++/// Flux patch (part 10.5): macOS asks whether the app may quit — Quit in the Dock or its menu, the
++/// end of the user's session (logging out, restarting, shutting down), `terminate:` sent by
++/// anyone. Unless the app has decided already ([`Platform::quit`]), its callback is asked and
++/// AppKit waits ("later": a run loop in `NSModalPanelRunLoopMode`, where the main dispatch queue
++/// — gpui's tasks, frames and timers — keeps running) until the app answers with
++/// [`Platform::quit`] or [`Platform::cancel_quit`].
++///
++/// The callback runs as a separate main queue task, outside this delegate call. The wait must not
++/// start inside a main queue task, though: the run loop doesn't serve the main queue nested in one
++/// of its own tasks, and gpui would stop. The system's requests (Apple Events) never come from one;
++/// gpui itself sends `terminate:` only after [`Platform::quit`], which doesn't wait.
++///
++/// While AppKit waits, it ignores another quit event (Quit in the Dock again); a `terminate:`
++/// message sent then terminates at once, without asking — so [`Platform::quit`] answers the
++/// request instead of sending one.
++extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
++    use super::dispatcher::{dispatch_get_main_queue, dispatch_sys::dispatch_async_f};
++
++    let platform = unsafe { get_mac_platform(this) };
++    let mut state = platform.0.lock();
++    if state.quit_approved || state.quit_requested.is_none() {
++        return NS_TERMINATE_NOW;
++    }
++    // Asked already: the answer to that request is the answer to this one.
++    if !state.quit_pending {
++        state.quit_pending = true;
++        drop(state);
++        unsafe {
++            dispatch_async_f(dispatch_get_main_queue(), ptr::null_mut(), Some(ask_to_quit));
++        }
++    }
++    NS_TERMINATE_LATER
++}
++
++/// Flux patch: the app's callback for a quit macOS asked for; asked again in 50 ms if it couldn't
++/// ask now.
++unsafe extern "C" fn ask_to_quit(_: *mut c_void) {
++    use super::dispatcher::{
++        dispatch_get_main_queue,
++        dispatch_sys::{DISPATCH_TIME_NOW, dispatch_after_f, dispatch_time},
++    };
++
++    let platform = unsafe {
++        let app = NSApplication::sharedApplication(nil);
++        get_mac_platform(&mut *app)
++    };
++    let mut state = platform.0.lock();
++    // Answered in the meantime.
++    if !state.quit_pending {
++        return;
++    }
++    let Some(mut callback) = state.quit_requested.take() else {
++        return;
++    };
++    drop(state);
++    let asked = callback();
++    platform.0.lock().quit_requested.get_or_insert(callback);
++    if !asked {
++        unsafe {
++            let when = dispatch_time(DISPATCH_TIME_NOW as u64, 50_000_000);
++            dispatch_after_f(
++                when,
++                dispatch_get_main_queue(),
++                ptr::null_mut(),
++                Some(ask_to_quit),
++            );
++        }
++    }
++}
++
++/// Flux patch: AppKit may terminate the app now.
++unsafe extern "C" fn reply_to_should_terminate_yes(_: *mut c_void) {
++    unsafe {
++        let app = NSApplication::sharedApplication(nil);
++        let _: () = msg_send![app, replyToApplicationShouldTerminate: YES];
++    }
++}
++
++/// Flux patch: the app keeps running.
++unsafe extern "C" fn reply_to_should_terminate_no(_: *mut c_void) {
++    unsafe {
++        let app = NSApplication::sharedApplication(nil);
++        let _: () = msg_send![app, replyToApplicationShouldTerminate: NO];
+     }
+ }
+ 
 diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
 --- a/src/platform/mac/window.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/window.rs	2026-10-15 03:46:06
++++ b/src/platform/mac/window.rs	2026-10-15 04:00:04
 @@ -455,6 +455,12 @@
                          - traffic_light_position.y
                          - px(close_button_frame.size.height as f32),
@@ -172,8 +398,24 @@ diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
      fn titlebar_double_click(&self) {
 diff -ruN a/src/platform.rs b/src/platform.rs
 --- a/src/platform.rs	2006-07-24 05:21:28
-+++ b/src/platform.rs	2026-10-15 03:46:59
-@@ -499,6 +499,11 @@
++++ b/src/platform.rs	2026-10-15 10:24:59
+@@ -230,6 +230,15 @@
+ 
+     fn on_quit(&self, callback: Box<dyn FnMut()>);
+     fn on_reopen(&self, callback: Box<dyn FnMut()>);
++    /// Flux patch (part 10.5): `callback` is asked when the platform wants the application to quit
++    /// on its own (macOS: Quit in the Dock, the end of the user's session). The platform waits
++    /// until the application answers with [`Platform::quit`] or [`Platform::cancel_quit`].
++    /// `callback` returns `false` when it can't ask now (the app is busy): it is asked again a
++    /// little later. Platforms without such requests ignore it.
++    fn on_quit_requested(&self, _callback: Box<dyn FnMut() -> bool>) {}
++    /// Flux patch (part 10.5): the application keeps running after a quit the platform asked for
++    /// ([`Platform::on_quit_requested`]); nothing to do without such a request.
++    fn cancel_quit(&self) {}
+ 
+     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
+     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
+@@ -499,6 +508,11 @@
      fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
      fn draw(&self, scene: &Scene);
      fn completed_frame(&self) {}
@@ -185,7 +427,7 @@ diff -ruN a/src/platform.rs b/src/platform.rs
      fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
  
      // macOS specific methods
-@@ -514,6 +519,8 @@
+@@ -514,6 +528,8 @@
      fn set_edited(&mut self, _edited: bool) {}
      fn show_character_palette(&self) {}
      fn titlebar_double_click(&self) {}
@@ -194,7 +436,7 @@ diff -ruN a/src/platform.rs b/src/platform.rs
      fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
      fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
      fn on_select_previous_tab(&self, _callback: Box<dyn FnMut()>) {}
-@@ -940,7 +947,11 @@
+@@ -940,7 +956,11 @@
  
      fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
          self.cx
@@ -207,7 +449,7 @@ diff -ruN a/src/platform.rs b/src/platform.rs
              .ok()
              .flatten()
      }
-@@ -970,7 +981,11 @@
+@@ -970,7 +990,11 @@
      #[allow(unused)]
      pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
          self.cx
@@ -234,7 +476,7 @@ diff -ruN a/src/taffy.rs b/src/taffy.rs
  
 diff -ruN a/src/window.rs b/src/window.rs
 --- a/src/window.rs	2006-07-24 05:21:28
-+++ b/src/window.rs	2026-10-15 03:46:59
++++ b/src/window.rs	2026-10-15 04:00:04
 @@ -7,11 +7,12 @@
      DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
      FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,

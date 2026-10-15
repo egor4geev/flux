@@ -750,6 +750,32 @@ impl App {
         self.platform.quit();
     }
 
+    /// Flux patch (part 10.5): `callback` is asked when the platform wants the application to quit
+    /// on its own — macOS: Quit in the Dock or its menu, the end of the user's session (logging
+    /// out, restarting, shutting down) — but not after [`App::quit`]. The platform waits while the
+    /// application asks its questions: it quits on [`App::quit`] and keeps running on
+    /// [`App::cancel_quit`]. Without a callback the application quits at once, as before.
+    pub fn on_quit_requested(&mut self, mut callback: impl FnMut(&mut App) + 'static) {
+        let app = self.this.clone();
+        self.platform.on_quit_requested(Box::new(move || {
+            let Some(app) = app.upgrade() else {
+                return true;
+            };
+            // Busy (a nested run loop inside an update): the platform asks again a little later.
+            let Ok(mut cx) = app.try_borrow_mut() else {
+                return false;
+            };
+            cx.update(|cx| callback(cx));
+            true
+        }));
+    }
+
+    /// Flux patch (part 10.5): the application keeps running after a quit the platform asked for
+    /// ([`App::on_quit_requested`]); does nothing without such a request.
+    pub fn cancel_quit(&self) {
+        self.platform.cancel_quit();
+    }
+
     /// Schedules all windows in the application to be redrawn. This can be called
     /// multiple times in an update cycle and still result in a single redraw.
     pub fn refresh_windows(&mut self) {

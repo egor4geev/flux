@@ -1526,18 +1526,24 @@ fn render_preview(
                     .layout
                     .as_ref()
                     .map_or(theme::LINE_HEIGHT, |layout| f32::from(layout.line_height));
-                let top = editor.scroll.y.max(0.) / line_height;
-                if synced.get().is_some_and(|last| (last - top).abs() < 0.01) {
+                // The display row at the top, and the line it is in with how far into it (soft
+                // wraps, part 10.5: a line may take several rows).
+                let top_row = editor.scroll.y.max(0.) / line_height;
+                let wrap = &editor.wrap;
+                let line = wrap.row_to_line(top_row as usize);
+                let into = (top_row - wrap.line_to_row(line) as f32) / wrap.line_rows(line) as f32;
+                let top = line as f32 + into.clamp(0., 0.999);
+                if synced.get().is_some_and(|last| (last - top).abs() < 0.001) {
                     return;
                 }
                 synced.set(Some(top));
-                let lines = editor.document.text().len_lines();
+                let rows = wrap.row_count();
                 let visible = editor
                     .layout
                     .as_ref()
                     .map_or(0, |layout| layout.visible_lines());
                 // The editor shows the end of the text: so does the preview.
-                if top > 0. && top as usize + visible >= lines {
+                if top_row > 0. && top_row as usize + visible >= rows {
                     ctx.list.scroll_to(ListOffset {
                         item_ix: ctx.doc.blocks.len(),
                         offset_in_item: px(0.),

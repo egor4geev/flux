@@ -463,32 +463,12 @@ fn marked_blocks(marked: MarkedString) -> Vec<Block> {
     }
 }
 
-/// The character under a point of the window: over the text of a line, not past its end.
+/// The character under a point of the window: over the text of a row, not past its end.
 fn position_under(editor: &Editor, point: Point<Pixels>) -> Option<usize> {
-    let layout = editor.layout.as_ref()?;
-    if !layout.text_bounds.contains(&point) {
-        return None;
-    }
-    let text = editor.document.text();
-    let row = ((point.y - layout.origin.y) / layout.line_height).floor();
-    if row < 0. {
-        return None;
-    }
-    let line = row as usize;
-    if line >= text.len_lines() {
-        return None;
-    }
-    let line_layout = layout.line(line)?;
-    let x = point.x - layout.origin.x;
-    if x < px(0.) {
-        return None;
-    }
-    let byte = line_layout.shaped.index_for_x(x)?;
-    let column = line_layout
-        .char_to_byte
-        .partition_point(|&b| b <= byte)
-        .checked_sub(1)?;
-    (column < line_len(text, line)).then(|| line_start(text, line) + column)
+    editor
+        .layout
+        .as_ref()?
+        .char_at_point(editor.document.text(), point)
 }
 
 /// What a pause of the mouse at `pos` is about: a plugin's link with a tooltip (all of it), else

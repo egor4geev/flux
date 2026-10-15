@@ -73,6 +73,9 @@ enum Item {
         label: SharedString,
         action: Box<dyn Action>,
         enabled: bool,
+        /// A switch's state, shown with a check mark (the editor's Soft-Wrap); `None` — not a
+        /// switch.
+        checked: Option<bool>,
     },
     Separator,
     Submenu {
@@ -86,6 +89,20 @@ impl Item {
     fn selectable(&self) -> bool {
         matches!(self, Item::Entry { enabled: true, .. } | Item::Submenu { .. })
     }
+}
+
+/// Whether the items have a switch: then every entry leaves room for a check mark, so the labels
+/// line up (as macOS menus do).
+fn has_switches(items: &[Item]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            Item::Entry {
+                checked: Some(_),
+                ..
+            }
+        )
+    })
 }
 
 /// The items of a submenu: [`ContextMenu::submenu`] fills it.
@@ -120,6 +137,7 @@ impl Submenu {
             label: label.into(),
             action,
             enabled,
+            checked: None,
         });
         self
     }
@@ -211,6 +229,23 @@ impl ContextMenu {
             label: label.into(),
             action: Box::new(action),
             enabled,
+            checked: None,
+        });
+        self
+    }
+
+    /// A switch: the label with a check mark while `checked` (the editor's Soft-Wrap).
+    pub fn check_entry(
+        mut self,
+        label: impl Into<SharedString>,
+        checked: bool,
+        action: impl Action,
+    ) -> Self {
+        self.items.push(Item::Entry {
+            label: label.into(),
+            action: Box::new(action),
+            enabled: true,
+            checked: Some(checked),
         });
         self
     }
@@ -453,19 +488,41 @@ impl ContextMenu {
         binding.map(|binding| ui::shortcut_label(&binding))
     }
 
-    /// An entry in its row ([`item_row`]): the label and the shortcut.
+    /// An entry in its row ([`item_row`]): the label and the shortcut. In a menu with switches
+    /// (`check_room`), the label has room for a check mark before it.
+    #[allow(clippy::too_many_arguments)]
     fn render_entry(
         &self,
         row: gpui::Stateful<gpui::Div>,
         label: &SharedString,
         action: &dyn Action,
         enabled: bool,
+        checked: Option<bool>,
+        check_room: bool,
         window: &Window,
         cx: &App,
     ) -> gpui::Stateful<gpui::Div> {
         let ui = Theme::ui(cx);
         let keys = self.keys_for(action, window, cx);
-        row.child(label.clone())
+        let label = if check_room {
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(14.))
+                        .when(checked == Some(true), |slot| {
+                            slot.child(icon(IconName::Check, ui.accent_text).size(px(14.)))
+                        }),
+                )
+                .child(label.clone())
+                .into_any_element()
+        } else {
+            label.clone().into_any_element()
+        };
+        row.child(label)
             .children(keys.map(|keys| ui::keys(&keys, ui).when(!enabled, |keys| keys.opacity(0.5))))
     }
 
@@ -478,6 +535,7 @@ impl ContextMenu {
         let ui = Theme::ui(cx);
         let last = items.len().saturating_sub(1);
         let index = open.index;
+        let check_room = has_switches(items);
         let rows: Vec<AnyElement> = items
             .iter()
             .enumerate()
@@ -487,6 +545,7 @@ impl ContextMenu {
                     label,
                     action,
                     enabled,
+                    checked,
                 } => self
                     .render_entry(
                         item_row(
@@ -498,6 +557,8 @@ impl ContextMenu {
                         label,
                         action.as_ref(),
                         *enabled,
+                        *checked,
+                        check_room,
                         window,
                         cx,
                     )
@@ -647,6 +708,7 @@ impl Render for ContextMenu {
         let ui = Theme::ui(cx);
         let last = self.items.len().saturating_sub(1);
         let open = self.open.as_ref().map(|open| open.index);
+        let check_room = has_switches(&self.items);
         let items: Vec<AnyElement> = self
             .items
             .iter()
@@ -658,6 +720,7 @@ impl Render for ContextMenu {
                     label,
                     action,
                     enabled,
+                    checked,
                 } => self
                     .render_entry(
                         item_row(
@@ -669,6 +732,8 @@ impl Render for ContextMenu {
                         label,
                         action.as_ref(),
                         *enabled,
+                        *checked,
+                        check_room,
                         window,
                         cx,
                     )
@@ -703,7 +768,16 @@ impl Render for ContextMenu {
                             .absolute()
                             .size_full(),
                         )
-                        .child(label.clone())
+                        .child(match check_room {
+                            true => div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(div().flex_none().w(px(14.)))
+                                .child(label.clone())
+                                .into_any_element(),
+                            false => label.clone().into_any_element(),
+                        })
                         .child(icon(IconName::ChevronRight, ui.dim).size(px(12.)))
                         .into_any_element()
                 }
@@ -774,6 +848,7 @@ mod tests {
                     label: SharedString::from(label.to_string()),
                     action: Box::new(Cancel),
                     enabled: !label.starts_with('-'),
+                    checked: None,
                 },
                 None => Item::Separator,
             })

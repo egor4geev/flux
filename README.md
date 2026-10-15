@@ -73,9 +73,10 @@ every match into a cursor to edit them all at once.
 A Markdown file opens with its preview beside it, as in JetBrains IDEs: the text, the text and the
 preview, or the preview alone — three buttons in the corner, and Flux remembers your choice. The preview
 follows your typing and your scrolling, shows pictures, tables and code, and its links open files in Flux
-and pages in the browser.
+and pages in the browser. Long lines of prose wrap at the edge of the editor — in Markdown and text files
+by default, in any file you add in Settings → Editor, and in any editor at all with <kbd>⌃</kbd><kbd>⌥</kbd><kbd>W</kbd>.
 
-<img src="docs/images/markdown.png" alt="README.md with its rendered preview beside the text" width="100%">
+<img src="docs/images/markdown.png" alt="README.md with its long lines wrapped, and its rendered preview beside the text" width="100%">
 
 ### Understands your code
 
@@ -90,6 +91,14 @@ offers, as in JetBrains IDEs, or right-click the code for everything else: go to
 reformat, Git and Claude.
 
 <img src="docs/images/context-actions.png" alt="⌥↵ on an error: the language server's quick fix and refactorings, and Claude to fix or explain the code" width="100%">
+
+The scrollbar maps the whole file, as in JetBrains IDEs: errors, warnings, what you searched for and your
+changes since the last commit — hover a mark to read it, click it to go there. The corner of the editor
+counts the problems, and <kbd>F2</kbd> takes you to the next one. When a language server can't load your
+project, Flux says so in the status bar and tells you why; click the status for every server of the window
+— restart, stop, read its log, or set it up in `settings.json`, where your settings apply without a restart.
+
+<img src="docs/images/scrollbar.png" alt="A Rust file with error, warning and change marks on the scrollbar, a tooltip over an error mark, and the problem count in the corner" width="100%">
 
 ### A terminal built in
 
@@ -111,7 +120,8 @@ Open as many projects as you like, each in its own window with its own language 
 and Claude sessions — or switch the current window to another project. Like JetBrains IDEs, Flux
 asks which you prefer until you tell it to remember, and switching to a project that is already open
 just brings its window forward. Every project keeps its tabs, cursor positions, chats and layout, and
-when you start Flux from the Dock, the projects you had open come back where you left them.
+when you start Flux from the Dock, the projects you had open come back where you left them. Quit from the
+Dock or log out with unsaved files, and Flux asks first, as it does for <kbd>⌘</kbd><kbd>Q</kbd>.
 
 <img src="docs/images/open-project.png" alt="Flux asks whether to open another project in this window or a new one" width="100%">
 
@@ -211,8 +221,9 @@ Flux has no language for, it tells you which plugin knows it.
 ### Your tasks, next to the code
 
 The Yandex Tracker & Calendar plugin brings your work into Flux. The board of tasks opens as a tab,
-its columns side by side, as on Tracker's own board; a task opens on the right with its fields, its
-description, its links to other tasks, its comments and its history. Take a task to work with one
+its columns side by side, as on Tracker's own board, with filters by assignee, type, priority, tags and
+components that you can save; a task opens on the right with every one of its fields, its description,
+its links to other tasks, its comments and its history. Take a task to work with one
 button: Flux moves it to In Progress, makes its branch, opens the task's own tabs, starts a timer —
 and hands Claude your prompt, filled in from the task. Your prompts are yours to write: several
 Claude actions in the plugin's settings, with the task's key, title, description, links and comments
@@ -245,7 +256,8 @@ accept it — and Claude learns what you changed.
 Answer Claude's questions and approve its plans with a click or a key. Mention files with `@` or send
 your selection (<kbd>⌥</kbd><kbd>⌘</kbd><kbd>K</kbd>), paste screenshots, pick the model, the effort
 and the mode, and keep an eye on your subscription's limits in the status bar. Start a message with `!`
-to run a shell command in the project — Claude sees its output. Open a subagent to watch it work, search
+to run a shell command in the project — Claude sees its output. Open a subagent — from its card or from
+the list of what runs in the background — to watch it work, search
 the conversation with <kbd>⌘</kbd><kbd>F</kbd>, edit an earlier message to take the conversation another
 way, or roll back the code Claude changed since then. Flux runs your own `claude` command with your
 Claude subscription — no API key.
@@ -302,6 +314,8 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 | <kbd>⌘</kbd><kbd>F</kbd> · <kbd>⌘</kbd><kbd>R</kbd> | Find · replace in a file |
 | <kbd>⌘</kbd><kbd>B</kbd> · <kbd>⌥</kbd><kbd>F7</kbd> | Go to definition · find usages |
 | <kbd>⌥</kbd><kbd>↵</kbd> | Quick fixes and context actions, Fix with Claude |
+| <kbd>F2</kbd> · <kbd>⇧</kbd><kbd>F2</kbd> | Next · previous problem |
+| <kbd>⌃</kbd><kbd>⌥</kbd><kbd>W</kbd> | Wrap long lines in this editor, or stop wrapping them |
 | <kbd>⇧</kbd><kbd>F6</kbd> | Rename everywhere |
 | <kbd>⌘</kbd><kbd>1</kbd> | Show or hide the project tree |
 | <kbd>⌥</kbd><kbd>F12</kbd> · <kbd>⌘</kbd><kbd>T</kbd> | Show or hide the terminal · new terminal |
@@ -337,7 +351,8 @@ with <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. Fo
 - [x] Before the beta: Claude polish — a new chat, `!` commands, live subagents, search, edit and rewind
 - [x] Before the beta: tasks — Yandex Tracker and Calendar, task contexts, plugin API 0.3
 - [x] Before the beta: a flat look and zoom, Markdown preview, files in Find in Files, recent projects
-- [ ] Before the beta: editor polish, updates over the air, a signed and notarized app
+- [x] Before the beta: soft wraps, a scrollbar with the file's marks, language servers' status and settings, a safe quit
+- [ ] Before the beta: updates over the air, a signed and notarized app
 - [ ] Public beta
 
 ## License

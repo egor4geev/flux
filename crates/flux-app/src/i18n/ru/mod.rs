@@ -73,6 +73,10 @@ mod project_popup;
 mod command_usage;
 mod markdown_preview;
 mod search_files;
+mod soft_wrap;
+mod scrollbar;
+mod lsp_status;
+mod lsp_settings;
 
 /// Tables of plain strings and templates (`tr`, `trf`).
 pub(super) const STRINGS: &[&[(&str, &str)]] = &[
@@ -149,6 +153,10 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     command_usage::STRINGS,
     markdown_preview::STRINGS,
     search_files::STRINGS,
+    soft_wrap::STRINGS,
+    scrollbar::STRINGS,
+    lsp_status::STRINGS,
+    lsp_settings::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -205,4 +213,8 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     command_usage::PLURALS,
     markdown_preview::PLURALS,
     search_files::PLURALS,
+    soft_wrap::PLURALS,
+    scrollbar::PLURALS,
+    lsp_status::PLURALS,
+    lsp_settings::PLURALS,
 ];

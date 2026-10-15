@@ -4,12 +4,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     // Server status in the status bar.
     ("Starting…", "Запуск…"),
     ("{0} stopped", "{0} остановлен"),
-    ("Click to restart", "Щёлкните, чтобы перезапустить"),
     ("Restarting {0}…", "Перезапуск {0}…"),
     ("{0} is not installed", "{0} не установлен"),
     ("Installing {0}…", "Установка {0}…"),
     ("Couldn't install {0}", "Не удалось установить {0}"),
-    ("Click to retry", "Щёлкните, чтобы повторить"),
     // Why a server can't be installed (the installer's messages).
     ("Needs Go", "Нужен Go"),
     (

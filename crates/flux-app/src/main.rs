@@ -35,6 +35,7 @@ mod diff_view;
 mod display;
 mod editor;
 mod editor_menu;
+mod editor_settings;
 mod element;
 mod file_finder;
 mod file_tree;
@@ -58,6 +59,9 @@ mod launchpad;
 mod locations;
 mod log_actions;
 mod lsp;
+mod lsp_settings;
+mod lsp_status;
+mod lsp_watch;
 mod markdown;
 mod markdown_preview;
 mod merge_view;
@@ -94,7 +98,9 @@ mod recent;
 mod rename;
 #[cfg(feature = "scenario")]
 mod scenario;
+mod scrollbar;
 mod settings;
+mod settings_file;
 mod settings_view;
 mod start_screen;
 mod stash_panel;
@@ -111,6 +117,7 @@ mod ui;
 mod ui_scale;
 mod vcs_menu;
 mod workspace;
+mod wrap;
 
 use std::path::{PathBuf, absolute};
 
@@ -231,6 +238,12 @@ fn main() {
             project_popup::init(cx);
             command_usage::init(cx);
             markdown_preview::init(cx);
+            wrap::init(cx);
+            editor_settings::init(cx);
+            scrollbar::init(cx);
+            lsp_status::init(cx);
+            lsp_settings::init(cx);
+            settings_file::init(cx);
 
             // The project of the command line, or the projects open when Flux quit (part 10.1).
             let _window = workspace::open_startup_windows(root, paths, cx)

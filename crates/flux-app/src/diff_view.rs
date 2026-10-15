@@ -189,30 +189,16 @@ pub fn prepaint_decorations(
             *color,
         ));
     }
-    let len = text.len_chars();
     for (range, color) in &decorations.words {
-        let line = text.char_to_line(range.start.min(len));
-        if line < first_line || line >= last_line {
-            continue;
+        for segment in layout.segments(text, range.start, range.end, px(0.)) {
+            paint.words.push(fill(
+                Bounds::from_corners(
+                    point(segment.left, segment.top),
+                    point(segment.right, segment.top + layout.line_height),
+                ),
+                *color,
+            ));
         }
-        let Some(line_layout) = layout.line(line) else {
-            continue;
-        };
-        let start = line_start(text, line);
-        let columns = line_len(text, line);
-        let x0 = line_layout.x_for_column((range.start - start).min(columns));
-        let x1 = line_layout.x_for_column(range.end.saturating_sub(start).min(columns));
-        if x1 <= x0 {
-            continue;
-        }
-        let top = layout.line_top(line);
-        paint.words.push(fill(
-            Bounds::from_corners(
-                point(layout.origin.x + x0, top),
-                point(layout.origin.x + x1, top + layout.line_height),
-            ),
-            *color,
-        ));
     }
     paint
 }

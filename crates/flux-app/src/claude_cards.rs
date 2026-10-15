@@ -155,7 +155,7 @@ pub fn render(
         })
         .collect();
     let tasks = render_tasks(state, model, ui, cx);
-    let background = render_background(session, model, ui);
+    let background = render_background(session, model, ui, cx);
     if cards.is_empty() && tasks.is_none() && background.is_none() {
         return None;
     }
@@ -1753,25 +1753,47 @@ fn render_tasks(
     )
 }
 
-/// Commands and agents running in the background, each with Stop.
+/// Commands and agents running in the background, each with Stop. A click on a row shows what it
+/// runs (part 10.5): an agent's live conversation on the chat's place, as Watch on its card does;
+/// a command's card in the conversation.
 fn render_background(
     session: &Entity<ClaudeSession>,
     model: &Session,
     ui: UiColors,
+    cx: &mut Context<ClaudeChat>,
 ) -> Option<AnyElement> {
     if model.background.is_empty() {
         return None;
     }
+    let chat = cx.entity().downgrade();
     let rows = model.background.iter().map(|task| {
         let agent = task.task_type.contains("agent");
         let session = session.clone();
         let task_id = task.task_id.clone();
+        let shown = task.task_id.clone();
+        let chat = chat.clone();
         div()
+            .id(SharedString::from(format!("claude-background-{}", task.task_id)))
             .flex()
             .items_center()
             .gap(px(8.))
             .min_h(px(28.))
             .px(px(6.))
+            .rounded(px(ui::RADIUS_SM))
+            .cursor_pointer()
+            .hover(move |style| style.bg(ui.hover))
+            .tooltip(ui::tooltip(
+                if agent {
+                    tr("Watch the agent")
+                } else {
+                    tr("Show the command")
+                },
+                None,
+            ))
+            .on_click(move |_: &ClickEvent, window, cx| {
+                chat.update(cx, |chat, cx| chat.show_background_task(&shown, window, cx))
+                    .ok();
+            })
             .child(
                 icon(
                     if agent {
@@ -1798,6 +1820,8 @@ fn render_background(
                     ui,
                 )
                 .on_click(move |_: &ClickEvent, _, cx| {
+                    // Stop only: the row under the button doesn't open the task.
+                    cx.stop_propagation();
                     let task_id = task_id.clone();
                     session.update(cx, |session, cx| session.stop_task(task_id, cx))
                 }),
@@ -1835,6 +1859,47 @@ fn render_background(
             .children(rows)
             .into_any_element(),
     )
+}
+
+impl ClaudeChat {
+    /// A row of "In the background" (part 10.5): an agent's conversation on the chat's place, a
+    /// command's card in the conversation. The CLI names the task's call right after it lists the
+    /// task; until then the click does nothing.
+    pub(crate) fn show_background_task(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let call = {
+            let model = self.session().read(cx).model();
+            task_call(model, &model.entries, task_id)
+        };
+        match call {
+            Some((entry, true)) => self.open_agent(entry, window, cx),
+            Some((entry, false)) => self.reveal_activity(entry, window, cx),
+            None => {}
+        }
+    }
+}
+
+/// The entry of the tool call that runs the background task `task_id`, at any depth (an agent a
+/// subagent started), and whether it is an Agent call.
+fn task_call(
+    model: &Session,
+    entries: &[flux_claude::Entry],
+    task_id: &str,
+) -> Option<(flux_claude::EntryId, bool)> {
+    entries.iter().find_map(|entry| match &entry.kind {
+        flux_claude::EntryKind::Tool(tool) if model.task_id(&tool.tool_use_id) == Some(task_id) => {
+            Some((
+                entry.id,
+                matches!(tool.call, flux_claude::ToolCall::Agent { .. }),
+            ))
+        }
+        flux_claude::EntryKind::Tool(tool) => task_call(model, &tool.children, task_id),
+        _ => None,
+    })
 }
 
 /// Why an edit doesn't apply, in the interface language (the reasons of `flux_claude::edits`).
@@ -2019,5 +2084,67 @@ mod tests {
         assert_eq!(short_path("/p/src/main.rs", Path::new("/p")), "src/main.rs");
         assert_eq!(rule_path("//tmp/x/**", Path::new("/p")), "/tmp/x/**");
         assert_eq!(rule_path("src/**", Path::new("/p")), "src/**");
+    }
+
+    /// `j_background` (claude 2.1.285) up to the start of its subagent's task: a command and an
+    /// agent run in the background.
+    fn both_in_the_background() -> Session {
+        use flux_claude::process::ProcessEvent;
+        use flux_claude::protocol::{self, Incoming};
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../flux-claude/tests/fixtures/j_background.jsonl");
+        let mut session = Session::new(PathBuf::from("/project"));
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let Some(frame) = protocol::parse_line(line) else {
+                continue;
+            };
+            match &frame {
+                Incoming::Response {
+                    result: Ok(response),
+                    ..
+                } if response.get("commands").is_some() => {
+                    session.initialized(response);
+                }
+                _ => {
+                    session.apply(&ProcessEvent::Frame(Box::new(frame)));
+                }
+            }
+            if line.contains("\"task_started\"") && line.contains("\"local_agent\"") {
+                break;
+            }
+        }
+        session
+    }
+
+    #[test]
+    fn background_tasks_lead_to_their_calls() {
+        let session = both_in_the_background();
+        let tasks: Vec<_> = session
+            .background
+            .iter()
+            .map(|task| (task.task_id.as_str(), task.task_type.as_str()))
+            .collect();
+        assert_eq!(
+            tasks,
+            [
+                ("b4e752g0b", "local_bash"),
+                ("a344fb693c7c029ca", "local_agent")
+            ]
+        );
+        let call = |task_id| {
+            let (entry, agent) = task_call(&session, &session.entries, task_id)?;
+            let tool = crate::claude_transcript::find_tool(&session.entries, entry)?;
+            Some((tool.tool_use_id.clone(), agent))
+        };
+        assert_eq!(
+            call("a344fb693c7c029ca"),
+            Some(("toolu_01S794YQDpAcvdg1Mq21yzH8".to_string(), true))
+        );
+        assert_eq!(
+            call("b4e752g0b"),
+            Some(("toolu_01LNr7KzigqJ84jnT4vDKUYs".to_string(), false))
+        );
+        assert_eq!(call("unknown"), None);
     }
 }

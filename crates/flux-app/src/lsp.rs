@@ -23,12 +23,23 @@
 //! whose config is gone stops, one whose config changed starts again, and documents that now have a
 //! server (a language plugin was installed) are opened on it.
 //!
+//! Part 10.5: the user's settings of a server (`lsp.<server>` in `settings.json`) go over the
+//! plugin's ([`crate::lsp_settings::configs`]); when they change, a running server takes new
+//! `settings` without a restart (`workspace/didChangeConfiguration`), anything else starts it
+//! again, and a server the user turned off stops.
+//!
 //! Part 9.2: a file nobody opened can be opened on its servers without an editor — a background
 //! document (Flux's tools for Claude: the problems of a file, its definitions and usages); a few are
 //! kept, the least recently used closed. What servers published last is kept as they sent it (the
 //! context of ⌥↵ code actions carries a problem's `data`), and a caller can wait for the next
 //! publication of a file. A server's `workspace/applyEdit` goes to the window
 //! ([`LspEvent::ApplyEdit`]).
+//!
+//! Part 10.5: a project the server couldn't load (rust-analyzer's `experimental/serverStatus`)
+//! shows in the status bar and as a notification once it settles, with Restart, Configure… and
+//! Show Log; a click on the status opens the window's servers ([`crate::lsp_status`]), where a
+//! server can also be stopped (it stays stopped until started there). Files the servers watch get
+//! the changes on disk ([`crate::lsp_watch`]).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -49,7 +60,10 @@ use flux_lsp::lsp_types::{
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncKind,
     Uri, VersionedTextDocumentIdentifier,
 };
-use flux_lsp::{ApplyEdit, LanguageServer, ServerEvent, install, position, sync};
+use flux_lsp::{
+    ApplyEdit, Health, LanguageServer, ServerEvent, ServerLog, ServerStatus, install, position,
+    sync,
+};
 use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use futures::channel::oneshot;
@@ -84,6 +98,11 @@ actions!(
 /// error the server showed; and an edit a server asks the window to apply.
 pub enum LspEvent {
     Notify(Notification),
+    /// The project problem of the server `server` (name) is over — loaded, restarted, stopped: its
+    /// notification goes ([`crate::lsp_status::is_problem_of`]).
+    Resolved {
+        server: String,
+    },
     /// `workspace/applyEdit` of `server` (a code action's command): the window applies it and
     /// answers the request.
     ApplyEdit {
@@ -111,6 +130,10 @@ const MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longer status texts are shortened with "…": the status bar shares its width with the position,
 /// language, and line endings.
 const STATUS_MAX_CHARS: usize = 48;
+/// A project problem is told once the server's status stops changing for this long:
+/// rust-analyzer says "Failed to discover workspace", then "… Failed to load workspaces" within
+/// a fraction of a second — one notification, about the last.
+const PROBLEM_SETTLE: Duration = Duration::from_millis(1200);
 
 pub fn init(_cx: &mut App) {
     if let Some(dir) = servers_dir_for(
@@ -131,12 +154,17 @@ fn servers_dir_for(explicit: Option<OsString>, home: Option<OsString>) -> Option
 }
 
 pub struct LspStore {
-    /// For the status bar: a click on a stopped server restarts it.
-    this: WeakEntity<LspStore>,
     /// Project root: the workspace root of every server, when there is one.
     root: Option<PathBuf>,
-    /// The servers the language plugins bring ([`crate::contributions::servers`]).
+    /// The servers the language plugins bring ([`crate::contributions::servers`]), with the user's
+    /// settings over them ([`crate::lsp_settings::configs`]).
     configs: Vec<ServerConfig>,
+    /// The user's settings of servers (`lsp` in `settings.json`) the configs were made with: a
+    /// change of a server's tells the user what happened to it (part 10.5).
+    user_settings: serde_json::Map<String, serde_json::Value>,
+    /// Servers whose own command (`lsp.<server>.command`) wasn't found, as told: once, not at every
+    /// file opened.
+    missing_commands: HashSet<(String, String)>,
     servers: Vec<Server>,
     /// Registered editors: each has one release observer, whatever its path changes.
     registered: HashSet<EntityId>,
@@ -148,6 +176,10 @@ pub struct LspStore {
     waiters: Vec<(PathBuf, oneshot::Sender<()>)>,
     /// Orders background documents by last use.
     background_clock: u64,
+    /// Watchers of the files the servers registered (part 10.5).
+    watch: crate::lsp_watch::WatchState,
+    /// Where the status item was drawn and whether the servers' popup is open (part 10.5).
+    pub(crate) status_ui: crate::lsp_status::StatusUi,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -163,11 +195,12 @@ struct BackgroundDocument {
     used: u64,
 }
 
-/// Which server: the config and the workspace root.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServerKey {
-    name: String,
-    root: PathBuf,
+/// Which server: the config and the workspace root (the popup's and the notifications' actions
+/// name a server so).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ServerKey {
+    pub(crate) name: String,
+    pub(crate) root: PathBuf,
 }
 
 struct Server {
@@ -194,6 +227,14 @@ struct Server {
     message_timer: Option<Task<()>>,
     /// Started by the "Restart" command: if it turns out not to be installed, say so.
     announce_unavailable: bool,
+    /// rust-analyzer's last `experimental/serverStatus` (part 10.5).
+    health: Option<ServerStatus>,
+    /// The project problem a notification was shown for: its repeats are not news.
+    notified: Option<(Health, String)>,
+    /// Tells the problem once the status settles ([`PROBLEM_SETTLE`]).
+    notify_task: Option<Task<()>>,
+    /// What the server said; kept after it is gone (Show Log).
+    log: Option<Arc<ServerLog>>,
     /// Stops an install in progress when the server is dropped (window closed, restarted).
     cancel: Arc<AtomicBool>,
     /// Installs and starts the server, then reads its events; dropping it stops all that.
@@ -224,6 +265,9 @@ enum Status {
     InstallFailed(String),
     /// Could not start, or exited; the reason is for the status bar.
     Failed(String),
+    /// Stopped in the servers' popup (part 10.5): it stays so until started there; documents
+    /// opened meanwhile wait for it.
+    Stopped,
 }
 
 impl Status {
@@ -293,17 +337,22 @@ impl LspStore {
             cx.observe_global::<crate::contributions::Contributions>(|this, cx| {
                 this.configs_changed(cx)
             }),
+            // The user's settings of servers changed (`settings.json`, the switches in Settings).
+            cx.observe_global::<crate::settings::Settings>(|this, cx| this.configs_changed(cx)),
         ];
         Self {
-            this: cx.weak_entity(),
             root,
-            configs: crate::contributions::servers(cx),
+            configs: crate::lsp_settings::configs(cx),
+            user_settings: crate::settings::lsp(cx),
+            missing_commands: HashSet::new(),
             servers: Vec::new(),
             registered: HashSet::new(),
             editors: Vec::new(),
             next_server_id: 0,
             waiters: Vec::new(),
             background_clock: 0,
+            watch: Default::default(),
+            status_ui: Default::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -363,11 +412,16 @@ impl LspStore {
     /// config changed start again with it, and each document is opened on the servers that serve
     /// it now.
     fn configs_changed(&mut self, cx: &mut Context<Self>) {
-        let configs = crate::contributions::servers(cx);
+        let configs = crate::lsp_settings::configs(cx);
+        let user_settings = crate::settings::lsp(cx);
         if configs == self.configs {
+            self.user_settings = user_settings;
             return;
         }
         let old = std::mem::replace(&mut self.configs, configs);
+        let old_user = std::mem::replace(&mut self.user_settings, user_settings);
+        // A command that was missing may be there now, or another one is set.
+        self.missing_commands.clear();
         // One server per name and root: each name once.
         let mut names: Vec<String> = self
             .servers
@@ -378,9 +432,31 @@ impl LspStore {
         names.dedup();
         for name in names {
             let before = old.iter().find(|config| config.name == name);
+            // The user changed this server's settings (rather than a plugin its config): say what
+            // came of it.
+            let by_user = old_user.get(&name) != self.user_settings.get(&name);
             match self.configs.iter().find(|config| config.name == name) {
-                None => self.stop_named(&name, cx),
-                Some(after) if before != Some(after) => self.restart_named(&name, cx),
+                None => {
+                    self.stop_named(&name, cx);
+                    if by_user {
+                        self.tell(trf("{0} is turned off", &[&name]), cx);
+                    }
+                }
+                Some(after) if before != Some(after) => {
+                    let after = after.clone();
+                    if before.is_some_and(|before| config::differs_only_in_settings(before, &after))
+                    {
+                        self.update_settings_named(&after, cx);
+                        if by_user {
+                            self.tell(trf("{0}: new settings applied", &[&name]), cx);
+                        }
+                    } else {
+                        self.restart_named(&name, cx);
+                        if by_user {
+                            self.tell(trf("{0} restarted with new settings", &[&name]), cx);
+                        }
+                    }
+                }
                 Some(_) => {}
             }
         }
@@ -405,6 +481,56 @@ impl LspStore {
             if wanted != serving {
                 self.register(&editor, cx);
             }
+        }
+        cx.notify();
+    }
+
+    /// The user changed only the `settings` of the servers named so: those running take them without
+    /// a restart (`workspace/didChangeConfiguration`); one not spawned yet (being installed, failed)
+    /// starts again with them.
+    fn update_settings_named(&mut self, config: &ServerConfig, cx: &mut Context<Self>) {
+        let mut again = Vec::new();
+        for server in self
+            .servers
+            .iter()
+            .filter(|server| server.key.name == config.name)
+        {
+            match &server.handle {
+                Some(handle) => {
+                    handle.set_settings(config::workspace_settings(config, &server.key.root))
+                }
+                None => again.push(server.key.clone()),
+            }
+        }
+        for key in again {
+            self.restart_server(&key, Vec::new(), cx);
+        }
+    }
+
+    /// A short note about what the user's settings did to a server.
+    fn tell(&mut self, title: String, cx: &mut Context<Self>) {
+        let notification = Notification::info(title)
+            .transient()
+            .group(NotificationGroup::LanguageServers);
+        cx.emit(LspEvent::Notify(notification));
+    }
+
+    /// The user's own command for the server isn't there: the server stops with the reason, and the
+    /// user hears of it once, with the way to the setting (Flux doesn't install a server in place of
+    /// the user's own).
+    fn own_command_missing(&mut self, id: u64, command: String, cx: &mut Context<Self>) {
+        let Some(server) = self.server_mut(id) else {
+            return;
+        };
+        let name = server.key.name.clone();
+        let reason = trf("{0} not found", &[&command]);
+        server.status = Status::Failed(reason.clone());
+        if self.missing_commands.insert((name.clone(), command)) {
+            let notification = Notification::error(trf("{0} stopped", &[&name]))
+                .body(reason)
+                .action(tr("Configure…"), crate::lsp_settings::ConfigureServer { name })
+                .group(NotificationGroup::LanguageServers);
+            cx.emit(LspEvent::Notify(notification));
         }
         cx.notify();
     }
@@ -590,10 +716,18 @@ impl LspStore {
         self.next_server_id += 1;
         let root = key.root.clone();
         let cancel = Arc::new(AtomicBool::new(false));
+        let own_command = crate::lsp_settings::own_command(&config.name, cx);
         let task = cx.spawn({
             let cancel = cancel.clone();
             async move |this, cx| {
                 let mut started = launch(&config, &root, cx).await;
+                if is_not_found(&started)
+                    && let Some(command) = own_command
+                {
+                    this.update(cx, |this, cx| this.own_command_missing(id, command, cx))
+                        .ok();
+                    return;
+                }
                 if is_not_found(&started) {
                     if !install_server(id, &config, &cancel, &this, cx).await {
                         return;
@@ -653,6 +787,10 @@ impl LspStore {
             message: None,
             message_timer: None,
             announce_unavailable: false,
+            health: None,
+            notified: None,
+            notify_task: None,
+            log: None,
             cancel,
             _task: task,
         }
@@ -709,6 +847,9 @@ impl LspStore {
                     return;
                 };
                 server.status = Status::Running;
+                if let Some(handle) = &server.handle {
+                    server.log = Some(handle.log());
+                }
                 let editors: Vec<_> = server
                     .editors
                     .iter()
@@ -799,7 +940,91 @@ impl LspStore {
                 cx.notify();
             }
             ServerEvent::Exited { reason } => self.exited(id, reason, cx),
+            ServerEvent::Status(status) => self.server_status(id, status, cx),
+            ServerEvent::WatchersChanged => self.update_watch(cx),
         }
+    }
+
+    /// rust-analyzer's `experimental/serverStatus`: the status bar shows a problem at once; a
+    /// notification tells it once the status settles, and goes when the problem is over.
+    fn server_status(&mut self, id: u64, status: ServerStatus, cx: &mut Context<Self>) {
+        let Some(server) = self.server_mut(id) else {
+            return;
+        };
+        let healthy = status.health == Health::Ok;
+        server.health = Some(status);
+        if healthy {
+            server.notify_task = None;
+            if server.notified.take().is_some() {
+                let name = server.key.name.clone();
+                cx.emit(LspEvent::Resolved { server: name });
+            }
+        } else {
+            server.notify_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(PROBLEM_SETTLE).await;
+                this.update(cx, |this, cx| this.tell_problem(id, cx)).ok();
+            }));
+        }
+        cx.notify();
+    }
+
+    /// The settled project problem of the server, as a notification (once per problem; a new one
+    /// replaces the previous card).
+    fn tell_problem(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(server) = self.server_mut(id) else {
+            return;
+        };
+        server.notify_task = None;
+        let Some(status) = server.health.clone().filter(|status| status.health != Health::Ok)
+        else {
+            return;
+        };
+        let problem = (status.health, status.message.clone().unwrap_or_default());
+        if server.notified.as_ref() == Some(&problem) {
+            return;
+        }
+        let key = server.key.clone();
+        let last_error = server
+            .log
+            .clone()
+            .or_else(|| server.handle.as_ref().map(LanguageServer::log))
+            .and_then(|log| log.last_error());
+        if server.notified.replace(problem).is_some() {
+            cx.emit(LspEvent::Resolved {
+                server: key.name.clone(),
+            });
+        }
+        let notification = crate::lsp_status::problem_notification(&key, &status, last_error);
+        cx.emit(LspEvent::Notify(notification));
+    }
+
+    /// The servers that watch files changed (registered, dropped, stopped): the watchers follow
+    /// their roots.
+    fn update_watch(&mut self, cx: &mut Context<Self>) {
+        let roots: Vec<PathBuf> = self
+            .servers
+            .iter()
+            .filter(|server| {
+                server.status == Status::Running
+                    && server
+                        .handle
+                        .as_ref()
+                        .is_some_and(LanguageServer::watches_files)
+            })
+            .map(|server| server.key.root.clone())
+            .collect();
+        let store = cx.weak_entity();
+        self.watch.set_roots(roots, store, cx);
+    }
+
+    /// The running servers that watch files: the watcher sends them the changes on disk.
+    pub(crate) fn watching_servers(&self) -> Vec<LanguageServer> {
+        self.servers
+            .iter()
+            .filter(|server| server.status == Status::Running)
+            .filter_map(|server| server.handle.clone())
+            .filter(LanguageServer::watches_files)
+            .collect()
     }
 
     /// The server is gone: its documents are no longer open anywhere, their diagnostics are stale.
@@ -812,8 +1037,13 @@ impl LspStore {
             .action(tr("Restart"), RestartStopped)
             .group(NotificationGroup::LanguageServers);
         server.status = Status::Failed(reason);
-        server.handle = None;
+        if let Some(handle) = server.handle.take() {
+            server.log = Some(handle.log());
+        }
         server.progress.clear();
+        server.health = None;
+        server.notify_task = None;
+        let resolved = server.notified.take().map(|_| server.key.name.clone());
         let mut changed: Vec<PathBuf> = server.unopened.keys().cloned().collect();
         changed.extend(server.published.keys().cloned());
         server.unopened.clear();
@@ -837,7 +1067,11 @@ impl LspStore {
         if !changed.is_empty() {
             cx.emit(DiagnosticsChanged(changed));
         }
+        if let Some(server) = resolved {
+            cx.emit(LspEvent::Resolved { server });
+        }
         cx.emit(LspEvent::Notify(notification));
+        self.update_watch(cx);
         cx.notify();
     }
 
@@ -1082,6 +1316,7 @@ impl LspStore {
             Status::InstallFailed(reason) | Status::Failed(reason) => {
                 FileServers::Failed(name, reason.clone())
             }
+            Status::Stopped => FileServers::Failed(name, tr("Stopped").to_string()),
         })
     }
 
@@ -1164,9 +1399,166 @@ impl LspStore {
                 status: &server.status,
                 progress: server.progress.first(),
                 message: server.message.as_ref(),
+                health: server
+                    .health
+                    .as_ref()
+                    .filter(|status| status.health != Health::Ok),
             })
             .collect();
         status_line(&summaries)
+    }
+
+    // --- The servers' popup (part 10.5) ---
+
+    /// The window's servers for the popup, by name.
+    pub(crate) fn overview(&self) -> Vec<crate::lsp_status::ServerRow> {
+        let mut rows: Vec<crate::lsp_status::ServerRow> = self
+            .servers
+            .iter()
+            .filter(|server| server.status != Status::Unavailable)
+            .map(|server| {
+                let state = match &server.status {
+                    Status::Starting => crate::lsp_status::RowState::Starting,
+                    Status::Installing(progress) => crate::lsp_status::RowState::Installing(
+                        progress.as_ref().and_then(|progress| progress.fraction),
+                    ),
+                    Status::Running => match (&server.health, server.progress.first()) {
+                        (Some(status), _) if status.health != Health::Ok => {
+                            crate::lsp_status::RowState::Problem(status.clone())
+                        }
+                        (_, Some(progress)) => crate::lsp_status::RowState::Busy {
+                            title: progress.title.clone(),
+                            message: progress.message.clone(),
+                            percentage: progress.percentage,
+                        },
+                        _ => crate::lsp_status::RowState::Running,
+                    },
+                    Status::Unavailable | Status::NotInstalled => {
+                        crate::lsp_status::RowState::NotInstalled
+                    }
+                    Status::CannotInstall(reason) => {
+                        crate::lsp_status::RowState::CannotInstall(install_reason(reason))
+                    }
+                    Status::InstallFailed(reason) => {
+                        crate::lsp_status::RowState::InstallFailed(install_reason(reason))
+                    }
+                    Status::Failed(reason) => crate::lsp_status::RowState::Failed(reason.clone()),
+                    Status::Stopped => crate::lsp_status::RowState::Stopped,
+                };
+                let log = server
+                    .log
+                    .clone()
+                    .or_else(|| server.handle.as_ref().map(LanguageServer::log));
+                crate::lsp_status::ServerRow {
+                    key: server.key.clone(),
+                    extension: self
+                        .configs
+                        .iter()
+                        .find(|config| config.name == server.key.name)
+                        .and_then(|config| config.extensions.first().cloned()),
+                    documents: server
+                        .editors
+                        .iter()
+                        .filter(|editor| editor.upgrade().is_some())
+                        .count(),
+                    state,
+                    last_error: log.as_ref().and_then(|log| log.last_error()),
+                    has_log: log.is_some_and(|log| !log.is_empty()),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| (&a.key.name, &a.key.root).cmp(&(&b.key.name, &b.key.root)));
+        rows
+    }
+
+    /// Restart (or Start) from the popup and the notifications: the server starts anew with its
+    /// documents; one that is gone (its plugin turned off) is left alone.
+    pub(crate) fn restart_key(&mut self, key: &ServerKey, cx: &mut Context<Self>) {
+        if self.servers.iter().any(|server| server.key == *key) {
+            self.restart_server(key, Vec::new(), cx);
+            // The old process's watchers are gone; the new one registers its own.
+            self.update_watch(cx);
+        }
+    }
+
+    /// Stop from the popup: the process ends, its documents lose its problems; the server stays in
+    /// the list as stopped (documents opened meanwhile wait for it) until started.
+    pub(crate) fn stop_key(&mut self, key: &ServerKey, cx: &mut Context<Self>) {
+        let Some(server) = self.servers.iter_mut().find(|server| server.key == *key) else {
+            return;
+        };
+        let id = server.id;
+        server.cancel.store(true, Ordering::Relaxed);
+        if let Some(handle) = server.handle.take() {
+            server.log = Some(handle.log());
+            cx.background_spawn(handle.shutdown()).detach();
+        }
+        // Its events (the exit included) are no longer read.
+        server._task = Task::ready(());
+        server.status = Status::Stopped;
+        server.progress.clear();
+        server.message = None;
+        server.message_timer = None;
+        server.health = None;
+        server.notify_task = None;
+        let resolved = server.notified.take().map(|_| server.key.name.clone());
+        let mut changed: Vec<PathBuf> = server.unopened.drain().map(|(path, _)| path).collect();
+        changed.extend(server.published.drain().map(|(path, _)| path));
+        server.background.clear();
+        let editors: Vec<_> = server
+            .editors
+            .iter()
+            .filter_map(WeakEntity::upgrade)
+            .collect();
+        for editor in editors {
+            editor.update(cx, |editor, cx| {
+                editor.lsp.retain(|doc| doc.server_id != id);
+                editor.diagnostics.clear_owner(id);
+                changed.extend(editor.document.path().map(Path::to_path_buf));
+                cx.notify();
+            });
+        }
+        changed.sort();
+        changed.dedup();
+        if !changed.is_empty() {
+            cx.emit(DiagnosticsChanged(changed));
+        }
+        if let Some(server) = resolved {
+            cx.emit(LspEvent::Resolved { server });
+        }
+        self.update_watch(cx);
+        cx.notify();
+    }
+
+    /// The server's log as text (Show Log), if it ever started.
+    pub(crate) fn log_text(&self, key: &ServerKey) -> Option<String> {
+        let server = self.servers.iter().find(|server| server.key == *key)?;
+        let log = server
+            .log
+            .clone()
+            .or_else(|| server.handle.as_ref().map(LanguageServer::log))?;
+        Some(log.text())
+    }
+
+    /// Whether the servers of the editor's document have looked at it in peace (part 10.5): each
+    /// is running, has loaded its project and has no work in progress. The problems widget claims
+    /// a clean file only then — not while a server indexes, nor when it couldn't load the project
+    /// and so reports nothing.
+    pub fn settled(&self, editor: EntityId) -> bool {
+        let mut serving = self
+            .servers
+            .iter()
+            .filter(|server| server.editors.iter().any(|e| e.entity_id() == editor))
+            .peekable();
+        serving.peek().is_some()
+            && serving.all(|server| {
+                server.status == Status::Running
+                    && server.progress.is_empty()
+                    && server
+                        .health
+                        .as_ref()
+                        .is_none_or(|status| status.health == Health::Ok && status.quiescent)
+            })
     }
 
     /// Why the editor's document has no server to ask yet — starting, being installed, not
@@ -1190,7 +1582,7 @@ impl LspStore {
                 trf("{0} is not installed", &[name])
             }
             Status::InstallFailed(_) => trf("Couldn't install {0}", &[name]),
-            Status::Failed(_) => trf("{0} stopped", &[name]),
+            Status::Failed(_) | Status::Stopped => trf("{0} stopped", &[name]),
         })
     }
 }
@@ -1202,10 +1594,13 @@ struct ServerSummary<'a> {
     /// The oldest work in progress.
     progress: Option<&'a Progress>,
     message: Option<&'a (MessageType, String)>,
+    /// A project it couldn't load (health not ok, part 10.5).
+    health: Option<&'a ServerStatus>,
 }
 
-/// The most important state among the servers: a stopped server, then a message from a server,
-/// then work in progress, then starting; otherwise the names of the running servers.
+/// The most important state among the servers: a stopped server, then a project a server couldn't
+/// load, then a message from a server, then work in progress, then starting; otherwise the names
+/// of the running servers. A click on any of it opens the servers' popup.
 fn status_line(servers: &[ServerSummary]) -> Option<StatusLine> {
     if let Some((server, reason)) = servers.iter().find_map(|server| match server.status {
         Status::Failed(reason) => Some((server, reason)),
@@ -1213,10 +1608,8 @@ fn status_line(servers: &[ServerSummary]) -> Option<StatusLine> {
     }) {
         return Some(StatusLine {
             text: trf("{0} stopped", &[&server.name]),
-            tooltip: Some(format!("{reason}\n{}", tr("Click to restart"))),
+            tooltip: Some(reason.clone()),
             tone: Tone::Error,
-            restart: true,
-            open_settings: false,
         });
     }
     if let Some((server, reason)) = servers.iter().find_map(|server| match server.status {
@@ -1225,14 +1618,28 @@ fn status_line(servers: &[ServerSummary]) -> Option<StatusLine> {
     }) {
         return Some(StatusLine {
             text: trf("Couldn't install {0}", &[&server.name]),
-            tooltip: Some(format!(
-                "{}\n{}",
-                install_reason(reason),
-                tr("Click to retry")
-            )),
+            tooltip: Some(install_reason(reason)),
             tone: Tone::Error,
-            restart: true,
-            open_settings: false,
+        });
+    }
+    if let Some((server, status)) = servers
+        .iter()
+        .find_map(|server| server.health.map(|status| (server, status)))
+    {
+        let message = crate::lsp_status::plain_message(status.message.as_deref().unwrap_or(""));
+        let headline = message
+            .lines()
+            .next()
+            .map(str::to_string)
+            .unwrap_or_else(|| tr("The project isn't loaded").to_string());
+        return Some(StatusLine {
+            text: format!("{}: {headline}", server.name),
+            tooltip: (!message.is_empty()).then_some(message),
+            tone: if status.health == Health::Error {
+                Tone::Error
+            } else {
+                Tone::Warning
+            },
         });
     }
     if let Some((server, (kind, text))) = servers
@@ -1248,8 +1655,6 @@ fn status_line(servers: &[ServerSummary]) -> Option<StatusLine> {
             } else {
                 Tone::Warning
             },
-            restart: false,
-            open_settings: false,
         });
     }
     if let Some((server, progress)) = servers.iter().find_map(|server| match server.status {
@@ -1265,8 +1670,6 @@ fn status_line(servers: &[ServerSummary]) -> Option<StatusLine> {
             // What is going on right now ("Downloading Node.js"), from the installer.
             tooltip: progress.as_ref().map(|progress| progress.text.clone()),
             tone: Tone::Quiet,
-            restart: false,
-            open_settings: false,
         });
     }
     if let Some((server, progress)) = servers
@@ -1291,8 +1694,6 @@ fn status_line(servers: &[ServerSummary]) -> Option<StatusLine> {
             },
             tooltip: None,
             tone: Tone::Quiet,
-            restart: false,
-            open_settings: false,
         });
     }
     if let Some(server) = servers
@@ -1303,8 +1704,6 @@ fn status_line(servers: &[ServerSummary]) -> Option<StatusLine> {
             text: format!("{} · {}", server.name, tr("Starting…")),
             tooltip: None,
             tone: Tone::Quiet,
-            restart: false,
-            open_settings: false,
         });
     }
     if let Some((server, reason)) = servers.iter().find_map(|server| match server.status {
@@ -1315,8 +1714,6 @@ fn status_line(servers: &[ServerSummary]) -> Option<StatusLine> {
             text: format!("{}: {}", server.name, install_reason(reason)),
             tooltip: None,
             tone: Tone::Quiet,
-            restart: false,
-            open_settings: false,
         });
     }
     if let Some(server) = servers
@@ -1327,8 +1724,16 @@ fn status_line(servers: &[ServerSummary]) -> Option<StatusLine> {
             text: trf("{0} is not installed", &[&server.name]),
             tooltip: Some(tr("Automatic installation is off: install it in Settings").to_string()),
             tone: Tone::Quiet,
-            restart: false,
-            open_settings: true,
+        });
+    }
+    if let Some(server) = servers
+        .iter()
+        .find(|server| *server.status == Status::Stopped)
+    {
+        return Some(StatusLine {
+            text: format!("{} · {}", server.name, tr("Stopped")),
+            tooltip: None,
+            tone: Tone::Quiet,
         });
     }
     let mut names: Vec<&str> = servers
@@ -1342,8 +1747,6 @@ fn status_line(servers: &[ServerSummary]) -> Option<StatusLine> {
         text: names.join(" · "),
         tooltip: None,
         tone: Tone::Quiet,
-        restart: false,
-        open_settings: false,
     })
 }
 
@@ -1652,8 +2055,10 @@ pub fn path_changed(editor: &mut Editor, cx: &mut Context<Editor>) {
 }
 
 /// The language server actions of a window: "Restart" (from the command palette, wherever the
-/// focus is) restarts the server of the active document, or all of them without one.
+/// focus is) restarts the server of the active document, or all of them without one; the servers'
+/// popup and its actions ([`crate::lsp_status`]).
 pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
+    let root = crate::lsp_status::workspace_actions(root, cx);
     root.on_action(cx.listener(|workspace, _: &RestartStopped, _, cx| {
         workspace
             .lsp
@@ -1670,25 +2075,22 @@ pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
 
 /// One line of server status for the status bar.
 #[derive(Debug, PartialEq)]
-struct StatusLine {
-    text: String,
-    tooltip: Option<String>,
-    tone: Tone,
-    /// A click restarts the server (it has stopped).
-    restart: bool,
-    /// A click opens Settings (automatic installation is off).
-    open_settings: bool,
+pub(crate) struct StatusLine {
+    pub(crate) text: String,
+    pub(crate) tooltip: Option<String>,
+    pub(crate) tone: Tone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Tone {
+pub(crate) enum Tone {
     Quiet,
     Warning,
     Error,
 }
 
 /// Status of the active document's servers (`editor`; all servers without one) for the window
-/// status bar ("rust-analyzer · Indexing 40%", "Installing pyright… 40%"), if any.
+/// status bar ("rust-analyzer · Indexing 40%", "Installing pyright… 40%"), if any; a click opens
+/// the window's servers ([`crate::lsp_status`]).
 pub fn status_item(
     store: &LspStore,
     editor: Option<EntityId>,
@@ -1712,20 +2114,9 @@ pub fn status_item(
         .child(shorten(&status.text, STATUS_MAX_CHARS));
     let item = match status.tooltip {
         Some(tooltip) => item.tooltip(ui::tooltip(tooltip, None)),
-        None => item,
+        None => item.tooltip(ui::tooltip(tr("Language Servers"), None)),
     };
-    Some(if status.restart {
-        let store = store.this.clone();
-        item.cursor_pointer().on_click(move |_, _, cx| {
-            store.update(cx, |store, cx| store.restart_failed(cx)).ok();
-        })
-    } else if status.open_settings {
-        item.cursor_pointer().on_click(|_, window, cx| {
-            window.dispatch_action(Box::new(crate::settings_view::Toggle), cx)
-        })
-    } else {
-        item
-    })
+    Some(crate::lsp_status::clickable_status(item, &store.status_ui, ui))
 }
 
 /// `text` cut to `max` characters with "…".
@@ -1748,6 +2139,7 @@ mod tests {
             status,
             progress: None,
             message: None,
+            health: None,
         }
     }
 
@@ -1772,15 +2164,80 @@ mod tests {
         let line = status_line(&[summary("gopls", &starting)]).unwrap();
         assert_eq!(line.text, "gopls · Starting…");
 
-        // A stopped server wins over everything and can be restarted with a click.
+        // A stopped server wins over everything; the reason is in the tooltip.
         let line = status_line(&[
             summary("gopls", &running),
             summary("rust-analyzer", &failed),
         ])
         .unwrap();
         assert_eq!(line.text, "rust-analyzer stopped");
-        assert_eq!((line.tone, line.restart), (Tone::Error, true));
+        assert_eq!(line.tone, Tone::Error);
         assert!(line.tooltip.unwrap().starts_with("exit status: 1"));
+
+        // Stopped in the popup: quiet.
+        let stopped = Status::Stopped;
+        let line = status_line(&[summary("gopls", &stopped)]).unwrap();
+        assert_eq!((line.text.as_str(), line.tone), ("gopls · Stopped", Tone::Quiet));
+    }
+
+    #[test]
+    fn a_project_the_server_couldnt_load_is_shown_over_its_work() {
+        let running = Status::Running;
+        let indexing = Progress {
+            token: "t".into(),
+            title: Some("Fetching".into()),
+            message: None,
+            percentage: None,
+        };
+        let warning = ServerStatus {
+            health: Health::Warning,
+            quiescent: true,
+            message: Some(
+                "Failed to discover workspace.\nConsider adding the `Cargo.toml` of the workspace \
+                 to the [`linkedProjects`](https://rust-analyzer.github.io/book) setting."
+                    .into(),
+            ),
+        };
+        let line = status_line(&[ServerSummary {
+            progress: Some(&indexing),
+            health: Some(&warning),
+            ..summary("rust-analyzer", &running)
+        }])
+        .unwrap();
+        assert_eq!(line.text, "rust-analyzer: Failed to discover workspace.");
+        assert_eq!(line.tone, Tone::Warning);
+        assert_eq!(
+            line.tooltip.as_deref(),
+            Some(
+                "Failed to discover workspace.\nConsider adding the Cargo.toml of the workspace \
+                 to the linkedProjects setting."
+            )
+        );
+        let error = ServerStatus {
+            health: Health::Error,
+            quiescent: true,
+            message: Some("Failed to load workspaces.".into()),
+        };
+        let line = status_line(&[ServerSummary {
+            health: Some(&error),
+            ..summary("rust-analyzer", &running)
+        }])
+        .unwrap();
+        assert_eq!(
+            (line.text.as_str(), line.tone),
+            ("rust-analyzer: Failed to load workspaces.", Tone::Error)
+        );
+        // A stopped server still comes first.
+        let failed = Status::Failed("exit".into());
+        let line = status_line(&[
+            ServerSummary {
+                health: Some(&error),
+                ..summary("rust-analyzer", &running)
+            },
+            summary("gopls", &failed),
+        ])
+        .unwrap();
+        assert_eq!(line.text, "gopls stopped");
     }
 
     #[test]
@@ -1831,7 +2288,7 @@ mod tests {
         let line = status_line(&[summary("pyright", &installing)]).unwrap();
         assert_eq!(line.text, "Installing pyright… 40%");
         assert_eq!(line.tooltip.as_deref(), Some("Downloading Node.js"));
-        assert_eq!((line.tone, line.restart), (Tone::Quiet, false));
+        assert_eq!(line.tone, Tone::Quiet);
 
         let just_started = Status::Installing(None);
         let line = status_line(&[summary("pyright", &just_started)]).unwrap();
@@ -1845,12 +2302,12 @@ mod tests {
             ("gopls: Needs Go", Tone::Quiet)
         );
 
-        // A failed install is an error, retried with a click; it wins over an install elsewhere.
+        // A failed install is an error; it wins over an install elsewhere.
         let offline = Status::InstallFailed("no network".into());
         let line =
             status_line(&[summary("ruff", &installing), summary("pyright", &offline)]).unwrap();
         assert_eq!(line.text, "Couldn't install pyright");
-        assert_eq!((line.tone, line.restart), (Tone::Error, true));
+        assert_eq!(line.tone, Tone::Error);
         assert!(line.tooltip.unwrap().starts_with("no network"));
     }
 
@@ -1862,6 +2319,8 @@ mod tests {
         assert!(!Status::Running.retried_on_open());
         assert!(!Status::Installing(None).retried_on_open());
         assert!(!Status::Unavailable.retried_on_open());
+        // Stopped by the user: only the popup starts it.
+        assert!(!Status::Stopped.retried_on_open());
     }
 
     #[test]

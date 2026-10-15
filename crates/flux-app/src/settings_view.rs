@@ -2,8 +2,11 @@
 //! left.
 //! - System Settings (part 10.1): reopening the projects on startup, and where another project
 //!   opens — a new window, this one, or ask (JetBrains: Appearance & Behavior → System Settings).
+//! - Editor (part 10.5): soft wraps ([`crate::editor_settings`]).
 //! - Language Servers: automatic installation on or off, and every server Flux knows with where it
-//!   comes from; those Flux installed can be updated and deleted, missing ones installed.
+//!   comes from; those Flux installed can be updated and deleted, missing ones installed. Each can
+//!   be turned off, and "Configure…" opens its key in `settings.json` (part 10.5,
+//!   [`crate::lsp_settings`]).
 //! - Version Control: how Update Project (⌘T) brings incoming commits into the current branch —
 //!   merge, rebase, or ask every time (the question's "Don't show again" sets it).
 //! - Notifications: Do Not Disturb, and for every group (plugins' too) how its notifications show —
@@ -31,6 +34,7 @@ use gpui::{
 
 use crate::appearance_settings::{AppearancePage, Page};
 use crate::claude::{self, ClaudeStore, CliState};
+use crate::editor_settings::EditorSettingsPage;
 use crate::i18n::{tr, trf};
 use crate::icons::{self, IconName, file_icon, icon};
 use crate::input::{InputEvent, TextInput};
@@ -83,6 +87,8 @@ pub enum Section {
     Language,
     /// System Settings: how projects open (part 10.1).
     System,
+    /// Soft wraps (part 10.5).
+    Editor,
     LanguageServers,
     VersionControl,
     Notifications,
@@ -105,8 +111,9 @@ impl Section {
     ];
 
     /// The sections above the plugins' pages; About goes after them.
-    const BUILT_IN: [Section; 6] = [
+    const BUILT_IN: [Section; 7] = [
         Section::System,
+        Section::Editor,
         Section::LanguageServers,
         Section::VersionControl,
         Section::Notifications,
@@ -121,6 +128,7 @@ impl Section {
             Section::FileIcons => tr("File Icons"),
             Section::Language => tr("Language"),
             Section::System => tr("System Settings"),
+            Section::Editor => tr("Editor"),
             Section::LanguageServers => tr("Language Servers"),
             Section::VersionControl => tr("Version Control"),
             Section::Notifications => tr("Notifications"),
@@ -136,6 +144,7 @@ impl Section {
                 IconName::Palette
             }
             Section::System => IconName::Settings,
+            Section::Editor => IconName::Pencil,
             Section::LanguageServers => IconName::Command,
             Section::VersionControl => IconName::Branch,
             Section::Notifications => IconName::Bell,
@@ -164,6 +173,7 @@ impl Section {
             Section::FileIcons => "file-icons".into(),
             Section::Language => "language".into(),
             Section::System => "system".into(),
+            Section::Editor => "editor".into(),
             Section::LanguageServers => "language-servers".into(),
             Section::VersionControl => "version-control".into(),
             Section::Notifications => "notifications".into(),
@@ -249,6 +259,7 @@ fn scenario_section() -> Option<Section> {
         "file-icons" => Section::FileIcons,
         "language" => Section::Language,
         "system" => Section::System,
+        "editor" => Section::Editor,
         "language-servers" => Section::LanguageServers,
         "plugins" => Section::Plugins,
         "notifications" => Section::Notifications,
@@ -296,9 +307,13 @@ pub struct SettingsView {
     plugin_pages: HashMap<SharedString, Entity<PluginSettingsPage>>,
     /// The pages of Appearance, made when first shown.
     appearance: Option<Entity<AppearancePage>>,
+    /// Settings → Editor (part 10.5), made when first shown.
+    editor: Option<Entity<EditorSettingsPage>>,
     servers: Vec<ServerRow>,
     /// Operations in progress or failed, by server name.
     jobs: HashMap<String, Job>,
+    /// The user's settings of servers the rows were made with (`lsp` in `settings.json`).
+    user_servers: serde_json::Map<String, serde_json::Value>,
     /// The window's Claude Code.
     claude: Entity<ClaudeStore>,
     /// Claude Code's additional arguments, as the user types them.
@@ -309,6 +324,9 @@ pub struct SettingsView {
 
 struct ServerRow {
     config: ServerConfig,
+    /// As the user set it up (`lsp.<server>` in `settings.json`): their own command is the one
+    /// looked for; `None` — turned off.
+    effective: Option<ServerConfig>,
     /// The language plugin that brings it, by its name in the interface language.
     plugin: SharedString,
     /// Where it comes from; `None` until the background check is done.
@@ -370,6 +388,12 @@ impl SettingsView {
             cx.observe_global::<crate::contributions::Contributions>(|this, cx| {
                 this.servers_changed(cx)
             }),
+            // A server turned off or given its own command (`settings.json`, the switches).
+            cx.observe_global::<settings::Settings>(|this, cx| {
+                if settings::lsp(cx) != this.user_servers {
+                    this.servers_changed(cx)
+                }
+            }),
             cx.subscribe(&claude_args, |this, input, _: &InputEvent, cx| {
                 let args = input.read(cx).text();
                 let args: Vec<String> = args.split_whitespace().map(str::to_string).collect();
@@ -387,8 +411,10 @@ impl SettingsView {
             initial_plugin: plugin,
             plugin_pages: HashMap::new(),
             appearance: None,
+            editor: None,
             servers,
             jobs: HashMap::new(),
+            user_servers: settings::lsp(cx),
             claude: handles.claude,
             claude_args,
             _tasks: Vec::new(),
@@ -401,8 +427,11 @@ impl SettingsView {
 
     /// Where each server comes from: file checks (and `rustup which`) in the background.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let configs: Vec<ServerConfig> =
-            self.servers.iter().map(|row| row.config.clone()).collect();
+        let configs: Vec<ServerConfig> = self
+            .servers
+            .iter()
+            .map(|row| row.effective.clone().unwrap_or_else(|| row.config.clone()))
+            .collect();
         let task = cx.spawn(async move |this, cx| {
             let found = cx
                 .background_spawn(async move {
@@ -434,12 +463,13 @@ impl SettingsView {
     /// The language plugins bring other servers: the rows follow (a row that stays keeps what is
     /// known about it), then where they come from is checked again.
     fn servers_changed(&mut self, cx: &mut Context<Self>) {
+        self.user_servers = settings::lsp(cx);
         let mut rows = server_rows(&self.plugins, cx);
         for row in &mut rows {
             if let Some(known) = self
                 .servers
                 .iter()
-                .find(|known| known.config == row.config)
+                .find(|known| known.config == row.config && known.effective == row.effective)
             {
                 row.source = known.source.clone();
                 row.installable = known.installable.clone();
@@ -555,7 +585,19 @@ impl SettingsView {
             &ui,
         );
         let job = self.jobs.get(&config.name);
+        let enabled = row.effective.is_some();
+        let own_command = crate::lsp_settings::own_command(&config.name, cx);
+        // The user's settings change something (an empty key "Configure…" added doesn't).
+        let custom = row
+            .effective
+            .as_ref()
+            .is_some_and(|effective| effective != config);
         let (status, status_color): (String, _) = match (job, &row.source) {
+            (None, _) if !enabled => (tr("Turned off: Flux doesn't start it").to_string(), ui.dim),
+            (None, Some(Source::Missing)) if own_command.is_some() => (
+                trf("Not found: {0}", &[&own_command.unwrap_or_default()]),
+                ui.error,
+            ),
             (Some(Job::Working { what, progress }), _) => {
                 let mut text = match what {
                     Operation::Install => tr("Installing…").to_string(),
@@ -605,7 +647,7 @@ impl SettingsView {
                     )
                     .into_any_element(),
             ],
-            Some(Source::Missing) if row.installable.is_ok() => vec![
+            Some(Source::Missing) if row.installable.is_ok() && enabled => vec![
                 ui::text_button(("install", index), tr("Install"), false, ui)
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.run(index, Operation::Install, cx)),
@@ -613,6 +655,28 @@ impl SettingsView {
                     .into_any_element(),
             ],
             _ => Vec::new(),
+        };
+        // Its key in `settings.json` (part 10.5), and on or off.
+        let name = config.name.clone();
+        let configure = ui::text_button(("configure", index), tr("Configure…"), false, ui)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.configure(name.clone(), window, cx)
+            }));
+        let name = config.name.clone();
+        let switch = ui::switch(("server-on", index), enabled, ui)
+            .tooltip(ui::tooltip(
+                if enabled { tr("Turn off") } else { tr("Turn on") },
+                None,
+            ))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                crate::lsp_settings::set_enabled(&name, !enabled, cx)
+            }));
+        let mark = if !enabled {
+            Some(ui::badge(tr("Off"), ui.dim))
+        } else if custom {
+            Some(ui::badge(tr("Custom"), ui.accent_text))
+        } else {
+            None
         };
         div()
             .flex()
@@ -638,8 +702,10 @@ impl SettingsView {
                             .child(
                                 div()
                                     .font_weight(FontWeight::MEDIUM)
+                                    .when(!enabled, |name| name.text_color(ui.text_muted))
                                     .child(config.name.clone()),
                             )
+                            .children(mark)
                             .child(
                                 div()
                                     .text_size(px(theme::TEXT_XS))
@@ -656,7 +722,43 @@ impl SettingsView {
                             .child(status),
                     ),
             )
-            .child(div().flex_none().flex().gap_1p5().children(buttons))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .children(buttons)
+                    .child(configure)
+                    .child(div().w(px(6.)))
+                    .child(switch),
+            )
+    }
+
+    /// "Configure…" of a server: Settings close, and `settings.json` opens in a tab at its key.
+    fn configure(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        cx.emit(DismissEvent);
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                crate::lsp_settings::configure(workspace, &name, window, cx)
+            });
+        });
+    }
+
+    /// "Open settings.json" (Language Servers): Settings close, the file opens in a tab.
+    fn open_settings_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        cx.emit(DismissEvent);
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                crate::settings_file::open(workspace, None, window, cx)
+            });
+        });
     }
 }
 
@@ -698,6 +800,14 @@ impl SettingsView {
                         let appearance = cx.new(|cx| AppearancePage::new(page, window, cx));
                         self.appearance = Some(appearance);
                     }
+                }
+                if !self.focus_handle.is_focused(window) {
+                    window.focus(&self.focus_handle);
+                }
+            }
+            Section::Editor => {
+                if self.editor.is_none() {
+                    self.editor = Some(cx.new(|cx| EditorSettingsPage::new(window, cx)));
                 }
                 if !self.focus_handle.is_focused(window) {
                     window.focus(&self.focus_handle);
@@ -972,6 +1082,40 @@ impl SettingsView {
                             ),
                     )
                     .child(ui::switch("auto-install-switch", auto, ui)),
+            )
+            // Part 10.5: what each server is given lives in `settings.json`.
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .p_3()
+                    .rounded(px(ui::RADIUS_MD))
+                    .border_1()
+                    .border_color(ui.island_border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(tr("Server settings"))
+                            .child(
+                                div()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.dim)
+                                    .child(tr(
+                                        "Each server's settings, command and environment are in settings.json, under “lsp”: Configure… opens a server's key.",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        ui::text_button("open-settings-file", tr("Open settings.json"), false, ui)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings_file(window, cx)
+                            })),
+                    ),
             )
             .child(ui::divider(ui))
             .child(div().flex().flex_col().gap_0p5().children(rows))
@@ -1869,6 +2013,7 @@ fn server_rows(plugins: &Entity<PluginStore>, cx: &App) -> Vec<ServerRow> {
                 })
                 .unwrap_or_default();
             ServerRow {
+                effective: crate::lsp_settings::effective(&config, cx),
                 config,
                 plugin: plugin.into(),
                 source: None,
@@ -1913,6 +2058,10 @@ impl Render for SettingsView {
                 })
             }
             Section::System => Some(self.render_system(cx).into_any_element()),
+            Section::Editor => Some(match &self.editor {
+                Some(page) => page.clone().into_any_element(),
+                None => div().into_any_element(),
+            }),
             Section::LanguageServers => Some(self.render_language_servers(cx).into_any_element()),
             Section::VersionControl => Some(self.render_version_control(cx).into_any_element()),
             Section::Notifications => Some(self.render_notifications(cx).into_any_element()),

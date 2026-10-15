@@ -105,7 +105,10 @@ impl CommandPalette {
                 let (namespace, title) = humanized.split_once(": ").unwrap_or(("", &humanized));
                 // The chip and the title are looked up as «Editor» and «Move Word Left».
                 let chip = tr(&title_case(namespace)).to_string();
-                let title = tr(&title_case(title)).to_string();
+                let title = match own_title(action.name()) {
+                    Some(title) => tr(title).to_string(),
+                    None => tr(&title_case(title)).to_string(),
+                };
                 let label = if chip.is_empty() {
                     title
                 } else {
@@ -452,6 +455,14 @@ fn namespace_color(namespace: &str, ui: &UiColors) -> Hsla {
         PLUGIN_NAMESPACE | "plugins" => ui.pink,
         "claude" | "claude composer" | "claude panel" => ui.orange,
         _ => ui.indigo,
+    }
+}
+
+/// A command whose title isn't its action's name: as JetBrains IDEs call it.
+fn own_title(action: &str) -> Option<&'static str> {
+    match action {
+        "editor::ToggleSoftWrap" => Some("Soft-Wrap"),
+        _ => None,
     }
 }
 

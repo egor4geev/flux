@@ -122,6 +122,9 @@ pub struct OpenProject(pub PathBuf);
 pub fn init(cx: &mut App) {
     bind_keys(cx);
     cx.on_action(quit);
+    // Quit in the Dock or its menu, logging out, restarting, shutting down (part 10.5): macOS waits
+    // while the windows ask about their unsaved documents, as for ⌘Q (Flux's patch of gpui).
+    cx.on_quit_requested(quit_requested);
     // Quitting (⌘Q, Quit in the Dock, logging out): every window saves its project's state, and the
     // open project windows are remembered for the next launch.
     cx.on_app_quit(|cx| {
@@ -1265,6 +1268,12 @@ impl Workspace {
         cx.observe(&lsp, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&lsp, |this, _, event, cx| match event {
             crate::lsp::LspEvent::Notify(notification) => this.notify(notification.clone(), cx),
+            // A project problem of a server is over (part 10.5): its card goes.
+            crate::lsp::LspEvent::Resolved { server } => {
+                this.notification_center.update(cx, |center, cx| {
+                    center.expire_where(|card| crate::lsp_status::is_problem_of(card, server), cx)
+                })
+            }
             crate::lsp::LspEvent::ApplyEdit { server, request } => {
                 crate::code_actions::apply_server_edit(this, server.clone(), request.clone(), cx)
             }
@@ -5573,17 +5582,48 @@ async fn ask_to_save(
     }
 }
 
-/// Quitting is already in progress: a repeated cmd-q while dialogs are open does not start a second
-/// review.
+/// Quitting is already in progress: a repeated cmd-q (or Quit in the Dock) while dialogs are open
+/// does not start a second review.
 #[derive(Default)]
 struct Quitting(bool);
 
 impl Global for Quitting {}
 
-/// Quit: the windows go through their unsaved documents in turn; declining in any of them cancels
-/// the quit.
+/// Quit (⌘Q, the app menu).
 fn quit(_: &Quit, cx: &mut App) {
+    start_quit(cx);
+}
+
+/// A quit macOS asks for (part 10.5): Quit in the Dock or its menu, the end of the session. With
+/// something to ask, Flux comes forward first — the question mustn't wait behind another app's
+/// windows (a logout would stall out of sight).
+fn quit_requested(cx: &mut App) {
+    let asks = cx
+        .windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<Workspace>())
+        .any(|handle| {
+            handle.read(cx).is_ok_and(|workspace| {
+                !workspace.running_processes(cx).is_empty()
+                    || !workspace.claude.read(cx).working_sessions(cx).is_empty()
+                    || workspace.tabs.iter().any(|tab| tab.item.is_modified(cx))
+            })
+        });
+    // A scenario in the background leaves the keyboard with the app the user works in.
+    #[cfg(feature = "scenario")]
+    let asks = asks && !crate::scenario::background();
+    if asks {
+        cx.activate(true);
+    }
+    start_quit(cx);
+}
+
+/// Quit, or a quit macOS asks for (part 10.5): the windows go through their running commands,
+/// Claude at work and unsaved documents in turn; declining in any of them cancels the quit — and
+/// answers macOS's request "no", so a logout stops and Flux keeps running.
+fn start_quit(cx: &mut App) {
     let quitting = cx.default_global::<Quitting>();
+    // The review in progress answers macOS's request too.
     if quitting.0 {
         return;
     }
@@ -5600,6 +5640,7 @@ fn quit(_: &Quit, cx: &mut App) {
                 cx.quit();
             } else {
                 cx.global_mut::<Quitting>().0 = false;
+                cx.cancel_quit();
             }
         })
         .ok();

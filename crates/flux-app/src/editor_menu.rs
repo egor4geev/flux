@@ -80,6 +80,9 @@ struct Facts {
     tracked: bool,
     /// A change against HEAD on the caret's line: Rollback Lines.
     change_at_caret: bool,
+    /// Soft-Wrap's state, where it applies (part 10.5): not in a commit message, a diff, read-only
+    /// text.
+    soft_wrap: Option<bool>,
 }
 
 /// The menu's groups, separated, in the order of JetBrains IDEs.
@@ -138,6 +141,9 @@ fn facts(editor: &Editor, cx: &App) -> Facts {
         change_at_caret: editor.git.hunks.iter().any(|hunk| {
             hunk.new.contains(&line) || (hunk.new.is_empty() && hunk.new.start == line)
         }),
+        soft_wrap: editor
+            .can_toggle_soft_wrap()
+            .then(|| editor.soft_wrap_wanted(cx)),
     }
 }
 
@@ -243,6 +249,12 @@ fn build(mut menu: ContextMenu, facts: &Facts) -> ContextMenu {
         if separated {
             menu = menu.separator();
         }
+    }
+    // Soft-Wrap, a switch (JetBrains: View → Active Editor → Soft-Wrap).
+    if let Some(on) = facts.soft_wrap {
+        menu = menu
+            .separator()
+            .check_entry(tr("Soft-Wrap"), on, crate::wrap::ToggleSoftWrap);
     }
     menu
 }

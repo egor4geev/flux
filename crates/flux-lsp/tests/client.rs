@@ -14,9 +14,10 @@ use flux_lsp::lsp_types::{
     MessageType, Position, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
     Uri,
 };
-use flux_lsp::{LanguageServer, RequestError, ServerConfig, ServerEvent};
+use flux_lsp::lsp_types::FileChangeType;
+use flux_lsp::{Health, LanguageServer, RequestError, ServerConfig, ServerEvent, ServerStatus};
 use futures::channel::mpsc::{TryRecvError, UnboundedReceiver};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -48,6 +49,7 @@ impl Fake {
             initialization_options: None,
             settings: None,
             install: None,
+            env: Default::default(),
         }
     }
 
@@ -319,6 +321,104 @@ impl flux_lsp::lsp_types::notification::Notification for AskApply {
     const METHOD: &'static str = "flux/askApply";
 }
 
+/// Custom notifications: the fake server sends rust-analyzer's status, (un)registers watched files
+/// with the params given.
+enum FakeStatus {}
+
+impl flux_lsp::lsp_types::notification::Notification for FakeStatus {
+    type Params = Value;
+    const METHOD: &'static str = "flux/status";
+}
+
+enum FakeRegister {}
+
+impl flux_lsp::lsp_types::notification::Notification for FakeRegister {
+    type Params = Value;
+    const METHOD: &'static str = "flux/register";
+}
+
+enum FakeUnregister {}
+
+impl flux_lsp::lsp_types::notification::Notification for FakeUnregister {
+    type Params = Value;
+    const METHOD: &'static str = "flux/unregister";
+}
+
+#[test]
+fn server_status_watched_files_and_the_log() {
+    let fake = Fake::new();
+    let root = fake.dir.path().to_path_buf();
+    let (server, mut events) = fake.start(&[]);
+    assert!(matches!(next_event(&mut events), ServerEvent::Initialized));
+    let initialize = &fake.received()[1];
+    let capabilities = &initialize["params"]["capabilities"];
+    assert_eq!(capabilities["experimental"]["serverStatusNotification"], true);
+    assert_eq!(
+        capabilities["workspace"]["didChangeWatchedFiles"],
+        json!({ "dynamicRegistration": true, "relativePatternSupport": true })
+    );
+
+    // rust-analyzer couldn't load the project.
+    server.notify::<FakeStatus>(json!({
+        "health": "error", "quiescent": true, "message": "Failed to load workspaces.",
+    }));
+    let ServerEvent::Status(status) =
+        wait_event(&mut events, |e| matches!(e, ServerEvent::Status(_)))
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        status,
+        ServerStatus {
+            health: Health::Error,
+            quiescent: true,
+            message: Some("Failed to load workspaces.".into()),
+        }
+    );
+
+    // Nothing is watched until the server registers globs.
+    assert!(!server.watches_files());
+    assert_eq!(
+        server.files_changed(&[(root.join("src/a.rs"), FileChangeType::CHANGED)]),
+        0
+    );
+    let base = flux_lsp::position::uri_from_path(&root);
+    server.notify::<FakeRegister>(json!({ "registrations": [{
+        "id": "watch",
+        "method": "workspace/didChangeWatchedFiles",
+        "registerOptions": { "watchers": [
+            { "globPattern": { "baseUri": base.as_str(), "pattern": "**/*.rs" } },
+        ]},
+    }]}));
+    wait_event(&mut events, |e| matches!(e, ServerEvent::WatchersChanged));
+    assert!(server.watches_files());
+    fake.wait_received(|m| m["id"] == "reg" && m.get("method").is_none());
+    let sent = server.files_changed(&[
+        (root.join("src/a.rs"), FileChangeType::CREATED),
+        (root.join("README.md"), FileChangeType::CHANGED),
+    ]);
+    assert_eq!(sent, 1);
+    let notification = fake.wait_received(|m| m["method"] == "workspace/didChangeWatchedFiles");
+    let uri = flux_lsp::position::uri_from_path(&root.join("src/a.rs"));
+    assert_eq!(
+        notification["params"]["changes"],
+        json!([{ "uri": uri.as_str(), "type": 1 }])
+    );
+
+    server.notify::<FakeUnregister>(json!({ "unregisterations": [{
+        "id": "watch", "method": "workspace/didChangeWatchedFiles",
+    }]}));
+    wait_event(&mut events, |e| matches!(e, ServerEvent::WatchersChanged));
+    assert!(!server.watches_files());
+
+    // The log: what Flux noted, the server's `window/logMessage` (sent after `initialized`) and
+    // its status.
+    let log = server.log().text();
+    assert!(log.contains("flux    started python3"), "{log}");
+    assert!(log.contains("log     ignored"), "{log}");
+    assert!(log.contains("status: error Failed to load workspaces."), "{log}");
+}
+
 /// A custom request: the fake server exits on it with a message on stderr.
 enum Crash {}
 
@@ -349,6 +449,10 @@ fn a_crash_fails_pending_requests_and_reports_stderr() {
         reason.contains('3') && reason.contains("fatal: boom"),
         "{reason}"
     );
+    // The log outlives the process: its stderr and the exit are there.
+    let log = server.log().text();
+    assert!(log.contains("stderr  fatal: boom"), "{log}");
+    assert!(log.contains("flux    exited: "), "{log}");
 }
 
 #[test]
@@ -399,4 +503,52 @@ fn uris_from_the_server_compare_by_path() {
         flux_lsp::position::path_from_uri(&a),
         flux_lsp::position::path_from_uri(&b)
     );
+}
+
+#[test]
+fn settings_change_while_the_server_runs() {
+    let fake = Fake::new();
+    let config = ServerConfig {
+        settings: Some(serde_json::json!({ "a": { "x": 1 } })),
+        env: [("FLUX_FAKE_ENV".to_string(), "on".to_string())].into(),
+        ..fake.config(&[])
+    };
+    let (server, mut events) = LanguageServer::start(&config, fake.dir.path()).unwrap();
+    assert!(matches!(next_event(&mut events), ServerEvent::Initialized));
+    // The user's environment reached the process.
+    assert_eq!(fake.received()[0]["env"], "on");
+    // The answer to the first `workspace/configuration` (sections "a" and "b").
+    let answer = |id: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(found) = fake.received().into_iter().find(|m| m["id"] == id) {
+                return found["result"].clone();
+            }
+            assert!(Instant::now() < deadline, "no answer to {id}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert_eq!(answer("conf-1"), serde_json::json!([{ "x": 1 }, null]));
+
+    server.set_settings(serde_json::json!({ "a": { "x": 2 }, "b": true }));
+    server.notify::<FluxAskConfiguration>(());
+    assert_eq!(answer("conf-2"), serde_json::json!([{ "x": 2 }, 2, true]));
+    let changed = fake
+        .received()
+        .into_iter()
+        .find(|m| m["method"] == "workspace/didChangeConfiguration")
+        .expect("didChangeConfiguration sent");
+    assert_eq!(
+        changed["params"]["settings"],
+        serde_json::json!({ "a": { "x": 2 }, "b": true })
+    );
+    drop(server);
+}
+
+/// The fake server's request to ask for its settings again.
+enum FluxAskConfiguration {}
+
+impl Notification for FluxAskConfiguration {
+    type Params = ();
+    const METHOD: &'static str = "flux/askConfiguration";
 }

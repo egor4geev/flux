@@ -33,13 +33,16 @@ pub fn anchor(editor: &Editor, pos: usize) -> Option<Anchor> {
     let layout = editor.layout.as_ref()?;
     let text = editor.document.text();
     let pos = pos.min(text.len_chars());
-    let line = text.char_to_line(pos);
-    let x_in_line = layout
-        .line(line)?
-        .x_for_column(pos - line_start(text, line));
+    // The row from the previous frame's layout (its x), its place from the current scroll and
+    // rows (soft wraps, part 10.5).
+    let index = layout.caret_row(text, pos)?;
+    let row = &layout.rows[index];
+    let x_in_line = row.x_for_column(pos - line_start(text, row.line));
     let bounds = layout.text_bounds;
     let x = bounds.left() + px(theme::TEXT_PADDING - editor.scroll.x) + x_in_line;
-    let line_top = bounds.top() + layout.line_height * line as f32 - px(editor.scroll.y);
+    let display_row = editor.wrap.row_of(text, pos);
+    let line_top =
+        bounds.top() + layout.line_height * display_row as f32 - px(editor.scroll.y);
     let line_bottom = line_top + layout.line_height;
     let visible = line_bottom > bounds.top()
         && line_top < bounds.bottom()

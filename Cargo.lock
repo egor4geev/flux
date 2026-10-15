@@ -2072,6 +2072,7 @@ version = "0.1.0"
 dependencies = [
  "flux-core",
  "futures",
+ "globset",
  "lsp-types",
  "memchr",
  "percent-encoding",
