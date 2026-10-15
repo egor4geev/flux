@@ -2019,6 +2019,8 @@ dependencies = [
  "futures",
  "gpui",
  "image",
+ "libc",
+ "log",
  "objc",
  "regex",
  "resvg",

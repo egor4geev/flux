@@ -9,6 +9,9 @@ Code, comments and docs in this repository are in English. The UI is localized (
 user-visible strings go through `crate::i18n::tr`/`trf`/`trn`, with Russian translations in
 `crates/flux-app/src/i18n/ru/`.
 
+Development happens on the `pre-release` branch; `main` holds the released version and takes only
+pull requests from `pre-release` and `hotfix/*` (`CONTRIBUTING.md`, `.github/rulesets/`).
+
 Rust is installed via Homebrew rustup (keg-only): in a non-interactive shell run
 `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"` first. `ls` may be aliased to `eza`, which can
 hang — use `/bin/ls`.

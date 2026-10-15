@@ -1,0 +1,15 @@
+# The New issue page: the bug form, and links for everything that isn't a bug of Flux.
+blank_issues_enabled: false
+contact_links:
+  - name: Suggest a feature
+    url: https://github.com/egor4geev/flux/discussions/new?category=ideas
+    about: Ideas live in Discussions, where others can upvote them and join in.
+  - name: Ask a question
+    url: https://github.com/egor4geev/flux/discussions/new?category=q-a
+    about: How to do something in Flux, or why it works the way it does.
+  - name: A problem with a plugin from the Marketplace
+    url: https://github.com/egor4geev/flux-plugins/issues/new/choose
+    about: Languages, themes, file icons, Yandex Tracker & Calendar — the catalog's plugins have their own issues.
+  - name: Report a security vulnerability
+    url: https://github.com/egor4geev/flux/security/advisories/new
+    about: Privately, not in a public issue — see SECURITY.md.

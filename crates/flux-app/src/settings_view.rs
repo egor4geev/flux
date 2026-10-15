@@ -15,26 +15,30 @@
 //!   is on and has settings ([`crate::plugin_settings`]).
 //! - Claude Code: on or off, the `claude` executable (found or chosen), its version and account,
 //!   the defaults of new sessions, the chat's switches, more arguments for the CLI.
-//! - About: the version, the license, the developer, the source code. «About Flux» in the app menu
-//!   ([`About`]) opens Settings on this section.
+//! - About: the version with the commit it is built from, macOS and the computer, the license, the
+//!   developer, the source code; Report a Bug… and Copy — the facts for a report, as JetBrains' Copy
+//!   and Close (part 10.6, [`crate::feedback`]). «About Flux» in the app menu ([`About`]) opens
+//!   Settings on this section.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
 use flux_lsp::config::ServerConfig;
 use flux_lsp::install::{self, Source};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, AppContext as _, BoxShadow, Context, DismissEvent, Div, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, KeyBinding, PathPromptOptions, Render, SharedString,
-    Subscription, Task, WeakEntity, Window, actions, div, img, linear_color_stop, linear_gradient,
-    point, prelude::*, px, svg,
+    AnyElement, App, AppContext as _, BoxShadow, ClipboardItem, Context, DismissEvent, Div, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, PathPromptOptions, Render,
+    SharedString, Subscription, Task, WeakEntity, Window, actions, div, img, linear_color_stop,
+    linear_gradient, point, prelude::*, px, svg,
 };
 
 use crate::appearance_settings::{AppearancePage, Page};
 use crate::claude::{self, ClaudeStore, CliState};
 use crate::editor_settings::EditorSettingsPage;
+use crate::feedback;
 use crate::i18n::{tr, trf};
 use crate::icons::{self, IconName, file_icon, icon};
 use crate::input::{InputEvent, TextInput};
@@ -61,6 +65,8 @@ const ABOUT_LOGO_SIZE: f32 = 64.;
 const ABOUT_LABEL_WIDTH: f32 = 120.;
 /// Claude Code: the column of the CLI's facts (Executable, Version, Account).
 const CLAUDE_LABEL_WIDTH: f32 = 150.;
+/// About → Copy says «Copied» this long.
+const COPIED_FOR: Duration = Duration::from_millis(1500);
 
 /// The developer and the repository, for About.
 const DEVELOPER: &str = "Egor Ageev";
@@ -318,6 +324,8 @@ pub struct SettingsView {
     claude: Entity<ClaudeStore>,
     /// Claude Code's additional arguments, as the user types them.
     claude_args: Entity<TextInput>,
+    /// When About → Copy was last clicked: it says «Copied» for a moment.
+    about_copied: Option<Instant>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -417,6 +425,7 @@ impl SettingsView {
             user_servers: settings::lsp(cx),
             claude: handles.claude,
             claude_args,
+            about_copied: None,
             _tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -1885,10 +1894,12 @@ impl SettingsView {
             .detach();
     }
 
-    /// About: the logo with the name, version, and description; then the facts in rows.
+    /// About: the logo with the name, version, and description; then the facts in rows — the build,
+    /// this Mac — and the buttons of a report.
     fn render_about(&self, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
         let version = env!("CARGO_PKG_VERSION");
+        let machine = feedback::machine();
         let identity = div()
             .flex()
             .items_center()
@@ -1927,12 +1938,45 @@ impl SettingsView {
             .on_click(|_, _, cx| cx.open_url(&format!("https://{REPOSITORY}")))
             .child(REPOSITORY)
             .into_any_element();
+        let macos = machine
+            .macos
+            .strip_prefix("macOS ")
+            .unwrap_or(&machine.macos)
+            .to_string();
         let facts = [
-            (tr("Version"), plain(version, ui)),
+            (tr("Version"), plain(machine.version.clone(), ui)),
+            ("macOS", plain(macos, ui)),
+            (tr("Computer"), plain(feedback::computer(), ui)),
             (tr("License"), plain(env!("CARGO_PKG_LICENSE"), ui)),
             (tr("Developer"), plain(DEVELOPER, ui)),
             (tr("Source code"), repository),
         ];
+        // Copy last: «Copied» is wider and moves nothing.
+        let copied = self
+            .about_copied
+            .is_some_and(|at| at.elapsed() < COPIED_FOR);
+        let buttons = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                ui::text_button("about-report-bug", tr("Report a Bug…"), false, ui)
+                    .on_click(|_, _, cx| feedback::report_bug(None, cx)),
+            )
+            .child(
+                ui::text_button(
+                    "about-copy",
+                    if copied { tr("Copied") } else { tr("Copy") },
+                    false,
+                    ui,
+                )
+                .when(copied, |button| button.text_color(ui.success))
+                .tooltip(ui::tooltip(
+                    tr("The version, macOS, the computer and the plugins — for a report"),
+                    None,
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.copy_about(cx))),
+            );
         div()
             .flex()
             .flex_col()
@@ -1959,6 +2003,20 @@ impl SettingsView {
                             .child(value)
                     })),
             )
+            .child(buttons)
+    }
+
+    /// About → Copy: the facts for a report, with this window's plugins.
+    fn copy_about(&mut self, cx: &mut Context<Self>) {
+        let text = feedback::system_info_with(&self.plugins, cx).to_text();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.about_copied = Some(Instant::now());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPIED_FOR).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
     }
 }
 

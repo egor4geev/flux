@@ -1,7 +1,9 @@
 //! The menu bar: the application menu (the bold «Flux» next to the Apple menu) with About, Settings,
-//! Services, hiding, and Quit, and the Window menu (part 10.1): Minimize, Zoom, the next and the
-//! previous Flux window, Bring All to Front, and — added by macOS — the list of the windows. The
-//! items dispatch the same actions as their keys; macOS shows the shortcuts from the keymap.
+//! Services, hiding, and Quit, the Window menu (part 10.1): Minimize, Zoom, the next and the
+//! previous Flux window, Bring All to Front, and — added by macOS — the list of the windows, and the
+//! Help menu (part 10.6): reporting a bug, an idea or a question on GitHub, and the log — with the
+//! search field macOS adds to it. The items dispatch the same actions as their keys; macOS shows
+//! the shortcuts from the keymap.
 //!
 //! The menu's titles are in the interface language: when it changes while Flux runs (Settings →
 //! Appearance → Language), the menu is built anew ([`rebuild`]).
@@ -10,7 +12,7 @@ use gpui::{AnyWindowHandle, App, KeyBinding, Menu, MenuItem, SystemMenuType, act
 
 use crate::i18n::tr;
 use crate::workspace::Workspace;
-use crate::{settings_view, workspace};
+use crate::{app_log, feedback, settings_view, workspace};
 
 actions!(flux, [Hide, HideOthers, ShowAll]);
 
@@ -32,6 +34,8 @@ actions!(
 
 /// The Window menu's place in the menu bar: after the application menu.
 const WINDOW_MENU: usize = 1;
+/// The Help menu's place: the last one, after Window.
+const HELP_MENU: usize = 2;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -92,11 +96,25 @@ pub fn rebuild(cx: &mut App) {
                 MenuItem::action(tr("Bring All to Front"), BringAllToFront),
             ],
         },
+        Menu {
+            name: tr("Help").into(),
+            items: vec![
+                MenuItem::action(tr("Report a Bug…"), feedback::ReportBug),
+                MenuItem::action(tr("Suggest a Feature…"), feedback::SuggestFeature),
+                MenuItem::action(tr("Ask a Question…"), feedback::AskQuestion),
+                MenuItem::separator(),
+                MenuItem::action(tr("Show Log in Finder"), app_log::ShowLog),
+            ],
+        },
     ]);
     // gpui makes a menu the windows menu only when it is named "Window" exactly: in Russian it
-    // is «Окно», so it is set here.
+    // is «Окно», so it is set here. The same for the help menu («Справка»): macOS puts its search
+    // field into it.
     #[cfg(target_os = "macos")]
-    appkit::set_windows_menu(WINDOW_MENU);
+    {
+        appkit::set_windows_menu(WINDOW_MENU);
+        appkit::set_help_menu(HELP_MENU);
+    }
 }
 
 /// The windows of Flux in the order they opened: ⌘` goes along it, as macOS cycles a document
@@ -148,23 +166,45 @@ mod appkit {
     /// The menu at `index` of the menu bar becomes the app's windows menu: macOS adds the
     /// windows to it and keeps the list current. On the main thread.
     pub fn set_windows_menu(index: usize) {
+        // SAFETY: AppKit's shared application; the submenu comes from `submenu`.
+        unsafe {
+            if let Some((app, submenu)) = submenu(index) {
+                let _: () = msg_send![app, setWindowsMenu: submenu];
+            }
+        }
+    }
+
+    /// The menu at `index` becomes the app's help menu: macOS puts its search field at the top.
+    /// On the main thread.
+    pub fn set_help_menu(index: usize) {
+        // SAFETY: as in `set_windows_menu`.
+        unsafe {
+            if let Some((app, submenu)) = submenu(index) {
+                let _: () = msg_send![app, setHelpMenu: submenu];
+            }
+        }
+    }
+
+    /// The shared application and the submenu at `index` of its menu bar; `None` past the end
+    /// or without one.
+    ///
+    /// SAFETY: on the main thread.
+    unsafe fn submenu(index: usize) -> Option<(*mut Object, *mut Object)> {
         // SAFETY: AppKit's shared application and its main menu; the index is checked against
         // the number of items (`itemAtIndex:` raises past the end); nil results are skipped.
         unsafe {
             let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
             let main: *mut Object = msg_send![app, mainMenu];
             if main.is_null() {
-                return;
+                return None;
             }
             let count: isize = msg_send![main, numberOfItems];
             if index as isize >= count {
-                return;
+                return None;
             }
             let item: *mut Object = msg_send![main, itemAtIndex: index as isize];
             let submenu: *mut Object = msg_send![item, submenu];
-            if !submenu.is_null() {
-                let _: () = msg_send![app, setWindowsMenu: submenu];
-            }
+            (!submenu.is_null()).then_some((app, submenu))
         }
     }
 

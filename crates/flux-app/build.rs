@@ -25,6 +25,7 @@ fn main() {
         .expect("crates/flux-app is two levels down")
         .to_path_buf();
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("set by cargo"));
+    emit_commit(&workspace);
     let plugins = workspace.join("plugins");
     // The whole folder: a new plugin, a changed source, translation or icon. Builds go elsewhere
     // (`target/plugins`), so a build doesn't trigger the next one.
@@ -97,6 +98,39 @@ fn main() {
         "cargo:rustc-env=FLUX_BUNDLED_SKIPPED={}",
         skipped.join("; ")
     );
+}
+
+/// `FLUX_COMMIT`: the short hash of the commit Flux is built from (part 10.6), so that About and bug
+/// reports name the build exactly; empty outside a git checkout (a source archive). A `FLUX_COMMIT`
+/// in the environment (a CI build) wins.
+fn emit_commit(workspace: &Path) {
+    println!("cargo:rerun-if-env-changed=FLUX_COMMIT");
+    let commit = env::var("FLUX_COMMIT")
+        .ok()
+        .filter(|commit| !commit.is_empty())
+        .or_else(|| git_commit(workspace))
+        .unwrap_or_default();
+    println!("cargo:rustc-env=FLUX_COMMIT={commit}");
+}
+
+/// The checkout's `HEAD`, short. The script runs again when it moves: a checkout changes `HEAD`, a
+/// commit the branch's ref. Only paths that exist are watched: cargo reruns a script whose watched
+/// path is missing on every build.
+fn git_commit(workspace: &Path) -> Option<String> {
+    let git = workspace.join(".git");
+    for path in [git.join("HEAD"), git.join("refs/heads"), git.join("packed-refs")] {
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!commit.is_empty()).then_some(commit)
 }
 
 /// The files of a plugin's folder that go into Flux as they are, by their `/`-separated path in

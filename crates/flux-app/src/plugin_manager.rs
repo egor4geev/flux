@@ -40,6 +40,7 @@ use gpui::{
 use crate::command_palette::keystroke_label;
 use crate::context_menu::ContextMenu;
 use crate::dialog::Dialog;
+use crate::feedback;
 use crate::i18n::{lang_code, tr, trf, trn};
 use crate::icons::{self, IconName, icon};
 use crate::input::{InputEvent, TextInput};
@@ -1689,6 +1690,17 @@ impl PluginManager {
                     .child(tilde(dir))
                     .into_any_element(),
             ));
+        }
+        // Where its problems go (part 10.6): Flux's, the catalog's or the plugin's own tracker.
+        let report = feedback::PluginReport {
+            id: manifest.id.clone(),
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            repository: manifest.repository.clone(),
+            bundled: plugin.entry.source == PluginSource::Bundled,
+        };
+        if let Some(link) = feedback::report_issue_link("plugin-report-issue", report, ui) {
+            facts.push((tr("Feedback"), link));
         }
         div()
             .flex()

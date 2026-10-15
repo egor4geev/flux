@@ -1,0 +1,29 @@
+# The form of the Q&A category (the file is named by the category's slug). Help → Ask a Question… in
+# Flux opens it: /discussions/new?category=q-a. The ids can be filled through the URL's query, as in
+# the issue forms.
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What you'd like to do or understand. Screenshots help — drag them in here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you tried
+
+  - type: input
+    id: version
+    attributes:
+      label: Flux version
+      description: Flux → About Flux.
+      placeholder: 0.1.0 (ca086c2)
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS
+      placeholder: macOS 26.1 (25B78)
