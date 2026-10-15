@@ -885,7 +885,10 @@ impl DiffView {
 
     /// The plugin's proposal, if it wasn't answered here: closing the tab answers it `closed`.
     pub fn unanswered_plugin_proposal(&self) -> Option<PluginProposal> {
-        let proposal = self.proposal.as_ref().filter(|proposal| !proposal.answered)?;
+        let proposal = self
+            .proposal
+            .as_ref()
+            .filter(|proposal| !proposal.answered)?;
         match &proposal.owner {
             ProposalOwner::Plugin(proposal) => Some(proposal.clone()),
             ProposalOwner::Claude { .. } => None,
@@ -1886,15 +1889,18 @@ impl DiffView {
                         ),
                 )
                 .child(
-                    ui::text_button("proposal-reject", tr("Reject"), true, ui)
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.reject_proposal(cx))),
+                    ui::text_button("proposal-reject", tr("Reject"), true, ui).on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.reject_proposal(cx)),
+                    ),
                 )
                 .child(
                     ui::primary_button("proposal-accept", tr("Accept"), true, ui)
                         .when_some(accept_keys, |button, keys| {
                             button.tooltip(ui::tooltip(tr("Accept"), Some(keys)))
                         })
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.accept_proposal(cx))),
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.accept_proposal(cx)),
+                        ),
                 ),
         )
     }
@@ -2442,10 +2448,12 @@ impl Render for DiffView {
                 cx.listener(|this, _: &JumpToSource, window, cx| this.jump_to_source(window, cx)),
             )
             .when(self.proposal.is_some(), |view| {
-                view.on_action(cx.listener(|this, _: &AcceptProposal, _, cx| this.accept_proposal(cx)))
-                    .on_action(cx.listener(|this, _: &RejectProposal, _, cx| this.reject_proposal(cx)))
-                    // The proposal isn't a file of its own: ⌘S must not ask where to save it.
-                    .capture_action(cx.listener(|_, _: &editor::Save, _, cx| cx.stop_propagation()))
+                view.on_action(
+                    cx.listener(|this, _: &AcceptProposal, _, cx| this.accept_proposal(cx)),
+                )
+                .on_action(cx.listener(|this, _: &RejectProposal, _, cx| this.reject_proposal(cx)))
+                // The proposal isn't a file of its own: ⌘S must not ask where to save it.
+                .capture_action(cx.listener(|_, _: &editor::Save, _, cx| cx.stop_propagation()))
             })
             .children(self.render_proposal_banner(window, cx))
             .child(self.render_toolbar(window, cx))

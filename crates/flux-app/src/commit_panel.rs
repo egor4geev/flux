@@ -46,11 +46,11 @@ use flux_git::{
     Operation, RepoState,
 };
 use gpui::{
-    Action, Animation, AnimationExt, AnyElement, App, AsyncApp, ClickEvent, ClipboardItem,
-    Context, CursorStyle, DismissEvent, Div, DragMoveEvent, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, Pixels, Point,
-    Render, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window,
-    actions, div, prelude::*, px, uniform_list,
+    Action, Animation, AnimationExt, AnyElement, App, AsyncApp, ClickEvent, ClipboardItem, Context,
+    CursorStyle, DismissEvent, Div, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, Pixels, Point, Render,
+    ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window, actions,
+    div, prelude::*, px, uniform_list,
 };
 
 use crate::claude::{self, ClaudeStore, ClaudeStoreEvent};
@@ -59,9 +59,9 @@ use crate::dialog::Dialog;
 use crate::editor::{self, Editor};
 use crate::git::{self, Change, CheckState, GitEvent, GitStore};
 use crate::i18n::{tr, trf, trn};
+use crate::icons::{IconName, file_icon, folder_icon, icon};
 use crate::notification_center::NotificationGroup;
 use crate::notifications::Notification;
-use crate::icons::{IconName, file_icon, folder_icon, icon};
 use crate::rename::difference;
 use crate::stash_panel::{StashPanel, StashPanelEvent, StashSelected};
 use crate::theme::{self, Theme, UiColors};
@@ -722,13 +722,16 @@ impl CommitPanel {
         let subscriptions = vec![
             cx.observe(&git, |this, _, cx| this.rebuild(cx)),
             // Not every event: a streaming answer notifies the store with each token.
-            cx.subscribe(&claude, |this, _, event: &ClaudeStoreEvent, cx| match event {
-                ClaudeStoreEvent::SessionAdded(_)
-                | ClaudeStoreEvent::SessionRemoved(_)
-                | ClaudeStoreEvent::FilesChanged(_)
-                | ClaudeStoreEvent::Changed => this.claude_changed(cx),
-                _ => {}
-            }),
+            cx.subscribe(
+                &claude,
+                |this, _, event: &ClaudeStoreEvent, cx| match event {
+                    ClaudeStoreEvent::SessionAdded(_)
+                    | ClaudeStoreEvent::SessionRemoved(_)
+                    | ClaudeStoreEvent::FilesChanged(_)
+                    | ClaudeStoreEvent::Changed => this.claude_changed(cx),
+                    _ => {}
+                },
+            ),
             // The stash tab's toolbar follows its selection.
             cx.observe(&stash, |_, _, cx| cx.notify()),
             cx.subscribe(&stash, |_, _, event: &StashPanelEvent, cx| match event {
@@ -919,7 +922,8 @@ impl CommitPanel {
             .iter()
             .map(|session| session.entity_id())
             .collect();
-        self.claude_checked.retain(|session| alive.contains(session));
+        self.claude_checked
+            .retain(|session| alive.contains(session));
         if lists != self.claude_lists {
             self.claude_lists = lists;
             self.claude_groups = ClaudeGroups::build(&self.claude_lists);
@@ -984,7 +988,12 @@ impl CommitPanel {
     }
 
     /// The files leave a session's changelist (committed, rolled back, moved to "Changes").
-    fn forget_claude_files(&mut self, session: EntityId, paths: &[PathBuf], cx: &mut Context<Self>) {
+    fn forget_claude_files(
+        &mut self,
+        session: EntityId,
+        paths: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) {
         if let Some(session) = self.claude.read(cx).session(session).cloned() {
             session.update(cx, |session, cx| session.forget_changed_files(paths, cx));
         }
@@ -993,7 +1002,10 @@ impl CommitPanel {
     /// The changelist file behind a change: its session and the path as Claude wrote it.
     fn claude_file(&self, change: &Change) -> Option<(EntityId, PathBuf)> {
         let session = self.claude_groups.owner(change)?;
-        let list = self.claude_lists.iter().find(|list| list.session == session)?;
+        let list = self
+            .claude_lists
+            .iter()
+            .find(|list| list.session == session)?;
         let file = list
             .files
             .iter()
@@ -1312,7 +1324,12 @@ impl CommitPanel {
     }
 
     /// A file of a Claude changelist against HEAD, as the other files.
-    fn show_diff_with_head(&mut self, _: &ShowDiffWithHead, _: &mut Window, cx: &mut Context<Self>) {
+    fn show_diff_with_head(
+        &mut self,
+        _: &ShowDiffWithHead,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(change) = self.selected_file().cloned() {
             cx.emit(CommitPanelEvent::OpenDiff(change.path));
         }
@@ -1389,7 +1406,8 @@ impl CommitPanel {
                 &[&trn(targets.len(), "in {n} file", "in {n} files")],
             ),
         };
-        let mut message = tr("The files get back their text from before Claude changed them.").to_string();
+        let mut message =
+            tr("The files get back their text from before Claude changed them.").to_string();
         if created {
             message.push(' ');
             message.push_str(tr("Files Claude created are moved to the Trash."));
@@ -2831,10 +2849,8 @@ impl CommitPanel {
             ui::toggle_button("commit-generate", IconName::Claude, true, ui)
                 .tooltip(ui::tooltip(tr("Stop Generating"), None))
         } else {
-            ui::icon_button("commit-generate", IconName::Claude, ui).tooltip(ui::tooltip(
-                tr("Generate Commit Message with Claude"),
-                None,
-            ))
+            ui::icon_button("commit-generate", IconName::Claude, ui)
+                .tooltip(ui::tooltip(tr("Generate Commit Message with Claude"), None))
         }
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -3216,7 +3232,9 @@ pub(crate) fn confirm_rollback(
         let result = task.await;
         cx.update(|cx| {
             if let Err(err) = result {
-                return git.update(cx, |git, cx| git.notify_error(tr("Rollback failed"), &err, cx));
+                return git.update(cx, |git, cx| {
+                    git.notify_error(tr("Rollback failed"), &err, cx)
+                });
             }
             let removed = follow_rollback(&git, &changes, cx);
             let message = match changes.as_slice() {
@@ -3274,7 +3292,9 @@ pub(crate) fn restore_originals(jobs: &[(PathBuf, Option<Arc<str>>)]) -> Vec<Str
 /// save): a failure leaves the old file whole.
 fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let permissions = std::fs::metadata(&target).ok().map(|meta| meta.permissions());
+    let permissions = std::fs::metadata(&target)
+        .ok()
+        .map(|meta| meta.permissions());
     let temp = target.with_file_name(format!(
         ".{}.flux-tmp",
         target.file_name().unwrap_or_default().to_string_lossy()
@@ -3367,7 +3387,11 @@ pub(crate) fn message_prompt(files: &[MessageFile], subjects: &[String]) -> Stri
     }
     prompt.push_str("Changed files:\n");
     for file in files {
-        prompt.push_str(&format!("{} {}\n", status_letter(file.status), file.relative));
+        prompt.push_str(&format!(
+            "{} {}\n",
+            status_letter(file.status),
+            file.relative
+        ));
     }
     prompt.push_str("\nDiff:\n");
     let mut size = 0;
@@ -3580,9 +3604,9 @@ impl Render for CommitPanel {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleAmend, _, cx| this.toggle_amend(cx)))
-            .on_action(cx.listener(|this, _: &GenerateCommitMessage, _, cx| {
-                this.generate_message(cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &GenerateCommitMessage, _, cx| this.generate_message(cx)),
+            )
             .on_action(cx.listener(|this, action: &UseMessage, _, cx| {
                 if let Some(message) = this.history.get(action.0).cloned() {
                     this.set_message(&message, cx);
@@ -3615,11 +3639,12 @@ impl Render for CommitPanel {
             CommitTab::Stash => root.child(div().flex_1().min_h_0().child(self.stash.clone())),
         };
         let center = ui::resize_handle_center(ui::style(cx));
-        root.child(resize_handle(self.resizing, center, ui)).children(
-            self.menu
-                .as_ref()
-                .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-        )
+        root.child(resize_handle(self.resizing, center, ui))
+            .children(
+                self.menu
+                    .as_ref()
+                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
+            )
     }
 }
 
@@ -3807,7 +3832,13 @@ mod tests {
             change(0, "file10.rs", FileStatus::Untracked),
             change(0, "file2.rs", FileStatus::Untracked),
         ];
-        let rows = build_rows(&changes, &one_repo(), true, &HashSet::new(), &ClaudeGroups::default());
+        let rows = build_rows(
+            &changes,
+            &one_repo(),
+            true,
+            &HashSet::new(),
+            &ClaudeGroups::default(),
+        );
         assert_eq!(
             labels(&rows),
             vec![
@@ -3833,7 +3864,13 @@ mod tests {
             change(0, "src/main.rs", FileStatus::Modified),
             change(0, "Cargo.toml", FileStatus::Modified),
         ];
-        let rows = build_rows(&changes, &one_repo(), false, &HashSet::new(), &ClaudeGroups::default());
+        let rows = build_rows(
+            &changes,
+            &one_repo(),
+            false,
+            &HashSet::new(),
+            &ClaudeGroups::default(),
+        );
         assert_eq!(
             labels(&rows),
             vec!["Changes", "  Cargo.toml", "  main.rs (src)"]
@@ -3883,7 +3920,13 @@ mod tests {
             change(0, "README.md", FileStatus::Conflicted),
             change(0, "notes.md", FileStatus::Untracked),
         ];
-        let rows = build_rows(&changes, &one_repo(), true, &HashSet::new(), &ClaudeGroups::default());
+        let rows = build_rows(
+            &changes,
+            &one_repo(),
+            true,
+            &HashSet::new(),
+            &ClaudeGroups::default(),
+        );
         assert_eq!(
             labels(&rows),
             vec![

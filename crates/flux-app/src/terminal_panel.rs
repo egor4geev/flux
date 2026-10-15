@@ -999,7 +999,11 @@ impl Render for TerminalPanel {
             .child(self.render_header(window, cx))
             .child(ui::divider(ui).mx(px(GAP)))
             .child(body)
-            .child(resize_handle(self.resizing, ui::resize_handle_center(ui::style(cx)), ui))
+            .child(resize_handle(
+                self.resizing,
+                ui::resize_handle_center(ui::style(cx)),
+                ui,
+            ))
             .children(
                 self.menu
                     .as_ref()

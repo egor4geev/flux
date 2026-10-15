@@ -6,7 +6,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     // The history popup.
     ("Search sessions…", "Поиск сессий…"),
     ("Reading the sessions…", "Чтение сессий…"),
-    ("No saved sessions in this project", "В этом проекте нет сохранённых сессий"),
+    (
+        "No saved sessions in this project",
+        "В этом проекте нет сохранённых сессий",
+    ),
     ("already open", "уже открыта"),
     ("resume", "продолжить"),
     ("{0} min ago", "{0} мин назад"),
@@ -16,14 +19,20 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Recent Sessions", "Недавние сессии"),
     ("Show All…", "Показать все…"),
     // The message field's `/` list.
-    ("Resume a session of this project", "Продолжить сессию этого проекта"),
+    (
+        "Resume a session of this project",
+        "Продолжить сессию этого проекта",
+    ),
     // The command palette (action names).
     ("Resume Session", "Продолжить сессию"),
     // Deleting a session (part 10.2).
     ("delete", "удалить"),
     ("Delete Session", "Удалить сессию"),
     ("Delete the session “{0}”?", "Удалить сессию «{0}»?"),
-    ("Its transcript goes to the Trash.", "Запись уйдёт в Корзину."),
+    (
+        "Its transcript goes to the Trash.",
+        "Запись уйдёт в Корзину.",
+    ),
     ("The session “{0}” is open", "Сессия «{0}» открыта"),
     (
         "It closes, and its transcript goes to the Trash.",
@@ -33,7 +42,5 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Couldn't delete the session", "Не удалось удалить сессию"),
 ];
 
-pub(super) const PLURALS: &[(&str, [&str; 3])] = &[(
-    "{n} session",
-    ["{n} сессия", "{n} сессии", "{n} сессий"],
-)];
+pub(super) const PLURALS: &[(&str, [&str; 3])] =
+    &[("{n} session", ["{n} сессия", "{n} сессии", "{n} сессий"])];

@@ -1885,4 +1885,3 @@ mod tests {
         assert!(matches!(right, DiffSide::Revision { ref path, .. } if path == "docs/journal.md"));
     }
 }
-

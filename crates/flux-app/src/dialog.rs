@@ -465,10 +465,8 @@ fn auto_answer(
                     .await;
             }
             cx.background_executor().timer(delay).await;
-            cx.update(|window, cx| {
-                layer.update(cx, |layer, cx| layer.answer(button, window, cx))
-            })
-            .ok();
+            cx.update(|window, cx| layer.update(cx, |layer, cx| layer.answer(button, window, cx)))
+                .ok();
         })
         .detach();
 }

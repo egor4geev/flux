@@ -114,9 +114,16 @@ mod tests {
 
     #[test]
     fn builds_options() {
-        let tests = command(["cargo", "test"]).title("Tests").env("A", "1").in_editor().focus();
+        let tests = command(["cargo", "test"])
+            .title("Tests")
+            .env("A", "1")
+            .in_editor()
+            .focus();
         let raw = tests.as_raw();
-        assert_eq!(raw.command.as_deref(), Some(&["cargo".to_string(), "test".to_string()][..]));
+        assert_eq!(
+            raw.command.as_deref(),
+            Some(&["cargo".to_string(), "test".to_string()][..])
+        );
         assert_eq!(raw.title.as_deref(), Some("Tests"));
         assert_eq!(raw.location, TerminalLocation::Editor);
         assert!(raw.focus);

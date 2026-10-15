@@ -69,9 +69,8 @@ use futures::channel::mpsc::{self, UnboundedReceiver};
 use futures::channel::oneshot;
 use gpui::{
     App, AppContext, AsyncApp, Context, Div, Entity, EntityId, EventEmitter, InteractiveElement,
-    IntoElement,
-    ParentElement, Stateful, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
-    actions, div, px,
+    IntoElement, ParentElement, Stateful, StatefulInteractiveElement, Styled, Subscription, Task,
+    WeakEntity, actions, div, px,
 };
 
 use crate::diagnostics;
@@ -528,7 +527,10 @@ impl LspStore {
         if self.missing_commands.insert((name.clone(), command)) {
             let notification = Notification::error(trf("{0} stopped", &[&name]))
                 .body(reason)
-                .action(tr("Configure…"), crate::lsp_settings::ConfigureServer { name })
+                .action(
+                    tr("Configure…"),
+                    crate::lsp_settings::ConfigureServer { name },
+                )
                 .group(NotificationGroup::LanguageServers);
             cx.emit(LspEvent::Notify(notification));
         }
@@ -537,7 +539,12 @@ impl LspStore {
 
     /// The server `key` (its index): the running one, or a new one — also in place of one that
     /// exited, failed to install, or couldn't be installed earlier (with its old documents).
-    fn ensure_server(&mut self, config: ServerConfig, key: ServerKey, cx: &mut Context<Self>) -> usize {
+    fn ensure_server(
+        &mut self,
+        config: ServerConfig,
+        key: ServerKey,
+        cx: &mut Context<Self>,
+    ) -> usize {
         match self.servers.iter().position(|server| server.key == key) {
             Some(index) if self.servers[index].status.retried_on_open() => {
                 let mut old = self.servers.remove(index);
@@ -803,7 +810,9 @@ impl LspStore {
                     Notification::error(trf("Couldn't install {0}", &[&server.key.name]))
                         .body(install_reason(reason))
                         .action(tr("Restart"), RestartStopped);
-                cx.emit(LspEvent::Notify(notification.group(NotificationGroup::LanguageServers)));
+                cx.emit(LspEvent::Notify(
+                    notification.group(NotificationGroup::LanguageServers),
+                ));
             }
             server.status = status;
             cx.notify();
@@ -975,7 +984,10 @@ impl LspStore {
             return;
         };
         server.notify_task = None;
-        let Some(status) = server.health.clone().filter(|status| status.health != Health::Ok)
+        let Some(status) = server
+            .health
+            .clone()
+            .filter(|status| status.health != Health::Ok)
         else {
             return;
         };
@@ -1108,7 +1120,9 @@ impl LspStore {
                     if params.diagnostics.is_empty() {
                         server.unopened.remove(&path);
                     } else {
-                        server.unopened.insert(path.clone(), params.diagnostics.clone());
+                        server
+                            .unopened
+                            .insert(path.clone(), params.diagnostics.clone());
                     }
                 }
                 current
@@ -1270,7 +1284,10 @@ impl LspStore {
         if let Some(editor) = self.editor_for_path(path, cx) {
             return document_server(editor.read(cx));
         }
-        let main = config::servers_for_path(&self.configs, path).first()?.name.clone();
+        let main = config::servers_for_path(&self.configs, path)
+            .first()?
+            .name
+            .clone();
         let root = self.server_root(path);
         let server = self
             .servers
@@ -2116,7 +2133,11 @@ pub fn status_item(
         Some(tooltip) => item.tooltip(ui::tooltip(tooltip, None)),
         None => item.tooltip(ui::tooltip(tr("Language Servers"), None)),
     };
-    Some(crate::lsp_status::clickable_status(item, &store.status_ui, ui))
+    Some(crate::lsp_status::clickable_status(
+        item,
+        &store.status_ui,
+        ui,
+    ))
 }
 
 /// `text` cut to `max` characters with "…".
@@ -2177,7 +2198,10 @@ mod tests {
         // Stopped in the popup: quiet.
         let stopped = Status::Stopped;
         let line = status_line(&[summary("gopls", &stopped)]).unwrap();
-        assert_eq!((line.text.as_str(), line.tone), ("gopls · Stopped", Tone::Quiet));
+        assert_eq!(
+            (line.text.as_str(), line.tone),
+            ("gopls · Stopped", Tone::Quiet)
+        );
     }
 
     #[test]

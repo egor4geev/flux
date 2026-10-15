@@ -748,8 +748,10 @@ mod tests {
         assert!(name.code);
         assert_eq!(name.enabled_by.as_deref(), Some("branch"));
         assert_eq!(name.placeholder.as_deref(), Some("branch"));
-        assert!(matches!(&spec.fields[0].kind, FieldKind::Choice((options, Some(value)))
-            if options[0].title == "In Progress" && value == "1"));
+        assert!(
+            matches!(&spec.fields[0].kind, FieldKind::Choice((options, Some(value)))
+            if options[0].title == "In Progress" && value == "1")
+        );
         assert!(matches!(spec.fields[4].kind, FieldKind::Note(_)));
         let values = Values::from(vec![
             ("branch".to_string(), "true".to_string()),

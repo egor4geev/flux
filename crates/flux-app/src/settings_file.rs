@@ -41,7 +41,9 @@ pub fn init(cx: &mut App) {
         };
         cx.defer(move |cx| {
             window
-                .update(cx, |workspace, window, cx| open(workspace, None, window, cx))
+                .update(cx, |workspace, window, cx| {
+                    open(workspace, None, window, cx)
+                })
                 .ok();
         });
     });
@@ -155,7 +157,9 @@ fn apply(old: &Settings, cx: &mut App) {
     if before.ui_style != now.ui_style {
         for window in cx.windows() {
             window
-                .update(cx, |_, window, cx| crate::ui::apply_window_style(window, cx))
+                .update(cx, |_, window, cx| {
+                    crate::ui::apply_window_style(window, cx)
+                })
                 .ok();
         }
     }
@@ -212,8 +216,9 @@ pub fn open(
     cx: &mut Context<Workspace>,
 ) {
     let Some(path) = settings::file_path(cx) else {
-        let notification = Notification::info(tr("Settings aren't saved to a file in this session"))
-            .group(NotificationGroup::General);
+        let notification =
+            Notification::info(tr("Settings aren't saved to a file in this session"))
+                .group(NotificationGroup::General);
         return workspace.notify(notification, cx);
     };
     if !path.exists() {

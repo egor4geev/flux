@@ -1663,8 +1663,17 @@ fn split_named(path: &str, positions: &[usize]) -> (String, Vec<usize>, String, 
         .iter()
         .filter_map(|&p| p.checked_sub(name_start))
         .collect();
-    let dir_positions = positions.iter().copied().filter(|&p| p < dir_chars).collect();
-    (name.to_string(), name_positions, dir.to_string(), dir_positions)
+    let dir_positions = positions
+        .iter()
+        .copied()
+        .filter(|&p| p < dir_chars)
+        .collect();
+    (
+        name.to_string(),
+        name_positions,
+        dir.to_string(),
+        dir_positions,
+    )
 }
 
 /// The file name and directory (relative, `/`-separated) for the header.

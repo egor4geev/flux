@@ -156,7 +156,10 @@ mod tests {
         let leap = LocalTime::at(951_782_400, 0);
         assert_eq!(leap.date(), "2000-02-29");
         assert_eq!(leap.day_number(), 951_782_400 / 86_400);
-        assert_eq!(moscow.day_number() + 1, LocalTime::at(1_792_047_600, 3 * 3600).day_number());
+        assert_eq!(
+            moscow.day_number() + 1,
+            LocalTime::at(1_792_047_600, 3 * 3600).day_number()
+        );
     }
 
     #[test]

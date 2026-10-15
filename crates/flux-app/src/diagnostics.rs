@@ -408,7 +408,10 @@ pub fn prepaint(
         let segments = layout.segments(text, start, end, px(0.));
         // An empty range, or one that covers only a line break: one character wide, where it
         // starts.
-        if segments.iter().all(|segment| segment.right - segment.left < px(2.)) {
+        if segments
+            .iter()
+            .all(|segment| segment.right - segment.left < px(2.))
+        {
             let line = start_line;
             let Some(index) = layout.caret_row(text, start) else {
                 continue;

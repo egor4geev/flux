@@ -5,7 +5,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("The project isn't loaded", "Проект не загружен"),
     ("Configure…", "Настроить…"),
     ("Show Log", "Показать журнал"),
-    ("Couldn't save the log of {0}", "Не удалось сохранить журнал {0}"),
+    (
+        "Couldn't save the log of {0}",
+        "Не удалось сохранить журнал {0}",
+    ),
     // The servers' popup.
     ("Start Server", "Запустить сервер"),
     ("Couldn't install: {0}", "Не удалось установить: {0}"),

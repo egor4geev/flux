@@ -81,7 +81,10 @@ pub struct ShowExitDetails {
 
 /// The official installer and Homebrew, as the Claude Code documentation gives them.
 pub const INSTALL_COMMANDS: [(&str, &str); 2] = [
-    ("Native installer", "curl -fsSL https://claude.ai/install.sh | bash"),
+    (
+        "Native installer",
+        "curl -fsSL https://claude.ai/install.sh | bash",
+    ),
     ("Homebrew", "brew install --cask claude-code"),
 ];
 
@@ -287,7 +290,9 @@ impl ClaudeStore {
 
     /// A session by its entity id (a notification's "Show").
     pub fn session(&self, id: EntityId) -> Option<&Entity<ClaudeSession>> {
-        self.sessions.iter().find(|session| session.entity_id() == id)
+        self.sessions
+            .iter()
+            .find(|session| session.entity_id() == id)
     }
 
     /// The sessions that work or wait for the user: closing the window asks about them.
@@ -867,7 +872,10 @@ mod tests {
     fn mentions_name_the_lines() {
         assert_eq!(mention("src/main.rs", None), "@src/main.rs");
         assert_eq!(mention("src/main.rs", Some((12, 12))), "@src/main.rs#L12");
-        assert_eq!(mention("src/main.rs", Some((12, 20))), "@src/main.rs#L12-20");
+        assert_eq!(
+            mention("src/main.rs", Some((12, 20))),
+            "@src/main.rs#L12-20"
+        );
     }
 
     #[test]
@@ -893,8 +901,14 @@ mod tests {
 
     #[test]
     fn shell_quoting() {
-        assert_eq!(shell_quote("/opt/homebrew/bin/claude"), "/opt/homebrew/bin/claude");
-        assert_eq!(shell_quote("/Users/me/My Tools/claude"), "'/Users/me/My Tools/claude'");
+        assert_eq!(
+            shell_quote("/opt/homebrew/bin/claude"),
+            "/opt/homebrew/bin/claude"
+        );
+        assert_eq!(
+            shell_quote("/Users/me/My Tools/claude"),
+            "'/Users/me/My Tools/claude'"
+        );
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         let cli = Cli {
             path: PathBuf::from("/opt/homebrew/bin/claude"),

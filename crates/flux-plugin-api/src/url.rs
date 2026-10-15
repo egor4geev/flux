@@ -83,7 +83,10 @@ mod tests {
     #[test]
     fn queries() {
         assert_eq!(
-            pairs(&[("client_id", "abc"), ("redirect_uri", "http://127.0.0.1:8123/cb")]),
+            pairs(&[
+                ("client_id", "abc"),
+                ("redirect_uri", "http://127.0.0.1:8123/cb")
+            ]),
             "client_id=abc&redirect_uri=http%3A%2F%2F127.0.0.1%3A8123%2Fcb"
         );
         let query = "code=x%2By&state=s+1&empty&code=second";

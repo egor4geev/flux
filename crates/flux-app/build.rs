@@ -118,7 +118,11 @@ fn emit_commit(workspace: &Path) {
 /// path is missing on every build.
 fn git_commit(workspace: &Path) -> Option<String> {
     let git = workspace.join(".git");
-    for path in [git.join("HEAD"), git.join("refs/heads"), git.join("packed-refs")] {
+    for path in [
+        git.join("HEAD"),
+        git.join("refs/heads"),
+        git.join("packed-refs"),
+    ] {
         if path.exists() {
             println!("cargo:rerun-if-changed={}", path.display());
         }

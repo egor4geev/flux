@@ -194,7 +194,11 @@ fn a_flux_tool_call_waits_for_the_host() {
                         McpReply::Respond(response) => {
                             process.respond(id, serde_json::json!({ "mcp_response": response }))
                         }
-                        McpReply::Call { id: rpc, name, arguments } => {
+                        McpReply::Call {
+                            id: rpc,
+                            name,
+                            arguments,
+                        } => {
                             call = Some((name, arguments));
                             let output = ToolOutput::text("src/main.rs:3:5: error: expected `;`");
                             process.respond(
@@ -226,7 +230,12 @@ fn a_flux_tool_call_waits_for_the_host() {
     assert_eq!(hooks_allowed, 1);
     let (name, arguments) = call.expect("the tool was called");
     assert_eq!(name, "get_diagnostics");
-    assert!(arguments["path"].as_str().unwrap().ends_with("/src/main.rs"));
+    assert!(
+        arguments["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/src/main.rs")
+    );
     let tool = session.tool("toolu_flux_diagnostics_1").unwrap();
     assert_eq!(tool.state, ToolState::Done);
     assert_eq!(
@@ -278,11 +287,16 @@ fn an_allowed_edit_asks_the_edit_hook() {
             match request {
                 Some((id, flux_claude::protocol::CliRequest::CanUseTool(_))) => {
                     let pending = session.pending(&id).cloned().unwrap();
-                    let answer = Answer::Allow { remember: Vec::new() };
+                    let answer = Answer::Allow {
+                        remember: Vec::new(),
+                    };
                     process.respond(&id, Session::response(&pending, &answer));
                     session.resolve(&id, &answer);
                 }
-                Some((id, flux_claude::protocol::CliRequest::HookCallback { callback_id, input })) => {
+                Some((
+                    id,
+                    flux_claude::protocol::CliRequest::HookCallback { callback_id, input },
+                )) => {
                     assert_eq!(callback_id, flux_claude::session::EDIT_HOOK);
                     hook_input = Some(input);
                     process.respond(

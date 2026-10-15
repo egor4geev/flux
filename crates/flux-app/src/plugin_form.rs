@@ -221,7 +221,8 @@ impl FormDialog {
             .fields
             .into_iter()
             .map(|field| {
-                let placeholder: SharedString = field.placeholder.clone().unwrap_or_default().into();
+                let placeholder: SharedString =
+                    field.placeholder.clone().unwrap_or_default().into();
                 let code = field.code;
                 let input = match field.kind {
                     FieldKind::Text(text) => Input::Text(cx.new(|cx| {
@@ -284,9 +285,9 @@ impl FormDialog {
         let Some(key) = &self.fields[index].enabled_by else {
             return true;
         };
-        self.fields.iter().any(|field| {
-            field.key == *key && matches!(field.input, Input::Toggle { on: true, .. })
-        })
+        self.fields
+            .iter()
+            .any(|field| field.key == *key && matches!(field.input, Input::Toggle { on: true, .. }))
     }
 
     fn field_focus(&self, index: usize, cx: &App) -> Option<FocusHandle> {
@@ -333,9 +334,7 @@ impl FormDialog {
     }
 
     fn focus_next(&mut self, _: &FocusNext, window: &mut Window, cx: &mut Context<Self>) {
-        let start = self
-            .focused_field(window, cx)
-            .map_or(0, |index| index + 1);
+        let start = self.focused_field(window, cx).map_or(0, |index| index + 1);
         self.focus_field(start, true, window, cx);
     }
 
@@ -434,7 +433,12 @@ impl FormDialog {
         cx.notify();
     }
 
-    fn close_menu(&mut self, menu: &Entity<ContextMenu>, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_menu(
+        &mut self,
+        menu: &Entity<ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(open) = self.menu.take_if(|open| open.menu == *menu) else {
             return;
         };
@@ -450,12 +454,13 @@ impl FormDialog {
 
     fn choose(&mut self, action: &ChooseOption, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(Field {
-            input: Input::Choice {
-                options,
-                selected,
-                focus,
-                ..
-            },
+            input:
+                Input::Choice {
+                    options,
+                    selected,
+                    focus,
+                    ..
+                },
             ..
         }) = self.fields.get_mut(action.field)
             && action.option < options.len()
@@ -605,16 +610,17 @@ impl FormDialog {
                 .into_any_element(),
         };
         // A disabled field: dimmed, and the mouse doesn't reach it.
-        let control = div()
-            .relative()
-            .flex_1()
-            .min_w_0()
-            .child(control)
-            .when(!enabled, |control| {
-                control
-                    .opacity(0.45)
-                    .child(div().absolute().inset_0().occlude())
-            });
+        let control =
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .child(control)
+                .when(!enabled, |control| {
+                    control
+                        .opacity(0.45)
+                        .child(div().absolute().inset_0().occlude())
+                });
         let label = match &field.input {
             Input::Text(_) | Input::Multiline(_) | Input::Lines(_) | Input::Choice { .. } => {
                 field.label.clone()
@@ -700,7 +706,9 @@ impl Render for FormDialog {
         let ui = Theme::ui(cx);
         if self.focus_first && self.focus_handle.is_focused(window) {
             self.focus_first = false;
-            cx.defer_in(window, |this, window, cx| this.focus_field(0, true, window, cx));
+            cx.defer_in(window, |this, window, cx| {
+                this.focus_field(0, true, window, cx)
+            });
         }
         // The label column shows when a field to its right has a label.
         let labels = self.fields.iter().any(|field| {
@@ -761,9 +769,11 @@ impl Render for FormDialog {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(self.title.clone()),
                             )
-                            .children(self.message.clone().map(|message| {
-                                div().text_color(ui.text_muted).child(message)
-                            })),
+                            .children(
+                                self.message
+                                    .clone()
+                                    .map(|message| div().text_color(ui.text_muted).child(message)),
+                            ),
                     ),
             )
             .when(!fields.is_empty(), |dialog| {

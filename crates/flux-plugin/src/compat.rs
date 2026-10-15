@@ -438,8 +438,14 @@ mod tests {
 
     #[test]
     fn the_api_of_an_import() {
-        assert_eq!(api_of_import("flux:plugin/log@0.2.0").as_deref(), Some("0.2"));
-        assert_eq!(api_of_import("flux:plugin/ui@0.3.1").as_deref(), Some("0.3"));
+        assert_eq!(
+            api_of_import("flux:plugin/log@0.2.0").as_deref(),
+            Some("0.2")
+        );
+        assert_eq!(
+            api_of_import("flux:plugin/ui@0.3.1").as_deref(),
+            Some("0.3")
+        );
         assert_eq!(api_of_import("wasi:cli/stdout@0.2.6"), None);
         assert_eq!(api_of_import("flux:plugin/log"), None);
     }

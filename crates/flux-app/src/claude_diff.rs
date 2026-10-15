@@ -52,8 +52,7 @@ pub fn open(
         proposed.clone(),
     );
     let git = workspace.git().clone();
-    let view = cx.new(|cx| {
-        DiffView::proposal(path, original, proposed, session, request, git, window, cx)
-    });
+    let view = cx
+        .new(|cx| DiffView::proposal(path, original, proposed, session, request, git, window, cx));
     workspace.add_diff_view_tab(view, focus, window, cx);
 }

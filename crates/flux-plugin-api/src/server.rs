@@ -74,7 +74,11 @@ pub fn respond_html(request: u64, status: u16, html: &str) {
 pub fn respond_json<T: Serialize + ?Sized>(request: u64, status: u16, value: &T) {
     match serde_json::to_vec(value) {
         Ok(body) => respond(request, status, "application/json", body),
-        Err(err) => respond_text(request, 500, &format!("The answer doesn't serialize: {err}")),
+        Err(err) => respond_text(
+            request,
+            500,
+            &format!("The answer doesn't serialize: {err}"),
+        ),
     }
 }
 

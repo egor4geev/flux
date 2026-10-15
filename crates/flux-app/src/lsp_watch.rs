@@ -73,7 +73,10 @@ impl WatchState {
                 Ok(watcher) => {
                     self.watchers.insert(root, watcher);
                 }
-                Err(err) => eprintln!("flux: can't watch {} for the language servers: {err}", root.display()),
+                Err(err) => eprintln!(
+                    "flux: can't watch {} for the language servers: {err}",
+                    root.display()
+                ),
             }
         }
     }
@@ -133,9 +136,13 @@ fn send(servers: &[LanguageServer], paths: BTreeSet<PathBuf>) {
         // Any kind of change: a path no server watches isn't looked at.
         .filter(|path| {
             servers.iter().any(|server| {
-                [FileChangeType::CHANGED, FileChangeType::CREATED, FileChangeType::DELETED]
-                    .into_iter()
-                    .any(|change| server.watches(path, change))
+                [
+                    FileChangeType::CHANGED,
+                    FileChangeType::CREATED,
+                    FileChangeType::DELETED,
+                ]
+                .into_iter()
+                .any(|change| server.watches(path, change))
             })
         })
         .filter_map(|path| classify(&path, now).map(|change| (path, change)))
@@ -162,10 +169,7 @@ fn classify(path: &Path, now: SystemTime) -> Option<FileChangeType> {
         return None;
     }
     let born = metadata.created().ok();
-    let new = born.is_some_and(|born| {
-        now.duration_since(born)
-            .map_or(true, |age| age <= NEW_FILE)
-    });
+    let new = born.is_some_and(|born| now.duration_since(born).map_or(true, |age| age <= NEW_FILE));
     Some(if new {
         FileChangeType::CREATED
     } else {

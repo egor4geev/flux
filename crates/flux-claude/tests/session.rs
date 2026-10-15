@@ -704,7 +704,10 @@ fn thoughts_with_something_between_stay_apart() {
             wire::block_stop(0),
         ],
     );
-    let thoughts: Vec<String> = thoughts(&session).into_iter().map(|(text, _)| text).collect();
+    let thoughts: Vec<String> = thoughts(&session)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect();
     assert_eq!(thoughts, ["First.", "Second."]);
 }
 
@@ -776,11 +779,19 @@ fn wire(json: &str) -> Incoming {
 /// What the CLI (2.1.287) answers a message of context only (`shouldQuery: false`), as recorded.
 fn context_taken(uuid: &str) -> Vec<Incoming> {
     vec![
-        wire(&format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"queued"}}"#)),
-        wire(&format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"started"}}"#)),
+        wire(&format!(
+            r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"queued"}}"#
+        )),
+        wire(&format!(
+            r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"started"}}"#
+        )),
         wire(r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-haiku-4-5"}"#),
-        wire(r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":16,"num_turns":0,"result":"","total_cost_usd":0}"#),
-        wire(&format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"completed"}}"#)),
+        wire(
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":16,"num_turns":0,"result":"","total_cost_usd":0}"#,
+        ),
+        wire(&format!(
+            r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"completed"}}"#
+        )),
     ]
 }
 
@@ -789,11 +800,19 @@ fn a_shell_command_s_records_are_context_not_a_turn() {
     use flux_claude::Change;
     use flux_claude::session::ShellState;
     let mut session = Session::new(PathBuf::from("/project"));
-    feed(&mut session, wire(r#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#));
+    feed(
+        &mut session,
+        wire(r#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#),
+    );
     let (id, _) = session.start_shell("cargo test".into());
     session.shell_output(id, "running 3 tests\n");
     session.shell_output(id, "10%\r50%\r100%\n");
-    session.shell_ended(id, ShellState::Done, Some(101), Some(std::time::Duration::from_secs(2)));
+    session.shell_ended(
+        id,
+        ShellState::Done,
+        Some(101),
+        Some(std::time::Duration::from_secs(2)),
+    );
     session.shell_delivered(id, 2);
     let mut changes = Vec::new();
     let mut frames = vec![wire(
@@ -801,7 +820,9 @@ fn a_shell_command_s_records_are_context_not_a_turn() {
     )];
     frames.extend(context_taken("in"));
     frames.extend(context_taken("out"));
-    frames.push(wire(r#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#));
+    frames.push(wire(
+        r#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#,
+    ));
     for frame in frames {
         changes.extend(session.apply(&ProcessEvent::Frame(Box::new(frame))));
     }
@@ -809,22 +830,29 @@ fn a_shell_command_s_records_are_context_not_a_turn() {
     assert_eq!(turn_ends(&session), 0);
     assert_eq!(session.status, Status::Idle);
     assert!(
-        !changes
-            .iter()
-            .any(|change| matches!(change, Change::Status | Change::Idle | Change::TurnFinished { .. })),
+        !changes.iter().any(|change| matches!(
+            change,
+            Change::Status | Change::Idle | Change::TurnFinished { .. }
+        )),
         "{changes:?}"
     );
     let EntryKind::Shell(shell) = &session.entries[0].kind else {
         panic!("{:?}", session.entries[0].kind);
     };
     assert_eq!(shell.output, "running 3 tests\n100%\n");
-    assert_eq!((shell.state, shell.exit_code, shell.delivered), (ShellState::Done, Some(101), true));
+    assert_eq!(
+        (shell.state, shell.exit_code, shell.delivered),
+        (ShellState::Done, Some(101), true)
+    );
 
     // The next message is a turn as always.
-    session.push_user(Some("u1".into()), &UserInput {
-        text: "Fix the failing test".into(),
-        ..UserInput::default()
-    });
+    session.push_user(
+        Some("u1".into()),
+        &UserInput {
+            text: "Fix the failing test".into(),
+            ..UserInput::default()
+        },
+    );
     let mut changes = Vec::new();
     for frame in [
         r#"{"type":"system","subtype":"session_state_changed","state":"running"}"#,

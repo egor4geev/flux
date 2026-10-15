@@ -99,9 +99,9 @@ pub fn init(cx: &mut App) {
 /// the rows and the notifications ("Configure…" is [`ConfigureServer`], handled by
 /// [`crate::lsp_settings`] for any window).
 pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
-    root.on_action(cx.listener(|workspace, _: &ShowServers, window, cx| {
-        toggle(workspace, window, cx)
-    }))
+    root.on_action(
+        cx.listener(|workspace, _: &ShowServers, window, cx| toggle(workspace, window, cx)),
+    )
     .on_action(cx.listener(|workspace, action: &RestartServer, _, cx| {
         let key = action.0.clone();
         workspace
@@ -110,11 +110,15 @@ pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
     }))
     .on_action(cx.listener(|workspace, action: &StopServer, _, cx| {
         let key = action.0.clone();
-        workspace.lsp.update(cx, |store, cx| store.stop_key(&key, cx))
+        workspace
+            .lsp
+            .update(cx, |store, cx| store.stop_key(&key, cx))
     }))
-    .on_action(cx.listener(|workspace, action: &ShowServerLog, window, cx| {
-        show_log(workspace, &action.0, window, cx)
-    }))
+    .on_action(
+        cx.listener(|workspace, action: &ShowServerLog, window, cx| {
+            show_log(workspace, &action.0, window, cx)
+        }),
+    )
 }
 
 // --- The status item ---
@@ -431,10 +435,9 @@ impl RowState {
             RowState::Failed(reason) => (trf("Stopped: {0}", &[reason]), Tone::Error),
             RowState::NotInstalled => (tr("Not installed").to_string(), Tone::Quiet),
             RowState::CannotInstall(reason) => (reason.clone(), Tone::Quiet),
-            RowState::InstallFailed(reason) => (
-                trf("Couldn't install: {0}", &[reason]),
-                Tone::Error,
-            ),
+            RowState::InstallFailed(reason) => {
+                (trf("Couldn't install: {0}", &[reason]), Tone::Error)
+            }
         }
     }
 
@@ -542,12 +545,7 @@ impl ServersPopup {
     }
 
     /// ⌘, and ⌘L: Configure… and Show Log of the selected server.
-    fn act_on_selected(
-        &mut self,
-        log: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn act_on_selected(&mut self, log: bool, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.rows(cx);
         let Some(row) = rows.get(self.selected) else {
             return;
@@ -584,7 +582,13 @@ impl ServersPopup {
         window.defer(cx, move |window, cx| window.dispatch_action(action, cx));
     }
 
-    fn render_row(&self, index: usize, row: &ServerRow, roots: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_row(
+        &self,
+        index: usize,
+        row: &ServerRow,
+        roots: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let ui = Theme::ui(cx);
         let selected = self.selected == index;
         let (state, tone) = row.state.describe(row.documents);
@@ -754,7 +758,14 @@ impl ServersPopup {
                     .child(state_line)
                     .children(cause),
             )
-            .child(div().flex_none().flex().items_center().gap_0p5().children(buttons))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .children(buttons),
+            )
     }
 
     /// "Language Server Settings…": Settings → Language Servers.
@@ -777,9 +788,9 @@ impl ServersPopup {
                     this.select(index, cx)
                 }
             }))
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                this.open_settings(window, cx)
-            }))
+            .on_click(
+                cx.listener(|this, _: &ClickEvent, window, cx| this.open_settings(window, cx)),
+            )
             .child(
                 div()
                     .flex_none()
@@ -812,9 +823,10 @@ impl Render for ServersPopup {
         self.selected = self.selected.min(rows.len());
         // Servers of several roots (files from several repositories without a project): each
         // shows its root.
-        let roots = rows
-            .iter()
-            .any(|row| rows.first().is_some_and(|first| first.key.root != row.key.root));
+        let roots = rows.iter().any(|row| {
+            rows.first()
+                .is_some_and(|first| first.key.root != row.key.root)
+        });
         let items: Vec<AnyElement> = rows
             .iter()
             .enumerate()
@@ -936,7 +948,10 @@ mod tests {
             &status,
             Some("unclosed table, expected `]` (Cargo.toml:5:14)".into()),
         );
-        assert_eq!(card.title.as_ref(), "rust-analyzer: Failed to load workspaces.");
+        assert_eq!(
+            card.title.as_ref(),
+            "rust-analyzer: Failed to load workspaces."
+        );
         assert_eq!(
             card.body.as_ref().map(|body| body.as_ref()),
             Some("unclosed table, expected `]` (Cargo.toml:5:14)")

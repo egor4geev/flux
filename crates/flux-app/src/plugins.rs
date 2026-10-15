@@ -37,10 +37,10 @@ use flux_plugin::api::dialogs::{
 };
 use flux_plugin::api::editors::TextEdit;
 use flux_plugin::api::events::{Event, UiEvent};
-use flux_plugin::api::settings::SettingStatus;
 use flux_plugin::api::notifications::{
     Notification as ApiNotification, NotificationKind as ApiKind, Progress as ApiProgress,
 };
+use flux_plugin::api::settings::SettingStatus;
 use flux_plugin::api::types::{
     CommandContext, CommandSource, EditorInfo, Position, Range as ApiRange,
 };
@@ -963,10 +963,15 @@ impl PluginStore {
 
     /// The problems the plugins published for files none of `open` (canonical paths) is: the
     /// file and its problems (several plugins' together, each with its source).
-    pub(crate) fn published_elsewhere(&self, open: &[PathBuf]) -> Vec<(PathBuf, Vec<ApiDiagnostic>)> {
+    pub(crate) fn published_elsewhere(
+        &self,
+        open: &[PathBuf],
+    ) -> Vec<(PathBuf, Vec<ApiDiagnostic>)> {
         let mut files: Vec<(PathBuf, Vec<ApiDiagnostic>)> = Vec::new();
         for (plugin, published) in &self.published {
-            let name = self.plugin(plugin).map_or(plugin.to_string(), |state| state.name().to_string());
+            let name = self
+                .plugin(plugin)
+                .map_or(plugin.to_string(), |state| state.name().to_string());
             for (path, diagnostics) in published {
                 if open.contains(&crate::navigation::canonical(path)) {
                     continue;
@@ -1008,7 +1013,11 @@ impl PluginStore {
         let source = self
             .plugin(plugin)
             .map_or(plugin.to_string(), |state| state.name().to_string());
-        let target = editor.read(cx).document.path().map(crate::navigation::canonical);
+        let target = editor
+            .read(cx)
+            .document
+            .path()
+            .map(crate::navigation::canonical);
         let published = target.and_then(|target| {
             self.published
                 .get(plugin)?
@@ -1035,7 +1044,11 @@ impl PluginStore {
     }
 
     /// The problems of `paths` changed: the plugins hear of them together, a moment later.
-    fn diagnostics_changed(&mut self, paths: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
+    fn diagnostics_changed(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         if self.instances.is_empty() {
             return;
         }
@@ -1589,7 +1602,14 @@ impl PluginStore {
                 ToolWindowLocation::Editor => Chrome::Tab,
             };
             let view = cx.new(|cx| {
-                PluginView::new(plugin.clone(), window.clone(), title.clone(), width, chrome, cx)
+                PluginView::new(
+                    plugin.clone(),
+                    window.clone(),
+                    title.clone(),
+                    width,
+                    chrome,
+                    cx,
+                )
             });
             let subscription = cx.subscribe(&view, move |this, _, event, cx| {
                 this.on_view_event(key, event, cx)
@@ -2792,20 +2812,38 @@ mod tests {
             details: SharedString::default(),
         };
         // Turned on elsewhere: it starts here too; turned off: it stops.
-        assert_eq!(follow(&PluginStatus::Disabled, true, true, false), Follow::Start);
-        assert_eq!(follow(&PluginStatus::Running, false, true, false), Follow::TurnOff);
+        assert_eq!(
+            follow(&PluginStatus::Disabled, true, true, false),
+            Follow::Start
+        );
+        assert_eq!(
+            follow(&PluginStatus::Running, false, true, false),
+            Follow::TurnOff
+        );
         assert_eq!(follow(&stopped, false, true, false), Follow::TurnOff);
         // A new version replaces the running one; a plugin that stopped by itself stays stopped.
-        assert_eq!(follow(&PluginStatus::Running, true, true, true), Follow::Start);
-        assert_eq!(follow(&PluginStatus::Running, true, true, false), Follow::Keep);
+        assert_eq!(
+            follow(&PluginStatus::Running, true, true, true),
+            Follow::Start
+        );
+        assert_eq!(
+            follow(&PluginStatus::Running, true, true, false),
+            Follow::Keep
+        );
         assert_eq!(follow(&stopped, true, true, false), Follow::Keep);
         // A plugin that can't run doesn't start, whatever the settings say.
-        assert_eq!(follow(&PluginStatus::Disabled, true, false, false), Follow::Keep);
+        assert_eq!(
+            follow(&PluginStatus::Disabled, true, false, false),
+            Follow::Keep
+        );
         assert_eq!(
             follow(&PluginStatus::Unavailable("api".into()), true, false, true),
             Follow::Keep
         );
-        assert_eq!(follow(&PluginStatus::Disabled, false, true, true), Follow::Keep);
+        assert_eq!(
+            follow(&PluginStatus::Disabled, false, true, true),
+            Follow::Keep
+        );
     }
 
     fn position(line: u32, column: u32) -> Position {

@@ -129,16 +129,19 @@ pub(crate) fn close(
 /// The plugin hears when its terminal's command ends and when the pane goes away.
 fn watch(view: &Entity<TerminalView>, cx: &mut Context<Workspace>) {
     let id = view.entity_id().as_u64();
-    cx.subscribe(view, move |workspace, view, event: &TerminalViewEvent, cx| {
-        if let TerminalViewEvent::ProcessEnded(code) = event
-            && let Some(plugin) = view.read(cx).plugin.clone()
-        {
-            workspace
-                .plugins
-                .read(cx)
-                .send_to(&plugin, Event::TerminalExited((id, *code)));
-        }
-    })
+    cx.subscribe(
+        view,
+        move |workspace, view, event: &TerminalViewEvent, cx| {
+            if let TerminalViewEvent::ProcessEnded(code) = event
+                && let Some(plugin) = view.read(cx).plugin.clone()
+            {
+                workspace
+                    .plugins
+                    .read(cx)
+                    .send_to(&plugin, Event::TerminalExited((id, *code)));
+            }
+        },
+    )
     .detach();
     cx.observe_release(view, move |workspace, view: &mut TerminalView, cx| {
         if let Some(plugin) = view.plugin.take() {
@@ -235,7 +238,10 @@ mod tests {
         let args = ["test".to_string(), "--all".to_string()];
         let (shell, argv) = through_login_shell("/bin/zsh", "cargo", &args);
         assert_eq!(shell, "/bin/zsh");
-        assert_eq!(argv, ["-l", "-c", "exec \"$0\" \"$@\"", "cargo", "test", "--all"]);
+        assert_eq!(
+            argv,
+            ["-l", "-c", "exec \"$0\" \"$@\"", "cargo", "test", "--all"]
+        );
         let (shell, argv) = through_login_shell("/opt/homebrew/bin/fish", "npm", &[]);
         assert_eq!(shell, "/opt/homebrew/bin/fish");
         assert_eq!(argv, ["-l", "-c", "exec $argv", "npm"]);
@@ -247,7 +253,10 @@ mod tests {
     #[test]
     fn the_exit_code_survives_the_login_shell() {
         let (shell, argv) = through_login_shell("/bin/sh", "sh", &["-c".into(), "exit 3".into()]);
-        let status = std::process::Command::new(shell).args(argv).status().unwrap();
+        let status = std::process::Command::new(shell)
+            .args(argv)
+            .status()
+            .unwrap();
         assert_eq!(status.code(), Some(3));
     }
 
@@ -257,7 +266,10 @@ mod tests {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         assert_eq!(working_dir(Some(&root), None), Ok(Some(root.clone())));
         assert_eq!(working_dir(Some(&root), Some("  ")), Ok(Some(root.clone())));
-        assert_eq!(working_dir(Some(&root), Some("sub")), Ok(Some(root.join("sub"))));
+        assert_eq!(
+            working_dir(Some(&root), Some("sub")),
+            Ok(Some(root.join("sub")))
+        );
         assert!(working_dir(Some(&root), Some("missing")).is_err());
         assert!(working_dir(None, Some("sub")).is_err());
         assert_eq!(working_dir(None, None), Ok(None));

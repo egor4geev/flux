@@ -11,13 +11,34 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Approve, and accept edits", "Одобрить и принимать правки"),
     ("Keep Planning", "Планировать дальше"),
     ("Keep Planning…", "Планировать дальше…"),
-    ("Accept all edits in this session", "Принимать все правки в этой сессии"),
-    ("Allow, and accept edits in this session", "Разрешить и принимать правки в этой сессии"),
-    ("Allow, and stop asking in this session", "Разрешить и больше не спрашивать в этой сессии"),
-    ("Allow, and switch to plan mode", "Разрешить и перейти в режим плана"),
-    ("Allow, and don't ask again for {0} {1}", "Разрешить и больше не спрашивать: {0} {1}"),
-    ("Accept, and don't ask again for {0} {1}", "Принять и больше не спрашивать: {0} {1}"),
-    ("Allow, and allow access to {0} {1}", "Разрешить и открыть доступ к {0} {1}"),
+    (
+        "Accept all edits in this session",
+        "Принимать все правки в этой сессии",
+    ),
+    (
+        "Allow, and accept edits in this session",
+        "Разрешить и принимать правки в этой сессии",
+    ),
+    (
+        "Allow, and stop asking in this session",
+        "Разрешить и больше не спрашивать в этой сессии",
+    ),
+    (
+        "Allow, and switch to plan mode",
+        "Разрешить и перейти в режим плана",
+    ),
+    (
+        "Allow, and don't ask again for {0} {1}",
+        "Разрешить и больше не спрашивать: {0} {1}",
+    ),
+    (
+        "Accept, and don't ask again for {0} {1}",
+        "Принять и больше не спрашивать: {0} {1}",
+    ),
+    (
+        "Allow, and allow access to {0} {1}",
+        "Разрешить и открыть доступ к {0} {1}",
+    ),
     ("in this session", "в этой сессии"),
     ("in this project", "в этом проекте"),
     ("in this project, for everyone", "в этом проекте для всех"),
@@ -44,12 +65,24 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("… {0} more changed lines", "… ещё изменённых строк: {0}"),
     ("The edit doesn't apply: {0}", "Правка не применяется: {0}"),
     ("The file doesn't exist", "Файла нет"),
-    ("The edit has no text to replace", "В правке нет заменяемого текста"),
-    ("The text to replace isn't in the file any more", "Заменяемого текста в файле больше нет"),
-    ("The text to replace occurs more than once", "Заменяемый текст встречается больше одного раза"),
+    (
+        "The edit has no text to replace",
+        "В правке нет заменяемого текста",
+    ),
+    (
+        "The text to replace isn't in the file any more",
+        "Заменяемого текста в файле больше нет",
+    ),
+    (
+        "The text to replace occurs more than once",
+        "Заменяемый текст встречается больше одного раза",
+    ),
     ("Claude's plan", "План Claude"),
     ("What should change in the plan?", "Что изменить в плане?"),
-    ("Tell Claude what to do instead (optional)", "Скажите Claude, что делать вместо этого (необязательно)"),
+    (
+        "Tell Claude what to do instead (optional)",
+        "Скажите Claude, что делать вместо этого (необязательно)",
+    ),
     ("Claude asks", "Claude спрашивает"),
     ("{0} questions", "Вопросов: {0}"),
     ("Several answers", "Несколько ответов"),
@@ -66,9 +99,18 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Stop", "Остановить"),
     // The proposal tab (`diff_view.rs`).
     ("{0} — Claude", "{0} — Claude"),
-    ("Claude proposes changes to {0}", "Claude предлагает изменить {0}"),
-    ("Edit the right side or reject changes with the arrows", "Правьте справа или отклоняйте изменения стрелками"),
-    ("Accept applies your version of the right side", "«Принять» применит вашу версию правой стороны"),
+    (
+        "Claude proposes changes to {0}",
+        "Claude предлагает изменить {0}",
+    ),
+    (
+        "Edit the right side or reject changes with the arrows",
+        "Правьте справа или отклоняйте изменения стрелками",
+    ),
+    (
+        "Accept applies your version of the right side",
+        "«Принять» применит вашу версию правой стороны",
+    ),
     ("Current version", "Текущая версия"),
     ("Proposed by Claude", "Предлагает Claude"),
     ("Reject This Change", "Отклонить это изменение"),

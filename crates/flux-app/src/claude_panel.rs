@@ -155,15 +155,19 @@ impl ClaudePanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subscriptions = vec![cx.subscribe(&store, |this, _, event: &ClaudeStoreEvent, cx| {
-            // Ready now, or the last session closed: the recent ones are read again.
-            if matches!(event, ClaudeStoreEvent::Changed | ClaudeStoreEvent::SessionRemoved(_))
-                && this.chats.is_empty()
-            {
-                this.refresh_recent(cx);
-            }
-            cx.notify()
-        })];
+        let subscriptions = vec![
+            cx.subscribe(&store, |this, _, event: &ClaudeStoreEvent, cx| {
+                // Ready now, or the last session closed: the recent ones are read again.
+                if matches!(
+                    event,
+                    ClaudeStoreEvent::Changed | ClaudeStoreEvent::SessionRemoved(_)
+                ) && this.chats.is_empty()
+                {
+                    this.refresh_recent(cx);
+                }
+                cx.notify()
+            }),
+        ];
         Self {
             store,
             chats: Vec::new(),
@@ -344,7 +348,12 @@ impl ClaudePanel {
     }
 
     /// ⋯ in the header: the sessions and the settings.
-    fn open_more_menu(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_more_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // The actions go to the active session, wherever the focus was.
         self.focus(window, cx);
         let has_chat = !self.chats.is_empty();
@@ -363,7 +372,9 @@ impl ClaudePanel {
                     .entry(tr("Close Session"), claude::CloseSession);
             }
             if !ready {
-                menu = menu.separator().entry(tr("Check Again"), claude::CheckAgain);
+                menu = menu
+                    .separator()
+                    .entry(tr("Check Again"), claude::CheckAgain);
             }
             menu.separator()
                 .entry(tr("Claude Code Settings…"), claude::OpenSettings)
@@ -427,7 +438,12 @@ impl ClaudePanel {
     }
 
     /// Closes the menu (if it is still the same one); Esc in it returns focus to the chat.
-    fn close_menu(&mut self, menu: &Entity<ContextMenu>, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_menu(
+        &mut self,
+        menu: &Entity<ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.menu.as_ref().is_none_or(|open| open.menu != *menu) {
             return;
         }
@@ -457,7 +473,11 @@ impl ClaudePanel {
         self.set_drop_index(Some(index + usize::from(after)), cx);
     }
 
-    fn drag_over_header(&mut self, event: &DragMoveEvent<DraggedClaudeChat>, cx: &mut Context<Self>) {
+    fn drag_over_header(
+        &mut self,
+        event: &DragMoveEvent<DraggedClaudeChat>,
+        cx: &mut Context<Self>,
+    ) {
         if !event.bounds.contains(&event.event.position) {
             self.set_drop_index(None, cx);
         }
@@ -479,7 +499,12 @@ impl ClaudePanel {
 
     /// A pill dropped on the header: one of ours moves to its new place; a chat from the editor's
     /// tabs is handed over by the window ([`ClaudePanelEvent::MoveToPanel`]).
-    fn drop_tab(&mut self, dragged: &DraggedClaudeChat, window: &mut Window, cx: &mut Context<Self>) {
+    fn drop_tab(
+        &mut self,
+        dragged: &DraggedClaudeChat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let index = self.drop_index.take().unwrap_or(self.chats.len());
         cx.notify();
         let chat = dragged.chat.clone();
@@ -557,9 +582,11 @@ impl ClaudePanel {
             .id("claude-tabs-tail")
             .flex_1()
             .h_full()
-            .on_drag_move(cx.listener(
-                |this, event: &DragMoveEvent<DraggedClaudeChat>, _, cx| this.drag_over_tail(event, cx),
-            ));
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedClaudeChat>, _, cx| {
+                    this.drag_over_tail(event, cx)
+                }),
+            );
         // The project's saved sessions, in a popup under the button (as Chat History of JetBrains
         // AI Assistant).
         let history = ready.then(|| {
@@ -599,14 +626,16 @@ impl ClaudePanel {
             .flex()
             .items_center()
             .gap_0p5()
-            .on_drag_move(cx.listener(
-                |this, event: &DragMoveEvent<DraggedClaudeChat>, _, cx| {
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedClaudeChat>, _, cx| {
                     this.drag_over_header(event, cx)
-                },
-            ))
-            .on_drop(cx.listener(|this, dragged: &DraggedClaudeChat, window, cx| {
-                this.drop_tab(dragged, window, cx)
-            }))
+                }),
+            )
+            .on_drop(
+                cx.listener(|this, dragged: &DraggedClaudeChat, window, cx| {
+                    this.drop_tab(dragged, window, cx)
+                }),
+            )
             .children(title)
             .children(strip)
             .children(sessions)
@@ -782,7 +811,9 @@ impl ClaudePanel {
                     this.drag_over_tab(index, event, cx)
                 },
             ))
-            .when(drop_index == Some(index), |tab| tab.child(drop_marker(false, ui)))
+            .when(drop_index == Some(index), |tab| {
+                tab.child(drop_marker(false, ui))
+            })
             .when(
                 drop_index == Some(self.chats.len()) && index + 1 == self.chats.len(),
                 |tab| tab.child(drop_marker(true, ui)),
@@ -842,14 +873,16 @@ impl ClaudePanel {
                 .text_color(ui.text_muted)
                 .child(text)
         };
-        let action_button = |id: &'static str, label: &'static str, primary: bool, action: Box<dyn Action>| {
-            let button = if primary {
-                ui::primary_button(id, label, true, ui)
-            } else {
-                ui::text_button(id, label, false, ui)
+        let action_button =
+            |id: &'static str, label: &'static str, primary: bool, action: Box<dyn Action>| {
+                let button = if primary {
+                    ui::primary_button(id, label, true, ui)
+                } else {
+                    ui::text_button(id, label, false, ui)
+                };
+                button
+                    .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
             };
-            button.on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
-        };
         let content = match store.cli() {
             CliState::Checking => column
                 .child(spinner_dot(ui))
@@ -1047,16 +1080,20 @@ impl ClaudePanel {
                             .flex_none()
                             .text_size(px(theme::TEXT_XS))
                             .text_color(ui.dim)
-                            .child(claude_history::when(now, claude_history::seconds(saved.modified))),
+                            .child(claude_history::when(
+                                now,
+                                claude_history::seconds(saved.modified),
+                            )),
                     )
             });
-        let show_all = ui::text_button("claude-recent-all", tr("Show All…"), false, ui).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|_, event: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-                cx.emit(ClaudePanelEvent::ShowHistory(under(event.position)))
-            }),
-        );
+        let show_all = ui::text_button("claude-recent-all", tr("Show All…"), false, ui)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(ClaudePanelEvent::ShowHistory(under(event.position)))
+                }),
+            );
         Some(
             div()
                 .w_full()
@@ -1086,7 +1123,12 @@ fn under(position: Point<Pixels>) -> Point<Pixels> {
 }
 
 /// An install option: its name, the command (code font), and "Type in Terminal".
-fn install_option(index: usize, title: &'static str, command: &'static str, ui: UiColors) -> impl IntoElement {
+fn install_option(
+    index: usize,
+    title: &'static str,
+    command: &'static str,
+    ui: UiColors,
+) -> impl IntoElement {
     div()
         .w_full()
         .p_2p5()
@@ -1246,18 +1288,24 @@ impl Render for ClaudePanel {
             .on_action(cx.listener(|this, action: &ActivateSession, window, cx| {
                 this.activate(action.0, window, cx)
             }))
-            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
-                // The handle sits in the gap to the left of the edge.
-                let width = f32::from(event.bounds.right() - event.event.position.x)
-                    - ui::resize_handle_center(ui::style(cx));
-                this.width.set(width);
-                this.resizing = true;
-                cx.notify();
-            }))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
+                    // The handle sits in the gap to the left of the edge.
+                    let width = f32::from(event.bounds.right() - event.event.position.x)
+                        - ui::resize_handle_center(ui::style(cx));
+                    this.width.set(width);
+                    this.resizing = true;
+                    cx.notify();
+                }),
+            )
             .child(header)
             .child(ui::divider(ui).mx(px(GAP)))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
-            .child(resize_handle(self.resizing, ui::resize_handle_center(ui::style(cx)), ui))
+            .child(resize_handle(
+                self.resizing,
+                ui::resize_handle_center(ui::style(cx)),
+                ui,
+            ))
             .children(
                 self.menu
                     .as_ref()

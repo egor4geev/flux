@@ -95,7 +95,9 @@ pub(crate) fn window_call(
             .plugins
             .update(cx, |store, cx| store.clear_diagnostics(plugin, cx)),
         WindowCall::OpenUrl(url) => open_url(url, cx),
-        WindowCall::CopyText(text) => cx.write_to_clipboard(ClipboardItem::new_string(text.clone())),
+        WindowCall::CopyText(text) => {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+        }
         // API 0.3 (part 10.3).
         WindowCall::OpenSettings => crate::plugin_settings::open(workspace, plugin, window, cx),
         WindowCall::GitBranches(root) => {
@@ -182,7 +184,9 @@ fn close_editor(
         return Err(tr("The document is closed").into());
     };
     if editor.read(cx).document.is_modified() {
-        return Err(tr("The document has unsaved changes: they are the user's to decide about").into());
+        return Err(
+            tr("The document has unsaved changes: they are the user's to decide about").into(),
+        );
     }
     workspace.remove_tab(&editor, window, cx);
     // A working copy a diff opened has no tab of its own: it stays with the diff.
@@ -568,7 +572,10 @@ mod tests {
         assert_eq!(change_kind(FileStatus::Untracked), ChangeKind::Untracked);
         assert_eq!(change_kind(FileStatus::Conflicted), ChangeKind::Conflicted);
         assert_eq!(operation_name(RepoState::Normal), None);
-        assert_eq!(operation_name(RepoState::CherryPicking), Some("cherry-pick"));
+        assert_eq!(
+            operation_name(RepoState::CherryPicking),
+            Some("cherry-pick")
+        );
     }
 
     #[test]
@@ -590,7 +597,11 @@ mod tests {
         assert_eq!(text.slice(items[1].range.clone()).to_string(), "é() {}");
         assert_eq!(items[0].source.as_deref(), Some("Linter"));
         assert_eq!(items[1].source.as_deref(), Some("lint"));
-        assert_eq!(items[2].source.as_deref(), Some("Linter"), "a blank source is none");
+        assert_eq!(
+            items[2].source.as_deref(),
+            Some("Linter"),
+            "a blank source is none"
+        );
         assert_eq!(items[2].range, text.len_chars()..text.len_chars());
         assert_eq!(items[0].severity, Severity::Warning);
         assert_eq!(items[0].code.as_deref(), Some("W1"));
@@ -626,16 +637,25 @@ mod tests {
     #[test]
     fn files_merge_their_problems() {
         let mut files = Vec::new();
-        merge(&mut files, Path::new("/p/a.rs"), vec![problem(at(0, 0), at(0, 1), None)]);
+        merge(
+            &mut files,
+            Path::new("/p/a.rs"),
+            vec![problem(at(0, 0), at(0, 1), None)],
+        );
         merge(&mut files, Path::new("/p/b.rs"), Vec::new());
-        merge(&mut files, Path::new("/p/a.rs"), vec![problem(at(1, 0), at(1, 1), None)]);
+        merge(
+            &mut files,
+            Path::new("/p/a.rs"),
+            vec![problem(at(1, 0), at(1, 1), None)],
+        );
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].diagnostics.len(), 2);
     }
 
     #[test]
     fn a_diff_against_head_and_of_a_new_file() {
-        let dir = std::env::temp_dir().join(format!("flux-plugin-calls-diff-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("flux-plugin-calls-diff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {
@@ -664,7 +684,10 @@ mod tests {
         let new = repo.work_dir.join("b.txt");
         std::fs::write(&new, "fresh\n").unwrap();
         let diff = file_diff(&repo, &new, true).unwrap();
-        assert!(diff.contains("+fresh") && diff.contains("new file"), "{diff}");
+        assert!(
+            diff.contains("+fresh") && diff.contains("new file"),
+            "{diff}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

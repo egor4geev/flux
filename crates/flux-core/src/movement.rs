@@ -130,7 +130,8 @@ pub fn word_range_at(text: &Rope, pos: usize) -> Range {
     }
     // A click right after a word selects that word, not the space after it.
     let probe = if pos >= len
-        || (pos > 0 && char_class(text.char(pos)) == CharClass::Whitespace
+        || (pos > 0
+            && char_class(text.char(pos)) == CharClass::Whitespace
             && char_class(text.char(pos - 1)) != CharClass::Whitespace)
     {
         pos.min(len) - 1

@@ -602,9 +602,9 @@ impl SettingSpec {
         let fits = match &self.kind {
             SettingKind::Bool => value.is_boolean(),
             SettingKind::String => value.is_string(),
-            SettingKind::Integer { min, max } => value.as_i64().is_some_and(|n| {
-                min.is_none_or(|min| n >= min) && max.is_none_or(|max| n <= max)
-            }),
+            SettingKind::Integer { min, max } => value
+                .as_i64()
+                .is_some_and(|n| min.is_none_or(|min| n >= min) && max.is_none_or(|max| n <= max)),
             SettingKind::Choice(options) => value
                 .as_str()
                 .is_some_and(|value| options.iter().any(|option| option.value == value)),
@@ -942,9 +942,9 @@ impl RawPermissions {
             let name = host.strip_prefix("*.").unwrap_or(&host);
             let valid = host == "*"
                 || (!name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')));
+                    && name.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')
+                    }));
             if !valid {
                 return error(format!(
                     "permissions.network: \"{host}\" — a host, like \"api.example.com\" or \
@@ -962,7 +962,9 @@ impl RawPermissions {
             }
         }
         for folder in &self.folders {
-            if !(folder.path.starts_with("~/") || folder.path == "~" || folder.path.starts_with('/'))
+            if !(folder.path.starts_with("~/")
+                || folder.path == "~"
+                || folder.path.starts_with('/'))
             {
                 return error(format!(
                     "permissions.folders: \"{}\" — an absolute path or one in the home folder \
@@ -1033,7 +1035,9 @@ impl RawRecordField {
             "string" => RecordFieldKind::String,
             "text" => RecordFieldKind::Text,
             "bool" => RecordFieldKind::Bool,
-            "choice" if self.options.is_empty() => return Err(error("a choice needs options".into())),
+            "choice" if self.options.is_empty() => {
+                return Err(error("a choice needs options".into()));
+            }
             "choice" => RecordFieldKind::Choice(self.options),
             other => {
                 return Err(error(format!(
@@ -1083,7 +1087,11 @@ impl RawManifest {
         )?;
         unique("setting", self.settings.iter().map(|s| s.key.as_str()))?;
         for menu in &self.menus {
-            if !self.commands.iter().any(|command| command.id == menu.command) {
+            if !self
+                .commands
+                .iter()
+                .any(|command| command.id == menu.command)
+            {
                 return error(format!(
                     "menus: the command \"{}\" isn't in [[commands]]",
                     menu.command
@@ -1379,7 +1387,10 @@ impl RawSetting {
                 let mut fields = Vec::new();
                 for field in self.fields {
                     let field = field.check(&key)?;
-                    if fields.iter().any(|known: &RecordField| known.key == field.key) {
+                    if fields
+                        .iter()
+                        .any(|known: &RecordField| known.key == field.key)
+                    {
                         return Err(ManifestError(format!(
                             "setting \"{key}\": the field \"{}\" is there twice",
                             field.key
@@ -1540,13 +1551,20 @@ options = [{ value = "project", title = "Project" }, { value = "file", title = "
             let text = TODO.replace("project = \"read\"", wrong);
             assert!(Manifest::parse(&text).is_err(), "{wrong}");
         }
-        assert!(Manifest::parse(TODO).unwrap().permissions.network.is_empty());
+        assert!(
+            Manifest::parse(TODO)
+                .unwrap()
+                .permissions
+                .network
+                .is_empty()
+        );
     }
 
     #[test]
     fn menus() {
         let with = |menu: &str| Manifest::parse(&format!("{TODO}\n[[menus]]\n{menu}"));
-        let manifest = with("command = \"refresh\"\nlocation = \"tree\"\nwhen = \"folder\"").unwrap();
+        let manifest =
+            with("command = \"refresh\"\nlocation = \"tree\"\nwhen = \"folder\"").unwrap();
         assert_eq!(manifest.menus[0].location, MenuLocation::Tree);
         assert_eq!(manifest.menus[0].when, Some(MenuWhen::Folder));
         assert!(with("command = \"nope\"\nlocation = \"editor\"").is_err());
@@ -1938,11 +1956,20 @@ title = "After"
             .iter()
             .map(|field| (field.key.as_str(), &field.kind, &field.default))
             .collect();
-        assert_eq!(kinds[0], ("name", &RecordFieldKind::String, &Value::from("")));
-        assert_eq!(kinds[1], ("prompt", &RecordFieldKind::Text, &Value::from("")));
+        assert_eq!(
+            kinds[0],
+            ("name", &RecordFieldKind::String, &Value::from(""))
+        );
+        assert_eq!(
+            kinds[1],
+            ("prompt", &RecordFieldKind::Text, &Value::from(""))
+        );
         assert_eq!(kinds[2].0, "mode");
         assert_eq!(kinds[2].2, &Value::from("default"));
-        assert_eq!(kinds[3], ("favorite", &RecordFieldKind::Bool, &Value::Bool(false)));
+        assert_eq!(
+            kinds[3],
+            ("favorite", &RecordFieldKind::Bool, &Value::Bool(false))
+        );
         assert_eq!(
             actions.default,
             serde_json::json!([

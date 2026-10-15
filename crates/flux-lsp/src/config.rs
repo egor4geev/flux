@@ -54,7 +54,11 @@ pub fn with_user_settings(mut config: ServerConfig, user: &Value) -> Option<Serv
     if user.get("enabled") == Some(&Value::Bool(false)) {
         return None;
     }
-    let object = |key: &str| user.get(key).filter(|value| value.is_object()).and_then(pruned);
+    let object = |key: &str| {
+        user.get(key)
+            .filter(|value| value.is_object())
+            .and_then(pruned)
+    };
     if let Some(settings) = object("settings") {
         merge_into(&mut config.settings, settings);
     }
@@ -651,12 +655,19 @@ mod tests {
             json!({ "settings": { "rust-analyzer": {} }, "initialization_options": {} }),
             json!({ "settings": 5, "args": "x", "env": [1], "command": "  ", "enabled": "no" }),
         ] {
-            assert_eq!(with_user_settings(plugin.clone(), &user), Some(plugin.clone()), "{user}");
+            assert_eq!(
+                with_user_settings(plugin.clone(), &user),
+                Some(plugin.clone()),
+                "{user}"
+            );
         }
         // Settings where the plugin has none.
         let bare = server("gopls", "gopls", &[], &["go"], &[]);
         let merged = with_user_settings(bare, &json!({ "settings": { "gopls": { "a": 1 } } }));
-        assert_eq!(merged.unwrap().settings, Some(json!({ "gopls": { "a": 1 } })));
+        assert_eq!(
+            merged.unwrap().settings,
+            Some(json!({ "gopls": { "a": 1 } }))
+        );
     }
 
     #[test]
@@ -668,7 +679,10 @@ mod tests {
             }),
             ..server("gopls", "gopls", &[], &["go"], &[])
         };
-        assert_eq!(with_user_settings(plugin.clone(), &json!({ "enabled": false })), None);
+        assert_eq!(
+            with_user_settings(plugin.clone(), &json!({ "enabled": false })),
+            None
+        );
         assert!(with_user_settings(plugin.clone(), &json!({ "enabled": true })).is_some());
         let custom = with_user_settings(plugin.clone(), &json!({ "command": "/opt/gopls" }));
         let custom = custom.unwrap();
@@ -679,7 +693,10 @@ mod tests {
             expand_home("~/bin/gopls", Some(std::ffi::OsStr::new("/Users/me"))),
             "/Users/me/bin/gopls"
         );
-        assert_eq!(expand_home("gopls", Some(std::ffi::OsStr::new("/Users/me"))), "gopls");
+        assert_eq!(
+            expand_home("gopls", Some(std::ffi::OsStr::new("/Users/me"))),
+            "gopls"
+        );
     }
 
     #[test]
@@ -706,8 +723,14 @@ mod tests {
     #[test]
     fn deep_merge_goes_into_objects_and_replaces_the_rest() {
         let mut base = json!({ "a": { "b": 1, "c": [1] }, "d": "x" });
-        deep_merge(&mut base, &json!({ "a": { "c": [2], "e": null }, "d": { "f": 1 } }));
-        assert_eq!(base, json!({ "a": { "b": 1, "c": [2], "e": null }, "d": { "f": 1 } }));
+        deep_merge(
+            &mut base,
+            &json!({ "a": { "c": [2], "e": null }, "d": { "f": 1 } }),
+        );
+        assert_eq!(
+            base,
+            json!({ "a": { "b": 1, "c": [2], "e": null }, "d": { "f": 1 } })
+        );
         let mut scalar = json!(1);
         deep_merge(&mut scalar, &json!({ "a": 1 }));
         assert_eq!(scalar, json!({ "a": 1 }));
@@ -722,7 +745,12 @@ mod tests {
         fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin").unwrap();
         let pyright = server("pyright", "pyright-langserver", &[], &["py"], &[]);
         let found = workspace_settings(&pyright, root.path());
-        assert!(found["python"]["pythonPath"].as_str().unwrap().ends_with(".venv/bin/python"));
+        assert!(
+            found["python"]["pythonPath"]
+                .as_str()
+                .unwrap()
+                .ends_with(".venv/bin/python")
+        );
         let own = with_user_settings(
             pyright.clone(),
             &json!({ "settings": { "python": { "pythonPath": "/usr/bin/python3" } } }),

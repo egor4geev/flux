@@ -103,7 +103,9 @@ fn settings_are_written_and_checked_like_the_settings_page() {
     );
     probe.command("v3:settings-reset");
     match probe.host_call() {
-        HostCall::SetSetting { key, value } => assert_eq!((key.as_str(), value), ("greeting", None)),
+        HostCall::SetSetting { key, value } => {
+            assert_eq!((key.as_str(), value), ("greeting", None))
+        }
         other => panic!("expected SetSetting, got {other:?}"),
     }
     assert_eq!(probe.notification(), "reset: ok");
@@ -192,7 +194,10 @@ fn forms_and_pickers_go_to_the_window_and_answer_with_events() {
     probe
         .instance
         .send_event(Event::PickerChosen((picker, Some("b".into()))));
-    assert_eq!(probe.notification(), format!("chosen {picker}: Some(\"b\")"));
+    assert_eq!(
+        probe.notification(),
+        format!("chosen {picker}: Some(\"b\")")
+    );
     // An anchor the manifest doesn't declare: under the title bar, and a warning.
     probe.command("v3:picker-unknown-anchor");
     match probe.host_call() {
@@ -239,7 +244,10 @@ fn branches_and_checkouts_need_write_access() {
             _,
         ) => {
             assert_eq!(at, root);
-            assert_eq!((name.as_str(), start.as_deref()), ("TRACK-1-fix", Some("main")));
+            assert_eq!(
+                (name.as_str(), start.as_deref()),
+                ("TRACK-1-fix", Some("main"))
+            );
             id
         }
         (other, _) => panic!("expected GitNewBranch, got {other:?}"),
@@ -397,10 +405,7 @@ fn the_clock_the_time_zone_and_settings() {
     };
     assert_eq!(
         probe.run("v3:utc-offset"),
-        format!(
-            "offset: {}",
-            crate::host::local_utc_offset(1_791_961_200)
-        )
+        format!("offset: {}", crate::host::local_utc_offset(1_791_961_200))
     );
     assert_eq!(
         probe.run("v3:time-zone"),

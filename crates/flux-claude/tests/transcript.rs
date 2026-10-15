@@ -108,7 +108,10 @@ fn tool_results_keep_their_structure_and_files_their_originals() {
     let edit = session.tool("toolu_edit").expect("the edit");
     assert_eq!(edit.state, ToolState::Done);
     let structured = edit.result.as_ref().unwrap().structured.as_ref().unwrap();
-    assert_eq!(structured["structuredPatch"][0]["lines"][1], "+print('hello')");
+    assert_eq!(
+        structured["structuredPatch"][0]["lines"][1],
+        "+print('hello')"
+    );
 
     let at = |minutes: u64, seconds: u64| {
         // 2026-10-09T10:MM:SSZ
@@ -153,7 +156,9 @@ fn a_session_that_went_on_keeps_its_own_entries_after_the_saved_ones() {
     let saved_count = saved.entries.len();
     live.prepend_history(saved);
     assert_eq!(live.entries.len(), saved_count + 1);
-    assert!(matches!(&live.entries.last().unwrap().kind, EntryKind::User(user) if user.text == "Go on"));
+    assert!(
+        matches!(&live.entries.last().unwrap().kind, EntryKind::User(user) if user.text == "Go on")
+    );
     // Every id is still unique, the subagent's entries included.
     let mut ids = Vec::new();
     fn collect(entries: &[flux_claude::Entry], ids: &mut Vec<u64>) {
@@ -220,11 +225,18 @@ fn the_history_lists_sessions_from_their_head_and_tail() {
     write(projects.path(), root, "untitled", &untitled, now - 2 * day);
 
     // Nothing the user wrote: not listed.
-    let empty = vec![r#"{"type":"queue-operation","operation":"enqueue","sessionId":"empty"}"#.to_string()];
+    let empty =
+        vec![r#"{"type":"queue-operation","operation":"enqueue","sessionId":"empty"}"#.to_string()];
     write(projects.path(), root, "empty", &empty, now - 3 * day);
 
     // Another project's session isn't listed.
-    write(projects.path(), Path::new("/Users/me/dev/other"), "other", &untitled, now);
+    write(
+        projects.path(),
+        Path::new("/Users/me/dev/other"),
+        "other",
+        &untitled,
+        now,
+    );
 
     let sessions = transcript::list(projects.path(), root);
     let summary: Vec<_> = sessions
@@ -375,7 +387,9 @@ fn bash_mode_records_read_back_as_commands() {
         .entries
         .iter()
         .filter_map(|entry| match &entry.kind {
-            EntryKind::Shell(shell) => Some((shell.output.as_str(), shell.exit_code, shell.delivered)),
+            EntryKind::Shell(shell) => {
+                Some((shell.output.as_str(), shell.exit_code, shell.delivered))
+            }
             _ => None,
         })
         .collect();
@@ -390,7 +404,11 @@ fn bash_mode_records_read_back_as_commands() {
     let projects = tempfile::tempdir().unwrap();
     let project = project_dir(projects.path(), Path::new("/project/bash"));
     fs::create_dir_all(&project).unwrap();
-    fs::copy(&path, project.join("5f0c1d2e-0000-4000-8000-0000000000b1.jsonl")).unwrap();
+    fs::copy(
+        &path,
+        project.join("5f0c1d2e-0000-4000-8000-0000000000b1.jsonl"),
+    )
+    .unwrap();
     let listed = transcript::list(projects.path(), Path::new("/project/bash"));
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].title, "Fix it");

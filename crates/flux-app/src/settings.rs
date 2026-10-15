@@ -1013,7 +1013,9 @@ fn parse_editor(value: &Value) -> EditorSettings {
             .unwrap_or(defaults.soft_wrap_indent),
         soft_wrap_extra_indent: value["soft_wrap_extra_indent"]
             .as_u64()
-            .map_or(defaults.soft_wrap_extra_indent, |spaces| spaces.min(16) as u32),
+            .map_or(defaults.soft_wrap_extra_indent, |spaces| {
+                spaces.min(16) as u32
+            }),
         soft_wrap_signs_current_line_only: value["soft_wrap_signs_current_line_only"]
             .as_bool()
             .unwrap_or(defaults.soft_wrap_signs_current_line_only),
@@ -1090,9 +1092,7 @@ fn parse_claude(value: &Value) -> ClaudeSettings {
         restore_sessions: value["restore_sessions"]
             .as_bool()
             .unwrap_or(defaults.restore_sessions),
-        flux_tools: value["flux_tools"]
-            .as_bool()
-            .unwrap_or(defaults.flux_tools),
+        flux_tools: value["flux_tools"].as_bool().unwrap_or(defaults.flux_tools),
         report_problems: value["report_problems"]
             .as_bool()
             .unwrap_or(defaults.report_problems),
@@ -1333,7 +1333,8 @@ mod tests {
 
     #[test]
     fn a_broken_file_is_an_error_with_its_place() {
-        let error = parse_file("{\n  \"git\": {\n    \"update_method\": \"merge\"\n  \n}").unwrap_err();
+        let error =
+            parse_file("{\n  \"git\": {\n    \"update_method\": \"merge\"\n  \n}").unwrap_err();
         assert_eq!(error.line, 5);
         assert!(error.message.contains("EOF"), "{}", error.message);
         assert!(!error.message.contains(" at line "), "{}", error.message);
@@ -1370,7 +1371,10 @@ mod tests {
         save(&settings);
         assert_eq!(read_file(&path).unwrap(), Settings::default());
         // A missing file is the defaults.
-        assert_eq!(read_file(&dir.join("none.json")).unwrap(), Settings::default());
+        assert_eq!(
+            read_file(&dir.join("none.json")).unwrap(),
+            Settings::default()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }

@@ -125,7 +125,11 @@ impl ChangeSet {
     }
 
     pub fn apply(&self, text: &mut Rope) {
-        debug_assert_eq!(text.len_chars(), self.len, "changeset applied to wrong document");
+        debug_assert_eq!(
+            text.len_chars(),
+            self.len,
+            "changeset applied to wrong document"
+        );
         let mut pos = 0;
         for op in &self.ops {
             match op {
@@ -288,7 +292,11 @@ mod tests {
         let mut rope = original.clone();
         let cs = ChangeSet::from_changes(
             rope.len_chars(),
-            vec![(0, 4, Some("1".into())), (9, 12, None), (13, 13, Some("→".into()))],
+            vec![
+                (0, 4, Some("1".into())),
+                (9, 12, None),
+                (13, 13, Some("→".into())),
+            ],
         );
         let inverted = cs.invert(&original);
         cs.apply(&mut rope);

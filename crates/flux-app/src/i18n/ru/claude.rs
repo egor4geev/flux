@@ -44,7 +44,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Попросите Claude объяснить, исправить или сделать что-нибудь.",
     ),
     ("Open Claude from anywhere", "Открыть Claude откуда угодно"),
-    ("Mention the selection in the message", "Упомянуть выделение в сообщении"),
+    (
+        "Mention the selection in the message",
+        "Упомянуть выделение в сообщении",
+    ),
     ("Signed in as {0}", "Вход выполнен: {0}"),
     // Notifications.
     ("Claude needs your permission", "Claude просит разрешения"),
@@ -52,10 +55,19 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Claude's plan is ready", "План Claude готов"),
     ("Show", "Показать"),
     ("Claude finished: {0}", "Claude закончил: {0}"),
-    ("Claude stopped with an error: {0}", "Claude остановился с ошибкой: {0}"),
+    (
+        "Claude stopped with an error: {0}",
+        "Claude остановился с ошибкой: {0}",
+    ),
     ("Claude stopped: {0}", "Claude остановлен: {0}"),
-    ("The process exited with code {0}.", "Процесс завершился с кодом {0}."),
-    ("The process ended unexpectedly.", "Процесс неожиданно завершился."),
+    (
+        "The process exited with code {0}.",
+        "Процесс завершился с кодом {0}.",
+    ),
+    (
+        "The process ended unexpectedly.",
+        "Процесс неожиданно завершился.",
+    ),
     // Closing a session, the window.
     ("Stop “{0}”?", "Остановить «{0}»?"),
     (
@@ -115,44 +127,68 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Сессия может поменять их в чате; здесь — то, с чем начинается новая.",
     ),
     ("Chat", "Чат"),
-    ("Show proposed edits in a diff tab", "Показывать предложенные правки во вкладке диффа"),
+    (
+        "Show proposed edits in a diff tab",
+        "Показывать предложенные правки во вкладке диффа",
+    ),
     (
         "An edit Claude asks about also opens next to your tabs, where hunks can be taken one by one.",
         "Правка, о которой спрашивает Claude, открывается и рядом с вашими вкладками — там куски можно принимать по одному.",
     ),
-    ("Share the editor's selection", "Делиться выделением редактора"),
+    (
+        "Share the editor's selection",
+        "Делиться выделением редактора",
+    ),
     (
         "The file and the selected lines go along with a message as a mention.",
         "Файл и выделенные строки уходят вместе с сообщением как упоминание.",
     ),
-    ("Show subscription limits in the status bar", "Показывать лимиты подписки в статус-баре"),
+    (
+        "Show subscription limits in the status bar",
+        "Показывать лимиты подписки в статус-баре",
+    ),
     (
         "How much of the 5-hour and the weekly limits is used.",
         "Сколько израсходовано из 5-часового и недельного лимитов.",
     ),
-    ("Reopen sessions with the project", "Открывать сессии вместе с проектом"),
+    (
+        "Reopen sessions with the project",
+        "Открывать сессии вместе с проектом",
+    ),
     (
         "The sessions open when the project closed come back, their history read from Claude Code's transcripts.",
         "Сессии, открытые при закрытии проекта, возвращаются, а их история читается из записей Claude Code.",
     ),
     // Part 10.2
-    ("Claude answers the output of ! commands", "Claude отвечает на вывод команд !"),
+    (
+        "Claude answers the output of ! commands",
+        "Claude отвечает на вывод команд !",
+    ),
     (
         "A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message.",
         "Команда после ! выполняется в корне проекта, её вывод получает Claude. Включено — Claude сразу отвечает на него; выключено — увидит вывод вместе с вашим следующим сообщением.",
     ),
-    ("Notify when a session finishes or waits", "Уведомлять, когда сессия закончила или ждёт"),
+    (
+        "Notify when a session finishes or waits",
+        "Уведомлять, когда сессия закончила или ждёт",
+    ),
     (
         "A macOS notification while Flux isn't the active app.",
         "Уведомление macOS, пока Flux не активное приложение.",
     ),
     ("Flux Tools for Claude", "Инструменты Flux для Claude"),
-    ("Give Claude the tools of Flux", "Дать Claude инструменты Flux"),
+    (
+        "Give Claude the tools of Flux",
+        "Дать Claude инструменты Flux",
+    ),
     (
         "Problems the language servers find, definitions, usages and symbols, the open files. Takes effect in new sessions.",
         "Проблемы, найденные языковыми серверами, определения, использования и символы, открытые файлы. Действует в новых сессиях.",
     ),
-    ("Tell Claude about new problems after its edits", "Сообщать Claude о новых проблемах после его правок"),
+    (
+        "Tell Claude about new problems after its edits",
+        "Сообщать Claude о новых проблемах после его правок",
+    ),
     (
         "After an edit, the errors the language server finds in the file go back to Claude, so it fixes them at once.",
         "После правки ошибки, которые языковой сервер находит в файле, уходят Claude — и он сразу их исправляет.",

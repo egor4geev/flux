@@ -30,7 +30,9 @@ use gpui::{
 };
 use serde_json::Value;
 
-use flux_claude::session::{ShellEntry, ShellState, TaskProgress, TurnFile, TurnSummary, UserEntry};
+use flux_claude::session::{
+    ShellEntry, ShellState, TaskProgress, TurnFile, TurnSummary, UserEntry,
+};
 use flux_claude::{
     Activity, Entry, EntryId, EntryKind, Notice, Session, Status, ToolCall, ToolEntry, ToolState,
 };
@@ -909,22 +911,24 @@ impl Renderer<'_> {
         div()
             .flex()
             .gap(px(AVATAR_GAP))
-            .child(
-                div().flex_none().w(px(AVATAR)).children(lead.then(|| {
-                    if self.agent {
-                        agent_avatar(self.ui)
-                    } else {
-                        avatar(self.ui)
-                    }
-                })),
-            )
+            .child(div().flex_none().w(px(AVATAR)).children(lead.then(|| {
+                if self.agent {
+                    agent_avatar(self.ui)
+                } else {
+                    avatar(self.ui)
+                }
+            })))
             .child(div().flex_1().min_w_0().child(content))
             .into_any_element()
     }
 
     /// The search's marks for the texts of the entry `id` (none while nothing is searched).
     fn marks(&self, id: EntryId) -> Option<Rc<Marks>> {
-        let search = self.state.search.as_ref().filter(|search| !search.needle.is_empty())?;
+        let search = self
+            .state
+            .search
+            .as_ref()
+            .filter(|search| !search.needle.is_empty())?;
         let mut marks = self.marks.borrow_mut();
         let marks = marks.entry(id).or_insert_with(|| {
             Rc::new(Marks {
@@ -1003,7 +1007,11 @@ impl Renderer<'_> {
                 let image = self.state.images.get(&(id, index))?.clone();
                 let attachment = user.images.get(index)?;
                 let source = ImageSource::Bytes {
-                    name: format!("image-{}.{}", index + 1, image_extension(&attachment.media_type)),
+                    name: format!(
+                        "image-{}.{}",
+                        index + 1,
+                        image_extension(&attachment.media_type)
+                    ),
                     media_type: attachment.media_type.clone(),
                     data: Arc::from(attachment.data.as_slice()),
                 };
@@ -1023,7 +1031,8 @@ impl Renderer<'_> {
                         .child(img(image).size_full().object_fit(gpui::ObjectFit::Cover))
                         .on_click(move |_, _, cx| {
                             let source = source.clone();
-                            chat.update(cx, |chat, cx| chat.preview_image(source, cx)).ok();
+                            chat.update(cx, |chat, cx| chat.preview_image(source, cx))
+                                .ok();
                         })
                         .into_any_element(),
                 )
@@ -1090,7 +1099,11 @@ impl Renderer<'_> {
             let chat = self.chat.clone();
             let copy = small_button(
                 ("claude-user-copy", id),
-                if copied { IconName::Check } else { IconName::Copy },
+                if copied {
+                    IconName::Check
+                } else {
+                    IconName::Copy
+                },
                 ui,
             )
             .tooltip(ui::tooltip(tr("Copy"), None))
@@ -1200,7 +1213,10 @@ impl Renderer<'_> {
             .text_color(ui.foreground)
             .cursor_pointer()
             .hover(move |style| style.border_color(ui.accent))
-            .tooltip(ui::tooltip(chip.raw.trim_start_matches('@').to_string(), None))
+            .tooltip(ui::tooltip(
+                chip.raw.trim_start_matches('@').to_string(),
+                None,
+            ))
             .child(file.render().size(px(13.)))
             .child(label)
             .on_click(move |_, _, cx| {
@@ -1293,7 +1309,11 @@ impl Renderer<'_> {
         // tooltip.
         let mut links: Vec<_> = crate::plugin_links::web_links(&display)
             .into_iter()
-            .filter(|url| !ranges.iter().any(|r| r.start < url.end && url.start < r.end))
+            .filter(|url| {
+                !ranges
+                    .iter()
+                    .any(|r| r.start < url.end && url.start < r.end)
+            })
             .map(|url| {
                 let target = crate::plugin_links::Target::Url(display[url.clone()].to_string());
                 (url, target)
@@ -1424,7 +1444,9 @@ impl Renderer<'_> {
                     .text_color(ui.foreground)
                     .child(self.marked(id, first_line(&shell.command))),
             )
-            .when(running, |row| row.child(pulse(("claude-shell-pulse", id), ui)))
+            .when(running, |row| {
+                row.child(pulse(("claude-shell-pulse", id), ui))
+            })
             .children(status)
             .when(expandable, |row| {
                 row.cursor_pointer()
@@ -1701,7 +1723,9 @@ impl Renderer<'_> {
                         .child(trn(failed, "{n} error", "{n} errors")),
                 )
             })
-            .when(waiting, |row| row.children(state_mark(ToolState::Waiting, ui)))
+            .when(waiting, |row| {
+                row.children(state_mark(ToolState::Waiting, ui))
+            })
             .child(chevron(open, ui))
             .on_click(move |_, _, cx| {
                 chat.update(cx, |chat, cx| {
@@ -1777,12 +1801,7 @@ impl Renderer<'_> {
             .border_color(border)
             .bg(background)
             .child(header)
-            .children(body.map(|body| {
-                div()
-                    .border_t_1()
-                    .border_color(ui.divider)
-                    .child(body)
-            }))
+            .children(body.map(|body| div().border_t_1().border_color(ui.divider).child(body)))
             .into_any_element()
     }
 
@@ -1810,13 +1829,9 @@ impl Renderer<'_> {
             _ if failed => ui.error,
             _ => ui.success,
         };
-        let body = self.details_body(id, tool, 0).map(|body| {
-            div()
-                .px(px(10.))
-                .py(px(8.))
-                .child(body)
-                .into_any_element()
-        });
+        let body = self
+            .details_body(id, tool, 0)
+            .map(|body| div().px(px(10.)).py(px(8.)).child(body).into_any_element());
         let expanded = body.is_some()
             && self
                 .state
@@ -1832,7 +1847,13 @@ impl Renderer<'_> {
             _ => None,
         };
         let mut header = vec![
-            tile(IconName::Terminal, color, running, ("claude-bash-pulse", id), ui),
+            tile(
+                IconName::Terminal,
+                color,
+                running,
+                ("claude-bash-pulse", id),
+                ui,
+            ),
             div()
                 .flex_1()
                 .min_w_0()
@@ -1976,13 +1997,9 @@ impl Renderer<'_> {
                     .into_any_element(),
             );
         }
-        let body = self.edit_body(id, tool, structured).map(|body| {
-            div()
-                .px(px(4.))
-                .py(px(4.))
-                .child(body)
-                .into_any_element()
-        });
+        let body = self
+            .edit_body(id, tool, structured)
+            .map(|body| div().px(px(4.)).py(px(4.)).child(body).into_any_element());
         let expanded = body.is_some() && self.state.expanded(id, true);
         let toggle = body.is_some().then_some(expanded);
         let card = self.card(
@@ -1996,7 +2013,12 @@ impl Renderer<'_> {
     }
 
     /// What an edit card opens to: the change, or why it didn't happen.
-    fn edit_body(&self, id: EntryId, tool: &ToolEntry, structured: Option<&Value>) -> Option<AnyElement> {
+    fn edit_body(
+        &self,
+        id: EntryId,
+        tool: &ToolEntry,
+        structured: Option<&Value>,
+    ) -> Option<AnyElement> {
         // A refused or failed edit changed nothing: its reason, not a diff.
         if matches!(tool.state, ToolState::Denied | ToolState::Failed) {
             return self.result_body(id, tool);
@@ -2203,7 +2225,9 @@ impl Renderer<'_> {
                     matches!(tool.state, ToolState::Streaming | ToolState::Running),
                 )
             }
-            EntryKind::Text { text, .. } => (IconName::Claude, String::new(), first_line(text), false),
+            EntryKind::Text { text, .. } => {
+                (IconName::Claude, String::new(), first_line(text), false)
+            }
             _ => (IconName::Claude, String::new(), String::new(), false),
         };
         div()
@@ -3004,12 +3028,11 @@ impl Renderer<'_> {
         };
         // Links, as the "Done" card of JetBrains has them: room for the title in a narrow island.
         let chat = self.chat.clone();
-        let review = link(("claude-done-review", id), tr("Review"), ui).on_click(
-            move |_, window, cx| {
+        let review =
+            link(("claude-done-review", id), tr("Review"), ui).on_click(move |_, window, cx| {
                 chat.update(cx, |chat, cx| chat.review_turn(id, None, window, cx))
                     .ok();
-            },
-        );
+            });
         let chat = self.chat.clone();
         let rollback = link(("claude-done-rollback", id), tr("Rollback"), ui).on_click(
             move |_, window, cx| {
@@ -3278,10 +3301,14 @@ fn agent_totals(result: &Value) -> Option<String> {
 
 /// A subagent's answer: its last text, else the summary of its task, else the call's result.
 fn agent_answer(tool: &ToolEntry) -> Option<String> {
-    let last_text = tool.children.iter().rev().find_map(|child| match &child.kind {
-        EntryKind::Text { text, .. } if !text.trim().is_empty() => Some(text.clone()),
-        _ => None,
-    });
+    let last_text = tool
+        .children
+        .iter()
+        .rev()
+        .find_map(|child| match &child.kind {
+            EntryKind::Text { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        });
     last_text
         .or_else(|| tool.task.as_ref().and_then(|task| task.summary.clone()))
         .or_else(|| {
@@ -3560,7 +3587,8 @@ pub(crate) struct Mention<'a> {
 /// with Claude" put the file and the lines first; mentions inside a sentence stay in it.
 pub(crate) fn edge_mentions(text: &str) -> (Vec<Mention<'_>>, &str) {
     let segments = split_mentions(text);
-    let is_space = |segment: &Segment| matches!(segment, Segment::Text(text) if text.trim().is_empty());
+    let is_space =
+        |segment: &Segment| matches!(segment, Segment::Text(text) if text.trim().is_empty());
     let mut start = 0;
     let mut chips = Vec::new();
     while start < segments.len() {
@@ -3584,7 +3612,10 @@ pub(crate) fn edge_mentions(text: &str) -> (Vec<Mention<'_>>, &str) {
     tail.reverse();
     chips.extend(tail);
     // The text between the first and the last segment kept, as it is in the message.
-    let rest = match (segments.get(start), end.checked_sub(1).and_then(|last| segments.get(last))) {
+    let rest = match (
+        segments.get(start),
+        end.checked_sub(1).and_then(|last| segments.get(last)),
+    ) {
         (Some(first), Some(last)) if start < end => {
             let from = segment_offset(text, first);
             let to = segment_offset(text, last) + segment_text(last).len();
@@ -3943,7 +3974,6 @@ fn callout(
         .into_any_element()
 }
 
-
 /// The line under the conversation while Claude works: what it does, for how long, Esc to stop;
 /// while a question waits — that it waits for the user. It keeps to Claude's side of the column.
 fn activity_line(model: &Session, ui: UiColors) -> Option<AnyElement> {
@@ -4016,12 +4046,18 @@ fn agent_activity_line(tool: &ToolEntry, ui: UiColors) -> Option<AnyElement> {
     if !agent_running(tool) {
         return None;
     }
-    let running = tool.children.iter().rev().find_map(|child| match &child.kind {
-        EntryKind::Tool(call) if matches!(call.state, ToolState::Streaming | ToolState::Running) => {
-            Some(call.name.clone())
-        }
-        _ => None,
-    });
+    let running = tool
+        .children
+        .iter()
+        .rev()
+        .find_map(|child| match &child.kind {
+            EntryKind::Tool(call)
+                if matches!(call.state, ToolState::Streaming | ToolState::Running) =>
+            {
+                Some(call.name.clone())
+            }
+            _ => None,
+        });
     let label = match running.or_else(|| tool.task.as_ref()?.last_tool.clone()) {
         Some(name) => trf("Running {0}…", &[&tool_display_name(&name)]),
         None => tr("Thinking…").to_string(),
@@ -4046,11 +4082,7 @@ fn agent_activity_line(tool: &ToolEntry, ui: UiColors) -> Option<AnyElement> {
                         .child(pulse("claude-agent-activity", ui))
                         .child(div().flex_none().text_color(ui.foreground).child(label))
                         .children(details.map(|details| {
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(ui.dim)
-                                .child(details)
+                            div().min_w_0().truncate().text_color(ui.dim).child(details)
                         })),
                 ),
         )
@@ -4910,7 +4942,14 @@ mod tests {
             id: 9,
             kind: EntryKind::Tool(Box::new(tool("Bash", json!({ "command": "ls" }), None))),
         };
-        let entries = vec![read(1), text(2, ""), read(3), text(4, "Done."), bash, read(6)];
+        let entries = vec![
+            read(1),
+            text(2, ""),
+            read(3),
+            text(4, "Done."),
+            bash,
+            read(6),
+        ];
         // A lone step (the last read) is its own item, not a group of one.
         assert_eq!(
             items(&entries),

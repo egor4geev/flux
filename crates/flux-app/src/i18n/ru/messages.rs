@@ -3,7 +3,10 @@
 pub(super) const STRINGS: &[(&str, &str)] = &[
     // Git: results and errors of the commit window.
     ("Committed {0}", "Закоммичено {0}"),
-    ("Couldn't add to .gitignore", "Не удалось добавить в .gitignore"),
+    (
+        "Couldn't add to .gitignore",
+        "Не удалось добавить в .gitignore",
+    ),
     // Files: the tree, open documents, the disk.
     ("Couldn't move to Trash", "Не удалось переместить в Корзину"),
     ("Couldn't rename", "Не удалось переименовать"),

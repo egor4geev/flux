@@ -189,9 +189,13 @@ pub fn installed(store: &PluginStore, id: &str) -> Option<(String, PluginSource)
 pub enum Offer {
     Install,
     /// A newer version than the installed one.
-    Update { from: String },
+    Update {
+        from: String,
+    },
     /// The installed version (as new as the catalog's, or newer).
-    Installed { version: String },
+    Installed {
+        version: String,
+    },
     /// Under development: the author's folder wins, the catalog doesn't touch it.
     Development,
     /// Built for a plugin API this Flux doesn't run.
@@ -286,10 +290,8 @@ pub fn install(
                                 !updates(workspace.plugins.read(cx), &index).is_empty()
                             });
                             if !left {
-                                workspace.dismiss_notifications(
-                                    &["plugin_updates::UpdatePlugins"],
-                                    cx,
-                                );
+                                workspace
+                                    .dismiss_notifications(&["plugin_updates::UpdatePlugins"], cx);
                             }
                         })
                         .ok();
@@ -793,7 +795,13 @@ impl PluginCatalog {
                     }))
                     .child(category_label(category))
             });
-        div().flex().flex_wrap().gap_0p5().px_2().pb_2().children(chips)
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_0p5()
+            .px_2()
+            .pb_2()
+            .children(chips)
     }
 
     fn render_list(&self, listed: &[IndexEntry], cx: &mut Context<Self>) -> Div {
@@ -899,9 +907,7 @@ impl PluginCatalog {
                 trf("Update available: {0}", &[&entry.version]),
                 ui.accent_text,
             ),
-            (None, Offer::Installed { version }) => {
-                (trf("Installed: {0}", &[version]), ui.success)
-            }
+            (None, Offer::Installed { version }) => (trf("Installed: {0}", &[version]), ui.success),
             (None, Offer::Development) => (tr("Under development").to_string(), ui.amber),
             (None, Offer::Incompatible) => (tr("Needs a newer Flux").to_string(), ui.warning),
         };
@@ -1156,19 +1162,15 @@ impl PluginCatalog {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .w(px(140.))
-                            .child(crate::notifications::progress_bar(
-                                match progress.fraction() {
-                                    Some(fraction) if !progress.installing() => {
-                                        crate::notifications::Progress::Fraction(fraction)
-                                    }
-                                    _ => crate::notifications::Progress::Indeterminate,
-                                },
-                                ui,
-                            )),
-                    )
+                    .child(div().w(px(140.)).child(crate::notifications::progress_bar(
+                        match progress.fraction() {
+                            Some(fraction) if !progress.installing() => {
+                                crate::notifications::Progress::Fraction(fraction)
+                            }
+                            _ => crate::notifications::Progress::Indeterminate,
+                        },
+                        ui,
+                    )))
                     .child(
                         div()
                             .text_size(px(theme::TEXT_SM))
@@ -1388,20 +1390,24 @@ fn note(text: String, color: Hsla) -> AnyElement {
 }
 
 fn broken_manifest(ui: UiColors) -> Div {
-    div()
-        .text_color(ui.warning)
-        .child(tr("The catalog has a manifest Flux can't read for this plugin"))
+    div().text_color(ui.warning).child(tr(
+        "The catalog has a manifest Flux can't read for this plugin",
+    ))
 }
 
 impl Render for PluginCatalog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A scenario can't click Install: it names the plugin in the environment.
         #[cfg(feature = "scenario")]
-        if let Some(entry) = self.scenario_install.as_ref().and_then(|id| {
-            peek(cx).and_then(|index| index.plugin(id).cloned())
-        }) {
+        if let Some(entry) = self
+            .scenario_install
+            .as_ref()
+            .and_then(|id| peek(cx).and_then(|index| index.plugin(id).cloned()))
+        {
             self.scenario_install = None;
-            cx.defer_in(window, move |this, window, cx| this.install(entry, window, cx));
+            cx.defer_in(window, move |this, window, cx| {
+                this.install(entry, window, cx)
+            });
         }
         #[cfg(not(feature = "scenario"))]
         let _ = window;
@@ -1442,9 +1448,8 @@ impl Render for PluginCatalog {
                         .child(error),
                 )
                 .child(
-                    ui::primary_button("catalog-retry", tr("Retry"), true, ui).on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.retry(cx)),
-                    ),
+                    ui::primary_button("catalog-retry", tr("Retry"), true, ui)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.retry(cx))),
                 )
                 .into_any_element(),
             (None, _) => div()
@@ -1562,11 +1567,19 @@ mod tests {
         };
         use gpui::AssetSource;
         let path = index_icon(&entry).unwrap();
-        assert_eq!(index_icon(&entry).unwrap(), path, "the same SVG keeps its path");
+        assert_eq!(
+            index_icon(&entry).unwrap(),
+            path,
+            "the same SVG keeps its path"
+        );
         let served = icons::Assets.load(&path).unwrap().unwrap();
         assert_eq!(&*served, b"<svg viewBox=\"0 0 16 16\"/>");
         entry.icon_svg = Some("<svg viewBox=\"0 0 16 16\"><path/></svg>".into());
-        assert_ne!(index_icon(&entry).unwrap(), path, "a changed icon gets a new path");
+        assert_ne!(
+            index_icon(&entry).unwrap(),
+            path,
+            "a changed icon gets a new path"
+        );
         entry.icon_svg = None;
         assert!(index_icon(&entry).is_none());
     }

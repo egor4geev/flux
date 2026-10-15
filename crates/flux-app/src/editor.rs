@@ -1261,24 +1261,22 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &MoveRight, _, cx| {
                 this.motion(cx, |t, r| movement::move_horizontally(t, r, Forward, false))
             }))
-            .on_action(cx.listener(|this, _: &MoveUp, _, cx| {
-                this.vertical(Backward, 1, false, cx)
-            }))
-            .on_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                this.vertical(Forward, 1, false, cx)
-            }))
+            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.vertical(Backward, 1, false, cx)))
+            .on_action(
+                cx.listener(|this, _: &MoveDown, _, cx| this.vertical(Forward, 1, false, cx)),
+            )
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| {
                 this.motion(cx, |t, r| movement::move_horizontally(t, r, Backward, true))
             }))
             .on_action(cx.listener(|this, _: &SelectRight, _, cx| {
                 this.motion(cx, |t, r| movement::move_horizontally(t, r, Forward, true))
             }))
-            .on_action(cx.listener(|this, _: &SelectUp, _, cx| {
-                this.vertical(Backward, 1, true, cx)
-            }))
-            .on_action(cx.listener(|this, _: &SelectDown, _, cx| {
-                this.vertical(Forward, 1, true, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &SelectUp, _, cx| this.vertical(Backward, 1, true, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectDown, _, cx| this.vertical(Forward, 1, true, cx)),
+            )
             .on_action(cx.listener(|this, _: &MoveWordLeft, _, cx| {
                 this.motion(cx, |t, r| movement::move_word(t, r, Backward, false))
             }))

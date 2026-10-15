@@ -402,9 +402,7 @@ fn item_row(
                 ui,
             )
             .mt(px(2.))
-            .on_click(cx.listener(move |guide, _, window, cx| {
-                try_it(&action, guide, window, cx)
-            }))
+            .on_click(cx.listener(move |guide, _, window, cx| try_it(&action, guide, window, cx)))
         }))
 }
 
@@ -487,8 +485,7 @@ fn try_it(
     window.remove_window();
     // After this update: the guide's window is being updated, another one can't be meanwhile.
     cx.defer(move |cx| {
-        let handle =
-            front.or_else(|| crate::workspace::open_startup_windows(None, Vec::new(), cx));
+        let handle = front.or_else(|| crate::workspace::open_startup_windows(None, Vec::new(), cx));
         if let Some(handle) = handle {
             handle
                 .update(cx, |_, window, cx| {
@@ -613,8 +610,16 @@ mod tests {
         assert_eq!(notes.len(), NOTES.len(), "every bundled notes file reads");
         for notes in &notes {
             assert!(parse_version(&notes.version).is_some());
-            assert!(!date_label(&notes.date).contains('-'), "a real date: {}", notes.date);
-            assert!((3..=5).contains(&notes.items.len()), "3 to 5 items: {}", notes.version);
+            assert!(
+                !date_label(&notes.date).contains('-'),
+                "a real date: {}",
+                notes.date
+            );
+            assert!(
+                (3..=5).contains(&notes.items.len()),
+                "3 to 5 items: {}",
+                notes.version
+            );
             for item in &notes.items {
                 for text in [&item.title, &item.text] {
                     assert!(!text.get(Lang::En).is_empty());
@@ -644,7 +649,10 @@ mod tests {
         // No Russian — English.
         assert_eq!(notes.items[0].text.get(Lang::Ru), "X");
         assert_eq!(notes.items[0].action, None);
-        assert_eq!(notes.items[1].action.as_deref(), Some("claude::ToggleClaude"));
+        assert_eq!(
+            notes.items[1].action.as_deref(),
+            Some("claude::ToggleClaude")
+        );
         assert_eq!(notes.short_version(), "0.2");
         assert!(parse_notes("version = \"0.2.0\"").is_err());
         assert!(parse_notes(&file("0.2.0").replace("sparkle", "no-such-icon")).is_err());
@@ -655,11 +663,20 @@ mod tests {
             parse_notes(&file("0.4.0")).unwrap(),
         ];
         let version = |notes: Option<Notes>| notes.map(|notes| notes.version);
-        assert_eq!(version(latest_up_to(&all, "0.2.5")).as_deref(), Some("0.2.0"));
-        assert_eq!(version(latest_up_to(&all, "0.3.0")).as_deref(), Some("0.2.0"));
+        assert_eq!(
+            version(latest_up_to(&all, "0.2.5")).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            version(latest_up_to(&all, "0.3.0")).as_deref(),
+            Some("0.2.0")
+        );
         assert_eq!(version(latest_up_to(&all, "0.0.9")), None);
         // An update shows only its own minor's notes.
-        assert_eq!(version(notes_of_minor(&all, "0.2.1")).as_deref(), Some("0.2.0"));
+        assert_eq!(
+            version(notes_of_minor(&all, "0.2.1")).as_deref(),
+            Some("0.2.0")
+        );
         assert_eq!(version(notes_of_minor(&all, "0.3.0")), None);
     }
 }

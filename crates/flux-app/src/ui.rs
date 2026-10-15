@@ -40,10 +40,8 @@ const DIALOG_MIN_HEIGHT: f32 = 240.;
 /// scale (part 10.4), which makes the window logically smaller — leaves less room above the status
 /// bar.
 pub fn dialog_height(preferred: f32, window: &Window) -> f32 {
-    let room = f32::from(window.viewport_size().height)
-        - DIALOG_TOP
-        - STATUS_BAR_HEIGHT
-        - DIALOG_MARGIN;
+    let room =
+        f32::from(window.viewport_size().height) - DIALOG_TOP - STATUS_BAR_HEIGHT - DIALOG_MARGIN;
     preferred.min(room).max(DIALOG_MIN_HEIGHT)
 }
 
@@ -772,7 +770,14 @@ mod tests {
 
     gpui::actions!(
         label_test,
-        [Commit, ClearTerminal, MentionSelection, HideApp, NewTab, Unbound]
+        [
+            Commit,
+            ClearTerminal,
+            MentionSelection,
+            HideApp,
+            NewTab,
+            Unbound
+        ]
     );
 
     /// The label's binding doesn't depend on where the focus is: the window's own key first (a

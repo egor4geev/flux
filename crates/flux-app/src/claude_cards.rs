@@ -16,8 +16,7 @@ use flux_claude::session::{Pending, PendingKind, Question, TaskStatus};
 use flux_claude::{Answer, Session};
 use gpui::{
     Action, AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Focusable, FontWeight,
-    HighlightStyle,
-    KeyBinding, SharedString, StyledText, Window, actions, div, prelude::*, px,
+    HighlightStyle, KeyBinding, SharedString, StyledText, Window, actions, div, prelude::*, px,
 };
 use serde_json::Value;
 
@@ -151,7 +150,9 @@ pub fn render(
         .iter()
         .map(|pending| {
             let keyboard = state.keyboard.as_deref() == Some(pending.id.as_str());
-            render_card(state, session, pending, model, keyboard, &focus, ui, window, cx)
+            render_card(
+                state, session, pending, model, keyboard, &focus, ui, window, cx,
+            )
         })
         .collect();
     let tasks = render_tasks(state, model, ui, cx);
@@ -181,7 +182,11 @@ fn sync(
     window: &mut Window,
     cx: &mut Context<ClaudeChat>,
 ) {
-    let ids: HashSet<String> = model.pending.iter().map(|pending| pending.id.clone()).collect();
+    let ids: HashSet<String> = model
+        .pending
+        .iter()
+        .map(|pending| pending.id.clone())
+        .collect();
     state.cards.retain(|id, _| ids.contains(id));
     state.plans.retain(|id, _| ids.contains(id));
     let mut arrived = None;
@@ -202,10 +207,7 @@ fn sync(
             highlight_plan(pending.id.clone(), plan.clone(), cx);
         }
     }
-    let keyboard_gone = state
-        .keyboard
-        .as_ref()
-        .is_none_or(|id| !ids.contains(id));
+    let keyboard_gone = state.keyboard.as_ref().is_none_or(|id| !ids.contains(id));
     if let Some(id) = arrived {
         let cards_had_keys = has_focus(state, window)
             || state
@@ -277,10 +279,14 @@ fn highlight_plan(id: String, plan: String, cx: &mut Context<ClaudeChat>) {
 #[derive(Debug, Clone, PartialEq)]
 enum Choice {
     /// Allow (accept an edit), remembering the chosen "don't ask again" suggestions.
-    Allow { remember: Vec<Value> },
+    Allow {
+        remember: Vec<Value>,
+    },
     /// Deny: the field for what to do instead opens.
     Deny,
-    Approve { accept_edits: bool },
+    Approve {
+        accept_edits: bool,
+    },
     /// Keep planning: the field for the feedback opens.
     KeepPlanning,
 }
@@ -401,9 +407,12 @@ fn suggestion_label(suggestion: &Value, cwd: &Path, edit: bool) -> Option<String
             if dirs.is_empty() {
                 return None;
             }
-            trf("Allow, and allow access to {0} {1}", &[&dirs.join(", "), &place(destination)])
-                .trim_end()
-                .to_string()
+            trf(
+                "Allow, and allow access to {0} {1}",
+                &[&dirs.join(", "), &place(destination)],
+            )
+            .trim_end()
+            .to_string()
         }
         _ => return None,
     };
@@ -413,7 +422,9 @@ fn suggestion_label(suggestion: &Value, cwd: &Path, edit: bool) -> Option<String
 /// A permission rule as words: "`npm test`", "fetches from example.com", "reading `/tmp/**`".
 fn rule_label(rule: &Value, cwd: &Path) -> Option<String> {
     let tool = rule["toolName"].as_str()?;
-    let content = rule["ruleContent"].as_str().filter(|content| !content.is_empty());
+    let content = rule["ruleContent"]
+        .as_str()
+        .filter(|content| !content.is_empty());
     Some(match (tool, content) {
         ("Bash", Some(command)) => format!("`{command}`"),
         ("WebFetch", Some(content)) => {
@@ -428,7 +439,10 @@ fn rule_label(rule: &Value, cwd: &Path) -> Option<String> {
         ("Edit" | "Write" | "MultiEdit", Some(path)) => {
             trf("edits of {0}", &[&format!("`{}`", rule_path(path, cwd))])
         }
-        (tool, None) => match tool.strip_prefix("mcp__").and_then(|rest| rest.split_once("__")) {
+        (tool, None) => match tool
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split_once("__"))
+        {
             Some((server, name)) => format!("`{name}` ({server})"),
             None => format!("`{tool}`"),
         },
@@ -438,7 +452,10 @@ fn rule_label(rule: &Value, cwd: &Path) -> Option<String> {
 
 /// A rule's path: `//abs/dir/**` is an absolute path in the CLI's rules.
 fn rule_path(path: &str, cwd: &Path) -> String {
-    let path = path.strip_prefix('/').filter(|rest| rest.starts_with('/')).unwrap_or(path);
+    let path = path
+        .strip_prefix('/')
+        .filter(|rest| rest.starts_with('/'))
+        .unwrap_or(path);
     short_path(path, cwd)
 }
 
@@ -482,7 +499,10 @@ fn question_answers(
                 .filter_map(|option| question.options.get(*option))
                 .map(|option| option.label.clone())
                 .collect();
-            if let Some(text) = other.get(index).map(|text| text.trim()).filter(|t| !t.is_empty())
+            if let Some(text) = other
+                .get(index)
+                .map(|text| text.trim())
+                .filter(|t| !t.is_empty())
             {
                 parts.push(text.to_string());
             }
@@ -584,7 +604,12 @@ fn open_field(chat: &mut ClaudeChat, id: &str, window: &mut Window, cx: &mut Con
 }
 
 /// ↵ in a card's text field.
-fn submit_field(chat: &mut ClaudeChat, id: &str, window: &mut Window, cx: &mut Context<ClaudeChat>) {
+fn submit_field(
+    chat: &mut ClaudeChat,
+    id: &str,
+    window: &mut Window,
+    cx: &mut Context<ClaudeChat>,
+) {
     let Some(pending) = pending_of(chat, id, cx) else {
         return;
     };
@@ -703,11 +728,18 @@ fn next_question(
     let other: Vec<String> = card
         .other
         .iter()
-        .map(|field| field.as_ref().map(|field| field.read(cx).text()).unwrap_or_default())
+        .map(|field| {
+            field
+                .as_ref()
+                .map(|field| field.read(cx).text())
+                .unwrap_or_default()
+        })
         .collect();
     let step = card.step;
     let answered = |step: usize| {
-        card.chosen.get(step).is_some_and(|chosen| !chosen.is_empty())
+        card.chosen
+            .get(step)
+            .is_some_and(|chosen| !chosen.is_empty())
             || other.get(step).is_some_and(|text| !text.trim().is_empty())
     };
     if !answered(step) {
@@ -730,7 +762,11 @@ fn next_question(
 fn row_count(chat: &ClaudeChat, pending: &Pending, cx: &App) -> usize {
     match &pending.kind {
         PendingKind::Questions(questions) => {
-            let step = chat.cards.cards.get(&pending.id).map_or(0, |card| card.step);
+            let step = chat
+                .cards
+                .cards
+                .get(&pending.id)
+                .map_or(0, |card| card.step);
             questions
                 .get(step.min(questions.len().saturating_sub(1)))
                 .map_or(0, |question| question.options.len() + 1)
@@ -767,7 +803,9 @@ fn confirm(chat: &mut ClaudeChat, window: &mut Window, cx: &mut Context<ClaudeCh
     let highlighted = chat.cards.cards.get(&id).map_or(0, |card| card.highlighted);
     if let PendingKind::Questions(questions) = &pending.kind {
         let step = chat.cards.cards.get(&id).map_or(0, |card| card.step);
-        let multi = questions.get(step).is_some_and(|question| question.multi_select);
+        let multi = questions
+            .get(step)
+            .is_some_and(|question| question.multi_select);
         let has_choice = chat
             .cards
             .cards
@@ -813,7 +851,14 @@ fn render_card(
     let card = state.cards.entry(pending.id.clone()).or_default();
     let rows_element = match &pending.kind {
         PendingKind::Questions(questions) => render_question_options(&id, questions, card, ui, cx),
-        _ => render_rows(&id, &rows(pending, &cwd), card.highlighted, keyboard, ui, cx),
+        _ => render_rows(
+            &id,
+            &rows(pending, &cwd),
+            card.highlighted,
+            keyboard,
+            ui,
+            cx,
+        ),
     };
     // The rows of the card with the keyboard take the keys (a field never sits inside them).
     let rows_element = div()
@@ -821,7 +866,9 @@ fn render_card(
         .when(keyboard, |rows| {
             rows.key_context(ROWS_CONTEXT)
                 .track_focus(focus)
-                .on_action(cx.listener(|chat, _: &SelectPrevious, _, cx| move_highlight(chat, -1, cx)))
+                .on_action(
+                    cx.listener(|chat, _: &SelectPrevious, _, cx| move_highlight(chat, -1, cx)),
+                )
                 .on_action(cx.listener(|chat, _: &SelectNext, _, cx| move_highlight(chat, 1, cx)))
                 .on_action(cx.listener(|chat, _: &Confirm, window, cx| confirm(chat, window, cx)))
                 .on_action(cx.listener(|chat, _: &Toggle, window, cx| {
@@ -846,7 +893,9 @@ fn render_card(
     let card = state.cards.entry(pending.id.clone()).or_default();
     let field = render_field(&id, pending, card, ui, cx);
     let footer = match &pending.kind {
-        PendingKind::Questions(questions) => Some(render_question_footer(&id, questions, card, ui, cx)),
+        PendingKind::Questions(questions) => {
+            Some(render_question_footer(&id, questions, card, ui, cx))
+        }
         _ => None,
     };
     let field_focused = card
@@ -994,7 +1043,11 @@ fn render_header(
                     row.child(div().text_color(ui.diff_added).child(format!("+{added}")))
                 })
                 .when(removed > 0, |row| {
-                    row.child(div().text_color(ui.diff_deleted).child(format!("−{removed}")))
+                    row.child(
+                        div()
+                            .text_color(ui.diff_deleted)
+                            .child(format!("−{removed}")),
+                    )
                 })
         }))
         .children(detail.map(|detail| {
@@ -1023,10 +1076,9 @@ fn tool_title(pending: &Pending) -> (IconName, String) {
         "Read" | "Glob" | "Grep" => (IconName::Search, tr("Read outside the project?").into()),
         "NotebookEdit" => (IconName::Pencil, tr("Edit a notebook?").into()),
         "Agent" | "Task" => (IconName::Agent, tr("Start a subagent?").into()),
-        _ if tool.starts_with("mcp__") => (
-            IconName::Plug,
-            trf("Use {0}?", &[&pending.display_name]),
-        ),
+        _ if tool.starts_with("mcp__") => {
+            (IconName::Plug, trf("Use {0}?", &[&pending.display_name]))
+        }
         _ => (IconName::Command, trf("Use {0}?", &[&pending.display_name])),
     }
 }
@@ -1044,11 +1096,17 @@ fn render_tool_details(pending: &Pending, cwd: &Path, ui: UiColors) -> Option<An
             text("pattern"),
             text("path").map(|path| short_path(&path, cwd)),
         ),
-        "NotebookEdit" => (text("notebook_path").map(|path| short_path(&path, cwd)), None),
+        "NotebookEdit" => (
+            text("notebook_path").map(|path| short_path(&path, cwd)),
+            None,
+        ),
         "Agent" | "Task" => (text("description"), text("prompt")),
         _ => {
             let json = serde_json::to_string_pretty(input).unwrap_or_default();
-            ((!json.is_empty() && json != "null" && json != "{}").then_some(json), pending.description.clone())
+            (
+                (!json.is_empty() && json != "null" && json != "{}").then_some(json),
+                pending.description.clone(),
+            )
         }
     };
     // Why it asks (a path outside the project…), and the path it is about.
@@ -1155,7 +1213,15 @@ fn render_edit_preview(proposal: &flux_claude::edits::EditProposal, ui: UiColors
                     .child(number.map(|n| n.to_string()).unwrap_or_default()),
             )
             .child(div().flex_none().text_color(color).child(sign))
-            .child(div().text_color(if kind == PreviewKind::More { ui.dim } else { ui.foreground }).child(text))
+            .child(
+                div()
+                    .text_color(if kind == PreviewKind::More {
+                        ui.dim
+                    } else {
+                        ui.foreground
+                    })
+                    .child(text),
+            )
     });
     div()
         .py(px(4.))
@@ -1315,14 +1381,20 @@ fn option_row(
         .rounded(px(ui::RADIUS_SM))
         .cursor_pointer()
         .when(selected, |row| row.bg(ui.list_selected))
-        .when(!selected, move |row| row.hover(move |style| style.bg(ui.hover)))
+        .when(!selected, move |row| {
+            row.hover(move |style| style.bg(ui.hover))
+        })
         .child(
             div()
                 .flex_none()
                 .w(px(14.))
                 .text_size(px(theme::TEXT_SM))
                 .text_color(if selected { ui.accent_text } else { ui.dim })
-                .child(if index < 9 { (index + 1).to_string() } else { String::new() }),
+                .child(if index < 9 {
+                    (index + 1).to_string()
+                } else {
+                    String::new()
+                }),
         )
 }
 
@@ -1499,7 +1571,12 @@ fn render_question_options(
                 .font_family(theme::code_font())
                 .text_size(px(theme::TEXT_SM))
                 .whitespace_nowrap()
-                .children(preview.lines().map(|line| div().child(line.to_string())).collect::<Vec<_>>())
+                .children(
+                    preview
+                        .lines()
+                        .map(|line| div().child(line.to_string()))
+                        .collect::<Vec<_>>(),
+                )
         }))
         .into_any_element()
 }
@@ -1514,7 +1591,10 @@ fn render_question_footer(
 ) -> AnyElement {
     let step = card.step.min(questions.len().saturating_sub(1));
     let last = step + 1 >= questions.len();
-    let answered = card.chosen.get(step).is_some_and(|chosen| !chosen.is_empty())
+    let answered = card
+        .chosen
+        .get(step)
+        .is_some_and(|chosen| !chosen.is_empty())
         || card.other.get(step).is_some_and(Option::is_some);
     let label = if last { tr("Submit") } else { tr("Next") };
     let (next_id, back_id) = (id.to_string(), id.to_string());
@@ -1579,18 +1659,17 @@ fn render_field(
     cx: &mut Context<ClaudeChat>,
 ) -> Option<AnyElement> {
     // The button: a refusal in the error color; keeping on planning isn't one.
-    let (field, button, danger): (Entity<TextInput>, Option<SharedString>, bool) =
-        match &pending.kind {
-            PendingKind::Questions(_) => {
-                let step = card.step;
-                (card.other.get(step)?.clone()?, None, false)
-            }
-            PendingKind::Plan { .. } => {
-                (card.field.clone()?, Some(tr("Keep Planning").into()), false)
-            }
-            PendingKind::Edit(_) => (card.field.clone()?, Some(tr("Reject").into()), true),
-            PendingKind::Tool => (card.field.clone()?, Some(tr("Deny").into()), true),
-        };
+    let (field, button, danger): (Entity<TextInput>, Option<SharedString>, bool) = match &pending
+        .kind
+    {
+        PendingKind::Questions(_) => {
+            let step = card.step;
+            (card.other.get(step)?.clone()?, None, false)
+        }
+        PendingKind::Plan { .. } => (card.field.clone()?, Some(tr("Keep Planning").into()), false),
+        PendingKind::Edit(_) => (card.field.clone()?, Some(tr("Reject").into()), true),
+        PendingKind::Tool => (card.field.clone()?, Some(tr("Deny").into()), true),
+    };
     let submit_id = id.to_string();
     let (enter_id, escape_id) = (id.to_string(), id.to_string());
     Some(
@@ -1640,7 +1719,11 @@ fn render_tasks(
         .tasks
         .iter()
         .find(|task| task.status == TaskStatus::InProgress)
-        .map(|task| task.active_form.clone().unwrap_or_else(|| task.subject.clone()));
+        .map(|task| {
+            task.active_form
+                .clone()
+                .unwrap_or_else(|| task.subject.clone())
+        });
     let collapsed = state.tasks_collapsed;
     let header = div()
         .id("claude-tasks-header")
@@ -1690,12 +1773,8 @@ fn render_tasks(
                 .child(current)
         }));
     let list = (!collapsed).then(|| {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .pl(px(22.))
-            .children(model.tasks.iter().enumerate().map(|(index, task)| {
+        div().flex().flex_col().gap(px(1.)).pl(px(22.)).children(
+            model.tasks.iter().enumerate().map(|(index, task)| {
                 let (mark, color, text): (AnyElement, _, String) = match task.status {
                     TaskStatus::Pending => (
                         ui::radio(("claude-task", index), false, ui).into_any_element(),
@@ -1705,7 +1784,9 @@ fn render_tasks(
                     TaskStatus::InProgress => (
                         ui::radio(("claude-task", index), true, ui).into_any_element(),
                         ui.foreground,
-                        task.active_form.clone().unwrap_or_else(|| task.subject.clone()),
+                        task.active_form
+                            .clone()
+                            .unwrap_or_else(|| task.subject.clone()),
                     ),
                     TaskStatus::Completed => (
                         icon(IconName::CheckCircle, ui.success)
@@ -1734,7 +1815,8 @@ fn render_tasks(
                             })
                             .child(text),
                     )
-            }))
+            }),
+        )
     });
     Some(
         div()
@@ -1773,7 +1855,10 @@ fn render_background(
         let shown = task.task_id.clone();
         let chat = chat.clone();
         div()
-            .id(SharedString::from(format!("claude-background-{}", task.task_id)))
+            .id(SharedString::from(format!(
+                "claude-background-{}",
+                task.task_id
+            )))
             .flex()
             .items_center()
             .gap(px(8.))
@@ -1958,7 +2043,10 @@ mod tests {
             "Allow, and don't ask again for `touch:*` in this project"
         );
         let mode = json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"});
-        assert_eq!(suggestion_label(&mode, cwd, true).unwrap(), "Accept all edits in this session");
+        assert_eq!(
+            suggestion_label(&mode, cwd, true).unwrap(),
+            "Accept all edits in this session"
+        );
         assert_eq!(
             suggestion_label(&mode, cwd, false).unwrap(),
             "Allow, and accept edits in this session"
@@ -1975,7 +2063,8 @@ mod tests {
             suggestion_label(&read, cwd, false).unwrap(),
             "Allow, and don't ask again for reading `/tmp/data/**` in this session"
         );
-        let dirs = json!({"type": "addDirectories", "directories": ["/p/sub"], "destination": "session"});
+        let dirs =
+            json!({"type": "addDirectories", "directories": ["/p/sub"], "destination": "session"});
         assert_eq!(
             suggestion_label(&dirs, cwd, false).unwrap(),
             "Allow, and allow access to `sub` in this session"
@@ -1986,19 +2075,32 @@ mod tests {
 
     #[test]
     fn permission_rows_end_with_deny() {
-        let suggestion = json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"});
+        let suggestion =
+            json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"});
         let rows = rows(
             &pending("Bash", PendingKind::Tool, vec![suggestion.clone()]),
             Path::new("/p"),
         );
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].choice, Choice::Allow { remember: vec![] });
-        assert_eq!(rows[1].choice, Choice::Allow { remember: vec![suggestion.clone()] });
+        assert_eq!(
+            rows[1].choice,
+            Choice::Allow {
+                remember: vec![suggestion.clone()]
+            }
+        );
         assert_eq!(rows[2].choice, Choice::Deny);
         let mut hidden = pending("Bash", PendingKind::Tool, vec![suggestion]);
         hidden.suppress_always_allow = true;
         assert_eq!(rows_len(&hidden), 2);
-        let plan = pending("ExitPlanMode", PendingKind::Plan { plan: "x".into(), path: None }, vec![]);
+        let plan = pending(
+            "ExitPlanMode",
+            PendingKind::Plan {
+                plan: "x".into(),
+                path: None,
+            },
+            vec![],
+        );
         assert_eq!(rows_len(&plan), 3);
     }
 
@@ -2050,7 +2152,13 @@ mod tests {
 
     #[test]
     fn deny_without_words_stops_the_turn() {
-        assert!(matches!(deny("  "), Answer::Deny { interrupt: true, .. }));
+        assert!(matches!(
+            deny("  "),
+            Answer::Deny {
+                interrupt: true,
+                ..
+            }
+        ));
         match deny("use cargo") {
             Answer::Deny { message, interrupt } => {
                 assert!(!interrupt);

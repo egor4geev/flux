@@ -3,8 +3,14 @@
 pub(super) const STRINGS: &[(&str, &str)] = &[
     // Editing a sent message
     ("Editing a message", "Изменение сообщения"),
-    ("This message can't be edited", "Это сообщение нельзя изменить"),
-    ("The message isn't in the conversation", "Сообщения нет в разговоре"),
+    (
+        "This message can't be edited",
+        "Это сообщение нельзя изменить",
+    ),
+    (
+        "The message isn't in the conversation",
+        "Сообщения нет в разговоре",
+    ),
     (
         "The session's record doesn't have this message",
         "В записи сессии нет этого сообщения",
@@ -16,10 +22,19 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Rewind the code to before this message?",
         "Откатить код до этого сообщения?",
     ),
-    ("Roll back the changes of this turn?", "Откатить изменения этого хода?"),
-    ("Roll back Claude's changes to {0}?", "Откатить изменения Claude в {0}?"),
+    (
+        "Roll back the changes of this turn?",
+        "Откатить изменения этого хода?",
+    ),
+    (
+        "Roll back Claude's changes to {0}?",
+        "Откатить изменения Claude в {0}?",
+    ),
     ("Roll back this edit of {0}?", "Откатить эту правку {0}?"),
-    ("Can't roll back this edit of {0}", "Не удаётся откатить правку {0}"),
+    (
+        "Can't roll back this edit of {0}",
+        "Не удаётся откатить правку {0}",
+    ),
     (
         "The file changed after the edit, and the edited text isn't in it as it was. Compare the edit with the file and undo it by hand.",
         "Файл изменился после правки, и исправленного текста в нём в прежнем виде нет. Сравните правку с файлом и отмените её вручную.",

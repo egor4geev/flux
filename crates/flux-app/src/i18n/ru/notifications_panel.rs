@@ -8,7 +8,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Clear All", "Очистить всё"),
     ("Notification Settings", "Настройки уведомлений"),
     ("Remove", "Удалить"),
-    ("No notifications in this group", "В этой группе нет уведомлений"),
+    (
+        "No notifications in this group",
+        "В этой группе нет уведомлений",
+    ),
     ("No notifications", "Уведомлений нет"),
     (
         "Results of Git operations, errors and messages of Flux will appear here",

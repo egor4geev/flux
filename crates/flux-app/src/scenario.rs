@@ -161,9 +161,8 @@ fn keep_panels_off_the_keyboard() {
         // SAFETY: `canBecomeKeyWindow` is a method of the class with this signature
         // (`- (BOOL)canBecomeKeyWindow`); only its implementation is replaced.
         unsafe {
-            let imp = std::mem::transmute::<extern "C" fn(&Object, Sel) -> BOOL, Imp>(
-                cannot_become_key,
-            );
+            let imp =
+                std::mem::transmute::<extern "C" fn(&Object, Sel) -> BOOL, Imp>(cannot_become_key);
             class_replaceMethod(panel, sel!(canBecomeKeyWindow), imp, c"B@:".as_ptr());
         }
     });
@@ -380,8 +379,8 @@ fn capture_later(name: String, cx: &AsyncApp) {
         for window in windows {
             let image = window
                 .update(cx, |_, window, cx| {
-                    let dark = crate::theme::Theme::get(cx).appearance
-                        == crate::theme::Appearance::Dark;
+                    let dark =
+                        crate::theme::Theme::get(cx).appearance == crate::theme::Appearance::Dark;
                     let width = f32::from(window.bounds().size.width);
                     let ui_scale = window.ui_scale();
                     window.render_to_image(cx).map(|image| {
@@ -418,7 +417,9 @@ fn over_backdrop(mut image: image::RgbaImage, dark: bool) -> image::RgbaImage {
     for pixel in image.pixels_mut() {
         let alpha = f32::from(pixel[3]) / 255.;
         for (channel, back) in pixel.0.iter_mut().take(3).zip(backdrop) {
-            *channel = (f32::from(*channel) + back * (1. - alpha)).round().min(255.) as u8;
+            *channel = (f32::from(*channel) + back * (1. - alpha))
+                .round()
+                .min(255.) as u8;
         }
         pixel[3] = 255;
     }
@@ -447,15 +448,17 @@ fn paint_traffic_lights(image: &mut image::RgbaImage, device: f32, ui_scale: f32
         for y in rows.filter(|y| *y < height) {
             let columns = (center_x - radius - 1.).max(0.) as u32..(center_x + radius + 2.) as u32;
             for x in columns.filter(|x| *x < width) {
-                let distance =
-                    ((x as f32 + 0.5 - center_x).powi(2) + (y as f32 + 0.5 - center_y).powi(2)).sqrt();
+                let distance = ((x as f32 + 0.5 - center_x).powi(2)
+                    + (y as f32 + 0.5 - center_y).powi(2))
+                .sqrt();
                 let coverage = (radius + 0.5 - distance).clamp(0., 1.);
                 if coverage == 0. {
                     continue;
                 }
                 let pixel = image.get_pixel_mut(x, y);
                 for (channel, value) in pixel.0.iter_mut().take(3).zip(color) {
-                    *channel = (f32::from(*channel) * (1. - coverage) + value * coverage).round() as u8;
+                    *channel =
+                        (f32::from(*channel) * (1. - coverage) + value * coverage).round() as u8;
                 }
             }
         }
@@ -482,7 +485,11 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
         println!(
             "OPEN-PROJECT {} -> {}",
             &step["open-project:".len()..],
-            if dispatched { "dispatched" } else { "no window" }
+            if dispatched {
+                "dispatched"
+            } else {
+                "no window"
+            }
         );
         return STEP_PAUSE;
     }
@@ -507,7 +514,10 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
             .split_once(',')
             .and_then(|(x, y)| Some((x.parse::<f64>().ok()?, y.parse::<f64>().ok()?)));
         let clicked = point.is_some_and(|(x, y)| post_click(x, y));
-        println!("CLICK {point:?} -> {}", if clicked { "posted" } else { "no window" });
+        println!(
+            "CLICK {point:?} -> {}",
+            if clicked { "posted" } else { "no window" }
+        );
         return STEP_PAUSE;
     }
     if step == "app-terminate" {
@@ -547,7 +557,10 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
             _ => Vec::new(),
         };
         let posted = !events.is_empty() && post_mouse(&events);
-        println!("MOUSE {step} -> {}", if posted { "posted" } else { "bad step" });
+        println!(
+            "MOUSE {step} -> {}",
+            if posted { "posted" } else { "bad step" }
+        );
         return STEP_PAUSE;
     }
     if let Some(name) = step.strip_prefix("action:") {

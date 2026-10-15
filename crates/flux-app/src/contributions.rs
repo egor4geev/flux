@@ -481,7 +481,11 @@ extensions = ["zz"]
         assert!(resolved.languages[0].1.is_empty());
         let unknown = MANIFEST.replace("builtin = \"javascript\"", "builtin = \"cobol\"");
         let resolved = resolve(&[plugin(&unknown, PluginSource::Bundled)]);
-        assert!(resolved.problems[0].1.contains("cobol"), "{:?}", resolved.problems);
+        assert!(
+            resolved.problems[0].1.contains("cobol"),
+            "{:?}",
+            resolved.problems
+        );
         let lonely = r#"
 id = "test.lonely"
 name = "Lonely"

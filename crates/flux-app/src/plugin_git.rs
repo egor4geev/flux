@@ -135,9 +135,9 @@ pub(crate) fn set_commit_template(
     let template = template
         .filter(|template| !template.text.trim().is_empty())
         .map(|template| (template.text, template.prefix));
-    workspace.git().update(cx, |git, cx| {
-        git.set_commit_template(plugin, template, cx)
-    });
+    workspace
+        .git()
+        .update(cx, |git, cx| git.set_commit_template(plugin, template, cx));
 }
 
 /// The repository whose work tree holds `root` (relative — in the project).
@@ -214,12 +214,7 @@ impl Waiting {
     }
 }
 
-fn waiting(
-    workspace: &Workspace,
-    plugin: &str,
-    id: u64,
-    cx: &mut Context<Workspace>,
-) -> Waiting {
+fn waiting(workspace: &Workspace, plugin: &str, id: u64, cx: &mut Context<Workspace>) -> Waiting {
     let (sender, receiver) = oneshot::channel::<Result<(), String>>();
     let plugins = workspace.plugins.downgrade();
     let plugin = plugin.to_string();

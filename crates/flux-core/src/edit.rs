@@ -40,7 +40,11 @@ pub fn insert_newline(text: &Rope, selection: &Selection, line_ending: &str) -> 
             .chars()
             .take(range.from() - line_start(text, line))
             .collect();
-        (range.from(), range.to(), Some(format!("{line_ending}{indent}")))
+        (
+            range.from(),
+            range.to(),
+            Some(format!("{line_ending}{indent}")),
+        )
     })
 }
 
@@ -58,7 +62,11 @@ pub fn insert_tab(text: &Rope, selection: &Selection, tab_width: usize) -> Trans
 pub fn delete_backward(text: &Rope, selection: &Selection) -> Transaction {
     change_by_selection(text, selection, |range| {
         if range.is_empty() {
-            (prev_grapheme_boundary(text.slice(..), range.head), range.head, None)
+            (
+                prev_grapheme_boundary(text.slice(..), range.head),
+                range.head,
+                None,
+            )
         } else {
             (range.from(), range.to(), None)
         }
@@ -69,7 +77,11 @@ pub fn delete_backward(text: &Rope, selection: &Selection) -> Transaction {
 pub fn delete_forward(text: &Rope, selection: &Selection) -> Transaction {
     change_by_selection(text, selection, |range| {
         if range.is_empty() {
-            (range.head, next_grapheme_boundary(text.slice(..), range.head), None)
+            (
+                range.head,
+                next_grapheme_boundary(text.slice(..), range.head),
+                None,
+            )
         } else {
             (range.from(), range.to(), None)
         }
@@ -148,7 +160,11 @@ pub fn delete_lines(text: &Rope, selection: &Selection) -> Transaction {
 mod tests {
     use super::*;
 
-    fn run(text: &str, selection: Selection, f: impl Fn(&Rope, &Selection) -> Transaction) -> (String, Selection) {
+    fn run(
+        text: &str,
+        selection: Selection,
+        f: impl Fn(&Rope, &Selection) -> Transaction,
+    ) -> (String, Selection) {
         let mut rope = Rope::from_str(text);
         let tx = f(&rope, &selection);
         tx.changes.apply(&mut rope);
@@ -174,7 +190,9 @@ mod tests {
 
     #[test]
     fn newline_keeps_indent() {
-        let (text, sel) = run("    foo", Selection::point(7), |t, s| insert_newline(t, s, "\n"));
+        let (text, sel) = run("    foo", Selection::point(7), |t, s| {
+            insert_newline(t, s, "\n")
+        });
         assert_eq!(text, "    foo\n    ");
         assert_eq!(sel.primary(), Range::point(12));
     }

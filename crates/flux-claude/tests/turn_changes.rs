@@ -2,10 +2,10 @@
 
 use std::path::PathBuf;
 
+use flux_claude::Session;
 use flux_claude::process::ProcessEvent;
 use flux_claude::protocol::{self, Incoming};
 use flux_claude::session::{EntryKind, TurnFile};
-use flux_claude::Session;
 
 fn replay(name: &str) -> Session {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

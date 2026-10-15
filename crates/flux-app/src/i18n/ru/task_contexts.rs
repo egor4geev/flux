@@ -6,7 +6,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Save Context", "Сохранить контекст"),
     ("Load Context", "Загрузить контекст"),
     ("Clear Context", "Очистить контекст"),
-    ("Contexts are kept by project", "Контексты хранятся по проектам"),
+    (
+        "Contexts are kept by project",
+        "Контексты хранятся по проектам",
+    ),
     ("Context name", "Название контекста"),
     (
         "The open tabs come back with Load Context",
@@ -23,7 +26,5 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("load", "загрузить"),
 ];
 
-pub(super) const PLURALS: &[(&str, [&str; 3])] = &[(
-    "{n} tab",
-    ["{n} вкладка", "{n} вкладки", "{n} вкладок"],
-)];
+pub(super) const PLURALS: &[(&str, [&str; 3])] =
+    &[("{n} tab", ["{n} вкладка", "{n} вкладки", "{n} вкладок"])];

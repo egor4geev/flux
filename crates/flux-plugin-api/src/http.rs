@@ -311,7 +311,10 @@ mod tests {
             with_query("https://x/authorize", &[("scope", "a b"), ("state", "1")]),
             "https://x/authorize?scope=a%20b&state=1"
         );
-        assert_eq!(with_query("https://x/?a=1", &[("b", "2")]), "https://x/?a=1&b=2");
+        assert_eq!(
+            with_query("https://x/?a=1", &[("b", "2")]),
+            "https://x/?a=1&b=2"
+        );
         assert_eq!(with_query("https://x/", &[]), "https://x/");
     }
 

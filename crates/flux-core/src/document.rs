@@ -140,8 +140,8 @@ impl Document {
             return None;
         }
 
-        let inversion = Transaction::new(changes.invert(&self.text))
-            .with_selection(selection_before.clone());
+        let inversion =
+            Transaction::new(changes.invert(&self.text)).with_selection(selection_before.clone());
         let change = TextChange {
             old_text: self.text.clone(),
             changes: changes.clone(),
@@ -221,7 +221,10 @@ impl Document {
         let result = (|| {
             let mut writer = BufWriter::new(File::create(&tmp)?);
             self.text.write_to(&mut writer)?;
-            writer.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            writer
+                .into_inner()
+                .map_err(|e| e.into_error())?
+                .sync_all()?;
             if let Some(permissions) = permissions {
                 fs::set_permissions(&tmp, permissions)?;
             }

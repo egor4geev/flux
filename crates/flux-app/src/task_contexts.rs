@@ -27,8 +27,8 @@ use flux_plugin::api::contexts::ContextRef;
 use flux_plugin::runtime::WindowReply;
 use flux_search::{FuzzyMatch, match_list};
 use gpui::{
-    AnyElement, App, Context, DismissEvent, Div, KeyBinding, MouseButton, SharedString,
-    WeakEntity, Window, actions, div, prelude::*, px,
+    AnyElement, App, Context, DismissEvent, Div, KeyBinding, MouseButton, SharedString, WeakEntity,
+    Window, actions, div, prelude::*, px,
 };
 use serde_json::{Value, json};
 
@@ -62,12 +62,12 @@ pub fn init(cx: &mut App) {
 
 /// The window's commands of contexts.
 pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
-    root.on_action(cx.listener(|workspace, _: &SaveContext, window, cx| {
-        save_context(workspace, window, cx)
-    }))
-    .on_action(cx.listener(|workspace, _: &LoadContext, window, cx| {
-        load_context(workspace, window, cx)
-    }))
+    root.on_action(
+        cx.listener(|workspace, _: &SaveContext, window, cx| save_context(workspace, window, cx)),
+    )
+    .on_action(
+        cx.listener(|workspace, _: &LoadContext, window, cx| load_context(workspace, window, cx)),
+    )
     .on_action(cx.listener(|workspace, _: &ClearContext, window, cx| {
         workspace.close_context_tabs(window, cx)
     }))
@@ -147,9 +147,7 @@ pub(crate) fn switch_for_plugin(
         );
     }
     workspace.close_context_tabs(window, cx);
-    if let Some(saved) =
-        load.and_then(|key| find(&root, &plugin_key(plugin, &key)))
-    {
+    if let Some(saved) = load.and_then(|key| find(&root, &plugin_key(plugin, &key))) {
         open(workspace, &saved, window, cx);
     }
     reply.send(WindowReply::Done(Ok(()))).ok();
@@ -233,14 +231,24 @@ fn load_context(workspace: &mut Workspace, window: &mut Window, cx: &mut Context
 }
 
 /// Replaces the open tabs with a saved context's.
-fn switch_to(workspace: &mut Workspace, saved: &Saved, window: &mut Window, cx: &mut Context<Workspace>) {
+fn switch_to(
+    workspace: &mut Workspace,
+    saved: &Saved,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     workspace.close_context_tabs(window, cx);
     open(workspace, saved, window, cx);
 }
 
 /// Opens a context's tabs after the open ones: the documents read in the background, the chats
 /// resumed from their transcripts.
-fn open(workspace: &mut Workspace, saved: &Saved, window: &mut Window, cx: &mut Context<Workspace>) {
+fn open(
+    workspace: &mut Workspace,
+    saved: &Saved,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let tabs = &saved.tabs;
     workspace.open_saved_tabs(
         tabs.files.clone(),
@@ -286,7 +294,11 @@ struct ContextList {
 }
 
 impl ContextList {
-    fn new(workspace: WeakEntity<Workspace>, root: PathBuf, names: HashMap<String, String>) -> Self {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        root: PathBuf,
+        names: HashMap<String, String>,
+    ) -> Self {
         let mut list = ContextList {
             contexts: load(&root),
             workspace,
@@ -301,7 +313,11 @@ impl ContextList {
     }
 
     fn refilter(&mut self) {
-        let titles: Vec<&str> = self.contexts.iter().map(|saved| saved.title.as_str()).collect();
+        let titles: Vec<&str> = self
+            .contexts
+            .iter()
+            .map(|saved| saved.title.as_str())
+            .collect();
         self.matches = match_list(&self.query, &titles);
     }
 
@@ -314,7 +330,12 @@ impl ContextList {
         let tabs = saved.tabs.files.len() + saved.tabs.chats.len();
         let mut parts = vec![trn(tabs, "{n} tab", "{n} tabs")];
         if let Some(plugin) = &saved.plugin {
-            parts.push(self.names.get(plugin).cloned().unwrap_or_else(|| plugin.clone()));
+            parts.push(
+                self.names
+                    .get(plugin)
+                    .cloned()
+                    .unwrap_or_else(|| plugin.clone()),
+            );
         }
         parts.push(crate::git_log::format_time(self.now, saved.saved_at as i64));
         parts.join(" · ")
@@ -366,9 +387,9 @@ impl PickerDelegate for ContextList {
             .flex_none()
             .tooltip(crate::ui::tooltip(tr("Delete Context"), Some("⌘⌫".into())))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |picker, _, window, cx| {
-                picker.delegate.delete(index, window, cx)
-            }))
+            .on_click(
+                cx.listener(move |picker, _, window, cx| picker.delegate.delete(index, window, cx)),
+            )
             .when(!selected, |button| {
                 button
                     .invisible()
@@ -712,8 +733,7 @@ mod tests {
             let mut list = parse_list(&value["projects"][key(root)]);
             list.retain(|known| known.key != saved.key);
             list.insert(0, saved);
-            value["projects"][key(root)] =
-                Value::Array(list.iter().map(context_json).collect());
+            value["projects"][key(root)] = Value::Array(list.iter().map(context_json).collect());
             write(&file, &value).unwrap();
         };
         put_in(root, saved("user:old", 10));
@@ -748,7 +768,10 @@ mod tests {
     #[test]
     fn keys_keep_plugins_and_the_user_apart() {
         assert_eq!(user_key("Release"), "user:Release");
-        assert_eq!(plugin_key("flux.yandex", "TRACK-142"), "plugin:flux.yandex:TRACK-142");
+        assert_eq!(
+            plugin_key("flux.yandex", "TRACK-142"),
+            "plugin:flux.yandex:TRACK-142"
+        );
         assert_ne!(plugin_key("a.b", "c"), plugin_key("a", "b:c"));
     }
 }

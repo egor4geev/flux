@@ -32,7 +32,9 @@ pub fn init(cx: &mut App) {
         // The action arrives while its window is being updated: the window is updated after.
         cx.defer(move |cx| {
             window
-                .update(cx, |workspace, window, cx| configure(workspace, &name, window, cx))
+                .update(cx, |workspace, window, cx| {
+                    configure(workspace, &name, window, cx)
+                })
                 .ok();
         });
     });
@@ -166,10 +168,7 @@ pub fn configure(
     let edited = tab
         .as_ref()
         .is_some_and(|editor| editor.read(cx).document.is_modified());
-    if !edited
-        && settings::file_error(cx).is_none()
-        && settings::lsp_server(server, cx).is_none()
-    {
+    if !edited && settings::file_error(cx).is_none() && settings::lsp_server(server, cx).is_none() {
         settings::update_lsp(cx, |lsp| {
             lsp.insert(server.to_string(), stub(server));
         });
@@ -289,7 +288,10 @@ mod tests {
 
     #[test]
     fn configure_adds_the_section_the_server_asks_for() {
-        assert_eq!(stub("rust-analyzer"), json!({ "settings": { "rust-analyzer": {} } }));
+        assert_eq!(
+            stub("rust-analyzer"),
+            json!({ "settings": { "rust-analyzer": {} } })
+        );
         assert_eq!(stub("pyright"), json!({ "settings": { "python": {} } }));
         assert_eq!(stub("some-server"), json!({ "settings": {} }));
         // Empty, it changes nothing in the server's config.

@@ -134,7 +134,10 @@ fn last_error_in(lines: &[&str]) -> Option<String> {
     };
     let starts_block = |line: &str| {
         let line = line.trim_start();
-        line == "stderr:" || line.get(..4).is_some_and(|year| year.parse::<u16>().is_ok())
+        line == "stderr:"
+            || line
+                .get(..4)
+                .is_some_and(|year| year.parse::<u16>().is_ok())
     };
     let last = lines.iter().rposition(|line| is_error(line))?;
     // The block of the last error: its first line, and the log line that heads it.
@@ -156,7 +159,11 @@ fn last_error_in(lines: &[&str]) -> Option<String> {
     let inline = start
         .checked_sub(1)
         .map(|heading| lines[heading])
-        .and_then(|heading| heading.rfind(INLINE).map(|at| &heading[at + INLINE.len()..]));
+        .and_then(|heading| {
+            heading
+                .rfind(INLINE)
+                .map(|at| &heading[at + INLINE.len()..])
+        });
     let (message, after) = match inline {
         Some(message) => (message.trim(), start),
         None => {
@@ -216,7 +223,12 @@ mod tests {
         }
         let text = log.text();
         assert_eq!(text.lines().count(), MAX_LINES);
-        assert!(text.lines().last().unwrap().ends_with(&(MAX_LINES + 9).to_string()));
+        assert!(
+            text.lines()
+                .last()
+                .unwrap()
+                .ends_with(&(MAX_LINES + 9).to_string())
+        );
         assert!(!text.contains("started"));
     }
 
@@ -242,7 +254,8 @@ mod tests {
             "help: to avoid searching for a non-existent workspace, add `[workspace]`",
             "",
         ];
-        let mut stderr = vec!["2026-10-15T10:26:53.43294+03:00 ERROR failed fetching cargo workspace"];
+        let mut stderr =
+            vec!["2026-10-15T10:26:53.43294+03:00 ERROR failed fetching cargo workspace"];
         stderr.extend(block);
         stderr.push("2026-10-15T10:26:53.487895+03:00  WARN failed to run `cargo metadata`");
         stderr.extend(block);
@@ -295,7 +308,10 @@ mod tests {
     fn only_stderr_counts_for_the_last_error() {
         let log = ServerLog::new();
         log.push(LogSource::Stderr, "error: broken\n --> Cargo.toml:1:1");
-        log.push(LogSource::Message(MessageType::ERROR), "error: from a message");
+        log.push(
+            LogSource::Message(MessageType::ERROR),
+            "error: from a message",
+        );
         assert_eq!(log.last_error().as_deref(), Some("broken (Cargo.toml:1:1)"));
     }
 }

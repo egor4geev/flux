@@ -244,8 +244,8 @@ impl AppearancePage {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let ui = Theme::ui(cx);
-        let preview = theme::by_name(&info.name, cx)
-            .unwrap_or_else(|| Theme::base(info.appearance));
+        let preview =
+            theme::by_name(&info.name, cx).unwrap_or_else(|| Theme::base(info.appearance));
         // Where it comes from: its plugin (unless named as the theme), or Flux itself.
         let source: Option<SharedString> = match &info.plugin {
             Some(plugin) => {
@@ -266,7 +266,11 @@ impl AppearancePage {
             .p_1p5()
             .rounded(px(ui::RADIUS_LG))
             .border_2()
-            .border_color(if selected { ui.accent } else { ui.island_border })
+            .border_color(if selected {
+                ui.accent
+            } else {
+                ui.island_border
+            })
             .cursor_pointer()
             .hover(move |style| style.bg(ui.hover))
             .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
@@ -343,7 +347,11 @@ impl AppearancePage {
                 .p_1p5()
                 .rounded(px(ui::RADIUS_LG))
                 .border_2()
-                .border_color(if selected { ui.accent } else { ui.island_border })
+                .border_color(if selected {
+                    ui.accent
+                } else {
+                    ui.island_border
+                })
                 .cursor_pointer()
                 .hover(move |card| card.bg(ui.hover))
                 .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
@@ -402,7 +410,11 @@ impl AppearancePage {
                 .justify_center()
                 .rounded(px(ui::RADIUS_SM))
                 .cursor_pointer()
-                .text_color(if selected { ui.accent_text } else { ui.text_muted })
+                .text_color(if selected {
+                    ui.accent_text
+                } else {
+                    ui.text_muted
+                })
                 .when(selected, |chip| {
                     chip.bg(ui.list_selected).font_weight(FontWeight::SEMIBOLD)
                 })
@@ -417,14 +429,8 @@ impl AppearancePage {
         });
         // The keys of Zoom In / Zoom Out / Reset, as their commands have them.
         let hints: Vec<(SharedString, &'static str)> = [
-            (
-                ui::shortcut_for(&ui_scale::ZoomIn, cx),
-                tr("Zoom In"),
-            ),
-            (
-                ui::shortcut_for(&ui_scale::ZoomOut, cx),
-                tr("Zoom Out"),
-            ),
+            (ui::shortcut_for(&ui_scale::ZoomIn, cx), tr("Zoom In")),
+            (ui::shortcut_for(&ui_scale::ZoomOut, cx), tr("Zoom Out")),
             (ui::shortcut_for(&ui_scale::ResetZoom, cx), tr("Reset")),
         ]
         .into_iter()
@@ -847,7 +853,11 @@ fn switch_row(
                         .child(detail),
                 ),
         )
-        .child(ui::switch(SharedString::from(format!("{id}-switch")), on, ui))
+        .child(ui::switch(
+            SharedString::from(format!("{id}-switch")),
+            on,
+            ui,
+        ))
 }
 
 /// A link to Settings → Plugins, which opens on the Marketplace.
@@ -961,7 +971,9 @@ pub(crate) fn theme_preview(theme: &Theme) -> Div {
                 .when(style.is_some_and(|style| style.bold), |piece| {
                     piece.font_weight(FontWeight::BOLD)
                 })
-                .when(style.is_some_and(|style| style.italic), |piece| piece.italic())
+                .when(style.is_some_and(|style| style.italic), |piece| {
+                    piece.italic()
+                })
                 .child(*text)
         });
         div()
@@ -971,11 +983,20 @@ pub(crate) fn theme_preview(theme: &Theme) -> Div {
             .items_center()
             .whitespace_nowrap()
             .overflow_hidden()
-            .when(index == SAMPLE_CURRENT_LINE, |line| line.bg(ui.current_line))
+            .when(index == SAMPLE_CURRENT_LINE, |line| {
+                line.bg(ui.current_line)
+            })
             .children(pieces)
             // The cursor at the end of the current line, in the theme's cursor color.
             .when(index == SAMPLE_CURRENT_LINE, |line| {
-                line.child(div().flex_none().ml(px(1.)).w(px(1.5)).h(px(10.)).bg(ui.cursor))
+                line.child(
+                    div()
+                        .flex_none()
+                        .ml(px(1.))
+                        .w(px(1.5))
+                        .h(px(10.))
+                        .bg(ui.cursor),
+                )
             })
     });
     let editor = div()
@@ -1039,13 +1060,15 @@ pub(crate) fn style_preview(theme: &Theme, style: UiStyle) -> Div {
             .bg(surfaces.island)
             .overflow_hidden()
             .when(!flat, |panel| {
-                panel
-                    .rounded(px(4.))
-                    .border_1()
-                    .border_color(line)
+                panel.rounded(px(4.)).border_1().border_color(line)
             })
     };
-    let light = |color: Hsla| div().size(px(5.)).rounded(px(2.5)).bg(UiColors::tint(color, 0.85));
+    let light = |color: Hsla| {
+        div()
+            .size(px(5.))
+            .rounded(px(2.5))
+            .bg(UiColors::tint(color, 0.85))
+    };
     let title = div()
         .flex_none()
         .h(px(15.))
@@ -1140,8 +1163,14 @@ pub(crate) fn style_preview(theme: &Theme, style: UiStyle) -> Div {
                 .flex()
                 .flex_col()
                 .gap(px(4.))
-                .child(line_of(0., vec![code("keyword", 0.16), code("function", 0.28)]))
-                .child(line_of(8., vec![code("keyword", 0.14), code("string", 0.3)]))
+                .child(line_of(
+                    0.,
+                    vec![code("keyword", 0.16), code("function", 0.28)],
+                ))
+                .child(line_of(
+                    8.,
+                    vec![code("keyword", 0.14), code("string", 0.3)],
+                ))
                 .child(line_of(8., vec![code("comment", 0.4)]))
                 .child(line_of(0., vec![code("punctuation.bracket", 0.05)])),
         );
@@ -1186,17 +1215,13 @@ pub(crate) fn style_preview(theme: &Theme, style: UiStyle) -> Div {
         // The frame's glow, with the preview's own corners (a child's background isn't clipped by
         // the parent's rounding).
         .when(!flat, |window| {
-            window.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .rounded(px(ui::RADIUS_MD))
-                    .bg(gpui::linear_gradient(
-                        135.,
-                        gpui::linear_color_stop(ui.frame_glow, 0.),
-                        gpui::linear_color_stop(UiColors::tint(ui.frame_glow, 0.), 0.55),
-                    )),
-            )
+            window.child(div().absolute().inset_0().rounded(px(ui::RADIUS_MD)).bg(
+                gpui::linear_gradient(
+                    135.,
+                    gpui::linear_color_stop(ui.frame_glow, 0.),
+                    gpui::linear_color_stop(UiColors::tint(ui.frame_glow, 0.), 0.55),
+                ),
+            ))
         })
         .child(title)
         .child(body)
@@ -1211,8 +1236,14 @@ mod tests {
     /// settings file) marks none.
     #[test]
     fn the_scale_marks_its_step() {
-        assert_eq!(scale_step(1.), ui_scale::STEPS.iter().position(|step| *step == 1.));
-        assert_eq!(scale_step(1.25), ui_scale::STEPS.iter().position(|step| *step == 1.25));
+        assert_eq!(
+            scale_step(1.),
+            ui_scale::STEPS.iter().position(|step| *step == 1.)
+        );
+        assert_eq!(
+            scale_step(1.25),
+            ui_scale::STEPS.iter().position(|step| *step == 1.25)
+        );
         assert_eq!(scale_step(1.2500001), scale_step(1.25));
         assert_eq!(scale_step(1.05), None);
         assert_eq!(STYLES, [UiStyle::Islands, UiStyle::Flat]);

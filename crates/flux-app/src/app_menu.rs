@@ -146,7 +146,8 @@ fn cycle_windows(step: isize, cx: &mut App) {
     // The action arrives while the active window is being updated: the other one is updated
     // after.
     cx.defer(move |cx| {
-        next.update(cx, |_, window, _| window.activate_window()).ok();
+        next.update(cx, |_, window, _| window.activate_window())
+            .ok();
     });
 }
 

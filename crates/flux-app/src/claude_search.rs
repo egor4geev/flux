@@ -122,10 +122,14 @@ impl ClaudeChat {
         let Some(search) = &self.search else {
             return;
         };
-        let needle: Vec<char> = search.query.read(cx).text().to_lowercase().chars().collect();
-        let previous = (!fresh)
-            .then(|| current_entry(search))
-            .flatten();
+        let needle: Vec<char> = search
+            .query
+            .read(cx)
+            .text()
+            .to_lowercase()
+            .chars()
+            .collect();
+        let previous = (!fresh).then(|| current_entry(search)).flatten();
         let found = {
             let session = self.session().read(cx);
             let model = session.model();
@@ -200,7 +204,11 @@ impl ClaudeChat {
 
     /// Brings the current match into view.
     fn reveal_current(&mut self, cx: &mut Context<Self>) {
-        let Some(entry) = self.search.as_ref().and_then(current_entry).map(|(entry, _)| entry)
+        let Some(entry) = self
+            .search
+            .as_ref()
+            .and_then(current_entry)
+            .map(|(entry, _)| entry)
         else {
             return;
         };
@@ -312,12 +320,12 @@ fn shell_texts(shell: &ShellEntry) -> Vec<String> {
 
 /// ⌘F, ⌘G and ⇧⌘G on the chat (the window's find bar actions, caught before the window's).
 pub fn actions(root: gpui::Div, cx: &mut Context<ClaudeChat>) -> gpui::Div {
-    root.on_action(cx.listener(|chat, _: &find_bar::Deploy, window, cx| {
-        chat.deploy_search(window, cx)
-    }))
-    .on_action(cx.listener(|chat, _: &find_bar::DeployReplace, window, cx| {
-        chat.deploy_search(window, cx)
-    }))
+    root.on_action(
+        cx.listener(|chat, _: &find_bar::Deploy, window, cx| chat.deploy_search(window, cx)),
+    )
+    .on_action(
+        cx.listener(|chat, _: &find_bar::DeployReplace, window, cx| chat.deploy_search(window, cx)),
+    )
     .on_action(cx.listener(|chat, _: &find_bar::FindNext, window, cx| {
         if chat.search_is_open() {
             chat.step_search(true, cx)
@@ -384,9 +392,9 @@ pub fn render_bar(
         .child(
             ui::icon_button("claude-search-close", IconName::Close, ui)
                 .tooltip(tip("Close", &find_bar::Dismiss, &focus))
-                .on_click(cx.listener(|chat, _: &ClickEvent, window, cx| {
-                    chat.close_search(window, cx)
-                })),
+                .on_click(
+                    cx.listener(|chat, _: &ClickEvent, window, cx| chat.close_search(window, cx)),
+                ),
         );
     Some(
         claude_transcript::column(
@@ -399,9 +407,11 @@ pub fn render_bar(
                 .on_action(cx.listener(|chat, _: &find_bar::SelectNextMatch, _, cx| {
                     chat.step_search(true, cx)
                 }))
-                .on_action(cx.listener(|chat, _: &find_bar::SelectPreviousMatch, _, cx| {
-                    chat.step_search(false, cx)
-                }))
+                .on_action(
+                    cx.listener(|chat, _: &find_bar::SelectPreviousMatch, _, cx| {
+                        chat.step_search(false, cx)
+                    }),
+                )
                 .on_action(cx.listener(|chat, _: &find_bar::Dismiss, window, cx| {
                     chat.close_search(window, cx)
                 }))
@@ -452,8 +462,9 @@ mod tests {
             entry(
                 2,
                 EntryKind::Text {
-                    text: "The **config** reads `CONFIG_PATH` first.\n\n```rust\nlet config = 1;\n```"
-                        .to_string(),
+                    text:
+                        "The **config** reads `CONFIG_PATH` first.\n\n```rust\nlet config = 1;\n```"
+                            .to_string(),
                     streaming: false,
                 },
             ),
@@ -471,7 +482,10 @@ mod tests {
             entry_texts(&entries[0], Path::new("/p"), &[]),
             vec!["explain the config".to_string()]
         );
-        assert_eq!(find(&entries, Path::new("/p"), &[], &needle("config")), vec![(1, 1)]);
+        assert_eq!(
+            find(&entries, Path::new("/p"), &[], &needle("config")),
+            vec![(1, 1)]
+        );
     }
 
     #[test]
@@ -486,6 +500,9 @@ mod tests {
             delivered: true,
         });
         let entries = vec![entry(7, shell)];
-        assert_eq!(find(&entries, Path::new("/p"), &[], &needle("test")), vec![(7, 3)]);
+        assert_eq!(
+            find(&entries, Path::new("/p"), &[], &needle("test")),
+            vec![(7, 3)]
+        );
     }
 }

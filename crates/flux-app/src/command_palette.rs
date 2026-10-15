@@ -400,7 +400,10 @@ fn keys_label(
     cx: &App,
 ) -> Option<SharedString> {
     let binding = match focus {
-        Some(focus) => window.bindings_for_action_in(action, focus).first().cloned(),
+        Some(focus) => window
+            .bindings_for_action_in(action, focus)
+            .first()
+            .cloned(),
         None => ui::action_binding(action, cx),
     };
     binding.map(|binding| ui::shortcut_label(&binding))

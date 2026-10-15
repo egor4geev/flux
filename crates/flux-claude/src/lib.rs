@@ -29,13 +29,13 @@ mod types;
 pub use cli::{AuthStatus, Cli, LaunchOptions};
 pub use mcp::{McpReply, McpServer, ToolOutput, ToolSpec};
 pub use process::{Process, ProcessEvent};
-pub use transcript::SavedSession;
 pub use protocol::{CliRequest, HostRequest, Incoming};
 pub use session::{
     Activity, Answer, Change, ChangedFile, Entry, EntryId, EntryKind, FileRestore, Notice, Pending,
     PendingKind, Session, SessionInfo, ShellEntry, ShellState, Status, TaskItem, TaskStatus,
     ToolCall, ToolEntry, ToolResult, ToolState, TurnFile,
 };
+pub use transcript::SavedSession;
 pub use types::{
     BackgroundTask, ContextUsage, Effort, ImageAttachment, LimitStatus, LimitWindow, ModelInfo,
     PermissionMode, Priority, RateLimits, SlashCommand, UserInput,

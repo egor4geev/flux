@@ -173,7 +173,11 @@ fn watch() {
                 language.owner()
             );
         }
-        let next = watchdog.running.iter().map(|running| running.deadline).min();
+        let next = watchdog
+            .running
+            .iter()
+            .map(|running| running.deadline)
+            .min();
         watchdog = match next {
             None => WAKE.wait(watchdog).unwrap(),
             Some(deadline) => {
@@ -215,8 +219,14 @@ mod tests {
         while !stuck.grammar_failed() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(stuck.grammar_error(), Some("the grammar stopped responding"));
-        assert!(!fine.grammar_failed(), "a parse that returned in time is left alone");
+        assert_eq!(
+            stuck.grammar_error(),
+            Some("the grammar stopped responding")
+        );
+        assert!(
+            !fine.grammar_failed(),
+            "a parse that returned in time is left alone"
+        );
         // The stuck parse returns at last: the grammar stays off.
         drop(watch);
         assert!(stuck.grammar_failed());

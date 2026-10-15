@@ -116,9 +116,7 @@ impl HostState {
 /// The error of a call the permissions don't allow: what the plugin wanted, and what the manifest
 /// lacks.
 pub(crate) fn missing(what: &str, permission: &str) -> String {
-    format!(
-        "The plugin may not {what}: no `{permission}` in the permissions of flux-plugin.toml"
-    )
+    format!("The plugin may not {what}: no `{permission}` in the permissions of flux-plugin.toml")
 }
 
 impl terminal::Host for State {
@@ -249,7 +247,9 @@ impl diagnostics::Host for State {
 
 impl system::Host for State {
     fn open_url(&mut self, url: String) -> Result<(), String> {
-        let scheme = url.split_once(':').map(|(scheme, _)| scheme.to_ascii_lowercase());
+        let scheme = url
+            .split_once(':')
+            .map(|(scheme, _)| scheme.to_ascii_lowercase());
         match scheme.as_deref() {
             Some("http" | "https" | "mailto") => {
                 self.host.tell(WindowCall::OpenUrl(url));
