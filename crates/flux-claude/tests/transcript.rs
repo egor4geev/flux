@@ -277,6 +277,33 @@ fn the_history_lists_sessions_from_their_head_and_tail() {
     assert_eq!(transcript::list(projects.path(), Path::new("/nowhere")), []);
 }
 
+#[test]
+fn the_history_sees_a_transcript_that_changed() {
+    let projects = tempfile::tempdir().unwrap();
+    let root = Path::new("/Users/me/dev/kept");
+    let now = SystemTime::now();
+    let prompt = r#"{"type":"user","uuid":"k1","parentUuid":null,"message":{"role":"user","content":"Explain the build script"}}"#;
+    write(projects.path(), root, "kept", &[prompt.to_string()], now);
+    let titles = || {
+        transcript::list(projects.path(), root)
+            .into_iter()
+            .map(|session| session.title)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(titles(), ["Explain the build script"]);
+    assert_eq!(titles(), ["Explain the build script"]);
+    // The CLI names the session: the transcript grows, the history shows the new title.
+    let title = r#"{"type":"ai-title","aiTitle":"Build script tour","sessionId":"kept"}"#;
+    write(
+        projects.path(),
+        root,
+        "kept",
+        &[prompt.to_string(), title.to_string()],
+        now + Duration::from_secs(1),
+    );
+    assert_eq!(titles(), ["Build script tour"]);
+}
+
 /// How long reading takes on real data — prints only sizes, counts and times:
 /// `FLUX_TRANSCRIPT=<a .jsonl> FLUX_TRANSCRIPT_ROOT=<its project root> cargo test --release -p
 /// flux-claude --test transcript timing -- --ignored --nocapture`.
@@ -303,6 +330,9 @@ fn timing() {
             sessions.len(),
             started.elapsed()
         );
+        let started = std::time::Instant::now();
+        transcript::list(&projects, &root);
+        println!("list again (summaries kept): {:?}", started.elapsed());
     }
 }
 

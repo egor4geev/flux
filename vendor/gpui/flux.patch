@@ -1,6 +1,6 @@
 diff -ruN a/src/app.rs b/src/app.rs
 --- a/src/app.rs	2006-07-24 05:21:28
-+++ b/src/app.rs	2026-10-15 10:25:43
++++ b/src/app.rs	2026-10-15 19:30:44
 @@ -750,6 +750,32 @@
          self.platform.quit();
      }
@@ -34,9 +34,82 @@ diff -ruN a/src/app.rs b/src/app.rs
      /// Schedules all windows in the application to be redrawn. This can be called
      /// multiple times in an update cycle and still result in a single redraw.
      pub fn refresh_windows(&mut self) {
+diff -ruN a/src/elements/animation.rs b/src/elements/animation.rs
+--- a/src/elements/animation.rs	2006-07-24 05:21:28
++++ b/src/elements/animation.rs	2026-10-16 13:40:43
+@@ -1,12 +1,54 @@
+ use std::{
++    cell::RefCell,
+     rc::Rc,
++    sync::OnceLock,
+     time::{Duration, Instant},
+ };
+ 
++use collections::FxHashSet;
++
+ use crate::{
+-    AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, Window,
++    AnyElement, App, Element, ElementId, EntityId, GlobalElementId, InspectorElementId,
++    IntoElement, Window,
+ };
+ 
++/// Flux patch (animation rate, 2026-10-16): a repeating animation — Flux's pulses that say
++/// something runs — redraws its view 30 times a second on a timer, instead of asking for every
++/// frame: that was a full redraw of the window at the display's 120 Hz for as long as a pulse
++/// showed (a working Claude session: ~23 % of the main thread and ~60 % of the GPU). One-shot
++/// animations — transitions — keep every frame. The ticks of all repeating animations sit on one
++/// grid ([`until_next_animation_tick`]), so they land in the same frames.
++const REPEAT_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
++
++thread_local! {
++    /// The views whose next tick is on its way.
++    static TICKING: RefCell<FxHashSet<EntityId>> = RefCell::default();
++}
++
++/// Flux patch (animation rate): how long until the next tick of the grid of the repeating
++/// animations — for redraws that should land in the same frames as theirs.
++pub fn until_next_animation_tick() -> Duration {
++    static EPOCH: OnceLock<Instant> = OnceLock::new();
++    let since = EPOCH.get_or_init(Instant::now).elapsed();
++    let into = since.as_nanos() % REPEAT_INTERVAL.as_nanos();
++    REPEAT_INTERVAL.saturating_sub(Duration::from_nanos(into as u64))
++}
++
++/// Redraws the view being drawn at the next tick — once, however many of its animations ask.
++fn request_tick(window: &Window, cx: &mut App) {
++    let view = window.current_view();
++    if !TICKING.with(|ticking| ticking.borrow_mut().insert(view)) {
++        return;
++    }
++    let wait = until_next_animation_tick();
++    cx.spawn(async move |cx| {
++        cx.background_executor().timer(wait).await;
++        TICKING.with(|ticking| ticking.borrow_mut().remove(&view));
++        cx.update(|cx| cx.notify(view)).ok();
++    })
++    .detach();
++}
++
+ pub use easing::*;
+ use smallvec::SmallVec;
+ 
+@@ -173,7 +215,12 @@
+             let mut element = (self.animator)(element, animation_ix, delta).into_any_element();
+ 
+             if !done {
+-                window.request_animation_frame();
++                // Flux patch (animation rate): see `REPEAT_INTERVAL`.
++                if self.animations[animation_ix].oneshot {
++                    window.request_animation_frame();
++                } else {
++                    request_tick(window, cx);
++                }
+             }
+ 
+             ((element.request_layout(window, cx), element), state)
 diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
 --- a/src/platform/mac/metal_renderer.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/metal_renderer.rs	2026-10-15 03:41:33
++++ b/src/platform/mac/metal_renderer.rs	2026-10-15 19:30:44
 @@ -370,8 +370,12 @@
          loop {
              let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
@@ -167,7 +240,7 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
  
 diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
 --- a/src/platform/mac/platform.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/platform.rs	2026-10-15 10:34:34
++++ b/src/platform/mac/platform.rs	2026-10-15 19:30:44
 @@ -98,7 +98,12 @@
                  sel!(applicationWillTerminate:),
                  will_terminate as extern "C" fn(&mut Object, Sel, id),
@@ -357,7 +430,7 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
  
 diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
 --- a/src/platform/mac/window.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/window.rs	2026-10-15 04:00:04
++++ b/src/platform/mac/window.rs	2026-10-15 19:30:44
 @@ -455,6 +455,12 @@
                          - traffic_light_position.y
                          - px(close_button_frame.size.height as f32),
@@ -398,7 +471,7 @@ diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
      fn titlebar_double_click(&self) {
 diff -ruN a/src/platform.rs b/src/platform.rs
 --- a/src/platform.rs	2006-07-24 05:21:28
-+++ b/src/platform.rs	2026-10-15 10:24:59
++++ b/src/platform.rs	2026-10-15 19:30:44
 @@ -230,6 +230,15 @@
  
      fn on_quit(&self, callback: Box<dyn FnMut()>);
@@ -464,7 +537,7 @@ diff -ruN a/src/platform.rs b/src/platform.rs
      }
 diff -ruN a/src/taffy.rs b/src/taffy.rs
 --- a/src/taffy.rs	2006-07-24 05:21:28
-+++ b/src/taffy.rs	2026-10-15 03:27:31
++++ b/src/taffy.rs	2026-10-15 19:30:44
 @@ -309,7 +309,7 @@
              unit: &Option<u16>,
          ) -> Vec<taffy::GridTemplateComponent<T>> {
@@ -476,7 +549,7 @@ diff -ruN a/src/taffy.rs b/src/taffy.rs
  
 diff -ruN a/src/window.rs b/src/window.rs
 --- a/src/window.rs	2006-07-24 05:21:28
-+++ b/src/window.rs	2026-10-15 04:00:04
++++ b/src/window.rs	2026-10-16 12:53:36
 @@ -7,11 +7,12 @@
      DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
      FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
@@ -493,7 +566,53 @@ diff -ruN a/src/window.rs b/src/window.rs
      SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
      SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
      TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-@@ -856,6 +857,8 @@
+@@ -95,6 +96,9 @@
+     pub dirty: bool,
+     pub draw_phase: DrawPhase,
+     pub dirty_views: FxHashSet<EntityId>,
++    /// Flux patch (input rate): how many times the window was invalidated — an input event that
++    /// raises it changed something on screen.
++    pub updates: usize,
+ }
+ 
+ #[derive(Clone)]
+@@ -109,6 +113,7 @@
+                 dirty: true,
+                 draw_phase: DrawPhase::None,
+                 dirty_views: FxHashSet::default(),
++                updates: 0,
+             })),
+         }
+     }
+@@ -118,6 +123,7 @@
+         inner.dirty_views.insert(entity);
+         if inner.draw_phase == DrawPhase::None {
+             inner.dirty = true;
++            inner.updates += 1;
+             cx.push_effect(Effect::Notify { emitter: entity });
+             true
+         } else {
+@@ -130,9 +136,18 @@
+     }
+ 
+     pub fn set_dirty(&self, dirty: bool) {
+-        self.inner.borrow_mut().dirty = dirty
++        let mut inner = self.inner.borrow_mut();
++        inner.dirty = dirty;
++        if dirty {
++            inner.updates += 1;
++        }
+     }
+ 
++    /// Flux patch (input rate): see [`WindowInvalidatorInner::updates`].
++    pub fn update_count(&self) -> usize {
++        self.inner.borrow().updates
++    }
++
+     pub fn set_phase(&self, phase: DrawPhase) {
+         self.inner.borrow_mut().draw_phase = phase
+     }
+@@ -856,13 +871,16 @@
      modifiers: Modifiers,
      capslock: Capslock,
      scale_factor: f32,
@@ -502,7 +621,103 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
      appearance: WindowAppearance,
      pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
-@@ -1125,7 +1128,12 @@
+     active: Rc<Cell<bool>>,
+     hovered: Rc<Cell<bool>>,
+     pub(crate) needs_present: Rc<Cell<bool>>,
+-    pub(crate) last_input_timestamp: Rc<Cell<Instant>>,
++    /// Flux patch (input rate): see [`InputRateTracker`].
++    pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+     pub(crate) refreshing: bool,
+     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
+     pub(crate) focus: Option<FocusId>,
+@@ -882,6 +900,51 @@
+     saw_keystroke: bool,
+ }
+ 
++/// Flux patch (input rate, from upstream gpui — zed#45369): keeps a window presenting at the
++/// display's rate only while input that changes it comes fast (scrolling, dragging, typing with
++/// key repeat). The old rule — present for a second after *any* input — kept an idle window
++/// presenting its unchanged scene ~120 times a second (2026-10-16: ~33–52 % of the GPU with no
++/// keyboard or mouse input for minutes).
++#[derive(Clone, Debug)]
++pub(crate) struct InputRateTracker {
++    /// When the recent input that changed the window came, within [`Self::WINDOW`].
++    timestamps: Vec<Instant>,
++    sustain_until: Instant,
++}
++
++impl Default for InputRateTracker {
++    fn default() -> Self {
++        Self {
++            timestamps: Vec::new(),
++            sustain_until: Instant::now(),
++        }
++    }
++}
++
++impl InputRateTracker {
++    /// The span input is counted over.
++    const WINDOW: Duration = Duration::from_millis(100);
++    /// Inputs within [`Self::WINDOW`] that count as fast: 60 a second.
++    const FAST: usize = 6;
++    /// How long fast input keeps the window presenting, so that the display doesn't lower its
++    /// refresh rate between bursts.
++    const SUSTAIN: Duration = Duration::from_secs(1);
++
++    pub fn record_input(&mut self) {
++        let now = Instant::now();
++        self.timestamps
++            .retain(|&time| now.duration_since(time) <= Self::WINDOW);
++        self.timestamps.push(now);
++        if self.timestamps.len() >= Self::FAST {
++            self.sustain_until = now + Self::SUSTAIN;
++        }
++    }
++
++    pub fn is_high_rate(&self) -> bool {
++        Instant::now() < self.sustain_until
++    }
++}
++
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub(crate) enum DrawPhase {
+     None,
+@@ -991,7 +1054,7 @@
+         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
+         let needs_present = Rc::new(Cell::new(false));
+         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
+-        let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
++        let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+ 
+         platform_window
+             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
+@@ -1021,7 +1084,7 @@
+             let active = active.clone();
+             let needs_present = needs_present.clone();
+             let next_frame_callbacks = next_frame_callbacks.clone();
+-            let last_input_timestamp = last_input_timestamp.clone();
++            let input_rate_tracker = input_rate_tracker.clone();
+             move |request_frame_options| {
+                 let next_frame_callbacks = next_frame_callbacks.take();
+                 if !next_frame_callbacks.is_empty() {
+@@ -1034,12 +1097,12 @@
+                         .log_err();
+                 }
+ 
+-                // Keep presenting the current scene for 1 extra second since the
+-                // last input to prevent the display from underclocking the refresh rate.
++                // Flux patch (input rate): keep presenting the current scene while input that
++                // changes the window comes fast (and a second after), so that the display doesn't
++                // lower its refresh rate — not after every input.
+                 let needs_present = request_frame_options.require_presentation
+                     || needs_present.get()
+-                    || (active.get()
+-                        && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
++                    || (active.get() && input_rate_tracker.borrow().is_high_rate());
+ 
+                 if invalidator.is_dirty() || request_frame_options.force_render {
+                     measure("frame duration", || {
+@@ -1125,7 +1188,12 @@
              let mut cx = cx.to_async();
              Box::new(move |event| {
                  handle
@@ -516,7 +731,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                      .log_err()
                      .unwrap_or(DispatchEventResult::default())
              })
-@@ -1239,6 +1247,7 @@
+@@ -1239,13 +1307,14 @@
              modifiers,
              capslock,
              scale_factor,
@@ -524,7 +739,15 @@ diff -ruN a/src/window.rs b/src/window.rs
              bounds_observers: SubscriberSet::new(),
              appearance,
              appearance_observers: SubscriberSet::new(),
-@@ -1673,8 +1682,10 @@
+             active,
+             hovered,
+             needs_present,
+-            last_input_timestamp,
++            input_rate_tracker,
+             refreshing: false,
+             activation_observers: SubscriberSet::new(),
+             focus: None,
+@@ -1673,8 +1742,10 @@
      }
  
      fn bounds_changed(&mut self, cx: &mut App) {
@@ -537,7 +760,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          self.display_id = self.platform_window.display().map(|display| display.id());
  
          self.refresh();
-@@ -1691,7 +1702,9 @@
+@@ -1691,7 +1762,9 @@
  
      /// Set the content size of the window.
      pub fn resize(&mut self, size: Size<Pixels>) {
@@ -548,7 +771,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Returns whether or not the window is currently fullscreen
-@@ -1744,7 +1757,9 @@
+@@ -1744,7 +1817,9 @@
  
      /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
      pub fn show_window_menu(&self, position: Point<Pixels>) {
@@ -559,7 +782,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Tells the compositor to take control of window movement (Wayland and X11)
-@@ -1816,6 +1831,41 @@
+@@ -1816,6 +1891,41 @@
          self.scale_factor
      }
  
@@ -601,7 +824,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// The size of an em for the base font of the application. Adjusting this value allows the
      /// UI to scale, just like zooming a web page.
      pub fn rem_size(&self) -> Pixels {
-@@ -2010,6 +2060,29 @@
+@@ -2010,6 +2120,29 @@
          profiling::finish_frame!();
      }
  
@@ -631,7 +854,28 @@ diff -ruN a/src/window.rs b/src/window.rs
      fn draw_roots(&mut self, cx: &mut App) {
          self.invalidator.set_phase(DrawPhase::Prepaint);
          self.tooltip_bounds.take();
-@@ -4128,7 +4201,10 @@
+@@ -3579,7 +3712,8 @@
+     /// Dispatch a mouse or keyboard event on the window.
+     #[profiling::function]
+     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+-        self.last_input_timestamp.set(Instant::now());
++        // Flux patch (input rate): only input that changes the window counts.
++        let updates_before = self.invalidator.update_count();
+         // Handlers may set this to false by calling `stop_propagation`.
+         cx.propagate_event = true;
+         // Handlers may set this to true by calling `prevent_default`.
+@@ -3668,6 +3802,10 @@
+             self.dispatch_key_event(any_key_event, cx);
+         }
+ 
++        if self.invalidator.update_count() > updates_before {
++            self.input_rate_tracker.borrow_mut().record_input();
++        }
++
+         DispatchEventResult {
+             propagate: cx.propagate_event,
+             default_prevented: self.default_prevented,
+@@ -4128,7 +4266,10 @@
          self.on_next_frame(|window, cx| {
              if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                  if let Some(bounds) = input_handler.selected_bounds(window, cx) {
@@ -643,7 +887,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  }
                  window.platform_window.set_input_handler(input_handler);
              }
-@@ -5099,5 +5175,76 @@
+@@ -5099,5 +5240,76 @@
          border_widths: (1.).into(),
          border_color: border_color.into(),
          border_style,

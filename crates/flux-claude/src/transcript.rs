@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine;
@@ -110,10 +111,32 @@ pub fn list(projects: &Path, root: &Path) -> Vec<SavedSession> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl") && path.is_file())
-        .filter_map(|path| summarize(&path))
+        .filter_map(|path| summary(&path))
         .collect();
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
     sessions
+}
+
+/// [`summarize`], unless the transcript is as it was: the summaries made, by path, are kept with
+/// their size and time. The history is listed again on every status change of a session
+/// (2026-10-16: 28 transcripts of 1.4 GB — ~5 MB of JSON parsed each time, on every tool call).
+fn summary(path: &Path) -> Option<SavedSession> {
+    static SUMMARIES: OnceLock<Mutex<HashMap<PathBuf, SavedSession>>> = OnceLock::new();
+    let summaries = SUMMARIES.get_or_init(Default::default);
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    if let Ok(summaries) = summaries.lock()
+        && let Some(saved) = summaries.get(path)
+        && saved.size == metadata.len()
+        && saved.modified == modified
+    {
+        return Some(saved.clone());
+    }
+    let saved = summarize(path)?;
+    if let Ok(mut summaries) = summaries.lock() {
+        summaries.insert(path.to_path_buf(), saved.clone());
+    }
+    Some(saved)
 }
 
 /// What the history shows of one transcript.

@@ -13,9 +13,10 @@ use gpui::{
     Action, AnyElement, AnyView, App, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, Context,
     Corner, DismissEvent, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight,
     Global, KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions,
-    Pixels, Point, Render, ScrollHandle, SharedString, Subscription, Task, TitlebarOptions,
-    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowId,
-    WindowOptions, actions, anchored, deferred, div, point, prelude::*, px, relative, size,
+    Pixels, Point, Render, ScrollHandle, SharedString, StyleRefinement, Subscription, Task,
+    TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowId, WindowOptions, actions, anchored, deferred, div, point, prelude::*, px, relative,
+    size,
 };
 
 use crate::claude::{self, ClaudeStore, ClaudeStoreEvent};
@@ -5371,7 +5372,12 @@ impl Render for Workspace {
                 self.start_drawn = false;
                 self.retry_tab_scroll(window, cx);
                 let content = match &item {
-                    TabItem::Editor(editor) => editor.clone().into_any_element(),
+                    // A cached view: drawn again only when notified, so that a frame for something
+                    // else (a working session's pulse, streamed text) doesn't lay the editor out
+                    // again (2026-10-16: ~18 % of such a frame).
+                    TabItem::Editor(editor) => AnyView::from(editor.clone())
+                        .cached(StyleRefinement::default().size_full())
+                        .into_any_element(),
                     TabItem::Terminal(group) => group.clone().into_any_element(),
                     TabItem::Diff(view) => view.clone().into_any_element(),
                     TabItem::Merge(view) => view.clone().into_any_element(),
@@ -5427,10 +5433,19 @@ impl Render for Workspace {
         // The left island: the commit window in place of the tree, or the tree.
         let left = match &self.commit_panel {
             Some(handle) if self.commit_open => Some(handle.panel.clone().into_any_element()),
-            _ => self
-                .tree_panel()
-                .filter(|_| self.tree_open)
-                .map(|panel| panel.into_any_element()),
+            // The tree is a cached view too (see the editor's tab above): its root style is the
+            // panel's own (`FileTreePanel::render`).
+            _ => self.tree_panel().filter(|_| self.tree_open).map(|panel| {
+                AnyView::from(panel)
+                    .cached(
+                        StyleRefinement::default()
+                            .relative()
+                            .flex_none()
+                            .w(px(self.left_width.get()))
+                            .h_full(),
+                    )
+                    .into_any_element()
+            }),
         };
         let tree = left.map(|panel| {
             ui::island(ui, style)

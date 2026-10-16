@@ -360,6 +360,107 @@ fn cancels_a_started_request() {
     );
 }
 
+/// A server that takes connections and never answers: a TLS handshake with it waits.
+fn silent_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            held.push(stream);
+        }
+    });
+    port
+}
+
+/// Drops the probe's instance mid-request and waits for the request's line in the log: a
+/// request cancelled by the stop ends at once (it used to spin on a core for good, 2026-10-16).
+fn stop_ends_the_request(probe: Probe) {
+    let Probe {
+        instance,
+        messages: _messages,
+        log,
+    } = probe;
+    let stopped = Instant::now();
+    drop(instance);
+    let cancelled = || {
+        log.lines()
+            .iter()
+            .any(|line| line.text.contains("→ cancelled"))
+    };
+    while !cancelled() {
+        assert!(
+            stopped.elapsed() < Duration::from_secs(5),
+            "the request still runs after the stop"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        stopped.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        stopped.elapsed()
+    );
+}
+
+#[test]
+fn a_cancel_ends_a_tls_handshake() {
+    let Some((mut probe, data)) = net_probe("test.net-cancel-tls", LOCAL) else {
+        return;
+    };
+    let port = silent_server();
+    ask(
+        &data,
+        "GET",
+        &format!("https://127.0.0.1:{port}/"),
+        true,
+        None,
+        "",
+    );
+    probe.send("net:start");
+    // The handshake waits for the server's hello.
+    std::thread::sleep(Duration::from_millis(300));
+    let cancelled = Instant::now();
+    probe.send("net:cancel");
+    assert_eq!(probe.wait_for("done"), "done: HttpError::Cancelled");
+    assert!(
+        cancelled.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        cancelled.elapsed()
+    );
+}
+
+#[test]
+fn a_stop_ends_a_fetch_in_a_tls_handshake() {
+    let Some((mut probe, data)) = net_probe("test.net-stop-tls", LOCAL) else {
+        return;
+    };
+    let port = silent_server();
+    ask(
+        &data,
+        "GET",
+        &format!("https://127.0.0.1:{port}/"),
+        true,
+        None,
+        "",
+    );
+    probe.send("net:fetch");
+    std::thread::sleep(Duration::from_millis(300));
+    stop_ends_the_request(probe);
+}
+
+#[test]
+fn a_stop_ends_a_fetch_reading_its_body() {
+    let Some((mut probe, data)) = net_probe("test.net-stop-body", LOCAL) else {
+        return;
+    };
+    let base = format!("http://127.0.0.1:{}", test_server());
+    // The body never ends: `fetch` reads it until the stop.
+    ask(&data, "GET", &format!("{base}/endless"), true, None, "");
+    probe.send("net:fetch");
+    std::thread::sleep(Duration::from_millis(300));
+    stop_ends_the_request(probe);
+}
+
 // --- The server ---
 
 /// The probe's server: its port.
