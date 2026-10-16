@@ -30,6 +30,21 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
   points, as `TitlebarOptions::traffic_light_position` — Flux keeps them in the middle of its title
   bar at any scale. `move_traffic_light` (`src/platform/mac/window.rs`) keeps the buttons inside the
   system title bar: lower, they were cut off and didn't take clicks.
+- **Input rate** (2026-10-16, from upstream gpui — zed-industries/zed#45369): gpui 0.2.2 kept a
+  window presenting its unchanged scene at the display's rate for a second after *any* input, to
+  keep ProMotion from lowering the refresh rate; an idle Flux window presented ~120 frames a second
+  with no keyboard or mouse input for minutes (~33–52 % of the M5's GPU). `src/window.rs`:
+  `InputRateTracker` — only input that invalidated the window counts (`WindowInvalidator::update_count`,
+  compared before and after `dispatch_event`), and only fast input (6 within 100 ms, 60 a second)
+  keeps the window presenting, for a second after the last burst.
+- **Animation rate** (2026-10-16, `src/elements/animation.rs`): a repeating animation (`repeat()` —
+  Flux's pulses that say something runs) asked for every frame, so a pulse redrew the whole window
+  at the display's 120 Hz for as long as it showed (a working Claude session: ~23 % of the main
+  thread, ~60 % of the GPU). Now it notifies its view on a timer, 30 times a second, on a grid shared
+  by all repeating animations (one tick per view, however many pulses it has); the phase still comes
+  from the clock. One-shot animations — transitions — keep every frame. `until_next_animation_tick`
+  (public) gives the grid to redraws that should land in the same frames: Flux's Claude session
+  redraws streamed text on it (`crates/flux-app/src/claude_session.rs`, `redraw_on_tick`).
 - **Headless scenario frames** (`crates/flux-app/src/scenario.rs`, `FLUX_SCENARIO_HEADLESS`): a
   locked screen stops the display link of every window, and the window server won't capture
   them. `Window::headless_frame` does what the platform's frame callback does, without presenting

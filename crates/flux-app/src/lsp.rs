@@ -371,8 +371,10 @@ impl LspStore {
             server.editors.retain(|e| e.entity_id() != id);
         }
         let store = cx.weak_entity();
+        let observed = cx.entity();
         let path = editor.update(cx, |editor, cx| {
             editor.lsp_store = Some(store);
+            editor.lsp_observation = Some(cx.observe(&observed, |_, _, cx| cx.notify()));
             // A document still open elsewhere (the store of a previous project root, a restart) is
             // closed; the servers will publish their own diagnostics (plugins' stay).
             if !editor.lsp.is_empty() {

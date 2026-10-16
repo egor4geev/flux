@@ -704,11 +704,10 @@ fn cancelled() -> bool {
     })
 }
 
+/// Never `Interrupted`: rustls (`complete_io`) and std (`read_to_end`) retry that kind at once,
+/// so a cancelled read spun on a core for good; ureq ends a body quietly on `ConnectionAborted`.
 fn cancelled_error() -> ureq::Error {
-    ureq::Error::Io(std::io::Error::new(
-        std::io::ErrorKind::Interrupted,
-        "cancelled",
-    ))
+    ureq::Error::Io(std::io::Error::other("cancelled"))
 }
 
 /// Wraps the TCP connection (under TLS): reads wait in slices of [`SLICE`] and give up once the

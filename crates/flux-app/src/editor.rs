@@ -204,6 +204,10 @@ pub struct Editor {
     /// The window's language servers, once Workspace registered the editor: a document that gets a
     /// path later (Save As, rename) is opened on its server then.
     pub(crate) lsp_store: Option<gpui::WeakEntity<crate::lsp::LspStore>>,
+    /// The editor is drawn again when the language servers' state changes: the problems widget
+    /// shows whether they settled, and a tab's editor is a cached view (it is drawn again only
+    /// when notified).
+    pub(crate) lsp_observation: Option<Subscription>,
     pub(crate) diagnostics: crate::diagnostics::Diagnostics,
     pub(crate) completion: Option<crate::completion::CompletionMenu>,
     pub(crate) hover: crate::hover::HoverState,
@@ -327,6 +331,7 @@ impl Editor {
             preview,
             lsp: Vec::new(),
             lsp_store: None,
+            lsp_observation: None,
             diagnostics: Default::default(),
             completion: None,
             hover: Default::default(),

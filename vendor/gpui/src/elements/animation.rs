@@ -1,11 +1,53 @@
 use std::{
+    cell::RefCell,
     rc::Rc,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
+use collections::FxHashSet;
+
 use crate::{
-    AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, Window,
+    AnyElement, App, Element, ElementId, EntityId, GlobalElementId, InspectorElementId,
+    IntoElement, Window,
 };
+
+/// Flux patch (animation rate, 2026-10-16): a repeating animation — Flux's pulses that say
+/// something runs — redraws its view 30 times a second on a timer, instead of asking for every
+/// frame: that was a full redraw of the window at the display's 120 Hz for as long as a pulse
+/// showed (a working Claude session: ~23 % of the main thread and ~60 % of the GPU). One-shot
+/// animations — transitions — keep every frame. The ticks of all repeating animations sit on one
+/// grid ([`until_next_animation_tick`]), so they land in the same frames.
+const REPEAT_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
+
+thread_local! {
+    /// The views whose next tick is on its way.
+    static TICKING: RefCell<FxHashSet<EntityId>> = RefCell::default();
+}
+
+/// Flux patch (animation rate): how long until the next tick of the grid of the repeating
+/// animations — for redraws that should land in the same frames as theirs.
+pub fn until_next_animation_tick() -> Duration {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let since = EPOCH.get_or_init(Instant::now).elapsed();
+    let into = since.as_nanos() % REPEAT_INTERVAL.as_nanos();
+    REPEAT_INTERVAL.saturating_sub(Duration::from_nanos(into as u64))
+}
+
+/// Redraws the view being drawn at the next tick — once, however many of its animations ask.
+fn request_tick(window: &Window, cx: &mut App) {
+    let view = window.current_view();
+    if !TICKING.with(|ticking| ticking.borrow_mut().insert(view)) {
+        return;
+    }
+    let wait = until_next_animation_tick();
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(wait).await;
+        TICKING.with(|ticking| ticking.borrow_mut().remove(&view));
+        cx.update(|cx| cx.notify(view)).ok();
+    })
+    .detach();
+}
 
 pub use easing::*;
 use smallvec::SmallVec;
@@ -173,7 +215,12 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
             let mut element = (self.animator)(element, animation_ix, delta).into_any_element();
 
             if !done {
-                window.request_animation_frame();
+                // Flux patch (animation rate): see `REPEAT_INTERVAL`.
+                if self.animations[animation_ix].oneshot {
+                    window.request_animation_frame();
+                } else {
+                    request_tick(window, cx);
+                }
             }
 
             ((element.request_layout(window, cx), element), state)

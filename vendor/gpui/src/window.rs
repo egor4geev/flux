@@ -96,6 +96,9 @@ struct WindowInvalidatorInner {
     pub dirty: bool,
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
+    /// Flux patch (input rate): how many times the window was invalidated — an input event that
+    /// raises it changed something on screen.
+    pub updates: usize,
 }
 
 #[derive(Clone)]
@@ -110,6 +113,7 @@ impl WindowInvalidator {
                 dirty: true,
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
+                updates: 0,
             })),
         }
     }
@@ -119,6 +123,7 @@ impl WindowInvalidator {
         inner.dirty_views.insert(entity);
         if inner.draw_phase == DrawPhase::None {
             inner.dirty = true;
+            inner.updates += 1;
             cx.push_effect(Effect::Notify { emitter: entity });
             true
         } else {
@@ -131,7 +136,16 @@ impl WindowInvalidator {
     }
 
     pub fn set_dirty(&self, dirty: bool) {
-        self.inner.borrow_mut().dirty = dirty
+        let mut inner = self.inner.borrow_mut();
+        inner.dirty = dirty;
+        if dirty {
+            inner.updates += 1;
+        }
+    }
+
+    /// Flux patch (input rate): see [`WindowInvalidatorInner::updates`].
+    pub fn update_count(&self) -> usize {
+        self.inner.borrow().updates
     }
 
     pub fn set_phase(&self, phase: DrawPhase) {
@@ -865,7 +879,8 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
-    pub(crate) last_input_timestamp: Rc<Cell<Instant>>,
+    /// Flux patch (input rate): see [`InputRateTracker`].
+    pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -883,6 +898,51 @@ pub struct Window {
 struct ModifierState {
     modifiers: Modifiers,
     saw_keystroke: bool,
+}
+
+/// Flux patch (input rate, from upstream gpui — zed#45369): keeps a window presenting at the
+/// display's rate only while input that changes it comes fast (scrolling, dragging, typing with
+/// key repeat). The old rule — present for a second after *any* input — kept an idle window
+/// presenting its unchanged scene ~120 times a second (2026-10-16: ~33–52 % of the GPU with no
+/// keyboard or mouse input for minutes).
+#[derive(Clone, Debug)]
+pub(crate) struct InputRateTracker {
+    /// When the recent input that changed the window came, within [`Self::WINDOW`].
+    timestamps: Vec<Instant>,
+    sustain_until: Instant,
+}
+
+impl Default for InputRateTracker {
+    fn default() -> Self {
+        Self {
+            timestamps: Vec::new(),
+            sustain_until: Instant::now(),
+        }
+    }
+}
+
+impl InputRateTracker {
+    /// The span input is counted over.
+    const WINDOW: Duration = Duration::from_millis(100);
+    /// Inputs within [`Self::WINDOW`] that count as fast: 60 a second.
+    const FAST: usize = 6;
+    /// How long fast input keeps the window presenting, so that the display doesn't lower its
+    /// refresh rate between bursts.
+    const SUSTAIN: Duration = Duration::from_secs(1);
+
+    pub fn record_input(&mut self) {
+        let now = Instant::now();
+        self.timestamps
+            .retain(|&time| now.duration_since(time) <= Self::WINDOW);
+        self.timestamps.push(now);
+        if self.timestamps.len() >= Self::FAST {
+            self.sustain_until = now + Self::SUSTAIN;
+        }
+    }
+
+    pub fn is_high_rate(&self) -> bool {
+        Instant::now() < self.sustain_until
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -994,7 +1054,7 @@ impl Window {
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
-        let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
+        let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1024,7 +1084,7 @@ impl Window {
             let active = active.clone();
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
-            let last_input_timestamp = last_input_timestamp.clone();
+            let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
@@ -1037,12 +1097,12 @@ impl Window {
                         .log_err();
                 }
 
-                // Keep presenting the current scene for 1 extra second since the
-                // last input to prevent the display from underclocking the refresh rate.
+                // Flux patch (input rate): keep presenting the current scene while input that
+                // changes the window comes fast (and a second after), so that the display doesn't
+                // lower its refresh rate — not after every input.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || (active.get()
-                        && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
+                    || (active.get() && input_rate_tracker.borrow().is_high_rate());
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {
@@ -1254,7 +1314,7 @@ impl Window {
             active,
             hovered,
             needs_present,
-            last_input_timestamp,
+            input_rate_tracker,
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -3652,7 +3712,8 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
-        self.last_input_timestamp.set(Instant::now());
+        // Flux patch (input rate): only input that changes the window counts.
+        let updates_before = self.invalidator.update_count();
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;
         // Handlers may set this to true by calling `prevent_default`.
@@ -3739,6 +3800,10 @@ impl Window {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
+        }
+
+        if self.invalidator.update_count() > updates_before {
+            self.input_rate_tracker.borrow_mut().record_input();
         }
 
         DispatchEventResult {

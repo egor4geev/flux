@@ -137,6 +137,8 @@ pub struct ClaudeSession {
     /// What the message field starts with (part 10.3: a plugin's session with its context); the
     /// chat's field takes it when it is made.
     draft: Option<SessionDraft>,
+    /// A redraw of the conversation waits for the next animation tick ([`Self::emit`]).
+    redraw_pending: bool,
 }
 
 /// The start of a session's message field: text, and attachments as chips (part 10.3).
@@ -244,6 +246,7 @@ impl ClaudeSession {
             shell_ticker: None,
             restart: None,
             draft: None,
+            redraw_pending: false,
         }
     }
 
@@ -1045,6 +1048,22 @@ impl ClaudeSession {
         if changes.is_empty() {
             return;
         }
+        // Nothing but the conversation and its lines changed (streamed text, a tool's output).
+        let only_redraw = changes.iter().all(|change| {
+            matches!(
+                change,
+                Change::Entries
+                    | Change::Info
+                    | Change::Context
+                    | Change::Tasks
+                    | Change::Background
+                    | Change::Queue
+            )
+        });
+        if only_redraw {
+            self.redraw_on_tick(cx);
+            return;
+        }
         let mut redraw = false;
         let mut finished = false;
         // The status moved (the process is ready, a turn ended): held `!` records may go.
@@ -1093,6 +1112,28 @@ impl ClaudeSession {
         if status && !self.held.is_empty() {
             self.deliver_when_idle(cx);
         }
+    }
+
+    /// Redraws the conversation at the next animation tick — in the same frame as the pulse of a
+    /// working session — rather than at once: streamed text comes 30–100 times a second, and each
+    /// redraw is a redraw of the whole window (2026-10-16: 17–30 % CPU while streaming, 6–9 % on
+    /// the tick).
+    fn redraw_on_tick(&mut self, cx: &mut Context<Self>) {
+        if self.redraw_pending {
+            return;
+        }
+        self.redraw_pending = true;
+        let wait = gpui::until_next_animation_tick();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |this, cx| {
+                this.redraw_pending = false;
+                cx.emit(SessionEvent::Changed);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
