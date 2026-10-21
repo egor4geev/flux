@@ -43,6 +43,23 @@ pub fn remove(root: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// Whether projects are reported to macOS as recent documents ([`gpui::App::add_recent_document`]:
+/// the Dock menu's recent folders, even while Flux isn't running). Never from a scenario or a test:
+/// those would end up in the author's own list.
+pub fn tells_the_system() -> bool {
+    !cfg!(test) && std::env::var_os("FLUX_SCENARIO").is_none()
+}
+
+/// Reports the list to macOS, oldest first so the most recent ends up on top (once at launch: the
+/// projects opened before Flux started reporting them).
+pub fn tell_the_system(cx: &gpui::App) {
+    if tells_the_system() {
+        for root in load().iter().rev() {
+            cx.add_recent_document(root);
+        }
+    }
+}
+
 fn store_path() -> Option<PathBuf> {
     store_path_for(
         std::env::var_os("FLUX_RECENT_FILE"),

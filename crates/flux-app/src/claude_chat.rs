@@ -54,6 +54,9 @@ pub struct ClaudeChat {
     pub(crate) transcript: TranscriptState,
     pub(crate) cards: CardsState,
     composer: Entity<Composer>,
+    /// The field of a subagent's view (made the first time one is opened): its own draft, the
+    /// message goes to Claude for the agent ([`crate::claude_composer::AgentTarget`]).
+    pub(crate) agent_composer: Option<Entity<Composer>>,
     pub(crate) focus_handle: FocusHandle,
     /// Subagents in sight, one per level (`claude_agent_view`, part 10.2); empty — the session's
     /// conversation.
@@ -83,8 +86,11 @@ impl ClaudeChat {
                 this.invalidate_transcripts();
                 this.update_ticker(cx);
                 match event {
-                    // A question takes the keyboard, unless the user is typing a message.
-                    SessionEvent::PendingAdded(_) if this.composer.read(cx).is_empty(cx) => {
+                    // A question takes the keyboard, unless the user is typing a message. Not
+                    // in a subagent's view: the questions aren't drawn there.
+                    SessionEvent::PendingAdded(_)
+                        if this.agents.is_empty() && this.composer.read(cx).is_empty(cx) =>
+                    {
                         claude_cards::take_focus(&mut this.cards, session.read(cx).model(), window)
                     }
                     // The last one answered: back to the message field.
@@ -110,6 +116,7 @@ impl ClaudeChat {
             transcript: TranscriptState::new(cx.weak_entity()),
             cards: CardsState::default(),
             composer,
+            agent_composer: None,
             focus_handle: cx.focus_handle(),
             agents: Vec::new(),
             search: None,
@@ -249,10 +256,15 @@ impl Render for ClaudeChat {
             claude_transcript::render(self, window, cx)
         };
         let search_bar = claude_search::render_bar(self, window, cx);
-        // A subagent in sight: its bar on top, its line at the bottom, no cards and no field.
+        // A subagent in sight: its bar on top, its line at the bottom, no cards, its own field.
         let agent_header = claude_agent_view::render_header(self, cx);
         let agent_footer = claude_agent_view::render_footer(self, cx);
         let in_agent = !self.agents.is_empty();
+        let field = if in_agent {
+            self.sync_agent_composer(window, cx)
+        } else {
+            Some(self.composer.clone())
+        };
         let light = without_entries(session.read(cx).model());
         let cards = if in_agent {
             None
@@ -311,6 +323,7 @@ impl Render for ClaudeChat {
                     this.open_latest_agent(window, cx)
                 }),
             );
+        let root = crate::claude_select::actions(root, cx);
         claude_search::actions(root, cx)
             .children(agent_header)
             .children(search_bar)
@@ -319,16 +332,14 @@ impl Render for ClaudeChat {
             // `COLUMN_MAX_WIDTH` wide in an editor tab); the field's own inset is 10 px.
             .children(cards.map(|cards| claude_transcript::column(cards).flex_none()))
             .children(agent_footer)
-            .when(!in_agent, |chat| {
-                chat.child(
-                    div().flex_none().w_full().flex().justify_center().child(
-                        div()
-                            .w_full()
-                            .max_w(px(claude_transcript::COLUMN_MAX_WIDTH))
-                            .px(px(claude_transcript::COLUMN_INSET - 10.))
-                            .child(self.composer.clone()),
-                    ),
+            .children(field.map(|field| {
+                div().flex_none().w_full().flex().justify_center().child(
+                    div()
+                        .w_full()
+                        .max_w(px(claude_transcript::COLUMN_MAX_WIDTH))
+                        .px(px(claude_transcript::COLUMN_INSET - 10.))
+                        .child(field),
                 )
-            })
+            }))
     }
 }

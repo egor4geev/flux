@@ -14,6 +14,12 @@
 //! - `!` typed first in the empty field: shell mode (part 10.2) — a green `!` badge, ↵ runs the
 //!   command in the project's root ([`ClaudeSession::run_shell`]), its output goes to Claude; ⌫ in
 //!   the empty field or Esc leaves the mode.
+//! - A subagent's view has a field of its own ([`AgentTarget`]): the CLI can't take a message for a
+//!   subagent (a `parent_tool_use_id` on the host's message is ignored — `PROTOCOL.md` §10.1), so
+//!   the message goes to Claude, asking it to pass it on with SendMessage — that reaches a running
+//!   background agent and resumes a finished one. While a foreground agent runs, Claude waits for
+//!   it: the message waits too. No `!`, no ⌘↵ and no Stop there — they would stop Claude's turn and
+//!   the agent with it; Esc goes back to the session.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -443,7 +449,38 @@ pub struct Composer {
     /// A sent message being edited (part 10.2): sending continues the conversation from just
     /// before it.
     editing: Option<Editing>,
+    /// The field of a subagent's view: messages go to Claude for the agent.
+    agent: Option<AgentTarget>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The subagent a field in its view writes to (through Claude).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTarget {
+    /// The Agent call's description: «Agent · its task».
+    pub description: String,
+    /// The CLI's agent id (`task_started.task_id`, the result's `agentId`): what SendMessage
+    /// takes; `None` before the CLI reports it.
+    pub agent_id: Option<String>,
+    /// A foreground agent at work: Claude waits for it, and so does the message.
+    pub waits: bool,
+}
+
+impl AgentTarget {
+    /// What Claude gets: the message and whom to pass it on to.
+    pub fn message(&self, body: &str) -> String {
+        let head = match &self.agent_id {
+            Some(id) => trf(
+                "A message for the subagent «{0}» (agent id {1}), written in its view — pass it on to the agent with SendMessage:",
+                &[&self.description, id],
+            ),
+            None => trf(
+                "A message for the subagent «{0}», written in its view — pass it on to the agent with SendMessage:",
+                &[&self.description],
+            ),
+        };
+        format!("{head}\n\n{body}")
+    }
 }
 
 /// A sent message back in the field (part 10.2), and what the field held before it — back on Esc.
@@ -520,6 +557,7 @@ impl Composer {
             shell_mode: false,
             was_empty: true,
             editing: None,
+            agent: None,
             _subscriptions: subscriptions,
         };
         #[cfg(feature = "scenario")]
@@ -554,11 +592,24 @@ impl Composer {
         window.focus(&self.input.focus_handle(cx));
     }
 
+    /// Makes this the field of a subagent's view (the chat sets it as the agent in sight changes).
+    pub fn set_agent(&mut self, agent: Option<AgentTarget>, cx: &mut Context<Self>) {
+        if self.agent != agent {
+            self.agent = agent;
+            cx.notify();
+        }
+    }
+
     /// A `!` typed (or pasted) first into the empty field: shell mode, the `!` becomes its badge.
     fn enter_shell_mode(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text();
         let was_empty = std::mem::replace(&mut self.was_empty, text.is_empty());
-        if self.shell_mode || self.editing.is_some() || !was_empty || !text.starts_with('!') {
+        if self.shell_mode
+            || self.editing.is_some()
+            || self.agent.is_some()
+            || !was_empty
+            || !text.starts_with('!')
+        {
             return;
         }
         self.shell_mode = true;
@@ -645,6 +696,13 @@ impl Composer {
             }
             input.insert(&text, cx);
         });
+        self.focus(window, cx);
+    }
+
+    /// Types `text` at the caret, as typed in the field: a key pressed while the conversation had
+    /// the keyboard (a selection in it).
+    pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.insert(text, cx));
         self.focus(window, cx);
     }
 
@@ -755,7 +813,7 @@ impl Composer {
             return;
         }
         // `/resume` is Flux's: the project's saved sessions in the history popup.
-        if is_resume(body) {
+        if self.agent.is_none() && is_resume(body) {
             self.editing = None;
             self.input.update(cx, |input, cx| input.set_text("", cx));
             self.close_suggestions(cx);
@@ -771,6 +829,10 @@ impl Composer {
             message.push(' ');
         }
         message.push_str(body);
+        // A subagent's view: Claude passes the message on (the CLI has no way to the agent).
+        if let Some(agent) = &self.agent {
+            message = agent.message(&message);
+        }
         // A plugin's attachments go first (part 10.3); a slash command keeps them for later.
         let attach = !self.attachments.is_empty() && !body.starts_with('/');
         if attach {
@@ -785,10 +847,12 @@ impl Composer {
             })
             .collect();
         let working = self.session.read(cx).model().is_working();
+        // ⌘↵ in a subagent's view would stop Claude's turn, and a foreground agent with it.
+        let priority = priority.filter(|_| working && self.agent.is_none());
         let input = UserInput {
             text: message,
             images,
-            priority: priority.filter(|_| working),
+            priority,
         };
         // An edited message: the conversation goes on from just before the old one.
         if let Some(editing) = self.editing.take() {
@@ -834,6 +898,9 @@ impl Composer {
         let running_shell = self.session.read(cx).running_shell();
         if self.editing.is_some() {
             self.cancel_edit(cx);
+        } else if self.agent.is_some() {
+            // A subagent's view: Esc goes back to the session; the bar above stops the agent.
+            cx.propagate();
         } else if self.session.read(cx).model().is_working() {
             self.session.update(cx, |session, cx| session.interrupt(cx));
         } else if self.shell_mode {
@@ -1761,18 +1828,21 @@ impl Composer {
                     ),
             );
         }
-        let stop = (working || shell_running && !has_message).then(|| {
-            let label = if working {
-                tr("Stop")
-            } else {
-                tr("Stop the command")
-            };
-            button("claude-stop", IconName::Stop, None)
-                .tooltip(ui::tooltip(label, Some("Esc".into())))
-                .on_click(
-                    cx.listener(|this, _: &ClickEvent, window, cx| this.stop(&Stop, window, cx)),
-                )
-        });
+        let stop =
+            (self.agent.is_none() && (working || shell_running && !has_message)).then(|| {
+                let label = if working {
+                    tr("Stop")
+                } else {
+                    tr("Stop the command")
+                };
+                button("claude-stop", IconName::Stop, None)
+                    .tooltip(ui::tooltip(label, Some("Esc".into())))
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.stop(&Stop, window, cx)
+                        }),
+                    )
+            });
         let send = (has_message || stop.is_none()).then(|| {
             button("claude-send", IconName::ArrowUp, Some(ui.accent))
                 .when(!has_message, |button| button.opacity(0.5).cursor_default())
@@ -1891,7 +1961,13 @@ impl Render for Composer {
                 matches!(model.status, Status::Exited { .. }),
             )
         };
-        let placeholder = if self.shell_mode {
+        let placeholder = if let Some(agent) = &self.agent {
+            if agent.waits {
+                tr("Delivered when the agent is done")
+            } else {
+                tr("A message for the agent")
+            }
+        } else if self.shell_mode {
             tr("A command, e.g. git status")
         } else if waiting {
             tr("Answer Claude above, or write here")
@@ -1935,6 +2011,34 @@ impl Render for Composer {
                 .text_color(ui.success)
                 .child("!")
         });
+        // A subagent's view: whom the message is for.
+        let agent_banner = self
+            .agent
+            .as_ref()
+            .filter(|_| self.editing.is_none())
+            .map(|agent| {
+                div()
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(theme::TEXT_SM))
+                    .child(
+                        icon(IconName::Agent, ui.accent_text)
+                            .size(px(12.))
+                            .flex_none(),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(ui.accent_text)
+                            .child(trf(
+                                "Through Claude to the agent «{0}»",
+                                &[&agent.description],
+                            )),
+                    )
+            });
         let banner = self.editing.as_ref().map(|_| {
             div()
                 .h(px(20.))
@@ -2022,6 +2126,7 @@ impl Render for Composer {
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.focus(window, cx)))
             // Editing a sent message (part 10.2).
             .children(banner)
+            .children(agent_banner)
             .children(chips)
             .child(
                 div()
@@ -2119,6 +2224,23 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_for_a_subagent_names_it_for_send_message() {
+        let mut agent = AgentTarget {
+            description: "Find the tests".into(),
+            agent_id: Some("a928daf3b62218c72".into()),
+            waits: false,
+        };
+        let message = agent.message("Skip the slow ones");
+        assert!(message.contains("«Find the tests»"));
+        assert!(message.contains("agent id a928daf3b62218c72"));
+        assert!(message.contains("SendMessage"));
+        assert!(message.ends_with("\n\nSkip the slow ones"));
+        // Before the CLI reports the id: the description only.
+        agent.agent_id = None;
+        assert!(!agent.message("x").contains("agent id"));
+    }
 
     #[test]
     fn resume_is_flux_s_own_command() {

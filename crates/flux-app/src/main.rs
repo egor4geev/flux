@@ -15,6 +15,7 @@ mod claude_diff;
 mod claude_history;
 mod claude_panel;
 mod claude_search;
+mod claude_select;
 mod claude_session;
 mod claude_status;
 mod claude_tools;
@@ -58,6 +59,7 @@ mod image_view;
 mod input;
 mod input_dialog;
 mod launchpad;
+mod leftovers;
 mod locations;
 mod log_actions;
 mod lsp;
@@ -71,6 +73,7 @@ mod navigation;
 mod notification_center;
 mod notifications;
 mod notifications_panel;
+mod open_urls;
 mod picker;
 mod plugin_calls;
 mod plugin_catalog;
@@ -172,115 +175,120 @@ fn main() {
     // Compiled WebAssembly grammars of plugins: next to the compiled plugins' components.
     flux_syntax::set_wasm_cache_dir(flux_plugin::paths::cache_dir().with_file_name("grammars"));
 
-    Application::new()
-        .with_assets(icons::Assets)
-        .run(move |cx: &mut App| {
-            cx.set_global(Theme::flux_night());
-            theme::init_fonts(cx);
-            editor::bind_keys(cx);
-            workspace::init(cx);
-            input::init(cx);
-            input_dialog::init(cx);
-            picker::init(cx);
-            command_palette::init(cx);
-            context_menu::init(cx);
-            file_finder::init(cx);
-            file_tree::init(cx);
-            find_bar::init(cx);
-            go_to_line::init(cx);
-            project_search::init(cx);
-            settings::init(cx);
-            // The interface language, the theme and the icons as the settings choose them, from
-            // the plugins that bring them (stage 8.3): before any window opens.
-            i18n::apply_choice(settings::appearance(cx).language);
-            contributions::init(cx);
-            quick_switch::init(cx);
-            dialog::init(cx);
-            settings_view::init(cx);
-            app_menu::init(cx);
-            lsp::init(cx);
-            diagnostics::init(cx);
-            completion::init(cx);
-            hover::init(cx);
-            navigation::init(cx);
-            terminal_view::init(cx);
-            terminal_search::init(cx);
-            terminal_group::init(cx);
-            terminal_panel::init(cx);
-            git::init(cx);
-            git_gutter::init(cx);
-            commit_panel::init(cx);
-            push_dialog::init(cx);
-            diff_view::init(cx);
-            branches_popup::init(cx);
-            branch_dialogs::init(cx);
-            git_sync::init(cx);
-            compare_dialog::init(cx);
-            commit_details::init(cx);
-            log_actions::init(cx);
-            stash_panel::init(cx);
-            conflicts_dialog::init(cx);
-            merge_view::init(cx);
-            git_log::init(cx);
-            git_window::init(cx);
-            notifications_panel::init(cx);
-            rebase_dialog::init(cx);
-            plugins::init(cx);
-            plugin_view::init(cx);
-            claude::init(cx);
-            claude_panel::init(cx);
-            claude_composer::init(cx);
-            claude_transcript::init(cx);
-            image_view::init(cx);
-            claude_history::init(cx);
-            claude_cards::init(cx);
-            claude_diff::init(cx);
-            claude_actions::init(cx);
-            editor_menu::init(cx);
-            code_actions::init(cx);
-            prompt_input::init(cx);
-            plugin_manager::init(cx);
-            plugin_settings::init(cx);
-            task_contexts::init(cx);
-            ui_scale::init(cx);
-            project_popup::init(cx);
-            command_usage::init(cx);
-            markdown_preview::init(cx);
-            wrap::init(cx);
-            editor_settings::init(cx);
-            scrollbar::init(cx);
-            lsp_status::init(cx);
-            lsp_settings::init(cx);
-            settings_file::init(cx);
-            feedback::init(cx);
-            app_log::init(cx);
-            welcome::init(cx);
-            updates::init(cx);
-            update_notes::init(cx);
+    let app = Application::new().with_assets(icons::Assets);
+    // Folders and files macOS asks to open (the Dock menu's recent folders, a folder dropped on the
+    // Dock icon): they may come right after the launch, before the windows have opened.
+    let urls = open_urls::listen(&app);
+    app.run(move |cx: &mut App| {
+        cx.set_global(Theme::flux_night());
+        theme::init_fonts(cx);
+        editor::bind_keys(cx);
+        workspace::init(cx);
+        input::init(cx);
+        input_dialog::init(cx);
+        picker::init(cx);
+        command_palette::init(cx);
+        context_menu::init(cx);
+        file_finder::init(cx);
+        file_tree::init(cx);
+        find_bar::init(cx);
+        go_to_line::init(cx);
+        project_search::init(cx);
+        settings::init(cx);
+        // The interface language, the theme and the icons as the settings choose them, from
+        // the plugins that bring them (stage 8.3): before any window opens.
+        i18n::apply_choice(settings::appearance(cx).language);
+        contributions::init(cx);
+        quick_switch::init(cx);
+        dialog::init(cx);
+        settings_view::init(cx);
+        app_menu::init(cx);
+        lsp::init(cx);
+        diagnostics::init(cx);
+        completion::init(cx);
+        hover::init(cx);
+        navigation::init(cx);
+        terminal_view::init(cx);
+        terminal_search::init(cx);
+        terminal_group::init(cx);
+        terminal_panel::init(cx);
+        git::init(cx);
+        git_gutter::init(cx);
+        commit_panel::init(cx);
+        push_dialog::init(cx);
+        diff_view::init(cx);
+        branches_popup::init(cx);
+        branch_dialogs::init(cx);
+        git_sync::init(cx);
+        compare_dialog::init(cx);
+        commit_details::init(cx);
+        log_actions::init(cx);
+        stash_panel::init(cx);
+        conflicts_dialog::init(cx);
+        merge_view::init(cx);
+        git_log::init(cx);
+        git_window::init(cx);
+        notifications_panel::init(cx);
+        rebase_dialog::init(cx);
+        plugins::init(cx);
+        plugin_view::init(cx);
+        claude::init(cx);
+        claude_panel::init(cx);
+        claude_composer::init(cx);
+        claude_transcript::init(cx);
+        image_view::init(cx);
+        claude_history::init(cx);
+        claude_cards::init(cx);
+        claude_diff::init(cx);
+        claude_actions::init(cx);
+        editor_menu::init(cx);
+        code_actions::init(cx);
+        prompt_input::init(cx);
+        plugin_manager::init(cx);
+        plugin_settings::init(cx);
+        task_contexts::init(cx);
+        ui_scale::init(cx);
+        project_popup::init(cx);
+        command_usage::init(cx);
+        markdown_preview::init(cx);
+        wrap::init(cx);
+        editor_settings::init(cx);
+        scrollbar::init(cx);
+        lsp_status::init(cx);
+        lsp_settings::init(cx);
+        settings_file::init(cx);
+        feedback::init(cx);
+        app_log::init(cx);
+        welcome::init(cx);
+        updates::init(cx);
+        update_notes::init(cx);
 
-            // The project of the command line, or the projects open when Flux quit (part 10.1);
-            // on the first launch the welcome guide — alone when started from the Dock — and after
-            // an update What's New (part 10.7).
-            let _window = welcome::startup(root, paths, cx).expect("failed to open window");
-            #[cfg(feature = "scenario")]
-            scenario::run(_window, cx);
+        // The project of the command line, or the projects open when Flux quit (part 10.1);
+        // on the first launch the welcome guide — alone when started from the Dock — and after
+        // an update What's New (part 10.7).
+        let _window = welcome::startup(root, paths, cx).expect("failed to open window");
+        open_urls::run(urls, cx);
+        // The recent projects for the Dock menu, also those opened before Flux reported them.
+        recent::tell_the_system(cx);
+        #[cfg(feature = "scenario")]
+        scenario::run(_window, cx);
 
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            // A scenario in the background doesn't take the keyboard from the app the user works
-            // in (`FLUX_SCENARIO_BACKGROUND`).
-            #[cfg(feature = "scenario")]
-            let activate = !scenario::background();
-            #[cfg(not(feature = "scenario"))]
-            let activate = true;
-            if activate {
-                cx.activate(true);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
             }
-        });
+        })
+        .detach();
+        // A scenario in the background doesn't take the keyboard from the app the user works
+        // in (`FLUX_SCENARIO_BACKGROUND`).
+        #[cfg(feature = "scenario")]
+        let activate = !scenario::background();
+        #[cfg(not(feature = "scenario"))]
+        let activate = true;
+        if activate {
+            cx.activate(true);
+        }
+    });
 }
 
 /// Project root: the directory from the arguments; without one, the nearest ancestor of the current

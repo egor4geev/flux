@@ -25,8 +25,8 @@ use flux_plugin::api::events::Event;
 use flux_plugin::api::links::LinkPattern;
 use gpui::{
     AnyElement, AnyView, App, Context, ElementId, Entity, EntityId, Hsla, InteractiveText,
-    IntoElement, Render, SharedString, StyledText, TextRun, UnderlineStyle, WeakEntity, Window,
-    div, prelude::*, px,
+    IntoElement, Render, SharedString, StyledText, TextLayout, TextRun, UnderlineStyle, WeakEntity,
+    Window, div, prelude::*, px,
 };
 use regex::Regex;
 
@@ -473,15 +473,29 @@ pub(crate) fn clickable_text(
     targets: Vec<(Range<usize>, Target)>,
     color: Hsla,
 ) -> AnyElement {
+    clickable_text_laid(id, text, runs, targets, color).0
+}
+
+/// As [`clickable_text`], with the text's layout (where the mouse is in it, once laid out).
+pub(crate) fn clickable_text_laid(
+    id: impl Into<ElementId>,
+    text: SharedString,
+    runs: Vec<TextRun>,
+    targets: Vec<(Range<usize>, Target)>,
+    color: Hsla,
+) -> (AnyElement, TextLayout) {
     if targets.is_empty() {
-        return StyledText::new(text).with_runs(runs).into_any_element();
+        let styled = StyledText::new(text).with_runs(runs);
+        let layout = styled.layout().clone();
+        return (styled.into_any_element(), layout);
     }
     let ranges: Vec<Range<usize>> = targets.iter().map(|(range, _)| range.clone()).collect();
     let runs = link_runs(runs, &ranges, color);
     let styled = StyledText::new(text).with_runs(runs);
+    let layout = styled.layout().clone();
     let targets = Rc::new(targets);
     let clicked = targets.clone();
-    InteractiveText::new(id, styled)
+    let element = InteractiveText::new(id, styled)
         .on_click(ranges, move |index, window, cx| match clicked.get(index) {
             Some((_, Target::Plugin(link))) => {
                 let store = store_of(window, cx);
@@ -500,7 +514,8 @@ pub(crate) fn clickable_text(
                 Target::Url(url) => Some(url_tooltip(url, cx)),
             }
         })
-        .into_any_element()
+        .into_any_element();
+    (element, layout)
 }
 
 /// The plugins' links of `text` as targets, leaving out those that overlap `taken` (byte ranges

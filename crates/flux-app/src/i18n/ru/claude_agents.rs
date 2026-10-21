@@ -19,6 +19,24 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Агент закончил — итог передан Claude",
     ),
     ("back to the session", "назад к сессии"),
+    // subagent: a message for the agent, through Claude
+    (
+        "A message for the subagent «{0}» (agent id {1}), written in its view — pass it on to the agent with SendMessage:",
+        "Сообщение для субагента «{0}» (agent id {1}), написано в его окне — передай его агенту через SendMessage:",
+    ),
+    (
+        "A message for the subagent «{0}», written in its view — pass it on to the agent with SendMessage:",
+        "Сообщение для субагента «{0}», написано в его окне — передай его агенту через SendMessage:",
+    ),
+    (
+        "Delivered when the agent is done",
+        "Дойдёт, когда агент закончит",
+    ),
+    ("A message for the agent", "Сообщение агенту"),
+    (
+        "Through Claude to the agent «{0}»",
+        "Через Claude агенту «{0}»",
+    ),
 ];
 
 pub(super) const PLURALS: &[(&str, [&str; 3])] = &[];

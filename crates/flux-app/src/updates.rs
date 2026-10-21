@@ -70,6 +70,9 @@ actions!(
 const STARTUP_DELAY: Duration = Duration::from_secs(5);
 /// Automatic checks come this often.
 const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// A launch checks unless the last check is younger than this: relaunching Flux a few times in a
+/// row shouldn't spend GitHub's unauthenticated request limit (60 an hour).
+const LAUNCH_FLOOR: Duration = Duration::from_secs(60 * 60);
 /// The checking loop looks at the clock and the settings at least this often (a switch turned on,
 /// a Mac waking up after a day asleep).
 const WAKE: Duration = Duration::from_secs(60 * 60);
@@ -177,8 +180,10 @@ impl Updates {
     fn new(cx: &mut Context<Self>) -> Self {
         let checks = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(STARTUP_DELAY).await;
+            let mut launch = true;
             loop {
-                let Ok(wait) = this.update(cx, |this, cx| this.tick(cx)) else {
+                let launched = std::mem::take(&mut launch);
+                let Ok(wait) = this.update(cx, |this, cx| this.tick(launched, cx)) else {
                     return;
                 };
                 cx.background_executor().timer(wait).await;
@@ -219,16 +224,14 @@ impl Updates {
         self.state.last_check
     }
 
-    /// The automatic check, when it is due: returns how long to sleep till the next look.
-    fn tick(&mut self, cx: &mut Context<Self>) -> Duration {
+    /// The automatic check, when it is due: returns how long to sleep till the next look. The first
+    /// look after a launch checks right away (see [`due`]).
+    fn tick(&mut self, launch: bool, cx: &mut Context<Self>) -> Duration {
         if !automatic(cx) {
             return WAKE;
         }
         let now = now();
-        let due = self
-            .state
-            .last_check
-            .map_or(0, |last| last.saturating_add(INTERVAL.as_secs()));
+        let due = due(self.state.last_check, launch);
         if now < due {
             return Duration::from_secs(due - now).min(WAKE);
         }
@@ -1029,6 +1032,13 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     })
 }
 
+/// When the next automatic check is due (Unix seconds): a day after the last one, or an hour after
+/// it at launch.
+fn due(last_check: Option<u64>, launch: bool) -> u64 {
+    let interval = if launch { LAUNCH_FLOOR } else { INTERVAL };
+    last_check.map_or(0, |last| last.saturating_add(interval.as_secs()))
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1115,6 +1125,17 @@ mod tests {
         assert_eq!(release_date("2026-1-5"), "January 5, 2026");
         assert_eq!(release_date("soon"), "soon");
         assert_eq!(release_date("2026-13-01"), "2026-13-01");
+    }
+
+    #[test]
+    fn a_launch_checks_unless_the_last_check_is_fresh() {
+        let last = 1_760_000_000;
+        assert_eq!(due(None, true), 0);
+        assert_eq!(due(None, false), 0);
+        // At launch: an hour after the last check, not a day.
+        assert_eq!(due(Some(last), true), last + 60 * 60);
+        // Afterwards: once a day.
+        assert_eq!(due(Some(last), false), last + 24 * 60 * 60);
     }
 
     #[test]

@@ -509,8 +509,27 @@ impl ClaudeChat {
         while !self.agents.is_empty() {
             self.agent_back(window, cx);
         }
-        self.transcript.reveal(id);
+        // The click took the focus off the message field (a click in the chat focuses the chat):
+        // typing goes on there.
+        self.focus_composer(window, cx);
+        // Highlighted for a moment, then the highlight fades.
+        let at = self.transcript.reveal_highlighted(id);
         cx.notify();
+        cx.spawn(async move |chat, cx| {
+            cx.background_executor()
+                .timer(crate::claude_transcript::REVEALED_HOLD)
+                .await;
+            chat.update(cx, |_, cx| cx.notify()).ok();
+            cx.background_executor()
+                .timer(crate::claude_transcript::REVEALED_FADE)
+                .await;
+            chat.update(cx, |chat, cx| {
+                chat.transcript.end_highlight(at);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 

@@ -604,7 +604,7 @@ impl Workspace {
             ),
         ];
         let recent = match &root {
-            Some(root) => recent::record(root),
+            Some(root) => record_recent(root, cx),
             None => recent::load(),
         };
         let mut workspace = Self {
@@ -719,7 +719,7 @@ impl Workspace {
         self.file_tree = Some(tree);
         self.tree_open = true;
         self.revealed = None;
-        self.recent = recent::record(&root);
+        self.recent = record_recent(&root, cx);
         self.show_message(trf("Project: {0}", &[&tilde(&root)]).into(), cx);
         self.root = Some(root.clone());
         self.terminal_panel
@@ -5655,7 +5655,8 @@ fn quit_requested(cx: &mut App) {
                     || !workspace.claude.read(cx).working_sessions(cx).is_empty()
                     || workspace.tabs.iter().any(|tab| tab.item.is_modified(cx))
             })
-        });
+        })
+        || !crate::leftovers::detached().is_empty();
     // A scenario in the background leaves the keyboard with the app the user works in.
     #[cfg(feature = "scenario")]
     let asks = asks && !crate::scenario::background();
@@ -5691,7 +5692,8 @@ fn start_quit_then(cx: &mut App, cancelled: impl FnOnce(&mut App) + 'static) {
         .filter_map(|window| window.downcast())
         .collect();
     cx.spawn(async move |cx| {
-        let confirmed = confirm_windows(windows, cx).await;
+        let confirmed =
+            confirm_windows(windows.clone(), cx).await && confirm_leftovers(&windows, cx).await;
         cx.update(|cx| {
             if confirmed {
                 cx.quit();
@@ -5720,6 +5722,50 @@ async fn confirm_windows(windows: Vec<WindowHandle<Workspace>>, cx: &mut AsyncAp
         }
     }
     true
+}
+
+const LEFTOVERS_MESSAGE: &str = "{0} started from Flux and will keep running after it quits. Until they end, the Dock shows Flux as open.";
+
+/// Processes started from Flux that have left it (a daemon a terminal command started: a container
+/// VM manager, a build daemon) keep running after Flux quits, and macOS shows Flux in the Dock as
+/// open until they end ([`crate::leftovers`]): the user decides whether they end with Flux.
+async fn confirm_leftovers(windows: &[WindowHandle<Workspace>], cx: &mut AsyncApp) -> bool {
+    let leftovers = crate::leftovers::detached();
+    if leftovers.is_empty() {
+        return true;
+    }
+    let names = names_with_counts(&crate::leftovers::names(&leftovers));
+    // The window in front, if it is a project window.
+    let active = cx
+        .update(|cx| {
+            cx.active_window()
+                .and_then(|window| window.downcast::<Workspace>())
+        })
+        .ok()
+        .flatten();
+    let Some(handle) = active.or_else(|| windows.first().copied()) else {
+        return true;
+    };
+    let answer = handle.update(cx, |_, window, cx| {
+        window.activate_window();
+        Dialog::warning(tr("Leave processes running?"))
+            .message(trf(LEFTOVERS_MESSAGE, &[&names]))
+            .danger(tr("Terminate"))
+            .normal(tr("Leave Running"))
+            .cancel(tr("Cancel"))
+            .show(window, cx)
+    });
+    let Ok(answer) = answer else {
+        return true;
+    };
+    match answer.await {
+        Some(0) => {
+            crate::leftovers::terminate(&leftovers);
+            true
+        }
+        Some(1) => true,
+        _ => false,
+    }
 }
 
 // --- Windows (part 10.1) ---
@@ -5883,7 +5929,15 @@ fn window_frames(cx: &mut App) -> Vec<Bounds<Pixels>> {
 }
 
 /// The window that has the project open (other than the one being updated, which can't be read).
-fn project_window(root: &Path, cx: &App) -> Option<WindowHandle<Workspace>> {
+/// Remembers the project as the most recent one, for Flux's lists and for macOS (the Dock menu).
+fn record_recent(root: &Path, cx: &App) -> Vec<PathBuf> {
+    if recent::tells_the_system() {
+        cx.add_recent_document(root);
+    }
+    recent::record(root)
+}
+
+pub(crate) fn project_window(root: &Path, cx: &App) -> Option<WindowHandle<Workspace>> {
     cx.windows()
         .into_iter()
         .filter_map(|handle| handle.downcast::<Workspace>())
@@ -6209,6 +6263,18 @@ fn terminal_details(terminals: &[Option<(SharedString, Option<PathBuf>)>]) -> Ve
 /// The detail of the "Terminate running processes?" question, naming the commands (each once, with
 /// a count when it runs in several terminals); `None` when nothing is running.
 fn running_processes_detail(names: &[String]) -> Option<String> {
+    match names {
+        [] => None,
+        [name] => Some(trf("“{0}” is still running in a terminal.", &[name])),
+        _ => Some(trf(
+            "{0} are still running in terminals.",
+            &[&names_with_counts(names)],
+        )),
+    }
+}
+
+/// "cargo, node ×2": process names in the order first seen, repeats counted.
+fn names_with_counts(names: &[String]) -> String {
     let mut counted: Vec<(&str, usize)> = Vec::new();
     for name in names {
         match counted.iter_mut().find(|(seen, _)| seen == name) {
@@ -6216,21 +6282,14 @@ fn running_processes_detail(names: &[String]) -> Option<String> {
             None => counted.push((name, 1)),
         }
     }
-    match counted.as_slice() {
-        [] => None,
-        [(name, 1)] => Some(trf("“{0}” is still running in a terminal.", &[name])),
-        _ => {
-            let list = counted
-                .iter()
-                .map(|(name, count)| match count {
-                    1 => name.to_string(),
-                    count => format!("{name} ×{count}"),
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            Some(trf("{0} are still running in terminals.", &[&list]))
-        }
-    }
+    counted
+        .iter()
+        .map(|(name, count)| match count {
+            1 => name.to_string(),
+            count => format!("{name} ×{count}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl Render for DraggedEditorTab {
