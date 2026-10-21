@@ -13,7 +13,7 @@
 </div>
 
 <p align="center">
-  <img src="docs/images/hero.png" alt="Flux: the project tree, a Rust file with Claude's change marked in the gutter, and a Claude chat with the edit and a summary of the changed files" width="100%">
+  <img src="docs/images/hero.png" alt="Flux: the Claude console on the left — one session pinging localhost, one asking which color format to add with its options, one done — and a session\'s chat with Claude\'s edit to color.rs and the Done summary" width="100%">
 </p>
 
 ## Features
