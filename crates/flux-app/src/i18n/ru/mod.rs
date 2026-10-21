@@ -13,6 +13,8 @@ mod claude_cards;
 mod claude_changes;
 mod claude_commands;
 mod claude_composer;
+mod claude_console;
+mod claude_console_core;
 mod claude_history;
 mod claude_session;
 mod claude_tabs;
@@ -153,6 +155,8 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     windows::STRINGS,
     claude_commands::STRINGS,
     claude_tabs::STRINGS,
+    claude_console::STRINGS,
+    claude_console_core::STRINGS,
     claude_turns::STRINGS,
     claude_agents::STRINGS,
     image_view::STRINGS,
@@ -222,6 +226,8 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     windows::PLURALS,
     claude_commands::PLURALS,
     claude_tabs::PLURALS,
+    claude_console::PLURALS,
+    claude_console_core::PLURALS,
     claude_turns::PLURALS,
     claude_agents::PLURALS,
     image_view::PLURALS,

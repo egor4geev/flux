@@ -1781,7 +1781,9 @@ fn render_block(block: &DocBlock, id: u64, ctx: &Rc<Ctx>, theme: &Theme) -> AnyE
                 )
                 .into_any_element()
         }
-        Kind::Code(code) => markdown::chat_code_block(code, theme, element_id(id + 1000), None),
+        Kind::Code(code) => {
+            markdown::chat_code_block(code, theme, element_id(id + 1000), None, None)
+        }
         Kind::Table(table) => render_table(table, id, ctx, ui),
         Kind::Rule => div().h(px(1.)).bg(ui.divider).into_any_element(),
         Kind::Images(images) => render_images(images, centered, id, ctx, ui),

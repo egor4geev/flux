@@ -5,12 +5,12 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Setup · Claude Code", "Настройка · Claude Code"),
     ("Claude in Its Own Chat", "Claude — в своём чате"),
     (
-        "Flux works with your claude and your Claude subscription: the chat on the right or as an editor tab, edits as diffs with review and rollback, a fix for a problem with {0}.",
-        "Flux работает с вашим claude и подпиской Claude: чат справа или вкладкой редактора, правки — диффом с обзором и откатом, исправление проблемы — по {0}.",
+        "Flux works with your claude and your Claude subscription: sessions in the console on the left, each chat in an editor tab, edits as diffs with review and rollback, a fix for a problem with {0}.",
+        "Flux работает с вашим claude и подпиской Claude: сессии — в пульте слева, каждый чат — вкладкой редактора, правки — диффом с обзором и откатом, исправление проблемы — по {0}.",
     ),
     (
-        "Open the chat and go back to the editor",
-        "Открыть чат и вернуться в редактор",
+        "The console, and back to the last chat",
+        "Пульт и обратно к последнему чату",
     ),
     ("The selection into the message", "Выделенное — в сообщение"),
     ("“{0}” on a problem", "«{0}» у проблемы"),

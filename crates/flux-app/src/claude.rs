@@ -3,10 +3,12 @@
 //! subscription limits, and tells the window what needs it: a question for the user, an edit to
 //! show in a diff tab, files Claude changed, a session that finished or failed.
 //!
-//! The chat lives in the island on the right ([`crate::claude_panel`]); a session's chat can move to
-//! the editor's tabs and back ([`crate::claude_chat`]). Keys, as the Claude Code plugin for
-//! JetBrains IDEs: ⌘Esc opens the Claude window or goes back to the editor, ⌥⌘K puts the
-//! selection into the message.
+//! A session's chat lives in an editor tab ([`crate::claude_chat`]); the console in the left island
+//! ([`crate::claude_console`]) lists the sessions (part «Пульт Claude»). Closing a chat's tab doesn't
+//! end its session: one that works or waits for the user goes on, an idle one is unloaded — its
+//! process stops, the console keeps it, opening it resumes it. Keys, as the Claude Code plugin for
+//! JetBrains IDEs: ⌘Esc focuses the console or goes back to the last chat, ⌥⌘K puts the selection
+//! into the message.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,7 +23,8 @@ use flux_claude::{
     Cli, EntryKind, LaunchOptions, Notice, PendingKind, RateLimits, SavedSession, Status,
 };
 
-use crate::claude_history::{self, OpenSessions, SessionPlace};
+use crate::claude_console::SessionRef;
+use crate::claude_history::{self, ConsoleState, OpenSessions, SessionPlace};
 use crate::claude_session::{ClaudeSession, SessionEvent};
 use crate::i18n::{tr, trf};
 use crate::settings;
@@ -29,25 +32,21 @@ use crate::settings;
 actions!(
     claude,
     [
-        /// ⌘Esc: shows the Claude window and focuses the message field (starting a session when
-        /// there is none); from a chat, back to the editor.
+        /// ⌘Esc: shows the console and focuses it; from the console, back to the last chat (else the
+        /// editor).
         ToggleClaude,
         /// ⌥⌘K: the editor's file and selected lines go into the message as a mention.
         AddSelectionToClaude,
-        /// A new session in the Claude window.
+        /// A new session in a new editor tab.
         NewSession,
         /// Stops the running turn of the current session (Esc in the message field).
         Interrupt,
         /// The current session goes on in the terminal CLI (`claude --resume`): for what only the
         /// terminal does (`/config`, `/mcp`).
         OpenInTerminal,
-        /// The current session's chat moves to the editor's tabs.
-        MoveToEditor,
-        /// A chat in the editor's tabs goes back to the Claude window.
-        MoveToPanel,
         /// Renames the current session.
         RenameSession,
-        /// Ends the current session: its process stops, its chat goes.
+        /// Closes the current session's tab (the session stays in the console).
         CloseSession,
         /// Signs in to Claude: `claude auth login` in a terminal.
         SignIn,
@@ -193,13 +192,22 @@ pub enum ClaudeStoreEvent {
         path: PathBuf,
     },
     /// A session open when the project last closed came back (Settings → Claude Code → "Reopen
-    /// sessions with the project"): its chat goes where it was — a pill of the Claude window
-    /// (`active` — the active one) or an editor tab — without coming into sight.
+    /// sessions with the project"): its chat goes back to an editor tab (`active` — the active one)
+    /// without coming into sight.
     SessionRestored {
         session: Entity<ClaudeSession>,
         place: SessionPlace,
         active: bool,
     },
+}
+
+/// A session of the console's "Now".
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConsoleItem {
+    /// In this window: working, waiting, idle, its process maybe not started yet.
+    Live(Entity<ClaudeSession>),
+    /// Unloaded: no process, no chat; opening it resumes it.
+    Unloaded(SavedSession),
 }
 
 /// Bringing back the sessions open when the project last closed.
@@ -234,6 +242,23 @@ pub struct ClaudeStore {
     finished: HashMap<EntityId, Instant>,
     /// Redraws the window each second while a session works: the clocks on the sessions' badges.
     _ticker: Option<Task<()>>,
+    // --- The console (part «Пульт Claude») ---
+    /// "Now" by CLI id: the sessions of the console that may be unloaded (live ones are found by
+    /// their entities). The latest first.
+    console_ids: Vec<String>,
+    /// The archive: out of "Now", still in the history.
+    archived: Vec<String>,
+    /// Sessions that finished their work out of sight: "Done" until their chat is shown.
+    unseen: HashSet<EntityId>,
+    /// When each live session last finished a turn in this window.
+    worked: HashMap<EntityId, SystemTime>,
+    /// Sessions just unloaded, until the saved list has them.
+    placeholders: HashMap<String, SavedSession>,
+    /// The root's saved sessions (`None` until first read).
+    saved: Option<Vec<SavedSession>>,
+    _saved: Option<Task<()>>,
+    /// The console as last written for the root: `None` until it was read.
+    saved_console: Option<ConsoleState>,
 }
 
 impl EventEmitter<ClaudeStoreEvent> for ClaudeStore {}
@@ -254,7 +279,17 @@ impl ClaudeStore {
             saved_open: None,
             finished: HashMap::new(),
             _ticker: None,
+            console_ids: Vec::new(),
+            archived: Vec::new(),
+            unseen: HashSet::new(),
+            worked: HashMap::new(),
+            placeholders: HashMap::new(),
+            saved: None,
+            _saved: None,
+            saved_console: None,
         };
+        store.load_console();
+        store.refresh_saved(cx);
         store.check(cx);
         store
     }
@@ -279,6 +314,9 @@ impl ClaudeStore {
             self.restore = Restore::Pending;
             self._restore = None;
             self.saved_open = None;
+            self.load_console();
+            self.saved = None;
+            self.refresh_saved(cx);
             self.restore(cx);
         }
         cx.notify();
@@ -286,6 +324,289 @@ impl ClaudeStore {
 
     pub fn sessions(&self) -> &[Entity<ClaudeSession>] {
         &self.sessions
+    }
+
+    // --- The console (part «Пульт Claude») ---
+
+    /// The console's "Now": the live sessions and the unloaded ones (closed while idle, or back
+    /// after a restart) that aren't archived, the latest activity first.
+    pub fn console(&self, cx: &App) -> Vec<ConsoleItem> {
+        // A session takes the top when it comes into "Now" and stays where it is: opening it, a
+        // turn starting don't move it. Live sessions not in the kept order yet (new ones, resumed
+        // from the history) are on top, the latest first; then the kept order.
+        let id_of =
+            |session: &Entity<ClaudeSession>| session.read(cx).session_id().map(str::to_string);
+        let mut items: Vec<ConsoleItem> = self
+            .sessions
+            .iter()
+            .rev()
+            .filter(|session| id_of(session).is_none_or(|id| !self.console_ids.contains(&id)))
+            .cloned()
+            .map(ConsoleItem::Live)
+            .collect();
+        for id in &self.console_ids {
+            if self.archived.contains(id) {
+                continue;
+            }
+            if let Some(session) = self.open_session(id, cx) {
+                items.push(ConsoleItem::Live(session));
+                continue;
+            }
+            let saved = self.placeholders.get(id).or_else(|| {
+                self.saved
+                    .as_deref()
+                    .and_then(|saved| saved.iter().find(|saved| &saved.id == id))
+            });
+            if let Some(saved) = saved {
+                items.push(ConsoleItem::Unloaded(saved.clone()));
+            }
+        }
+        items
+    }
+
+    /// Whether the session finished its work out of sight and its chat wasn't shown since.
+    pub fn is_unseen(&self, id: EntityId) -> bool {
+        self.unseen.contains(&id)
+    }
+
+    /// The session's chat was shown: its "Done" is seen.
+    pub fn mark_seen(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        if self.unseen.remove(&id) {
+            cx.emit(ClaudeStoreEvent::Changed);
+            cx.notify();
+        }
+    }
+
+    /// Fixes the order of "Now" as shown: the live sessions on top that aren't kept yet take their
+    /// places in it, so nothing moves later (their tab opening, a turn starting). Only once the
+    /// saved sessions are read: before that the unloaded ones aren't shown and would sink.
+    fn keep_order(&mut self, cx: &App) {
+        if self.saved.is_none() {
+            return;
+        }
+        let mut order: Vec<String> = Vec::new();
+        for item in self.console(cx) {
+            let id = match &item {
+                ConsoleItem::Live(session) => session.read(cx).session_id().map(str::to_string),
+                ConsoleItem::Unloaded(saved) => Some(saved.id.clone()),
+            };
+            if let Some(id) = id
+                && !order.contains(&id)
+            {
+                order.push(id);
+            }
+        }
+        for id in &self.console_ids {
+            if !order.contains(id) {
+                order.push(id.clone());
+            }
+        }
+        self.console_ids = order;
+    }
+
+    /// When the session last worked: its last turn's end in this window, else when its transcript
+    /// was last written.
+    pub fn last_worked(&self, session: &Entity<ClaudeSession>, cx: &App) -> Option<SystemTime> {
+        if let Some(at) = self.worked.get(&session.entity_id()) {
+            return Some(*at);
+        }
+        let id = session.read(cx).session_id()?;
+        self.placeholders
+            .get(id)
+            .or_else(|| {
+                self.saved
+                    .as_deref()
+                    .and_then(|saved| saved.iter().find(|saved| saved.id == id))
+            })
+            .map(|saved| saved.modified)
+    }
+
+    /// Every saved session of the root (`~/.claude/projects/<root>`), the latest first, archived
+    /// ones included; `None` until first read. Kept by the store and re-read in the background
+    /// when sessions change ([`Self::refresh_saved`]).
+    pub fn saved_sessions(&self) -> Option<&[SavedSession]> {
+        self.saved.as_deref()
+    }
+
+    /// Reads the saved sessions again (the console opened, a session finished or was unloaded).
+    pub fn refresh_saved(&mut self, cx: &mut Context<Self>) {
+        if self.root.is_none() {
+            self.saved = Some(Vec::new());
+            self._saved = None;
+            return;
+        }
+        let list = self.history(cx);
+        self._saved = Some(cx.spawn(async move |this, cx| {
+            let list = list.await;
+            this.update(cx, |this, cx| {
+                this.placeholders
+                    .retain(|id, _| !list.iter().any(|saved| &saved.id == id));
+                this.saved = Some(list);
+                this._saved = None;
+                cx.emit(ClaudeStoreEvent::Changed);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Whether the session (by its CLI id) is in the archive.
+    pub fn is_archived(&self, id: &str) -> bool {
+        self.archived.iter().any(|known| known == id)
+    }
+
+    /// Moves an unloaded or saved session to the archive (a live one is unloaded by the window
+    /// first). Kept in `claude-console.json`.
+    pub fn archive(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.is_archived(id) {
+            self.archived.insert(0, id.to_string());
+        }
+        self.console_ids.retain(|known| known != id);
+        self.placeholders.remove(id);
+        self.persist_console(cx);
+        cx.emit(ClaudeStoreEvent::Changed);
+        cx.notify();
+    }
+
+    /// Brings a session back from the archive into "Now".
+    pub fn unarchive(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.archived.retain(|known| known != id);
+        if !self.console_ids.iter().any(|known| known == id) {
+            self.console_ids.insert(0, id.to_string());
+        }
+        self.persist_console(cx);
+        cx.emit(ClaudeStoreEvent::Changed);
+        cx.notify();
+    }
+
+    /// A session's tab closed while it is idle: its process stops and it stays in "Now" unloaded
+    /// (opening it resumes it). One without an id yet (nothing was said) just ends.
+    pub fn unload(&mut self, session: &Entity<ClaudeSession>, cx: &mut Context<Self>) {
+        let (id, title, cwd) = {
+            let session = session.read(cx);
+            (
+                session.session_id().map(str::to_string),
+                session.title().to_string(),
+                session.model().info.cwd.clone(),
+            )
+        };
+        // It keeps its place in "Now": closing the session takes it out of the order first.
+        self.keep_order(cx);
+        let place = id
+            .as_ref()
+            .and_then(|id| self.console_ids.iter().position(|known| known == id));
+        self.close_session(session, cx);
+        let Some(id) = id else {
+            return;
+        };
+        let path = flux_claude::transcript::transcript_path(&cwd, &id).unwrap_or_default();
+        self.placeholders.insert(
+            id.clone(),
+            SavedSession {
+                id: id.clone(),
+                title,
+                prompt: None,
+                branch: None,
+                modified: SystemTime::now(),
+                size: 0,
+                path,
+            },
+        );
+        self.archived.retain(|known| known != &id);
+        self.console_ids.retain(|known| known != &id);
+        let place = place.unwrap_or(0).min(self.console_ids.len());
+        self.console_ids.insert(place, id);
+        self.refresh_saved(cx);
+        self.persist_console(cx);
+        cx.emit(ClaudeStoreEvent::Changed);
+        cx.notify();
+    }
+
+    /// The console's Close: the session leaves "Now" — a live one ends, its process stops — and
+    /// shows in the history ("Recent", "This Week") by its time. Not archived.
+    pub fn close_from_console(&mut self, target: &SessionRef, cx: &mut Context<Self>) {
+        match target {
+            SessionRef::Live(session) => {
+                if let Some(id) = session.read(cx).session_id().map(str::to_string) {
+                    self.placeholders.remove(&id);
+                }
+                self.close_session(session, cx);
+            }
+            SessionRef::Saved(saved) => {
+                self.console_ids.retain(|known| known != &saved.id);
+                self.placeholders.remove(&saved.id);
+            }
+        }
+        self.refresh_saved(cx);
+        self.persist_console(cx);
+        cx.emit(ClaudeStoreEvent::Changed);
+        cx.notify();
+    }
+
+    /// Whether closing the session's tab keeps it running: Claude works, waits for the user, or a
+    /// background task of the session still runs.
+    pub fn keeps_running(session: &ClaudeSession) -> bool {
+        let model = session.model();
+        model.is_working() || crate::claude_status::glance(model).background > 0
+    }
+
+    /// The root's console as it was: "Now" (unloaded until opened) and the archive.
+    fn load_console(&mut self) {
+        self.console_ids.clear();
+        self.archived.clear();
+        self.placeholders.clear();
+        self.saved_console = None;
+        let Some(root) = &self.root else {
+            return;
+        };
+        let state = claude_history::load_console(root);
+        self.console_ids = state.now.clone();
+        self.archived = state.archived.clone();
+        self.saved_console = Some(state);
+    }
+
+    /// Writes the root's console when it changed: "Now" (the sessions of this root that have an id)
+    /// and the archive.
+    fn persist_console(&mut self, cx: &App) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        if self.saved_console.is_none() {
+            return;
+        }
+        let mut now: Vec<String> = Vec::new();
+        for item in self.console(cx) {
+            let id = match &item {
+                ConsoleItem::Live(session) => {
+                    let session = session.read(cx);
+                    if session.model().info.cwd != root {
+                        continue;
+                    }
+                    session.session_id().map(str::to_string)
+                }
+                ConsoleItem::Unloaded(saved) => Some(saved.id.clone()),
+            };
+            if let Some(id) = id
+                && !now.contains(&id)
+            {
+                now.push(id);
+            }
+        }
+        // Unloaded ones whose transcript isn't listed yet stay.
+        for id in &self.console_ids {
+            if !now.contains(id) && !self.archived.contains(id) {
+                now.push(id.clone());
+            }
+        }
+        let state = ConsoleState {
+            now,
+            archived: self.archived.clone(),
+        };
+        if self.saved_console.as_ref() == Some(&state) {
+            return;
+        }
+        claude_history::save_console(&root, &state);
+        self.saved_console = Some(state);
     }
 
     /// A session by its entity id (a notification's "Show").
@@ -635,6 +956,11 @@ impl ClaudeStore {
         self.subscriptions.retain(|(known, _)| known != session);
         self.busy.remove(&session.entity_id());
         self.finished.remove(&session.entity_id());
+        self.unseen.remove(&session.entity_id());
+        self.worked.remove(&session.entity_id());
+        if let Some(id) = session.read(cx).session_id() {
+            self.console_ids.retain(|known| known != id);
+        }
         crate::system_notify::withdraw(session.entity_id());
         cx.emit(ClaudeStoreEvent::SessionRemoved(session.clone()));
         cx.emit(ClaudeStoreEvent::Changed);
@@ -648,6 +974,7 @@ impl ClaudeStore {
         cx: &mut Context<Self>,
     ) {
         let id = session.entity_id();
+        self.keep_order(cx);
         match event {
             SessionEvent::PendingAdded(request) => {
                 crate::system_notify::session_waits(&session, cx);
@@ -673,8 +1000,12 @@ impl ClaudeStore {
                 if self.busy.remove(&id) {
                     let is_error = last_turn_failed(&session, cx);
                     self.finished.insert(id, Instant::now());
+                    self.worked.insert(id, SystemTime::now());
+                    // Seen right away when its chat is in sight (the window says so).
+                    self.unseen.insert(id);
                     crate::system_notify::session_finished(&session, is_error, cx);
                     cx.emit(ClaudeStoreEvent::Finished { session, is_error });
+                    self.refresh_saved(cx);
                 }
                 cx.emit(ClaudeStoreEvent::Changed);
             }
@@ -730,6 +1061,14 @@ impl ClaudeStore {
             SessionEvent::Changed | SessionEvent::TurnFinished { .. } => {}
         }
         self.update_ticker(cx);
+        // A new session got its id, a turn started: "Now" as it is now (not on every streamed
+        // change).
+        if matches!(
+            event,
+            SessionEvent::Status | SessionEvent::Idle | SessionEvent::Title
+        ) {
+            self.persist_console(cx);
+        }
         cx.notify();
     }
 }
@@ -841,6 +1180,20 @@ pub fn resets_in(at: SystemTime, now: SystemTime) -> String {
     trf("in {0} days", &[&hours.div_ceil(24)])
 }
 
+/// Shortens in the middle: "start…end".
+pub fn shorten(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(count - tail).collect();
+    format!("{start}…{end}")
+}
+
 /// A path for a shell command line: as it is when it has nothing special, else in single quotes.
 pub fn shell_quote(text: &str) -> String {
     let plain = !text.is_empty()
@@ -867,6 +1220,16 @@ pub fn resume_command(cli: &Cli, session_id: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_titles_shorten_in_the_middle() {
+        assert_eq!(shorten("fix tests", 24), "fix tests");
+        let long = "Fix the failing lexer tests in the parser crate";
+        let short = shorten(long, 24);
+        assert_eq!(short.chars().count(), 24);
+        assert!(short.starts_with("Fix the fail"));
+        assert!(short.ends_with("arser crate"));
+    }
 
     #[test]
     fn mentions_name_the_lines() {

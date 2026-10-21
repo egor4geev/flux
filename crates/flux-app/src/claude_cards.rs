@@ -483,7 +483,7 @@ fn short_path(path: &str, cwd: &Path) -> String {
 
 /// Claude's questions as answered: the question's text → the chosen labels (", " between several)
 /// and the "Other" text.
-fn question_answers(
+pub(crate) fn question_answers(
     questions: &[Question],
     chosen: &[Vec<usize>],
     other: &[String],

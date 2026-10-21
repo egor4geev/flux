@@ -6,15 +6,17 @@
 //! level, the crumbs anywhere. The session's conversation keeps its place meanwhile: each level has
 //! its own list ([`TranscriptState`] with a scope).
 //!
-//! No message field while a subagent is in sight: one can't write to a subagent.
+//! Under it, a message field of its own: the CLI takes no message for a subagent, so it goes to
+//! Claude, who passes it on with SendMessage (`claude_composer::AgentTarget`, `PROTOCOL.md` §10.1).
 
 use flux_claude::{EntryId, ToolCall, ToolEntry, ToolState};
 use gpui::{
-    AnyElement, App, ClickEvent, Context, KeyBinding, SharedString, Window, actions, div,
+    AnyElement, App, ClickEvent, Context, Entity, KeyBinding, SharedString, Window, actions, div,
     prelude::*, px,
 };
 
 use crate::claude_chat::ClaudeChat;
+use crate::claude_composer::{AgentTarget, Composer};
 use crate::claude_transcript::{self, TranscriptState};
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
@@ -140,12 +142,40 @@ impl ClaudeChat {
         self.shown_transcript_mut().invalidate();
         // The search goes on in the conversation now in sight.
         self.search_stale();
-        if self.agents.is_empty() && !self.search_is_open() {
-            self.focus_composer(window, cx);
-        } else if !self.search_is_open() {
-            window.focus(&self.focus_handle);
+        if !self.search_is_open() {
+            if self.agents.is_empty() {
+                self.focus_composer(window, cx);
+            } else if let Some(field) = self.sync_agent_composer(window, cx) {
+                field.read(cx).focus(window, cx);
+            } else {
+                window.focus(&self.focus_handle);
+            }
         }
         cx.notify();
+    }
+
+    /// The field under the subagent in sight, aimed at it (made the first time).
+    pub(crate) fn sync_agent_composer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Composer>> {
+        let target = self.agent_target(cx)?;
+        let session = self.session().clone();
+        let field = self
+            .agent_composer
+            .get_or_insert_with(|| cx.new(|cx| Composer::new(session, window, cx)))
+            .clone();
+        field.update(cx, |field, cx| field.set_agent(Some(target), cx));
+        Some(field)
+    }
+
+    /// Whom the field of the subagent in sight writes to.
+    fn agent_target(&self, cx: &App) -> Option<AgentTarget> {
+        let current = self.agents.last()?;
+        let model = self.session().read(cx).model();
+        let tool = claude_transcript::find_tool(&model.entries, current.tool)?;
+        Some(agent_target(tool, model.task_id(&tool.tool_use_id)))
     }
 
     /// Stop on the subagent's bar: its task stops (the CLI's `stop_task`); a subagent without a
@@ -411,6 +441,28 @@ fn current_crumb(tool: &ToolEntry, description: &str, ui: UiColors) -> AnyElemen
             )
         })
         .into_any_element()
+}
+
+/// The subagent of the Agent call `tool` as a field's addressee: its id from the result (a
+/// finished or resumed call) or from its task (`task_started`, while it runs).
+fn agent_target(tool: &ToolEntry, task_id: Option<&str>) -> AgentTarget {
+    let from_result = tool
+        .result
+        .as_ref()
+        .and_then(|result| result.structured.as_ref())
+        .and_then(|structured| structured["agentId"].as_str());
+    let background = matches!(
+        tool.call,
+        ToolCall::Agent {
+            background: true,
+            ..
+        }
+    );
+    AgentTarget {
+        description: agent_description(tool),
+        agent_id: from_result.or(task_id).map(str::to_string),
+        waits: !background && claude_transcript::agent_is_running(tool),
+    }
 }
 
 fn agent_description(tool: &ToolEntry) -> String {

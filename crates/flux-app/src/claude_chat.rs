@@ -1,6 +1,6 @@
 //! The chat of one Claude session: the conversation, the questions for the user and the task list,
-//! the message field. The same view lives in the Claude window (the island on the right) or in an
-//! editor tab; the workspace moves it between them.
+//! the message field. It lives in an editor tab; closing the tab drops the view, not the session
+//! (part «Пульт Claude»).
 //!
 //! A resumed session (the history, Flux restarting) shows "Loading…" while its transcript is read
 //! and starts its process the first time its chat is drawn — in sight — not before.
@@ -22,7 +22,43 @@ use crate::claude_search::{self, ChatSearch};
 use crate::claude_session::{ClaudeSession, SessionEvent};
 use crate::claude_transcript::{self, TranscriptState};
 use crate::i18n::tr;
-use crate::theme::{self, Theme};
+use crate::icons::{IconName, icon};
+use crate::theme::{self, Theme, UiColors};
+use crate::ui::{self, RADIUS_MD};
+
+/// Long session titles are shortened in the middle in a dragged tab's label.
+const DRAG_LABEL_MAX_CHARS: usize = 24;
+
+/// A session's editor tab being dragged along the tabs: also the label next to the pointer.
+#[derive(Clone)]
+pub struct DraggedClaudeChat {
+    pub chat: Entity<ClaudeChat>,
+    pub title: gpui::SharedString,
+}
+
+impl Render for DraggedClaudeChat {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .h(px(28.))
+            .pl_2()
+            .pr_2p5()
+            .rounded(px(RADIUS_MD))
+            // Opaque: the label floats over the tabs, and their text must not show through.
+            .bg(UiColors::tint(ui.elevated, 1.))
+            .border_1()
+            .border_color(ui.elevated_border)
+            .shadow(ui::popover_shadow(ui))
+            .font_family(theme::UI_FONT)
+            .text_size(px(theme::TEXT_MD))
+            .text_color(ui.foreground)
+            .child(icon(IconName::Claude, ui.accent_text).size(px(13.)))
+            .child(crate::claude::shorten(&self.title, DRAG_LABEL_MAX_CHARS))
+    }
+}
 
 /// How often the line of what Claude does is redrawn while it works (its clock).
 const TICK: Duration = Duration::from_secs(1);
@@ -54,6 +90,9 @@ pub struct ClaudeChat {
     pub(crate) transcript: TranscriptState,
     pub(crate) cards: CardsState,
     composer: Entity<Composer>,
+    /// The field of a subagent's view (made the first time one is opened): its own draft, the
+    /// message goes to Claude for the agent ([`crate::claude_composer::AgentTarget`]).
+    pub(crate) agent_composer: Option<Entity<Composer>>,
     pub(crate) focus_handle: FocusHandle,
     /// Subagents in sight, one per level (`claude_agent_view`, part 10.2); empty — the session's
     /// conversation.
@@ -83,8 +122,11 @@ impl ClaudeChat {
                 this.invalidate_transcripts();
                 this.update_ticker(cx);
                 match event {
-                    // A question takes the keyboard, unless the user is typing a message.
-                    SessionEvent::PendingAdded(_) if this.composer.read(cx).is_empty(cx) => {
+                    // A question takes the keyboard, unless the user is typing a message. Not
+                    // in a subagent's view: the questions aren't drawn there.
+                    SessionEvent::PendingAdded(_)
+                        if this.agents.is_empty() && this.composer.read(cx).is_empty(cx) =>
+                    {
                         claude_cards::take_focus(&mut this.cards, session.read(cx).model(), window)
                     }
                     // The last one answered: back to the message field.
@@ -110,6 +152,7 @@ impl ClaudeChat {
             transcript: TranscriptState::new(cx.weak_entity()),
             cards: CardsState::default(),
             composer,
+            agent_composer: None,
             focus_handle: cx.focus_handle(),
             agents: Vec::new(),
             search: None,
@@ -249,10 +292,15 @@ impl Render for ClaudeChat {
             claude_transcript::render(self, window, cx)
         };
         let search_bar = claude_search::render_bar(self, window, cx);
-        // A subagent in sight: its bar on top, its line at the bottom, no cards and no field.
+        // A subagent in sight: its bar on top, its line at the bottom, no cards, its own field.
         let agent_header = claude_agent_view::render_header(self, cx);
         let agent_footer = claude_agent_view::render_footer(self, cx);
         let in_agent = !self.agents.is_empty();
+        let field = if in_agent {
+            self.sync_agent_composer(window, cx)
+        } else {
+            Some(self.composer.clone())
+        };
         let light = without_entries(session.read(cx).model());
         let cards = if in_agent {
             None
@@ -311,6 +359,7 @@ impl Render for ClaudeChat {
                     this.open_latest_agent(window, cx)
                 }),
             );
+        let root = crate::claude_select::actions(root, cx);
         claude_search::actions(root, cx)
             .children(agent_header)
             .children(search_bar)
@@ -319,16 +368,14 @@ impl Render for ClaudeChat {
             // `COLUMN_MAX_WIDTH` wide in an editor tab); the field's own inset is 10 px.
             .children(cards.map(|cards| claude_transcript::column(cards).flex_none()))
             .children(agent_footer)
-            .when(!in_agent, |chat| {
-                chat.child(
-                    div().flex_none().w_full().flex().justify_center().child(
-                        div()
-                            .w_full()
-                            .max_w(px(claude_transcript::COLUMN_MAX_WIDTH))
-                            .px(px(claude_transcript::COLUMN_INSET - 10.))
-                            .child(self.composer.clone()),
-                    ),
+            .children(field.map(|field| {
+                div().flex_none().w_full().flex().justify_center().child(
+                    div()
+                        .w_full()
+                        .max_w(px(claude_transcript::COLUMN_MAX_WIDTH))
+                        .px(px(claude_transcript::COLUMN_INSET - 10.))
+                        .child(field),
                 )
-            })
+            }))
     }
 }

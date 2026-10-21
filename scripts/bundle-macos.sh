@@ -78,6 +78,19 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
     <key>NSHighResolutionCapable</key><true/>
+    <!-- Folders are Flux's documents: macOS then keeps the recent projects for the Dock menu
+         (even while Flux isn't running), a folder dropped on the Dock icon opens as a project,
+         and Flux is among the Finder's "Open With" apps for folders. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>Folder</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array><string>public.folder</string></array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST

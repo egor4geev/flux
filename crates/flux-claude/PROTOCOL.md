@@ -529,7 +529,8 @@ Rule syntax, as listed by `list_permission_rules`: `Bash(touch:*)` (prefix match
 | WebFetch / WebSearch, detached | — | `{detachedToolCall:true}` when the call stepped aside for a user message | T |
 | **MCP** `mcp__<server>__<tool>` | the server's schema | the MCP `content` array, e.g. `[{type:"text",text}]` | V q |
 | **TaskStop** / **Monitor** | `{task_id}` / `{description, timeout_ms, command?\|ws?}` | `{message, task_id, task_type, command?}` / `{taskId, timeoutMs, persistent?}` | T |
-| **Skill** / **SendMessage** | `{skill, args?}` / `{to, message, summary?}` | — | T |
+| **Skill** | `{skill, args?}` | — | T |
+| **SendMessage** | `{to, message, summary?}` (Haiku also sent `type`, `recipient`, `content`) | text: `{"success":true,"message":"Resuming agent …","resumedAgentId":…}` or `{"success":false,"message":"… could not be resumed: …"}` (§10.1) | V 2.1.287 |
 
 ### AskUserQuestion: how to answer [V h_ask]
 
@@ -582,6 +583,17 @@ Without `--forward-subagent-text` (or `initialize.forwardSubagentText`), only th
 - **Task set and completion.** `background_tasks_changed` carries the full live set whenever it changes. Each task ends with `task_updated` and `task_notification`; for Bash the summary reads `Background command "…" completed (exit code 0)`.
 - **Automatic follow-up turn.** After the notifications **the CLI starts a new turn on its own**: `system/init` → model output → a second `result`, with no host user message and no `command_lifecycle`. `session_state_changed idle` arrives only after this turn.
 - **Stopping tasks** [T]. `stop_task{task_id}` stops one task. With `initialize.perTaskStopAffordance:true`, background tasks survive an `interrupt`; otherwise the interrupt kills them.
+
+### 10.1 Writing to a subagent [V 2.1.287, Haiku, 2026-10-21]
+
+The host has **no channel into a subagent**. Recorded (foreground and background Agent, `sleep 30` inside):
+
+- **A host `user` message with `parent_tool_use_id` = the Agent call's id is not routed to the subagent.** It is an ordinary message of the main conversation: `command_lifecycle queued` while a turn runs; with a foreground agent the main turn is blocked on the Agent call, so the message waits until the agent returns and then starts the next main turn (the agent reported "no messages"). With a background agent and an idle session it starts a main turn at once.
+- **SendMessage works, through Claude.** Asked to relay ("pass it on to agent id X with SendMessage"), the main model calls `SendMessage{to:"<agent id>", message}`; `tool_use_result` text `{"success":true,"message":"Resuming agent a928daf","resumedAgentId":"…"}`.
+  - The **agent id** is `task_started.task_id` of the Agent call (17 hex chars, `a…`) = the result's `agentId`.
+  - A **running background** agent gets it; a **finished** agent (foreground or background) is **resumed** with it — as a background task: a new `task_started{task_id: <same agent id>, tool_use_id: <the SendMessage call>, is_backgrounded:true}`, then the agent's frames with `parent_tool_use_id` = the **original Agent call's** id, then `task_notification` and the CLI's own follow-up main turn. The resumed agent answered "Message received from coordinator: …".
+  - Resuming needs the agent's transcript: with `--no-session-persistence` a finished foreground agent gives `{"success":false,"message":"Agent \"…\" could not be resumed: No transcript found for agent ID: …"}`.
+- **Flux** (`claude_composer::AgentTarget`): the subagent's view has its own field; its message goes to the main session as a normal (queued) message that names the agent, its id and SendMessage. No `priority:"now"` from there — it would abort the main turn and a foreground agent with it.
 
 ---------------------------------------------------------------------------------------------------
 
@@ -716,7 +728,7 @@ To rebuild the chat, follow `parentUuid` back from the leaf, skipping `isSidecha
 - **Never seen on the wire:** prompt_suggestion (enabled, never received), api_retry, notification, informational, local_command_output, hook_* events, model_refusal_*, auth_status, conversation_reset, tool_progress, tool_use_summary, keep_alive, redacted_thinking; the CLI requests elicitation and request_user_dialog.
 - **Untested host requests:** apply_flag_settings, update_settings, get_settings, mcp_set_servers, mcp_call, mcp_read_resource, reload_plugins, reload_output_styles, get_hooks_listing, seed_read_state, register_repo_root, set_color, and a working get_task_output.
 - **Untested behaviours:** deny with `interrupt:true`, `client_composed`, folding of queued messages, `--continue`, `--fork-session`, checkpointed rewind, `perTaskStopAffordance` semantics, `auto` mode. (`shouldQuery:false` — verified in §3.1; `--resume-session-at` — §11.)
-- **Tool contracts:** NotebookEdit, Monitor, TaskStop, EnterPlanMode, Skill, SendMessage, and the AskUserQuestion multiSelect separator.
+- **Tool contracts:** NotebookEdit, Monitor, TaskStop, EnterPlanMode, Skill, and the AskUserQuestion multiSelect separator.
 
 **Differs from the types:** see the skew list in §14.
 

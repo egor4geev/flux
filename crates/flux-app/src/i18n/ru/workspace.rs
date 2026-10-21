@@ -38,4 +38,11 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "{0} ещё работают в терминалах.",
     ),
     ("Terminate", "Завершить"),
+    // lifecycle
+    ("Leave processes running?", "Оставить процессы работать?"),
+    (
+        "{0} started from Flux and will keep running after it quits. Until they end, the Dock shows Flux as open.",
+        "{0} запущены из Flux и продолжат работать после выхода. Пока они не завершатся, Dock показывает Flux открытым.",
+    ),
+    ("Leave Running", "Оставить"),
 ];

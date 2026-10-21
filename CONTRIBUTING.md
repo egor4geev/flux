@@ -107,8 +107,10 @@ release for Flux's updater, each archive signed with the update key.
    `Cargo.lock`), the release notes in `docs/release-notes/<version>.md` (Markdown, English — the
    release's page and Flux's update notification show them) and, for a new minor version, What's New
    in `crates/flux-app/assets/whats-new/<version>.toml` with the release date.
-2. **A beta**: tag the commit on `pre-release` — `git tag v0.2.0-beta.1 && git push origin
-   v0.2.0-beta.1`.
+2. **A beta**: the tag must match `Cargo.toml` exactly — set the version to `0.2.0-beta.1` (and its
+   notes `docs/release-notes/0.2.0-beta.1.md`), commit, then tag that commit on `pre-release` —
+   `git tag v0.2.0-beta.1 && git push origin v0.2.0-beta.1`. Set the version back to `0.2.0` before
+   the stable release's pull request.
 3. **A stable release**: a pull request `pre-release → main`. Besides CI it gets a dry run of the
    release (the `Release` workflow): the `.dmg`, the `.zip` and `latest.json` as the run's artifacts —
    try them before merging. Merge it, then tag the merge commit on `main`:

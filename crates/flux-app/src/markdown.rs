@@ -7,7 +7,7 @@
 //! language, otherwise by the document's.
 //!
 //! The Claude chat (stage 9) draws Claude's answers with it too: GitHub-style tables, and code
-//! blocks with a copy button ([`render_copyable`]).
+//! blocks with a copy button, texts selectable with the mouse ([`render_selectable`]).
 //!
 //! Links click (part 10.3): a web link (`[text](https://…)`, `<https://…>`, a bare `https://…`)
 //! opens in the browser, with its address on hover; a plugin's link (`TRACK-142`) goes to its
@@ -32,6 +32,7 @@ use gpui::{
     div, font, prelude::*, px,
 };
 
+use crate::claude_select::{Collect, Joint};
 use crate::display::{display_line, text_runs};
 use crate::plugin_links::Target;
 use crate::theme::{self, Theme, UiColors};
@@ -1194,21 +1195,24 @@ pub(crate) fn entity(chars: &[char], start: usize) -> Option<(char, usize)> {
 /// The blocks as a column of elements: prose in the UI font, code in the code font with syntax
 /// colors. `color` is the color of regular text.
 pub fn render(blocks: &[Block], color: Hsla, theme: &Theme) -> AnyElement {
-    render_blocks(blocks, color, theme, None, None)
+    render_blocks(blocks, color, theme, None, None, None)
 }
 
 /// As [`render`], in the look of Claude's chat: a code block is a card with its language and a copy
 /// button in a header, inline code is a lighter pill. `id` keeps the buttons' ids apart from those
 /// of other blocks in the window. `marks` — the matches of a search to mark (the chat's ⌘F, part
-/// 10.2), in the texts [`block_texts`] lists, in that order.
-pub fn render_copyable(
+/// 10.2), in the texts [`block_texts`] lists, in that order. The texts are selectable with the
+/// mouse: `select` numbers them in drawing order, marks the selection and records where they were
+/// laid out ([`crate::claude_select`]).
+pub fn render_selectable(
     blocks: &[Block],
     color: Hsla,
     theme: &Theme,
     id: impl Into<gpui::SharedString>,
     marks: Option<&Marks>,
+    select: &Collect,
 ) -> AnyElement {
-    render_blocks(blocks, color, theme, Some(id.into()), marks)
+    render_blocks(blocks, color, theme, Some(id.into()), marks, Some(select))
 }
 
 /// The texts the blocks draw, in the order they are drawn (tables row by row, code blocks as their
@@ -1360,6 +1364,7 @@ fn render_blocks(
     theme: &Theme,
     copy: Option<gpui::SharedString>,
     marks: Option<&Marks>,
+    select: Option<&Collect>,
 ) -> AnyElement {
     let ui = theme.ui;
     // The chat's look (copyable blocks are Claude's text).
@@ -1370,9 +1375,19 @@ fn render_blocks(
         .flex_col()
         .gap_2()
         .children(blocks.iter().enumerate().map(|(index, block)| {
+            // A list item right after another starts a new line in a copy, not a new block.
+            let joint = match (block, index.checked_sub(1).map(|before| &blocks[before])) {
+                (Block::Item { .. }, Some(Block::Item { .. })) => Joint::Line,
+                _ => Joint::Block,
+            };
+            let marker = match block {
+                Block::Item { marker, .. } => Some(marker.as_str()),
+                _ => None,
+            };
             let text = |spans: &[Span], color: Hsla, weight: FontWeight| {
                 let (text, runs) = styled_parts(spans, color, ui, weight, chat, marks);
-                clickable(texts.id(index, 0), text, runs, spans, ui)
+                let select = select.map(|select| (select, joint, marker));
+                clickable(texts.id(index, 0), text, runs, spans, ui, select)
             };
             match block {
                 Block::Paragraph(spans) => div()
@@ -1409,11 +1424,14 @@ fn render_blocks(
                         theme,
                         ElementId::NamedInteger(prefix.clone(), index as u64),
                         marks,
+                        select,
                     ),
                     None => code_block(code, theme),
                 },
                 Block::Rule => ui::divider(ui).into_any_element(),
-                Block::Table(table) => render_table(table, color, ui, chat, marks, &texts, index),
+                Block::Table(table) => {
+                    render_table(table, color, ui, chat, marks, &texts, index, select)
+                }
             }
         }))
         .into_any_element()
@@ -1440,6 +1458,7 @@ fn clickable(
     runs: Vec<TextRun>,
     spans: &[Span],
     ui: UiColors,
+    select: Option<(&Collect, Joint, Option<&str>)>,
 ) -> AnyElement {
     let mut targets = Vec::new();
     let mut code = Vec::new();
@@ -1468,7 +1487,13 @@ fn clickable(
         .collect();
     targets.extend(crate::plugin_links::plugin_targets(&text, &taken));
     targets.sort_by_key(|(range, _)| range.start);
-    crate::plugin_links::clickable_text(id, text.into(), runs, targets, ui.accent_text)
+    let Some((select, joint, marker)) = select else {
+        return crate::plugin_links::clickable_text(id, text.into(), runs, targets, ui.accent_text);
+    };
+    let (index, runs) = select.text(&text, runs, joint, marker);
+    let (element, layout) =
+        crate::plugin_links::clickable_text_laid(id, text.into(), runs, targets, ui.accent_text);
+    select.wrap(index, &layout, element)
 }
 
 /// A target the browser opens.
@@ -1479,6 +1504,7 @@ pub(crate) fn is_web_link(target: &str) -> bool {
 
 /// A table: a header row on a tinted background, rows between thin lines, columns of equal share
 /// (cells wrap).
+#[allow(clippy::too_many_arguments)]
 fn render_table(
     table: &Table,
     color: Hsla,
@@ -1487,6 +1513,7 @@ fn render_table(
     marks: Option<&Marks>,
     texts: &TextIds,
     block: usize,
+    select: Option<&Collect>,
 ) -> AnyElement {
     let columns = table.align.len().max(1);
     let row = |row_index: usize, cells: &[Vec<Span>], header: bool| {
@@ -1517,7 +1544,14 @@ fn render_table(
                         };
                         let (text, runs) = styled_parts(spans, color, ui, weight, chat, marks);
                         let id = texts.id(block, 1 + row_index * columns + column);
-                        clickable(id, text, runs, spans, ui)
+                        // In a copy: rows on their lines, cells apart by tabs.
+                        let joint = match (row_index, column) {
+                            (0, 0) => Joint::Block,
+                            (_, 0) => Joint::Line,
+                            _ => Joint::Cell,
+                        };
+                        let select = select.map(|select| (select, joint, None));
+                        clickable(id, text, runs, spans, ui, select)
                     })
             }))
     };
@@ -1544,6 +1578,7 @@ pub(crate) fn chat_code_block(
     theme: &Theme,
     id: ElementId,
     marks: Option<&Marks>,
+    select: Option<&Collect>,
 ) -> AnyElement {
     let ui = theme.ui;
     let text = code.text.clone();
@@ -1586,7 +1621,7 @@ pub(crate) fn chat_code_block(
                 .py(px(8.))
                 .text_size(px(12.5))
                 .line_height(px(19.))
-                .child(code_text(code, theme, marks)),
+                .child(code_text(code, theme, marks, select)),
         )
         .into_any_element()
 }
@@ -1663,12 +1698,18 @@ fn code_block(code: &CodeBlock, theme: &Theme) -> AnyElement {
         .rounded(px(RADIUS_SM))
         .bg(UiColors::tint(ui.foreground, 0.04))
         .font_family(theme::code_font())
-        .child(code_text(code, theme, None))
+        .child(code_text(code, theme, None, None))
         .into_any_element()
 }
 
-/// A code block's text with its syntax colors, in the code font (search matches marked).
-fn code_text(code: &CodeBlock, theme: &Theme, marks: Option<&Marks>) -> StyledText {
+/// A code block's text with its syntax colors, in the code font (search matches marked; selectable
+/// with `select`).
+fn code_text(
+    code: &CodeBlock,
+    theme: &Theme,
+    marks: Option<&Marks>,
+    select: Option<&Collect>,
+) -> AnyElement {
     let ui = theme.ui;
     let text = Rope::from_str(&code.text);
     let base = TextRun {
@@ -1700,7 +1741,13 @@ fn code_text(code: &CodeBlock, theme: &Theme, marks: Option<&Marks>) -> StyledTe
         Some(marks) => marks.mark(&display, runs),
         None => runs,
     };
-    StyledText::new(display).with_runs(runs)
+    let Some(select) = select else {
+        return StyledText::new(display).with_runs(runs).into_any_element();
+    };
+    let (index, runs) = select.text(&display, runs, Joint::Block, None);
+    let styled = StyledText::new(display).with_runs(runs);
+    let layout = styled.layout().clone();
+    select.wrap(index, &layout, styled.into_any_element())
 }
 
 #[cfg(test)]

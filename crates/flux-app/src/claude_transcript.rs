@@ -39,6 +39,7 @@ use flux_claude::{
 
 use crate::claude_chat::{ClaudeChat, ClaudeChatEvent};
 use crate::claude_search::SearchMarks;
+use crate::claude_select::{self, Collect};
 use crate::claude_session::ClaudeSession;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, IconSource, file_icon, icon, source_icon};
@@ -74,9 +75,17 @@ const AGENT_STEPS: usize = 3;
 const CARD_RADIUS: f32 = 10.;
 /// How long a copy button shows its check mark.
 const COPIED_FOR: Duration = Duration::from_millis(1500);
+/// How long an entry a click brought into sight stays highlighted, then how long the highlight
+/// takes to fade.
+pub(crate) const REVEALED_HOLD: Duration = Duration::from_millis(1600);
+pub(crate) const REVEALED_FADE: Duration = Duration::from_millis(500);
+/// Space kept above (or below) an entry a click brings into sight.
+const REVEAL_MARGIN: f32 = 48.;
 
 pub fn init(cx: &mut App) {
     crate::claude_agent_view::init(cx);
+    // After the subagent view's keys: Esc clears a selection before it goes back.
+    claude_select::init(cx);
 }
 
 /// The transcript's state in its chat: the list, what the user expanded, parsed Markdown.
@@ -101,6 +110,13 @@ pub struct TranscriptState {
     texts: HashMap<EntryId, Parsed>,
     /// Thumbnails of the user's pictures, by entry and index.
     images: HashMap<(EntryId, usize), Arc<Image>>,
+    // Text selection with the mouse (`claude_select`).
+    /// The text selected in one message.
+    pub(crate) selection: Option<claude_select::Selection>,
+    /// The messages' texts as last drawn: where the mouse is in them.
+    pub(crate) drawn: claude_select::Drawn,
+    /// The transcript's draws, counted: a message's texts are numbered anew in each.
+    frame: Cell<u64>,
     /// The copy button that shows a check mark, and since when.
     copied: Option<(EntryId, Instant)>,
     /// An entry to bring into view at the next sync ([`TranscriptState::reveal`]).
@@ -112,6 +128,13 @@ pub struct TranscriptState {
     pub(crate) scope: Option<EntryId>,
     /// The chat's search (⌘F): the matches to mark, the current one opened (part 10.2).
     pub(crate) search: Option<SearchMarks>,
+
+    // What a click on something that runs (a background command, the session's status) brought
+    // into sight.
+    /// The entry and since when: it shows highlighted for a moment ([`REVEALED_HOLD`]).
+    revealed: Option<(EntryId, Instant)>,
+    /// Entries such a click opened: they stay open until the user closes them.
+    shown: HashSet<EntryId>,
 }
 
 /// Claude's text as Markdown blocks.
@@ -152,11 +175,16 @@ impl TranscriptState {
             unclipped: HashSet::new(),
             texts: HashMap::new(),
             images: HashMap::new(),
+            selection: None,
+            drawn: Default::default(),
+            frame: Cell::new(0),
             copied: None,
             reveal: None,
             dirty: true,
             scope: None,
             search: None,
+            revealed: None,
+            shown: HashSet::new(),
         }
     }
 
@@ -192,6 +220,32 @@ impl TranscriptState {
         self.dirty = true;
     }
 
+    /// Like [`TranscriptState::reveal`], and the entry opens and shows highlighted for a moment:
+    /// what a click on a background command or the session's status asked to see. The caller
+    /// redraws the chat when the highlight should fade and end ([`REVEALED_HOLD`]).
+    pub fn reveal_highlighted(&mut self, id: EntryId) -> Instant {
+        let at = Instant::now();
+        self.reveal(id);
+        self.shown.insert(id);
+        self.revealed = Some((id, at));
+        at
+    }
+
+    /// The highlight of [`TranscriptState::reveal_highlighted`] at `at` is over.
+    pub fn end_highlight(&mut self, at: Instant) {
+        if self.revealed.is_some_and(|(_, since)| since == at) {
+            self.revealed = None;
+        }
+    }
+
+    /// How long the entry `id` has been highlighted, while it is.
+    fn highlighted(&self, id: EntryId) -> Option<Duration> {
+        self.revealed
+            .filter(|(revealed, _)| *revealed == id)
+            .map(|(_, at)| at.elapsed())
+            .filter(|elapsed| *elapsed < REVEALED_HOLD + REVEALED_FADE)
+    }
+
     pub fn scroll_to_bottom(&self) {
         self.list.scroll_to(ListOffset {
             item_ix: self.list.item_count(),
@@ -203,6 +257,7 @@ impl TranscriptState {
         if self.search_current() == Some(id) {
             return true;
         }
+        let default = default || self.shown.contains(&id);
         (default || expand_all()) != self.toggled.contains(&id)
     }
 
@@ -307,7 +362,17 @@ pub fn sync(
         state.scroll_to_bottom();
     }
     if let Some(index) = reveal {
+        // Not flush with the edge: a little of what's around shows too.
+        let top = state.list.logical_scroll_top();
         state.list.scroll_to_reveal_item(index);
+        let moved = state.list.logical_scroll_top();
+        if (moved.item_ix, moved.offset_in_item) != (top.item_ix, top.offset_in_item) {
+            state.list.scroll_by(px(if index <= top.item_ix {
+                -REVEAL_MARGIN
+            } else {
+                REVEAL_MARGIN
+            }));
+        }
     }
 
     for (key, media_type, data) in pictures {
@@ -621,6 +686,7 @@ fn collect_texts(entries: &[Entry], parsed: &HashMap<EntryId, Parsed>, jobs: &mu
 fn hash_entry(entry: &Entry, state: &TranscriptState, hasher: &mut DefaultHasher) {
     entry.id.hash(hasher);
     state.toggled.contains(&entry.id).hash(hasher);
+    state.shown.contains(&entry.id).hash(hasher);
     state.unclipped.contains(&entry.id).hash(hasher);
     match &entry.kind {
         EntryKind::User(user) => (
@@ -715,6 +781,8 @@ pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeCh
     let ui = Theme::ui(cx);
     let weak = cx.weak_entity();
     let state = chat.shown_transcript();
+    state.frame.set(state.frame.get() + 1);
+    claude_select::prune(&state.drawn, state.frame.get(), state.selection.as_ref());
     let model = chat.session().read(cx).model();
     let agent = state.scope.and_then(|tool| find_tool(&model.entries, tool));
     let activity = match agent {
@@ -792,7 +860,8 @@ pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeCh
                 .flex_1()
                 .min_h_0()
                 .child(items)
-                .children(jump),
+                .children(jump)
+                .child(claude_select::drag_listener(weak.clone())),
         )
         .children(activity)
         .into_any_element()
@@ -945,6 +1014,17 @@ impl Renderer<'_> {
         Some(marks.clone())
     }
 
+    /// What makes the texts of the entry `id` selectable with the mouse (`claude_select`).
+    fn select(&self, id: EntryId) -> Collect {
+        Collect::new(
+            id,
+            self.state.frame.get(),
+            self.state.selection.as_ref(),
+            self.ui.selection,
+            self.state.drawn.clone(),
+        )
+    }
+
     /// A line of text with the search's matches in it marked.
     fn marked(&self, id: EntryId, text: String) -> AnyElement {
         match self.marks(id) {
@@ -983,14 +1063,51 @@ impl Renderer<'_> {
     /// A tool call that isn't a minor step: a card for a command, an edit, a subagent; a row with
     /// its details for the rest (a question, the plan).
     fn tool_entry(&self, id: EntryId, tool: &ToolEntry, depth: usize) -> AnyElement {
-        match &tool.call {
+        let element = match &tool.call {
             ToolCall::Bash { .. } => self.bash_card(id, tool),
             ToolCall::Edit { .. } | ToolCall::Write { .. } | ToolCall::NotebookEdit { .. } => {
                 self.edit_card(id, tool)
             }
             ToolCall::Agent { .. } if depth == 0 => self.agent_card(id, tool),
             _ => self.tool(id, tool, depth),
+        };
+        match self.state.highlighted(id) {
+            Some(elapsed) => self.highlight(id, element, elapsed),
+            None => element,
         }
+    }
+
+    /// An entry a click brought into sight: an accent frame over it, which fades after a moment.
+    fn highlight(&self, id: EntryId, element: AnyElement, elapsed: Duration) -> AnyElement {
+        let ui = self.ui;
+        let frame = div()
+            .absolute()
+            .top(px(-3.))
+            .bottom(px(-3.))
+            .left(px(-3.))
+            .right(px(-3.))
+            .rounded(px(CARD_RADIUS + 3.))
+            .border_2()
+            .border_color(UiColors::tint(ui.accent, 0.85))
+            .bg(UiColors::tint(ui.accent, 0.07));
+        let frame = if elapsed < REVEALED_HOLD {
+            frame.into_any_element()
+        } else {
+            frame
+                .with_animation(
+                    ("claude-revealed", id),
+                    Animation::new(REVEALED_FADE),
+                    |frame, delta| frame.opacity(1. - delta),
+                )
+                .into_any_element()
+        };
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .child(element)
+            .child(frame)
+            .into_any_element()
     }
 
     // --- The user's side ---
@@ -1071,6 +1188,11 @@ impl Renderer<'_> {
                 .bg(UiColors::tint(ui.accent, 0.17))
                 .border_1()
                 .border_color(UiColors::tint(ui.accent, 0.26))
+                .cursor_text()
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    claude_select::mouse_down(self.chat.clone(), id),
+                )
                 .child(self.user_text(id, text, user.cancelled))
         });
         let status = if user.cancelled {
@@ -1328,15 +1450,20 @@ impl Renderer<'_> {
         links.sort_by_key(|(range, _)| range.start);
         let link_ranges: Vec<_> = links.iter().map(|(range, _)| range.clone()).collect();
         let runs = crate::plugin_links::link_runs(runs, &link_ranges, ui.accent_text);
+        let select = self.select(id);
+        let (index, runs) = select.text(&display, runs, claude_select::Joint::Block, None);
         let styled = StyledText::new(display).with_runs(runs);
+        let layout = styled.layout().clone();
+        // The bubble takes the mouse (`user`).
+        let selectable = |text: AnyElement| select.wrap(index, &layout, text);
         if ranges.is_empty() && links.is_empty() {
-            return div().child(styled).into_any_element();
+            return selectable(styled.into_any_element());
         }
         let chat = self.chat.clone();
         let mentions = ranges.len();
         let links = Rc::new(links);
         let clicked = links.clone();
-        InteractiveText::new(("claude-user-text", id), styled)
+        let text = InteractiveText::new(("claude-user-text", id), styled)
             .on_click(
                 ranges.into_iter().chain(link_ranges).collect(),
                 move |index, window, cx| {
@@ -1369,7 +1496,8 @@ impl Renderer<'_> {
                     }
                 }
             })
-            .into_any_element()
+            .into_any_element();
+        selectable(text)
     }
 
     /// A `!` command: a terminal card on the user's side — the command, how it ended (or a clock
@@ -1510,15 +1638,22 @@ impl Renderer<'_> {
         let copied = self.state.just_copied(id);
         let copy = (!streaming).then(|| self.copy_button(id, text.to_string()));
         // The copy button sits over the message's bottom right corner: no room is taken for it.
+        let select = self.select(id);
         div()
             .group(group.clone())
             .relative()
-            .child(markdown::render_copyable(
+            .cursor_text()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                claude_select::mouse_down(self.chat.clone(), id),
+            )
+            .child(markdown::render_selectable(
                 &parsed.blocks,
                 ui.foreground,
                 self.theme,
                 format!("claude-code-{id}"),
                 self.marks(id).as_deref(),
+                &select,
             ))
             .children(copy.map(|copy| {
                 div()
@@ -1817,12 +1952,28 @@ impl Renderer<'_> {
         else {
             return self.tool(id, tool, 0);
         };
-        let running = matches!(tool.state, ToolState::Streaming | ToolState::Running);
-        let exit = exit_code(tool);
-        let failed = tool.state == ToolState::Failed
+        // A command in the background: its call ends at once, the command goes on as a task —
+        // the card shows the task's state.
+        let task = if *background && tool.state == ToolState::Done {
+            background_run(self.model, tool)
+        } else {
+            None
+        };
+        let state = match task {
+            Some(BackgroundRun::Running) => ToolState::Running,
+            Some(BackgroundRun::Failed) => ToolState::Failed,
+            Some(BackgroundRun::Stopped) => ToolState::Interrupted,
+            Some(BackgroundRun::Exited(_)) | None => tool.state,
+        };
+        let running = matches!(state, ToolState::Streaming | ToolState::Running);
+        let exit = match task {
+            Some(BackgroundRun::Exited(code)) => Some(code),
+            _ => exit_code(tool),
+        };
+        let failed = state == ToolState::Failed
             || exit.is_some_and(|code| code != 0)
             || tool.result.as_ref().is_some_and(|result| result.is_error);
-        let color = match tool.state {
+        let color = match state {
             ToolState::Streaming | ToolState::Running => ui.accent_text,
             ToolState::Denied | ToolState::Waiting => ui.warning,
             ToolState::Interrupted => ui.dim,
@@ -1836,7 +1987,7 @@ impl Renderer<'_> {
             && self
                 .state
                 .expanded(id, failed || tool.state == ToolState::Denied);
-        let end: Option<AnyElement> = match (tool.state, exit) {
+        let end: Option<AnyElement> = match (state, exit) {
             (ToolState::Waiting | ToolState::Denied | ToolState::Interrupted, _) => {
                 state_mark(tool.state, ui)
             }
@@ -1865,7 +2016,9 @@ impl Renderer<'_> {
                 .into_any_element(),
         ];
         if *background {
-            header.push(ui::badge(tr("in the background"), ui.dim).into_any_element());
+            // In the accent while the command runs (the tile pulses too), dim once it ended.
+            let color = if running { ui.accent_text } else { ui.dim };
+            header.push(ui::badge(tr("in the background"), color).into_any_element());
         }
         header.extend(end);
         let toggle = body.is_some().then_some(expanded);
@@ -3392,6 +3545,49 @@ pub(crate) fn bash_body_texts(tool: &ToolEntry, command: &str) -> Vec<String> {
 }
 
 /// The exit code a failed command reported ("Exit code 101" at the start of its result).
+/// How a command Claude ran in the background is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundRun {
+    Running,
+    /// It ended with this exit code.
+    Exited(i32),
+    Failed,
+    /// Stopped (by the user, or with the session).
+    Stopped,
+}
+
+/// The state of the background command of `tool` (a Bash call with `run_in_background`, whose
+/// result came): running while the session lists its task in the background; afterwards, as the
+/// task's last update says. `None` — nothing known (an old session's call).
+fn background_run(model: &Session, tool: &ToolEntry) -> Option<BackgroundRun> {
+    let task_id = model.task_id(&tool.tool_use_id);
+    if task_id.is_some_and(|id| model.background.iter().any(|task| task.task_id == id)) {
+        return Some(BackgroundRun::Running);
+    }
+    let task = tool.task.as_ref()?;
+    match task.status.as_deref()? {
+        "completed" => Some(
+            task.summary
+                .as_deref()
+                .and_then(summary_exit_code)
+                .map_or(BackgroundRun::Exited(0), BackgroundRun::Exited),
+        ),
+        "failed" => Some(BackgroundRun::Failed),
+        "killed" => Some(BackgroundRun::Stopped),
+        _ => None,
+    }
+}
+
+/// The exit code in a background command's summary: `Background command "…" completed (exit code
+/// 1)`.
+fn summary_exit_code(summary: &str) -> Option<i32> {
+    let rest = &summary[summary.rfind("exit code ")? + "exit code ".len()..];
+    rest.split(|c: char| !c.is_ascii_digit() && c != '-')
+        .next()?
+        .parse()
+        .ok()
+}
+
 fn exit_code(tool: &ToolEntry) -> Option<i32> {
     let result = tool.result.as_ref()?;
     let text = result.text.trim_start().trim_start_matches("Error: ");
@@ -4739,6 +4935,44 @@ mod tests {
             children: Vec::new(),
             task: None,
         }
+    }
+
+    #[test]
+    fn a_background_command_shows_its_task() {
+        let model = Session::new(PathBuf::from("/project"));
+        let mut bash = tool(
+            "Bash",
+            json!({"command": "sleep 3", "run_in_background": true}),
+            None,
+        );
+        // An old session's call: nothing known about its task.
+        assert_eq!(background_run(&model, &bash), None);
+        let ended = |status: &str, summary: Option<&str>| flux_claude::session::TaskProgress {
+            status: Some(status.into()),
+            summary: summary.map(String::from),
+            background: true,
+            ..Default::default()
+        };
+        // Running, but the session doesn't list it (the process is gone): not shown as running.
+        bash.task = Some(ended("running", None));
+        assert_eq!(background_run(&model, &bash), None);
+        bash.task = Some(ended(
+            "completed",
+            Some("Background command \"Sleep\" completed (exit code 2)"),
+        ));
+        assert_eq!(
+            background_run(&model, &bash),
+            Some(BackgroundRun::Exited(2))
+        );
+        bash.task = Some(ended("completed", None));
+        assert_eq!(
+            background_run(&model, &bash),
+            Some(BackgroundRun::Exited(0))
+        );
+        bash.task = Some(ended("killed", None));
+        assert_eq!(background_run(&model, &bash), Some(BackgroundRun::Stopped));
+        bash.task = Some(ended("failed", None));
+        assert_eq!(background_run(&model, &bash), Some(BackgroundRun::Failed));
     }
 
     #[test]

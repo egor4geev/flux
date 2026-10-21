@@ -97,8 +97,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ),
     ("Enable Claude Code", "Включить Claude Code"),
     (
-        "The Claude window in the launchpad, ⌘Esc and ⌥⌘K.",
-        "Окно Claude в лаунчпаде, ⌘Esc и ⌥⌘K.",
+        "The Claude console in the launchpad, ⌘Esc and ⌥⌘K.",
+        "Пульт Claude в лаунчпаде, ⌘Esc и ⌥⌘K.",
     ),
     ("Command Line Tool", "Консольная утилита"),
     ("Executable", "Исполняемый файл"),

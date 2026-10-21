@@ -13,7 +13,7 @@
 </div>
 
 <p align="center">
-  <img src="docs/images/hero.png" alt="Flux: the project tree, a Rust file with Claude's change marked in the gutter, and the Claude chat on the right with the edit and a summary of the changed files" width="100%">
+  <img src="docs/images/hero.png" alt="Flux: the project tree, a Rust file with Claude's change marked in the gutter, and a Claude chat with the edit and a summary of the changed files" width="100%">
 </p>
 
 ## Features
@@ -39,8 +39,10 @@ interactive rebase, and who changed each line right in the gutter.
 
 ### Claude Code, built in
 
-A native chat (<kbd>⌘</kbd><kbd>Esc</kbd>) that runs your own `claude` with your Claude subscription —
-no API key. Every edit Claude proposes opens as a diff you accept or trim, and everything it changed
+A native chat that runs your own `claude` with your Claude subscription — no API key. Sessions open
+as editor tabs; the Claude console (<kbd>⌘</kbd><kbd>Esc</kbd>) lists them with what each one is doing,
+lets you answer Claude's questions without leaving your file, and keeps the project's history. Closing
+a tab doesn't stop Claude. Every edit Claude proposes opens as a diff you accept or trim, and everything it changed
 gathers in its own changelist to review, roll back or commit. <kbd>⌥</kbd><kbd>↵</kbd> asks Claude to
 fix or explain the code right where it is.
 
