@@ -1,0 +1,28 @@
+# What's New in Flux 0.2: the Claude console and the smaller things of 0.2.0 (format: 0.1.0.toml).
+version = "0.2.0"
+date = "2026-10-21"
+
+[[items]]
+icon = "claude"
+color = "claude"
+action = "claude::ToggleClaude"
+title = "The Claude console"
+text = "⌘Esc lists your sessions with what each one is doing right now. Answer Claude's questions from there without leaving your file, and find the project's history: recent, this week, all. Closing a tab no longer stops Claude."
+ru.title = "Пульт Claude"
+ru.text = "⌘Esc — сессии и что каждая делает прямо сейчас. Отвечайте на вопросы Claude, не уходя из файла, и находите историю проекта: недавние, за неделю, все. Закрытая вкладка больше не останавливает Claude."
+
+[[items]]
+icon = "copy"
+color = "blue"
+title = "Select text in the chat"
+text = "Drag across Claude's answers and your messages, double- or triple-click, ⌘C — lists, code and tables copy as they read."
+ru.title = "Выделение текста в чате"
+ru.text = "Протяните мышью по ответам Claude и своим сообщениям, двойной или тройной щелчок, ⌘C — списки, код и таблицы копируются как читаются."
+
+[[items]]
+icon = "agent"
+color = "violet"
+title = "Write to a subagent"
+text = "A subagent's window has its own message field: Claude passes your words on to the agent while it works."
+ru.title = "Сообщение сабагенту"
+ru.text = "В окне сабагента — своё поле: Claude передаёт ваши слова агенту, пока тот работает."

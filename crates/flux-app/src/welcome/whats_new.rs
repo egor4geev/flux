@@ -22,7 +22,10 @@ use crate::workspace::Workspace;
 use crate::{settings, ui};
 
 /// The notes of every version that has them: `assets/whats-new/<version>.toml`.
-const NOTES: &[&str] = &[include_str!("../../assets/whats-new/0.1.0.toml")];
+const NOTES: &[&str] = &[
+    include_str!("../../assets/whats-new/0.1.0.toml"),
+    include_str!("../../assets/whats-new/0.2.0.toml"),
+];
 
 /// Where a version's full release notes are read: the release of its tag.
 const RELEASES: &str = "https://github.com/egor4geev/flux/releases/tag/v";
