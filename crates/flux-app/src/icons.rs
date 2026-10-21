@@ -59,6 +59,7 @@ macro_rules! icons {
 
 icons! {
     // Interface
+    Archive => "archive",
     ArrowDown => "arrow-down",
     ArrowLeft => "arrow-left",
     ArrowRight => "arrow-right",

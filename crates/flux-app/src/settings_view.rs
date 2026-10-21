@@ -1594,7 +1594,7 @@ impl SettingsView {
         };
         // The CLI: where it is, its version and account.
         // A long path is shortened in the middle: the file name stays.
-        let path_label = |path: &std::path::Path| crate::claude_panel::shorten(&tilde(path), 56);
+        let path_label = |path: &std::path::Path| crate::claude::shorten(&tilde(path), 56);
         let (path_text, path_color) = match (&current.path, state.cli()) {
             (Some(path), _) => (path_label(path), ui.foreground),
             (None, Some(cli)) => (path_label(&cli.path), ui.foreground),
@@ -1897,7 +1897,7 @@ impl SettingsView {
                     .child(switch_row(
                         "claude-enabled",
                         tr("Enable Claude Code"),
-                        tr("The Claude window in the launchpad, ⌘Esc and ⌥⌘K."),
+                        tr("The Claude console in the launchpad, ⌘Esc and ⌥⌘K."),
                         enabled,
                         |claude, on| claude.enabled = on,
                         cx,

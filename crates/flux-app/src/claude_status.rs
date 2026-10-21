@@ -68,14 +68,6 @@ impl Glance {
     pub fn is_live(&self) -> bool {
         matches!(self.state, GlanceState::Working | GlanceState::Starting)
     }
-
-    /// How many badges [`glyph`] draws: the command (while working), subagents, background
-    /// tasks.
-    pub fn badges(&self) -> usize {
-        usize::from(self.command.is_some() && self.state == GlanceState::Working)
-            + usize::from(!self.agents.is_empty())
-            + usize::from(self.background > 0)
-    }
 }
 
 /// The session's status from its model.
@@ -197,25 +189,7 @@ pub fn compact_elapsed(elapsed: Duration) -> String {
 /// a command and its clock, subagents, background tasks), amber while it waits for the user, the
 /// success color when it finished out of sight, a hollow ring when ready.
 pub fn glyph(glance: &Glance, unseen: bool, id: impl Into<ElementId>, ui: UiColors) -> Div {
-    let dot = div().flex_none().size(px(7.)).rounded(px(4.));
-    let dot = match glance.state {
-        GlanceState::Working | GlanceState::Starting => dot
-            .bg(ui.accent)
-            .with_animation(
-                id,
-                Animation::new(Duration::from_millis(1100)).repeat(),
-                |dot, delta| dot.opacity(0.35 + 0.65 * (1. - (2. * delta - 1.).abs())),
-            )
-            .into_any_element(),
-        GlanceState::Waiting => dot.bg(ui.warning).into_any_element(),
-        GlanceState::Failed => dot.bg(ui.error).into_any_element(),
-        GlanceState::Stopped => dot.bg(ui.dim).into_any_element(),
-        GlanceState::Idle if unseen => dot.bg(ui.success).into_any_element(),
-        GlanceState::Idle => dot
-            .border_1()
-            .border_color(UiColors::tint(ui.text_muted, 0.6))
-            .into_any_element(),
-    };
+    let dot = dot(glance, unseen, id, ui);
     let working = glance.state == GlanceState::Working;
     let clock = glance.since.map(|since| compact_elapsed(since.elapsed()));
     let command = glance.command.as_ref().filter(|_| working).map(|_| {
@@ -247,6 +221,30 @@ pub fn glyph(glance: &Glance, unseen: bool, id: impl Into<ElementId>, ui: UiColo
         .children(command)
         .children(agents)
         .children(background)
+}
+
+/// The dot alone: pulsing while the session works, amber while it waits, the success color when it
+/// finished out of sight, red after an error, a hollow ring when ready (the console's rows).
+pub fn dot(glance: &Glance, unseen: bool, id: impl Into<ElementId>, ui: UiColors) -> AnyElement {
+    let dot = div().flex_none().size(px(7.)).rounded(px(4.));
+    match glance.state {
+        GlanceState::Working | GlanceState::Starting => dot
+            .bg(ui.accent)
+            .with_animation(
+                id,
+                Animation::new(Duration::from_millis(1100)).repeat(),
+                |dot, delta| dot.opacity(0.35 + 0.65 * (1. - (2. * delta - 1.).abs())),
+            )
+            .into_any_element(),
+        GlanceState::Waiting => dot.bg(ui.warning).into_any_element(),
+        GlanceState::Failed => dot.bg(ui.error).into_any_element(),
+        GlanceState::Stopped => dot.bg(ui.dim).into_any_element(),
+        GlanceState::Idle if unseen => dot.bg(ui.success).into_any_element(),
+        GlanceState::Idle => dot
+            .border_1()
+            .border_color(UiColors::tint(ui.text_muted, 0.6))
+            .into_any_element(),
+    }
 }
 
 /// A small pill: an icon and a short text (a clock, a count).
@@ -308,6 +306,11 @@ impl Render for StatusTooltip {
         let title = session.title();
         let glance = glance(session.model());
         let lines = lines(&glance, self.finished);
+        let long = title.chars().count() > WRAP_CHARS
+            || lines.iter().any(|line| match line {
+                Line::Waiting(text) | Line::State(text) => text.chars().count() > WRAP_CHARS,
+                _ => false,
+            });
         let row = |name: IconName, color, text: String, time: Option<String>| {
             div()
                 .flex()
@@ -352,9 +355,18 @@ impl Render for StatusTooltip {
                     time,
                 )
                 .into_any_element(),
-                Line::Waiting(text) => {
-                    row(IconName::Question, ui.warning, text, None).into_any_element()
-                }
+                Line::Waiting(text) => div()
+                    .flex()
+                    .items_start()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .flex_none()
+                            .pt(px(2.))
+                            .child(icon(IconName::Question, ui.warning).size(px(13.))),
+                    )
+                    .child(div().flex_1().min_w_0().line_clamp(3).child(text))
+                    .into_any_element(),
                 Line::State(text) => div()
                     .text_color(ui.text_muted)
                     .child(text)
@@ -375,6 +387,7 @@ impl Render for StatusTooltip {
                 .flex_col()
                 .gap_1()
                 .max_w(px(420.))
+                .when(long, |tooltip| tooltip.w(px(420.)))
                 .px_2()
                 .py_1p5()
                 .rounded(px(RADIUS_SM))
@@ -385,12 +398,21 @@ impl Render for StatusTooltip {
                 .font_family(theme::UI_FONT)
                 .text_size(px(theme::TEXT_SM))
                 .text_color(ui.foreground)
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .line_clamp(3)
+                        .child(title),
+                )
                 .children(rows)
                 .children(hint),
         )
     }
 }
+
+/// A title or question longer than this wraps: the tooltip takes its full width then — gpui sizes
+/// an auto-width box before wrapping, and a wrapped line ran into the status under it.
+const WRAP_CHARS: usize = 48;
 
 /// A line of the tooltip.
 #[derive(Debug, Clone, PartialEq)]
@@ -412,24 +434,136 @@ enum Line {
     State(String),
 }
 
-/// One line for the list of sessions (⌄): what the session does.
-pub fn summary(glance: &Glance) -> String {
-    let time = glance.since.map(|since| compact_elapsed(since.elapsed()));
-    let with_time = |text: String| match &time {
-        Some(time) => format!("{text} · {time}"),
-        None => text,
-    };
+/// How a [`Phrase`] is tinted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Accent,
+    Warning,
+    Success,
+    Error,
+    Muted,
+}
+
+/// One phrase of what a session does now, for the console's row (part «Пульт Claude»): "Running
+/// tests · 12 s", "Reading config.rs", "Asks: which schema?", "Done · 7 files".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Phrase {
+    pub text: String,
+    pub tone: Tone,
+}
+
+/// A command's text in a phrase, at most.
+const PHRASE_COMMAND_CHARS: usize = 40;
+
+/// The phrase of a session from its model; `finished` — when it finished its work out of sight and
+/// the result isn't seen yet: it reads "Done · N files". An idle session seen since has no phrase
+/// (the console tells when it last worked); one that never worked reads "Ready".
+pub fn phrase(model: &Session, finished: Option<Instant>) -> Phrase {
+    let glance = glance(model);
+    let phrase = |text: String, tone| Phrase { text, tone };
     match glance.state {
-        GlanceState::Waiting => tr("Waiting for your answer").to_string(),
-        GlanceState::Working => match (&glance.command, glance.agents.len()) {
-            (Some(_), _) => with_time(trf("Running {0}…", &[&"Bash"])),
-            (None, 0) => with_time(tr("Working…").to_string()),
-            (None, agents) => with_time(trn(agents, "{n} subagent works", "{n} subagents work")),
-        },
-        GlanceState::Starting => tr("Starting…").to_string(),
-        GlanceState::Idle => tr("Ready").to_string(),
-        GlanceState::Stopped | GlanceState::Failed => tr("Stopped").to_string(),
+        GlanceState::Waiting => {
+            let text = match model.pending.first().map(|pending| &pending.kind) {
+                Some(PendingKind::Questions(questions)) => match questions.first() {
+                    Some(question) => trf("Asks: {0}", &[&question.question]),
+                    None => tr("Waiting for your answer").to_string(),
+                },
+                Some(PendingKind::Plan { .. }) => tr("Waits for the plan's approval").to_string(),
+                Some(_) => match &glance.waiting {
+                    Some(what) => trf("Asks permission: {0}", &[what]),
+                    None => tr("Waiting for your answer").to_string(),
+                },
+                None => tr("Waiting for your answer").to_string(),
+            };
+            phrase(text, Tone::Warning)
+        }
+        GlanceState::Working => {
+            let text = doing(model);
+            let text = match glance.since {
+                Some(since) => format!("{text} · {}", compact_elapsed(since.elapsed())),
+                None => text,
+            };
+            phrase(text, Tone::Accent)
+        }
+        GlanceState::Starting => phrase(tr("Starting…").to_string(), Tone::Muted),
+        GlanceState::Idle => {
+            if finished.is_some() {
+                let files = model.changed_files.len();
+                let text = if files == 0 {
+                    tr("Done").to_string()
+                } else {
+                    format!("{} · {}", tr("Done"), trn(files, "{n} file", "{n} files"))
+                };
+                return phrase(text, Tone::Success);
+            }
+            let worked = model
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.kind, EntryKind::TurnEnd(_)));
+            if worked {
+                // Seen: nothing to tell but when it last worked — the console's to say.
+                phrase(String::new(), Tone::Muted)
+            } else {
+                phrase(tr("Ready").to_string(), Tone::Muted)
+            }
+        }
+        GlanceState::Failed => phrase(tr("Stopped with an error").to_string(), Tone::Error),
+        GlanceState::Stopped => phrase(tr("Stopped").to_string(), Tone::Muted),
     }
+}
+
+/// What a working session does: its newest running call, else what it streams.
+fn doing(model: &Session) -> String {
+    let running = model
+        .entries
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            EntryKind::Tool(tool) if tool.state == ToolState::Running => Some(tool),
+            _ => None,
+        });
+    if let Some(tool) = running {
+        let file = |path: &std::path::Path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned())
+        };
+        return match &tool.call {
+            ToolCall::Bash {
+                description: Some(description),
+                ..
+            } if !description.trim().is_empty() => description.trim().to_string(),
+            ToolCall::Bash { command, .. } => trf(
+                "Running {0}",
+                &[&clip(&first_line(command), PHRASE_COMMAND_CHARS)],
+            ),
+            ToolCall::Read { path, .. } => trf("Reading {0}", &[&file(path)]),
+            ToolCall::Edit { path, .. }
+            | ToolCall::Write { path, .. }
+            | ToolCall::NotebookEdit { path } => trf("Editing {0}", &[&file(path)]),
+            ToolCall::Grep { .. } | ToolCall::Glob { .. } => tr("Searching").to_string(),
+            ToolCall::WebSearch { .. } => tr("Searching the web").to_string(),
+            ToolCall::WebFetch { url } => trf("Reading {0}", &[&host(url)]),
+            ToolCall::Agent { description, .. } => trf("Agent: {0}", &[description]),
+            _ => trf("Running {0}", &[&tool.name]),
+        };
+    }
+    match model.entries.last().map(|entry| &entry.kind) {
+        Some(EntryKind::Thinking { .. }) => tr("Thinking").to_string(),
+        Some(EntryKind::Text {
+            streaming: true, ..
+        }) => tr("Writing").to_string(),
+        _ => tr("Working…").to_string(),
+    }
+}
+
+/// "docs.rs" of "https://docs.rs/gpui/latest".
+fn host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest)
+        .to_string()
 }
 
 fn lines(glance: &Glance, finished: Option<Instant>) -> Vec<Line> {
@@ -625,5 +759,86 @@ mod tests {
         assert_eq!(compact_elapsed(Duration::from_secs(12)), "12 s");
         assert_eq!(compact_elapsed(Duration::from_secs(150)), "2 min");
         assert_eq!(compact_elapsed(Duration::from_secs(7300)), "2 h");
+    }
+
+    #[test]
+    fn the_phrase_tells_what_runs_now() {
+        let mut model = Session::new(PathBuf::from("/project"));
+        model.status = Status::Working {
+            since: Instant::now(),
+            activity: Activity::Tool("Read".into()),
+        };
+        model.entries = vec![tool(
+            1,
+            "Read",
+            json!({"file_path": "/project/src/config.rs"}),
+            ToolState::Running,
+        )];
+        let reading = phrase(&model, None);
+        assert_eq!(reading.tone, Tone::Accent);
+        assert!(
+            reading.text.starts_with("Reading config.rs · "),
+            "{reading:?}"
+        );
+
+        model.entries.push(tool(
+            2,
+            "Bash",
+            json!({"command": "cargo test parse_config", "description": "Run the config tests"}),
+            ToolState::Running,
+        ));
+        assert!(
+            phrase(&model, None)
+                .text
+                .starts_with("Run the config tests · ")
+        );
+        model.entries[1] = tool(
+            2,
+            "Bash",
+            json!({"command": "cargo test parse_config\n--quiet"}),
+            ToolState::Running,
+        );
+        assert!(
+            phrase(&model, None)
+                .text
+                .starts_with("Running cargo test parse_config")
+        );
+        model.entries.push(tool(
+            3,
+            "Agent",
+            json!({"description": "Find calls", "prompt": "…"}),
+            ToolState::Running,
+        ));
+        assert!(phrase(&model, None).text.starts_with("Agent: Find calls"));
+        model.entries.push(tool(
+            4,
+            "Edit",
+            json!({"file_path": "/project/src/main.rs", "old_string": "a", "new_string": "b"}),
+            ToolState::Running,
+        ));
+        assert!(phrase(&model, None).text.starts_with("Editing main.rs"));
+    }
+
+    #[test]
+    fn an_idle_session_reads_ready_or_done() {
+        let mut model = Session::new(PathBuf::from("/project"));
+        model.status = Status::Idle;
+        assert_eq!(phrase(&model, None).text, "Ready");
+        let done = phrase(&model, Some(Instant::now()));
+        assert_eq!((done.text.as_str(), done.tone), ("Done", Tone::Success));
+        model.entries.push(Entry {
+            id: 9,
+            kind: EntryKind::TurnEnd(flux_claude::session::TurnSummary {
+                duration: Duration::from_secs(1),
+                cost_usd: 0.,
+                is_error: false,
+                reason: None,
+                errors: Vec::new(),
+            }),
+        });
+        assert_eq!(phrase(&model, None).text, "");
+        model.status = Status::Exited { code: Some(1) };
+        assert_eq!(phrase(&model, None).tone, Tone::Error);
+        assert_eq!(host("https://docs.rs/gpui/latest?x=1"), "docs.rs");
     }
 }

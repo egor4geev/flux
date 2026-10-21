@@ -5,7 +5,7 @@
 //! The slide asks the same questions Flux asks for its windows ([`claude::check_cli`], in the
 //! background): found, its version, the account. It asks again when the guide's window becomes
 //! active (Claude Code installed in another terminal meanwhile), when the sign-in's terminal ends,
-//! and every few seconds while a sign-in is awaited, as the Claude window does. Once it is ready
+//! and every few seconds while a sign-in is awaited, as the console does. Once it is ready
 //! after a sign-in or an install, every Flux window checks again too: its chat works without a
 //! restart.
 
@@ -43,7 +43,7 @@ const TILE: f32 = 34.;
 const FACT_LABEL_WIDTH: f32 = 136.;
 /// The executable's path, shortened in the middle to fit the card.
 const PATH_CHARS: usize = 30;
-/// How often and how long the sign-in is checked after Sign In, as the Claude window does.
+/// How often and how long the sign-in is checked after Sign In, as the console does.
 const SIGN_IN_POLL: Duration = Duration::from_secs(2);
 const SIGN_IN_WAIT: Duration = Duration::from_secs(300);
 /// Copy says «Copied» this long.
@@ -466,7 +466,7 @@ impl Render for ClaudeStep {
         let key_rows = [
             (
                 ui::shortcut_for(&claude::ToggleClaude, cx),
-                tr("Open the chat and go back to the editor").to_string(),
+                tr("The console, and back to the last chat").to_string(),
             ),
             (
                 ui::shortcut_for(&claude::AddSelectionToClaude, cx),
@@ -484,7 +484,7 @@ impl Render for ClaudeStep {
                 tr("Setup · Claude Code"),
                 tr("Claude in Its Own Chat"),
                 trf(
-                    "Flux works with your claude and your Claude subscription: the chat on the right or as an editor tab, edits as diffs with review and rollback, a fix for a problem with {0}.",
+                    "Flux works with your claude and your Claude subscription: sessions in the console on the left, each chat in an editor tab, edits as diffs with review and rollback, a fix for a problem with {0}.",
                     &[&fix],
                 ),
                 ui,
@@ -522,7 +522,7 @@ impl Render for ClaudeStep {
                         div()
                             .text_size(px(theme::TEXT_SM))
                             .text_color(ui.dim)
-                            .child(tr("The Claude window in the launchpad, ⌘Esc and ⌥⌘K.")),
+                            .child(tr("The Claude console in the launchpad, ⌘Esc and ⌥⌘K.")),
                     ),
             )
             .child(

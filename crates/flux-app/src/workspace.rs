@@ -20,9 +20,9 @@ use gpui::{
 };
 
 use crate::claude::{self, ClaudeStore, ClaudeStoreEvent};
-use crate::claude_chat::{ClaudeChat, ClaudeChatEvent};
+use crate::claude_chat::{ClaudeChat, ClaudeChatEvent, DraggedClaudeChat};
 use crate::claude_composer::EditorContext;
-use crate::claude_panel::{ClaudePanel, ClaudePanelEvent, DraggedClaudeChat};
+use crate::claude_console::{ClaudeConsole, ClaudeConsoleEvent, SessionRef};
 use crate::commit_panel::{CommitPanel, CommitPanelEvent};
 use crate::dialog::Dialog;
 use crate::diff_view::{DiffSide, DiffView, DiffViewEvent};
@@ -222,6 +222,12 @@ pub struct Workspace {
     /// The tree was shown when the commit window took its place: hiding the commit window brings it
     /// back.
     tree_before_commit: bool,
+    /// The Claude console in the left island instead of the tree or the commit window (⌘Esc, part
+    /// «Пульт Claude»).
+    console_open: bool,
+    /// What the left island showed before the console took it (the tree, the commit window):
+    /// hiding the console brings it back.
+    left_before_console: (bool, bool),
     /// Recent projects for the start screen, most recent first.
     recent: Vec<PathBuf>,
     /// Language servers of the project; recreated with the root.
@@ -247,12 +253,17 @@ pub struct Workspace {
     pub(crate) plugins: Entity<PluginStore>,
     /// Claude Code: the window's sessions (stage 9).
     pub(crate) claude: Entity<ClaudeStore>,
-    /// The Claude window in the island on the right: the sessions' tabs and the active chat.
-    claude_panel: Entity<ClaudePanel>,
+    /// The Claude console: the sessions of the project, in the left island.
+    claude_console: Entity<ClaudeConsole>,
+    /// The chat whose tab was last active: ⌘Esc from the console goes back to it.
+    claude_last_chat: Option<WeakEntity<ClaudeChat>>,
     /// The chats' events, by chat (a chat goes with its session).
     claude_chat_subscriptions: Vec<(Entity<ClaudeChat>, Subscription)>,
     /// ⌥⌘K without a chat: the mention waits for the session being started.
     claude_pending_mention: Option<String>,
+    /// A session resumed by a click in the console: its tab shows, the keyboard stays in the
+    /// console.
+    claude_keep_console_focus: bool,
     /// The tab that was active before ⌘Esc went to a chat tab: ⌘Esc there goes back to it.
     claude_return: Option<TabItem>,
     /// The document last active in the editor: the chats mention its file and selection.
@@ -283,15 +294,14 @@ pub struct Workspace {
 struct LayoutKey {
     tabs: Vec<EntityId>,
     active: usize,
-    islands: [bool; 4],
+    islands: [bool; 5],
     right: Option<RightTool>,
 }
 
-/// A tool window of the island on the right: Notifications, Claude, or a plugin's window.
+/// A tool window of the island on the right: Notifications or a plugin's window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RightTool {
     Notifications,
-    Claude,
     Plugin(ToolKey),
 }
 
@@ -331,7 +341,7 @@ enum TabItem {
     Merge(Entity<MergeView>),
     /// A tab of the Git window (the log, a history) brought over from it.
     Log(Entity<GitLogView>),
-    /// A Claude chat brought over from the Claude window.
+    /// A Claude session's chat (part «Пульт Claude»: chats live only in tabs).
     Claude(Entity<ClaudeChat>),
     /// A picture: an image file, or Claude's picture from a chat (part 10.2).
     Image(Entity<ImageView>),
@@ -534,8 +544,7 @@ impl Workspace {
             NotificationsPanel::new(notification_center.clone(), right_width.clone(), cx)
         });
         let claude = cx.new(|cx| ClaudeStore::new(root.clone(), cx));
-        let claude_panel =
-            cx.new(|cx| ClaudePanel::new(claude.clone(), right_width.clone(), window, cx));
+        let claude_console = cx.new(|cx| ClaudeConsole::new(claude.clone(), window, cx));
         let plugins = cx.new(|cx| PluginStore::new(root.clone(), right_width, cx));
         plugins.update(cx, |store, cx| {
             store.set_notification_center(notification_center.downgrade());
@@ -582,12 +591,9 @@ impl Workspace {
             cx.observe(&notifications_panel, |_, _, cx| cx.notify()),
             cx.observe(&plugins, |_, _, cx| cx.notify()),
             cx.subscribe_in(&plugins, window, Self::on_plugin_store_event),
-            cx.observe(&claude_panel, |this, _, cx| {
-                this.save_claude_sessions(cx);
-                cx.notify()
-            }),
+            cx.observe(&claude_console, |_, _, cx| cx.notify()),
             cx.subscribe_in(&claude, window, Self::on_claude_event),
-            cx.subscribe_in(&claude_panel, window, Self::on_claude_panel_event),
+            cx.subscribe_in(&claude_console, window, Self::on_claude_console_event),
             cx.subscribe_in(&terminal_panel, window, Self::on_terminal_panel_event),
             cx.subscribe_in(
                 &project_search,
@@ -635,6 +641,8 @@ impl Workspace {
             commit_panel: None,
             commit_open: false,
             tree_before_commit: false,
+            console_open: false,
+            left_before_console: (true, false),
             recent,
             lsp,
             terminal_panel,
@@ -647,9 +655,11 @@ impl Workspace {
             notifications_panel,
             plugins,
             claude,
-            claude_panel,
+            claude_console,
+            claude_last_chat: None,
             claude_chat_subscriptions: Vec::new(),
             claude_pending_mention: None,
+            claude_keep_console_focus: false,
             claude_return: None,
             claude_last_editor: None,
             claude_attention: HashMap::new(),
@@ -705,6 +715,7 @@ impl Workspace {
         self._git_subscription = git_subscription;
         self.commit_panel = None;
         self.commit_open = false;
+        self.console_open = false;
         // The Git window and its tabs in the editor area belong to the old hub.
         self.git_window = None;
         self.git_open = false;
@@ -940,7 +951,12 @@ impl Workspace {
                 self.tree_open = false;
                 self.commit_open = true;
             }
-            LeftIsland::Commit | LeftIsland::Hidden => self.tree_open = false,
+            LeftIsland::Claude if claude::enabled(cx) => {
+                self.left_before_console = (self.tree_open, false);
+                self.tree_open = false;
+                self.console_open = true;
+            }
+            LeftIsland::Commit | LeftIsland::Claude | LeftIsland::Hidden => self.tree_open = false,
         }
         if state.terminal && !self.terminal_open {
             self.terminal_open = true;
@@ -950,14 +966,8 @@ impl Workspace {
                     .update(cx, |panel, cx| panel.new_terminal(window, cx));
             }
         }
-        match state.right {
-            Some(RightIsland::Claude) if claude::enabled(cx) => {
-                self.show_right(RightTool::Claude, window, cx)
-            }
-            Some(RightIsland::Notifications) => {
-                self.show_right(RightTool::Notifications, window, cx)
-            }
-            _ => {}
+        if state.right == Some(RightIsland::Notifications) {
+            self.show_right(RightTool::Notifications, window, cx)
         }
         self.focus_active(window, cx);
         cx.notify();
@@ -1080,7 +1090,9 @@ impl Workspace {
                 scroll: (editor.scroll.y / theme::LINE_HEIGHT).max(0.),
             });
         }
-        let left = if self.commit_open {
+        let left = if self.console_open {
+            LeftIsland::Claude
+        } else if self.commit_open {
             LeftIsland::Commit
         } else if self.tree_open {
             LeftIsland::Tree
@@ -1088,7 +1100,6 @@ impl Workspace {
             LeftIsland::Hidden
         };
         let right = match self.right_tool {
-            Some(RightTool::Claude) => Some(RightIsland::Claude),
             Some(RightTool::Notifications) => Some(RightIsland::Notifications),
             Some(RightTool::Plugin(_)) | None => None,
         };
@@ -1221,6 +1232,7 @@ impl Workspace {
             islands: [
                 self.tree_open,
                 self.commit_open,
+                self.console_open,
                 self.terminal_open,
                 self.git_open,
             ],
@@ -1449,6 +1461,14 @@ impl Workspace {
         let item = tab.item.clone();
         window.focus(&item.focus_handle(cx));
         self.active = index;
+        // ⌘Esc from the console comes back here.
+        if let TabItem::Claude(chat) = &item {
+            self.claude_last_chat = Some(chat.downgrade());
+            // Its result is seen: the console's "Done" goes.
+            let session = chat.read(cx).session().entity_id();
+            self.claude
+                .update(cx, |store, cx| store.mark_seen(session, cx));
+        }
         // A plugin's tab is drawn only while it is the active one: its elements' places (a picker
         // under one) count then.
         for (position, tab) in self.tabs.iter().enumerate() {
@@ -2631,6 +2651,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let panel = self.commit_panel(window, cx);
+        if self.console_open {
+            self.console_open = false;
+            self.tree_open = self.left_before_console.0;
+        }
         if !self.commit_open {
             self.tree_before_commit = self.tree_open;
             self.tree_open = false;
@@ -2983,7 +3007,7 @@ impl Workspace {
             Tool::FindInFiles => self.project_search.read(cx).is_open(),
             Tool::Terminal => self.terminal_open && !self.git_open,
             Tool::Git => self.git_open,
-            Tool::Claude => self.claude_in_sight(),
+            Tool::Claude => self.console_open,
             Tool::Notifications => self.right_tool == Some(RightTool::Notifications),
         }
     }
@@ -3139,11 +3163,6 @@ impl Workspace {
                     .update(cx, |panel, cx| panel.set_visible(true, cx));
                 window.focus(&self.notifications_panel.focus_handle(cx));
             }
-            RightTool::Claude => {
-                self.claude_panel
-                    .update(cx, |panel, cx| panel.set_visible(true, cx));
-                self.claude_panel.read(cx).focus(window, cx);
-            }
             RightTool::Plugin(key) => {
                 let Some(view) = self.plugin_tool_view(key, cx) else {
                     self.right_tool = None;
@@ -3170,12 +3189,6 @@ impl Workspace {
                     .update(cx, |center, cx| center.set_journal_in_sight(false, cx));
                 let focused = self.notifications_panel.read(cx).contains_focus(window, cx);
                 self.notifications_panel
-                    .update(cx, |panel, cx| panel.set_visible(false, cx));
-                focused
-            }
-            RightTool::Claude => {
-                let focused = self.claude_panel.read(cx).contains_focus(window, cx);
-                self.claude_panel
                     .update(cx, |panel, cx| panel.set_visible(false, cx));
                 focused
             }
@@ -3229,12 +3242,14 @@ impl Workspace {
         // The commit window gives its place back to the tree, and its focus with it: a hidden panel
         // that keeps focus would take the keys away — gpui finds no path from it to the window, and
         // ⌘0, ⌘K and the rest go nowhere.
-        if self.commit_open {
+        if self.commit_open || self.console_open {
             let commit_focused = self
                 .commit_panel
                 .as_ref()
-                .is_some_and(|handle| handle.panel.read(cx).contains_focus(window, cx));
+                .is_some_and(|handle| handle.panel.read(cx).contains_focus(window, cx))
+                || self.claude_console.read(cx).contains_focus(window, cx);
             self.commit_open = false;
+            self.console_open = false;
             self.tree_open = true;
             if commit_focused {
                 window.focus(&panel.focus_handle(cx));
@@ -3263,6 +3278,7 @@ impl Workspace {
             return self.focus_active(window, cx);
         }
         self.commit_open = false;
+        self.console_open = false;
         if !self.tree_open {
             self.tree_open = true;
             self.revealed = None;
@@ -3926,6 +3942,7 @@ impl Workspace {
                 if let Some(panel) = self.tree_panel() {
                     // The commit window gives its place to the tree, which shows the directory.
                     self.commit_open = false;
+                    self.console_open = false;
                     self.tree_open = true;
                     self.revealed = None;
                     panel.update(cx, |panel, cx| panel.reveal(path, cx));
@@ -5106,7 +5123,6 @@ impl Render for Workspace {
         let ui = Theme::ui(cx);
         // The session actions of Claude are offered while a chat is current.
         let claude_chat = self.current_claude_chat(window, cx).is_some();
-        let claude_in_tab = matches!(self.active_item(), Some(TabItem::Claude(_)));
         let root = div()
             .key_context("Workspace")
             .relative()
@@ -5143,7 +5159,7 @@ impl Render for Workspace {
             .map(|root| crate::quick_switch::workspace_actions(root, cx))
             .map(|root| crate::editor_menu::workspace_actions(root, cx))
             .map(|root| crate::task_contexts::workspace_actions(root, cx))
-            .map(|root| Self::claude_actions(root, claude_chat, claude_in_tab, cx))
+            .map(|root| Self::claude_actions(root, claude_chat, cx))
             .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
                 this.open_project(action.0.clone(), Vec::new(), window, cx)
             }))
@@ -5349,22 +5365,12 @@ impl Render for Workspace {
                 this.move_log_to_editor(dragged.view.clone(), None, window, cx)
             }
         });
-        let drop_claude = cx.listener(|this, dragged: &DraggedClaudeChat, window, cx| {
-            if !this
-                .tabs
-                .iter()
-                .any(|tab| tab.item.claude() == Some(&dragged.chat))
-            {
-                this.move_chat_to_editor(dragged.chat.clone(), None, window, cx)
-            }
-        });
         let body = move |content: AnyElement| {
             div()
                 .flex_1()
                 .min_h_0()
                 .on_drop(drop_terminal)
                 .on_drop(drop_log)
-                .on_drop(drop_claude)
                 .child(content)
         };
         let main = match self.active_item() {
@@ -5432,6 +5438,14 @@ impl Render for Workspace {
         };
         // The left island: the commit window in place of the tree, or the tree.
         let left = match &self.commit_panel {
+            _ if self.console_open => Some(
+                div()
+                    .flex_none()
+                    .w(px(self.left_width.get()))
+                    .h_full()
+                    .child(self.claude_console.clone())
+                    .into_any_element(),
+            ),
             Some(handle) if self.commit_open => Some(handle.panel.clone().into_any_element()),
             // The tree is a cached view too (see the editor's tab above): its root style is the
             // panel's own (`FileTreePanel::render`).
@@ -5496,7 +5510,6 @@ impl Render for Workspace {
         let right = self.right_tool.map(|tool| {
             let content = match tool {
                 RightTool::Notifications => self.notifications_panel.clone().into_any_element(),
-                RightTool::Claude => self.claude_panel.clone().into_any_element(),
                 RightTool::Plugin(key) => match self.plugin_tool_view(key, cx) {
                     Some(view) => view.into_any_element(),
                     None => div().into_any_element(),
@@ -6322,12 +6335,7 @@ impl Render for DraggedEditorTab {
 impl Workspace {
     /// The Claude actions of the window. Those of a session are there only while one is current
     /// (the palette lists what can run); with Claude Code off in the settings, none are.
-    fn claude_actions(
-        root: gpui::Div,
-        has_chat: bool,
-        chat_in_tab: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    fn claude_actions(root: gpui::Div, has_chat: bool, cx: &mut Context<Self>) -> gpui::Div {
         if !claude::enabled(cx) {
             return root;
         }
@@ -6402,30 +6410,17 @@ impl Workspace {
                 }
             }))
         })
-        .when(has_chat && !chat_in_tab, |root| {
-            root.on_action(cx.listener(|this, _: &claude::MoveToEditor, window, cx| {
-                this.move_claude_to_editor(None, window, cx)
-            }))
-        })
-        .when(chat_in_tab, |root| {
-            root.on_action(cx.listener(|this, _: &claude::MoveToPanel, window, cx| {
-                this.move_claude_to_panel(window, cx)
-            }))
-        })
     }
 
-    /// Every chat of the window: those of the Claude window, then those in the editor's tabs.
-    fn claude_chats(&self, cx: &App) -> Vec<Entity<ClaudeChat>> {
-        let mut chats = self.claude_panel.read(cx).chats().to_vec();
-        chats.extend(
-            self.tabs
-                .iter()
-                .filter_map(|tab| tab.item.claude().cloned()),
-        );
-        chats
+    /// Every chat of the window: the editor's tabs of sessions.
+    fn claude_chats(&self, _cx: &App) -> Vec<Entity<ClaudeChat>> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| tab.item.claude().cloned())
+            .collect()
     }
 
-    /// The chat of a session: in the Claude window or in the editor's tabs.
+    /// The chat of a session: its editor tab, if open.
     fn claude_chat(
         &self,
         session: &Entity<crate::claude_session::ClaudeSession>,
@@ -6436,8 +6431,7 @@ impl Workspace {
             .find(|chat| chat.read(cx).session() == session)
     }
 
-    /// The chat the session actions act on: the one with the focus; else the Claude window's when
-    /// the focus is there; else the active tab's; else the shown window's.
+    /// The chat the session actions act on: the one with the focus; else the active tab's.
     fn current_claude_chat(&self, window: &Window, cx: &App) -> Option<Entity<ClaudeChat>> {
         let in_tabs = self.tabs.iter().filter_map(|tab| tab.item.claude());
         if let Some(chat) = in_tabs
@@ -6446,90 +6440,95 @@ impl Workspace {
         {
             return Some(chat.clone());
         }
-        let panel = self.claude_panel.read(cx);
-        let shown = self.right_tool == Some(RightTool::Claude);
-        if shown && panel.contains_focus(window, cx) {
-            return panel.active_chat().cloned();
+        match self.active_item() {
+            Some(TabItem::Claude(chat)) => Some(chat),
+            _ => None,
         }
-        if let Some(TabItem::Claude(chat)) = self.active_item() {
-            return Some(chat);
-        }
-        shown.then(|| panel.active_chat().cloned()).flatten()
     }
 
     /// The chat is on the screen and the window is active: no notification about it is needed.
     fn claude_chat_in_sight(&self, chat: &Entity<ClaudeChat>, window: &Window, cx: &App) -> bool {
-        if !window.is_window_active() {
-            return false;
-        }
-        if self.right_tool == Some(RightTool::Claude) && self.claude_panel.read(cx).shows(chat) {
-            return true;
-        }
-        matches!(self.active_item(), Some(TabItem::Claude(active)) if &active == chat)
+        let _ = cx;
+        window.is_window_active()
+            && matches!(self.active_item(), Some(TabItem::Claude(active)) if &active == chat)
     }
 
-    /// ⌘Esc goes by the focus: from a chat — back to where the user was; otherwise into the chat on
-    /// the screen (the active tab's, the shown window's), else Claude comes into sight
-    /// ([`Self::show_claude`]).
+    /// Whether the session's chat is on the screen (a session without a tab never is).
+    fn claude_session_in_sight(
+        &self,
+        session: &Entity<crate::claude_session::ClaudeSession>,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        self.claude_chat(session, cx)
+            .is_some_and(|chat| self.claude_chat_in_sight(&chat, window, cx))
+    }
+
+    /// ⌘Esc (part «Пульт Claude»): from the console — back to the last chat (else the editor);
+    /// from anywhere else the console comes with the focus.
     fn toggle_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(chat) = self.current_claude_chat(window, cx)
-            && chat.read(cx).contains_focus(window, cx)
-        {
-            return self.leave_claude(&chat, window, cx);
+        if self.console_open && self.claude_console.read(cx).contains_focus(window, cx) {
+            return self.back_from_console(window, cx);
         }
-        if let Some(TabItem::Claude(chat)) = self.active_item() {
-            return chat.read(cx).focus_composer(window, cx);
-        }
-        if self.right_tool == Some(RightTool::Claude)
-            && !self.claude_panel.read(cx).chats().is_empty()
-        {
-            return self.show_right(RightTool::Claude, window, cx);
-        }
-        self.show_claude(window, cx);
+        self.show_console(window, cx);
     }
 
-    /// The launchpad's Claude icon is a toggle, whatever has the focus: Claude in sight — the
-    /// Claude window, a chat's tab — goes (the window hides, the tab gives way to the one before
-    /// it); otherwise Claude comes into sight.
+    /// The launchpad's Claude icon: the console shows, or goes when shown.
     fn toggle_claude_icon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.claude_in_sight() {
-            return self.show_claude(window, cx);
-        }
-        if self.right_tool == Some(RightTool::Claude) {
-            self.hide_right(window, cx);
-        }
-        if let Some(TabItem::Claude(chat)) = self.active_item() {
-            self.leave_chat_tab(&chat, window, cx);
+        if self.console_open {
+            self.hide_console(window, cx);
+        } else {
+            self.show_console(window, cx);
         }
     }
 
-    /// The Claude window is shown or a chat's tab is active: the launchpad icon is highlighted.
-    fn claude_in_sight(&self) -> bool {
-        self.right_tool == Some(RightTool::Claude)
-            || matches!(self.active_item(), Some(TabItem::Claude(_)))
+    /// The console in the left island, in place of the tree or the commit window, with the focus.
+    fn show_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.console_open {
+            self.left_before_console = (self.tree_open, self.commit_open);
+            self.tree_open = false;
+            self.commit_open = false;
+            self.console_open = true;
+            self.claude.update(cx, |store, cx| store.refresh_saved(cx));
+        }
+        self.claude_console
+            .update(cx, |console, cx| console.focus(window, cx));
+        cx.notify();
     }
 
-    /// Brings Claude into sight: the Claude window when it has chats; else a chat's tab; else a
-    /// new session (its chat shows the window), or the window saying why `claude` isn't ready.
-    fn show_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.claude_panel.read(cx).chats().is_empty() {
-            return self.show_right(RightTool::Claude, window, cx);
+    /// The console goes; the tree or the commit window it replaced comes back.
+    fn hide_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = self.claude_console.read(cx).contains_focus(window, cx);
+        self.console_open = false;
+        let (tree, commit) = self.left_before_console;
+        self.tree_open = tree && self.file_tree.is_some();
+        self.commit_open = commit && self.commit_panel.is_some();
+        if focused {
+            self.focus_active(window, cx);
         }
-        if let Some(index) = self.tabs.iter().position(|tab| tab.item.claude().is_some()) {
-            return self.enter_chat_tab(index, window, cx);
-        }
-        if self.claude.read(cx).is_ready() {
-            // The new session's chat shows the window ([`ClaudeStoreEvent::SessionAdded`]).
-            self.claude.update(cx, |store, cx| {
-                store.new_session(cx);
+        self.revealed = None;
+        self.reveal_active(cx);
+        cx.notify();
+    }
+
+    /// ⌘Esc in the console: the chat whose tab was last active, else the editor.
+    fn back_from_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let last = self
+            .claude_last_chat
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .and_then(|chat| {
+                self.tabs
+                    .iter()
+                    .position(|tab| tab.item.claude() == Some(&chat))
             });
-            return;
+        match last {
+            Some(index) => self.enter_chat_tab(index, window, cx),
+            None => self.focus_active(window, cx),
         }
-        self.show_right(RightTool::Claude, window, cx);
     }
 
-    /// A chat's tab comes forward with the focus in its message field; leaving it goes back to the
-    /// tab that was active.
+    /// A chat's tab comes forward with the focus in its message field.
     fn enter_chat_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.remember_claude_return();
         self.activate(index, window, cx);
@@ -6538,96 +6537,118 @@ impl Workspace {
         }
     }
 
-    /// The tab to go back to from a chat's tab: the active one, unless it is a chat itself (then
-    /// the one remembered before stays — a chat going back to itself did nothing).
+    /// The tab to go back to from a chat's tab: the active one, unless it is a chat itself.
     fn remember_claude_return(&mut self) {
         if let Some(item) = self.active_item().filter(|item| item.claude().is_none()) {
             self.claude_return = Some(item);
         }
     }
 
-    /// ⌘Esc in a chat: a chat's tab gives way ([`Self::leave_chat_tab`]); from the Claude window,
-    /// the focus goes to the editor and the window stays.
-    fn leave_claude(
-        &mut self,
-        chat: &Entity<ClaudeChat>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if matches!(self.active_item(), Some(TabItem::Claude(active)) if &active == chat) {
-            return self.leave_chat_tab(chat, window, cx);
-        }
-        self.focus_active(window, cx);
-    }
-
-    /// A chat's tab gives way to the tab active before it came forward, else the document nearest
-    /// to it, else any other tab. A chat alone in the tabs stays; the focus leaves it for the tree
-    /// (or the window), so ⌘Esc still goes somewhere.
-    fn leave_chat_tab(
-        &mut self,
-        chat: &Entity<ClaudeChat>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(at) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.item.claude() == Some(chat))
-        else {
-            return;
-        };
-        let nearest = |accept: &dyn Fn(&TabItem) -> bool| {
-            (0..self.tabs.len())
-                .filter(|index| *index != at && accept(&self.tabs[*index].item))
-                .min_by_key(|index| (index.abs_diff(at), *index > at))
-        };
-        let back = self
-            .claude_return
-            .take()
-            .and_then(|item| self.tabs.iter().position(|tab| tab.item == item))
-            .filter(|index| *index != at)
-            .or_else(|| nearest(&|item| item.editor().is_some()))
-            .or_else(|| nearest(&|item| item.claude().is_none()))
-            .or_else(|| nearest(&|_| true));
-        match back {
-            Some(index) => self.activate(index, window, cx),
-            None => match self.tree_panel().filter(|_| self.tree_open) {
-                Some(tree) => window.focus(&tree.focus_handle(cx)),
-                None => window.focus(&self.focus_handle),
-            },
-        }
-        cx.notify();
-    }
-
-    /// "+", "New Session": a session in the Claude window; while `claude` isn't ready, the window
-    /// says why.
+    /// "+", "New Session": a session in a new tab; while `claude` isn't ready, the console says
+    /// why.
     fn new_claude_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let started = self.claude.update(cx, |store, cx| store.new_session(cx));
         if started.is_none() {
-            self.show_right(RightTool::Claude, window, cx);
+            self.show_console(window, cx);
         }
     }
 
-    /// A notification's "Show": the session's chat, wherever it is.
+    /// A notification's "Show", the status bar: the session's tab (opened when it has none).
     fn show_claude_session(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.claude.read(cx).session(id).cloned() else {
             return;
         };
-        let Some(chat) = self.claude_chat(&session, cx) else {
-            return;
-        };
         window.activate_window();
-        if self.claude_panel.read(cx).chats().contains(&chat) {
-            self.claude_panel
-                .update(cx, |panel, cx| panel.activate_chat(&chat, window, cx));
-            self.show_right(RightTool::Claude, window, cx);
-        } else if let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.item.claude() == Some(&chat))
+        self.open_claude_session(&session, window, cx);
+    }
+
+    /// A live session's chat in its tab, brought forward with the focus in the message field: a
+    /// session without a tab (closed while it worked, or just added) gets one next to the active
+    /// tab.
+    fn open_claude_session(
+        &mut self,
+        session: &Entity<crate::claude_session::ClaudeSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ClaudeChat> {
+        if let Some(chat) = self.claude_chat(session, cx)
+            && let Some(index) = self
+                .tabs
+                .iter()
+                .position(|tab| tab.item.claude() == Some(&chat))
         {
-            self.activate(index, window, cx);
-            chat.read(cx).focus_composer(window, cx);
+            self.enter_chat_tab(index, window, cx);
+            return chat;
+        }
+        let chat = self.new_claude_chat(session, window, cx);
+        self.remember_claude_return();
+        let subscriptions = vec![cx.observe(&chat, |_, _, cx| cx.notify())];
+        self.insert_tab(
+            TabItem::Claude(chat.clone()),
+            subscriptions,
+            None,
+            window,
+            cx,
+        );
+        chat.read(cx).focus_composer(window, cx);
+        self.update_claude_context(cx);
+        self.save_claude_sessions(cx);
+        chat
+    }
+
+    /// The console's Open: a live session's tab; a saved one (unloaded, from the history) is
+    /// resumed into a new tab, or the open one comes forward.
+    fn open_session_ref(
+        &mut self,
+        target: &SessionRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            SessionRef::Live(session) => {
+                self.open_claude_session(session, window, cx);
+            }
+            SessionRef::Saved(saved) => {
+                let open = self
+                    .claude
+                    .read(cx)
+                    .sessions()
+                    .iter()
+                    .find(|session| session.read(cx).session_id() == Some(saved.id.as_str()))
+                    .cloned();
+                match open {
+                    Some(session) => {
+                        self.open_claude_session(&session, window, cx);
+                    }
+                    // A new one comes into sight in a tab by itself
+                    // ([`ClaudeStoreEvent::SessionAdded`]).
+                    None => {
+                        let resumed = self.claude.update(cx, |store, cx| store.resume(saved, cx));
+                        if resumed.is_none() {
+                            self.show_console(window, cx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The live session a console action acts on: a saved one is resumed first (into a tab).
+    fn live_session_of(
+        &mut self,
+        target: &SessionRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::claude_session::ClaudeSession>> {
+        match target {
+            SessionRef::Live(session) => Some(session.clone()),
+            SessionRef::Saved(saved) => {
+                let session = self.claude.update(cx, |store, cx| store.resume(saved, cx));
+                if session.is_none() {
+                    self.show_console(window, cx);
+                }
+                session
+            }
         }
     }
 
@@ -6640,13 +6661,12 @@ impl Workspace {
     ) {
         match event {
             ClaudeStoreEvent::SessionAdded(session) => {
-                let chat = self.new_claude_chat(session, window, cx);
-                self.claude_panel
-                    .update(cx, |panel, cx| panel.add_chat(chat.clone(), None, cx));
-                self.show_right(RightTool::Claude, window, cx);
-                self.update_claude_context(cx);
+                let chat = self.open_claude_session(session, window, cx);
                 if let Some(mention) = self.claude_pending_mention.take() {
                     chat.update(cx, |chat, cx| chat.insert(&mention, window, cx));
+                }
+                if std::mem::take(&mut self.claude_keep_console_focus) {
+                    self.refocus_console(window, cx);
                 }
             }
             ClaudeStoreEvent::SessionRemoved(session) => {
@@ -6658,14 +6678,7 @@ impl Workspace {
                 if let Some(chat) = chat {
                     self.claude_chat_subscriptions
                         .retain(|(known, _)| *known != chat);
-                    let removed = self
-                        .claude_panel
-                        .update(cx, |panel, cx| panel.remove_chat(&chat, cx));
-                    if removed {
-                        if self.right_tool == Some(RightTool::Claude) {
-                            self.claude_panel.read(cx).focus(window, cx);
-                        }
-                    } else if let Some(index) = self
+                    if let Some(index) = self
                         .tabs
                         .iter()
                         .position(|tab| tab.item.claude() == Some(&chat))
@@ -6689,14 +6702,10 @@ impl Workspace {
                         cx,
                     );
                 }
-                let Some(chat) = self.claude_chat(session, cx) else {
-                    return;
-                };
-                if self.claude_chat_in_sight(&chat, window, cx) {
+                // A session without a tab (closed while it worked) asks too.
+                if self.claude_session_in_sight(session, window, cx) {
                     return;
                 }
-                self.claude_panel
-                    .update(cx, |panel, cx| panel.mark_unseen(&chat, cx));
                 let title = session.read(cx).title();
                 let body = match &pending.kind {
                     flux_claude::PendingKind::Questions(questions) => questions
@@ -6736,14 +6745,11 @@ impl Workspace {
                 }
             }
             ClaudeStoreEvent::Finished { session, is_error } => {
-                let Some(chat) = self.claude_chat(session, cx) else {
-                    return;
-                };
-                if self.claude_chat_in_sight(&chat, window, cx) {
+                if self.claude_session_in_sight(session, window, cx) {
+                    let id = session.entity_id();
+                    self.claude.update(cx, |store, cx| store.mark_seen(id, cx));
                     return;
                 }
-                self.claude_panel
-                    .update(cx, |panel, cx| panel.mark_unseen(&chat, cx));
                 let title = session.read(cx).title();
                 let notification = if *is_error {
                     Notification::warning(trf("Claude stopped with an error: {0}", &[&title]))
@@ -6760,10 +6766,7 @@ impl Workspace {
                 code,
                 stderr,
             } => {
-                let in_sight = self
-                    .claude_chat(session, cx)
-                    .is_some_and(|chat| self.claude_chat_in_sight(&chat, window, cx));
-                if in_sight {
+                if self.claude_session_in_sight(session, window, cx) {
                     return;
                 }
                 let title = trf("Claude stopped: {0}", &[&session.read(cx).title()]);
@@ -6826,9 +6829,9 @@ impl Workspace {
             }
             ClaudeStoreEvent::SessionRestored {
                 session,
-                place,
+                place: _,
                 active,
-            } => self.restore_claude_chat(session, *place, *active, window, cx),
+            } => self.restore_claude_chat(session, *active, window, cx),
         }
         // Sessions came, went or got their ids: the next start reopens them.
         self.save_claude_sessions(cx);
@@ -6848,46 +6851,38 @@ impl Workspace {
         chat
     }
 
-    /// A session open when the project last closed: its chat goes back to its pill or its editor
-    /// tab without coming into sight (it starts its process once it is shown).
+    /// A session open when the project last closed: its chat goes back to its editor tab without
+    /// coming into sight (it starts its process once it is shown).
     fn restore_claude_chat(
         &mut self,
         session: &Entity<crate::claude_session::ClaudeSession>,
-        place: crate::claude_history::SessionPlace,
         active: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let chat = self.new_claude_chat(session, window, cx);
-        match place {
-            crate::claude_history::SessionPlace::Panel => self
-                .claude_panel
-                .update(cx, |panel, cx| panel.restore_chat(chat, active, cx)),
-            crate::claude_history::SessionPlace::Editor => {
-                let subscriptions = vec![cx.observe(&chat, |_, _, cx| cx.notify())];
-                let item = TabItem::Claude(chat);
-                if self.tabs.is_empty() {
-                    // The only tab: shown at once.
-                    self.insert_tab(item, subscriptions, None, window, cx);
-                } else {
-                    self.tabs.push(Tab {
-                        item,
-                        _subscriptions: subscriptions,
-                    });
-                    // The active tab of a context coming back (part 10.3).
-                    if active {
-                        self.activate(self.tabs.len() - 1, window, cx);
-                    }
-                }
+        let subscriptions = vec![cx.observe(&chat, |_, _, cx| cx.notify())];
+        let item = TabItem::Claude(chat);
+        if self.tabs.is_empty() {
+            // The only tab: shown at once.
+            self.insert_tab(item, subscriptions, None, window, cx);
+        } else {
+            self.tabs.push(Tab {
+                item,
+                _subscriptions: subscriptions,
+            });
+            // The active tab of a context coming back (part 10.3).
+            if active {
+                self.activate(self.tabs.len() - 1, window, cx);
             }
         }
         self.update_claude_context(cx);
         cx.notify();
     }
 
-    /// The window's open sessions of the project — the Claude window's pills, then the chats in
-    /// the editor's tabs — for the next start (Settings → Claude Code → "Reopen sessions with the
-    /// project"); written only when they changed.
+    /// The window's open sessions of the project — the chats in the editor's tabs — for the next
+    /// start (Settings → Claude Code → "Reopen sessions with the project"); written only when they
+    /// changed. The console keeps the rest of "Now" itself.
     fn save_claude_sessions(&mut self, cx: &mut Context<Self>) {
         use crate::claude_history::{OpenSessions, SessionPlace};
         let Some(root) = self.claude.read(cx).root().map(Path::to_path_buf) else {
@@ -6900,14 +6895,7 @@ impl Workspace {
                 .then(|| session.session_id().map(str::to_string))
                 .flatten()
         };
-        let panel = self.claude_panel.read(cx);
         let mut open = OpenSessions::default();
-        for chat in panel.chats() {
-            if let Some(id) = id_of(chat, cx) {
-                open.sessions.push((id, SessionPlace::Panel));
-            }
-        }
-        open.active = panel.active_chat().and_then(|chat| id_of(chat, cx));
         for chat in self.tabs.iter().filter_map(|tab| tab.item.claude()) {
             if let Some(id) = id_of(chat, cx) {
                 open.sessions.push((id, SessionPlace::Editor));
@@ -6963,22 +6951,193 @@ impl Workspace {
         }
     }
 
-    fn on_claude_panel_event(
+    fn on_claude_console_event(
         &mut self,
-        _: &Entity<ClaudePanel>,
-        event: &ClaudePanelEvent,
+        _: &Entity<ClaudeConsole>,
+        event: &ClaudeConsoleEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
-            ClaudePanelEvent::MoveToPanel { chat, index } => {
-                self.move_chat_to_panel(chat.clone(), Some(*index), window, cx)
+            ClaudeConsoleEvent::NewSession => self.new_claude_session(window, cx),
+            ClaudeConsoleEvent::Open(target) => self.open_session_ref(target, window, cx),
+            ClaudeConsoleEvent::Show(target) => {
+                // A saved session resumes later ([`ClaudeStoreEvent::SessionAdded`]).
+                self.claude_keep_console_focus = matches!(target, SessionRef::Saved(_));
+                self.open_session_ref(target, window, cx);
+                self.refocus_console(window, cx);
             }
-            ClaudePanelEvent::CloseChat(chat) => self.close_claude_chat(chat.clone(), window, cx),
-            ClaudePanelEvent::ShowHistory(anchor) => {
-                crate::claude_history::open_at(self, Some(*anchor), window, cx)
+            ClaudeConsoleEvent::Close(target) => self.close_from_console(target, window, cx),
+            ClaudeConsoleEvent::Rename(target) => {
+                if let Some(session) = self.live_session_of(target, window, cx) {
+                    self.rename_session(session, window, cx);
+                }
             }
+            ClaudeConsoleEvent::OpenInTerminal(target) => match target {
+                SessionRef::Live(session) => self.session_in_terminal(session.clone(), window, cx),
+                SessionRef::Saved(saved) => {
+                    if let Some(cli) = self.claude.read(cx).cli().cli().cloned() {
+                        let command = claude::resume_command(&cli, Some(&saved.id));
+                        self.type_in_terminal(command, true, window, cx);
+                    }
+                }
+            },
+            ClaudeConsoleEvent::Stop(session) => {
+                session.update(cx, |session, cx| session.interrupt(cx));
+            }
+            ClaudeConsoleEvent::Archive(target) => self.archive_session(target, window, cx),
+            ClaudeConsoleEvent::Review(session) => {
+                if let Some((chat, turn)) = self.last_turn_of(session, window, cx) {
+                    chat.update(cx, |chat, cx| chat.review_turn(turn, None, window, cx));
+                }
+            }
+            ClaudeConsoleEvent::Rollback(session) => {
+                if let Some((chat, turn)) = self.last_turn_of(session, window, cx) {
+                    chat.update(cx, |chat, cx| chat.rollback_turn(turn, None, window, cx));
+                }
+            }
+            ClaudeConsoleEvent::Dismiss => self.focus_active(window, cx),
         }
+    }
+
+    /// The chat of a session (its tab opened when it has none) and the end of its last turn: the
+    /// console's Review and Rollback act on it as the "Done" card does.
+    fn last_turn_of(
+        &mut self,
+        session: &Entity<crate::claude_session::ClaudeSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<ClaudeChat>, flux_claude::EntryId)> {
+        let turn = session
+            .read(cx)
+            .model()
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.kind, flux_claude::EntryKind::TurnEnd(_)))
+            .map(|entry| entry.id)?;
+        let chat = match self.claude_chat(session, cx) {
+            Some(chat) => chat,
+            None => self.open_claude_session(session, window, cx),
+        };
+        Some((chat, turn))
+    }
+
+    /// The console's "Archive": out of "Now" into the archive. A live session is unloaded first —
+    /// its tab closes, its process stops (asked when Claude works).
+    fn archive_session(
+        &mut self,
+        target: &SessionRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session = match target {
+            SessionRef::Saved(saved) => {
+                let id = saved.id.clone();
+                return self.claude.update(cx, |store, cx| store.archive(&id, cx));
+            }
+            SessionRef::Live(session) => session.clone(),
+        };
+        if !ClaudeStore::keeps_running(session.read(cx)) {
+            return self.unload_and_archive(&session, window, cx);
+        }
+        let title = session.read(cx).title();
+        let answer = Dialog::warning(trf("Archive “{0}”?", &[&title]))
+            .message(tr(
+                "Claude is working in this session. Archiving it stops Claude. Its changes stay.",
+            ))
+            .danger(tr("Stop and Archive"))
+            .cancel(tr("Cancel"))
+            .show(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Some(0) {
+                this.update_in(cx, |this, window, cx| {
+                    this.unload_and_archive(&session, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// The console's Close: the session leaves "Now" for the history; a live one ends (asked when
+    /// Claude works) and its tab closes.
+    fn close_from_console(
+        &mut self,
+        target: &SessionRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session = match target {
+            SessionRef::Saved(_) => {
+                return self
+                    .claude
+                    .update(cx, |store, cx| store.close_from_console(target, cx));
+            }
+            SessionRef::Live(session) => session.clone(),
+        };
+        if !ClaudeStore::keeps_running(session.read(cx)) {
+            return self.end_from_console(&session, window, cx);
+        }
+        let title = session.read(cx).title();
+        let answer = Dialog::warning(trf("Stop “{0}”?", &[&title]))
+            .message(tr(
+                "Claude is working in this session. Closing it stops Claude. Its changes stay.",
+            ))
+            .danger(tr("Stop and Close"))
+            .cancel(tr("Cancel"))
+            .show(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Some(0) {
+                this.update_in(cx, |this, window, cx| {
+                    this.end_from_console(&session, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn end_from_console(
+        &mut self,
+        session: &Entity<crate::claude_session::ClaudeSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(chat) = self.claude_chat(session, cx) {
+            self.drop_claude_chat(&chat, window, cx);
+        }
+        let target = SessionRef::Live(session.clone());
+        self.claude
+            .update(cx, |store, cx| store.close_from_console(&target, cx));
+        self.save_claude_sessions(cx);
+    }
+
+    /// The keyboard back to the console (a click there showed a session's tab).
+    fn refocus_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.console_open {
+            self.claude_console
+                .update(cx, |console, cx| console.focus(window, cx));
+        }
+    }
+
+    fn unload_and_archive(
+        &mut self,
+        session: &Entity<crate::claude_session::ClaudeSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = session.read(cx).session_id().map(str::to_string);
+        if let Some(chat) = self.claude_chat(session, cx) {
+            self.drop_claude_chat(&chat, window, cx);
+        }
+        self.claude.update(cx, |store, cx| {
+            store.unload(session, cx);
+            if let Some(id) = &id {
+                store.archive(id, cx);
+            }
+        });
+        self.save_claude_sessions(cx);
     }
 
     // --- The editor and the chats ---
@@ -7040,8 +7199,8 @@ impl Workspace {
     }
 
     /// ⌥⌘K: the active document's file and selected lines go into a chat's message as a mention
-    /// (`@src/main.rs#L10-20`): the current chat, else the Claude window's, else one in a tab;
-    /// without any, a new session takes it once it starts.
+    /// (`@src/main.rs#L10-20`): the current chat, else the last one, else one in a tab; without
+    /// any, a new session takes it once it starts.
     fn add_selection_to_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.active_editor() else {
             return;
@@ -7050,34 +7209,12 @@ impl Workspace {
             return;
         };
         let mention = format!("{} ", claude::mention(&context.path, context.lines));
-        let chat = self
-            .current_claude_chat(window, cx)
-            .or_else(|| self.claude_panel.read(cx).active_chat().cloned())
-            .or_else(|| self.tabs.iter().find_map(|tab| tab.item.claude().cloned()));
-        let Some(chat) = chat else {
-            if self.claude.read(cx).is_ready() {
-                self.claude_pending_mention = Some(mention);
-            }
-            return self.toggle_claude(window, cx);
-        };
-        if self.claude_panel.read(cx).chats().contains(&chat) {
-            self.claude_panel
-                .update(cx, |panel, cx| panel.activate_chat(&chat, window, cx));
-            self.show_right(RightTool::Claude, window, cx);
-        } else if let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.item.claude() == Some(&chat))
-        {
-            self.remember_claude_return();
-            self.activate(index, window, cx);
-        }
-        chat.update(cx, |chat, cx| chat.insert(&mention, window, cx));
+        self.insert_into_chat(mention, window, cx);
     }
 
     /// Mentions (`@src/main.rs`, `@src/ui/`) go into the message of the current chat (else the
-    /// Claude window's, else one in a tab), which comes into sight; without any chat, a new
-    /// session takes them once it starts. "Send to Claude" of the tree and the tabs, dropped files.
+    /// last one, else one in a tab), which comes into sight; without any chat, a new session takes
+    /// them once it starts. "Send to Claude" of the tree and the tabs, dropped files.
     pub(crate) fn send_mentions_to_claude(
         &mut self,
         mentions: Vec<String>,
@@ -7088,21 +7225,29 @@ impl Workspace {
             return;
         }
         let text = mentions.join(" ") + " ";
+        self.insert_into_chat(text, window, cx);
+    }
+
+    /// Text for a chat's message (mentions): the current chat, else the one last active, else any
+    /// in the tabs, which comes forward; without any chat, a new session takes it once it starts
+    /// (the console says why when `claude` isn't ready).
+    fn insert_into_chat(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let chat = self
             .current_claude_chat(window, cx)
-            .or_else(|| self.claude_panel.read(cx).active_chat().cloned())
+            .or_else(|| {
+                self.claude_last_chat
+                    .as_ref()
+                    .and_then(WeakEntity::upgrade)
+                    .filter(|chat| self.tabs.iter().any(|tab| tab.item.claude() == Some(chat)))
+            })
             .or_else(|| self.tabs.iter().find_map(|tab| tab.item.claude().cloned()));
         let Some(chat) = chat else {
             if self.claude.read(cx).is_ready() {
                 self.claude_pending_mention = Some(text);
             }
-            return self.toggle_claude(window, cx);
+            return self.new_claude_session(window, cx);
         };
-        if self.claude_panel.read(cx).chats().contains(&chat) {
-            self.claude_panel
-                .update(cx, |panel, cx| panel.activate_chat(&chat, window, cx));
-            self.show_right(RightTool::Claude, window, cx);
-        } else if let Some(index) = self
+        if let Some(index) = self
             .tabs
             .iter()
             .position(|tab| tab.item.claude() == Some(&chat))
@@ -7113,8 +7258,8 @@ impl Workspace {
         chat.update(cx, |chat, cx| chat.insert(&text, window, cx));
     }
 
-    /// A ready request (Explain, Fix…) in a new session: its chat comes into sight in the Claude
-    /// window and the request goes at once; while `claude` isn't ready, the window says why.
+    /// A ready request (Explain, Fix…) in a new session: its chat comes into sight in a tab and the
+    /// request goes at once; while `claude` isn't ready, the console says why.
     pub(crate) fn ask_claude(
         &mut self,
         input: flux_claude::UserInput,
@@ -7124,7 +7269,7 @@ impl Workspace {
         let session = self.claude.update(cx, |store, cx| store.new_session(cx));
         match &session {
             Some(session) => session.update(cx, |session, cx| session.send(input, cx)),
-            None => self.show_right(RightTool::Claude, window, cx),
+            None => self.show_console(window, cx),
         }
         session
     }
@@ -7245,79 +7390,7 @@ impl Workspace {
 
     // --- Moving chats ---
 
-    /// The current chat of the Claude window moves to the editor's tabs.
-    fn move_claude_to_editor(
-        &mut self,
-        index: Option<usize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let chat = self
-            .current_claude_chat(window, cx)
-            .or_else(|| self.claude_panel.read(cx).active_chat().cloned());
-        if let Some(chat) = chat {
-            self.move_chat_to_editor(chat, index, window, cx);
-        }
-    }
-
-    fn move_chat_to_editor(
-        &mut self,
-        chat: Entity<ClaudeChat>,
-        index: Option<usize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self
-            .claude_panel
-            .update(cx, |panel, cx| panel.remove_chat(&chat, cx))
-        {
-            return;
-        }
-        if self.claude_panel.read(cx).chats().is_empty()
-            && self.right_tool == Some(RightTool::Claude)
-        {
-            self.hide_right(window, cx);
-        }
-        let subscriptions = vec![cx.observe(&chat, |_, _, cx| cx.notify())];
-        self.insert_tab(
-            TabItem::Claude(chat.clone()),
-            subscriptions,
-            index,
-            window,
-            cx,
-        );
-        chat.read(cx).focus_composer(window, cx);
-    }
-
-    /// The active tab's chat goes back to the Claude window.
-    fn move_claude_to_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(TabItem::Claude(chat)) = self.active_item() {
-            self.move_chat_to_panel(chat, None, window, cx);
-        }
-    }
-
-    fn move_chat_to_panel(
-        &mut self,
-        chat: Entity<ClaudeChat>,
-        index: Option<usize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(tab) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.item.claude() == Some(&chat))
-        else {
-            return;
-        };
-        self.remove_tab_at(tab, window, cx);
-        self.claude_panel
-            .update(cx, |panel, cx| panel.add_chat(chat, index, cx));
-        self.show_right(RightTool::Claude, window, cx);
-    }
-
-    /// A chat dropped on the tab strip: one of the tabs moves along it, one from the Claude window
-    /// joins the tabs where the marker shows.
+    /// A chat's tab dropped on the tab strip: it moves along it where the marker shows.
     fn drop_claude(
         &mut self,
         chat: Entity<ClaudeChat>,
@@ -7325,20 +7398,20 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let index = self.tab_drop.take().unwrap_or(self.tabs.len());
-        match self
+        if let Some(from) = self
             .tabs
             .iter()
             .position(|tab| tab.item.claude() == Some(&chat))
         {
-            Some(from) => self.move_tab(from, index, window, cx),
-            None => self.move_chat_to_editor(chat, Some(index), window, cx),
+            self.move_tab(from, index, window, cx);
         }
     }
 
     // --- Sessions ---
 
-    /// Closing a chat (its pill's ×, its tab, Close Session) ends its session; one that works is
-    /// asked about first.
+    /// Closing a chat's tab (its ×, middle click, Close Session) drops the view, not the session
+    /// (part «Пульт Claude»): one that works, waits for the user or runs a background task goes on
+    /// in the console; an idle one is unloaded — its process stops, opening it resumes it.
     fn close_claude_chat(
         &mut self,
         chat: Entity<ClaudeChat>,
@@ -7346,29 +7419,30 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let session = chat.read(cx).session().clone();
-        if !session.read(cx).model().is_working() {
-            return self
-                .claude
-                .update(cx, |store, cx| store.close_session(&session, cx));
+        self.drop_claude_chat(&chat, window, cx);
+        if !ClaudeStore::keeps_running(session.read(cx)) {
+            self.claude
+                .update(cx, |store, cx| store.unload(&session, cx));
         }
-        let title = session.read(cx).title();
-        let answer = Dialog::warning(trf("Stop “{0}”?", &[&title]))
-            .message(tr(
-                "Claude is working in this session. Closing the session stops Claude. Its changes stay.",
-            ))
-            .danger(tr("Stop and Close"))
-            .cancel(tr("Cancel"))
-            .show(window, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Some(0) {
-                this.update(cx, |this, cx| {
-                    this.claude
-                        .update(cx, |store, cx| store.close_session(&session, cx))
-                })
-                .ok();
-            }
-        })
-        .detach();
+        self.save_claude_sessions(cx);
+    }
+
+    /// A chat's tab and view go; its session stays.
+    fn drop_claude_chat(
+        &mut self,
+        chat: &Entity<ClaudeChat>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.claude_chat_subscriptions
+            .retain(|(known, _)| known != chat);
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.item.claude() == Some(chat))
+        {
+            self.remove_tab_at(index, window, cx);
+        }
     }
 
     /// Closing a chat's tab: as closing the chat.
@@ -7387,6 +7461,16 @@ impl Workspace {
             return;
         };
         let session = chat.read(cx).session().clone();
+        self.rename_session(session, window, cx);
+    }
+
+    /// The Rename dialog for a session (the chat's, the console's F2).
+    fn rename_session(
+        &mut self,
+        session: Entity<crate::claude_session::ClaudeSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let old = session.read(cx).title().to_string();
         self.toggle_dialog(window, cx, move |window, cx| {
             crate::input_dialog::InputDialog::new(
@@ -7419,10 +7503,20 @@ impl Workspace {
         let Some(chat) = self.current_claude_chat(window, cx) else {
             return;
         };
+        let session = chat.read(cx).session().clone();
+        self.session_in_terminal(session, window, cx);
+    }
+
+    /// A session goes on in the terminal CLI; its process here stops.
+    fn session_in_terminal(
+        &mut self,
+        session: Entity<crate::claude_session::ClaudeSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(cli) = self.claude.read(cx).cli().cli().cloned() else {
             return;
         };
-        let session = chat.read(cx).session().clone();
         let id = session.read(cx).session_id().map(str::to_string);
         session.update(cx, |session, cx| {
             session.shutdown();

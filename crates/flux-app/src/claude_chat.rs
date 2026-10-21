@@ -1,6 +1,6 @@
 //! The chat of one Claude session: the conversation, the questions for the user and the task list,
-//! the message field. The same view lives in the Claude window (the island on the right) or in an
-//! editor tab; the workspace moves it between them.
+//! the message field. It lives in an editor tab; closing the tab drops the view, not the session
+//! (part «Пульт Claude»).
 //!
 //! A resumed session (the history, Flux restarting) shows "Loading…" while its transcript is read
 //! and starts its process the first time its chat is drawn — in sight — not before.
@@ -22,7 +22,43 @@ use crate::claude_search::{self, ChatSearch};
 use crate::claude_session::{ClaudeSession, SessionEvent};
 use crate::claude_transcript::{self, TranscriptState};
 use crate::i18n::tr;
-use crate::theme::{self, Theme};
+use crate::icons::{IconName, icon};
+use crate::theme::{self, Theme, UiColors};
+use crate::ui::{self, RADIUS_MD};
+
+/// Long session titles are shortened in the middle in a dragged tab's label.
+const DRAG_LABEL_MAX_CHARS: usize = 24;
+
+/// A session's editor tab being dragged along the tabs: also the label next to the pointer.
+#[derive(Clone)]
+pub struct DraggedClaudeChat {
+    pub chat: Entity<ClaudeChat>,
+    pub title: gpui::SharedString,
+}
+
+impl Render for DraggedClaudeChat {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .h(px(28.))
+            .pl_2()
+            .pr_2p5()
+            .rounded(px(RADIUS_MD))
+            // Opaque: the label floats over the tabs, and their text must not show through.
+            .bg(UiColors::tint(ui.elevated, 1.))
+            .border_1()
+            .border_color(ui.elevated_border)
+            .shadow(ui::popover_shadow(ui))
+            .font_family(theme::UI_FONT)
+            .text_size(px(theme::TEXT_MD))
+            .text_color(ui.foreground)
+            .child(icon(IconName::Claude, ui.accent_text).size(px(13.)))
+            .child(crate::claude::shorten(&self.title, DRAG_LABEL_MAX_CHARS))
+    }
+}
 
 /// How often the line of what Claude does is redrawn while it works (its clock).
 const TICK: Duration = Duration::from_secs(1);

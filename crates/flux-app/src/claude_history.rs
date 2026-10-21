@@ -1,5 +1,5 @@
-//! The project's Claude sessions (part 9.2): "Resume Session…" — the history button of the Claude
-//! window, `/resume` in the message field, the palette — lists the saved sessions of the project
+//! The project's Claude sessions (part 9.2): "Resume Session…" — `/resume` in the message field,
+//! the palette — lists the saved sessions of the project
 //! (`~/.claude/projects`, the terminal's and Flux's alike) in a popup; the chosen one comes back in
 //! a tab, its conversation read from the transcript, and goes on with `claude --resume`. The
 //! sessions open when the project closed come back when it opens (Settings → Claude Code).
@@ -9,8 +9,7 @@
 //!   window are marked, choosing one of them brings its chat into sight where it is. A session is
 //!   deleted with the trash on its row or ⌘⌫ (part 10.2): after a question, its transcript and its
 //!   folder (subagents, tool results) go to the Trash; an open one is closed first.
-//! - The open sessions of a project ([`OpenSessions`]: the Claude window's pills, then the chats in
-//!   the editor's tabs) are kept in `~/Library/Application Support/flux/claude-sessions.json`
+//! - The open sessions of a project ([`OpenSessions`]: the chats in the editor's tabs) are kept in `~/Library/Application Support/flux/claude-sessions.json`
 //!   (`FLUX_CLAUDE_SESSIONS_FILE`; in scenarios without it — neither read nor written), written
 //!   whenever they change ([`crate::claude::ClaudeStore::persist`]).
 
@@ -41,8 +40,6 @@ use crate::workspace::Workspace;
 
 /// How many sessions of one project come back after a restart at most.
 const MAX_OPEN: usize = 20;
-/// The Claude window without sessions lists this many recent ones.
-pub const RECENT_COUNT: usize = 5;
 
 /// The popup's own key context: ⌘⌫ deletes the selected session (in the query field too — the
 /// binding comes after the field's own ⌘⌫).
@@ -75,8 +72,7 @@ pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Wor
     open_at(workspace, None, window, cx)
 }
 
-/// The history popup at `anchor` (under the Claude window's History button), or centered under
-/// the title bar.
+/// The history popup at `anchor`, or centered under the title bar.
 pub fn open_at(
     workspace: &mut Workspace,
     anchor: Option<Point<Pixels>>,
@@ -119,9 +115,8 @@ fn open_ids(store: &Entity<ClaudeStore>, cx: &gpui::App) -> HashSet<String> {
         .collect()
 }
 
-/// A saved session chosen in the history or in the Claude window's recent list: back in a tab (an
-/// open one is brought into sight where it is); while `claude` isn't ready, the Claude window says
-/// why.
+/// A saved session chosen in the history: back in a tab (an open one is brought into sight where it
+/// is); while `claude` isn't ready, the console says why.
 pub fn resume(
     store: &Entity<ClaudeStore>,
     saved: &SavedSession,
@@ -522,27 +517,23 @@ fn civil(days: i64) -> (i64, u32, u32) {
 
 // --- The open sessions of a project, between launches ---
 
-/// Where a session's chat was.
+/// Where a session's chat was: an editor tab — the only place since the console took the Claude
+/// window's (part «Пульт Claude»); a pill of that window (`"panel"`) comes back as a tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionPlace {
-    /// A pill of the Claude window.
-    Panel,
-    /// A tab of the editor.
     Editor,
 }
 
 impl SessionPlace {
     fn key(self) -> &'static str {
         match self {
-            SessionPlace::Panel => "panel",
             SessionPlace::Editor => "editor",
         }
     }
 
     fn from_key(key: &str) -> Option<Self> {
         match key {
-            "panel" => Some(SessionPlace::Panel),
-            "editor" => Some(SessionPlace::Editor),
+            "panel" | "editor" => Some(SessionPlace::Editor),
             _ => None,
         }
     }
@@ -551,9 +542,9 @@ impl SessionPlace {
 /// The open sessions of a project, as they come back.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OpenSessions {
-    /// The Claude window's pills in their order, then the chats in the editor's tabs.
+    /// The chats in the editor's tabs, in their order.
     pub sessions: Vec<(String, SessionPlace)>,
-    /// The active pill of the Claude window.
+    /// The active one (a context coming back, part 10.3).
     pub active: Option<String>,
 }
 
@@ -594,9 +585,29 @@ fn store_path() -> Option<PathBuf> {
     )
 }
 
+fn console_path() -> Option<PathBuf> {
+    file_path_for(
+        "claude-console.json",
+        std::env::var_os("FLUX_CLAUDE_CONSOLE_FILE"),
+        std::env::var_os("FLUX_SCENARIO").is_some(),
+        std::env::var_os("HOME"),
+    )
+}
+
 /// Where the open sessions are kept: an explicit file, otherwise (outside a scenario) Application
 /// Support.
 fn store_path_for(
+    file: Option<OsString>,
+    scenario: bool,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    file_path_for("claude-sessions.json", file, scenario, home)
+}
+
+/// A file of Flux's own in Application Support (`name`), unless an explicit one is given; in
+/// scenarios without one — none.
+fn file_path_for(
+    name: &str,
     file: Option<OsString>,
     scenario: bool,
     home: Option<OsString>,
@@ -608,7 +619,7 @@ fn store_path_for(
         return None;
     }
     let home = PathBuf::from(home?);
-    Some(home.join("Library/Application Support/flux/claude-sessions.json"))
+    Some(home.join("Library/Application Support/flux").join(name))
 }
 
 fn read(file: &Path) -> BTreeMap<String, OpenSessions> {
@@ -676,6 +687,102 @@ fn serialize(projects: &BTreeMap<String, OpenSessions>) -> String {
     serde_json::to_string_pretty(&json!({ "projects": projects })).unwrap_or_default() + "\n"
 }
 
+// --- The console's sessions of a project (part «Пульт Claude») ---
+
+/// The console's sessions of a project between launches: "Now" (by CLI id, the latest first — the
+/// ones open in tabs come back through [`OpenSessions`], the rest unloaded) and the archive. Kept in
+/// `~/Library/Application Support/flux/claude-console.json` (`FLUX_CLAUDE_CONSOLE_FILE`; in scenarios
+/// without it — neither read nor written). A new file: an older Flux running alongside rewrites
+/// `claude-sessions.json` from its own struct.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConsoleState {
+    pub now: Vec<String>,
+    pub archived: Vec<String>,
+}
+
+/// How many sessions "Now" and the archive keep at most.
+const MAX_CONSOLE: usize = 200;
+
+pub fn load_console(root: &Path) -> ConsoleState {
+    console_path()
+        .map(|file| read_console(&file))
+        .and_then(|mut projects| projects.remove(&key(root)))
+        .unwrap_or_default()
+}
+
+/// Remembers the project's console (an empty one — the project is forgotten).
+pub fn save_console(root: &Path, state: &ConsoleState) {
+    let Some(file) = console_path() else {
+        return;
+    };
+    let mut projects = read_console(&file);
+    if state.now.is_empty() && state.archived.is_empty() {
+        projects.remove(&key(root));
+    } else {
+        projects.insert(key(root), state.clone());
+    }
+    if let Err(error) = write(&file, &serialize_console(&projects)) {
+        eprintln!("flux: {}: {error}", file.display());
+    }
+}
+
+fn read_console(file: &Path) -> BTreeMap<String, ConsoleState> {
+    match fs::read_to_string(file) {
+        Ok(text) => parse_console(&text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(error) => {
+            eprintln!("flux: {}: {error}", file.display());
+            BTreeMap::new()
+        }
+    }
+}
+
+/// `{"projects": {"/root": {"now": ["…"], "archived": ["…"]}}}`; anything else is skipped.
+fn parse_console(text: &str) -> BTreeMap<String, ConsoleState> {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return BTreeMap::new();
+    };
+    let Some(projects) = value["projects"].as_object() else {
+        return BTreeMap::new();
+    };
+    let ids = |value: &Value| {
+        let mut ids: Vec<String> = Vec::new();
+        for id in value.as_array().into_iter().flatten() {
+            if let Some(id) = id.as_str().filter(|id| !id.is_empty())
+                && !ids.iter().any(|known| known == id)
+            {
+                ids.push(id.to_string());
+            }
+        }
+        ids.truncate(MAX_CONSOLE);
+        ids
+    };
+    projects
+        .iter()
+        .map(|(root, project)| {
+            let archived = ids(&project["archived"]);
+            let now = ids(&project["now"])
+                .into_iter()
+                .filter(|id| !archived.contains(id))
+                .collect();
+            (root.clone(), ConsoleState { now, archived })
+        })
+        .filter(|(_, state)| !state.now.is_empty() || !state.archived.is_empty())
+        .collect()
+}
+
+fn serialize_console(projects: &BTreeMap<String, ConsoleState>) -> String {
+    let projects: serde_json::Map<String, Value> = projects
+        .iter()
+        .map(|(root, state)| {
+            let now: Vec<&String> = state.now.iter().take(MAX_CONSOLE).collect();
+            let archived: Vec<&String> = state.archived.iter().take(MAX_CONSOLE).collect();
+            (root.clone(), json!({ "now": now, "archived": archived }))
+        })
+        .collect();
+    serde_json::to_string_pretty(&json!({ "projects": projects })).unwrap_or_default() + "\n"
+}
+
 /// Through a temporary file next to the target and a `rename`: never half-written; the process id
 /// in its name keeps two Flux windows apart.
 fn write(file: &Path, text: &str) -> io::Result<()> {
@@ -714,9 +821,9 @@ mod tests {
         let mut projects = BTreeMap::new();
         let open = OpenSessions {
             sessions: vec![
-                ("a".into(), SessionPlace::Panel),
+                ("a".into(), SessionPlace::Editor),
                 ("b".into(), SessionPlace::Editor),
-                ("c".into(), SessionPlace::Panel),
+                ("c".into(), SessionPlace::Editor),
             ],
             active: Some("c".into()),
         };
@@ -747,12 +854,47 @@ mod tests {
         assert_eq!(
             projects.get("/a"),
             Some(&OpenSessions {
-                sessions: vec![("x".into(), SessionPlace::Panel)],
+                // The Claude window's pill comes back as a tab.
+                sessions: vec![("x".into(), SessionPlace::Editor)],
                 active: None,
             })
         );
         assert_eq!(projects.len(), 1);
         assert!(parse("not json").is_empty());
+    }
+
+    #[test]
+    fn the_console_round_trips_and_archived_ids_leave_now() {
+        // Its own folder: the other file test removes its own when done.
+        let dir = std::env::temp_dir().join(format!("flux-claude-console-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("claude-console.json");
+        let state = ConsoleState {
+            now: vec!["a".into(), "b".into()],
+            archived: vec!["c".into()],
+        };
+        let projects = BTreeMap::from([("/Users/me/app".to_string(), state)]);
+        write(&file, &serialize_console(&projects)).unwrap();
+        assert_eq!(read_console(&file), projects);
+        let text = r#"{"projects": {"/a": {"now": ["x", "", "y", "x", 5], "archived": ["y"]},
+            "/b": {"now": []}}}"#;
+        assert_eq!(
+            parse_console(text),
+            BTreeMap::from([(
+                "/a".to_string(),
+                ConsoleState {
+                    now: vec!["x".into()],
+                    archived: vec!["y".into()],
+                }
+            )])
+        );
+        assert_eq!(
+            file_path_for("claude-console.json", None, false, Some("/Users/me".into())),
+            Some(PathBuf::from(
+                "/Users/me/Library/Application Support/flux/claude-console.json"
+            ))
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! and "Plan with Claude" (plan mode, the request sent at once). The session gets the plugin's
 //! title; the attachments go with the first message (each in a tag named by its label, before the
 //! text — [`crate::claude_session::attachments_text`]). The chat opens where new sessions do, in
-//! the Claude window. The `claude` permission is checked by `flux-plugin`.
+//! an editor tab. The `claude` permission is checked by `flux-plugin`.
 
 use flux_claude::{PermissionMode, UserInput};
 use flux_plugin::api::claude::SessionSpec;
@@ -14,7 +14,7 @@ use crate::claude_session::{Attachment, SessionDraft, with_attachments};
 use crate::workspace::Workspace;
 
 /// Opens a new Claude session for a plugin. An error says why Claude can't take it (turned off,
-/// not installed, signed out); the Claude window then shows the user how to fix it.
+/// not installed, signed out); the Claude console then shows the user how to fix it.
 pub(crate) fn new_session(
     workspace: &mut Workspace,
     plugin: &str,
@@ -32,7 +32,7 @@ pub(crate) fn new_session(
         .update(cx, |store, cx| store.new_session_in_mode(mode, cx));
     let Some(session) = session else {
         let reason = not_ready(workspace.claude.read(cx).cli());
-        // The Claude window shows what's wrong and how to fix it (install, sign in).
+        // The console shows what's wrong and how to fix it (install, sign in).
         window.dispatch_action(Box::new(claude::NewSession), cx);
         return Err(reason.into());
     };

@@ -4,9 +4,9 @@
 //! tool windows (stage 8) come from the window's plugins and sit above Notifications: they live in
 //! the same island on the right.
 //!
-//! Claude's icon is a toggle of its own ([`ToggleClaude`]): Claude in sight — its window or a
-//! chat's tab — goes, otherwise it comes, whatever has the focus; ⌘Esc, which its tooltip shows,
-//! goes by the focus (part 10.1).
+//! Claude's icon is a toggle of its own ([`ToggleClaude`]): the console shows in the left island or,
+//! when shown, goes, whatever has the focus; ⌘Esc, which its tooltip shows, goes by the focus
+//! (part 10.1, «Пульт Claude»).
 
 use gpui::{Action, Context, IntoElement, actions, div, prelude::*, px};
 
@@ -22,7 +22,7 @@ use crate::{file_tree, git, notifications_panel, project_search, terminal_panel}
 actions!(
     launchpad,
     [
-        /// The Claude icon: shows Claude, or hides it when it is in sight, whatever has the focus
+        /// The Claude icon: shows the console, or hides it when shown, whatever has the focus
         /// (⌘Esc, `claude::ToggleClaude`, goes by the focus). Not in the command palette.
         ToggleClaude,
     ]
@@ -48,7 +48,7 @@ pub enum Tool {
     Terminal,
     /// The Git window (the log): the island under the editor, in place of the terminals.
     Git,
-    /// The Claude window: the island on the right (stage 9).
+    /// The Claude console: the left island, in place of the tree (part «Пульт Claude»).
     Claude,
     /// The Notifications window: the island on the right. At the bottom of the strip, apart from
     /// the tools of the left and the bottom.
@@ -57,12 +57,13 @@ pub enum Tool {
 
 impl Tool {
     /// The tools at the bottom of the strip, above Settings: the windows of the right island.
-    pub const BOTTOM: [Tool; 2] = [Tool::Claude, Tool::Notifications];
+    pub const BOTTOM: [Tool; 1] = [Tool::Notifications];
 
     /// Order in the strip, top to bottom.
-    pub const ALL: [Tool; 5] = [
+    pub const ALL: [Tool; 6] = [
         Tool::Project,
         Tool::Commit,
+        Tool::Claude,
         Tool::FindInFiles,
         Tool::Terminal,
         Tool::Git,
@@ -140,6 +141,7 @@ pub fn render(workspace: &Workspace, cx: &Context<Workspace>) -> impl IntoElemen
         .children(
             Tool::ALL
                 .into_iter()
+                .filter(|tool| workspace.tool_visible(*tool, cx))
                 .map(|tool| tool_button(workspace, tool, cx)),
         )
         // Settings: at the bottom of the strip, apart from the tools; above them, the windows of the

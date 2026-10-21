@@ -56,13 +56,15 @@ pub enum LeftIsland {
     #[default]
     Tree,
     Commit,
+    /// The Claude console (part «Пульт Claude»).
+    Claude,
     Hidden,
 }
 
-/// The tool window of the island on the right (plugins' windows aren't remembered).
+/// The tool window of the island on the right (plugins' windows aren't remembered). Claude's
+/// window was here until the console took the left island: an old `"claude"` loads as none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RightIsland {
-    Claude,
     Notifications,
 }
 
@@ -246,11 +248,11 @@ fn parse_project(value: &Value) -> Option<ProjectState> {
         .filter(|active| *active < tabs.len());
     let left = match value["left"].as_str() {
         Some("commit") => LeftIsland::Commit,
+        Some("claude") => LeftIsland::Claude,
         Some("hidden") => LeftIsland::Hidden,
         _ => LeftIsland::Tree,
     };
     let right = match value["right"].as_str() {
-        Some("claude") => Some(RightIsland::Claude),
         Some("notifications") => Some(RightIsland::Notifications),
         _ => None,
     };
@@ -300,10 +302,10 @@ fn project_json(state: &ProjectState, saved_at: u64) -> Value {
     let left = match state.left {
         LeftIsland::Tree => "tree",
         LeftIsland::Commit => "commit",
+        LeftIsland::Claude => "claude",
         LeftIsland::Hidden => "hidden",
     };
     let right = state.right.map(|right| match right {
-        RightIsland::Claude => "claude",
         RightIsland::Notifications => "notifications",
     });
     let bounds = state.bounds.map(|bounds| {
@@ -430,9 +432,9 @@ mod tests {
                 },
             ],
             active: Some(1),
-            left: LeftIsland::Commit,
+            left: LeftIsland::Claude,
             terminal: true,
-            right: Some(RightIsland::Claude),
+            right: Some(RightIsland::Notifications),
             bounds: Some(SavedBounds {
                 x: 120.,
                 y: 64.,
@@ -455,6 +457,14 @@ mod tests {
         put_project(&mut value, Path::new("/q"), &empty, 8);
         assert_eq!(parse_project(&value["projects"]["/q"]), Some(empty));
         assert_eq!(parse_project(&value["projects"]["/r"]), None);
+    }
+
+    #[test]
+    fn the_old_claude_window_on_the_right_loads_as_none() {
+        let value = json!({"left": "commit", "right": "claude"});
+        let state = parse_project(&value).unwrap();
+        assert_eq!(state.left, LeftIsland::Commit);
+        assert_eq!(state.right, None);
     }
 
     #[test]
