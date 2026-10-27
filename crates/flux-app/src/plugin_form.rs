@@ -528,32 +528,26 @@ impl FormDialog {
             Input::Text(input) => input.clone().into_any_element(),
             Input::Multiline(editor) => {
                 let focused = editor.focus_handle(cx).is_focused(window);
-                div()
+                let field = div()
                     .h(px(MULTILINE_HEIGHT))
                     .pl_1()
                     .pt_1()
                     .rounded(px(ui::RADIUS_MD))
                     .bg(ui.input_background)
                     .border_1()
-                    .border_color(if focused {
-                        ui.focus_border
-                    } else {
-                        ui.input_border
-                    })
-                    .when(focused, |field| field.shadow(ui::focus_ring(ui)))
                     // Tab goes to the next field rather than into the text.
                     .capture_action(cx.listener(|this, _: &editor::Tab, window, cx| {
                         cx.stop_propagation();
                         this.focus_next(&FocusNext, window, cx)
                     }))
-                    .child(editor.clone())
-                    .into_any_element()
+                    .child(editor.clone());
+                ui::focus_field(field, ("plugin-form-focus", index), focused, ui).into_any_element()
             }
             Input::Lines(input) => {
                 let focus = input.focus_handle(cx);
                 let focused = focus.is_focused(window);
                 let target = input.clone();
-                div()
+                let field = div()
                     .key_context("PluginFormLines")
                     .min_h(px(MULTILINE_HEIGHT))
                     .px_2p5()
@@ -561,20 +555,14 @@ impl FormDialog {
                     .rounded(px(ui::RADIUS_MD))
                     .bg(ui.input_background)
                     .border_1()
-                    .border_color(if focused {
-                        ui.focus_border
-                    } else {
-                        ui.input_border
-                    })
-                    .when(focused, |field| field.shadow(ui::focus_ring(ui)))
                     .cursor(CursorStyle::IBeam)
                     // A click anywhere in the box puts the caret into the field.
                     .on_mouse_down(MouseButton::Left, move |_, window, _| window.focus(&focus))
                     .on_action(move |_: &NewLine, _, cx| {
                         target.update(cx, |input, cx| input.insert("\n", cx))
                     })
-                    .child(input.clone())
-                    .into_any_element()
+                    .child(input.clone());
+                ui::focus_field(field, ("plugin-form-focus", index), focused, ui).into_any_element()
             }
             Input::Choice {
                 options,
@@ -596,10 +584,12 @@ impl FormDialog {
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.toggle(index, window, cx)
                     }))
-                    .child(
-                        ui::checkbox(("plugin-form-check", index), CheckState::from_bool(*on), ui)
-                            .when(focused, |check| check.shadow(ui::focus_ring(ui))),
-                    )
+                    .child(ui::focus_halo(
+                        ui::checkbox(("plugin-form-check", index), CheckState::from_bool(*on), ui),
+                        ("plugin-form-check-focus", index),
+                        focused,
+                        ui,
+                    ))
                     .child(field.label.clone())
                     .into_any_element()
             }
@@ -664,7 +654,7 @@ impl FormDialog {
             .map(|option| option.title.clone())
             .unwrap_or_default();
         let bounds = bounds.clone();
-        div()
+        let choice = div()
             .id(("plugin-form-choice", index))
             .key_context("PluginFormChoice")
             .track_focus(focus)
@@ -677,12 +667,6 @@ impl FormDialog {
             .rounded(px(ui::RADIUS_MD))
             .bg(ui.input_background)
             .border_1()
-            .border_color(if focused {
-                ui.focus_border
-            } else {
-                ui.input_border
-            })
-            .when(focused, |choice| choice.shadow(ui::focus_ring(ui)))
             .when(!focused, |choice| {
                 choice.hover(move |style| style.border_color(ui.elevated_border))
             })
@@ -696,8 +680,8 @@ impl FormDialog {
                 canvas(move |area, _, _| bounds.set(Some(area)), |_, _, _, _| {})
                     .absolute()
                     .size_full(),
-            )
-            .into_any_element()
+            );
+        ui::focus_field(choice, ("plugin-form-choice-focus", index), focused, ui).into_any_element()
     }
 }
 
@@ -814,10 +798,9 @@ impl Render for FormDialog {
                             })),
                     ),
             )
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|open| ContextMenu::overlay(&open.menu, open.position)),
-            )
+            .child(ContextMenu::slot(
+                "plugin-form-menu",
+                self.menu.as_ref().map(|open| (&open.menu, open.position)),
+            ))
     }
 }

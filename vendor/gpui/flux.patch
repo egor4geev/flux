@@ -1,6 +1,6 @@
 diff -ruN a/src/app.rs b/src/app.rs
 --- a/src/app.rs	2006-07-24 05:21:28
-+++ b/src/app.rs	2026-10-15 19:30:44
++++ b/src/app.rs	2026-10-15 10:51:59
 @@ -750,6 +750,32 @@
          self.platform.quit();
      }
@@ -36,7 +36,7 @@ diff -ruN a/src/app.rs b/src/app.rs
      pub fn refresh_windows(&mut self) {
 diff -ruN a/src/elements/animation.rs b/src/elements/animation.rs
 --- a/src/elements/animation.rs	2006-07-24 05:21:28
-+++ b/src/elements/animation.rs	2026-10-16 13:40:43
++++ b/src/elements/animation.rs	2026-10-16 14:48:32
 @@ -1,12 +1,54 @@
  use std::{
 +    cell::RefCell,
@@ -107,9 +107,412 @@ diff -ruN a/src/elements/animation.rs b/src/elements/animation.rs
              }
  
              ((element.request_layout(window, cx), element), state)
+diff -ruN a/src/elements/div.rs b/src/elements/div.rs
+--- a/src/elements/div.rs	2006-07-24 05:21:28
++++ b/src/elements/div.rs	2026-10-28 00:30:47
+@@ -25,20 +25,21 @@
+     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
+     size,
+ };
++use crate::{BackgroundTag, Fill, Hsla, Rgba};
+ use collections::HashMap;
+ use refineable::Refineable;
+ use smallvec::SmallVec;
+ use stacksafe::{StackSafe, stacksafe};
+ use std::{
+     any::{Any, TypeId},
+-    cell::RefCell,
++    cell::{Cell, RefCell},
+     cmp::Ordering,
+     fmt::Debug,
+     marker::PhantomData,
+     mem,
+     rc::Rc,
+     sync::Arc,
+-    time::Duration,
++    time::{Duration, Instant},
+ };
+ use util::ResultExt;
+ 
+@@ -48,6 +49,197 @@
+ const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
+ const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
+ 
++/// Flux patch (motion, 2026-10-28): how the hover and press styles of elements with an id fade in
++/// and out — their colors, opacity and scale; everything else switches at once, as before. An
++/// element without an id has nowhere to keep the fade and switches at once too.
++#[derive(Clone, Copy)]
++pub struct InteractionTransitions {
++    /// Into the hover style.
++    pub hover_in: Duration,
++    /// Back out of it.
++    pub hover_out: Duration,
++    /// Into the press (`active`) style: the feedback of a mouse down.
++    pub press_in: Duration,
++    /// Back out of it, after the mouse up.
++    pub press_out: Duration,
++    /// The easing of the hover fades and of pressing in.
++    pub easing: fn(f32) -> f32,
++    /// The easing of the release: may overshoot (a spring), for a scale that springs back.
++    pub release_easing: fn(f32) -> f32,
++}
++
++thread_local! {
++    static INTERACTION_TRANSITIONS: Cell<Option<InteractionTransitions>> = const { Cell::new(None) };
++}
++
++/// Flux patch (motion): sets how hover and press styles fade in every window; `None` (the
++/// default) switches them at once.
++pub fn set_interaction_transitions(transitions: Option<InteractionTransitions>) {
++    INTERACTION_TRANSITIONS.with(|cell| cell.set(transitions));
++}
++
++/// Flux patch (motion): the fade of one interaction state (hover or press) of an element.
++#[derive(Clone, Copy)]
++struct InteractionFade {
++    on: bool,
++    since: Instant,
++    /// Where the fade started: a fade reversed halfway starts from halfway.
++    from: f32,
++    /// Which styles the fade goes to: the group's, the element's own.
++    group: bool,
++    element: bool,
++}
++
++impl InteractionFade {
++    fn settled(on: bool, group: bool, element: bool) -> Self {
++        Self {
++            on,
++            since: Instant::now(),
++            from: if on { 1. } else { 0. },
++            group,
++            element,
++        }
++    }
++
++    fn progress(&self, now: Instant, duration: Duration, easing: fn(f32) -> f32) -> (f32, bool) {
++        let target = if self.on { 1. } else { 0. };
++        if duration.is_zero() || self.from == target {
++            return (target, true);
++        }
++        let t = now.saturating_duration_since(self.since).as_secs_f32() / duration.as_secs_f32();
++        if t >= 1. {
++            return (target, true);
++        }
++        (self.from + (target - self.from) * easing(t), false)
++    }
++
++    /// Follows the state of this frame; returns how far into its styles the element is and
++    /// whether that is still moving.
++    fn update(
++        &mut self,
++        on: bool,
++        group: bool,
++        element: bool,
++        now: Instant,
++        (duration_in, duration_out): (Duration, Duration),
++        (easing_in, easing_out): (fn(f32) -> f32, fn(f32) -> f32),
++    ) -> (f32, bool) {
++        let duration_of = |on: bool| if on { duration_in } else { duration_out };
++        let easing_of = |on: bool| if on { easing_in } else { easing_out };
++        if on != self.on {
++            let (current, _) = self.progress(now, duration_of(self.on), easing_of(self.on));
++            self.on = on;
++            self.since = now;
++            self.from = current.clamp(0., 1.);
++        }
++        if on {
++            self.group = group;
++            self.element = element;
++        }
++        let (progress, done) = self.progress(now, duration_of(on), easing_of(on));
++        (progress, !done)
++    }
++}
++
++/// Flux patch (motion): the fades of an element with an id.
++#[derive(Clone, Copy)]
++pub(crate) struct InteractionFades {
++    hover: InteractionFade,
++    press: InteractionFade,
++}
++
++/// Flux patch (motion): `from` and `to` mixed — straight alpha, so a transparent end fades the
++/// other color's alpha only, as CSS mixes premultiplied colors.
++fn mix_colors(from: Hsla, to: Hsla, t: f32) -> Hsla {
++    if t <= 0. {
++        return from;
++    }
++    if t >= 1. {
++        return to;
++    }
++    let (mut a, mut b) = (from.to_rgb(), to.to_rgb());
++    if a.a == 0. {
++        a = Rgba { a: 0., ..b };
++    } else if b.a == 0. {
++        b = Rgba { a: 0., ..a };
++    }
++    let alpha = (a.a + (b.a - a.a) * t).clamp(0., 1.);
++    let channel = |x: f32, y: f32| {
++        if alpha <= 0. {
++            x + (y - x) * t
++        } else {
++            ((x * a.a + (y * b.a - x * a.a) * t) / alpha).clamp(0., 1.)
++        }
++    };
++    Hsla::from(Rgba {
++        r: channel(a.r, b.r),
++        g: channel(a.g, b.g),
++        b: channel(a.b, b.b),
++        a: alpha,
++    })
++}
++
++/// Flux patch (motion): `to` moved back toward `from` by `1 - t` in what fades — the background
++/// (solid), the border and text colors, opacity and scale. `inherited` is the text color `None`
++/// stands for.
++fn mix_styles(from: &Style, to: &mut Style, t: f32, inherited: Hsla) {
++    if t >= 1. {
++        return;
++    }
++    let solid = |fill: &Option<Fill>| match fill {
++        Some(Fill::Color(background)) if background.tag == BackgroundTag::Solid => {
++            Some(background.solid)
++        }
++        Some(_) => None,
++        None => Some(Hsla::transparent_black()),
++    };
++    if from.background != to.background {
++        match (solid(&from.background), solid(&to.background)) {
++            (Some(a), Some(b)) => to.background = Some(Fill::from(mix_colors(a, b, t))),
++            _ => {
++                if t < 0.5 {
++                    to.background = from.background.clone();
++                }
++            }
++        }
++    }
++    if from.border_color != to.border_color {
++        to.border_color = Some(mix_colors(
++            from.border_color.unwrap_or_default(),
++            to.border_color.unwrap_or_default(),
++            t,
++        ));
++    }
++    if from.text.color != to.text.color {
++        to.text.color = Some(mix_colors(
++            from.text.color.unwrap_or(inherited),
++            to.text.color.unwrap_or(inherited),
++            t,
++        ));
++    }
++    if from.opacity != to.opacity {
++        let (a, b) = (from.opacity.unwrap_or(1.), to.opacity.unwrap_or(1.));
++        to.opacity = Some((a + (b - a) * t).clamp(0., 1.));
++    }
++    if from.transform_translate != to.transform_translate {
++        let (a, b) = (
++            from.transform_translate.unwrap_or_default(),
++            to.transform_translate.unwrap_or_default(),
++        );
++        to.transform_translate = Some(a + (b - a) * t);
++    }
++    if from.transform_scale != to.transform_scale {
++        let (a, b) = (
++            from.transform_scale.unwrap_or(1.),
++            to.transform_scale.unwrap_or(1.),
++        );
++        to.transform_scale = Some(a + (b - a) * t);
++        if to.transform_origin.is_none() {
++            to.transform_origin = from.transform_origin;
++        }
++    }
++}
++
+ /// The styling information for a given group.
+ pub struct GroupStyle {
+     /// The identifier for this group.
+@@ -1818,7 +2010,8 @@
+                     window.next_frame.tab_stops.insert(focus_handle);
+                 }
+ 
+-                window.with_element_opacity(style.opacity, |window| {
++                // Flux patch (motion): opacity, and the scale and move of `transform_*`.
++                window.with_style_paint_effects(&style, bounds, |window| {
+                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                         window.with_text_style(style.text_style().cloned(), |window| {
+                             window.with_content_mask(
+@@ -2473,7 +2666,7 @@
+     fn compute_style_internal(
+         &self,
+         hitbox: Option<&Hitbox>,
+-        element_state: Option<&mut InteractiveElementState>,
++        mut element_state: Option<&mut InteractiveElementState>,
+         window: &mut Window,
+         cx: &mut App,
+     ) -> Style {
+@@ -2494,20 +2687,74 @@
+             }
+         }
+ 
++        // Flux patch (motion): hover and press fade, when painting an element with an id.
++        let transitions = INTERACTION_TRANSITIONS.with(Cell::get).filter(|_| {
++            hitbox.is_some()
++                && element_state.is_some()
++                && (self.hover_style.is_some()
++                    || self.group_hover_style.is_some()
++                    || self.active_style.is_some()
++                    || self.group_active_style.is_some())
++        });
++        let now = Instant::now();
++        let mut animating = false;
++
+         if let Some(hitbox) = hitbox {
++            let mut group_hovered = false;
++            let mut hovered = false;
+             if !cx.has_active_drag() {
+-                if let Some(group_hover) = self.group_hover_style.as_ref()
+-                    && let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx)
+-                    && group_hitbox_id.is_hovered(window)
+-                {
+-                    style.refine(&group_hover.style);
+-                }
++                group_hovered = self.group_hover_style.as_ref().is_some_and(|group_hover| {
++                    GroupHitboxes::get(&group_hover.group, cx)
++                        .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window))
++                });
++                hovered = self.hover_style.is_some() && hitbox.is_hovered(window);
++            }
+ 
+-                if let Some(hover_style) = self.hover_style.as_ref()
+-                    && hitbox.is_hovered(window)
+-                {
+-                    style.refine(hover_style);
++            match (transitions, element_state.as_deref_mut()) {
++                (Some(transitions), Some(element_state)) => {
++                    let fades =
++                        element_state
++                            .interaction_fades
++                            .get_or_insert_with(|| InteractionFades {
++                                hover: InteractionFade::settled(
++                                    group_hovered || hovered,
++                                    group_hovered,
++                                    hovered,
++                                ),
++                                press: InteractionFade::settled(false, false, false),
++                            });
++                    let (progress, moving) = fades.hover.update(
++                        group_hovered || hovered,
++                        group_hovered,
++                        hovered,
++                        now,
++                        (transitions.hover_in, transitions.hover_out),
++                        (transitions.easing, transitions.easing),
++                    );
++                    animating |= moving;
++                    let (group, element) = (fades.hover.group, fades.hover.element);
++                    if progress > 0. {
++                        let from = (progress < 1.).then(|| style.clone());
++                        if group && let Some(group_hover) = self.group_hover_style.as_ref() {
++                            style.refine(&group_hover.style);
++                        }
++                        if element && let Some(hover_style) = self.hover_style.as_ref() {
++                            style.refine(hover_style);
++                        }
++                        if let Some(from) = from {
++                            let inherited = window.text_style().color;
++                            mix_styles(&from, &mut style, progress, inherited);
++                        }
++                    }
+                 }
++                _ => {
++                    if group_hovered && let Some(group_hover) = self.group_hover_style.as_ref() {
++                        style.refine(&group_hover.style);
++                    }
++                    if hovered && let Some(hover_style) = self.hover_style.as_ref() {
++                        style.refine(hover_style);
++                    }
++                }
+             }
+ 
+             if let Some(drag) = cx.active_drag.take() {
+@@ -2541,23 +2788,54 @@
+         }
+ 
+         if let Some(element_state) = element_state {
+-            let clicked_state = element_state
++            let clicked_state = *element_state
+                 .clicked_state
+                 .get_or_insert_with(Default::default)
+                 .borrow();
+-            if clicked_state.group
+-                && let Some(group) = self.group_active_style.as_ref()
+-            {
+-                style.refine(&group.style)
+-            }
++            let group_pressed = clicked_state.group && self.group_active_style.is_some();
++            let pressed = clicked_state.element && self.active_style.is_some();
+ 
+-            if let Some(active_style) = self.active_style.as_ref()
+-                && clicked_state.element
+-            {
+-                style.refine(active_style)
++            match (transitions, element_state.interaction_fades.as_mut()) {
++                (Some(transitions), Some(fades)) => {
++                    let (progress, moving) = fades.press.update(
++                        group_pressed || pressed,
++                        group_pressed,
++                        pressed,
++                        now,
++                        (transitions.press_in, transitions.press_out),
++                        (transitions.easing, transitions.release_easing),
++                    );
++                    animating |= moving;
++                    let (group, element) = (fades.press.group, fades.press.element);
++                    if progress != 0. {
++                        let from = (progress != 1.).then(|| style.clone());
++                        if group && let Some(group) = self.group_active_style.as_ref() {
++                            style.refine(&group.style)
++                        }
++                        if element && let Some(active_style) = self.active_style.as_ref() {
++                            style.refine(active_style)
++                        }
++                        if let Some(from) = from {
++                            let inherited = window.text_style().color;
++                            mix_styles(&from, &mut style, progress, inherited);
++                        }
++                    }
++                }
++                _ => {
++                    if group_pressed && let Some(group) = self.group_active_style.as_ref() {
++                        style.refine(&group.style)
++                    }
++                    if pressed && let Some(active_style) = self.active_style.as_ref() {
++                        style.refine(active_style)
++                    }
++                }
+             }
+         }
+ 
++        if animating {
++            window.request_animation_frame();
++        }
++
+         style
+     }
+ }
+@@ -2572,6 +2850,8 @@
+     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
+     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
++    /// Flux patch (motion): the hover and press fades.
++    pub(crate) interaction_fades: Option<InteractionFades>,
+ }
+ 
+ /// Whether or not the element or a group that contains it is clicked by the mouse.
 diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
 --- a/src/platform/mac/metal_renderer.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/metal_renderer.rs	2026-10-15 19:30:44
++++ b/src/platform/mac/metal_renderer.rs	2026-10-15 03:41:33
 @@ -370,8 +370,12 @@
          loop {
              let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
@@ -240,7 +643,7 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
  
 diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
 --- a/src/platform/mac/platform.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/platform.rs	2026-10-15 19:30:44
++++ b/src/platform/mac/platform.rs	2026-10-15 10:51:59
 @@ -98,7 +98,12 @@
                  sel!(applicationWillTerminate:),
                  will_terminate as extern "C" fn(&mut Object, Sel, id),
@@ -430,7 +833,7 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
  
 diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
 --- a/src/platform/mac/window.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/window.rs	2026-10-15 19:30:44
++++ b/src/platform/mac/window.rs	2026-10-15 04:00:04
 @@ -455,6 +455,12 @@
                          - traffic_light_position.y
                          - px(close_button_frame.size.height as f32),
@@ -471,7 +874,7 @@ diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
      fn titlebar_double_click(&self) {
 diff -ruN a/src/platform.rs b/src/platform.rs
 --- a/src/platform.rs	2006-07-24 05:21:28
-+++ b/src/platform.rs	2026-10-15 19:30:44
++++ b/src/platform.rs	2026-10-15 10:51:59
 @@ -230,6 +230,15 @@
  
      fn on_quit(&self, callback: Box<dyn FnMut()>);
@@ -535,9 +938,73 @@ diff -ruN a/src/platform.rs b/src/platform.rs
              .ok()
              .flatten()
      }
+diff -ruN a/src/style.rs b/src/style.rs
+--- a/src/style.rs	2006-07-24 05:21:28
++++ b/src/style.rs	2026-10-28 00:20:40
+@@ -260,6 +260,19 @@
+     /// The opacity of this element
+     pub opacity: Option<f32>,
+ 
++    /// Flux patch (motion, 2026-10-28): scales what this element and its children paint by this
++    /// factor around [`Style::transform_origin`] — a popover growing out of the point it came
++    /// from, a button pressed in. Layout and hit testing keep the unscaled bounds.
++    pub transform_scale: Option<f32>,
++
++    /// Flux patch (motion): the point [`Style::transform_scale`] scales around, as fractions of
++    /// the element's width and height (the middle, `(0.5, 0.5)`, when unset).
++    pub transform_origin: Option<Point<f32>>,
++
++    /// Flux patch (motion): moves what this element and its children paint by this much, after
++    /// the scale — a card sliding in. Layout and hit testing keep the unmoved bounds.
++    pub transform_translate: Option<Point<Pixels>>,
++
+     /// The grid columns of this element
+     /// Equivalent to the Tailwind `grid-cols-<number>`
+     pub grid_cols: Option<u16>,
+@@ -769,6 +782,9 @@
+             text: TextStyleRefinement::default(),
+             mouse_cursor: None,
+             opacity: None,
++            transform_scale: None,
++            transform_origin: None,
++            transform_translate: None,
+             grid_rows: None,
+             grid_cols: None,
+             grid_location: None,
+diff -ruN a/src/styled.rs b/src/styled.rs
+--- a/src/styled.rs	2006-07-24 05:21:28
++++ b/src/styled.rs	2026-10-28 00:20:40
+@@ -654,6 +654,27 @@
+         self
+     }
+ 
++    /// Flux patch (motion, 2026-10-28): scales what this element and its children paint, around
++    /// the middle or [`Styled::transform_origin`]. Layout and hit testing don't change.
++    fn transform_scale(mut self, scale: f32) -> Self {
++        self.style().transform_scale = Some(scale);
++        self
++    }
++
++    /// Flux patch (motion): the point [`Styled::transform_scale`] scales around, as fractions of
++    /// the element's size: `(0., 0.)` is the top left corner, `(0.5, 1.)` the middle of the bottom.
++    fn transform_origin(mut self, x: f32, y: f32) -> Self {
++        self.style().transform_origin = Some(crate::Point { x, y });
++        self
++    }
++
++    /// Flux patch (motion): moves what this element and its children paint, after
++    /// [`Styled::transform_scale`]. Layout and hit testing don't change.
++    fn transform_translate(mut self, x: crate::Pixels, y: crate::Pixels) -> Self {
++        self.style().transform_translate = Some(crate::Point { x, y });
++        self
++    }
++
+     /// Sets the grid columns of this element.
+     fn grid_cols(mut self, cols: u16) -> Self {
+         self.style().grid_cols = Some(cols);
 diff -ruN a/src/taffy.rs b/src/taffy.rs
 --- a/src/taffy.rs	2006-07-24 05:21:28
-+++ b/src/taffy.rs	2026-10-15 19:30:44
++++ b/src/taffy.rs	2026-10-15 03:27:31
 @@ -309,7 +309,7 @@
              unit: &Option<u16>,
          ) -> Vec<taffy::GridTemplateComponent<T>> {
@@ -549,7 +1016,7 @@ diff -ruN a/src/taffy.rs b/src/taffy.rs
  
 diff -ruN a/src/window.rs b/src/window.rs
 --- a/src/window.rs	2006-07-24 05:21:28
-+++ b/src/window.rs	2026-10-16 12:53:36
++++ b/src/window.rs	2026-10-28 00:30:47
 @@ -7,11 +7,12 @@
      DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
      FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
@@ -612,7 +1079,35 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub fn set_phase(&self, phase: DrawPhase) {
          self.inner.borrow_mut().draw_phase = phase
      }
-@@ -856,13 +871,16 @@
+@@ -815,6 +830,16 @@
+     }
+ }
+ 
++/// Flux patch (motion, 2026-10-28): a uniform scale of what elements paint, `p' = p · scale +
++/// offset` in window pixels (`Window::with_element_scale`).
++#[derive(Clone, Debug)]
++struct ElementTransform {
++    scale: f32,
++    offset: Point<Pixels>,
++    /// The content mask in effect where the scale began, in the window's space.
++    outer_mask: ContentMask<Pixels>,
++}
++
+ /// Holds the state for a specific window.
+ pub struct Window {
+     pub(crate) handle: AnyWindowHandle,
+@@ -838,6 +863,10 @@
+     pub(crate) rendered_entity_stack: Vec<EntityId>,
+     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
+     pub(crate) element_opacity: f32,
++    /// Flux patch (motion): the scale of what elements paint (`with_element_scale`).
++    element_transform: Option<ElementTransform>,
++    /// Flux patch (motion): how many `with_inert` are around the element being prepainted.
++    inert_depth: usize,
+     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
+     pub(crate) image_cache_stack: Vec<AnyImageCache>,
+@@ -856,13 +885,16 @@
      modifiers: Modifiers,
      capslock: Capslock,
      scale_factor: f32,
@@ -630,7 +1125,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub(crate) refreshing: bool,
      pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
      pub(crate) focus: Option<FocusId>,
-@@ -882,6 +900,51 @@
+@@ -882,6 +914,51 @@
      saw_keystroke: bool,
  }
  
@@ -682,7 +1177,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub(crate) enum DrawPhase {
      None,
-@@ -991,7 +1054,7 @@
+@@ -991,7 +1068,7 @@
          let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
          let needs_present = Rc::new(Cell::new(false));
          let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
@@ -691,7 +1186,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
          platform_window
              .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
-@@ -1021,7 +1084,7 @@
+@@ -1021,7 +1098,7 @@
              let active = active.clone();
              let needs_present = needs_present.clone();
              let next_frame_callbacks = next_frame_callbacks.clone();
@@ -700,7 +1195,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              move |request_frame_options| {
                  let next_frame_callbacks = next_frame_callbacks.take();
                  if !next_frame_callbacks.is_empty() {
-@@ -1034,12 +1097,12 @@
+@@ -1034,12 +1111,12 @@
                          .log_err();
                  }
  
@@ -717,7 +1212,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
                  if invalidator.is_dirty() || request_frame_options.force_render {
                      measure("frame duration", || {
-@@ -1125,7 +1188,12 @@
+@@ -1125,7 +1202,12 @@
              let mut cx = cx.to_async();
              Box::new(move |event| {
                  handle
@@ -731,7 +1226,16 @@ diff -ruN a/src/window.rs b/src/window.rs
                      .log_err()
                      .unwrap_or(DispatchEventResult::default())
              })
-@@ -1239,13 +1307,14 @@
+@@ -1223,6 +1305,8 @@
+             element_offset_stack: Vec::new(),
+             content_mask_stack: Vec::new(),
+             element_opacity: 1.0,
++            element_transform: None,
++            inert_depth: 0,
+             requested_autoscroll: None,
+             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+@@ -1239,13 +1323,14 @@
              modifiers,
              capslock,
              scale_factor,
@@ -747,7 +1251,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              refreshing: false,
              activation_observers: SubscriberSet::new(),
              focus: None,
-@@ -1673,8 +1742,10 @@
+@@ -1673,8 +1758,10 @@
      }
  
      fn bounds_changed(&mut self, cx: &mut App) {
@@ -760,7 +1264,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          self.display_id = self.platform_window.display().map(|display| display.id());
  
          self.refresh();
-@@ -1691,7 +1762,9 @@
+@@ -1691,7 +1778,9 @@
  
      /// Set the content size of the window.
      pub fn resize(&mut self, size: Size<Pixels>) {
@@ -771,7 +1275,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Returns whether or not the window is currently fullscreen
-@@ -1744,7 +1817,9 @@
+@@ -1744,7 +1833,9 @@
  
      /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
      pub fn show_window_menu(&self, position: Point<Pixels>) {
@@ -782,7 +1286,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Tells the compositor to take control of window movement (Wayland and X11)
-@@ -1816,6 +1891,41 @@
+@@ -1816,6 +1907,41 @@
          self.scale_factor
      }
  
@@ -824,7 +1328,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// The size of an em for the base font of the application. Adjusting this value allows the
      /// UI to scale, just like zooming a web page.
      pub fn rem_size(&self) -> Pixels {
-@@ -2010,6 +2120,29 @@
+@@ -2010,6 +2136,29 @@
          profiling::finish_frame!();
      }
  
@@ -854,7 +1358,416 @@ diff -ruN a/src/window.rs b/src/window.rs
      fn draw_roots(&mut self, cx: &mut App) {
          self.invalidator.set_phase(DrawPhase::Prepaint);
          self.tooltip_bounds.take();
-@@ -3579,7 +3712,8 @@
+@@ -2448,6 +2597,166 @@
+         result
+     }
+ 
++    /// Flux patch (motion, 2026-10-28): paints what `f` paints scaled by `scale` around `origin`
++    /// (window pixels) — on top of any scale already in effect. Layout, hitboxes and the mouse
++    /// don't see it: an animation that grows a popover out of its anchor or presses a button in
++    /// keeps everything clickable where the layout put it. Content masks pushed inside are scaled
++    /// with the content; the mask in effect here clips in the window's space, as CSS clips a
++    /// transformed element by its ancestors.
++    pub fn with_element_scale<R>(
++        &mut self,
++        scale: Option<f32>,
++        origin: Point<Pixels>,
++        f: impl FnOnce(&mut Self) -> R,
++    ) -> R {
++        self.with_element_transform(scale, origin, None, f)
++    }
++
++    /// Flux patch (motion): [`Self::with_element_scale`], then a move by `translate` — a card
++    /// sliding in, painted where it will be clickable a moment later.
++    pub fn with_element_transform<R>(
++        &mut self,
++        scale: Option<f32>,
++        origin: Point<Pixels>,
++        translate: Option<Point<Pixels>>,
++        f: impl FnOnce(&mut Self) -> R,
++    ) -> R {
++        self.invalidator.debug_assert_paint_or_prepaint();
++
++        let scale = scale
++            .filter(|scale| (scale - 1.).abs() > f32::EPSILON)
++            .map(|scale| scale.max(0.));
++        let translate = translate.filter(|translate| !translate.is_zero());
++        if scale.is_none() && translate.is_none() {
++            return f(self);
++        }
++        let scale = scale.unwrap_or(1.);
++        let translate = translate.unwrap_or_default();
++        let previous = self.element_transform.clone();
++        let outer_mask = self.transformed_content_mask();
++        let (outer_scale, outer_offset) = previous
++            .as_ref()
++            .map_or((1., Point::default()), |outer| (outer.scale, outer.offset));
++        self.element_transform = Some(ElementTransform {
++            scale: outer_scale * scale,
++            offset: outer_offset + (origin * (1. - scale) + translate) * outer_scale,
++            outer_mask,
++        });
++        let result = f(self);
++        self.element_transform = previous;
++        result
++    }
++
++    /// Flux patch (motion, 2026-10-28): what `f` prepaints takes no mouse — hover, clicks, the
++    /// wheel and tooltips go to whatever lies beneath. For a popover fading out after it closed:
++    /// still drawn, no longer there.
++    pub fn with_inert<R>(&mut self, inert: bool, f: impl FnOnce(&mut Self) -> R) -> R {
++        if !inert {
++            return f(self);
++        }
++        self.inert_depth += 1;
++        let result = f(self);
++        self.inert_depth -= 1;
++        result
++    }
++
++    /// Flux patch (motion): the paint effects of an element's style — its transform (scale
++    /// around its origin point, then the move) around its opacity.
++    pub(crate) fn with_style_paint_effects<R>(
++        &mut self,
++        style: &Style,
++        bounds: Bounds<Pixels>,
++        f: impl FnOnce(&mut Self) -> R,
++    ) -> R {
++        let origin = style.transform_origin.unwrap_or(point(0.5, 0.5));
++        let origin = point(
++            bounds.origin.x + bounds.size.width * origin.x,
++            bounds.origin.y + bounds.size.height * origin.y,
++        );
++        self.with_element_transform(
++            style.transform_scale,
++            origin,
++            style.transform_translate,
++            |window| window.with_element_opacity(style.opacity, f),
++        )
++    }
++
++    /// Flux patch (motion): `bounds` where the scale in effect puts them.
++    fn transform_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
++        match &self.element_transform {
++            Some(transform) => Bounds {
++                origin: bounds.origin * transform.scale + transform.offset,
++                size: size(
++                    bounds.size.width * transform.scale,
++                    bounds.size.height * transform.scale,
++                ),
++            },
++            None => bounds,
++        }
++    }
++
++    /// Flux patch (motion): device pixel `bounds` where the scale in effect puts them.
++    fn transform_scaled_bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
++        match &self.element_transform {
++            Some(transform) => {
++                let offset = transform.offset.scale(self.scale_factor());
++                Bounds {
++                    origin: point(
++                        bounds.origin.x * transform.scale + offset.x,
++                        bounds.origin.y * transform.scale + offset.y,
++                    ),
++                    size: size(
++                        bounds.size.width * transform.scale,
++                        bounds.size.height * transform.scale,
++                    ),
++                }
++            }
++            None => bounds,
++        }
++    }
++
++    /// Flux patch (motion): a length (corner radius, border, blur) under the scale in effect.
++    fn transform_length(&self, length: Pixels) -> Pixels {
++        self.element_transform
++            .as_ref()
++            .map_or(length, |transform| length * transform.scale)
++    }
++
++    /// Flux patch (motion): a sprite's own transformation (a rotated SVG) moved into the scaled
++    /// space: `T' = A ∘ T ∘ A⁻¹`, with `A` the scale in effect in device pixels.
++    fn transform_sprite_matrix(&self, matrix: TransformationMatrix) -> TransformationMatrix {
++        let Some(transform) = &self.element_transform else {
++            return matrix;
++        };
++        if matrix == TransformationMatrix::unit() {
++            return matrix;
++        }
++        let offset = transform.offset.scale(self.scale_factor());
++        let (ox, oy) = (offset.x.0, offset.y.0);
++        let r = matrix.rotation_scale;
++        TransformationMatrix {
++            rotation_scale: r,
++            translation: [
++                transform.scale * matrix.translation[0] + ox - (r[0][0] * ox + r[0][1] * oy),
++                transform.scale * matrix.translation[1] + oy - (r[1][0] * ox + r[1][1] * oy),
++            ],
++        }
++    }
++
++    /// Flux patch (motion): the content mask for a primitive painted now — the current mask
++    /// scaled with the content, clipped by the mask in effect where the scale began.
++    fn transformed_content_mask(&self) -> ContentMask<Pixels> {
++        let mask = self.content_mask();
++        match &self.element_transform {
++            Some(transform) => ContentMask {
++                bounds: self
++                    .transform_bounds(mask.bounds)
++                    .intersect(&transform.outer_mask.bounds),
++            },
++            None => mask,
++        }
++    }
++
+     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
+     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
+     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
+@@ -2783,8 +3092,10 @@
+         self.invalidator.debug_assert_paint();
+ 
+         let scale_factor = self.scale_factor();
+-        let content_mask = self.content_mask();
+-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
++        let content_mask = self.transformed_content_mask();
++        let clipped_bounds = self
++            .transform_bounds(bounds)
++            .intersect(&content_mask.bounds);
+         if !clipped_bounds.is_empty() {
+             self.next_frame
+                 .scene
+@@ -2812,13 +3123,17 @@
+         self.invalidator.debug_assert_paint();
+ 
+         let scale_factor = self.scale_factor();
+-        let content_mask = self.content_mask();
++        let content_mask = self.transformed_content_mask();
+         let opacity = self.element_opacity();
++        let corner_radii = corner_radii.map(|radius| self.transform_length(*radius));
+         for shadow in shadows {
+-            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
++            let shadow_bounds =
++                self.transform_bounds((bounds + shadow.offset).dilate(shadow.spread_radius));
+             self.next_frame.scene.insert_primitive(Shadow {
+                 order: 0,
+-                blur_radius: shadow.blur_radius.scale(scale_factor),
++                blur_radius: self
++                    .transform_length(shadow.blur_radius)
++                    .scale(scale_factor),
+                 bounds: shadow_bounds.scale(scale_factor),
+                 content_mask: content_mask.scale(scale_factor),
+                 corner_radii: corner_radii.scale(scale_factor),
+@@ -2840,16 +3155,22 @@
+         self.invalidator.debug_assert_paint();
+ 
+         let scale_factor = self.scale_factor();
+-        let content_mask = self.content_mask();
++        let content_mask = self.transformed_content_mask();
+         let opacity = self.element_opacity();
++        let corner_radii = quad
++            .corner_radii
++            .map(|radius| self.transform_length(*radius));
++        let border_widths = quad
++            .border_widths
++            .map(|width| self.transform_length(*width));
+         self.next_frame.scene.insert_primitive(Quad {
+             order: 0,
+-            bounds: quad.bounds.scale(scale_factor),
++            bounds: self.transform_bounds(quad.bounds).scale(scale_factor),
+             content_mask: content_mask.scale(scale_factor),
+             background: quad.background.opacity(opacity),
+             border_color: quad.border_color.opacity(opacity),
+-            corner_radii: quad.corner_radii.scale(scale_factor),
+-            border_widths: quad.border_widths.scale(scale_factor),
++            corner_radii: corner_radii.scale(scale_factor),
++            border_widths: border_widths.scale(scale_factor),
+             border_style: quad.border_style,
+         });
+     }
+@@ -2861,9 +3182,20 @@
+         self.invalidator.debug_assert_paint();
+ 
+         let scale_factor = self.scale_factor();
+-        let content_mask = self.content_mask();
++        let content_mask = self.transformed_content_mask();
+         let opacity = self.element_opacity();
+         path.content_mask = content_mask;
++        if self.element_transform.is_some() {
++            path.bounds = self.transform_bounds(path.bounds);
++            for vertex in &mut path.vertices {
++                vertex.xy_position = self
++                    .transform_bounds(Bounds {
++                        origin: vertex.xy_position,
++                        size: Size::default(),
++                    })
++                    .origin;
++            }
++        }
+         let color: Background = color.into();
+         path.color = color.opacity(opacity);
+         self.next_frame
+@@ -2888,11 +3220,11 @@
+         } else {
+             style.thickness
+         };
+-        let bounds = Bounds {
++        let bounds = self.transform_bounds(Bounds {
+             origin,
+             size: size(width, height),
+-        };
+-        let content_mask = self.content_mask();
++        });
++        let content_mask = self.transformed_content_mask();
+         let element_opacity = self.element_opacity();
+ 
+         self.next_frame.scene.insert_primitive(Underline {
+@@ -2901,7 +3233,7 @@
+             bounds: bounds.scale(scale_factor),
+             content_mask: content_mask.scale(scale_factor),
+             color: style.color.unwrap_or_default().opacity(element_opacity),
+-            thickness: style.thickness.scale(scale_factor),
++            thickness: self.transform_length(style.thickness).scale(scale_factor),
+             wavy: if style.wavy { 1 } else { 0 },
+         });
+     }
+@@ -2919,11 +3251,11 @@
+ 
+         let scale_factor = self.scale_factor();
+         let height = style.thickness;
+-        let bounds = Bounds {
++        let bounds = self.transform_bounds(Bounds {
+             origin,
+             size: size(width, height),
+-        };
+-        let content_mask = self.content_mask();
++        });
++        let content_mask = self.transformed_content_mask();
+         let opacity = self.element_opacity();
+ 
+         self.next_frame.scene.insert_primitive(Underline {
+@@ -2931,7 +3263,7 @@
+             pad: 0,
+             bounds: bounds.scale(scale_factor),
+             content_mask: content_mask.scale(scale_factor),
+-            thickness: style.thickness.scale(scale_factor),
++            thickness: self.transform_length(style.thickness).scale(scale_factor),
+             color: style.color.unwrap_or_default().opacity(opacity),
+             wavy: 0,
+         });
+@@ -2981,11 +3313,11 @@
+                     Ok(Some((size, Cow::Owned(bytes))))
+                 })?
+                 .expect("Callback above only errors or returns Some");
+-            let bounds = Bounds {
++            let bounds = self.transform_scaled_bounds(Bounds {
+                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
+                 size: tile.bounds.size.map(Into::into),
+-            };
+-            let content_mask = self.content_mask().scale(scale_factor);
++            });
++            let content_mask = self.transformed_content_mask().scale(scale_factor);
+             self.next_frame.scene.insert_primitive(MonochromeSprite {
+                 order: 0,
+                 pad: 0,
+@@ -3038,11 +3370,11 @@
+                 })?
+                 .expect("Callback above only errors or returns Some");
+ 
+-            let bounds = Bounds {
++            let bounds = self.transform_scaled_bounds(Bounds {
+                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
+                 size: tile.bounds.size.map(Into::into),
+-            };
+-            let content_mask = self.content_mask().scale(scale_factor);
++            });
++            let content_mask = self.transformed_content_mask().scale(scale_factor);
+             let opacity = self.element_opacity();
+ 
+             self.next_frame.scene.insert_primitive(PolychromeSprite {
+@@ -3094,7 +3426,7 @@
+         else {
+             return Ok(());
+         };
+-        let content_mask = self.content_mask().scale(scale_factor);
++        let content_mask = self.transformed_content_mask().scale(scale_factor);
+         let svg_bounds = Bounds {
+             origin: bounds.center()
+                 - Point::new(
+@@ -3110,13 +3442,15 @@
+         self.next_frame.scene.insert_primitive(MonochromeSprite {
+             order: 0,
+             pad: 0,
+-            bounds: svg_bounds
+-                .map_origin(|origin| origin.round())
+-                .map_size(|size| size.ceil()),
++            bounds: self.transform_scaled_bounds(
++                svg_bounds
++                    .map_origin(|origin| origin.round())
++                    .map_size(|size| size.ceil()),
++            ),
+             content_mask,
+             color: color.opacity(element_opacity),
+             tile,
+-            transformation,
++            transformation: self.transform_sprite_matrix(transformation),
+         });
+ 
+         Ok(())
+@@ -3155,17 +3489,21 @@
+                 )))
+             })?
+             .expect("Callback above only returns Some");
+-        let content_mask = self.content_mask().scale(scale_factor);
+-        let corner_radii = corner_radii.scale(scale_factor);
++        let content_mask = self.transformed_content_mask().scale(scale_factor);
++        let corner_radii = corner_radii
++            .map(|radius| self.transform_length(*radius))
++            .scale(scale_factor);
+         let opacity = self.element_opacity();
+ 
+         self.next_frame.scene.insert_primitive(PolychromeSprite {
+             order: 0,
+             pad: 0,
+             grayscale,
+-            bounds: bounds
+-                .map_origin(|origin| origin.floor())
+-                .map_size(|size| size.ceil()),
++            bounds: self.transform_scaled_bounds(
++                bounds
++                    .map_origin(|origin| origin.floor())
++                    .map_size(|size| size.ceil()),
++            ),
+             content_mask,
+             corner_radii,
+             tile,
+@@ -3184,8 +3522,8 @@
+         self.invalidator.debug_assert_paint();
+ 
+         let scale_factor = self.scale_factor();
+-        let bounds = bounds.scale(scale_factor);
+-        let content_mask = self.content_mask().scale(scale_factor);
++        let bounds = self.transform_bounds(bounds).scale(scale_factor);
++        let content_mask = self.transformed_content_mask().scale(scale_factor);
+         self.next_frame.scene.insert_primitive(PaintSurface {
+             order: 0,
+             bounds,
+@@ -3305,7 +3643,12 @@
+     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
+         self.invalidator.debug_assert_prepaint();
+ 
+-        let content_mask = self.content_mask();
++        let mut content_mask = self.content_mask();
++        // Flux patch (motion): inside `with_inert` the mouse finds nothing — an empty mask, the
++        // bounds kept for whoever measures with them.
++        if self.inert_depth > 0 {
++            content_mask.bounds.size = Size::default();
++        }
+         let mut id = self.next_hitbox_id;
+         self.next_hitbox_id = self.next_hitbox_id.next();
+         let hitbox = Hitbox {
+@@ -3579,7 +3922,8 @@
      /// Dispatch a mouse or keyboard event on the window.
      #[profiling::function]
      pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
@@ -864,7 +1777,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          // Handlers may set this to false by calling `stop_propagation`.
          cx.propagate_event = true;
          // Handlers may set this to true by calling `prevent_default`.
-@@ -3668,6 +3802,10 @@
+@@ -3668,6 +4012,10 @@
              self.dispatch_key_event(any_key_event, cx);
          }
  
@@ -875,7 +1788,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          DispatchEventResult {
              propagate: cx.propagate_event,
              default_prevented: self.default_prevented,
-@@ -4128,7 +4266,10 @@
+@@ -4128,7 +4476,10 @@
          self.on_next_frame(|window, cx| {
              if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                  if let Some(bounds) = input_handler.selected_bounds(window, cx) {
@@ -887,7 +1800,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  }
                  window.platform_window.set_input_handler(input_handler);
              }
-@@ -5099,5 +5240,76 @@
+@@ -5099,5 +5450,76 @@
          border_widths: (1.).into(),
          border_color: border_color.into(),
          border_style,

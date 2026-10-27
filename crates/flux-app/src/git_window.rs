@@ -656,10 +656,9 @@ impl Render for GitWindow {
                 ui::resize_handle_center(ui::style(cx)),
                 ui,
             ))
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "git-window-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }

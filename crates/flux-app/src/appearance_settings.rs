@@ -13,8 +13,10 @@
 //! - **File Icons**: a row per set with a few of its icons; a click puts it in use.
 //! - **Language**: the interface language, at once ([`set_language`]).
 
+use std::rc::Rc;
+
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, FocusHandle, Focusable, FontWeight, Hsla,
+    AnyElement, App, ClickEvent, Context, Div, ElementId, FocusHandle, Focusable, FontWeight, Hsla,
     IntoElement, Render, SharedString, Stateful, Subscription, Window, div, prelude::*, px,
 };
 
@@ -22,6 +24,7 @@ use crate::contributions::Contributions;
 use crate::i18n::{self, Lang, tr, trf};
 use crate::icon_themes::{self, IconThemeInfo};
 use crate::icons::{FileIcon, IconName, icon};
+use crate::motion::{self, TransitionExt};
 use crate::plugins::PluginStatus;
 use crate::settings::{self, LanguageChoice, UiStyle};
 use crate::settings_view::{self, Section};
@@ -40,6 +43,11 @@ const PREVIEW_LINE_HEIGHT: f32 = 12.;
 /// A style card: the window drawn small, its name and what it is.
 const STYLE_CARD_WIDTH: f32 = 256.;
 const STYLE_PREVIEW_HEIGHT: f32 = 120.;
+
+/// A card under the mouse lifts this far; held down, it gives way to this scale (less than a
+/// button's: a card is large).
+const CARD_LIFT: f32 = 2.;
+const CARD_PRESS: f32 = 0.98;
 
 /// A page of Appearance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +92,8 @@ fn scale_step(scale: f32) -> Option<usize> {
 pub struct AppearancePage {
     page: Page,
     focus_handle: FocusHandle,
+    /// Where the scale's steps were drawn: the selected one's pill glides between them.
+    scale_steps: Rc<ui::Segments>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -94,6 +104,7 @@ impl AppearancePage {
         Self {
             page,
             focus_handle: cx.focus_handle(),
+            scale_steps: Rc::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -242,7 +253,7 @@ impl AppearancePage {
         sync: bool,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let preview =
             theme::by_name(&info.name, cx).unwrap_or_else(|| Theme::base(info.appearance));
@@ -256,23 +267,8 @@ impl AppearancePage {
         };
         let name = info.name.clone();
         let appearance = info.appearance;
-        div()
-            .id(("theme-card", index))
-            .flex_none()
+        let card = card_base(("theme-card", index), ui)
             .w(px(CARD_WIDTH))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_1p5()
-            .rounded(px(ui::RADIUS_LG))
-            .border_2()
-            .border_color(if selected {
-                ui.accent
-            } else {
-                ui.island_border
-            })
-            .cursor_pointer()
-            .hover(move |style| style.bg(ui.hover))
             .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                 if sync {
                     theme::select_for(appearance, &name, cx);
@@ -321,9 +317,10 @@ impl AppearancePage {
                         .size(px(13.)),
                     )
                     .when(selected, |row| {
-                        row.child(icon(IconName::Check, ui.accent_text).size(px(14.)))
+                        row.child(card_check(("theme-check", index), ui))
                     }),
-            )
+            );
+        card_selection(card, ("theme-card-border", index), selected, ui)
     }
 
     // --- Interface (part 10.4) ---
@@ -337,23 +334,8 @@ impl AppearancePage {
         let theme = theme::by_name(&shown.name, cx).unwrap_or_else(|| shown.clone());
         let cards = STYLES.into_iter().enumerate().map(|(index, style)| {
             let selected = style == current;
-            div()
-                .id(("style-card", index))
-                .flex_none()
+            let card = card_base(("style-card", index), ui)
                 .w(px(STYLE_CARD_WIDTH))
-                .flex()
-                .flex_col()
-                .gap_2()
-                .p_1p5()
-                .rounded(px(ui::RADIUS_LG))
-                .border_2()
-                .border_color(if selected {
-                    ui.accent
-                } else {
-                    ui.island_border
-                })
-                .cursor_pointer()
-                .hover(move |card| card.bg(ui.hover))
                 .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                     ui::set_style(style, cx);
                     cx.notify();
@@ -380,7 +362,7 @@ impl AppearancePage {
                                         .child(style_name(style)),
                                 )
                                 .when(selected, |row| {
-                                    row.child(icon(IconName::Check, ui.accent_text).size(px(14.)))
+                                    row.child(card_check(("style-check", index), ui))
                                 }),
                         )
                         .child(
@@ -392,10 +374,15 @@ impl AppearancePage {
                                     UiStyle::Flat => tr("Panels edge to edge, divided by lines"),
                                 }),
                         ),
-                )
+                );
+            card_selection(card, ("style-card-border", index), selected, ui)
         });
         let scale = settings::ui_scale(cx);
         let step = scale_step(scale);
+        // The selected step's pill, under the steps; until their places are known (the first
+        // frame), the step has a backdrop of its own.
+        let pill = self.scale_steps.pill(step, "scale-pill", ui);
+        let own_backdrop = pill.is_none();
         let steps = ui_scale::STEPS.iter().enumerate().map(|(index, value)| {
             let value = *value;
             let selected = step == Some(index);
@@ -415,9 +402,8 @@ impl AppearancePage {
                 } else {
                     ui.text_muted
                 })
-                .when(selected, |chip| {
-                    chip.bg(ui.list_selected).font_weight(FontWeight::SEMIBOLD)
-                })
+                .when(selected, |chip| chip.font_weight(FontWeight::SEMIBOLD))
+                .when(selected && own_backdrop, |chip| chip.bg(ui.list_selected))
                 .when(!selected, |chip| {
                     chip.hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
                 })
@@ -425,6 +411,7 @@ impl AppearancePage {
                     ui_scale::set(value, cx);
                     cx.notify();
                 }))
+                .child(self.scale_steps.measure(index))
                 .child(ui_scale::label(value))
         });
         // The keys of Zoom In / Zoom Out / Reset, as their commands have them.
@@ -479,6 +466,7 @@ impl AppearancePage {
                     .child(
                         div().flex().child(
                             div()
+                                .relative()
                                 .flex()
                                 .flex_wrap()
                                 .gap_1()
@@ -486,6 +474,8 @@ impl AppearancePage {
                                 .rounded(px(ui::RADIUS_MD))
                                 .border_1()
                                 .border_color(ui.island_border)
+                                .child(self.scale_steps.measure_origin())
+                                .children(pill)
                                 .children(steps),
                         ),
                     )
@@ -507,6 +497,36 @@ impl AppearancePage {
                                 })),
                         )
                     }),
+            )
+            .child(self.render_motion(cx))
+    }
+
+    /// Animations on or off (2026-10-28, `crate::motion`); macOS's "Reduce motion" keeps them off
+    /// whatever the switch says, and the row says so.
+    fn render_motion(&self, cx: &mut Context<Self>) -> Div {
+        let ui = Theme::ui(cx);
+        let on = settings::animations(cx);
+        let reduced = crate::motion::reduce_motion();
+        let detail = if reduced {
+            tr("Reduce motion is on in macOS’s Accessibility settings: everything simply appears.")
+        } else {
+            tr(
+                "Popovers grow out of where they were called, panels glide, buttons spring back. Off — everything simply appears.",
+            )
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(ui::section_label(tr("Motion"), ui))
+            .child(
+                switch_row("animations", tr("Animations"), detail, on && !reduced, ui).on_click(
+                    cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        settings::update_appearance(cx, |appearance| appearance.animations = !on);
+                        crate::motion::apply(cx);
+                        cx.refresh_windows();
+                    }),
+                ),
             )
     }
 
@@ -803,6 +823,54 @@ fn plugin_name(id: &str, window: &Window, cx: &App) -> Option<String> {
     let workspace = window.root::<Workspace>().flatten()?;
     let plugins = workspace.read(cx).plugins.read(cx);
     plugins.plugin(id).map(|plugin| plugin.name().to_string())
+}
+
+/// A card to choose (a theme, a look of the window): it lifts a little under the mouse and gives
+/// way when held down, springing back when let go.
+fn card_base(id: impl Into<ElementId>, ui: UiColors) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_1p5()
+        .rounded(px(ui::RADIUS_LG))
+        .border_2()
+        .cursor_pointer()
+        .hover(move |style| {
+            style
+                .bg(ui.hover)
+                .transform_translate(px(0.), px(-CARD_LIFT))
+        })
+        .active(|style| style.transform_scale(CARD_PRESS))
+}
+
+/// A card's border: accent when chosen, crossfading as the choice moves ([`motion::FADE`]).
+fn card_selection(
+    card: Stateful<Div>,
+    id: impl Into<ElementId>,
+    selected: bool,
+    ui: UiColors,
+) -> impl IntoElement {
+    card.with_transition(
+        id,
+        if selected {
+            ui.accent
+        } else {
+            ui.island_border
+        },
+        motion::FADE,
+        |card, color| card.border_color(color),
+    )
+}
+
+/// The check of the chosen card: it pops in as the card is chosen.
+fn card_check(id: impl Into<ElementId>, ui: UiColors) -> AnyElement {
+    motion::Appear::pop((0.5, 0.5))
+        .curve(motion::BOUNCE)
+        .scale(0.4)
+        .apply(id, icon(IconName::Check, ui.accent_text).size(px(14.)))
 }
 
 /// The page's title and what it is about, as the other pages of Settings have.

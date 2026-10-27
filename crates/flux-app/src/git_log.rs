@@ -35,8 +35,9 @@ use crate::diff_view::DiffSide;
 use crate::git::{self, GitStore};
 use crate::git_graph::{self, GraphLayout};
 use crate::i18n::{tr, trf};
-use crate::icons::{IconName, icon};
+use crate::icons::{self, IconName, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::motion::{Disclosure, unfold_style};
 use crate::push_dialog::now_seconds;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_SM};
@@ -119,6 +120,12 @@ const PAGE: usize = 1000;
 const PREFETCH: usize = 200;
 const ROW_HEIGHT: f32 = 26.;
 const BRANCHES_WIDTH: f32 = 190.;
+/// The collapsible sections of the branches pane, in order: key, title, the refs they list.
+const BRANCH_SECTIONS: [(&str, &str, RefKind); 3] = [
+    ("local", "Local", RefKind::Local),
+    ("remote", "Remote", RefKind::Remote),
+    ("tags", "Tags", RefKind::Tag),
+];
 const DETAILS_WIDTH: f32 = 320.;
 const AUTHOR_WIDTH: f32 = 96.;
 const DATE_WIDTH: f32 = 112.;
@@ -227,6 +234,8 @@ pub struct GitLogView {
     /// The window was wide in the last frame.
     wide: bool,
     collapsed: BTreeSet<&'static str>,
+    /// The sections the user opens and closes: their chevrons turn, their rows unfold.
+    disclosure: Disclosure<&'static str>,
     search: Entity<TextInput>,
     search_task: Option<Task<()>>,
     editing: Option<Editing>,
@@ -288,6 +297,7 @@ impl GitLogView {
             branches_open: None,
             wide: true,
             collapsed: BTreeSet::new(),
+            disclosure: Disclosure::default(),
             search,
             search_task: None,
             editing: None,
@@ -1041,7 +1051,31 @@ impl GitLogView {
         self.set_filter(|filter| filter.revs = branch.into_iter().collect(), cx);
     }
 
-    fn render_branches(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// Where the rows of each open section of the branches pane are (after HEAD's row and the
+    /// headers), for the disclosure: the pane's rows are drawn anew each frame.
+    fn track_sections(&mut self, cx: &App) {
+        let refs = self.git.read(cx).refs(self.repo);
+        let mut at = 1;
+        let mut open = Vec::new();
+        for (key, _, kind) in BRANCH_SECTIONS {
+            let count = section_refs(&refs, kind).len();
+            if count == 0 {
+                continue;
+            }
+            at += 1;
+            if !self.collapsed.contains(key) {
+                open.push((key, at..at + count));
+                at += count;
+            }
+        }
+        self.disclosure.rows_changed(|key| {
+            open.iter()
+                .find(|(section, _)| section == key)
+                .map(|(_, rows)| rows.clone())
+        });
+    }
+
+    fn render_branches(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let refs = self.git.read(cx).refs(self.repo);
         let filtered = self.filter.revs.first().cloned();
@@ -1052,10 +1086,11 @@ impl GitLogView {
                    color: Hsla,
                    rev: Option<String>,
                    checkout: Option<(String, RefKind)>,
+                   unfold: f32,
                    cx: &mut Context<Self>| {
             let selected = rev == filtered;
             let repo = self.repo;
-            div()
+            let element = div()
                 .id(id)
                 .h(px(24.))
                 .mx_1()
@@ -1090,8 +1125,8 @@ impl GitLogView {
                     this.filter_by_branch(branch, cx);
                 }))
                 .child(icon(glyph, color).size(px(13.)))
-                .child(div().min_w_0().truncate().child(label))
-                .into_any_element()
+                .child(div().min_w_0().truncate().child(label));
+            unfold_style(element, unfold).into_any_element()
         };
         let head_label: SharedString = match refs.current() {
             Some(branch) => format!("HEAD ({})", branch.name).into(),
@@ -1104,19 +1139,11 @@ impl GitLogView {
             ui.accent,
             Some("HEAD".into()),
             None,
+            1.,
             cx,
         ));
-        let sections: [(&'static str, &'static str, RefKind); 3] = [
-            ("local", "Local", RefKind::Local),
-            ("remote", "Remote", RefKind::Remote),
-            ("tags", "Tags", RefKind::Tag),
-        ];
-        for (key, title, kind) in sections {
-            let list = match kind {
-                RefKind::Local => &refs.local,
-                RefKind::Remote => &refs.remote,
-                RefKind::Tag => &refs.tags,
-            };
+        for (key, title, kind) in BRANCH_SECTIONS {
+            let list = section_refs(&refs, kind);
             if list.is_empty() {
                 continue;
             }
@@ -1139,18 +1166,12 @@ impl GitLogView {
                         if !this.collapsed.remove(key) {
                             this.collapsed.insert(key);
                         }
+                        this.disclosure.toggled(key, !this.collapsed.contains(key));
                         cx.notify();
                     }))
                     .child(
-                        icon(
-                            if collapsed {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            },
-                            ui.dim,
-                        )
-                        .size(px(12.)),
+                        icons::chevron(self.disclosure.chevron(&key, !collapsed, window), ui.dim)
+                            .size(px(12.)),
                     )
                     .child(tr(title))
                     .child(div().text_color(ui.dim).child(list.len().to_string()))
@@ -1173,6 +1194,7 @@ impl GitLogView {
                     color,
                     Some(reference.name.clone()),
                     checkout,
+                    self.disclosure.unfold(rows.len(), window),
                     cx,
                 ));
             }
@@ -1591,6 +1613,15 @@ fn history_sides(commit: &LogCommit, revision: &FileRevision) -> (DiffSide, Diff
     )
 }
 
+/// The refs a section of the branches pane lists.
+fn section_refs(refs: &Refs, kind: RefKind) -> &[flux_git::Ref] {
+    match kind {
+        RefKind::Local => &refs.local,
+        RefKind::Remote => &refs.remote,
+        RefKind::Tag => &refs.tags,
+    }
+}
+
 /// A branch / tag label's icon and color: the current branch — the accent, local — green, remote —
 /// violet, tags — amber.
 fn label_style(kind: RefKind, current: bool, ui: &UiColors) -> (IconName, Hsla) {
@@ -1721,6 +1752,7 @@ impl Render for GitLogView {
         let ui = Theme::ui(cx);
         let focused = self.focus_handle.is_focused(window);
         let all = self.scope == LogScope::All;
+        self.track_sections(cx);
         self.wide = f32::from(window.viewport_size().width) >= NARROW_WINDOW;
         let page = (f32::from(window.viewport_size().height) / 3. / ROW_HEIGHT).max(5.) as isize;
         let center = div()
@@ -1801,7 +1833,7 @@ impl Render for GitLogView {
             .on_action(cx.listener(|this, action: &SetRepo, _, cx| this.set_repo(action.repo, cx)))
             // In a narrow window the branches pane gives its room to the commits.
             .when(all && self.branches_shown(), |root| {
-                root.child(self.render_branches(cx))
+                root.child(self.render_branches(window, cx))
             })
             .child(center)
             .child(
@@ -1814,11 +1846,10 @@ impl Render for GitLogView {
                     .border_color(ui.divider)
                     .child(self.details.clone()),
             )
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "log-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }
 

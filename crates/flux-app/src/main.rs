@@ -69,6 +69,7 @@ mod lsp_watch;
 mod markdown;
 mod markdown_preview;
 mod merge_view;
+mod motion;
 mod navigation;
 mod notification_center;
 mod notifications;
@@ -195,6 +196,8 @@ fn main() {
         go_to_line::init(cx);
         project_search::init(cx);
         settings::init(cx);
+        // Animations on or off, the hover and press fades with them (2026-10-28).
+        motion::apply(cx);
         // The interface language, the theme and the icons as the settings choose them, from
         // the plugins that bring them (stage 8.3): before any window opens.
         i18n::apply_choice(settings::appearance(cx).language);

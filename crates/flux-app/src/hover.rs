@@ -744,6 +744,13 @@ fn render_popup(
         Side::Below => (Corner::TopLeft, anchor.line_bottom + px(POPUP_GAP)),
         Side::Above => (Corner::BottomLeft, anchor.line_top - px(POPUP_GAP)),
     };
+    // It grows out of its symbol: from its bottom left corner above the line, its top left below.
+    // The server's answer filling it later keeps the same popup, so it doesn't pop again.
+    let panel = crate::motion::Appear::pop((0., 0.)).apply_from(
+        ("hover-pop", popup.id),
+        point(x, y),
+        panel,
+    );
     Some(
         deferred(
             anchored()

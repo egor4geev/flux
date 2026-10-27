@@ -472,13 +472,10 @@ fn transition_time() -> Duration {
     TRANSITION
 }
 
-/// "Reduce motion" is on in the system's accessibility settings: the guide's transitions and the
-/// pictures' shows jump to their end instead of moving.
+/// Animations are off — the system's "Reduce motion" or Flux's own setting (`crate::motion`): the
+/// guide's transitions and the pictures' shows jump to their end instead of moving.
 pub fn reduce_motion() -> bool {
-    #[cfg(target_os = "macos")]
-    return appkit::reduce_motion();
-    #[cfg(not(target_os = "macos"))]
-    false
+    !crate::motion::enabled()
 }
 
 pub struct WelcomeGuide {
@@ -1141,7 +1138,7 @@ pub fn ghost_button(
 mod appkit {
     use std::ffi::{CStr, c_char};
 
-    use objc::runtime::{BOOL, NO, Object, YES};
+    use objc::runtime::{Object, YES};
     use objc::{class, msg_send, sel, sel_impl};
 
     #[repr(C)]
@@ -1177,16 +1174,6 @@ mod appkit {
     unsafe impl objc::Encode for Rect {
         fn encode() -> objc::Encoding {
             unsafe { objc::Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
-        }
-    }
-
-    /// The system's accessibility setting "Reduce motion".
-    pub fn reduce_motion() -> bool {
-        // SAFETY: AppKit's shared workspace and a BOOL property, on the main thread.
-        unsafe {
-            let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let reduce: BOOL = msg_send![workspace, accessibilityDisplayShouldReduceMotion];
-            reduce != NO
         }
     }
 

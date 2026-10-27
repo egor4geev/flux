@@ -44,6 +44,7 @@ mod lsp_status;
 mod markdown_preview;
 mod menu;
 mod messages;
+mod motion;
 mod navigation;
 mod notification_center;
 mod notifications_panel;
@@ -120,6 +121,7 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     blame::STRINGS,
     dialog::STRINGS,
     messages::STRINGS,
+    motion::STRINGS,
     notification_center::STRINGS,
     notifications_panel::STRINGS,
     popups::STRINGS,
@@ -250,4 +252,5 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     welcome_tour::PLURALS,
     welcome_shortcuts::PLURALS,
     welcome_whats_new::PLURALS,
+    motion::PLURALS,
 ];

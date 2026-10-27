@@ -1844,12 +1844,21 @@ fn header(name: &str, ui: UiColors) -> Div {
 
 /// A multi-line field in a box like a text field's: ↵ — a new line; a click on the box's padding
 /// puts the caret into it.
-fn render_lines(lines: &Lines, window: &Window, cx: &mut Context<PluginSettingsPage>) -> Div {
+///
+/// Focused, its border and ring come in as a text field's do (`ui::focus_field`).
+fn render_lines(
+    lines: &Lines,
+    window: &Window,
+    cx: &mut Context<PluginSettingsPage>,
+) -> impl IntoElement + use<> {
     let ui = Theme::ui(cx);
     let focus = lines.input.focus_handle(cx);
     let focused = focus.is_focused(window);
     let input = lines.input.clone();
-    div()
+    // Keyed by the field: a page may have several, in rows without ids.
+    let key = lines.input.entity_id().as_u64();
+    let field = div()
+        .id(("lines", key))
         .key_context(LINES_CONTEXT)
         .w_full()
         .px_2p5()
@@ -1857,12 +1866,6 @@ fn render_lines(lines: &Lines, window: &Window, cx: &mut Context<PluginSettingsP
         .rounded(px(ui::RADIUS_MD))
         .bg(ui.input_background)
         .border_1()
-        .border_color(if focused {
-            ui.focus_border
-        } else {
-            ui.input_border
-        })
-        .when(focused, |field| field.shadow(ui::focus_ring(ui)))
         .when(!focused, |field| {
             field.hover(move |style| style.border_color(ui.elevated_border))
         })
@@ -1871,7 +1874,8 @@ fn render_lines(lines: &Lines, window: &Window, cx: &mut Context<PluginSettingsP
             window.focus(&focus)
         })
         .on_action(move |_: &NewLine, _, cx| input.update(cx, |input, cx| input.insert("\n", cx)))
-        .child(lines.input.clone())
+        .child(lines.input.clone());
+    ui::focus_field(field, ("lines-focus", key), focused, ui)
 }
 
 /// The color of a status line's tone, as in the plugins' tool windows.

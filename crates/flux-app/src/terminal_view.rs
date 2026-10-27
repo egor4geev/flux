@@ -1008,10 +1008,9 @@ impl Render for TerminalView {
                     .child(TerminalElement::new(cx.entity())),
             )
             .children(self.render_exit_note(window, cx))
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "terminal-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }

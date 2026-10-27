@@ -654,6 +654,27 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Flux patch (motion, 2026-10-28): scales what this element and its children paint, around
+    /// the middle or [`Styled::transform_origin`]. Layout and hit testing don't change.
+    fn transform_scale(mut self, scale: f32) -> Self {
+        self.style().transform_scale = Some(scale);
+        self
+    }
+
+    /// Flux patch (motion): the point [`Styled::transform_scale`] scales around, as fractions of
+    /// the element's size: `(0., 0.)` is the top left corner, `(0.5, 1.)` the middle of the bottom.
+    fn transform_origin(mut self, x: f32, y: f32) -> Self {
+        self.style().transform_origin = Some(crate::Point { x, y });
+        self
+    }
+
+    /// Flux patch (motion): moves what this element and its children paint, after
+    /// [`Styled::transform_scale`]. Layout and hit testing don't change.
+    fn transform_translate(mut self, x: crate::Pixels, y: crate::Pixels) -> Self {
+        self.style().transform_translate = Some(crate::Point { x, y });
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(cols);

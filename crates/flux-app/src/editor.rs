@@ -2,7 +2,7 @@
 
 use std::ops::Range as Utf16Range;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::movement::{self, Direction};
 use flux_core::text::{CharClass, char_class, line_len, line_start};
@@ -19,6 +19,7 @@ use gpui::{
 use crate::element::{EditorElement, LayoutCache};
 use crate::highlighter::{self, Highlighter, ParseMode};
 use crate::i18n::{tr, trf};
+use crate::motion;
 use crate::settings::MarkdownLayout;
 use crate::theme::{self, Theme};
 use crate::wrap::ToggleSoftWrap;
@@ -144,6 +145,73 @@ pub enum Autoscroll {
     Middle,
 }
 
+/// A jump's scroll gliding to its place ([`motion::SCROLL`]): go to definition, Back, the next
+/// match or problem, go to line, Page Down, ⌘↓. Typing, the caret's own autoscroll and the wheel
+/// never glide. [`Editor::scroll`] is always what is on screen — the popups anchored to the text and
+/// the hosts that keep two sides together read it — and the glide moves it a step each frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Glide {
+    pub(crate) from: f32,
+    /// Where the view is going: what the next jump, Page Down or the caret's autoscroll count
+    /// from.
+    pub(crate) to: f32,
+    pub(crate) since: Instant,
+    /// The offset drawn last. Another one in [`Editor::scroll`] means something else scrolled —
+    /// the wheel, the scrollbar, a host keeping two sides together — and the glide gives way.
+    pub(crate) shown: f32,
+}
+
+impl Glide {
+    /// A glide from `from` to `to`; `None` if there is nowhere to go. A way longer than `limit`
+    /// (about a screen) starts that far before the target: the view jumps most of a long way and
+    /// glides the last screen, where the eye can follow the text.
+    pub(crate) fn new(from: f32, to: f32, limit: f32, now: Instant) -> Option<Self> {
+        let limit = limit.max(0.);
+        let from = to + (from - to).clamp(-limit, limit);
+        ((from - to).abs() >= 0.5).then_some(Self {
+            from,
+            to,
+            since: now,
+            shown: from,
+        })
+    }
+
+    /// The glide of a frame whose autoscroll moved the view's destination from `destination` to
+    /// `target`: a jump glides there from `shown`, what is on screen; anything else that moved it
+    /// (the caret, typing) takes the view there at once; otherwise `glide` goes on.
+    pub(crate) fn next(
+        glide: Option<Glide>,
+        destination: f32,
+        target: f32,
+        jump: bool,
+        shown: f32,
+        limit: f32,
+        now: Instant,
+    ) -> Option<Glide> {
+        if target == destination {
+            glide.map(|glide| Glide {
+                to: destination,
+                ..glide
+            })
+        } else if jump {
+            Glide::new(shown, target, limit, now)
+        } else {
+            None
+        }
+    }
+
+    /// The offset at `t`, the curve's value (0 → 1).
+    fn offset(&self, t: f32) -> f32 {
+        motion::lerp(self.from, self.to, t)
+    }
+
+    /// The offset at `now`, and whether the glide has ended (at once with animations off).
+    pub(crate) fn at(&self, now: Instant) -> (f32, bool) {
+        let (t, done) = motion::SCROLL.at(now.saturating_duration_since(self.since));
+        (if done { self.to } else { self.offset(t) }, done)
+    }
+}
+
 /// Matches found by the find bar: in ascending order, non-overlapping; `active` is the current one
 /// (drawn brighter). The editor owns them: it draws them and shifts them with its own edits until
 /// fresh search results arrive.
@@ -179,10 +247,16 @@ impl SearchHighlights {
 pub struct Editor {
     pub(crate) document: Document,
     pub(crate) focus_handle: FocusHandle,
-    /// Offset of the visible area, in pixels.
+    /// Offset of the visible area, in pixels: what is on screen (mid-glide, the glide's step).
     pub(crate) scroll: Point<f32>,
     /// Scroll to the cursor on the next render.
     pub(crate) autoscroll: Option<Autoscroll>,
+    /// A jump gliding to its place; `None` at rest.
+    pub(crate) glide: Option<Glide>,
+    /// The next autoscroll is a jump's and glides: a range selected from outside
+    /// ([`Editor::select_range`]), ⌘↑ / ⌘↓, Page Up / Page Down. Input clears it: what typing and
+    /// the caret scroll happens at once.
+    pub(crate) glide_next: bool,
     /// Text currently being typed through the IME (not yet committed).
     pub(crate) marked_range: Option<std::ops::Range<usize>>,
     pub(crate) layout: Option<LayoutCache>,
@@ -320,6 +394,8 @@ impl Editor {
             focus_handle,
             scroll: point(0., 0.),
             autoscroll: Some(Autoscroll::Fit),
+            glide: None,
+            glide_next: false,
             marked_range: None,
             layout: None,
             highlighter,
@@ -364,6 +440,7 @@ impl Editor {
         let position = position.min(self.document.text().len_chars());
         self.document.set_selection(Selection::point(position));
         self.autoscroll = Some(Autoscroll::Middle);
+        self.glide_next = false;
         cx.emit(EditorEvent::SelectionsChanged);
         cx.notify();
     }
@@ -373,6 +450,7 @@ impl Editor {
         self.marked_range = None;
         self.status = None;
         self.autoscroll = Some(Autoscroll::Fit);
+        self.glide_next = false;
         self.pause_blink(cx);
         cx.emit(EditorEvent::SelectionsChanged);
         cx.notify();
@@ -398,6 +476,7 @@ impl Editor {
         cx.emit(EditorEvent::SelectionsChanged);
         self.status = None;
         self.autoscroll = Some(Autoscroll::Fit);
+        self.glide_next = false;
         self.pause_blink(cx);
         cx.notify();
     }
@@ -416,6 +495,7 @@ impl Editor {
             cx.emit(EditorEvent::SelectionsChanged);
             self.marked_range = None;
             self.autoscroll = Some(Autoscroll::Fit);
+            self.glide_next = false;
             self.pause_blink(cx);
             cx.notify();
         }
@@ -521,16 +601,27 @@ impl Editor {
             .map_or(20, |layout| layout.visible_lines().saturating_sub(1).max(1))
     }
 
+    /// Page Up / Page Down: the view turns a page and the caret goes with it. The view glides, from
+    /// wherever it is (a held key keeps it gliding); the caret is there at once.
     fn page(&mut self, dir: Direction, cx: &mut Context<Self>) {
         let lines = self.page_lines();
-        if let Some(layout) = &self.layout {
-            let delta = lines as f32 * f32::from(layout.line_height);
-            self.scroll.y += match dir {
-                Direction::Backward => -delta,
-                Direction::Forward => delta,
-            };
-        }
+        let target = self.layout.as_ref().map(|layout| {
+            let lh = f32::from(layout.line_height);
+            let delta = lines as f32 * lh;
+            let max = self.wrap.row_count().saturating_sub(1) as f32 * lh;
+            let target = self.scroll_destination()
+                + match dir {
+                    Direction::Backward => -delta,
+                    Direction::Forward => delta,
+                };
+            target.clamp(0., max)
+        });
         self.vertical(dir, lines, false, cx);
+        if let Some(y) = target {
+            self.glide_to(y);
+        }
+        // At the end of the document the caret's autoscroll moves the view on: that glides too.
+        self.glide_next = true;
     }
 
     /// ↑ / ↓ (`count` rows, Page Up / Page Down): by display rows when the lines wrap, keeping the
@@ -669,7 +760,8 @@ impl Editor {
     }
 
     /// Selects a range (cursor at the end) and scrolls to it: if it is not visible, to the middle
-    /// of the viewport.
+    /// of the viewport. The view glides there, as after a jump; the find bar's incremental search,
+    /// which follows typing, takes it there at once ([`Editor::scroll_instantly`]).
     pub fn select_range(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
         self.select_ranges(vec![range], 0, cx);
     }
@@ -690,6 +782,49 @@ impl Editor {
             .collect();
         self.set_selection(Selection::new(ranges, primary), cx);
         self.autoscroll = Some(Autoscroll::Center);
+        self.glide_next = true;
+    }
+
+    // --- Gliding jumps ---
+
+    /// Where a jump counts from: where the view is going if it glides, otherwise where it is.
+    pub(crate) fn scroll_destination(&self) -> f32 {
+        self.glide.map_or(self.scroll.y, |glide| glide.to)
+    }
+
+    /// The pending scroll to the selection takes the view there at once instead of gliding: for
+    /// what follows typing, as the find bar's incremental search.
+    pub fn scroll_instantly(&mut self) {
+        self.glide_next = false;
+    }
+
+    /// Scrolls to the offset `y` as a jump: gliding from where the view is now, or a new target for
+    /// a glide on its way. Before the editor was first drawn (a file just opened) and with
+    /// animations off, at once.
+    pub(crate) fn glide_to(&mut self, y: f32) {
+        let limit = self
+            .layout
+            .as_ref()
+            .filter(|_| motion::enabled())
+            .map(|layout| f32::from(layout.text_bounds.size.height));
+        self.glide = limit.and_then(|limit| Glide::new(self.scroll.y, y, limit, Instant::now()));
+        self.scroll.y = self.glide.map_or(y, |glide| glide.from);
+    }
+
+    /// This frame's step of a glide, taken before anything reads the scroll: the popups anchored to
+    /// the text are drawn where the text is. The element asks for the next frame.
+    fn advance_glide(&mut self) {
+        let Some(glide) = self.glide else {
+            return;
+        };
+        if glide.shown != self.scroll.y {
+            // Something else scrolled: the wheel, the scrollbar, a host. It wins.
+            self.glide = None;
+            return;
+        }
+        let (y, done) = glide.at(Instant::now());
+        self.scroll.y = y;
+        self.glide = (!done).then_some(Glide { shown: y, ..glide });
     }
 
     /// What to search for on Cmd+F: the primary selection if it is on a single line, and the word
@@ -969,6 +1104,8 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        // A click stops a glide where it is: the view under the mouse is the one clicked.
+        self.glide = None;
         if crate::navigation::cmd_click(self, event, window, cx)
             || crate::git_gutter::mouse_down(self, event, window, cx)
             || crate::blame::mouse_down(self, event, window, cx)
@@ -1029,6 +1166,8 @@ impl Editor {
         self.scroll.x -= f32::from(delta.x);
         self.scroll.y -= f32::from(delta.y);
         self.autoscroll = None;
+        // The wheel takes over from a glide, from where the view is.
+        self.glide = None;
         cx.notify();
     }
 
@@ -1230,6 +1369,7 @@ impl Focusable for Editor {
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use Direction::{Backward, Forward};
+        self.advance_glide();
         let ui = Theme::ui(cx);
         // A Markdown file: Editor Only, Editor and Preview, or Preview Only (part 10.4).
         let markdown = crate::markdown_preview::layout(self, cx);
@@ -1298,18 +1438,23 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &MoveLineEnd, _, cx| this.end(false, cx)))
             .on_action(cx.listener(|this, _: &SelectLineStart, _, cx| this.home(true, cx)))
             .on_action(cx.listener(|this, _: &SelectLineEnd, _, cx| this.end(true, cx)))
+            // The start and the end of the document are jumps: the view glides there.
             .on_action(cx.listener(|this, _: &MoveDocumentStart, _, cx| {
-                this.set_selection(Selection::point(0), cx)
+                this.set_selection(Selection::point(0), cx);
+                this.glide_next = true;
             }))
             .on_action(cx.listener(|this, _: &MoveDocumentEnd, _, cx| {
                 let end = this.document.text().len_chars();
-                this.set_selection(Selection::point(end), cx)
+                this.set_selection(Selection::point(end), cx);
+                this.glide_next = true;
             }))
             .on_action(cx.listener(|this, _: &SelectDocumentStart, _, cx| {
-                this.motion(cx, |_, r| movement::move_document_start(r, true))
+                this.motion(cx, |_, r| movement::move_document_start(r, true));
+                this.glide_next = true;
             }))
             .on_action(cx.listener(|this, _: &SelectDocumentEnd, _, cx| {
-                this.motion(cx, |t, r| movement::move_document_end(t, r, true))
+                this.motion(cx, |t, r| movement::move_document_end(t, r, true));
+                this.glide_next = true;
             }))
             .on_action(cx.listener(|this, _: &PageUp, _, cx| this.page(Backward, cx)))
             .on_action(cx.listener(|this, _: &PageDown, _, cx| this.page(Forward, cx)))
@@ -1457,6 +1602,51 @@ mod tests {
         // The current match was deleted: there is no current match.
         let got = mapped(&search, 13, vec![(9, 13, None)]);
         assert_eq!(got, highlights(&[(3, 6)], None));
+    }
+
+    #[test]
+    fn a_long_glide_starts_a_screen_before_its_target() {
+        let now = Instant::now();
+        let down = Glide::new(0., 10_000., 600., now).unwrap();
+        assert_eq!((down.from, down.to, down.shown), (9_400., 10_000., 9_400.));
+        let up = Glide::new(10_000., 0., 600., now).unwrap();
+        assert_eq!(up.from, 600.);
+        // Within a screen, the whole way.
+        assert_eq!(Glide::new(100., 500., 600., now).unwrap().from, 100.);
+        // Nowhere to go: no glide.
+        assert_eq!(Glide::new(300., 300.2, 600., now), None);
+    }
+
+    #[test]
+    fn a_glide_moves_from_its_start_to_its_target_and_ends_there() {
+        let now = Instant::now();
+        let glide = Glide::new(100., 500., 600., now).unwrap();
+        assert_eq!(glide.offset(0.), 100.);
+        assert_eq!(glide.offset(motion::SCROLL.ease(0.5)), {
+            100. + 400. * motion::SCROLL.ease(0.5)
+        });
+        assert_eq!(glide.offset(1.), 500.);
+        // Past its duration (or with animations off) it is done, at its target.
+        let late = now + motion::SCROLL.duration() + Duration::from_millis(1);
+        assert_eq!(glide.at(late), (500., true));
+    }
+
+    #[test]
+    fn a_new_jump_glides_on_from_what_is_on_screen() {
+        let now = Instant::now();
+        let glide = Glide::new(0., 400., 600., now).map(|glide| Glide {
+            shown: 250.,
+            ..glide
+        });
+        let next = Glide::next(glide, 400., 800., true, 250., 600., now).unwrap();
+        assert_eq!((next.from, next.to), (250., 800.));
+        // Its target already in view: the glide goes on as it was.
+        assert_eq!(Glide::next(glide, 400., 400., true, 250., 600., now), glide);
+        // The caret or typing moved the view: at once, no glide.
+        assert_eq!(Glide::next(glide, 400., 430., false, 250., 600., now), None);
+        // A document that got shorter pulls the target in.
+        let pulled = Glide::next(glide, 380., 380., false, 250., 600., now).unwrap();
+        assert_eq!(pulled.to, 380.);
     }
 
     #[test]

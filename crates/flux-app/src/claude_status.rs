@@ -17,6 +17,7 @@ use crate::claude_session::ClaudeSession;
 use crate::claude_transcript::first_line;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, icon};
+use crate::motion::TransitionExt;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_SM};
 
@@ -224,27 +225,48 @@ pub fn glyph(glance: &Glance, unseen: bool, id: impl Into<ElementId>, ui: UiColo
 }
 
 /// The dot alone: pulsing while the session works, amber while it waits, the success color when it
-/// finished out of sight, red after an error, a hollow ring when ready (the console's rows).
+/// finished out of sight, red after an error, a hollow ring when ready (the console's rows). Its
+/// color crossfades as the state changes (`FADE`): the same elements in every state keep the fade.
 pub fn dot(glance: &Glance, unseen: bool, id: impl Into<ElementId>, ui: UiColors) -> AnyElement {
-    let dot = div().flex_none().size(px(7.)).rounded(px(4.));
-    match glance.state {
-        GlanceState::Working | GlanceState::Starting => dot
-            .bg(ui.accent)
-            .with_animation(
-                id,
-                Animation::new(Duration::from_millis(1100)).repeat(),
-                |dot, delta| dot.opacity(0.35 + 0.65 * (1. - (2. * delta - 1.).abs())),
-            )
-            .into_any_element(),
-        GlanceState::Waiting => dot.bg(ui.warning).into_any_element(),
-        GlanceState::Failed => dot.bg(ui.error).into_any_element(),
-        GlanceState::Stopped => dot.bg(ui.dim).into_any_element(),
-        GlanceState::Idle if unseen => dot.bg(ui.success).into_any_element(),
-        GlanceState::Idle => dot
-            .border_1()
-            .border_color(UiColors::tint(ui.text_muted, 0.6))
-            .into_any_element(),
-    }
+    let id = id.into();
+    let pulsing = matches!(glance.state, GlanceState::Working | GlanceState::Starting);
+    let fill = match glance.state {
+        GlanceState::Working | GlanceState::Starting => ui.accent,
+        GlanceState::Waiting => ui.warning,
+        GlanceState::Failed => ui.error,
+        GlanceState::Stopped => ui.dim,
+        GlanceState::Idle if unseen => ui.success,
+        GlanceState::Idle => gpui::transparent_black(),
+    };
+    // The ready ring: an outline, no fill.
+    let ring =
+        (glance.state == GlanceState::Idle && !unseen).then(|| UiColors::tint(ui.text_muted, 0.6));
+    // The pulse repeats while the session works; otherwise the animation ends at once (it asks
+    // for no frames), only keeping the element the same.
+    let animation = if pulsing {
+        Animation::new(Duration::from_millis(1100)).repeat()
+    } else {
+        Animation::new(Duration::from_nanos(1))
+    };
+    div()
+        .flex_none()
+        .size(px(7.))
+        .rounded(px(4.))
+        .border_1()
+        .with_animation(id.clone(), animation, move |dot, delta| {
+            if pulsing {
+                dot.opacity(0.35 + 0.65 * (1. - (2. * delta - 1.).abs()))
+            } else {
+                dot
+            }
+        })
+        .with_transition(
+            ElementId::NamedChild(Box::new(id), "fill".into()),
+            fill,
+            crate::motion::FADE,
+            move |dot, fill| dot.map_element(|dot| dot.bg(fill).border_color(ring.unwrap_or(fill))),
+        )
+        .into_any_element()
 }
 
 /// A small pill: an icon and a short text (a clock, a count).

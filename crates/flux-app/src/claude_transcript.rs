@@ -25,8 +25,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui::{
     Animation, AnimationExt, AnyElement, App, BoxShadow, ClipboardItem, Context, Div, Entity,
     FontWeight, Hsla, Image, ImageFormat, InteractiveText, ListAlignment, ListOffset, ListState,
-    SharedString, Stateful, StyledImage, StyledText, TextRun, WeakEntity, Window, div, font, img,
-    linear_color_stop, linear_gradient, list, point, prelude::*, px,
+    Pixels, SharedString, Stateful, StyledImage, StyledText, TextRun, Transformation, WeakEntity,
+    Window, div, font, img, linear_color_stop, linear_gradient, list, point, prelude::*, px,
+    radians,
 };
 use serde_json::Value;
 
@@ -45,6 +46,7 @@ use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, IconSource, file_icon, icon, source_icon};
 use crate::image_view::ImageSource;
 use crate::markdown::{self, Block, Marks};
+use crate::motion::{self, Appear, Curve, TransitionExt};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 use crate::workspace::Location;
@@ -81,6 +83,9 @@ pub(crate) const REVEALED_HOLD: Duration = Duration::from_millis(1600);
 pub(crate) const REVEALED_FADE: Duration = Duration::from_millis(500);
 /// Space kept above (or below) an entry a click brings into sight.
 const REVEAL_MARGIN: f32 = 48.;
+/// More entries than this arriving in one sync are a conversation loading, not Claude talking:
+/// they simply appear.
+const MAX_ARRIVALS: usize = 6;
 
 pub fn init(cx: &mut App) {
     crate::claude_agent_view::init(cx);
@@ -135,6 +140,66 @@ pub struct TranscriptState {
     revealed: Option<(EntryId, Instant)>,
     /// Entries such a click opened: they stay open until the user closes them.
     shown: HashSet<EntryId>,
+
+    // Motion (2026-10-28). The list draws only what is in view and builds each row anew, so what
+    // moves is driven by the times kept here, never by element ids: an appearance doesn't replay
+    // when its row scrolls back into view or a streamed delta changes it.
+    /// The list has been synced once: entries known then were there before the chat looked.
+    synced: bool,
+    /// The newest entry known at the last sync: newer ones arrived since.
+    newest: Option<EntryId>,
+    /// The session's saved conversation was still being read at the last sync: what comes with it
+    /// isn't an arrival.
+    loading: bool,
+    /// Entries that arrived while the chat was open, and when: the user's message rises from the
+    /// field, Claude's blocks fade in, the "Done" card pops.
+    arrived: HashMap<EntryId, Instant>,
+    /// Bodies unfolding or folding away (a click on a row, a card, a group; a group closing by
+    /// itself when its turn moves on), by entry.
+    folds: HashMap<EntryId, Fold>,
+    /// The natural height of each folding body as last drawn: its clip glides to it.
+    fold_heights: Rc<RefCell<HashMap<EntryId, Pixels>>>,
+    /// The group open while its turn runs, as of the last sync: when it closes by itself, it folds.
+    live_group: Option<EntryId>,
+    /// A redraw at the next animation tick is on its way ([`request_tick`]).
+    tick_pending: Rc<Cell<bool>>,
+}
+
+/// How often something moving in the conversation asks to be drawn again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Redraw {
+    None,
+    /// At the next tick of the 30 fps grid streamed text redraws on: what moves while Claude
+    /// streams adds no frames of its own.
+    Tick,
+    /// Every frame: what the user did (a click, a message sent) — rare and watched.
+    Frame,
+}
+
+/// A body unfolding (`open`) or folding away, from where it was (`from`, its shown share: a
+/// fold reversed halfway goes on from there).
+#[derive(Clone, Copy, Debug)]
+struct Fold {
+    since: Instant,
+    open: bool,
+    from: f32,
+    redraw: Redraw,
+}
+
+impl Fold {
+    /// The share of the body shown now, 0 → 1.
+    fn shown(&self) -> f32 {
+        let target = if self.open { 1. } else { 0. };
+        motion::lerp(
+            self.from,
+            target,
+            motion::progress(self.since, motion::SMOOTH),
+        )
+    }
+
+    fn running(&self) -> bool {
+        motion::running(self.since, motion::SMOOTH)
+    }
 }
 
 /// Claude's text as Markdown blocks.
@@ -185,6 +250,14 @@ impl TranscriptState {
             search: None,
             revealed: None,
             shown: HashSet::new(),
+            synced: false,
+            newest: None,
+            loading: false,
+            arrived: HashMap::new(),
+            folds: HashMap::new(),
+            fold_heights: Rc::default(),
+            live_group: None,
+            tick_pending: Rc::default(),
         }
     }
 
@@ -261,11 +334,55 @@ impl TranscriptState {
         (default || expand_all()) != self.toggled.contains(&id)
     }
 
-    fn toggle(&mut self, id: EntryId) {
+    /// Flips the expansion of `id`, which was `expanded`: its body unfolds or folds away.
+    fn toggle(&mut self, id: EntryId, expanded: bool) {
         if !self.toggled.remove(&id) {
             self.toggled.insert(id);
         }
+        self.fold(id, !expanded, Redraw::Frame);
         self.dirty = true;
+    }
+
+    /// The body of `id` starts to unfold (`open`) or fold away — from where a fold still running
+    /// has it.
+    fn fold(&mut self, id: EntryId, open: bool, redraw: Redraw) {
+        self.folds.retain(|_, fold| fold.running());
+        if !motion::enabled() {
+            return;
+        }
+        let from = match self.folds.get(&id) {
+            Some(fold) => fold.shown(),
+            None => {
+                // Measured anew: the body may have grown since it was last folded.
+                self.fold_heights.borrow_mut().remove(&id);
+                if open { 0. } else { 1. }
+            }
+        };
+        self.folds.insert(
+            id,
+            Fold {
+                since: Instant::now(),
+                open,
+                from,
+                redraw,
+            },
+        );
+    }
+
+    /// The fold of the body of `id`, while it runs toward `open`.
+    fn folding(&self, id: EntryId, open: bool) -> Option<Fold> {
+        self.folds
+            .get(&id)
+            .copied()
+            .filter(|fold| fold.open == open && fold.running())
+    }
+
+    /// Since when the entry `id` appears, while it does.
+    fn arriving(&self, id: EntryId, curve: Curve) -> Option<Instant> {
+        self.arrived
+            .get(&id)
+            .copied()
+            .filter(|since| motion::running(*since, curve))
     }
 
     /// A group of steps (by its first entry) is open: as the user left it, else by `default`.
@@ -309,6 +426,8 @@ pub fn sync(
             None => model.status.is_working(),
             Some(tool) => find_tool(&model.entries, tool).is_some_and(agent_running),
         };
+        note_arrivals(state, entries, session.read(cx).is_loading());
+        note_live_group(state, entries, &items, working);
         let fingerprints: Vec<u64> = (0..items.len())
             .map(|index| item_fingerprint(entries, &items, index, working, state))
             .collect();
@@ -434,6 +553,64 @@ pub fn sync(
             .detach();
         }
     }
+}
+
+/// Notes the entries that arrived since the last sync, so they appear. Not arrivals: what the
+/// first sync finds, a saved conversation being read or joining this one (it comes first, under
+/// new ids — before what was known), a batch (a conversation loading).
+fn note_arrivals(state: &mut TranscriptState, entries: &[Entry], loading: bool) {
+    let newest = state.newest;
+    let is_new = |entry: &Entry| newest.is_none_or(|newest| entry.id > newest);
+    state
+        .arrived
+        .retain(|_, since| motion::running(*since, motion::BOUNCE));
+    if state.synced && !state.loading && !loading && motion::enabled() {
+        let known = entries.iter().position(|entry| !is_new(entry));
+        let fresh: Vec<EntryId> = entries
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| is_new(entry) && known.is_none_or(|known| *index > known))
+            .map(|(_, entry)| entry.id)
+            .collect();
+        if fresh.len() <= MAX_ARRIVALS {
+            let now = Instant::now();
+            state.arrived.extend(fresh.into_iter().map(|id| (id, now)));
+        }
+    }
+    state.synced = true;
+    state.loading = loading;
+    state.newest = entries.iter().map(|entry| entry.id).max().max(newest);
+}
+
+/// The group open while its turn runs closes by itself once something follows it or the turn
+/// ends: it folds away — on the tick, as that happens while Claude streams.
+fn note_live_group(state: &mut TranscriptState, entries: &[Entry], items: &[Item], working: bool) {
+    let live = match items.last() {
+        Some(Item::Group { start, .. }) if working => Some(entries[*start].id),
+        _ => None,
+    };
+    if let Some(previous) = state.live_group.filter(|previous| live != Some(*previous))
+        && !state.opened.contains_key(&previous)
+    {
+        state.fold(previous, false, Redraw::Tick);
+    }
+    state.live_group = live;
+}
+
+/// Draws the conversation again at the next tick of the 30 fps grid the streamed text redraws on
+/// (`ClaudeSession::redraw_on_tick`) — once, however many of its rows ask.
+fn request_tick(chat: &WeakEntity<ClaudeChat>, pending: &Rc<Cell<bool>>, cx: &mut App) {
+    if pending.replace(true) {
+        return;
+    }
+    let (chat, pending) = (chat.clone(), pending.clone());
+    let wait = gpui::until_next_animation_tick();
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(wait).await;
+        pending.set(false);
+        chat.update(cx, |_, cx| cx.notify()).ok();
+    })
+    .detach();
 }
 
 /// The list's items over `entries`: one per shown entry, Claude's minor steps in a row as one
@@ -830,6 +1007,7 @@ pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeCh
                 .shadow(ui::popover_shadow(ui))
                 .cursor_pointer()
                 .hover(move |style| style.bg(ui.hover))
+                .active(motion::press)
                 .tooltip(ui::tooltip(tr("Jump to Latest"), None))
                 .child(icon(IconName::ArrowDown, ui.text_muted).size(px(14.)))
                 .on_click(move |_, _, cx| {
@@ -841,10 +1019,12 @@ pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeCh
                 }),
         )
     });
+    // It pops up where it sits as the user leaves the end.
+    let jump = jump.map(|jump| Appear::pop((1., 1.)).apply("claude-jump-appear", jump));
     let items = {
         let weak = weak.clone();
-        list(state.list.clone(), move |index, _window, cx| {
-            render_item(&weak, index, cx)
+        list(state.list.clone(), move |index, window, cx| {
+            render_item(&weak, index, window, cx)
         })
         .size_full()
     };
@@ -868,23 +1048,45 @@ pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeCh
 }
 
 /// One item of the main conversation, in the column, with the space above it.
-fn render_item(chat: &WeakEntity<ClaudeChat>, index: usize, cx: &mut App) -> AnyElement {
+fn render_item(
+    chat: &WeakEntity<ClaudeChat>,
+    index: usize,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let Some(entity) = chat.upgrade() else {
         return div().into_any_element();
     };
+    let (element, redraw, pending) = item_element(&entity, chat, index, cx);
+    match redraw {
+        Redraw::Frame => window.request_animation_frame(),
+        Redraw::Tick => request_tick(chat, &pending, cx),
+        Redraw::None => {}
+    }
+    element
+}
+
+/// [`render_item`]'s element, and how soon what moves in it wants the next frame.
+fn item_element(
+    entity: &Entity<ClaudeChat>,
+    chat: &WeakEntity<ClaudeChat>,
+    index: usize,
+    cx: &App,
+) -> (AnyElement, Redraw, Rc<Cell<bool>>) {
     let chat_view = entity.read(cx);
     let session = chat_view.session().clone();
     let model = session.read(cx).model();
     let state = chat_view.shown_transcript();
     let agent = state.scope.and_then(|tool| find_tool(&model.entries, tool));
     let entries = scope_entries(model, state.scope);
+    let pending = state.tick_pending.clone();
     let Some(item) = state
         .items
         .get(index)
         .copied()
         .filter(|item| item.range().end <= entries.len())
     else {
-        return div().into_any_element();
+        return (div().into_any_element(), Redraw::None, pending);
     };
     let theme = Theme::get(cx);
     let renderer = Renderer {
@@ -898,6 +1100,7 @@ fn render_item(chat: &WeakEntity<ClaudeChat>, index: usize, cx: &mut App) -> Any
         tasks: &model.tasks,
         agent: agent.is_some(),
         marks: RefCell::new(HashMap::new()),
+        redraw: Cell::new(Redraw::None),
     };
     let lead = leads_turn(entries, &state.items, index);
     let last = index + 1 == state.items.len();
@@ -923,10 +1126,12 @@ fn render_item(chat: &WeakEntity<ClaudeChat>, index: usize, cx: &mut App) -> Any
             .into_any_element(),
         None => body,
     };
-    column(body)
+    let body = renderer.arrival(&entries[item.range().start], body);
+    let element = column(body)
         .pt(px(top_gap(entries, &state.items, index)))
         .when(last, |item| item.pb(px(12.)))
-        .into_any_element()
+        .into_any_element();
+    (element, renderer.redraw.get(), pending)
 }
 
 /// Thinking that is over with nothing to show — no text (the CLI didn't summarize it) and no
@@ -962,9 +1167,97 @@ struct Renderer<'a> {
     agent: bool,
     /// The search's marks by entry, made on first use: an entry's texts share its count.
     marks: RefCell<HashMap<EntryId, Rc<Marks>>>,
+    /// How soon what moves in the item wants the next frame.
+    redraw: Cell<Redraw>,
 }
 
 impl Renderer<'_> {
+    /// Something in the item moves: it is drawn again as `redraw` says.
+    fn animating(&self, redraw: Redraw) {
+        self.redraw.set(self.redraw.get().max(redraw));
+    }
+
+    /// The item of `entry`, appearing while the entry has just arrived: the user's message rises
+    /// from the field below, growing out of its corner by the field (`BOUNCE`); the "Done" card
+    /// pops (`POP`); Claude's other blocks fade in rising a little (`SMOOTH`, on the tick).
+    fn arrival(&self, entry: &Entry, body: AnyElement) -> AnyElement {
+        let (appear, curve, redraw) = match &entry.kind {
+            EntryKind::User(_) | EntryKind::Shell(_) => (
+                Appear::slide(0., 16.).scale(0.96).origin(1., 1.),
+                motion::BOUNCE,
+                Redraw::Frame,
+            ),
+            EntryKind::TurnEnd(_) if !self.model.turn_changes(entry.id).is_empty() => (
+                Appear::pop((0.5, 1.)).scale(0.95),
+                motion::POP,
+                Redraw::Frame,
+            ),
+            _ => (
+                Appear::slide(0., 8.).curve(motion::SMOOTH),
+                motion::SMOOTH,
+                Redraw::Tick,
+            ),
+        };
+        match self.state.arriving(entry.id, curve) {
+            Some(since) => {
+                self.animating(redraw);
+                appear
+                    .style(div().child(body), motion::progress(since, curve))
+                    .into_any_element()
+            }
+            None => body,
+        }
+    }
+
+    /// A step that joined an open group fades in, rising a little — not the group's first, which
+    /// came with the group.
+    fn arriving_step(&self, entry: &Entry, row: AnyElement) -> AnyElement {
+        match self.state.arriving(entry.id, motion::SMOOTH) {
+            Some(since) => {
+                self.animating(Redraw::Tick);
+                Appear::slide(0., 6.)
+                    .style(div().child(row), motion::progress(since, motion::SMOOTH))
+                    .into_any_element()
+            }
+            None => row,
+        }
+    }
+
+    /// The body of a row, a card or a group that opens and closes (`open` now): shown while open;
+    /// for a moment after it flips, it unfolds — its clip glides from nothing to the body's height
+    /// (`SMOOTH`) as it fades in — or folds away, taking no input.
+    fn fold(&self, id: EntryId, open: bool, body: Option<AnyElement>) -> Option<AnyElement> {
+        let Some(fold) = self.state.folding(id, open) else {
+            return body.filter(|_| open);
+        };
+        let body = body?;
+        self.animating(fold.redraw);
+        let shown = fold.shown();
+        let heights = self.state.fold_heights.clone();
+        let natural = heights.borrow().get(&id).copied();
+        let opacity = if open { (shown / 0.6).min(1.) } else { shown };
+        let clip = div()
+            .overflow_hidden()
+            .opacity(opacity.clamp(0., 1.))
+            .on_children_prepainted(move |bounds, _, _| {
+                if let Some(bounds) = bounds.first() {
+                    heights.borrow_mut().insert(id, bounds.size.height);
+                }
+            });
+        // The first frame measures the body: hidden when it opens, whole when it folds.
+        let clip = match natural {
+            Some(height) => clip.h(height * shown.max(0.)),
+            None if open => clip.h(px(0.)),
+            None => clip,
+        };
+        let clip = clip.child(body);
+        Some(if open {
+            clip.into_any_element()
+        } else {
+            motion::inert(clip).into_any_element()
+        })
+    }
+
     /// A top-level entry on its side of the conversation.
     fn top_entry(&self, entry: &Entry, lead: bool) -> AnyElement {
         match &entry.kind {
@@ -1260,13 +1553,15 @@ impl Renderer<'_> {
                             .ok();
                     })
             });
+            // They fade in under the pointer (an id keeps the fade).
             div()
+                .id(("claude-user-actions", id))
                 .flex()
                 .items_center()
                 .gap(px(2.))
                 .when(!copied, |row| {
-                    row.invisible()
-                        .group_hover(group.clone(), |style| style.visible())
+                    row.opacity(0.)
+                        .group_hover(group.clone(), |style| style.opacity(1.))
                 })
                 .child(copy)
                 .children(edit)
@@ -1580,9 +1875,10 @@ impl Renderer<'_> {
                 row.cursor_pointer()
                     .hover(move |style| style.bg(ui.hover))
                     .child(chevron(expanded, ui))
-                    .on_click(self.toggle(id))
+                    .on_click(self.toggle(id, expanded))
             });
-        let body = expanded.then(|| {
+        let folding = expandable && self.state.folding(id, false).is_some();
+        let body = (expanded || folding).then(|| {
             let color = if shell.state == ShellState::Failed {
                 ui.error
             } else {
@@ -1594,7 +1890,9 @@ impl Renderer<'_> {
                 .px(px(10.))
                 .py(px(8.))
                 .child(self.marked_output_lines(id, output, color))
+                .into_any_element()
         });
+        let body = self.fold(id, expanded, body);
         let note = if shell.delivered {
             tr("Claude got the output")
         } else {
@@ -1657,6 +1955,7 @@ impl Renderer<'_> {
             ))
             .children(copy.map(|copy| {
                 div()
+                    .id(("claude-text-copy", id))
                     .absolute()
                     .right(px(-4.))
                     .bottom(px(-4.))
@@ -1664,8 +1963,8 @@ impl Renderer<'_> {
                     .bg(ui.island)
                     .when(!copied, |corner| {
                         corner
-                            .invisible()
-                            .group_hover(group.clone(), |style| style.visible())
+                            .opacity(0.)
+                            .group_hover(group.clone(), |style| style.opacity(1.))
                     })
                     .child(copy)
             }))
@@ -1757,9 +2056,10 @@ impl Renderer<'_> {
                 row.cursor_pointer()
                     .hover(move |style| style.bg(ui.hover))
                     .child(chevron(expanded, ui))
-                    .on_click(self.toggle(id))
+                    .on_click(self.toggle(id, expanded))
             });
-        let body = expanded.then(|| {
+        let folding = expandable && self.state.folding(id, false).is_some();
+        let body = (expanded || folding).then(|| {
             let blocks = self
                 .state
                 .texts
@@ -1777,12 +2077,13 @@ impl Renderer<'_> {
                     Some(blocks) => markdown::render(&blocks, ui.text_muted, self.theme),
                     None => div().child(text.to_string()).into_any_element(),
                 })
+                .into_any_element()
         });
         div()
             .flex()
             .flex_col()
             .child(row)
-            .children(body)
+            .children(self.fold(id, expanded, body))
             .into_any_element()
     }
 
@@ -1864,23 +2165,35 @@ impl Renderer<'_> {
             .child(chevron(open, ui))
             .on_click(move |_, _, cx| {
                 chat.update(cx, |chat, cx| {
-                    chat.shown_transcript_mut().opened.insert(id, !open);
-                    chat.shown_transcript_mut().invalidate();
+                    let transcript = chat.shown_transcript_mut();
+                    transcript.opened.insert(id, !open);
+                    transcript.fold(id, !open, Redraw::Frame);
+                    transcript.invalidate();
                     cx.notify();
                 })
                 .ok();
             });
-        let rows = open.then(|| {
+        let folding = self.state.folding(id, false).is_some();
+        let rows = (open || folding).then(|| {
             div()
                 .flex()
                 .flex_col()
                 .px(px(10.))
                 .pb(px(5.))
-                .children(shown.iter().map(|entry| match &entry.kind {
-                    EntryKind::Tool(tool) => self.tool(entry.id, tool, 1),
-                    _ => self.entry(entry, 1),
+                .children(shown.iter().map(|entry| {
+                    let row = match &entry.kind {
+                        EntryKind::Tool(tool) => self.tool(entry.id, tool, 1),
+                        _ => self.entry(entry, 1),
+                    };
+                    if entry.id == id {
+                        row
+                    } else {
+                        self.arriving_step(entry, row)
+                    }
                 }))
+                .into_any_element()
         });
+        let rows = self.fold(id, open, rows);
         div()
             .flex()
             .flex_col()
@@ -2022,24 +2335,19 @@ impl Renderer<'_> {
         }
         header.extend(end);
         let toggle = body.is_some().then_some(expanded);
-        let card = self.card(
-            ("claude-bash", id),
-            header,
-            body.filter(|_| expanded),
-            toggle,
-            None,
-        );
-        self.clickable_card(id, card, toggle.is_some())
+        let body = self.fold(id, expanded, body);
+        let card = self.card(("claude-bash", id), header, body, toggle, None);
+        self.clickable_card(id, card, toggle)
     }
 
-    /// A card whose header flips its body.
-    fn clickable_card(&self, id: EntryId, card: AnyElement, toggles: bool) -> AnyElement {
-        if !toggles {
+    /// A card whose header flips its body (`toggle`: whether it is open; `None` — it has none).
+    fn clickable_card(&self, id: EntryId, card: AnyElement, toggle: Option<bool>) -> AnyElement {
+        let Some(expanded) = toggle else {
             return card;
-        }
+        };
         div()
             .id(("claude-card-toggle", id))
-            .on_click(self.toggle(id))
+            .on_click(self.toggle(id, expanded))
             .child(card)
             .into_any_element()
     }
@@ -2155,14 +2463,9 @@ impl Renderer<'_> {
             .map(|body| div().px(px(4.)).py(px(4.)).child(body).into_any_element());
         let expanded = body.is_some() && self.state.expanded(id, true);
         let toggle = body.is_some().then_some(expanded);
-        let card = self.card(
-            ("claude-edit", id),
-            header,
-            body.filter(|_| expanded),
-            toggle,
-            None,
-        );
-        self.clickable_card(id, card, toggle.is_some())
+        let body = self.fold(id, expanded, body);
+        let card = self.card(("claude-edit", id), header, body, toggle, None);
+        self.clickable_card(id, card, toggle)
     }
 
     /// What an edit card opens to: the change, or why it didn't happen.
@@ -2496,7 +2799,7 @@ impl Renderer<'_> {
                 row.cursor_pointer()
                     .hover(move |style| style.bg(ui.hover))
                     .child(chevron(expanded, ui))
-                    .on_click(self.toggle(id))
+                    .on_click(self.toggle(id, expanded))
             });
         let error = (tool.state == ToolState::Failed && !expanded)
             .then_some(tool.result.as_ref())
@@ -2516,16 +2819,20 @@ impl Renderer<'_> {
             .flex_col()
             .child(row)
             .children(error)
-            .when(expanded, |column| column.children(details))
+            .children(self.fold(id, expanded, details))
             .into_any_element()
     }
 
-    /// The flip of an entry's expansion, for a click handler.
-    fn toggle(&self, id: EntryId) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+    /// The flip of an entry's expansion (`expanded` now), for a click handler.
+    fn toggle(
+        &self,
+        id: EntryId,
+        expanded: bool,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
         let chat = self.chat.clone();
         move |_, _, cx| {
             chat.update(cx, |chat, cx| {
-                chat.shown_transcript_mut().toggle(id);
+                chat.shown_transcript_mut().toggle(id, expanded);
                 cx.notify();
             })
             .ok();
@@ -3158,10 +3465,11 @@ impl Renderer<'_> {
             .child(div().flex_1())
             .children(answer.map(|answer| {
                 div()
+                    .id(("claude-turn-copy", id))
                     .when(!copied, |corner| {
                         corner
-                            .invisible()
-                            .group_hover(group.clone(), |style| style.visible())
+                            .opacity(0.)
+                            .group_hover(group.clone(), |style| style.opacity(1.))
                     })
                     .child(self.copy_button(id, answer))
             }))
@@ -4012,16 +4320,21 @@ fn pulse(id: impl Into<gpui::ElementId>, ui: UiColors) -> impl IntoElement {
         )
 }
 
+/// A row's chevron: points right, and turns down as the row opens (`POP`). The row's id scopes
+/// the turn.
 fn chevron(expanded: bool, ui: UiColors) -> impl IntoElement {
-    icon(
-        if expanded {
-            IconName::ChevronDown
-        } else {
-            IconName::ChevronRight
-        },
-        ui.dim,
-    )
-    .size(px(12.))
+    icon(IconName::ChevronRight, ui.dim)
+        .size(px(12.))
+        .with_transition(
+            "chevron",
+            if expanded { 1. } else { 0. },
+            motion::POP,
+            |chevron, turn: f32| {
+                chevron.with_transformation(Transformation::rotate(radians(
+                    turn * std::f32::consts::FRAC_PI_2,
+                )))
+            },
+        )
 }
 
 /// The state of a tool call at the row's end; nothing for a call that went well.

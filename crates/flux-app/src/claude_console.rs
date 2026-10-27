@@ -88,8 +88,7 @@ const STATUS_WIDTH: f32 = 16.;
 const STATUS_GAP: f32 = 12.;
 /// A history row: one line, the title and when.
 const HISTORY_ROW_HEIGHT: f32 = 28.;
-/// How long a waiting question takes to slide open, and the height it opens to at most.
-const OPEN_DURATION: Duration = Duration::from_millis(220);
+/// The height a waiting question slides open to at most (`motion::SMOOTH`).
 const OPEN_HEIGHT: f32 = 600.;
 /// How many options a question offers in the console (digits 1–9).
 const MAX_OPTIONS: usize = 9;
@@ -1006,11 +1005,24 @@ impl ClaudeConsole {
                 // It slides open when the session starts to wait: once per question (the
                 // animation's id), then it stays still — no frames asked for after.
                 if let (Some(extra), Some(request)) = (extra, request) {
-                    main = main.child(div().overflow_hidden().child(extra).with_animation(
-                        SharedString::from(format!("claude-console-open-{request}")),
-                        Animation::new(OPEN_DURATION).with_easing(gpui::ease_out_quint()),
-                        |content, delta| content.max_h(px(OPEN_HEIGHT * delta)).opacity(delta),
-                    ));
+                    let content = div().overflow_hidden().child(extra);
+                    main = main.child(if crate::motion::enabled() {
+                        let curve = crate::motion::SMOOTH;
+                        content
+                            .with_animation(
+                                SharedString::from(format!("claude-console-open-{request}")),
+                                Animation::new(curve.duration())
+                                    .with_easing(move |t| curve.ease(t)),
+                                |content, delta| {
+                                    content
+                                        .max_h(px(OPEN_HEIGHT * delta))
+                                        .opacity(delta.min(1.))
+                                },
+                            )
+                            .into_any_element()
+                    } else {
+                        content.into_any_element()
+                    });
                 }
                 let actions = (active && done && has_changes).then(|| {
                     let review = session.clone();
@@ -1902,10 +1914,10 @@ impl Render for ClaudeConsole {
             self.render_onboarding(cx)
         };
         let limits = ready.then(|| self.render_limits(cx)).flatten();
-        let menu = self
-            .menu
-            .as_ref()
-            .map(|menu| ContextMenu::overlay(&menu.menu, menu.position));
+        let menu = Some(ContextMenu::slot(
+            "claude-console-menu",
+            self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+        ));
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)

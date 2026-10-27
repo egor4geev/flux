@@ -10,9 +10,12 @@
 //! Keys (context "NotificationsPanel"): ↑/↓ select, ↵ runs the first action, ⌫ removes, Esc returns
 //! to the editor, ⇧Esc hides the window. No shortcut opens it (as in JetBrains): the launchpad, the
 //! bell in the status bar, the command palette.
+//!
+//! Motion: an entry that arrives while the window is shown fades in and drops into place
+//! ([`arrival`]).
 
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     Action, AnyElement, App, ClickEvent, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity,
@@ -23,6 +26,7 @@ use gpui::{
 use crate::context_menu::ContextMenu;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::motion;
 use crate::notification_center::{
     Entry, NotificationCenter, NotificationCenterEvent, NotificationGroup, NotificationId,
 };
@@ -703,7 +707,17 @@ impl Render for NotificationsPanel {
         let focused = self.focus_handle.contains_focused(window, cx);
         let rows: Vec<AnyElement> = entries
             .iter()
-            .map(|entry| self.render_entry(entry, now, focused, cx))
+            .map(|entry| {
+                let row = self.render_entry(entry, now, focused, cx);
+                let value = arrival(entry.at, window);
+                if value >= 1. {
+                    return row;
+                }
+                motion::Appear::slide(0., -ARRIVAL_DROP)
+                    .curve(motion::SMOOTH)
+                    .style(div().child(row), value)
+                    .into_any_element()
+            })
             .collect();
         let list = if rows.is_empty() {
             self.render_empty(cx).into_any_element()
@@ -789,11 +803,10 @@ impl Render for NotificationsPanel {
                 ui::resize_handle_center(ui::style(cx)),
                 ui,
             ))
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "notifications-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }
 
@@ -838,6 +851,22 @@ fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement 
 
 /// The time of a notification as the journal shows it: "10:42" today, "Yesterday 10:42", else
 /// "2026-10-07 10:42" (local time).
+/// How far a new entry drops into place as it fades in.
+const ARRIVAL_DROP: f32 = 8.;
+
+/// How far the entry that arrived `at` has come in, 0 → 1, asking for the next frame until it has.
+/// The journal draws every entry anew on each change, so the entry's own time drives it, not the
+/// row: one that came while the window was hidden is simply there.
+fn arrival(at: SystemTime, window: &Window) -> f32 {
+    let age = SystemTime::now().duration_since(at).unwrap_or_default();
+    if age >= motion::SMOOTH.duration() {
+        return 1.;
+    }
+    Instant::now()
+        .checked_sub(age)
+        .map_or(1., |since| motion::animate(since, motion::SMOOTH, window))
+}
+
 fn format_time(at: SystemTime, now: SystemTime) -> String {
     let seconds = |time: SystemTime| {
         time.duration_since(UNIX_EPOCH)

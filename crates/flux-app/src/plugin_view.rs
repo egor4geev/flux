@@ -38,9 +38,10 @@ use gpui::{
 };
 
 use crate::i18n::tr;
-use crate::icons::{IconName, icon, plugin_icon};
+use crate::icons::{self, IconName, icon, plugin_icon};
 use crate::input::{InputEvent, TextInput};
 use crate::markdown::{self, Block};
+use crate::motion::{Disclosure, unfold_style};
 use crate::notifications::{Progress, progress_bar};
 use crate::notifications_panel::{FocusEditor, Hide};
 use crate::prompt_input::{PromptInput, PromptInputEvent};
@@ -681,6 +682,7 @@ impl PluginView {
         };
         match tree.expand_selected() {
             TreeMove::Toggled(key, expanded) => {
+                tree.user_toggled(key.clone(), expanded);
                 self.emit(&id, UiEvent::Expanded((key, expanded)), cx)
             }
             TreeMove::Selected(index, key) => {
@@ -698,6 +700,7 @@ impl PluginView {
         };
         match tree.collapse_selected() {
             TreeMove::Toggled(key, expanded) => {
+                tree.user_toggled(key.clone(), expanded);
                 self.emit(&id, UiEvent::Expanded((key, expanded)), cx)
             }
             TreeMove::Selected(index, key) => {
@@ -758,7 +761,11 @@ impl PluginView {
         };
         let key = tree.rows[visible.row].key.clone();
         let selected = tree.select(index);
-        let toggled = (click_count >= 2 && visible.has_children).then(|| tree.toggle(visible.row));
+        let toggled = (click_count >= 2 && visible.has_children).then(|| {
+            let expanded = tree.toggle(visible.row);
+            tree.user_toggled(key.clone(), expanded);
+            expanded
+        });
         if let Some(key) = selected {
             self.emit(tree_id, UiEvent::Selected(key), cx);
         }
@@ -789,6 +796,7 @@ impl PluginView {
         };
         let key = tree.rows[visible.row].key.clone();
         let expanded = tree.toggle(visible.row);
+        tree.user_toggled(key.clone(), expanded);
         self.emit(tree_id, UiEvent::Expanded((key, expanded)), cx);
         cx.notify();
     }
@@ -821,14 +829,18 @@ impl PluginView {
                 let row = &tree.rows[visible.row];
                 let selected = tree.selected.as_ref() == Some(&row.key);
                 let expanded = visible.has_children && tree.is_expanded(visible.row);
+                let motion = RowMotion {
+                    chevron: tree.disclosure.chevron(&row.key, expanded, window),
+                    unfold: tree.disclosure.unfold(index, window),
+                };
                 Some(if tree.cards {
                     self.render_tree_card(
-                        tree_id, index, visible, row, selected, expanded, focused, look, window,
-                        ui, cx,
+                        tree_id, index, visible, row, selected, motion, focused, look, window, ui,
+                        cx,
                     )
                 } else {
                     self.render_tree_row(
-                        tree_id, index, visible, row, selected, expanded, focused, ui, cx,
+                        tree_id, index, visible, row, selected, motion, focused, ui, cx,
                     )
                 })
             })
@@ -918,7 +930,7 @@ impl PluginView {
         visible: Visible,
         row: &TreeRow,
         selected: bool,
-        expanded: bool,
+        motion: RowMotion,
         focused: bool,
         ui: UiColors,
         cx: &mut Context<Self>,
@@ -929,11 +941,6 @@ impl PluginView {
             .and_then(|name| plugin_icon(&self.plugin, name, &ui));
         let chevron = {
             let tree = tree_id.to_string();
-            let glyph = visible.has_children.then_some(if expanded {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            });
             div()
                 .flex_none()
                 .w(px(CHEVRON_WIDTH))
@@ -950,7 +957,11 @@ impl PluginView {
                         }),
                     )
                 })
-                .children(glyph.map(|glyph| icon(glyph, ui.dim).size(px(CHEVRON_SIZE))))
+                .children(
+                    visible
+                        .has_children
+                        .then(|| icons::chevron(motion.chevron, ui.dim).size(px(CHEVRON_SIZE))),
+                )
         };
         let body = div()
             .relative()
@@ -1060,7 +1071,7 @@ impl PluginView {
             body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover))
         };
         let tree = tree_id.to_string();
-        div()
+        let element = div()
             .id(("plugin-tree-row", index))
             .group(ROW_GROUP)
             .h(px(ROW_HEIGHT))
@@ -1070,8 +1081,8 @@ impl PluginView {
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_row(&tree, index, event.click_count(), window, cx)
             }))
-            .child(body)
-            .into_any_element()
+            .child(body);
+        unfold_style(element, motion.unfold).into_any_element()
     }
 
     /// A row of a tree of cards (a board's column): the icon, the label and the badge, the
@@ -1085,7 +1096,7 @@ impl PluginView {
         visible: Visible,
         row: &TreeRow,
         selected: bool,
-        expanded: bool,
+        motion: RowMotion,
         focused: bool,
         look: RowsLook,
         window: &mut Window,
@@ -1098,11 +1109,6 @@ impl PluginView {
             .and_then(|name| plugin_icon(&self.plugin, name, &ui));
         let chevron = visible.has_children.then(|| {
             let tree = tree_id.to_string();
-            let glyph = if expanded {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            };
             div()
                 .flex_none()
                 .w(px(CHEVRON_WIDTH))
@@ -1116,7 +1122,7 @@ impl PluginView {
                         this.click_chevron(&tree, index, window, cx)
                     }),
                 )
-                .child(icon(glyph, ui.dim).size(px(CHEVRON_SIZE)))
+                .child(icons::chevron(motion.chevron, ui.dim).size(px(CHEVRON_SIZE)))
         });
         let first_line = div()
             .flex_none()
@@ -1230,7 +1236,7 @@ impl PluginView {
                 .group_hover(ROW_GROUP, move |style| style.bg(ui.hover))
         };
         let tree = tree_id.to_string();
-        div()
+        let element = div()
             .id(("plugin-tree-row", index))
             .group(ROW_GROUP)
             .h(px(look.height))
@@ -1240,8 +1246,8 @@ impl PluginView {
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_row(&tree, index, event.click_count(), window, cx)
             }))
-            .child(card)
-            .into_any_element()
+            .child(card);
+        unfold_style(element, motion.unfold).into_any_element()
     }
 
     // --- Toggles and buttons ---
@@ -2461,6 +2467,14 @@ struct RowsLook {
     tags_width: Option<f32>,
 }
 
+/// A drawn row's motion: how open its chevron is (0 → 1, turning after the user toggled it) and how
+/// far it has unfolded (1 in place) — [`Disclosure::chevron`], [`Disclosure::unfold`].
+#[derive(Clone, Copy)]
+struct RowMotion {
+    chevron: f32,
+    unfold: f32,
+}
+
 /// A tree's rows and what the user did to them: expanded rows and the selection by key, the
 /// scroll.
 struct TreeState {
@@ -2475,6 +2489,8 @@ struct TreeState {
     /// Expanded or not, by key: the plugin's `expanded` when the key is first seen, then the
     /// user's choice.
     expanded: HashMap<String, bool>,
+    /// The rows the user expands and collapses: their chevrons turn, the rows they show unfold.
+    disclosure: Disclosure<String>,
     selected: Option<String>,
     scroll: UniformListScrollHandle,
     /// The rows are cards (`tree-spec.cards`).
@@ -2493,6 +2509,7 @@ impl TreeState {
             parents: Vec::new(),
             visible: Vec::new(),
             expanded: HashMap::new(),
+            disclosure: Disclosure::default(),
             selected: None,
             scroll: UniformListScrollHandle::new(),
             cards: false,
@@ -2585,6 +2602,37 @@ impl TreeState {
             }
             self.selected = row.map(|index| self.rows[index].key.clone());
         }
+        self.disclosure_rows();
+    }
+
+    /// Tells the disclosure where the rows under each expanded row are drawn now: the deeper ones
+    /// right after it (none yet when the plugin hasn't sent its children).
+    fn disclosure_rows(&mut self) {
+        let (rows, visible, expanded) = (&self.rows, &self.visible, &self.expanded);
+        self.disclosure.rows_changed(|key| {
+            let index = visible.iter().position(|v| rows[v.row].key == *key)?;
+            let node = visible[index];
+            if !expanded
+                .get(key)
+                .copied()
+                .unwrap_or(rows[node.row].expanded)
+            {
+                return None;
+            }
+            let end = visible[index + 1..]
+                .iter()
+                .position(|v| v.depth <= node.depth)
+                .map_or(visible.len(), |offset| index + 1 + offset);
+            Some(index + 1..end)
+        });
+    }
+
+    /// The user (a click, a key) expanded or collapsed the row `key` — after
+    /// [`TreeState::toggle`]: its chevron turns, the rows it shows unfold. What the plugin expands
+    /// (`tree-row.expanded`) simply shows.
+    fn user_toggled(&mut self, key: String, expanded: bool) {
+        self.disclosure.toggled(key, expanded);
+        self.disclosure_rows();
     }
 
     /// The selected row's index among the drawn ones.

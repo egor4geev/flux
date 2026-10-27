@@ -260,6 +260,19 @@ pub struct Style {
     /// The opacity of this element
     pub opacity: Option<f32>,
 
+    /// Flux patch (motion, 2026-10-28): scales what this element and its children paint by this
+    /// factor around [`Style::transform_origin`] — a popover growing out of the point it came
+    /// from, a button pressed in. Layout and hit testing keep the unscaled bounds.
+    pub transform_scale: Option<f32>,
+
+    /// Flux patch (motion): the point [`Style::transform_scale`] scales around, as fractions of
+    /// the element's width and height (the middle, `(0.5, 0.5)`, when unset).
+    pub transform_origin: Option<Point<f32>>,
+
+    /// Flux patch (motion): moves what this element and its children paint by this much, after
+    /// the scale — a card sliding in. Layout and hit testing keep the unmoved bounds.
+    pub transform_translate: Option<Point<Pixels>>,
+
     /// The grid columns of this element
     /// Equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<u16>,
@@ -769,6 +782,9 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            transform_scale: None,
+            transform_origin: None,
+            transform_translate: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

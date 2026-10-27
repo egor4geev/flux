@@ -11,12 +11,17 @@
 //! Operations — create, rename, move (⌘X ⌘V, drag and drop), copy, delete to the Trash — also run
 //! in the background; the affected directories are re-read right after them, without waiting for
 //! events. Workspace updates the open documents in response to [`FileTreeEvent`] events.
+//!
+//! Motion (`crate::motion`): a directory the user opens turns its chevron and unfolds its rows, one
+//! closed turns it back; a row that has just arrived (a new file, a renamed, moved or copied one)
+//! glows for a moment; the drop highlight crossfades from one directory to the next. The rows are
+//! recycled, so all of it is kept here, by path and time, not by the rows.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_fs::tree::{FileTree, Row};
 use flux_fs::{
@@ -38,6 +43,7 @@ use crate::dialog::Dialog;
 use crate::i18n::{tr, trf};
 use crate::icons::{FileIcon, ICON_SIZE, IconName, file_icon, folder_icon, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::motion;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 
@@ -69,6 +75,14 @@ const ROW_GROUP: &str = "file-tree-row";
 const WATCH_DELAY: Duration = Duration::from_millis(80);
 /// PageUp/PageDown while the list height is unknown.
 const DEFAULT_PAGE_ROWS: usize = 20;
+/// A row that has just arrived glows in the accent color and fades out on this curve: it holds a
+/// moment, then goes.
+const GLOW: motion::Curve =
+    motion::Curve::eased(Duration::from_millis(1100), motion::Easing::InOutCubic);
+/// The accent's alpha at the start of the glow.
+const GLOW_ALPHA: f32 = 0.42;
+/// An arrival's row shows once its directory is re-read; if it takes longer than this, no glow.
+const GLOW_WAIT: Duration = Duration::from_secs(2);
 
 // Window-level actions: handled by Workspace.
 actions!(file_tree, [ToggleOpen, ToggleFocus]);
@@ -228,6 +242,14 @@ pub(crate) struct DraggedEntry {
 #[derive(Debug, Clone, Copy)]
 struct DraggedEdge;
 
+/// A row that has just arrived — a new file, a renamed, moved or copied one — glows so the eye
+/// finds it ([`GLOW`]), from the moment its row shows.
+struct Glow {
+    path: PathBuf,
+    asked: Instant,
+    since: Option<Instant>,
+}
+
 /// File tree panel: one per window; it lives as long as the window keeps the same project root.
 pub struct FileTreePanel {
     root: PathBuf,
@@ -250,6 +272,12 @@ pub struct FileTreePanel {
     menu: Option<Menu>,
     /// Where the dragged row would be dropped: the directory under the cursor.
     drop_target: Option<PathBuf>,
+    /// The drop target before this one, and when it changed: the highlight crossfades.
+    drop_fade: Option<(Option<PathBuf>, Instant)>,
+    /// Directories the user opened and closed: chevrons turn, the rows shown unfold.
+    disclosure: motion::Disclosure<PathBuf>,
+    /// The row that has just arrived.
+    glow: Option<Glow>,
     /// The width is being dragged: the handle stays highlighted while the drag lasts.
     resizing: bool,
     _watcher: Option<Watcher>,
@@ -288,6 +316,9 @@ impl FileTreePanel {
             clipboard: None,
             menu: None,
             drop_target: None,
+            drop_fade: None,
+            disclosure: motion::Disclosure::default(),
+            glow: None,
             resizing: false,
             _watcher: None,
             _watch_task: watch_task,
@@ -329,6 +360,9 @@ impl FileTreePanel {
     /// repaint.
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.rows = self.tree.rows();
+        let rows = &self.rows;
+        self.disclosure.rows_changed(|dir| children_rows(rows, dir));
+        self.place_glow();
         for (dir, ignored) in self.tree.pending_loads() {
             if !self.reads.contains_key(&dir) {
                 self.read(dir, ignored, cx);
@@ -413,10 +447,34 @@ impl FileTreePanel {
         }
     }
 
-    /// Selects `path` as soon as the directories leading to it have been read.
+    /// Selects `path` as soon as the directories leading to it have been read; its row glows (it
+    /// has just arrived: created, renamed, moved, copied).
     fn select_when_shown(&mut self, path: PathBuf) {
         self.tree.reveal(&path);
+        self.glow = motion::enabled().then(|| Glow {
+            path: path.clone(),
+            asked: Instant::now(),
+            since: None,
+        });
         self.reveal_target = Some(path);
+        self.place_glow();
+    }
+
+    /// The glow starts when its row shows, and is forgotten once it has faded (or if the row
+    /// doesn't show in time).
+    fn place_glow(&mut self) {
+        let Some(glow) = &mut self.glow else {
+            return;
+        };
+        match glow.since {
+            Some(since) if !motion::running(since, GLOW) => self.glow = None,
+            Some(_) => {}
+            None if self.rows.iter().any(|row| row.path == glow.path) => {
+                glow.since = Some(Instant::now())
+            }
+            None if glow.asked.elapsed() > GLOW_WAIT => self.glow = None,
+            None => {}
+        }
     }
 
     /// Watching the root: events are coalesced into a batch and turned into a re-read plan.
@@ -557,6 +615,7 @@ impl FileTreePanel {
         if !row.expanded {
             let path = row.path.clone();
             self.tree.expand(&path);
+            self.disclosure.toggled(path, true);
             return self.changed(cx);
         }
         if self
@@ -577,6 +636,7 @@ impl FileTreePanel {
         if row.kind == EntryKind::Dir && row.expanded {
             let path = row.path.clone();
             self.tree.collapse(&path);
+            self.disclosure.toggled(path, false);
             return self.changed(cx);
         }
         let parent = row.path.parent().and_then(|parent| self.row_index(parent));
@@ -589,6 +649,8 @@ impl FileTreePanel {
     fn activate(&mut self, path: PathBuf, focus: bool, cx: &mut Context<Self>) {
         if self.tree.is_dir(&path) {
             self.tree.toggle(&path);
+            let open = self.tree.is_expanded(&path);
+            self.disclosure.toggled(path, open);
             self.keep_selection_visible();
             self.changed(cx);
         } else {
@@ -1224,9 +1286,25 @@ impl FileTreePanel {
 
     fn set_drop_target(&mut self, target: Option<PathBuf>, cx: &mut Context<Self>) {
         if self.drop_target != target {
-            self.drop_target = target;
+            let before = std::mem::replace(&mut self.drop_target, target);
+            self.drop_fade = motion::enabled().then(|| (before, Instant::now()));
             cx.notify();
         }
+    }
+
+    /// How strongly the drop highlight shows on what `inside` says yes to (a target directory),
+    /// 0 → 1: it crossfades ([`motion::FADE`]) from the previous target to the new one.
+    fn drop_strength(&self, inside: impl Fn(&Path) -> bool, window: &Window) -> f32 {
+        let now = self.drop_target.as_deref().is_some_and(&inside);
+        let Some((before, since)) = &self.drop_fade else {
+            return if now { 1. } else { 0. };
+        };
+        let was = before.as_deref().is_some_and(&inside);
+        if now == was {
+            return if now { 1. } else { 0. };
+        }
+        let progress = motion::animate(*since, motion::FADE, window);
+        if now { progress } else { 1. - progress }
     }
 
     /// The list row under a window point, based on the previous frame's layout.
@@ -1281,7 +1359,7 @@ impl FileTreePanel {
     /// right click opens the root's menu.
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
-        let dropping_root = self.drop_target.as_ref() == Some(&self.root);
+        let dropping_root = self.drop_strength(|target| target == self.root, window);
         div()
             .id("file-tree-header")
             .relative()
@@ -1292,8 +1370,13 @@ impl FileTreePanel {
             .flex()
             .items_center()
             .gap_0p5()
-            .when(dropping_root, |header| {
-                header.child(drop_overlay(ui).top(px(ROW_INSET)).bottom(px(2.)))
+            .when(dropping_root > 0., |header| {
+                header.child(
+                    drop_overlay(ui)
+                        .top(px(ROW_INSET))
+                        .bottom(px(2.))
+                        .opacity(dropping_root),
+                )
             })
             .on_mouse_down(
                 MouseButton::Right,
@@ -1350,12 +1433,13 @@ impl FileTreePanel {
         index: usize,
         slot: Option<(usize, usize, EntryKind)>,
         focused: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match slot {
             Some((at, depth, kind)) if index == at => self.render_new_entry(index, depth, kind, cx),
-            Some((at, ..)) if index > at => self.render_row(index - 1, index, focused, cx),
-            _ => self.render_row(index, index, focused, cx),
+            Some((at, ..)) if index > at => self.render_row(index - 1, index, focused, window, cx),
+            _ => self.render_row(index, index, focused, window, cx),
         }
     }
 
@@ -1364,6 +1448,7 @@ impl FileTreePanel {
         row_index: usize,
         list_index: usize,
         focused: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let ui = Theme::ui(cx);
@@ -1371,11 +1456,30 @@ impl FileTreePanel {
             return div().into_any_element();
         };
         let selected = self.selected.as_ref() == Some(&row.path);
-        let band = self
-            .drop_target
-            .as_deref()
-            .filter(|target| *target != self.root)
-            .and_then(|target| drop_band(&self.rows, target, row_index));
+        // The drop band of the target, crossfading from the previous target's.
+        let band_of = |target: Option<&Path>| {
+            target
+                .filter(|target| *target != self.root)
+                .and_then(|target| drop_band(&self.rows, target, row_index))
+        };
+        let band = band_of(self.drop_target.as_deref());
+        let band_before = self
+            .drop_fade
+            .as_ref()
+            .and_then(|(before, _)| band_of(before.as_deref()));
+        let band_strength = self.drop_strength(
+            |target| target != self.root && band_of(Some(target)).is_some(),
+            window,
+        );
+        let band = band.or(band_before).filter(|_| band_strength > 0.);
+        let unfold = self.disclosure.unfold(row_index, window);
+        let glow = self
+            .glow
+            .as_ref()
+            .filter(|glow| glow.path == row.path)
+            .and_then(|glow| glow.since)
+            .map(|since| motion::animate(since, GLOW, window))
+            .filter(|progress| *progress < 1.);
         let cut = self
             .clipboard
             .as_ref()
@@ -1399,24 +1503,33 @@ impl FileTreePanel {
         if muted {
             file.color = UiColors::tint(file.color, MUTED_ICON_ALPHA);
         }
-        let body = row_body(row.depth, row.kind, row.expanded, file, ui);
-        let body = match band {
-            Some((top, bottom)) => body
-                .bg(ui.drop_target)
+        let chevron = (row.kind == EntryKind::Dir)
+            .then(|| self.disclosure.chevron(&row.path, row.expanded, window));
+        let body = row_body(row.depth, chevron, file, ui);
+        let selection = if !selected {
+            gpui::transparent_black()
+        } else if focused {
+            ui.list_selected
+        } else {
+            ui.list_selected_inactive
+        };
+        let body = match (band, glow) {
+            (Some((top, bottom)), _) => body
+                .bg(motion::mix(selection, ui.drop_target, band_strength))
                 .rounded(px(0.))
                 .when(top, |body| body.rounded_t(px(RADIUS_SM)))
                 .when(bottom, |body| body.rounded_b(px(RADIUS_SM))),
-            None if selected => body.bg(if focused {
-                ui.list_selected
-            } else {
-                ui.list_selected_inactive
-            }),
-            None => body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover)),
+            (None, Some(progress)) => body.bg(motion::mix(
+                UiColors::tint(ui.accent, GLOW_ALPHA),
+                selection,
+                progress,
+            )),
+            (None, None) if selected => body.bg(selection),
+            (None, None) => body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover)),
         };
         if renaming {
-            return row_shell(list_index)
-                .child(body.child(self.render_edit_field(ui)))
-                .into_any_element();
+            let shell = row_shell(list_index).child(body.child(self.render_edit_field(ui)));
+            return motion::unfold_style(shell, unfold).into_any_element();
         }
         // Git: a changed file in its status color, a directory with changes inside in the modified
         // one, a wholly untracked directory in the untracked one (as the Project view of JetBrains
@@ -1445,7 +1558,7 @@ impl FileTreePanel {
             name: row.name.clone().into(),
             is_dir: row.kind == EntryKind::Dir,
         };
-        row_shell(list_index)
+        let shell = row_shell(list_index)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_row(click.clone(), event.click_count(), window, cx)
             }))
@@ -1457,8 +1570,8 @@ impl FileTreePanel {
                 }),
             )
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            .child(body.child(name))
-            .into_any_element()
+            .child(body.child(name));
+        motion::unfold_style(shell, unfold).into_any_element()
     }
 
     /// The row of the new file or directory field: the file icon follows the name being typed.
@@ -1481,7 +1594,7 @@ impl FileTreePanel {
         };
         row_shell(list_index)
             .child(
-                row_body(depth, kind, false, file, ui)
+                row_body(depth, (kind == EntryKind::Dir).then_some(0.), file, ui)
                     .bg(ui.list_selected_inactive)
                     .child(self.render_edit_field(ui)),
             )
@@ -1549,13 +1662,13 @@ impl Render for FileTreePanel {
             cx.processor(move |this, range: Range<usize>, window, cx| {
                 let focused = this.is_focused(window, cx);
                 range
-                    .map(|index| this.render_item(index, slot, focused, cx))
+                    .map(|index| this.render_item(index, slot, focused, window, cx))
                     .collect::<Vec<_>>()
             }),
         )
         .track_scroll(self.scroll.clone())
         .size_full();
-        let dropping_root = self.drop_target.as_ref() == Some(&self.root);
+        let dropping_root = self.drop_strength(|target| target == self.root, window);
         // The handle was released anywhere: the drag is over and the highlight goes away.
         self.resizing &= cx.has_active_drag();
         // A separate context applies while a name is being edited: the tree's keys (arrow keys, ⌫,
@@ -1670,8 +1783,13 @@ impl Render for FileTreePanel {
                     // from the bounds of the list itself.
                     .pt_0p5()
                     .pb_2()
-                    .when(dropping_root, |list| {
-                        list.child(drop_overlay(ui).top_0().bottom(px(ROW_INSET)))
+                    .when(dropping_root > 0., |list| {
+                        list.child(
+                            drop_overlay(ui)
+                                .top_0()
+                                .bottom(px(ROW_INSET))
+                                .opacity(dropping_root),
+                        )
                     })
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1690,11 +1808,10 @@ impl Render for FileTreePanel {
                 ui::resize_handle_center(ui::style(cx)),
                 ui,
             ))
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "tree-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }
 
@@ -1744,9 +1861,9 @@ fn row_shell(list_index: usize) -> Stateful<Div> {
         .whitespace_nowrap()
 }
 
-/// Row box: indent guides, chevron (an empty column for a file), icon. The caller adds the name or
-/// the edit field.
-fn row_body(depth: usize, kind: EntryKind, expanded: bool, file: FileIcon, ui: UiColors) -> Div {
+/// Row box: indent guides, chevron (`None`, an empty column, for a file), icon. The caller adds
+/// the name or the edit field.
+fn row_body(depth: usize, chevron: Option<f32>, file: FileIcon, ui: UiColors) -> Div {
     div()
         .size_full()
         .flex()
@@ -1754,7 +1871,7 @@ fn row_body(depth: usize, kind: EntryKind, expanded: bool, file: FileIcon, ui: U
         .pr_2()
         .rounded(px(RADIUS_SM))
         .child(indent_guides(depth, ui))
-        .child(chevron(kind, expanded, ui))
+        .child(chevron_column(chevron, ui))
         .child(file.render().ml(px(ICON_GAP)))
 }
 
@@ -1776,14 +1893,9 @@ fn indent_guides(depth: usize, ui: UiColors) -> impl IntoElement {
         }))
 }
 
-/// Directory chevron (pointing right when collapsed, down when expanded); for a file, an empty
-/// column of the same width.
-fn chevron(kind: EntryKind, expanded: bool, ui: UiColors) -> impl IntoElement {
-    let glyph = match (kind, expanded) {
-        (EntryKind::Dir, true) => Some(IconName::ChevronDown),
-        (EntryKind::Dir, false) => Some(IconName::ChevronRight),
-        (EntryKind::File, _) => None,
-    };
+/// Directory chevron, `openness` of the way from collapsed (pointing right) to expanded (down) —
+/// in between while it turns; for a file (`None`), an empty column of the same width.
+fn chevron_column(openness: Option<f32>, ui: UiColors) -> impl IntoElement {
     div()
         .flex_none()
         .w(px(CHEVRON_WIDTH))
@@ -1791,7 +1903,24 @@ fn chevron(kind: EntryKind, expanded: bool, ui: UiColors) -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .children(glyph.map(|glyph| icon(glyph, ui.dim).size(px(CHEVRON_SIZE))))
+        .children(
+            openness.map(|openness| crate::icons::chevron(openness, ui.dim).size(px(CHEVRON_SIZE))),
+        )
+}
+
+/// The rows under the expanded directory `dir`: right after its row, as deep as they go (empty
+/// while it is being read); `None` when it is collapsed or out of sight.
+fn children_rows(rows: &[Row], dir: &Path) -> Option<Range<usize>> {
+    let index = rows.iter().position(|row| row.path == dir)?;
+    let row = &rows[index];
+    if !row.expanded {
+        return None;
+    }
+    let end = rows[index + 1..]
+        .iter()
+        .position(|next| next.depth <= row.depth)
+        .map_or(rows.len(), |count| index + 1 + count);
+    Some(index + 1..end)
 }
 
 /// Highlight for the root as a drop target: a rounded box inset from the island's edges.
@@ -1995,6 +2124,23 @@ mod tests {
             drop_dir(&tree, &p("/p/src/app"), Some(&p("/p/src/main.rs"))),
             None
         );
+    }
+
+    #[test]
+    fn an_opened_dir_unfolds_the_rows_under_it() {
+        // /p/src, /p/src/app, /p/src/main.rs, /p/a.rs
+        let mut tree = tree();
+        let rows = tree.rows();
+        assert_eq!(children_rows(&rows, Path::new("/p/src")), Some(1..3));
+        // Expanded but not read yet: no rows so far.
+        tree.expand(Path::new("/p/src/app"));
+        let rows = tree.rows();
+        assert_eq!(children_rows(&rows, Path::new("/p/src/app")), Some(2..2));
+        // Collapsed, or not in sight.
+        tree.collapse(Path::new("/p/src"));
+        let rows = tree.rows();
+        assert_eq!(children_rows(&rows, Path::new("/p/src")), None);
+        assert_eq!(children_rows(&rows, Path::new("/p/src/app")), None);
     }
 
     #[test]
