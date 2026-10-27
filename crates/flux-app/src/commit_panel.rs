@@ -59,7 +59,8 @@ use crate::dialog::Dialog;
 use crate::editor::{self, Editor};
 use crate::git::{self, Change, CheckState, GitEvent, GitStore};
 use crate::i18n::{tr, trf, trn};
-use crate::icons::{IconName, file_icon, folder_icon, icon};
+use crate::icons::{self, IconName, file_icon, folder_icon, icon};
+use crate::motion::{Disclosure, unfold_style};
 use crate::notification_center::NotificationGroup;
 use crate::notifications::Notification;
 use crate::rename::difference;
@@ -389,6 +390,21 @@ impl Row {
     }
 }
 
+/// Where the rows under the node `key` are ([`Disclosure::rows_changed`]): the deeper ones right
+/// after it; `None` when it is collapsed or gone.
+fn rows_under(rows: &[Row], key: &RowKey) -> Option<Range<usize>> {
+    let index = rows.iter().position(|row| row.key == *key)?;
+    let node = &rows[index];
+    if !node.expanded {
+        return None;
+    }
+    let end = rows[index + 1..]
+        .iter()
+        .position(|row| row.depth <= node.depth)
+        .map_or(rows.len(), |offset| index + 1 + offset);
+    Some(index + 1..end)
+}
+
 /// A repository for the tree: its folder name and branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoLabel {
@@ -680,6 +696,8 @@ pub struct CommitPanel {
     template_offered: Option<String>,
     group_by_directory: bool,
     collapsed: HashSet<RowKey>,
+    /// The nodes the user opens and closes: their chevrons turn, the rows they show unfold.
+    disclosure: Disclosure<RowKey>,
     /// The changes and the visible rows, rebuilt when the git status or the view changes.
     changes: Vec<Change>,
     rows: Vec<Row>,
@@ -749,6 +767,7 @@ impl CommitPanel {
             template_offered: None,
             group_by_directory: true,
             collapsed: HashSet::new(),
+            disclosure: Disclosure::default(),
             changes: Vec::new(),
             rows: Vec::new(),
             selected: None,
@@ -855,6 +874,8 @@ impl CommitPanel {
             &self.collapsed,
             &self.claude_groups,
         );
+        self.disclosure
+            .rows_changed(|key| rows_under(&self.rows, key));
         self.follow_merge(cx);
         self.follow_template(cx);
         self.check_stopped_sessions(cx);
@@ -1158,7 +1179,10 @@ impl CommitPanel {
         self.select_row(index, strategy, cx);
     }
 
+    /// The user opens or closes a node (a click, → / ←, ↵): its chevron turns, the rows it shows
+    /// unfold. Expand All and Collapse All don't come here: they simply happen.
     fn set_expanded(&mut self, key: &RowKey, expanded: bool, cx: &mut Context<Self>) {
+        self.disclosure.toggled(key.clone(), expanded);
         if expanded {
             self.collapsed.remove(key);
         } else {
@@ -2614,7 +2638,13 @@ impl CommitPanel {
         banners
     }
 
-    fn render_row(&self, index: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(
+        &self,
+        index: usize,
+        focused: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let ui = Theme::ui(cx);
         let Some(row) = self.rows.get(index) else {
             return div().into_any_element();
@@ -2701,7 +2731,11 @@ impl CommitPanel {
                 (true, false) => body.bg(ui.list_selected_inactive),
                 _ => body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover)),
             })
-            .child(chevron(row.expandable(), row.expanded, ui))
+            .child(chevron(
+                row.expandable(),
+                self.disclosure.chevron(&row.key, row.expanded, window),
+                ui,
+            ))
             .child(if checkable {
                 ui::checkbox(("check", index), state, ui)
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -2734,7 +2768,7 @@ impl CommitPanel {
                     .child(detail)
             }))
             .children(resolve.map(|resolve| div().flex_1().flex().justify_end().child(resolve)));
-        div()
+        let row = div()
             .id(index)
             .group(ROW_GROUP)
             .h(px(ROW_HEIGHT))
@@ -2751,8 +2785,8 @@ impl CommitPanel {
                     this.secondary_click(Some(secondary.clone()), event.position, window, cx)
                 }),
             )
-            .child(body)
-            .into_any_element()
+            .child(body);
+        unfold_style(row, self.disclosure.unfold(index, window)).into_any_element()
     }
 
     /// No changes, no repository, or still looking for repositories.
@@ -3506,13 +3540,9 @@ pub(crate) fn clean_message(answer: &str) -> String {
     text.trim().to_string()
 }
 
-/// A node's chevron (right when collapsed, down when expanded); for a file, an empty column.
-fn chevron(expandable: bool, expanded: bool, ui: UiColors) -> impl IntoElement {
-    let glyph = expandable.then_some(if expanded {
-        IconName::ChevronDown
-    } else {
-        IconName::ChevronRight
-    });
+/// A node's chevron: right when collapsed, down when expanded, turning in between (`openness`
+/// 0 → 1, [`Disclosure::chevron`]); for a file, an empty column.
+fn chevron(expandable: bool, openness: f32, ui: UiColors) -> impl IntoElement {
     div()
         .flex_none()
         .w(px(CHEVRON_WIDTH))
@@ -3520,7 +3550,7 @@ fn chevron(expandable: bool, expanded: bool, ui: UiColors) -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .children(glyph.map(|glyph| icon(glyph, ui.dim).size(px(CHEVRON_SIZE))))
+        .children(expandable.then(|| icons::chevron(openness, ui.dim).size(px(CHEVRON_SIZE))))
 }
 
 /// A link-like button: colored text, a backdrop on hover (the banner's actions).
@@ -3640,11 +3670,10 @@ impl Render for CommitPanel {
         };
         let center = ui::resize_handle_center(ui::style(cx));
         root.child(resize_handle(self.resizing, center, ui))
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "commit-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }
 
@@ -3663,9 +3692,9 @@ impl CommitPanel {
             uniform_list(
                 "commit-rows",
                 self.rows.len(),
-                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                cx.processor(move |this, range: Range<usize>, window, cx| {
                     range
-                        .map(|index| this.render_row(index, focused, cx))
+                        .map(|index| this.render_row(index, focused, window, cx))
                         .collect::<Vec<_>>()
                 }),
             )

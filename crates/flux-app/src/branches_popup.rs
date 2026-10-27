@@ -1778,24 +1778,23 @@ impl BranchesPopup {
                 }
             })
             .collect();
-        Some(
-            div().mt(top).child(
-                crate::popup::panel(ui)
-                    .id("branch-submenu")
-                    .on_hover(
-                        cx.listener(|this, hovered: &bool, _, _| this.hover_submenu(*hovered)),
-                    )
-                    .min_w(px(SUBMENU_MIN_WIDTH))
-                    .p(px(SUBMENU_PADDING))
-                    .flex()
-                    .flex_col()
-                    // A click inside doesn't reach the list behind it.
-                    .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation()
-                    })
-                    .children(items),
-            ),
-        )
+        let panel = crate::popup::panel(ui)
+            .id("branch-submenu")
+            .on_hover(cx.listener(|this, hovered: &bool, _, _| this.hover_submenu(*hovered)))
+            .min_w(px(SUBMENU_MIN_WIDTH))
+            .p(px(SUBMENU_PADDING))
+            .flex()
+            .flex_col()
+            // A click inside doesn't reach the list behind it.
+            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation()
+            })
+            .children(items);
+        // It grows out of its row's edge (its top left corner, level with the row); another row's
+        // submenu grows anew.
+        let panel =
+            crate::motion::Appear::pop((0., 0.)).apply(("branch-submenu-pop", submenu.row), panel);
+        Some(div().mt(top).child(panel))
     }
 
     fn render_empty(&self, cx: &App) -> Option<impl IntoElement + use<>> {

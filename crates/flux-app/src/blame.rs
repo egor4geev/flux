@@ -814,10 +814,12 @@ pub fn actions(root: Div, editor: &Editor, cx: &mut Context<Editor>) -> Div {
 
 /// The gutter's menu and the commit popup, over the editor.
 pub fn render(editor: &Editor, window: &mut Window, cx: &mut Context<Editor>) -> Vec<AnyElement> {
-    let mut elements = Vec::new();
-    if let Some(menu) = &editor.blame.menu {
-        elements.push(ContextMenu::overlay(&menu.menu, menu.position));
-    }
+    // The slot is drawn while there is no menu too: a menu that closed fades out.
+    let menu = editor.blame.menu.as_ref();
+    let mut elements = vec![ContextMenu::slot(
+        "blame-menu",
+        menu.map(|menu| (&menu.menu, menu.position)),
+    )];
     if let Some(popup) = render_popup(editor, window, cx) {
         elements.push(popup);
     }
@@ -948,11 +950,14 @@ fn render_popup(
         .child(body)
         .child(footer);
     let _ = window;
+    // It grows out of the line it is about; moving to another line moves it at once.
+    let position = point(column.right() + px(POPUP_GAP), top);
+    let panel = crate::motion::Appear::pop((0., 0.)).apply_from("blame-popup-pop", position, panel);
     Some(
         deferred(
             anchored()
                 .anchor(Corner::TopLeft)
-                .position(point(column.right() + px(POPUP_GAP), top))
+                .position(position)
                 .snap_to_window_with_margin(px(WINDOW_MARGIN))
                 .child(panel),
         )

@@ -21,9 +21,10 @@
 ### Fast and native
 
 A Mac app written in Rust and drawn by the GPU: Flux opens instantly, and typing, scrolling and
-searching never wait, even in files with tens of thousands of lines. Find a file by a few letters of
-its name, search the whole project with a live preview, run any command from the palette — the
-keyboard comes first and every action shows its keys, in English or Russian.
+searching never wait, even in files with tens of thousands of lines. Popovers grow out of where you
+called them, panels glide and buttons spring back — and nothing ever waits for an animation. Find a
+file by a few letters of its name, search the whole project with a live preview, run any command
+from the palette — the keyboard comes first and every action shows its keys, in English or Russian.
 
 ### Understands your code
 

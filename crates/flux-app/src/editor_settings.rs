@@ -23,6 +23,8 @@ const EXTRA_INDENTS: [u32; 4] = [0, 2, 4, 8];
 pub struct EditorSettingsPage {
     /// The masks of the files that wrap, as typed: "*.md; *.txt".
     masks: gpui::Entity<TextInput>,
+    /// Where the extra indent's steps were drawn: the selected one's pill glides between them.
+    indent_steps: std::rc::Rc<ui::Segments>,
     _subscription: Subscription,
 }
 
@@ -40,6 +42,7 @@ impl EditorSettingsPage {
         });
         Self {
             masks,
+            indent_steps: Default::default(),
             _subscription: subscription,
         }
     }
@@ -116,6 +119,9 @@ impl Render for EditorSettingsPage {
                     )),
             );
         let extra = current.soft_wrap_extra_indent;
+        let selected_step = EXTRA_INDENTS.iter().position(|&spaces| spaces == extra);
+        let pill = self.indent_steps.pill(selected_step, "indent-pill", ui);
+        let own_backdrop = pill.is_none();
         let steps = EXTRA_INDENTS.iter().enumerate().map(|(index, &spaces)| {
             let selected = extra == spaces;
             div()
@@ -133,9 +139,8 @@ impl Render for EditorSettingsPage {
                 } else {
                     ui.text_muted
                 })
-                .when(selected, |chip| {
-                    chip.bg(ui.list_selected).font_weight(FontWeight::SEMIBOLD)
-                })
+                .when(selected, |chip| chip.font_weight(FontWeight::SEMIBOLD))
+                .when(selected && own_backdrop, |chip| chip.bg(ui.list_selected))
                 .when(indent && !selected, |chip| {
                     chip.cursor_pointer()
                         .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
@@ -146,6 +151,7 @@ impl Render for EditorSettingsPage {
                         cx.notify();
                     }))
                 })
+                .child(self.indent_steps.measure(index))
                 .child(spaces.to_string())
         });
         let extra_row = div()
@@ -164,12 +170,15 @@ impl Render for EditorSettingsPage {
             )
             .child(
                 div()
+                    .relative()
                     .flex()
                     .gap_1()
                     .p_1()
                     .rounded(px(ui::RADIUS_MD))
                     .border_1()
                     .border_color(ui.island_border)
+                    .child(self.indent_steps.measure_origin())
+                    .children(pill)
                     .children(steps),
             );
         let card = div()

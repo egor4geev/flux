@@ -22,7 +22,9 @@
 //!   and Close (part 10.6, [`crate::feedback`]). «About Flux» in the app menu ([`About`]) opens
 //!   Settings on this section.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
@@ -45,6 +47,7 @@ use crate::i18n::{tr, trf};
 use crate::icons::{self, IconName, file_icon, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::lsp::LspStore;
+use crate::motion::{self, TransitionExt};
 use crate::notification_center::{self, Display};
 use crate::plugin_manager::{PluginManager, PluginManagerEvent};
 use crate::plugin_settings::PluginSettingsPage;
@@ -63,6 +66,13 @@ const HEIGHT: f32 = 600.;
 /// The margin between Settings and the sides of a small window (the height — `ui::dialog_height`).
 const WINDOW_MARGIN: f32 = 16.;
 const SIDEBAR_WIDTH: f32 = 180.;
+/// The sidebar's rows: their height, the gap between them and the sidebar's padding — the selection
+/// glides to the place they make.
+const SIDEBAR_ROW_HEIGHT: f32 = 30.;
+const SIDEBAR_ROW_GAP: f32 = 2.;
+const SIDEBAR_PADDING: f32 = 8.;
+/// A page coming in rises from this far below as it fades in.
+const PAGE_RISE: f32 = 8.;
 /// About: the logo tile and the column of row labels.
 const ABOUT_LOGO_SIZE: f32 = 64.;
 const ABOUT_LABEL_WIDTH: f32 = 120.;
@@ -338,6 +348,9 @@ pub struct SettingsView {
     claude_args: Entity<TextInput>,
     /// When About → Copy was last clicked: it says «Copied» for a moment.
     about_copied: Option<Instant>,
+    /// Where each notification group's display choices were drawn, by the group's key: the chosen
+    /// one's pill glides between them.
+    display_choices: RefCell<HashMap<String, Rc<ui::Segments>>>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -439,6 +452,7 @@ impl SettingsView {
             claude: handles.claude,
             claude_args,
             about_copied: None,
+            display_choices: RefCell::default(),
             _tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -704,6 +718,8 @@ impl SettingsView {
             None
         };
         div()
+            // The id lets the hover fade.
+            .id(("server-row", index))
             .flex()
             .items_center()
             .gap_3()
@@ -928,7 +944,7 @@ impl SettingsView {
                         "settings-section-{}",
                         section.key()
                     )))
-                    .h(px(30.))
+                    .h(px(SIDEBAR_ROW_HEIGHT))
                     .px_2()
                     .when(nested && !with_icon, |row| row.pl(px(30.)))
                     .flex()
@@ -941,7 +957,7 @@ impl SettingsView {
                     } else {
                         ui.text_muted
                     })
-                    .when(selected, |row| row.bg(ui.list_selected))
+                    // The selection's backdrop is the sidebar's own, gliding from row to row.
                     .when(!selected, |row| {
                         row.hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
                     })
@@ -965,7 +981,7 @@ impl SettingsView {
         let mut rows: Vec<AnyElement> = vec![
             div()
                 .id("settings-section-appearance")
-                .h(px(30.))
+                .h(px(SIDEBAR_ROW_HEIGHT))
                 .px_2()
                 .flex()
                 .items_center()
@@ -995,6 +1011,29 @@ impl SettingsView {
                 .child(div().min_w_0().truncate().child(tr("Appearance")))
                 .into_any_element(),
         ];
+        // The selected row's place among them: the Appearance heading, its pages, the built-in
+        // sections, the plugins' pages, About.
+        let selected = Section::APPEARANCE
+            .iter()
+            .position(|section| *section == self.section)
+            .map(|index| 1 + index)
+            .or_else(|| {
+                let index = Section::BUILT_IN
+                    .iter()
+                    .position(|section| *section == self.section)?;
+                Some(1 + Section::APPEARANCE.len() + index)
+            })
+            .or_else(|| {
+                let index = plugin_pages
+                    .iter()
+                    .position(|(section, ..)| *section == self.section)?;
+                Some(1 + Section::APPEARANCE.len() + Section::BUILT_IN.len() + index)
+            })
+            .or_else(|| {
+                (self.section == Section::About).then(|| {
+                    1 + Section::APPEARANCE.len() + Section::BUILT_IN.len() + plugin_pages.len()
+                })
+            });
         rows.extend(Section::APPEARANCE.into_iter().map(|section| {
             let label = SharedString::from(section.label());
             row(section, label, true, None, cx).into_any_element()
@@ -1009,15 +1048,34 @@ impl SettingsView {
             }),
         );
         rows.push(row(Section::About, tr("About").into(), false, None, cx).into_any_element());
+        // The selection's backdrop, under the rows: it glides to the row chosen (`motion::SMOOTH`).
+        let highlight = selected.map(|index| {
+            let top = SIDEBAR_PADDING + index as f32 * (SIDEBAR_ROW_HEIGHT + SIDEBAR_ROW_GAP);
+            div()
+                .absolute()
+                .left(px(SIDEBAR_PADDING))
+                .right(px(SIDEBAR_PADDING))
+                .h(px(SIDEBAR_ROW_HEIGHT))
+                .rounded(px(ui::RADIUS_SM))
+                .bg(ui.list_selected)
+                .with_transition(
+                    "settings-selection",
+                    top,
+                    motion::SMOOTH,
+                    |highlight, top| highlight.top(px(top)),
+                )
+        });
         div()
             .flex_none()
+            .relative()
             .w(px(SIDEBAR_WIDTH))
-            .p_2()
+            .p(px(SIDEBAR_PADDING))
             .flex()
             .flex_col()
-            .gap_0p5()
+            .gap(px(SIDEBAR_ROW_GAP))
             .border_r_1()
             .border_color(ui.divider)
+            .children(highlight)
             .children(rows)
     }
 
@@ -1382,36 +1440,55 @@ impl SettingsView {
             .map(|(index, info)| {
                 let key = info.group.key();
                 let current = notification_center::display_of(&info.group, cx);
-                let choices = Display::ALL.into_iter().map(|display| {
-                    let key = key.clone();
-                    let selected = display == current;
-                    div()
-                        .id(SharedString::from(format!(
-                            "display-{index}-{}",
-                            display.key()
-                        )))
-                        .px_2()
-                        .h(px(24.))
-                        .flex()
-                        .items_center()
-                        .rounded(px(ui::RADIUS_SM))
-                        .text_size(px(theme::TEXT_SM))
-                        .cursor_pointer()
-                        .when(selected, |choice| {
-                            choice.bg(ui.list_selected).text_color(ui.foreground)
-                        })
-                        .when(!selected, |choice| {
-                            choice
-                                .text_color(ui.text_muted)
-                                .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
-                        })
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            settings::set_notification_display(&key, display, cx);
-                            cx.notify();
-                        }))
-                        .child(display.label())
-                });
+                let segments = self
+                    .display_choices
+                    .borrow_mut()
+                    .entry(key.to_string())
+                    .or_default()
+                    .clone();
+                let pill = segments.pill(
+                    Display::ALL.iter().position(|display| *display == current),
+                    "display-pill",
+                    ui,
+                );
+                let own_backdrop = pill.is_none();
+                let choices = Display::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(place, display)| {
+                        let key = key.clone();
+                        let selected = display == current;
+                        div()
+                            .id(SharedString::from(format!(
+                                "display-{index}-{}",
+                                display.key()
+                            )))
+                            .px_2()
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(ui::RADIUS_SM))
+                            .text_size(px(theme::TEXT_SM))
+                            .cursor_pointer()
+                            .when(selected, |choice| choice.text_color(ui.foreground))
+                            .when(selected && own_backdrop, |choice| {
+                                choice.bg(ui.list_selected)
+                            })
+                            .when(!selected, |choice| {
+                                choice.text_color(ui.text_muted).hover(move |style| {
+                                    style.bg(ui.hover).text_color(ui.foreground)
+                                })
+                            })
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                settings::set_notification_display(&key, display, cx);
+                                cx.notify();
+                            }))
+                            .child(segments.measure(place))
+                            .child(display.label())
+                    });
                 div()
+                    // The id lets the hover fade.
+                    .id(("notification-group", index))
                     .flex()
                     .items_center()
                     .gap_3()
@@ -1424,6 +1501,7 @@ impl SettingsView {
                     .child(
                         div()
                             .flex_none()
+                            .relative()
                             .flex()
                             .gap_0p5()
                             .p_0p5()
@@ -1431,6 +1509,8 @@ impl SettingsView {
                             .bg(ui.input_background)
                             .border_1()
                             .border_color(ui.input_border)
+                            .child(segments.measure_origin())
+                            .children(pill)
                             .children(choices),
                     )
             })
@@ -2190,6 +2270,10 @@ impl Render for SettingsView {
             }),
             Section::About => Some(self.render_about(cx).into_any_element()),
         };
+        // A page coming in fades in rising a little, once: keyed by the section, so the page shown
+        // doesn't play it again when it redraws.
+        let appear = motion::Appear::slide(0., PAGE_RISE).curve(motion::POP);
+        let page = SharedString::from(format!("settings-page-{}", self.section.key()));
         let content = match content {
             Some(content) => div()
                 .id("settings-content")
@@ -2197,16 +2281,18 @@ impl Render for SettingsView {
                 .min_w_0()
                 .overflow_y_scroll()
                 .p_4()
-                .child(content)
+                .child(appear.apply(page, div().child(content)))
                 .into_any_element(),
-            None => div()
-                .flex_1()
-                .min_w_0()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .children(self.manager.clone())
-                .into_any_element(),
+            None => appear.apply(
+                page,
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .children(self.manager.clone()),
+            ),
         };
         let viewport = window.viewport_size();
         let width = WIDTH.min(f32::from(viewport.width) - 2. * WINDOW_MARGIN);

@@ -1004,11 +1004,10 @@ impl Render for TerminalPanel {
                 ui::resize_handle_center(ui::style(cx)),
                 ui,
             ))
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "terminal-panel-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }
 

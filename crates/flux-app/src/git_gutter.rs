@@ -610,6 +610,12 @@ pub fn render(
         Side::Below => (Corner::TopLeft, anchor.line_bottom + px(POPUP_GAP)),
         Side::Above => (Corner::BottomLeft, anchor.line_top - px(POPUP_GAP)),
     };
+    // It grows out of its change; Previous / Next move it to the next change at once.
+    let panel = crate::motion::Appear::pop((0., 0.)).apply_from(
+        "change-popup-pop",
+        point(anchor.x, y),
+        panel,
+    );
     Some(
         deferred(
             anchored()

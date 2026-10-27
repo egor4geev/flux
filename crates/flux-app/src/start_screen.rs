@@ -5,16 +5,21 @@
 //! Actions are dispatched to the window (`window.dispatch_action`), the same ones the keys trigger;
 //! a recent project is opened with the [`OpenProject`] action. The screen has no state: everything
 //! it shows is passed in by the Workspace ([`StartScreen`]).
+//!
+//! It comes in once each time it shows: the card, the column titles, then the rows one after
+//! another, each sliding up a little as it fades in ([`motion::Appear`]).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::{
-    Action, AnyElement, BoxShadow, Context, Div, FontWeight, Hsla, SharedString, div,
+    Action, AnyElement, BoxShadow, Context, Div, FontWeight, Hsla, SharedString, Stateful, div,
     linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
+use crate::motion::{self, Appear};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_LG, RADIUS_MD};
 use crate::workspace::{self, OpenProject, Workspace, tilde};
@@ -36,6 +41,14 @@ const TILE_SIZE: f32 = 26.;
 /// in rows with flexible width, and the end of a path matters more than its beginning.
 const CARD_PATH_CHARS: usize = 64;
 const RECENT_PATH_CHARS: usize = 44;
+/// The entrance: how far apart the pieces come in, and how far each slides up.
+const ENTRANCE_STEP: Duration = Duration::from_millis(30);
+const ENTRANCE_RISE: f32 = 8.;
+
+/// The `index`th piece of the screen coming in: after the ones above it, at most a few steps late.
+fn entrance(index: usize) -> Appear {
+    Appear::slide(0., ENTRANCE_RISE).delay(motion::stagger(index, ENTRANCE_STEP, 8))
+}
 
 /// What the window knows about itself, for the start screen.
 pub struct StartScreen<'a> {
@@ -136,10 +149,15 @@ pub fn render(screen: StartScreen, cx: &mut Context<Workspace>) -> AnyElement {
         .map(|action| ui::shortcut_for(action.action.as_ref(), cx))
         .collect();
 
-    let action_rows = actions
-        .into_iter()
-        .zip(shortcuts)
-        .map(|(action, keys)| action_row(action, keys, ui).into_any_element());
+    // The card comes in first, the column titles next, then the rows of both columns side by side.
+    let action_rows =
+        actions
+            .into_iter()
+            .zip(shortcuts)
+            .enumerate()
+            .map(|(index, (action, keys))| {
+                entrance(index + 2).apply(("start-action-in", index), action_row(action, keys, ui))
+            });
     let recent: Vec<AnyElement> = screen
         .recent
         .iter()
@@ -147,11 +165,14 @@ pub fn render(screen: StartScreen, cx: &mut Context<Workspace>) -> AnyElement {
         .enumerate()
         .map(|(index, path)| {
             let current = screen.root == Some(path.as_path());
-            recent_row(index, path, current, ui).into_any_element()
+            entrance(index + 2).apply(
+                ("start-recent-in", index),
+                recent_row(index, path, current, ui),
+            )
         })
         .collect();
     let recent = if recent.is_empty() {
-        vec![empty_recent(ui).into_any_element()]
+        vec![entrance(2).apply("start-recent-empty-in", empty_recent(ui))]
     } else {
         recent
     };
@@ -162,10 +183,17 @@ pub fn render(screen: StartScreen, cx: &mut Context<Workspace>) -> AnyElement {
         .flex()
         .flex_col()
         .gap_7()
-        .children(screen.notice.map(|notice| notice_banner(notice, ui)))
+        .children(
+            screen
+                .notice
+                .map(|notice| entrance(0).apply("start-notice-in", notice_banner(notice, ui))),
+        )
         .child(match screen.root {
-            Some(root) => project_card(root, screen.branch, ui).into_any_element(),
-            None => open_folder_card(ui::shortcut_for(&workspace::Open, cx), ui).into_any_element(),
+            Some(root) => entrance(0).apply("start-card-in", project_card(root, screen.branch, ui)),
+            None => entrance(0).apply(
+                "start-card-in",
+                open_folder_card(ui::shortcut_for(&workspace::Open, cx), ui),
+            ),
         })
         .child(
             div()
@@ -174,8 +202,8 @@ pub fn render(screen: StartScreen, cx: &mut Context<Workspace>) -> AnyElement {
                 .flex_wrap()
                 .gap_x_8()
                 .gap_y_6()
-                .child(column(tr("Start"), action_rows, ui))
-                .child(column(tr("Recent Projects"), recent, ui)),
+                .child(column("start-start-in", tr("Start"), action_rows, ui))
+                .child(column("start-recent-in", tr("Recent Projects"), recent, ui)),
         );
     // The content sits a little above the middle, where the eye expects it; if it does not fit in
     // height, it scrolls (the spacers shrink to zero).
@@ -351,8 +379,13 @@ fn open_folder_card(keys: Option<SharedString>, ui: UiColors) -> Div {
         )
 }
 
-/// A column with a section label.
-fn column(title: &'static str, rows: impl IntoIterator<Item = AnyElement>, ui: UiColors) -> Div {
+/// A column with a section label (coming in after the card: `id` keys its entrance).
+fn column(
+    id: &'static str,
+    title: &'static str,
+    rows: impl IntoIterator<Item = AnyElement>,
+    ui: UiColors,
+) -> Div {
     div()
         .flex_grow()
         .flex_shrink()
@@ -361,12 +394,12 @@ fn column(title: &'static str, rows: impl IntoIterator<Item = AnyElement>, ui: U
         .flex()
         .flex_col()
         .gap_1()
-        .child(ui::section_label(title, ui).px_2().pb_1())
+        .child(entrance(1).apply(id, ui::section_label(title, ui).px_2().pb_1()))
         .children(rows)
 }
 
 /// A quick action row: icon tile, label, keys.
-fn action_row(action: QuickAction, keys: Option<SharedString>, ui: UiColors) -> impl IntoElement {
+fn action_row(action: QuickAction, keys: Option<SharedString>, ui: UiColors) -> Stateful<Div> {
     let QuickAction {
         id,
         label,
@@ -413,7 +446,7 @@ fn tile(name: IconName, hue: Hsla) -> Div {
 }
 
 /// A recent project: name and path; the current one gets a badge and is not clickable.
-fn recent_row(index: usize, path: &Path, current: bool, ui: UiColors) -> impl IntoElement {
+fn recent_row(index: usize, path: &Path, current: bool, ui: UiColors) -> Stateful<Div> {
     let row = div()
         .id(("recent-project", index))
         .h(px(RECENT_ROW_HEIGHT))
@@ -457,7 +490,7 @@ fn recent_row(index: usize, path: &Path, current: bool, ui: UiColors) -> impl In
         })
 }
 
-fn empty_recent(ui: UiColors) -> impl IntoElement {
+fn empty_recent(ui: UiColors) -> Div {
     div()
         .px_2()
         .py_2()

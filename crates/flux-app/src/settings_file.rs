@@ -172,6 +172,9 @@ fn apply(old: &Settings, cx: &mut App) {
     if before.language != now.language {
         crate::appearance_settings::apply_language(cx);
     }
+    if before.animations != now.animations {
+        crate::motion::apply(cx);
+    }
     cx.refresh_windows();
 }
 

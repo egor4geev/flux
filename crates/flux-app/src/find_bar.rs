@@ -12,9 +12,12 @@
 //! - the document changed (while the bar is open) or the tab changed — the selection is left alone;
 //! - after "replace" — the next match from the end of the inserted text is selected.
 
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use flux_search::{BufferMatches, QueryError, SearchQuery, find_all, replacement_for};
 use gpui::{
@@ -26,6 +29,7 @@ use crate::editor::{Editor, EditorEvent};
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::motion;
 use crate::theme::{self, Theme};
 use crate::ui::{self, GAP, ICON_BUTTON_SIZE};
 
@@ -114,6 +118,12 @@ enum Status {
 /// The window's find bar: one per Workspace, works with the active tab.
 pub struct FindBar {
     open: bool,
+    /// The bar slides down from under the tabs as it opens and back up as it closes (`motion`):
+    /// how much of it shows, from and to, since when. Closed, it is drawn without input until it
+    /// has slid away; the focus has left it already.
+    reveal: (f32, f32, Instant),
+    /// The bar's height as last laid out: how far it slides.
+    height: Rc<Cell<f32>>,
     replace_open: bool,
     query: Entity<TextInput>,
     replacement: Entity<TextInput>,
@@ -160,6 +170,8 @@ impl FindBar {
         )];
         Self {
             open: false,
+            reveal: (0., 0., Instant::now()),
+            height: Rc::new(Cell::new(0.)),
             replace_open: false,
             query,
             replacement,
@@ -184,6 +196,28 @@ impl FindBar {
         self.open
     }
 
+    /// The bar is in sight: open, or sliding away after it closed.
+    pub fn is_shown(&self) -> bool {
+        self.open || self.revealed().1 > 0.
+    }
+
+    /// How far the slide has come (0 → 1) and how much of the bar shows.
+    fn revealed(&self) -> (f32, f32) {
+        let (from, to, since) = self.reveal;
+        let (t, _) = motion::SMOOTH.at(since.elapsed());
+        (t, motion::lerp(from, to, t))
+    }
+
+    /// Opens or closes the bar: it slides from where it is.
+    fn set_open(&mut self, open: bool) {
+        if self.open == open {
+            return;
+        }
+        self.open = open;
+        let (_, shown) = self.revealed();
+        self.reveal = (shown, if open { 1. } else { 0. }, Instant::now());
+    }
+
     /// Opens the find bar (with replacement when `replace`) for `editor` and moves focus into it.
     /// The query is taken from the selection or the word under the cursor; if focus is already in
     /// the bar, only the field text is selected.
@@ -200,7 +234,7 @@ impl FindBar {
         self.set_active_editor(Some(editor.clone()), window, cx);
         let was_open = self.open;
         let focused_here = was_open && self.contains_focus(window, cx);
-        self.open = true;
+        self.set_open(true);
         if replace {
             self.replace_open = true;
         } else if !was_open {
@@ -244,7 +278,7 @@ impl FindBar {
             // Changed with this text won't repeat the search: `searched` will already be it.
             self.query.update(cx, |query, cx| query.set_text(&seed, cx));
         }
-        self.open = true;
+        self.set_open(true);
         self.search(SearchMode::Step { backward }, cx);
         cx.notify();
     }
@@ -397,6 +431,11 @@ impl FindBar {
             editor.set_search_highlights(matches, active, cx);
             if let Some(range) = range {
                 editor.select_range(range, cx);
+                // The first match while typing follows the keys: the view goes there at once
+                // (Enter / ⌘G and the match after a replace glide, `crate::motion`).
+                if matches!(mode, SearchMode::Incremental) {
+                    editor.scroll_instantly();
+                }
             }
         });
         cx.notify();
@@ -534,7 +573,7 @@ impl FindBar {
     /// Escape (in the bar or in the editor), ×: removes the highlighting and returns focus to the
     /// editor (the selection stays on the last current match).
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open = false;
+        self.set_open(false);
         self.cancel_search();
         if let Some(editor) = self.editor() {
             editor.update(cx, |editor, cx| editor.clear_search_highlights(cx));
@@ -716,53 +755,86 @@ impl Render for FindBar {
                 )
         });
 
+        let bar =
+            div()
+                .key_context("FindBar")
+                .relative()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .px_2()
+                .py_2()
+                .font_family(theme::UI_FONT)
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.foreground)
+                .on_action(cx.listener(|this, _: &SelectNextMatch, _, cx| this.step(false, cx)))
+                .on_action(cx.listener(|this, _: &SelectPreviousMatch, _, cx| this.step(true, cx)))
+                .on_action(cx.listener(|this, _: &SelectAllMatches, window, cx| {
+                    this.select_all_matches(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.close(window, cx)))
+                .on_action(cx.listener(|this, _: &FocusNextField, window, cx| {
+                    this.focus_next_field(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ToggleCaseSensitive, _, cx| {
+                    this.toggle_option(|this| &mut this.case_sensitive, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ToggleWholeWord, _, cx| {
+                    this.toggle_option(|this| &mut this.whole_word, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ToggleRegex, _, cx| {
+                    this.toggle_option(|this| &mut this.regex, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ReplaceNext, _, cx| this.replace_next(cx)))
+                .on_action(cx.listener(|this, _: &ReplaceAll, _, cx| this.replace_all(cx)))
+                .child(find_row)
+                .children(replace_row)
+                // The divider under the bar runs from edge to edge of the island, inset from the
+                // rounded corners.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(GAP))
+                        .right(px(GAP))
+                        .bottom_0()
+                        .h(px(1.))
+                        .bg(ui.divider),
+                )
+                // Its height, for the slide (the first slide starts from the frame that measured it).
+                .child({
+                    let height = self.height.clone();
+                    gpui::canvas(
+                        move |bounds, window, _| {
+                            let measured = f32::from(bounds.size.height);
+                            if height.replace(measured) != measured {
+                                window.request_animation_frame();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full()
+                });
+        // Sliding down from under the tabs: the room it takes grows, the bar comes down within it,
+        // fading in over the first half; closing, it slides back up. At rest, it lays out as is.
+        let (t, shown) = self.revealed();
+        if t >= 1. {
+            return bar.into_any_element();
+        }
+        window.request_animation_frame();
+        let height = self.height.get();
         div()
-            .key_context("FindBar")
-            .relative()
             .flex_none()
             .flex()
             .flex_col()
-            .gap_1p5()
-            .px_2()
-            .py_2()
-            .font_family(theme::UI_FONT)
-            .text_size(px(theme::TEXT_SM))
-            .text_color(ui.foreground)
-            .on_action(cx.listener(|this, _: &SelectNextMatch, _, cx| this.step(false, cx)))
-            .on_action(cx.listener(|this, _: &SelectPreviousMatch, _, cx| this.step(true, cx)))
-            .on_action(cx.listener(|this, _: &SelectAllMatches, window, cx| {
-                this.select_all_matches(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.close(window, cx)))
-            .on_action(
-                cx.listener(|this, _: &FocusNextField, window, cx| {
-                    this.focus_next_field(window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &ToggleCaseSensitive, _, cx| {
-                this.toggle_option(|this| &mut this.case_sensitive, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleWholeWord, _, cx| {
-                this.toggle_option(|this| &mut this.whole_word, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleRegex, _, cx| {
-                this.toggle_option(|this| &mut this.regex, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ReplaceNext, _, cx| this.replace_next(cx)))
-            .on_action(cx.listener(|this, _: &ReplaceAll, _, cx| this.replace_all(cx)))
-            .child(find_row)
-            .children(replace_row)
-            // The divider under the bar runs from edge to edge of the island, inset from the
-            // rounded corners.
+            .overflow_hidden()
+            .h(px(height * shown))
             .child(
-                div()
-                    .absolute()
-                    .left(px(GAP))
-                    .right(px(GAP))
-                    .bottom_0()
-                    .h(px(1.))
-                    .bg(ui.divider),
+                bar.opacity((shown / 0.5).clamp(0., 1.))
+                    .transform_translate(px(0.), px(-height * (1. - shown))),
             )
+            .into_any_element()
     }
 }
 

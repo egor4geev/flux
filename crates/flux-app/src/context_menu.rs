@@ -13,19 +13,27 @@
 //! → or ↵; ← and Esc close the child, its parent item stays highlighted while it is open. The child
 //! is drawn by the same view, so the focus (and the owner's focus-out handling) stays with the
 //! menu.
+//!
+//! Motion (`crate::motion`): the menu grows out of its click — the point itself, wherever the
+//! window's edges pushed the menu — and a submenu out of its item's edge. An owner that draws
+//! [`ContextMenu::slot`] in every frame, open or not, also gets the exit: the menu it dropped fades
+//! out toward its click, taking no input.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::panic::Location;
 use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Action, AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, KeyBinding, MouseDownEvent, Pixels, Point, Render, SharedString, Task,
-    Window, actions, anchored, canvas, deferred, div, point, prelude::*, px,
+    Action, AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Element, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId, KeyBinding,
+    LayoutId, MouseDownEvent, Pixels, Point, Render, SharedString, Task, Window, actions, anchored,
+    canvas, deferred, div, point, prelude::*, px,
 };
 
 use crate::icons::{IconName, icon};
+use crate::motion::{self, Appear, Leaving};
 use crate::popup;
 use crate::theme::Theme;
 use crate::ui::{self, RADIUS_SM};
@@ -280,15 +288,28 @@ impl ContextMenu {
     }
 
     /// The menu over the window at the point `position` (window coordinates); near the window edge
-    /// it is shifted inward, keeping the margin every popup keeps.
+    /// it is shifted inward, keeping the margin every popup keeps. It grows out of the point.
     pub fn overlay(menu: &Entity<Self>, position: Point<Pixels>) -> AnyElement {
-        deferred(
-            anchored()
-                .position(position)
-                .snap_to_window_with_margin(px(popup::WINDOW_MARGIN))
-                .child(menu.clone()),
-        )
-        .with_priority(1)
+        let view = Appear::pop((0., 0.)).apply_from(
+            ("context-menu", menu.entity_id().as_u64()),
+            position,
+            div().child(menu.clone()),
+        );
+        place(position, view)
+    }
+
+    /// [`Self::overlay`] for an owner that draws it in every frame, open or not —
+    /// `ContextMenu::slot("tree-menu", self.menu.as_ref().map(|open| (&open.menu, open.position)))`:
+    /// the menu it dropped (closed, or replaced by another one) fades out toward its click, taking
+    /// no input, while the owner has already let it go with its subscriptions.
+    pub fn slot(
+        id: impl Into<ElementId>,
+        open: Option<(&Entity<Self>, Point<Pixels>)>,
+    ) -> AnyElement {
+        MenuSlot {
+            id: id.into(),
+            open: open.map(|(menu, position)| (menu.clone(), position)),
+        }
         .into_any_element()
     }
 
@@ -588,34 +609,168 @@ impl ContextMenu {
             _ => px(estimated_width(items)),
         };
         let origin = child_origin(panel, item, width, window.viewport_size().width);
+        // It grows out of its item's edge: the menu's right edge, or its left one when the window
+        // sent the child to the left.
+        let edge = if origin.x >= panel.right() {
+            panel.right()
+        } else {
+            panel.left()
+        };
+        let anchor = point(edge, item.center().y);
         let recorded = self.geometry.clone();
         Some(
             anchored()
                 .position(origin)
                 .snap_to_window_with_margin(px(popup::WINDOW_MARGIN))
                 .child(
-                    popup::panel(ui)
-                        .id("context-submenu")
-                        .occlude()
-                        .min_w(px(MENU_MIN_WIDTH))
-                        .p(px(MENU_PADDING))
-                        .flex()
-                        .flex_col()
-                        .on_hover(
-                            cx.listener(|this, hovered: &bool, _, _| this.hover_child(*hovered)),
-                        )
-                        .child(
-                            canvas(
-                                move |bounds, _, _| recorded.child.set(Some((index, bounds))),
-                                |_, _, _, _| {},
+                    Appear::pop((0., 0.)).apply_from(
+                        ("context-submenu-pop", index),
+                        anchor,
+                        popup::panel(ui)
+                            .id("context-submenu")
+                            .occlude()
+                            .min_w(px(MENU_MIN_WIDTH))
+                            .p(px(MENU_PADDING))
+                            .flex()
+                            .flex_col()
+                            .on_hover(
+                                cx.listener(|this, hovered: &bool, _, _| {
+                                    this.hover_child(*hovered)
+                                }),
                             )
-                            .absolute()
-                            .size_full(),
-                        )
-                        .children(rows),
+                            .child(
+                                canvas(
+                                    move |bounds, _, _| recorded.child.set(Some((index, bounds))),
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .children(rows),
+                    ),
                 )
                 .into_any_element(),
         )
+    }
+}
+
+/// A menu's place over the window: at `position`, shifted inward near the window's edges.
+fn place(position: Point<Pixels>, view: impl IntoElement) -> AnyElement {
+    deferred(
+        anchored()
+            .position(position)
+            .snap_to_window_with_margin(px(popup::WINDOW_MARGIN))
+            .child(view),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
+/// A menu and its click.
+type Shown = (Entity<ContextMenu>, Point<Pixels>);
+
+/// The element of [`ContextMenu::slot`]: the open menu, and the one that left fading out.
+struct MenuSlot {
+    id: ElementId,
+    open: Option<Shown>,
+}
+
+/// What a slot remembers between frames: the menu it drew, and the one leaving.
+#[derive(Default)]
+struct SlotState {
+    shown: Option<Shown>,
+    leaving: Option<Leaving<Shown>>,
+}
+
+impl IntoElement for MenuSlot {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for MenuSlot {
+    type RequestLayoutState = AnyElement;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, AnyElement) {
+        let open = self.open.take();
+        let leaving = window.with_element_state(
+            global_id.expect("a menu slot has an id"),
+            |state: Option<SlotState>, window| {
+                let mut state = state.unwrap_or_default();
+                let gone = state
+                    .shown
+                    .as_ref()
+                    .is_some_and(|(shown, _)| open.as_ref().is_none_or(|(menu, _)| menu != shown));
+                if gone {
+                    let shown = state.shown.take();
+                    state.leaving = shown.filter(|_| motion::enabled()).map(Leaving::new);
+                }
+                if state.leaving.as_ref().is_some_and(Leaving::done) {
+                    state.leaving = None;
+                }
+                state.shown = open.clone();
+                let leaving = state.leaving.as_ref().map(|leaving| {
+                    let (menu, position) = leaving.value.clone();
+                    (menu, position, leaving.progress(window))
+                });
+                (leaving, state)
+            },
+        );
+        let leaving = leaving.map(|(menu, position, progress)| {
+            let view = motion::leaving_from(div().child(menu), progress, position);
+            place(position, motion::inert(view))
+        });
+        let open = open.map(|(menu, position)| ContextMenu::overlay(&menu, position));
+        // Out of the owner's flow: the menus are drawn over the window anyway.
+        let mut element = div()
+            .absolute()
+            .children(leaving)
+            .children(open)
+            .into_any_element();
+        let layout_id = element.request_layout(window, cx);
+        (layout_id, element)
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        element: &mut AnyElement,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        element.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        element: &mut AnyElement,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        element.paint(window, cx);
     }
 }
 

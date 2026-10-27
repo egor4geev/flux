@@ -3,6 +3,8 @@
 //! ([`crate::wrap`]): the layout is by rows, and whatever is drawn over the text (selections,
 //! matches, problems, the caret) finds its rows here.
 
+use std::time::Instant;
+
 use flux_core::Rope;
 use flux_core::text::{line_len, line_start};
 use gpui::{
@@ -12,7 +14,8 @@ use gpui::{
 };
 
 use crate::display::{display_line, display_range, row_spans, text_runs};
-use crate::editor::{Autoscroll, Editor};
+use crate::editor::{Autoscroll, Editor, Glide};
+use crate::motion;
 use crate::theme::{self, Theme};
 use crate::wrap::WrapParams;
 
@@ -511,6 +514,14 @@ impl Element for EditorElement {
         let head_column = primary.head - line_start(&text, head_line);
         let head_row = wrap.line_to_row(head_line) + wrap.row_in_line(head_line, head_column);
 
+        // A glide (a jump on its way) counts from where the view is going; one that something else
+        // interrupted (the wheel, the scrollbar, a host) is over.
+        let max_scroll = (total_rows - 1) as f32 * lh;
+        let shown = scroll.y.clamp(0., max_scroll);
+        let glide = editor.glide.filter(|glide| glide.shown == scroll.y);
+        let destination = glide.map_or(shown, |glide| glide.to.clamp(0., max_scroll));
+        scroll.y = destination;
+
         // Vertical autoscroll: keep the cursor in the viewport with a margin of a few rows, and
         // when jumping to a match, put a row that is out of view in the middle.
         let top = head_row as f32 * lh;
@@ -533,7 +544,27 @@ impl Element for EditorElement {
             Some(Autoscroll::Middle) => scroll.y = ((top - (height - lh) / 2.) / lh).round() * lh,
             Some(Autoscroll::Center) | None => {}
         }
-        scroll.y = scroll.y.clamp(0., (total_rows - 1) as f32 * lh);
+        scroll.y = scroll.y.clamp(0., max_scroll);
+        // A jump glides from what is on screen to its place; anything else that moved the view
+        // (the caret, typing) takes it there at once; otherwise a glide goes on. Not on the first
+        // frame: a file just opened shows its place at once.
+        let jump = autoscroll.is_some()
+            && editor.glide_next
+            && editor.layout.is_some()
+            && motion::enabled();
+        let glide = Glide::next(
+            glide,
+            destination,
+            scroll.y,
+            jump,
+            shown,
+            height,
+            Instant::now(),
+        );
+        if let Some(glide) = &glide {
+            scroll.y = glide.shown.clamp(0., max_scroll);
+            window.request_animation_frame();
+        }
 
         let first_row = (scroll.y / lh).floor() as usize;
         let last_row = (first_row + (height / lh).ceil() as usize + 1).min(total_rows);
@@ -809,6 +840,11 @@ impl Element for EditorElement {
 
         let decorations = self.editor.update(cx, |editor, _| {
             editor.scroll = scroll;
+            editor.glide = glide.map(|glide| Glide {
+                shown: scroll.y,
+                ..glide
+            });
+            editor.glide_next = false;
             editor.autoscroll = None;
             editor.blame.column = (blame_width > px(0.)).then_some(blame_column);
             editor.frame_decorations.take()

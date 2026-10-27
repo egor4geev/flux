@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_claude::{
     Effort, ImageAttachment, ModelInfo, PermissionMode, Priority, SlashCommand, Status, UserInput,
@@ -44,6 +44,7 @@ use crate::claude_session::{Attachment, ClaudeSession, EditPoint, SessionEvent, 
 use crate::context_menu::ContextMenu;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, file_icon, icon};
+use crate::motion::{self, Appear, TransitionExt};
 use crate::picker::highlighted_text;
 use crate::popup;
 use crate::prompt_input::{self, PromptInput, PromptInputEvent};
@@ -444,6 +445,10 @@ pub struct Composer {
     picker_bounds: HashMap<Picker, Bounds<Pixels>>,
     /// `!` typed first in the empty field: what's typed is a shell command (part 10.2).
     shell_mode: bool,
+    /// Which of Stop and Send the corner showed when last drawn; when that changed, and what it
+    /// showed before: the button that comes pops in.
+    buttons: Option<(bool, bool)>,
+    swapped: Option<(Instant, (bool, bool))>,
     /// The field was empty before the last change: a `!` typed into it starts shell mode.
     was_empty: bool,
     /// A sent message being edited (part 10.2): sending continues the conversation from just
@@ -555,6 +560,8 @@ impl Composer {
             card_bounds: None,
             picker_bounds: HashMap::new(),
             shell_mode: false,
+            buttons: None,
+            swapped: None,
             was_empty: true,
             editing: None,
             agent: None,
@@ -1395,6 +1402,11 @@ impl Composer {
                                 cx.notify();
                             })),
                     )
+            })
+            // A chip that joins pops in.
+            .enumerate()
+            .map(|(index, chip)| {
+                Appear::pop((0.5, 0.5)).apply(("claude-attachment-chip-appear", index), chip)
             });
         let context_chip = context.map(|context| {
             let file = file_icon(&context.path, &ui);
@@ -1428,9 +1440,11 @@ impl Composer {
                         })),
                 )
         });
+        let context_chip = context_chip
+            .map(|chip| Appear::pop((0.5, 0.5)).apply("claude-context-chip-appear", chip));
         let thumbnails = self.images.iter().enumerate().map(|(index, image)| {
             let id = image.id();
-            div()
+            let thumbnail = div()
                 .id(("claude-image", index))
                 .group("claude-image")
                 .relative()
@@ -1456,14 +1470,18 @@ impl Composer {
                         .border_1()
                         .border_color(ui.elevated_border)
                         .cursor_pointer()
-                        .invisible()
-                        .group_hover("claude-image", |style| style.visible())
+                        .opacity(0.)
+                        .group_hover("claude-image", |style| style.opacity(1.))
                         .child(icon(IconName::Close, ui.foreground).size(px(10.)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.images.retain(|image| image.id() != id);
                             cx.notify();
                         })),
-                )
+                );
+            Appear::pop((0.5, 0.5)).apply(
+                gpui::ElementId::NamedInteger("claude-image-appear".into(), id),
+                thumbnail,
+            )
         });
         Some(
             div()
@@ -1760,6 +1778,8 @@ impl Composer {
             .flex_col()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_suggestions(cx)))
             .children(rows);
+        // It grows out of the field's corner it hangs over.
+        let list = Appear::pop((0., 1.)).apply("claude-suggestions-appear", list);
         Some(
             deferred(
                 anchored()
@@ -1771,6 +1791,37 @@ impl Composer {
             .with_priority(1)
             .into_any_element(),
         )
+    }
+
+    /// Which of Stop and Send the corner shows.
+    fn shown_buttons(&self, has_message: bool, cx: &App) -> (bool, bool) {
+        if self.shell_mode {
+            return (false, true);
+        }
+        let session = self.session.read(cx);
+        let working = session.model().is_working();
+        let shell_running = session.running_shell().is_some();
+        let stop = self.agent.is_none() && (working || shell_running && !has_message);
+        (stop, has_message || !stop)
+    }
+
+    /// Stop and Send take each other's place (a turn starts or ends, a message is typed while
+    /// Claude works): the one that comes pops in where it sits (`POP`).
+    fn note_buttons(&mut self, has_message: bool, window: &Window, cx: &App) {
+        let shown = self.shown_buttons(has_message, cx);
+        if let Some(before) = self.buttons.replace(shown)
+            && before != shown
+            && motion::enabled()
+        {
+            self.swapped = Some((Instant::now(), before));
+        }
+        if let Some((since, _)) = self.swapped {
+            if motion::running(since, motion::POP) {
+                window.request_animation_frame();
+            } else {
+                self.swapped = None;
+            }
+        }
     }
 
     /// Send (an accent square; green in shell mode — Run) and Stop: Claude's turn, or the running
@@ -1794,6 +1845,7 @@ impl Composer {
                 .justify_center()
                 .rounded(px(ui::RADIUS_MD))
                 .cursor_pointer()
+                .active(motion::press)
                 .when_some(fill, |button, fill| {
                     button
                         .bg(UiColors::tint(fill, 0.85))
@@ -1818,16 +1870,34 @@ impl Composer {
                     .size(px(14.)),
                 )
         };
+        // Without a message Send dims; it lights up as one is typed (`FADE`).
+        let lit = if has_message { 1. } else { 0.5 };
         if self.shell_mode {
             return div().flex().flex_none().child(
                 button("claude-run", IconName::ArrowUp, Some(ui.success))
-                    .when(!has_message, |button| button.opacity(0.5).cursor_default())
+                    .when(!has_message, |button| button.cursor_default())
                     .tooltip(ui::tooltip(tr("Run"), Some("↵".into())))
                     .on_click(
                         cx.listener(|this, _: &ClickEvent, window, cx| this.send(None, window, cx)),
-                    ),
+                    )
+                    .with_transition("claude-run-lit", lit, motion::FADE, |button, opacity| {
+                        button.opacity(opacity)
+                    })
+                    .into_any_element(),
             );
         }
+        // The button that just took the other's place pops in.
+        let popping = self
+            .swapped
+            .filter(|(since, _)| motion::running(*since, motion::POP));
+        let pop_in = move |button: AnyElement, was_shown: bool| match popping {
+            Some((since, _)) if !was_shown => Appear::pop((0.5, 0.5))
+                .scale(0.6)
+                .style(div().child(button), motion::progress(since, motion::POP))
+                .into_any_element(),
+            _ => button,
+        };
+        let before = popping.map_or((true, true), |(_, before)| before);
         let stop =
             (self.agent.is_none() && (working || shell_running && !has_message)).then(|| {
                 let label = if working {
@@ -1835,17 +1905,17 @@ impl Composer {
                 } else {
                     tr("Stop the command")
                 };
-                button("claude-stop", IconName::Stop, None)
-                    .tooltip(ui::tooltip(label, Some("Esc".into())))
-                    .on_click(
-                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                let stop =
+                    button("claude-stop", IconName::Stop, None)
+                        .tooltip(ui::tooltip(label, Some("Esc".into())))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.stop(&Stop, window, cx)
-                        }),
-                    )
+                        }));
+                pop_in(stop.into_any_element(), before.0)
             });
         let send = (has_message || stop.is_none()).then(|| {
-            button("claude-send", IconName::ArrowUp, Some(ui.accent))
-                .when(!has_message, |button| button.opacity(0.5).cursor_default())
+            let send = button("claude-send", IconName::ArrowUp, Some(ui.accent))
+                .when(!has_message, |button| button.cursor_default())
                 .tooltip(ui::tooltip(
                     if working {
                         tr("Send after the turn")
@@ -1857,6 +1927,10 @@ impl Composer {
                 .on_click(
                     cx.listener(|this, _: &ClickEvent, window, cx| this.send(None, window, cx)),
                 )
+                .with_transition("claude-send-lit", lit, motion::FADE, |button, opacity| {
+                    button.opacity(opacity)
+                });
+            pop_in(send.into_any_element(), before.1)
         });
         div()
             .flex()
@@ -1982,6 +2056,7 @@ impl Render for Composer {
             .update(cx, |input, _| input.set_placeholder(placeholder));
         let has_message =
             !self.input.read(cx).is_empty() || !self.shell_mode && !self.images.is_empty();
+        self.note_buttons(has_message, window, cx);
         let focused = self.input.focus_handle(cx).is_focused(window);
         let chips = (!self.shell_mode)
             .then(|| self.render_chips(ui, cx))

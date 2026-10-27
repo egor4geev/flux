@@ -1928,11 +1928,10 @@ impl Render for PluginManager {
             .flex_col()
             .child(self.render_header(cx))
             .child(body)
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "plugins-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }
 

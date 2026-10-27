@@ -74,6 +74,34 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
     `terminate:` only after `Platform::quit`. Flux's scenario step `app-terminate` sends it from a run
     loop timer for the same reason.
 
+- **Motion** (2026-10-28, `crates/flux-app/src/motion.rs`): the author asked for lively, Liquid
+  Glass-like animations; gpui 0.2.2 can animate a style (`with_animation`) but can't scale or move
+  what an element paints, and its hover and press styles switch at once.
+  - `src/style.rs`, `src/styled.rs`: `Style::transform_scale`, `transform_origin` (fractions of the
+    element's size, the middle by default) and `transform_translate` — `Styled::transform_scale`,
+    `transform_origin`, `transform_translate`. Paint only: layout and hitboxes keep the real
+    bounds, so a popover that grows out of its anchor is clickable where it will be.
+  - `src/window.rs`: `Window::with_element_scale` / `with_element_transform` keep a uniform
+    transform (`p' = p · scale + offset`, nested ones composed) that every `paint_*` applies: the
+    bounds of quads, shadows, paths, underlines, glyphs, SVGs, images and surfaces, their corner
+    radii, borders, blur and thickness, and the content mask (masks pushed inside scale with the
+    content; the mask in effect where the transform began clips in the window's space, as CSS
+    clips a transformed element by its ancestors). Glyphs, SVGs and images keep their raster and
+    are stretched by the sampler, so an animation doesn't rasterize a new size every frame; a
+    rotated SVG's matrix is conjugated into the scaled space. `Interactivity::paint` applies an
+    element's transform around its opacity (`with_style_paint_effects`).
+  - `src/elements/div.rs`: `set_interaction_transitions` — the hover (`hover`, `group_hover`) and
+    press (`active`, `group_active`) styles of elements with an id fade in and out: background
+    (solid), border and text colors, opacity, scale and move are mixed between the style without
+    and with them (`mix_styles`, straight-alpha colors: a transparent end fades the other's alpha
+    only); everything else switches at once, as before. The fade lives in
+    `InteractiveElementState::interaction_fades`, so an element without an id switches at once;
+    a reversed fade starts from where it was; the release may overshoot (a spring: a pressed button
+    springs back past its size). Unset (the default), nothing fades — stock behaviour.
+  - `src/window.rs`: `Window::with_inert` — hitboxes inserted inside get an empty content mask
+    (the bounds stay for whoever measures with them): a popover fading out after it closed is
+    drawn but takes no hover, clicks, wheel or tooltips.
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,

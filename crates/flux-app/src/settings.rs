@@ -181,6 +181,9 @@ pub struct AppearanceSettings {
     /// The interface scale (part 10.4), 1.0 — 100 %: the whole window, the code included, as Zoom
     /// IDE of JetBrains IDEs (`crate::ui_scale`).
     pub ui_scale: f32,
+    /// Animations (2026-10-28, `crate::motion`): off, things simply appear. macOS's "Reduce
+    /// motion" turns them off too.
+    pub animations: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -194,6 +197,7 @@ impl Default for AppearanceSettings {
             language: LanguageChoice::default(),
             ui_style: UiStyle::default(),
             ui_scale: 1.,
+            animations: true,
         }
     }
 }
@@ -712,6 +716,12 @@ pub fn ui_scale(cx: &App) -> f32 {
         .map_or(1., |settings| settings.appearance.ui_scale)
 }
 
+/// Animations are on in the settings (`crate::motion::enabled` also asks macOS).
+pub fn animations(cx: &App) -> bool {
+    cx.try_global::<Settings>()
+        .is_none_or(|settings| settings.appearance.animations)
+}
+
 /// How a Markdown file opens (part 10.4).
 pub fn markdown_layout(cx: &App) -> MarkdownLayout {
     cx.try_global::<Settings>()
@@ -1102,6 +1112,7 @@ fn parse_appearance(value: &Value) -> AppearanceSettings {
             .map(|scale| scale as f32)
             .filter(|scale| scale.is_finite())
             .map_or(1., crate::ui_scale::clamp),
+        animations: value["animations"].as_bool().unwrap_or(true),
     }
 }
 
@@ -1191,6 +1202,7 @@ fn known_json(settings: &Settings) -> Value {
             "ui_style": settings.appearance.ui_style.key(),
             // 0.9, not the f32's 0.8999999761581421.
             "ui_scale": (f64::from(settings.appearance.ui_scale) * 100.).round() / 100.,
+            "animations": settings.appearance.animations,
         },
         "claude": {
             "enabled": settings.claude.enabled,
@@ -1281,6 +1293,7 @@ mod tests {
                 language: LanguageChoice::Russian,
                 ui_style: UiStyle::Flat,
                 ui_scale: 1.25,
+                animations: false,
             },
             check_plugin_updates: false,
             ignored_suggestions: BTreeSet::from(["*.rs".to_string()]),

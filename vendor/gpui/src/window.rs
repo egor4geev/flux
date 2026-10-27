@@ -830,6 +830,16 @@ impl Frame {
     }
 }
 
+/// Flux patch (motion, 2026-10-28): a uniform scale of what elements paint, `p' = p · scale +
+/// offset` in window pixels (`Window::with_element_scale`).
+#[derive(Clone, Debug)]
+struct ElementTransform {
+    scale: f32,
+    offset: Point<Pixels>,
+    /// The content mask in effect where the scale began, in the window's space.
+    outer_mask: ContentMask<Pixels>,
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -853,6 +863,10 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    /// Flux patch (motion): the scale of what elements paint (`with_element_scale`).
+    element_transform: Option<ElementTransform>,
+    /// Flux patch (motion): how many `with_inert` are around the element being prepainted.
+    inert_depth: usize,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
@@ -1291,6 +1305,8 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            element_transform: None,
+            inert_depth: 0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -2581,6 +2597,166 @@ impl Window {
         result
     }
 
+    /// Flux patch (motion, 2026-10-28): paints what `f` paints scaled by `scale` around `origin`
+    /// (window pixels) — on top of any scale already in effect. Layout, hitboxes and the mouse
+    /// don't see it: an animation that grows a popover out of its anchor or presses a button in
+    /// keeps everything clickable where the layout put it. Content masks pushed inside are scaled
+    /// with the content; the mask in effect here clips in the window's space, as CSS clips a
+    /// transformed element by its ancestors.
+    pub fn with_element_scale<R>(
+        &mut self,
+        scale: Option<f32>,
+        origin: Point<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_element_transform(scale, origin, None, f)
+    }
+
+    /// Flux patch (motion): [`Self::with_element_scale`], then a move by `translate` — a card
+    /// sliding in, painted where it will be clickable a moment later.
+    pub fn with_element_transform<R>(
+        &mut self,
+        scale: Option<f32>,
+        origin: Point<Pixels>,
+        translate: Option<Point<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let scale = scale
+            .filter(|scale| (scale - 1.).abs() > f32::EPSILON)
+            .map(|scale| scale.max(0.));
+        let translate = translate.filter(|translate| !translate.is_zero());
+        if scale.is_none() && translate.is_none() {
+            return f(self);
+        }
+        let scale = scale.unwrap_or(1.);
+        let translate = translate.unwrap_or_default();
+        let previous = self.element_transform.clone();
+        let outer_mask = self.transformed_content_mask();
+        let (outer_scale, outer_offset) = previous
+            .as_ref()
+            .map_or((1., Point::default()), |outer| (outer.scale, outer.offset));
+        self.element_transform = Some(ElementTransform {
+            scale: outer_scale * scale,
+            offset: outer_offset + (origin * (1. - scale) + translate) * outer_scale,
+            outer_mask,
+        });
+        let result = f(self);
+        self.element_transform = previous;
+        result
+    }
+
+    /// Flux patch (motion, 2026-10-28): what `f` prepaints takes no mouse — hover, clicks, the
+    /// wheel and tooltips go to whatever lies beneath. For a popover fading out after it closed:
+    /// still drawn, no longer there.
+    pub fn with_inert<R>(&mut self, inert: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        if !inert {
+            return f(self);
+        }
+        self.inert_depth += 1;
+        let result = f(self);
+        self.inert_depth -= 1;
+        result
+    }
+
+    /// Flux patch (motion): the paint effects of an element's style — its transform (scale
+    /// around its origin point, then the move) around its opacity.
+    pub(crate) fn with_style_paint_effects<R>(
+        &mut self,
+        style: &Style,
+        bounds: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let origin = style.transform_origin.unwrap_or(point(0.5, 0.5));
+        let origin = point(
+            bounds.origin.x + bounds.size.width * origin.x,
+            bounds.origin.y + bounds.size.height * origin.y,
+        );
+        self.with_element_transform(
+            style.transform_scale,
+            origin,
+            style.transform_translate,
+            |window| window.with_element_opacity(style.opacity, f),
+        )
+    }
+
+    /// Flux patch (motion): `bounds` where the scale in effect puts them.
+    fn transform_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        match &self.element_transform {
+            Some(transform) => Bounds {
+                origin: bounds.origin * transform.scale + transform.offset,
+                size: size(
+                    bounds.size.width * transform.scale,
+                    bounds.size.height * transform.scale,
+                ),
+            },
+            None => bounds,
+        }
+    }
+
+    /// Flux patch (motion): device pixel `bounds` where the scale in effect puts them.
+    fn transform_scaled_bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        match &self.element_transform {
+            Some(transform) => {
+                let offset = transform.offset.scale(self.scale_factor());
+                Bounds {
+                    origin: point(
+                        bounds.origin.x * transform.scale + offset.x,
+                        bounds.origin.y * transform.scale + offset.y,
+                    ),
+                    size: size(
+                        bounds.size.width * transform.scale,
+                        bounds.size.height * transform.scale,
+                    ),
+                }
+            }
+            None => bounds,
+        }
+    }
+
+    /// Flux patch (motion): a length (corner radius, border, blur) under the scale in effect.
+    fn transform_length(&self, length: Pixels) -> Pixels {
+        self.element_transform
+            .as_ref()
+            .map_or(length, |transform| length * transform.scale)
+    }
+
+    /// Flux patch (motion): a sprite's own transformation (a rotated SVG) moved into the scaled
+    /// space: `T' = A ∘ T ∘ A⁻¹`, with `A` the scale in effect in device pixels.
+    fn transform_sprite_matrix(&self, matrix: TransformationMatrix) -> TransformationMatrix {
+        let Some(transform) = &self.element_transform else {
+            return matrix;
+        };
+        if matrix == TransformationMatrix::unit() {
+            return matrix;
+        }
+        let offset = transform.offset.scale(self.scale_factor());
+        let (ox, oy) = (offset.x.0, offset.y.0);
+        let r = matrix.rotation_scale;
+        TransformationMatrix {
+            rotation_scale: r,
+            translation: [
+                transform.scale * matrix.translation[0] + ox - (r[0][0] * ox + r[0][1] * oy),
+                transform.scale * matrix.translation[1] + oy - (r[1][0] * ox + r[1][1] * oy),
+            ],
+        }
+    }
+
+    /// Flux patch (motion): the content mask for a primitive painted now — the current mask
+    /// scaled with the content, clipped by the mask in effect where the scale began.
+    fn transformed_content_mask(&self) -> ContentMask<Pixels> {
+        let mask = self.content_mask();
+        match &self.element_transform {
+            Some(transform) => ContentMask {
+                bounds: self
+                    .transform_bounds(mask.bounds)
+                    .intersect(&transform.outer_mask.bounds),
+            },
+            None => mask,
+        }
+    }
+
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
@@ -2916,8 +3092,10 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        let content_mask = self.transformed_content_mask();
+        let clipped_bounds = self
+            .transform_bounds(bounds)
+            .intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
             self.next_frame
                 .scene
@@ -2945,13 +3123,17 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let content_mask = self.transformed_content_mask();
         let opacity = self.element_opacity();
+        let corner_radii = corner_radii.map(|radius| self.transform_length(*radius));
         for shadow in shadows {
-            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            let shadow_bounds =
+                self.transform_bounds((bounds + shadow.offset).dilate(shadow.spread_radius));
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
-                blur_radius: shadow.blur_radius.scale(scale_factor),
+                blur_radius: self
+                    .transform_length(shadow.blur_radius)
+                    .scale(scale_factor),
                 bounds: shadow_bounds.scale(scale_factor),
                 content_mask: content_mask.scale(scale_factor),
                 corner_radii: corner_radii.scale(scale_factor),
@@ -2973,16 +3155,22 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let content_mask = self.transformed_content_mask();
         let opacity = self.element_opacity();
+        let corner_radii = quad
+            .corner_radii
+            .map(|radius| self.transform_length(*radius));
+        let border_widths = quad
+            .border_widths
+            .map(|width| self.transform_length(*width));
         self.next_frame.scene.insert_primitive(Quad {
             order: 0,
-            bounds: quad.bounds.scale(scale_factor),
+            bounds: self.transform_bounds(quad.bounds).scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             background: quad.background.opacity(opacity),
             border_color: quad.border_color.opacity(opacity),
-            corner_radii: quad.corner_radii.scale(scale_factor),
-            border_widths: quad.border_widths.scale(scale_factor),
+            corner_radii: corner_radii.scale(scale_factor),
+            border_widths: border_widths.scale(scale_factor),
             border_style: quad.border_style,
         });
     }
@@ -2994,9 +3182,20 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let content_mask = self.transformed_content_mask();
         let opacity = self.element_opacity();
         path.content_mask = content_mask;
+        if self.element_transform.is_some() {
+            path.bounds = self.transform_bounds(path.bounds);
+            for vertex in &mut path.vertices {
+                vertex.xy_position = self
+                    .transform_bounds(Bounds {
+                        origin: vertex.xy_position,
+                        size: Size::default(),
+                    })
+                    .origin;
+            }
+        }
         let color: Background = color.into();
         path.color = color.opacity(opacity);
         self.next_frame
@@ -3021,11 +3220,11 @@ impl Window {
         } else {
             style.thickness
         };
-        let bounds = Bounds {
+        let bounds = self.transform_bounds(Bounds {
             origin,
             size: size(width, height),
-        };
-        let content_mask = self.content_mask();
+        });
+        let content_mask = self.transformed_content_mask();
         let element_opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
@@ -3034,7 +3233,7 @@ impl Window {
             bounds: bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             color: style.color.unwrap_or_default().opacity(element_opacity),
-            thickness: style.thickness.scale(scale_factor),
+            thickness: self.transform_length(style.thickness).scale(scale_factor),
             wavy: if style.wavy { 1 } else { 0 },
         });
     }
@@ -3052,11 +3251,11 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let height = style.thickness;
-        let bounds = Bounds {
+        let bounds = self.transform_bounds(Bounds {
             origin,
             size: size(width, height),
-        };
-        let content_mask = self.content_mask();
+        });
+        let content_mask = self.transformed_content_mask();
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
@@ -3064,7 +3263,7 @@ impl Window {
             pad: 0,
             bounds: bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
-            thickness: style.thickness.scale(scale_factor),
+            thickness: self.transform_length(style.thickness).scale(scale_factor),
             color: style.color.unwrap_or_default().opacity(opacity),
             wavy: 0,
         });
@@ -3114,11 +3313,11 @@ impl Window {
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
-            let bounds = Bounds {
+            let bounds = self.transform_scaled_bounds(Bounds {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.content_mask().scale(scale_factor);
+            });
+            let content_mask = self.transformed_content_mask().scale(scale_factor);
             self.next_frame.scene.insert_primitive(MonochromeSprite {
                 order: 0,
                 pad: 0,
@@ -3171,11 +3370,11 @@ impl Window {
                 })?
                 .expect("Callback above only errors or returns Some");
 
-            let bounds = Bounds {
+            let bounds = self.transform_scaled_bounds(Bounds {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.content_mask().scale(scale_factor);
+            });
+            let content_mask = self.transformed_content_mask().scale(scale_factor);
             let opacity = self.element_opacity();
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
@@ -3227,7 +3426,7 @@ impl Window {
         else {
             return Ok(());
         };
-        let content_mask = self.content_mask().scale(scale_factor);
+        let content_mask = self.transformed_content_mask().scale(scale_factor);
         let svg_bounds = Bounds {
             origin: bounds.center()
                 - Point::new(
@@ -3243,13 +3442,15 @@ impl Window {
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
             pad: 0,
-            bounds: svg_bounds
-                .map_origin(|origin| origin.round())
-                .map_size(|size| size.ceil()),
+            bounds: self.transform_scaled_bounds(
+                svg_bounds
+                    .map_origin(|origin| origin.round())
+                    .map_size(|size| size.ceil()),
+            ),
             content_mask,
             color: color.opacity(element_opacity),
             tile,
-            transformation,
+            transformation: self.transform_sprite_matrix(transformation),
         });
 
         Ok(())
@@ -3288,17 +3489,21 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
-        let content_mask = self.content_mask().scale(scale_factor);
-        let corner_radii = corner_radii.scale(scale_factor);
+        let content_mask = self.transformed_content_mask().scale(scale_factor);
+        let corner_radii = corner_radii
+            .map(|radius| self.transform_length(*radius))
+            .scale(scale_factor);
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
             grayscale,
-            bounds: bounds
-                .map_origin(|origin| origin.floor())
-                .map_size(|size| size.ceil()),
+            bounds: self.transform_scaled_bounds(
+                bounds
+                    .map_origin(|origin| origin.floor())
+                    .map_size(|size| size.ceil()),
+            ),
             content_mask,
             corner_radii,
             tile,
@@ -3317,8 +3522,8 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let bounds = bounds.scale(scale_factor);
-        let content_mask = self.content_mask().scale(scale_factor);
+        let bounds = self.transform_bounds(bounds).scale(scale_factor);
+        let content_mask = self.transformed_content_mask().scale(scale_factor);
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
@@ -3438,7 +3643,12 @@ impl Window {
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
-        let content_mask = self.content_mask();
+        let mut content_mask = self.content_mask();
+        // Flux patch (motion): inside `with_inert` the mouse finds nothing — an empty mask, the
+        // bounds kept for whoever measures with them.
+        if self.inert_depth > 0 {
+            content_mask.bounds.size = Size::default();
+        }
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {

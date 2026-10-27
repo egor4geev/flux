@@ -1595,12 +1595,18 @@ fn marks_tooltip(editor: &Editor, cx: &mut Context<Editor>) -> Option<AnyElement
                     .child(trf("and {0} more", &[&hover.more])),
             )
         });
-    let panel = popup::panel(ui).occlude().child(content);
+    // It grows out of the mark under the mouse, and follows the mouse along the lane at once.
+    let position = point(hover.left - px(POPUP_GAP), hover.y - px(14.));
+    let panel = crate::motion::Appear::pop((1., 0.)).apply_from(
+        "scrollbar-marks-pop",
+        point(position.x, hover.y),
+        popup::panel(ui).occlude().child(content),
+    );
     Some(
         deferred(
             anchored()
                 .anchor(Corner::TopRight)
-                .position(point(hover.left - px(POPUP_GAP), hover.y - px(14.)))
+                .position(position)
                 .snap_to_window_with_margin(px(WINDOW_MARGIN))
                 .child(panel),
         )
