@@ -45,7 +45,9 @@ as editor tabs; the Claude console (<kbd>⌘</kbd><kbd>Esc</kbd>) lists them wit
 lets you answer Claude's questions without leaving your file, and keeps the project's history. Closing
 a tab doesn't stop Claude. Every edit Claude proposes opens as a diff you accept or trim, and everything it changed
 gathers in its own changelist to review, roll back or commit. <kbd>⌥</kbd><kbd>↵</kbd> asks Claude to
-fix or explain the code right where it is.
+fix or explain the code right where it is. The status bar shows the flag of the country your IP address is
+in: in the countries you list (Russia by default), or when the country can't be found out, Flux stops
+Claude at once and sends nothing until that changes.
 
 ### Plugins in a sandbox
 

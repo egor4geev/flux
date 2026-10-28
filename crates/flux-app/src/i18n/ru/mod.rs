@@ -65,6 +65,9 @@ mod popups;
 mod project_popup;
 mod projects;
 mod rebase;
+mod region_chat;
+mod region_guard;
+mod region_status;
 mod scrollbar;
 mod search;
 mod search_files;
@@ -122,6 +125,9 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     dialog::STRINGS,
     messages::STRINGS,
     motion::STRINGS,
+    region_guard::STRINGS,
+    region_status::STRINGS,
+    region_chat::STRINGS,
     notification_center::STRINGS,
     notifications_panel::STRINGS,
     popups::STRINGS,
@@ -230,6 +236,9 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     claude_tabs::PLURALS,
     claude_console::PLURALS,
     claude_console_core::PLURALS,
+    region_guard::PLURALS,
+    region_status::PLURALS,
+    region_chat::PLURALS,
     claude_turns::PLURALS,
     claude_agents::PLURALS,
     image_view::PLURALS,

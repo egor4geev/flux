@@ -330,6 +330,11 @@ pub struct ClaudeSettings {
     /// A macOS notification when a session finishes or waits for an answer while Flux isn't the
     /// active app (part 10.2).
     pub system_notifications: bool,
+    /// The country check (part «Флаг страны», [`crate::region_guard`]): Claude is blocked while
+    /// the IP address is in one of `blocked_countries` or its country can't be told.
+    pub country_check: bool,
+    /// ISO 3166-1 alpha-2 codes, upper case; Russia by default.
+    pub blocked_countries: Vec<String>,
 }
 
 impl Default for ClaudeSettings {
@@ -349,6 +354,8 @@ impl Default for ClaudeSettings {
             report_problems: true,
             answer_commands: true,
             system_notifications: true,
+            country_check: true,
+            blocked_countries: vec!["RU".to_string()],
         }
     }
 }
@@ -1160,6 +1167,19 @@ fn parse_claude(value: &Value) -> ClaudeSettings {
         system_notifications: value["system_notifications"]
             .as_bool()
             .unwrap_or(defaults.system_notifications),
+        country_check: value["country_check"]
+            .as_bool()
+            .unwrap_or(defaults.country_check),
+        // An empty list stays empty (then only a country that can't be told blocks Claude).
+        blocked_countries: value["blocked_countries"]
+            .as_array()
+            .map(|codes| {
+                codes
+                    .iter()
+                    .filter_map(|code| flux_claude::region::normalize(code.as_str()?))
+                    .collect()
+            })
+            .unwrap_or(defaults.blocked_countries),
     }
 }
 
@@ -1221,6 +1241,8 @@ fn known_json(settings: &Settings) -> Value {
             "report_problems": settings.claude.report_problems,
             "answer_commands": settings.claude.answer_commands,
             "system_notifications": settings.claude.system_notifications,
+            "country_check": settings.claude.country_check,
+            "blocked_countries": settings.claude.blocked_countries,
         },
         "projects": {
             "open_in": settings.projects.open_in.key(),
@@ -1285,6 +1307,8 @@ mod tests {
                 report_problems: false,
                 answer_commands: false,
                 system_notifications: false,
+                country_check: false,
+                blocked_countries: vec!["RU".to_string(), "BY".to_string()],
             },
             appearance: AppearanceSettings {
                 theme: Some("Flux Day".to_string()),

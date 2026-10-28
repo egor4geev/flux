@@ -4,6 +4,9 @@
 //!
 //! A resumed session (the history, Flux restarting) shows "Loading…" while its transcript is read
 //! and starts its process the first time its chat is drawn — in sight — not before.
+//!
+//! Part «Флаг страны»: the chat follows the country check itself (the banner of its field, the notes
+//! of its conversation), and messages the check sends back go into the field in sight.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,16 +16,17 @@ use gpui::{
     div, prelude::*, px,
 };
 
-use flux_claude::{Session, Status};
+use flux_claude::{Session, Status, UserInput};
 
 use crate::claude_agent_view::{self, AgentView};
 use crate::claude_cards::{self, CardsState};
-use crate::claude_composer::Composer;
+use crate::claude_composer::{Composer, Returned, follow_block};
 use crate::claude_search::{self, ChatSearch};
 use crate::claude_session::{ClaudeSession, SessionEvent};
 use crate::claude_transcript::{self, TranscriptState};
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
+use crate::region_guard::{self, Refusal};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD};
 
@@ -103,6 +107,9 @@ pub struct ClaudeChat {
     ticker: Option<Task<()>>,
     /// A resumed session without a process: it starts when the chat is first drawn.
     start_in_sight: bool,
+    /// Why the country check blocks Claude, kept while the country is checked again after the
+    /// block: the last note of the block in the conversation is live meanwhile.
+    region_refusal: Option<Refusal>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -136,11 +143,23 @@ impl ClaudeChat {
                     {
                         this.focus_composer(window, cx)
                     }
+                    SessionEvent::Unsent(inputs) => this.put_back(inputs, cx),
                     _ => {}
                 }
                 cx.notify();
             },
         )];
+        // The chat's tab is a cached view: the notes of the conversation follow the country check
+        // by themselves (part «Флаг страны»).
+        let mut subscriptions = subscriptions;
+        let mut region_refusal = None;
+        follow_block(&mut region_refusal, &region_guard::verdict(cx));
+        if let Some(guard) = region_guard::global(cx) {
+            subscriptions.push(cx.observe(&guard, |this: &mut Self, _, cx| {
+                follow_block(&mut this.region_refusal, &region_guard::verdict(cx));
+                cx.notify();
+            }));
+        }
         // A saved session back without a process (a new one that failed to start has no id).
         let start_in_sight = {
             let session = session.read(cx);
@@ -157,6 +176,7 @@ impl ClaudeChat {
             agents: Vec::new(),
             search: None,
             ticker: None,
+            region_refusal,
             _subscriptions: subscriptions,
         };
         chat.update_ticker(cx);
@@ -171,6 +191,11 @@ impl ClaudeChat {
         &self.composer
     }
 
+    /// The block of the country check in force (part «Флаг страны»), as the conversation shows it.
+    pub(crate) fn region_refusal(&self) -> Option<&Refusal> {
+        self.region_refusal.as_ref()
+    }
+
     /// Focus to the message field.
     pub fn focus_composer(&self, window: &mut Window, cx: &App) {
         self.composer.read(cx).focus(window, cx);
@@ -180,6 +205,28 @@ impl ClaudeChat {
     pub fn insert(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.composer
             .update(cx, |composer, cx| composer.insert(text, window, cx));
+    }
+
+    /// Messages the country check sent back: into the field in sight (a subagent's own, when its
+    /// view is open), each as its field remembers it was written.
+    fn put_back(&mut self, inputs: &[UserInput], cx: &mut Context<Self>) {
+        let fields: Vec<Entity<Composer>> = std::iter::once(self.composer.clone())
+            .chain(self.agent_composer.clone())
+            .collect();
+        let returned = inputs
+            .iter()
+            .map(|input| {
+                fields
+                    .iter()
+                    .find_map(|field| field.update(cx, |field, _| field.recall(input)))
+                    .unwrap_or_else(|| Returned::of(input))
+            })
+            .collect();
+        let in_sight = match &self.agent_composer {
+            Some(field) if !self.agents.is_empty() => field.clone(),
+            _ => self.composer.clone(),
+        };
+        in_sight.update(cx, |field, cx| field.put_back(returned, cx));
     }
 
     /// Files and folders dropped on the chat: mentions in the message, the field focused.

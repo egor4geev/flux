@@ -4981,6 +4981,8 @@ impl Workspace {
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
+        // The country check's flag, at the end of every kind of bar (part «Флаг страны»).
+        let region = crate::region_status::status_item;
         let bar = div()
             .flex_none()
             .h(px(STATUS_BAR_HEIGHT))
@@ -4998,7 +5000,7 @@ impl Workspace {
                 None => {
                     let path = self.display_path(view.read(cx).path());
                     let text = div().flex_1().min_w_0().truncate().child(path.clone());
-                    return bar.child(status_text(&path, text));
+                    return bar.child(status_text(&path, text)).children(region(cx));
                 }
             },
             Some(TabItem::Log(_) | TabItem::Claude(_) | TabItem::Plugin(..)) => {
@@ -5008,7 +5010,8 @@ impl Workspace {
                         &left,
                         div().flex_1().min_w_0().truncate().child(left.clone()),
                     ))
-                    .children(crate::git::status_item(self.git.read(cx), ui));
+                    .children(crate::git::status_item(self.git.read(cx), ui))
+                    .children(region(cx));
             }
             Some(TabItem::Merge(view)) => {
                 let path = self.display_path(view.read(cx).path());
@@ -5021,7 +5024,8 @@ impl Workspace {
                         &left,
                         div().flex_1().min_w_0().truncate().child(left.clone()),
                     ))
-                    .children(crate::git::status_item(self.git.read(cx), ui));
+                    .children(crate::git::status_item(self.git.read(cx), ui))
+                    .children(region(cx));
             }
             // A picture: its file's path (a chat's picture — its name).
             Some(TabItem::Image(view)) => {
@@ -5035,17 +5039,24 @@ impl Workspace {
                         &left,
                         div().flex_1().min_w_0().truncate().child(left.clone()),
                     ))
-                    .children(crate::git::status_item(self.git.read(cx), ui));
+                    .children(crate::git::status_item(self.git.read(cx), ui))
+                    .children(region(cx));
             }
             None => {
                 let text = match &self.root {
                     Some(root) => tilde(root),
                     None => tr("No project — open a folder with ⌘O").into(),
                 };
-                return bar.child(status_text(
-                    &text,
-                    div().text_color(ui.dim).child(text.clone()),
-                ));
+                return bar
+                    .child(status_text(
+                        &text,
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(ui.dim)
+                            .child(text.clone()),
+                    ))
+                    .children(region(cx));
             }
         };
         let editor_id = editor.entity_id();
@@ -5119,6 +5130,7 @@ impl Workspace {
             ui,
         ))
         .child(item(status.line_ending.to_string()).text_color(ui.dim))
+        .children(region(cx))
     }
 
     /// The status bar under a terminal tab: a message for a few seconds, otherwise the active
@@ -5130,18 +5142,22 @@ impl Workspace {
         cx: &Context<Self>,
     ) -> gpui::Div {
         let ui = Theme::ui(cx);
+        let region = crate::region_status::status_item;
         if let Some(message) = &self.status_message {
-            return bar.child(status_text(
-                message,
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .min_w_0()
-                    .text_color(ui.foreground)
-                    .child(icon(IconName::Info, ui.info).size(px(13.)))
-                    .child(div().truncate().child(message.clone())),
-            ));
+            return bar
+                .child(status_text(
+                    message,
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .min_w_0()
+                        .text_color(ui.foreground)
+                        .child(icon(IconName::Info, ui.info).size(px(13.)))
+                        .child(div().truncate().child(message.clone())),
+                ))
+                .children(region(cx));
         }
         let view = group.read(cx).active_view();
         let view = view.read(cx);
@@ -5164,6 +5180,7 @@ impl Workspace {
                 )
                 .children(directory.map(|directory| div().truncate().child(directory))),
         ))
+        .children(region(cx))
     }
 
     /// Display path: relative to the project root, or with `~` outside it.
@@ -7645,7 +7662,7 @@ impl Workspace {
                 SessionRef::Saved(saved) => {
                     if let Some(cli) = self.claude.read(cx).cli().cli().cloned() {
                         let command = claude::resume_command(&cli, Some(&saved.id));
-                        self.type_in_terminal(command, true, window, cx);
+                        self.claude_in_terminal(command, window, cx);
                     }
                 }
             },
@@ -8191,7 +8208,7 @@ impl Workspace {
         });
         self.claude.update(cx, |_, cx| cx.notify());
         let command = claude::resume_command(&cli, id.as_deref());
-        self.type_in_terminal(command, true, window, cx);
+        self.claude_in_terminal(command, window, cx);
     }
 
     /// "Sign In": `claude auth login` in a new terminal (it opens the browser); Flux checks the
@@ -8204,8 +8221,43 @@ impl Workspace {
             "{} auth login",
             claude::shell_quote(&cli.path.to_string_lossy())
         );
-        self.type_in_terminal(command, true, window, cx);
-        self.claude.update(cx, |store, cx| store.watch_sign_in(cx));
+        let this = cx.weak_entity();
+        let handle = window.window_handle();
+        // Part «Флаг страны»: signing in talks to Anthropic too.
+        crate::region_guard::when_allowed(cx, move |outcome, cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| match outcome {
+                        Ok(()) => {
+                            this.type_in_terminal(command, true, window, cx);
+                            this.claude.update(cx, |store, cx| store.watch_sign_in(cx));
+                        }
+                        Err(refusal) => {
+                            this.notify(crate::region_guard::notification(&refusal), cx)
+                        }
+                    })
+                })
+                .ok();
+        });
+    }
+
+    /// `claude` in a new terminal (the terminal CLI of a session), once the country check allows
+    /// it (part «Флаг страны»); blocked — a notification says why.
+    fn claude_in_terminal(&mut self, command: String, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let handle = window.window_handle();
+        crate::region_guard::when_allowed(cx, move |outcome, cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| match outcome {
+                        Ok(()) => this.type_in_terminal(command, true, window, cx),
+                        Err(refusal) => {
+                            this.notify(crate::region_guard::notification(&refusal), cx)
+                        }
+                    })
+                })
+                .ok();
+        });
     }
 
     /// A new terminal in the panel with `text` typed at its prompt (`run` — and run).

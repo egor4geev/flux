@@ -2038,6 +2038,7 @@ dependencies = [
  "libc",
  "serde_json",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]

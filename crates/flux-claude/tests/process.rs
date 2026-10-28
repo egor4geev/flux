@@ -347,7 +347,12 @@ fn a_question_without_a_session() {
         path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fake/fake-claude.py"),
     };
     let dir = tempfile::tempdir().unwrap();
-    let answer = cli.ask(dir.path(), "Write a commit message", Some("haiku"));
+    let answer = cli.ask(
+        dir.path(),
+        "Write a commit message",
+        Some("haiku"),
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     assert_eq!(
         answer.as_deref(),
         Ok("Make the greeting friendlier\n\nhello.py prints \"hello\" instead of \"hi\".")

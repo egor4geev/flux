@@ -101,6 +101,8 @@ mod push_dialog;
 mod quick_switch;
 mod rebase_dialog;
 mod recent;
+mod region_guard;
+mod region_status;
 mod rename;
 #[cfg(feature = "scenario")]
 mod scenario;
@@ -237,6 +239,8 @@ fn main() {
         plugins::init(cx);
         plugin_view::init(cx);
         claude::init(cx);
+        region_guard::init(cx);
+        region_status::init(cx);
         system_shortcuts::init(cx);
         claude_console::init(cx);
         claude_composer::init(cx);

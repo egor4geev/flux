@@ -20,6 +20,9 @@
 //!   - `open-project:/path` — open a project as a recent project on the start screen opens it
 //!     (`OpenProject`: this window or a new one, as the settings say — or asking);
 //!   - `window:2` — send the next steps to the second Flux window (in the order of `cx.windows()`);
+//!   - `region:RU` — the country check answers this country from now on (`fail` — it fails) and is
+//!     asked at once (part «Флаг страны»; without the step a scenario is in Finland, unless
+//!     `FLUX_REGION_FILE` says otherwise);
 //!   - `app-terminate` — macOS asks Flux to quit, as Quit in the Dock or logging out does
 //!     (`-[NSApplication terminate:]` from a run loop timer, outside gpui's tasks — the path of the
 //!     system's Apple Event; part 10.5);
@@ -492,6 +495,12 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
             }
         );
         return STEP_PAUSE;
+    }
+    if let Some(code) = step.strip_prefix("region:") {
+        cx.update(|cx| crate::region_guard::simulate(code, cx)).ok();
+        println!("REGION {code}");
+        // The answer comes from a background thread.
+        return STEP_PAUSE * 2;
     }
     if let Some(number) = step.strip_prefix("window:") {
         let windows = cx.update(|cx| cx.windows()).unwrap_or_default();

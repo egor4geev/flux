@@ -952,6 +952,7 @@ impl ClaudeStore {
     /// Ends a session: its process stops, its chat goes.
     pub fn close_session(&mut self, session: &Entity<ClaudeSession>, cx: &mut Context<Self>) {
         session.update(cx, |session, _| session.shutdown());
+        crate::region_guard::note_working(session.entity_id(), false, cx);
         self.sessions.retain(|known| known != session);
         self.subscriptions.retain(|(known, _)| known != session);
         self.busy.remove(&session.entity_id());
@@ -1058,7 +1059,9 @@ impl ClaudeStore {
                 request: request.clone(),
                 path: path.clone(),
             }),
-            SessionEvent::Changed | SessionEvent::TurnFinished { .. } => {}
+            // The chat puts unsent messages back into its field.
+            SessionEvent::Changed | SessionEvent::TurnFinished { .. } | SessionEvent::Unsent(_) => {
+            }
         }
         self.update_ticker(cx);
         // A new session got its id, a turn started: "Now" as it is now (not on every streamed

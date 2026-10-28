@@ -20,6 +20,10 @@
 //!   background agent and resumes a finished one. While a foreground agent runs, Claude waits for
 //!   it: the message waits too. No `!`, no ⌘↵ and no Stop there — they would stop Claude's turn and
 //!   the agent with it; Esc goes back to the session.
+//! - Part «Флаг страны»: while the country check blocks Claude ([`crate::region_guard`]) a banner on
+//!   top of the card says why, with "Check Again"; Send is off and ↵ keeps the text in the field.
+//!   A message that waits for the check's answer shows "Checking the country…" by Send; one the
+//!   check sends back comes back into the field as it was written ([`Composer::put_back`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,10 +38,10 @@ use flux_search::{PathMatcher, match_list, walk_files};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    Action, AnyElement, App, Bounds, ClickEvent, Context, Corner, DismissEvent, Entity,
-    ExternalPaths, FocusHandle, Focusable, Hsla, Image, ImageFormat, KeyBinding, ObjectFit, Pixels,
-    Render, SharedString, Subscription, Task, Window, actions, anchored, canvas, deferred, div,
-    img, point, prelude::*, px,
+    Action, Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, Corner,
+    DismissEvent, Entity, ExternalPaths, FocusHandle, Focusable, Hsla, Image, ImageFormat,
+    KeyBinding, ObjectFit, Pixels, Render, SharedString, Subscription, Task, Window, actions,
+    anchored, canvas, deferred, div, img, point, prelude::*, px,
 };
 
 use crate::claude_session::{Attachment, ClaudeSession, EditPoint, SessionEvent, with_attachments};
@@ -48,6 +52,7 @@ use crate::motion::{self, Appear, TransitionExt};
 use crate::picker::highlighted_text;
 use crate::popup;
 use crate::prompt_input::{self, PromptInput, PromptInputEvent};
+use crate::region_guard::{self, Refusal, Verdict};
 use crate::settings;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_LG, RADIUS_SM};
@@ -106,6 +111,9 @@ const RING_SIZE: f32 = 14.;
 const RING_LINE: f32 = 2.;
 /// Redraws on nucleo's signals happen at most once per frame (as in ⌘P).
 const REFRESH_INTERVAL: Duration = Duration::from_millis(16);
+/// How many sent messages the field remembers as they were written: one the country check sends
+/// back goes into the field as the user wrote it.
+const SENT_KEPT: usize = 16;
 
 pub fn init(cx: &mut App) {
     let context = Some(CONTEXT);
@@ -456,7 +464,46 @@ pub struct Composer {
     editing: Option<Editing>,
     /// The field of a subagent's view: messages go to Claude for the agent.
     agent: Option<AgentTarget>,
+    /// Why the country check blocks Claude, as the banner on top of the card says it; kept while
+    /// the country is checked again after a block (part «Флаг страны»).
+    region_refusal: Option<Refusal>,
+    /// The last messages sent from here, as they were written (part «Флаг страны»).
+    sent: Vec<Sent>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A message as the field held it when it went to the session.
+struct Sent {
+    /// What the session got: with the subagent's request and the plugin's attachments.
+    message: String,
+    returned: Returned,
+}
+
+/// A message the country check sent back, as the field shows it again: the text as written (with
+/// the mention of the editor's file), the pictures and the plugin's attachments as chips.
+pub struct Returned {
+    text: String,
+    images: Vec<Arc<Image>>,
+    attachments: Vec<Attachment>,
+}
+
+impl Returned {
+    /// A message no field remembers (an edited one): its text and pictures as they went.
+    pub fn of(input: &UserInput) -> Self {
+        let images = input
+            .images
+            .iter()
+            .filter_map(|image| {
+                let format = ImageFormat::from_mime_type(&image.media_type)?;
+                Some(Arc::new(Image::from_bytes(format, image.data.clone())))
+            })
+            .collect();
+        Self {
+            text: input.text.clone(),
+            images,
+            attachments: Vec::new(),
+        }
+    }
 }
 
 /// The subagent a field in its view writes to (through Claude).
@@ -529,6 +576,17 @@ impl Composer {
             // The session refreshes the context meter after each turn itself.
             cx.subscribe(&session, |_, _, _: &SessionEvent, cx| cx.notify()),
         ];
+        // The banner and Send follow the country check: the chat's tab is a cached view, it isn't
+        // drawn again with the window.
+        let mut subscriptions = subscriptions;
+        let mut region_refusal = None;
+        follow_block(&mut region_refusal, &region_guard::verdict(cx));
+        if let Some(guard) = region_guard::global(cx) {
+            subscriptions.push(cx.observe(&guard, |this: &mut Self, _, cx| {
+                follow_block(&mut this.region_refusal, &region_guard::verdict(cx));
+                cx.notify();
+            }));
+        }
         // The meter shows what the conversation starts with (the system prompt, the tools).
         session.update(cx, |session, cx| session.refresh_context(cx));
         // A plugin's session starts with its context and text, the field taking the keyboard
@@ -565,6 +623,8 @@ impl Composer {
             was_empty: true,
             editing: None,
             agent: None,
+            region_refusal,
+            sent: Vec::new(),
             _subscriptions: subscriptions,
         };
         #[cfg(feature = "scenario")]
@@ -829,6 +889,10 @@ impl Composer {
             window.dispatch_action(Box::new(crate::claude::ResumeSession), cx);
             return;
         }
+        // The country check blocks Claude: the message stays in the field, the banner says why.
+        if region_guard::verdict(cx).blocks() {
+            return;
+        }
         // A slash command must stay first: no mention in front of it.
         let mut message = String::new();
         if let Some(context) = self.shown_context()
@@ -838,6 +902,7 @@ impl Composer {
             message.push(' ');
         }
         message.push_str(body);
+        let written = message.clone();
         // A subagent's view: Claude passes the message on (the CLI has no way to the agent).
         if let Some(agent) = &self.agent {
             message = agent.message(&message);
@@ -882,13 +947,28 @@ impl Composer {
             cx.notify();
             return;
         }
+        let sent = input.text.clone();
         let before = self.session.read(cx).model().entries.len();
         self.session
             .update(cx, |session, cx| session.send(input, cx));
-        // The process couldn't start: the text stays for another try.
-        if self.session.read(cx).model().entries.len() == before {
+        // The process couldn't start: the text stays for another try. A message that waits for
+        // the country check leaves the field like a sent one (it comes back if Claude is blocked).
+        let session = self.session.read(cx);
+        if session.model().entries.len() == before && !session.waits_for_region() {
             return;
         }
+        self.remember(
+            sent,
+            Returned {
+                text: written,
+                images: self.images.clone(),
+                attachments: if attach {
+                    self.attachments.clone()
+                } else {
+                    Vec::new()
+                },
+            },
+        );
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.images.clear();
         if attach {
@@ -920,6 +1000,162 @@ impl Composer {
         } else {
             cx.propagate();
         }
+    }
+
+    // --- The country check (part «Флаг страны») ---
+
+    fn remember(&mut self, message: String, returned: Returned) {
+        if self.sent.len() == SENT_KEPT {
+            self.sent.remove(0);
+        }
+        self.sent.push(Sent { message, returned });
+    }
+
+    /// What this field sent as `input`, as it was written; `None` — it didn't send it.
+    pub fn recall(&mut self, input: &UserInput) -> Option<Returned> {
+        let index = self
+            .sent
+            .iter()
+            .rposition(|sent| sent.message == input.text)?;
+        Some(self.sent.remove(index).returned)
+    }
+
+    /// Messages the country check sent back: their text goes before what is typed, a blank line
+    /// apart, their pictures and attachments back to the chips. While a sent message is edited
+    /// they go into the draft that comes back after it.
+    pub fn put_back(&mut self, returned: Vec<Returned>, cx: &mut Context<Self>) {
+        if returned.is_empty() {
+            return;
+        }
+        let mut texts = Vec::new();
+        let mut images = Vec::new();
+        for message in returned {
+            if !message.text.trim().is_empty() {
+                texts.push(message.text);
+            }
+            images.extend(message.images);
+            for attachment in message.attachments {
+                if !self.attachments.contains(&attachment) {
+                    self.attachments.push(attachment);
+                }
+            }
+        }
+        let joined = |typed: String| {
+            let mut parts = texts.clone();
+            if !typed.trim().is_empty() {
+                parts.push(typed);
+            }
+            parts.join("\n\n")
+        };
+        let mut seen = std::collections::HashSet::new();
+        if let Some(editing) = &mut self.editing {
+            editing.draft = joined(std::mem::take(&mut editing.draft));
+            images.append(&mut editing.draft_images);
+            images.retain(|image| seen.insert(image.id()));
+            editing.draft_images = images;
+        } else {
+            // A message isn't a shell command: a command being typed stays, with its `!`.
+            let mut typed = self.input.read(cx).text();
+            if std::mem::take(&mut self.shell_mode) && !typed.is_empty() {
+                typed.insert(0, '!');
+            }
+            let text = joined(typed);
+            // Not empty before the change: a message starting with `!` doesn't start shell mode.
+            self.was_empty = false;
+            self.input.update(cx, |input, cx| input.set_text(&text, cx));
+            images.append(&mut self.images);
+            images.retain(|image| seen.insert(image.id()));
+            self.images = images;
+            self.close_suggestions(cx);
+        }
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// The banner on top of the card while the country check blocks Claude: the flag (a warning
+    /// sign when the country is unknown), why, and "Check Again"; while the country is checked
+    /// again after the block — that it is.
+    fn render_region_banner(
+        &self,
+        checking: bool,
+        ui: UiColors,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let refusal = self.region_refusal.as_ref()?;
+        let tone = if checking { ui.dim } else { ui.warning };
+        let lead = if checking {
+            pulse_dot("claude-region-checking", ui).into_any_element()
+        } else {
+            match &refusal.country {
+                Some(code) => div()
+                    .text_size(px(14.))
+                    .child(region_guard::flag(code))
+                    .into_any_element(),
+                None => icon(IconName::Warning, ui.warning)
+                    .size(px(14.))
+                    .into_any_element(),
+            }
+        };
+        let (text, color) = if checking {
+            (tr("Checking the country…").to_string(), ui.text_muted)
+        } else {
+            (refusal.message(), ui.foreground)
+        };
+        let check_again = (!checking).then(|| {
+            div()
+                .id("claude-region-check-again")
+                .flex_none()
+                .h(px(20.))
+                .px(px(6.))
+                .mr(px(-4.))
+                .flex()
+                .items_center()
+                .rounded(px(RADIUS_SM))
+                .cursor_pointer()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(ui.accent_text)
+                .hover(move |style| style.bg(ui.hover))
+                .active(motion::press)
+                .child(tr("Check Again"))
+                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    region_guard::check_again(cx);
+                }))
+        });
+        let banner = div()
+            .flex()
+            .items_start()
+            .gap(px(8.))
+            .ml(px(-4.))
+            .py(px(5.))
+            .pl(px(9.))
+            .pr(px(8.))
+            .rounded(px(ui::RADIUS_MD))
+            .border_1()
+            .text_size(px(theme::TEXT_SM))
+            .line_height(px(20.))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(16.))
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(lead),
+            )
+            .child(div().flex_1().min_w_0().text_color(color).child(text))
+            .children(check_again)
+            .with_transition("claude-region-tone", tone, motion::FADE, |banner, tone| {
+                banner
+                    .bg(UiColors::tint(tone, 0.1))
+                    .border_color(UiColors::tint(tone, 0.3))
+            });
+        Some(
+            Appear::slide(0., 6.)
+                .curve(motion::SMOOTH)
+                .apply("claude-region-banner", div().child(banner)),
+        )
     }
 
     /// The attach button: pictures to attach, other files to mention.
@@ -1578,9 +1814,14 @@ impl Composer {
 
     /// The card's bottom row: the pickers, the context ring, attach, Send / Stop; in shell mode —
     /// what the command does with its output, and Run.
-    fn render_footer(&self, has_message: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_footer(
+        &self,
+        has_message: bool,
+        blocked: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
-        let send = self.render_send(ui, has_message, cx);
+        let send = self.render_send(ui, has_message, blocked, cx);
         let row = div().h(px(FOOTER_HEIGHT)).flex().items_center().gap(px(1.));
         if self.shell_mode {
             // What ↵ does with the output, and how ⌘↵ runs it the other way.
@@ -1660,7 +1901,26 @@ impl Composer {
                 cx,
             )
         });
-        let ring = context.map(|usage| {
+        // A message waits for the country check (it takes a moment): said where the meter is.
+        let waits = self.session.read(cx).waits_for_region();
+        let checking = waits.then(|| {
+            let label = tr("Checking the country…");
+            let status = div()
+                .id("claude-region-wait")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(6.))
+                .px(px(6.))
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.text_muted)
+                .child(pulse_dot("claude-region-wait-dot", ui))
+                // In a narrow card the dot says it, the tooltip tells.
+                .when(!narrow, |status| status.child(label))
+                .when(narrow, |status| status.tooltip(ui::tooltip(label, None)));
+            Appear::fade().apply("claude-region-wait-appear", status)
+        });
+        let ring = context.filter(|_| !waits).map(|usage| {
             context_ring(usage.fraction(), !narrow, ui).tooltip(ui::tooltip(
                 trf(
                     "{0} / {1} tokens in the context",
@@ -1692,6 +1952,7 @@ impl Composer {
             cx,
         ))
         .child(div().flex_1())
+        .children(checking)
         .children(ring)
         .child(attach)
         .child(send)
@@ -1841,12 +2102,15 @@ impl Composer {
         &self,
         ui: UiColors,
         has_message: bool,
+        blocked: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let session = self.session.read(cx);
         let working = session.model().is_working();
         let shell_running = session.running_shell().is_some();
-        let button = |id: &'static str, name: IconName, fill: Option<Hsla>| {
+        // Send is off while the country check blocks Claude (part «Флаг страны»).
+        let off = blocked && !self.shell_mode;
+        let button = move |id: &'static str, name: IconName, fill: Option<Hsla>, enabled: bool| {
             div()
                 .id(id)
                 .size(px(SEND_SIZE))
@@ -1855,12 +2119,13 @@ impl Composer {
                 .items_center()
                 .justify_center()
                 .rounded(px(ui::RADIUS_MD))
-                .cursor_pointer()
-                .active(motion::press)
+                .when(enabled, |button| {
+                    button.cursor_pointer().active(motion::press)
+                })
                 .when_some(fill, |button, fill| {
                     button
                         .bg(UiColors::tint(fill, 0.85))
-                        .hover(move |style| style.bg(fill))
+                        .when(enabled, |button| button.hover(move |style| style.bg(fill)))
                 })
                 .when(fill.is_none(), |button| {
                     button
@@ -1881,11 +2146,17 @@ impl Composer {
                     .size(px(14.)),
                 )
         };
-        // Without a message Send dims; it lights up as one is typed (`FADE`).
-        let lit = if has_message { 1. } else { 0.5 };
+        // Without a message Send dims; it lights up as one is typed (`FADE`). Off, it stays dim.
+        let lit = if off {
+            0.35
+        } else if has_message {
+            1.
+        } else {
+            0.5
+        };
         if self.shell_mode {
             return div().flex().flex_none().child(
-                button("claude-run", IconName::ArrowUp, Some(ui.success))
+                button("claude-run", IconName::ArrowUp, Some(ui.success), true)
                     .when(!has_message, |button| button.cursor_default())
                     .tooltip(ui::tooltip(tr("Run"), Some("↵".into())))
                     .on_click(
@@ -1917,7 +2188,7 @@ impl Composer {
                     tr("Stop the command")
                 };
                 let stop =
-                    button("claude-stop", IconName::Stop, None)
+                    button("claude-stop", IconName::Stop, None, true)
                         .tooltip(ui::tooltip(label, Some("Esc".into())))
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.stop(&Stop, window, cx)
@@ -1925,16 +2196,20 @@ impl Composer {
                 pop_in(stop.into_any_element(), before.0)
             });
         let send = (has_message || stop.is_none()).then(|| {
-            let send = button("claude-send", IconName::ArrowUp, Some(ui.accent))
+            let send = button("claude-send", IconName::ArrowUp, Some(ui.accent), !off)
                 .when(!has_message, |button| button.cursor_default())
-                .tooltip(ui::tooltip(
-                    if working {
-                        tr("Send after the turn")
-                    } else {
-                        tr("Send")
-                    },
-                    Some("↵".into()),
-                ))
+                .tooltip(if off {
+                    ui::tooltip(tr("Claude is blocked by the country check"), None)
+                } else {
+                    ui::tooltip(
+                        if working {
+                            tr("Send after the turn")
+                        } else {
+                            tr("Send")
+                        },
+                        Some("↵".into()),
+                    )
+                })
                 .on_click(
                     cx.listener(|this, _: &ClickEvent, window, cx| this.send(None, window, cx)),
                 )
@@ -1951,6 +2226,31 @@ impl Composer {
             .children(stop)
             .children(send)
     }
+}
+
+/// Follows the block of the country check in force (part «Флаг страны»): its refusal while Claude
+/// is blocked, kept while the country is checked again after it; `None` once Claude may go, or
+/// while a check runs that no block came before (Flux has just started).
+pub(crate) fn follow_block(kept: &mut Option<Refusal>, verdict: &Verdict) {
+    match verdict.refusal() {
+        Some(refusal) => *kept = Some(refusal),
+        None if *verdict != Verdict::Checking => *kept = None,
+        None => {}
+    }
+}
+
+/// A pulsing dot: the country is being checked.
+fn pulse_dot(id: &'static str, ui: UiColors) -> impl IntoElement {
+    div()
+        .flex_none()
+        .size(px(7.))
+        .rounded(px(4.))
+        .bg(ui.accent)
+        .with_animation(
+            id,
+            Animation::new(Duration::from_millis(900)).repeat(),
+            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+        )
 }
 
 /// How full the context is: a ring that fills clockwise from the top, and the percentage.
@@ -2046,7 +2346,13 @@ impl Render for Composer {
                 matches!(model.status, Status::Exited { .. }),
             )
         };
-        let placeholder = if let Some(agent) = &self.agent {
+        // The country check: the banner keeps its refusal while the country is checked again.
+        let verdict = region_guard::verdict(cx);
+        let blocked = verdict.blocks();
+        let rechecking = self.region_refusal.is_some() && verdict == Verdict::Checking;
+        let placeholder = if (blocked || rechecking) && !self.shell_mode {
+            tr("The text stays here until Claude is unblocked")
+        } else if let Some(agent) = &self.agent {
             if agent.waits {
                 tr("Delivered when the agent is done")
             } else {
@@ -2072,7 +2378,8 @@ impl Render for Composer {
         let chips = (!self.shell_mode)
             .then(|| self.render_chips(ui, cx))
             .flatten();
-        let footer = self.render_footer(has_message, cx);
+        let footer = self.render_footer(has_message, blocked, cx);
+        let region_banner = self.render_region_banner(rechecking, ui, cx);
         let (border, ring) = if self.shell_mode {
             (ui.success, UiColors::tint(ui.success, 0.2))
         } else if focused {
@@ -2210,6 +2517,8 @@ impl Render for Composer {
             }))
             // A click on the card's padding goes to the field.
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.focus(window, cx)))
+            // The country check blocks Claude (part «Флаг страны»).
+            .children(region_banner)
             // Editing a sent message (part 10.2).
             .children(banner)
             .children(agent_banner)

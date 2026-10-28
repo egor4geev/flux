@@ -92,8 +92,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("in {0} days", "через {0} дн."),
     // Settings → Claude Code.
     (
-        "The chat of Claude Code in the window on the right (⌘Esc). Flux runs your claude command line tool, signed in with your Claude subscription.",
-        "Чат Claude Code в окне справа (⌘Esc). Flux запускает вашу утилиту claude со входом по подписке Claude.",
+        "Claude Code in Flux: chats in editor tabs, the console on the left (⌘Esc). Flux runs your claude command line tool, signed in with your Claude subscription.",
+        "Claude Code во Flux: чаты во вкладках редактора, пульт слева (⌘Esc). Flux запускает вашу утилиту claude со входом по подписке Claude.",
     ),
     ("Enable Claude Code", "Включить Claude Code"),
     (

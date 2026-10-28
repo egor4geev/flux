@@ -15,8 +15,10 @@
 //!   a card, a sticky card, the journal only, or nothing (JetBrains: Settings → Notifications).
 //! - Plugins: the plugin manager ([`crate::plugin_manager`]); under it, a page of every plugin that
 //!   is on and has settings ([`crate::plugin_settings`]).
-//! - Claude Code: on or off, the `claude` executable (found or chosen), its version and account,
-//!   the defaults of new sessions, the chat's switches, more arguments for the CLI.
+//! - Claude Code: on or off, the country check (part «Флаг страны»: the switch, the blocked
+//!   countries, where the network sees this Mac now — [`crate::region_guard`]), the `claude`
+//!   executable (found or chosen), its version and account, the defaults of new sessions, the
+//!   chat's switches, more arguments for the CLI.
 //! - About: the version with the commit it is built from, macOS and the computer, the license, the
 //!   developer, the source code; Report a Bug… and Copy — the facts for a report, as JetBrains' Copy
 //!   and Close (part 10.6, [`crate::feedback`]). «About Flux» in the app menu ([`About`]) opens
@@ -52,6 +54,8 @@ use crate::notification_center::{self, Display};
 use crate::plugin_manager::{PluginManager, PluginManagerEvent};
 use crate::plugin_settings::PluginSettingsPage;
 use crate::plugins::{PluginStatus, PluginStore};
+use crate::region_guard::{self, Verdict};
+use crate::region_status;
 use crate::settings::{self, OpenProjectIn, UpdatePreference};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
@@ -80,6 +84,8 @@ const ABOUT_LABEL_WIDTH: f32 = 120.;
 const CLAUDE_LABEL_WIDTH: f32 = 150.;
 /// About → Copy says «Copied» this long.
 const COPIED_FOR: Duration = Duration::from_millis(1500);
+/// Claude Code → Country Check: "checked 5 s ago" counts on this often while the page shows.
+const CLOCK_TICK: Duration = Duration::from_secs(1);
 
 /// The developer and the repository, for About.
 const DEVELOPER: &str = "Egor Ageev";
@@ -346,12 +352,17 @@ pub struct SettingsView {
     claude: Entity<ClaudeStore>,
     /// Claude Code's additional arguments, as the user types them.
     claude_args: Entity<TextInput>,
+    /// The countries Claude is blocked in, as the user types them: saved once every word is a
+    /// country code.
+    countries: Entity<TextInput>,
     /// When About → Copy was last clicked: it says «Copied» for a moment.
     about_copied: Option<Instant>,
     /// Where each notification group's display choices were drawn, by the group's key: the chosen
     /// one's pill glides between them.
     display_choices: RefCell<HashMap<String, Rc<ui::Segments>>>,
     _tasks: Vec<Task<()>>,
+    /// Redraws Claude Code's page every second: when the country was checked.
+    _clock: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -406,8 +417,13 @@ impl SettingsView {
             input.set_text(&settings::claude(cx).extra_args.join(" "), cx);
             input
         });
+        let countries = cx.new(|cx| {
+            let mut input = TextInput::new("RU, BY", cx);
+            input.set_text(&settings::claude(cx).blocked_countries.join(", "), cx);
+            input
+        });
         // A plugin turned off takes its page with it.
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.observe(&handles.plugins, |this, _, cx| {
                 if let Section::Plugin(id) = &this.section
                     && !this.plugin_pages_listed(cx).contains(id)
@@ -433,7 +449,38 @@ impl SettingsView {
                 settings::update_claude(cx, |claude| claude.extra_args = args);
                 this.claude.update(cx, |_, cx| cx.notify());
             }),
+            // A typo doesn't change the list: it stays as it was until every word is a code (a
+            // half-typed code would unblock a country for a moment).
+            cx.subscribe(&countries, |_, input, _: &InputEvent, cx| {
+                let text = input.read(cx).text();
+                if flux_claude::region::invalid_codes(&text).is_empty() {
+                    let codes = flux_claude::region::parse_codes(&text);
+                    if codes != settings::claude(cx).blocked_countries {
+                        settings::update_claude(cx, |claude| claude.blocked_countries = codes);
+                    }
+                }
+                cx.notify();
+            }),
         ];
+        if let Some(guard) = region_guard::global(cx) {
+            subscriptions.push(cx.observe(&guard, |_, _, cx| cx.notify()));
+        }
+        // An answer that only refreshes the time doesn't notify: the clock redraws the page.
+        let clock = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CLOCK_TICK).await;
+                let alive = this.update(cx, |this, cx| {
+                    if this.section == Section::Claude
+                        && region_guard::verdict(cx).checked_at().is_some()
+                    {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        });
         let mut view = Self {
             focus_handle: cx.focus_handle(),
             section: Section::Theme,
@@ -451,9 +498,11 @@ impl SettingsView {
             user_servers: settings::lsp(cx),
             claude: handles.claude,
             claude_args,
+            countries,
             about_copied: None,
             display_choices: RefCell::default(),
             _tasks: Vec::new(),
+            _clock: clock,
             _subscriptions: subscriptions,
         };
         view.refresh(cx);
@@ -1956,6 +2005,28 @@ impl SettingsView {
                         )),
                 ),
         );
+        let country_card = card(tr("Country Check"))
+            .child(switch_row(
+                "claude-country-check",
+                tr("Block Claude by the country of the IP address"),
+                tr("Flux finds out which country the network shows for this Mac and stops Claude while that country is on the list below or can't be found out."),
+                current.country_check,
+                |claude, on| claude.country_check = on,
+                cx,
+            ))
+            .child(self.render_countries(current.country_check, cx))
+            .child(self.render_region_now(cx))
+            .child(
+                div()
+                    .px_3()
+                    .pt_1()
+                    .pb_2()
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(ui.dim)
+                    .child(tr(
+                        "The stop is at once: running sessions end, and nothing is sent to Claude until the country changes. Flux checks as it starts, every minute (every 10 s while Claude works), when the network changes and before a new request. It asks a neutral service, never Claude's servers.",
+                    )),
+            );
         let enabled = current.enabled;
         div()
             .flex()
@@ -1964,7 +2035,7 @@ impl SettingsView {
             .child(section_header(
                 tr("Claude Code"),
                 tr(
-                    "The chat of Claude Code in the window on the right (⌘Esc). Flux runs your claude command line tool, signed in with your Claude subscription.",
+                    "Claude Code in Flux: chats in editor tabs, the console on the left (⌘Esc). Flux runs your claude command line tool, signed in with your Claude subscription.",
                 ),
                 ui,
             ))
@@ -1989,6 +2060,7 @@ impl SettingsView {
                     .flex_col()
                     .gap_3()
                     .when(!enabled, |cards| cards.opacity(0.6))
+                    .child(country_card)
                     .child(cli_card)
                     .child(defaults_card)
                     .child(chat_card)
@@ -2021,6 +2093,201 @@ impl SettingsView {
                 .ok();
             })
             .detach();
+    }
+
+    /// Country Check: the field of the blocked countries with its hint, the countries it holds as
+    /// chips (flag and name), and what in it isn't a code. `on` — the check is on (dimmed when not).
+    fn render_countries(&self, on: bool, cx: &mut Context<Self>) -> Div {
+        let ui = Theme::ui(cx);
+        let text = self.countries.read(cx).text();
+        let invalid = flux_claude::region::invalid_codes(&text);
+        // The list in effect (a typo keeps the previous one).
+        let codes: Vec<String> = match region_guard::global(cx) {
+            Some(guard) => guard.read(cx).countries().to_vec(),
+            None => settings::claude(cx).blocked_countries,
+        };
+        let chips = codes.iter().map(|code| {
+            let name = region_guard::country_name(code);
+            div()
+                .flex_none()
+                .h(px(26.))
+                .pl(px(8.))
+                .pr(px(10.))
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .rounded(px(13.))
+                .bg(ui.input_background)
+                .border_1()
+                .border_color(ui.input_border)
+                .text_size(px(theme::TEXT_SM))
+                .child(region_status::flag(code, 14.))
+                .child(
+                    div()
+                        .text_color(ui.foreground)
+                        .child(name.clone().unwrap_or_else(|| code.clone())),
+                )
+                .when(name.is_some(), |chip| {
+                    chip.child(div().text_color(ui.dim).child(code.clone()))
+                })
+        });
+        let note = codes.is_empty().then(|| {
+            div()
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.warning)
+                .child(tr(
+                    "No countries on the list: Claude is blocked only when the country can't be found out.",
+                ))
+        });
+        let typos = (!invalid.is_empty()).then(|| {
+            div()
+                .flex()
+                .gap_1p5()
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.warning)
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(16.))
+                        .flex()
+                        .items_center()
+                        .child(icon(IconName::Warning, ui.warning).size(px(13.))),
+                )
+                .child(div().flex_1().min_w_0().child(trf(
+                    "Not country codes: {0}. The list stays as it was until they are fixed.",
+                    &[&invalid.join(", ")],
+                )))
+        });
+        div()
+            .px_3()
+            .pt_1()
+            .pb_2()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .when(!on, |list| list.opacity(0.6))
+            .child(
+                div()
+                    .text_color(ui.text_muted)
+                    .child(tr("Blocked countries")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .child(self.countries.clone())
+                    .child(
+                        div()
+                            .text_size(px(theme::TEXT_SM))
+                            .text_color(ui.dim)
+                            .child(tr(
+                                "Two-letter country codes, separated by commas: RU, BY, IR.",
+                            )),
+                    ),
+            )
+            .when(!codes.is_empty(), |list| {
+                list.child(div().pt_0p5().flex().flex_wrap().gap_1p5().children(chips))
+            })
+            .children(note)
+            .children(typos)
+    }
+
+    /// Country Check: where the network sees this Mac now, what that means for Claude, when it was
+    /// checked, and Check Again.
+    fn render_region_now(&self, cx: &mut Context<Self>) -> Div {
+        let ui = Theme::ui(cx);
+        let verdict = region_guard::verdict(cx);
+        let asking = region_guard::global(cx).is_some_and(|guard| guard.read(cx).is_checking());
+        let place = match &verdict {
+            Verdict::Off => tr("Not checked").to_string(),
+            Verdict::Checking => tr("Checking the country of the IP address…").to_string(),
+            Verdict::Unknown(_) => tr("The country of the IP address is unknown").to_string(),
+            verdict => region_status::place(verdict).unwrap_or_default(),
+        };
+        let checked = match (region_status::checked(&verdict), asking) {
+            (_, true) if verdict != Verdict::Checking => Some(tr("checking now…").to_string()),
+            (Some(_), _) => verdict
+                .checked_at()
+                .map(|at| trf("checked {0}", &[&region_status::ago(at)])),
+            (None, _) => None,
+        };
+        let mark =
+            region_status::mark(&verdict, 20., "settings-region-pulse", ui).unwrap_or_else(|| {
+                icon(IconName::Globe, ui.dim)
+                    .size(px(18.))
+                    .into_any_element()
+            });
+        div()
+            .mx_3()
+            .mt_1()
+            .mb_1p5()
+            .px_3()
+            .py(px(10.))
+            .flex()
+            .items_center()
+            .gap_3()
+            .rounded(px(ui::RADIUS_MD))
+            .bg(ui.input_background)
+            .border_1()
+            .border_color(if verdict.blocks() {
+                UiColors::tint(ui.error, 0.4)
+            } else {
+                ui.input_border
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(24.))
+                    .flex()
+                    .justify_center()
+                    .child(mark),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(div().text_color(ui.foreground).child(place))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_x_1()
+                            .text_size(px(theme::TEXT_SM))
+                            .child(
+                                div()
+                                    .text_color(region_status::tone(&verdict, ui))
+                                    .child(region_status::state(&verdict)),
+                            )
+                            .children(checked.map(|checked| {
+                                div().text_color(ui.dim).child(format!("· {checked}"))
+                            })),
+                    ),
+            )
+            .when(verdict != Verdict::Off, |row| {
+                row.child(
+                    ui::text_button(
+                        "claude-country-check-again",
+                        if asking {
+                            tr("Checking…")
+                        } else {
+                            tr("Check Again")
+                        },
+                        false,
+                        ui,
+                    )
+                    .when(asking, |button| button.opacity(0.6))
+                    .when(!asking, |button| {
+                        button.on_click(cx.listener(|_, _, _, cx| {
+                            region_guard::check_again(cx);
+                            cx.notify();
+                        }))
+                    }),
+                )
+            })
     }
 
     /// About: the logo with the name, version, and description; then the facts in rows — the build,
