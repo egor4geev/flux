@@ -1258,7 +1258,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let confirm = self.confirm_close_all(window, cx);
+        let confirm = self.confirm_close_all(Processes::CloseProject, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if !confirm.await {
                 return;
@@ -3202,7 +3202,7 @@ impl Workspace {
             self.window_closing(window, cx);
             return true;
         }
-        let confirm = self.confirm_close_all(window, cx);
+        let confirm = self.confirm_close_all(Processes::CloseWindow, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if confirm.await {
                 this.update_in(cx, |this, window, cx| this.window_closing(window, cx))
@@ -3217,8 +3217,13 @@ impl Workspace {
     /// Before the window closes or the app quits: one question about the commands running in the
     /// window's terminals (the panel's and the tabs'), then the unsaved documents one by one, then
     /// the merge results not applied yet. `true` means everything may go.
-    fn confirm_close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
-        let documents = self.confirm_close_documents(window, cx);
+    fn confirm_close_all(
+        &mut self,
+        processes: Processes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
+        let documents = self.confirm_close_documents(processes, window, cx);
         let merges: Vec<Entity<MergeView>> = self
             .tabs
             .iter()
@@ -3254,9 +3259,12 @@ impl Workspace {
         })
     }
 
-    /// The running commands and the unsaved documents of [`Self::confirm_close_all`].
+    /// The running commands and the unsaved documents of [`Self::confirm_close_all`]: with commands
+    /// running in terminals or Claude at work, one short question first — all of them end with the
+    /// window (a quit has asked once for every window: [`confirm_processes`]).
     fn confirm_close_documents(
         &mut self,
+        processes: Processes,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<bool> {
@@ -3264,24 +3272,17 @@ impl Workspace {
             return Task::ready(false);
         }
         let editors = self.editors(cx);
-        let terminals = running_processes_detail(&self.running_processes(cx));
-        let claude = self.claude_working_detail(cx);
-        // Claude alone is stopped; with terminals, everything is terminated.
-        let (title, button) = if terminals.is_none() {
-            (tr("Stop Claude?"), tr("Stop"))
-        } else {
-            (tr("Terminate running processes?"), tr("Terminate"))
-        };
-        let detail = match (terminals, claude) {
-            (None, None) => return self.confirm(editors, window, cx),
-            (Some(detail), None) | (None, Some(detail)) => detail,
-            (Some(terminals), Some(claude)) => format!("{terminals}\n{claude}"),
+        let title = match processes {
+            _ if !self.has_running_work(cx) => return self.confirm(editors, window, cx),
+            Processes::Asked => return self.confirm(editors, window, cx),
+            Processes::CloseWindow => tr("Close the window?"),
+            Processes::CloseProject => tr("Close the project?"),
         };
         self.closing = true;
         window.activate_window();
         let answer = Dialog::warning(title)
-            .message(detail)
-            .danger(button)
+            .message(tr("All running processes of this window will be stopped."))
+            .danger(tr("Close"))
             .cancel(tr("Cancel"))
             .show(window, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -3297,6 +3298,13 @@ impl Workspace {
             };
             confirm.await
         })
+    }
+
+    /// Commands run in the window's terminals or Claude works in one of its sessions: closing the
+    /// window or quitting asks first.
+    fn has_running_work(&self, cx: &App) -> bool {
+        !self.running_processes(cx).is_empty()
+            || !self.claude.read(cx).working_sessions(cx).is_empty()
     }
 
     /// Names of the commands running in the window's terminals: in the panel and in the tabs.
@@ -6514,8 +6522,9 @@ fn start_quit_then(cx: &mut App, cancelled: impl FnOnce(&mut App) + 'static) {
         .filter_map(|window| window.downcast())
         .collect();
     cx.spawn(async move |cx| {
-        let confirmed =
-            confirm_windows(windows.clone(), cx).await && confirm_leftovers(&windows, cx).await;
+        let confirmed = confirm_processes(&windows, cx).await
+            && confirm_windows(windows.clone(), cx).await
+            && confirm_leftovers(&windows, cx).await;
         cx.update(|cx| {
             if confirmed {
                 cx.quit();
@@ -6530,10 +6539,59 @@ fn start_quit_then(cx: &mut App, cancelled: impl FnOnce(&mut App) + 'static) {
     .detach();
 }
 
+/// What closing a window asks about the commands running in its terminals and Claude at work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Processes {
+    /// The window closes: "Close the window?".
+    CloseWindow,
+    /// Another project opens in the window: "Close the project?".
+    CloseProject,
+    /// Flux quits and has asked once for every window ([`confirm_processes`]).
+    Asked,
+}
+
+/// Quitting with commands running in terminals or Claude at work in any window: one short
+/// question for all of them, asked in the window in front (or the first busy one) — no list of
+/// what runs where; the processes end with Flux.
+async fn confirm_processes(windows: &[WindowHandle<Workspace>], cx: &mut AsyncApp) -> bool {
+    let busy: Vec<WindowHandle<Workspace>> = windows
+        .iter()
+        .copied()
+        .filter(|handle| {
+            handle
+                .update(cx, |workspace, _, cx| workspace.has_running_work(cx))
+                .unwrap_or(false)
+        })
+        .collect();
+    let Some(&first) = busy.first() else {
+        return true;
+    };
+    let active = cx
+        .update(|cx| {
+            cx.active_window()
+                .and_then(|window| window.downcast::<Workspace>())
+        })
+        .ok()
+        .flatten()
+        .filter(|active| busy.contains(active));
+    let answer = active.unwrap_or(first).update(cx, |_, window, cx| {
+        window.activate_window();
+        Dialog::warning(tr("Quit Flux?"))
+            .message(tr("All running processes will be stopped."))
+            .danger(tr("Quit"))
+            .cancel(tr("Cancel"))
+            .show(window, cx)
+    });
+    let Ok(answer) = answer else {
+        return true;
+    };
+    answer.await == Some(0)
+}
+
 async fn confirm_windows(windows: Vec<WindowHandle<Workspace>>, cx: &mut AsyncApp) -> bool {
     for handle in windows {
         let confirm = handle.update(cx, |workspace, window, cx| {
-            workspace.confirm_close_all(window, cx)
+            workspace.confirm_close_all(Processes::Asked, window, cx)
         });
         // The window was closed in the meantime: there is nothing to ask about.
         let Ok(confirm) = confirm else {
@@ -7087,19 +7145,6 @@ fn terminal_details(terminals: &[Option<(SharedString, Option<PathBuf>)>]) -> Ve
             })
         })
         .collect()
-}
-
-/// The detail of the "Terminate running processes?" question, naming the commands (each once, with
-/// a count when it runs in several terminals); `None` when nothing is running.
-fn running_processes_detail(names: &[String]) -> Option<String> {
-    match names {
-        [] => None,
-        [name] => Some(trf("“{0}” is still running in a terminal.", &[name])),
-        _ => Some(trf(
-            "{0} are still running in terminals.",
-            &[&names_with_counts(names)],
-        )),
-    }
 }
 
 /// "cargo, node ×2": process names in the order first seen, repeats counted.
@@ -8408,23 +8453,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Closing the window: what Claude does in its sessions (`None` — nothing).
-    fn claude_working_detail(&self, cx: &App) -> Option<String> {
-        let working = self.claude.read(cx).working_sessions(cx);
-        match working.as_slice() {
-            [] => None,
-            [session] => Some(trf(
-                "Claude is working in “{0}”.",
-                &[&session.read(cx).title()],
-            )),
-            sessions => Some(trn(
-                sessions.len(),
-                "Claude is working in {n} session.",
-                "Claude is working in {n} sessions.",
-            )),
-        }
-    }
-
     // --- Drawing ---
 
     /// A Claude chat in the editor's tabs: ✳, the session's title, its status dot in place of ×.
@@ -8696,19 +8724,12 @@ mod tests {
     }
 
     #[test]
-    fn the_quit_question_names_the_running_commands_once() {
-        assert_eq!(running_processes_detail(&[]), None);
+    fn running_commands_are_named_once_with_a_count() {
+        assert_eq!(names_with_counts(&[]), "");
+        assert_eq!(names_with_counts(&["cargo".into()]), "cargo");
         assert_eq!(
-            running_processes_detail(&["cargo".into()]).as_deref(),
-            Some("“cargo” is still running in a terminal.")
-        );
-        assert_eq!(
-            running_processes_detail(&["cargo".into(), "vim".into(), "cargo".into()]).as_deref(),
-            Some("cargo ×2, vim are still running in terminals.")
-        );
-        assert_eq!(
-            running_processes_detail(&["cargo".into(), "cargo".into()]).as_deref(),
-            Some("cargo ×2 are still running in terminals.")
+            names_with_counts(&["cargo".into(), "vim".into(), "cargo".into()]),
+            "cargo ×2, vim"
         );
     }
 

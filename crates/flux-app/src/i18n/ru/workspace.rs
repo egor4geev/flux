@@ -29,13 +29,17 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Terminate running processes?",
         "Завершить запущенные процессы?",
     ),
+    // Closing a window or quitting with commands running or Claude at work: one short question.
+    ("Quit Flux?", "Выйти из Flux?"),
     (
-        "“{0}” is still running in a terminal.",
-        "«{0}» ещё работает в терминале.",
+        "All running processes will be stopped.",
+        "При выходе будут прерваны все запущенные процессы.",
     ),
+    ("Close the window?", "Закрыть окно?"),
+    ("Close the project?", "Закрыть проект?"),
     (
-        "{0} are still running in terminals.",
-        "{0} ещё работают в терминалах.",
+        "All running processes of this window will be stopped.",
+        "При закрытии будут прерваны все процессы этого окна.",
     ),
     ("Terminate", "Завершить"),
     // lifecycle
