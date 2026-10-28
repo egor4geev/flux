@@ -47,6 +47,7 @@ use crate::icons::{IconName, IconSource, file_icon, icon, source_icon};
 use crate::image_view::ImageSource;
 use crate::markdown::{self, Block, Marks};
 use crate::motion::{self, Appear, Curve, TransitionExt};
+use crate::region_guard::{self, Verdict};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 use crate::workspace::Location;
@@ -1101,6 +1102,10 @@ fn item_element(
         root: &model.info.cwd,
         tasks: &model.tasks,
         agent: agent.is_some(),
+        block: chat_view.region_refusal().map(|refusal| LiveBlock {
+            refusal: refusal.clone(),
+            checking: region_guard::verdict(cx) == Verdict::Checking,
+        }),
         marks: RefCell::new(HashMap::new()),
         redraw: Cell::new(Redraw::None),
     };
@@ -1154,6 +1159,13 @@ fn is_hidden(kind: &EntryKind) -> bool {
     }
 }
 
+/// The block of the country check in force (part «Флаг страны»): why, and whether the country is
+/// being checked again.
+struct LiveBlock {
+    refusal: region_guard::Refusal,
+    checking: bool,
+}
+
 /// Draws entries; borrows what it needs for one frame.
 struct Renderer<'a> {
     ui: UiColors,
@@ -1167,6 +1179,8 @@ struct Renderer<'a> {
     tasks: &'a [flux_claude::TaskItem],
     /// A subagent's conversation (its avatar instead of Claude's).
     agent: bool,
+    /// The block of the country check in force: the last note of a block is live while it lasts.
+    block: Option<LiveBlock>,
     /// The search's marks by entry, made on first use: an entry's texts share its count.
     marks: RefCell<HashMap<EntryId, Rc<Marks>>>,
     /// How soon what moves in the item wants the next frame.
@@ -1265,7 +1279,7 @@ impl Renderer<'_> {
         match &entry.kind {
             EntryKind::User(user) => self.user(entry.id, user),
             EntryKind::Shell(shell) => self.shell(entry.id, shell),
-            EntryKind::Notice(notice @ Notice::Compacted { .. }) => self.notice(notice),
+            EntryKind::Notice(notice @ Notice::Compacted { .. }) => self.notice(entry.id, notice),
             _ => self.claude(lead, self.entry(entry, 0)),
         }
     }
@@ -1349,7 +1363,7 @@ impl Renderer<'_> {
                 ..
             } => self.thinking(entry.id, text, *tokens, *streaming, *duration),
             EntryKind::Tool(tool) => self.tool_entry(entry.id, tool, depth),
-            EntryKind::Notice(notice) => self.notice(notice),
+            EntryKind::Notice(notice) => self.notice(entry.id, notice),
             EntryKind::TurnEnd(summary) => self.turn_end(entry.id, summary),
             EntryKind::Shell(shell) => self.shell(entry.id, shell),
         }
@@ -3263,7 +3277,7 @@ impl Renderer<'_> {
 
     // --- Notices and the ends of turns ---
 
-    fn notice(&self, notice: &Notice) -> AnyElement {
+    fn notice(&self, id: EntryId, notice: &Notice) -> AnyElement {
         let ui = self.ui;
         match notice {
             Notice::Interrupted => notice_row(IconName::Stop, tr("Interrupted"), ui.dim, ui),
@@ -3334,7 +3348,81 @@ impl Renderer<'_> {
                     ui,
                 )
             }
+            Notice::Blocked { country } => self.blocked(id, country.as_ref()),
         }
+    }
+
+    /// The country check kept Claude from going or stopped it (part «Флаг страны»). The last such
+    /// note, while the block lasts, is a callout of the block in force — the flag (a warning sign
+    /// when the country is unknown), why, "Check Again" — as the field's banner says it. Once
+    /// Claude is allowed again, or a later note took over, it is a quiet line of what was.
+    fn blocked(&self, id: EntryId, country: Option<&String>) -> AnyElement {
+        let ui = self.ui;
+        let lead = |country: Option<&String>, size: f32| match country {
+            Some(code) => div()
+                .text_size(px(size))
+                .child(region_guard::flag(code))
+                .into_any_element(),
+            None => icon(IconName::Warning, ui.warning)
+                .size(px(size))
+                .into_any_element(),
+        };
+        let latest = self
+            .model
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.kind, EntryKind::Notice(Notice::Blocked { .. })))
+            .map(|entry| entry.id);
+        let Some(live) = self.block.as_ref().filter(|_| latest == Some(id)) else {
+            let label = match country {
+                Some(code) => trf(
+                    "Claude was blocked: the IP address was in {0}.",
+                    &[&region_guard::country_label(code)],
+                ),
+                None => {
+                    tr("Claude was blocked: Flux couldn't find out the country of the IP address.")
+                        .to_string()
+                }
+            };
+            return div()
+                .min_h(px(ROW_HEIGHT))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.text_muted)
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(16.))
+                        .flex()
+                        .justify_center()
+                        .child(lead(country, 13.)),
+                )
+                .child(div().min_w_0().child(label))
+                .into_any_element();
+        };
+        let action = if live.checking {
+            ui::primary_button(
+                "claude-region-check",
+                tr("Checking the country…"),
+                false,
+                ui,
+            )
+        } else {
+            ui::primary_button("claude-region-check", tr("Check Again"), true, ui)
+                .on_click(|_, _, cx| region_guard::check_again(cx))
+        };
+        callout_box(
+            lead(live.refusal.country.as_ref(), 14.),
+            tr("Claude is blocked").to_string(),
+            Some(live.refusal.reason().into()),
+            None,
+            ui.warning,
+            Some(action.into_any_element()),
+            ui,
+        )
     }
 
     fn error(&self, kind: &str, text: &str) -> AnyElement {
@@ -4455,6 +4543,32 @@ fn callout(
     action: NoticeAction,
     ui: UiColors,
 ) -> AnyElement {
+    let action = action.map(|(label, action)| {
+        ui::primary_button("claude-notice-action", label, true, ui)
+            .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+            .into_any_element()
+    });
+    callout_box(
+        icon(name, color).size(px(14.)).into_any_element(),
+        title,
+        body,
+        details,
+        color,
+        action,
+        ui,
+    )
+}
+
+/// [`callout`] with any mark before the title (a country's flag) and any button.
+fn callout_box(
+    lead: AnyElement,
+    title: String,
+    body: Option<SharedString>,
+    details: Option<String>,
+    color: Hsla,
+    action: Option<AnyElement>,
+    ui: UiColors,
+) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -4471,7 +4585,7 @@ fn callout(
                 .gap(px(6.))
                 .text_size(px(theme::TEXT_SM))
                 .font_weight(FontWeight::MEDIUM)
-                .child(icon(name, color).size(px(14.)))
+                .child(lead)
                 .child(title),
         )
         .children(body.map(|body| {
@@ -4484,13 +4598,7 @@ fn callout(
             let (shown, _) = clip_lines(&details, CLIP_LINES);
             code_box(shown, ui.text_muted, ui)
         }))
-        .children(action.map(|(label, action)| {
-            div().flex().child(
-                ui::primary_button("claude-notice-action", label, true, ui).on_click(
-                    move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx),
-                ),
-            )
-        }))
+        .children(action.map(|action| div().flex().child(action)))
         .into_any_element()
 }
 

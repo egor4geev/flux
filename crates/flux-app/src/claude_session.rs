@@ -12,6 +12,11 @@
 //! login shell's environment; when one ends and Claude is idle, its records go to the CLI as
 //! context only (or as a message Claude answers — a setting).
 //!
+//! Part «Флаг страны»: nothing goes to Anthropic unless the country check allows it
+//! ([`crate::region_guard`]) — a process waits for the answer to start, a message to go (it goes
+//! back to the field when Claude is blocked: [`SessionEvent::Unsent`]); a block kills the process
+//! at once.
+//!
 //! Part 9.2: a saved session comes back in a tab without a process ([`ClaudeSession::resumed`]:
 //! the conversation from its transcript); the process starts with `--resume` when the chat is in
 //! sight ([`ClaudeSession::ensure_started`]) or the user writes. Flux's MCP server (`flux`, the
@@ -23,7 +28,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::StreamExt;
-use gpui::{AppContext, AsyncApp, Context, EventEmitter, SharedString, Task, WeakEntity};
+use gpui::{
+    AppContext, AsyncApp, Context, EventEmitter, SharedString, Subscription, Task, WeakEntity,
+};
 use serde_json::{Value, json};
 
 use flux_claude::mcp::{self, McpReply, McpServer, ToolOutput};
@@ -32,11 +39,12 @@ use flux_claude::protocol::{CliRequest, HostRequest, Incoming};
 use flux_claude::session::EDIT_HOOK;
 use flux_claude::shell::{self, ShellCommand, ShellEvent};
 use flux_claude::{
-    Answer, Change, Cli, Effort, EntryId, LaunchOptions, PermissionMode, Process, Session,
+    Answer, Change, Cli, Effort, EntryId, LaunchOptions, Notice, PermissionMode, Process, Session,
     ShellState, Status, UserInput,
 };
 
 use crate::i18n::tr;
+use crate::region_guard::{self, Gate, Refusal, RegionEvent};
 
 /// How often `get_usage` is asked again while the CLI hasn't fetched the limits yet (right after
 /// it starts it answers `rate_limits: null`).
@@ -88,6 +96,9 @@ pub enum SessionEvent {
         request: String,
         path: PathBuf,
     },
+    /// Messages that didn't go: the country check blocks Claude (part «Флаг страны»). The chat
+    /// puts them back into its field.
+    Unsent(Vec<UserInput>),
 }
 
 /// The PreToolUse hook that lets Flux's own tools run without a permission card.
@@ -139,6 +150,20 @@ pub struct ClaudeSession {
     draft: Option<SessionDraft>,
     /// A redraw of the conversation waits for the next animation tick ([`Self::emit`]).
     redraw_pending: bool,
+    /// What waits for the country check (part «Флаг страны»).
+    region_wait: RegionWait,
+    /// A block of the country check kills the process.
+    _region: Option<Subscription>,
+}
+
+/// What waits for an answer of the country check: the process's start and the messages, which go
+/// in their order once it allows.
+#[derive(Default)]
+struct RegionWait {
+    /// A waiter is registered with the guard.
+    waiting: bool,
+    start: bool,
+    inputs: Vec<UserInput>,
 }
 
 /// The start of a session's message field: text, and attachments as chips (part 10.3).
@@ -203,6 +228,7 @@ impl EventEmitter<SessionEvent> for ClaudeSession {}
 impl ClaudeSession {
     pub fn new(cli: Cli, options: LaunchOptions, cx: &mut Context<Self>) -> Self {
         let mut session = Self::idle(cli, options);
+        session.watch_region(cx);
         session.start(cx);
         session
     }
@@ -218,6 +244,7 @@ impl ClaudeSession {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut session = Self::idle(cli, options);
+        session.watch_region(cx);
         session.model.info.session_id = session.options.resume.clone();
         session.model.status = Status::Idle;
         session.loading = true;
@@ -250,6 +277,8 @@ impl ClaudeSession {
             restart: None,
             draft: None,
             redraw_pending: false,
+            region_wait: RegionWait::default(),
+            _region: None,
         }
     }
 
@@ -381,8 +410,29 @@ impl ClaudeSession {
     }
 
     /// Sends the user's message; a session whose process exited starts again, resuming the
-    /// conversation.
+    /// conversation. Something new for Anthropic (a start, an idle process's turn) waits for a
+    /// fresh answer of the country check; a blocked one goes back to the field
+    /// ([`SessionEvent::Unsent`]).
     pub fn send(&mut self, input: UserInput, cx: &mut Context<Self>) {
+        // Messages that wait keep their order.
+        if !self.region_wait.inputs.is_empty() {
+            self.region_wait.inputs.push(input);
+            return;
+        }
+        let fresh = self.process.is_none() || !self.model.is_working();
+        match region_guard::gate(fresh, cx) {
+            Gate::Go => {}
+            Gate::Wait => {
+                self.region_wait.inputs.push(input);
+                self.wait_for_region(cx);
+                return;
+            }
+            Gate::Refuse(refusal) => {
+                self.refused(&refusal, cx);
+                cx.emit(SessionEvent::Unsent(vec![input]));
+                return;
+            }
+        }
         if self.process.is_none() {
             self.options.resume = self.model.info.session_id.clone();
             self.start(cx);
@@ -883,6 +933,14 @@ impl ClaudeSession {
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
+        match region_guard::gate(true, cx) {
+            Gate::Go => {}
+            Gate::Wait => {
+                self.region_wait.start = true;
+                return self.wait_for_region(cx);
+            }
+            Gate::Refuse(refusal) => return self.refused(&refusal, cx),
+        }
         let (process, events) = match Process::spawn(&self.cli, &self.options) {
             Ok(started) => started,
             Err(err) => {
@@ -1053,6 +1111,120 @@ impl ClaudeSession {
         }
     }
 
+    // --- The country check (part «Флаг страны») ---
+
+    /// Messages wait for the country check's answer (the field shows it).
+    pub fn waits_for_region(&self) -> bool {
+        !self.region_wait.inputs.is_empty()
+    }
+
+    fn watch_region(&mut self, cx: &mut Context<Self>) {
+        let Some(guard) = region_guard::global(cx) else {
+            return;
+        };
+        self._region = Some(cx.subscribe(&guard, |this, _, event, cx| {
+            if let RegionEvent::Blocked(refusal) = event {
+                this.stop_for_region(refusal, cx);
+            }
+        }));
+    }
+
+    /// Asks the guard to call back with its next answer (once for all that waits).
+    fn wait_for_region(&mut self, cx: &mut Context<Self>) {
+        cx.emit(SessionEvent::Changed);
+        cx.notify();
+        if self.region_wait.waiting {
+            return;
+        }
+        self.region_wait.waiting = true;
+        let this = cx.weak_entity();
+        region_guard::wait(cx, move |outcome, cx| {
+            this.update(cx, |this, cx| this.region_answered(outcome, cx))
+                .ok();
+        });
+    }
+
+    /// The country check answered: what waited goes — the process starts, the messages are sent
+    /// in their order, held `!` records follow — or, blocked, the messages go back to the field.
+    fn region_answered(&mut self, outcome: Result<(), Refusal>, cx: &mut Context<Self>) {
+        self.region_wait.waiting = false;
+        let start = std::mem::take(&mut self.region_wait.start);
+        let inputs = std::mem::take(&mut self.region_wait.inputs);
+        match outcome {
+            Ok(()) => {
+                if start && self.process.is_none() {
+                    self.start(cx);
+                }
+                for input in inputs {
+                    self.send(input, cx);
+                }
+                self.deliver_when_idle(cx);
+            }
+            Err(refusal) => {
+                self.refused(&refusal, cx);
+                if !inputs.is_empty() {
+                    cx.emit(SessionEvent::Unsent(inputs));
+                }
+            }
+        }
+        cx.emit(SessionEvent::Changed);
+        cx.notify();
+    }
+
+    /// Claude doesn't go: a note in the conversation says why (not twice in a row).
+    fn refused(&mut self, refusal: &Refusal, cx: &mut Context<Self>) {
+        let changes = self.model.push_notice(Notice::Blocked {
+            country: refusal.country.clone(),
+        });
+        self.emit(changes, cx);
+    }
+
+    /// Claude became blocked: the process is killed at once — a running turn with it; even an
+    /// idle `claude` talks to Anthropic — and what waited goes back to the field. `!` commands run
+    /// on: they are the user's, on this computer.
+    fn stop_for_region(&mut self, refusal: &Refusal, cx: &mut Context<Self>) {
+        let mut unsent = std::mem::take(&mut self.region_wait.inputs);
+        self.region_wait.start = false;
+        if let Some(restart) = self.restart.take() {
+            unsent.push(restart.input);
+        }
+        if let Some(process) = self.process.take() {
+            process.kill();
+            self._pump = None;
+            self.tool_calls.clear();
+            self.edit_hooks.clear();
+            // Messages the CLI queued die with it (they show as cancelled): back to the field
+            // too, before the later ones.
+            let queued: Vec<UserInput> = self
+                .model
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.kind {
+                    flux_claude::EntryKind::User(user) if user.queued => Some(UserInput {
+                        text: user.text.clone(),
+                        images: user.images.clone(),
+                        priority: None,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            unsent.splice(0..0, queued);
+            // The note first: the model adds "Claude stopped (exit code 0)" to an empty
+            // conversation, and a block isn't a crash.
+            self.refused(refusal, cx);
+            let changes = self.model.apply(&ProcessEvent::Exited {
+                code: Some(0),
+                stderr: Vec::new(),
+            });
+            self.emit(changes, cx);
+        } else if !unsent.is_empty() {
+            self.refused(refusal, cx);
+        }
+        if !unsent.is_empty() {
+            cx.emit(SessionEvent::Unsent(unsent));
+        }
+    }
+
     fn emit(&mut self, changes: Vec<Change>, cx: &mut Context<Self>) {
         if changes.is_empty() {
             return;
@@ -1117,6 +1289,10 @@ impl ClaudeSession {
             self.refresh_context(cx);
         }
         cx.notify();
+        // The country check keeps a faster pace while a session works.
+        if status {
+            region_guard::note_working(cx.entity_id(), self.model.is_working(), cx);
+        }
         // Claude is idle again: the `!` commands that ended meanwhile go to it.
         if status && !self.held.is_empty() {
             self.deliver_when_idle(cx);

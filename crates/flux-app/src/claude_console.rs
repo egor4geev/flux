@@ -13,6 +13,10 @@
 //! go into its chat; F2 renames, ⌘⌫ closes (out of "Now", into the history), the menu archives
 //! (out of the history too), ⇧F10 opens the menu, ⌘F filters "All". While `claude` isn't ready, the console says what to do about it: install (the command
 //! typed into a terminal), sign in, try again.
+//!
+//! The country check (part «Флаг страны», [`crate::region_guard`]): the flag next to the title, and
+//! while Claude is blocked a banner over the list says why, with Check Again; asked again after a
+//! block, it says Flux is checking.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -36,6 +40,8 @@ use crate::git_log::local_offset;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::region_guard::{self, Verdict};
+use crate::region_status;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 
@@ -216,6 +222,8 @@ pub struct ClaudeConsole {
     picks: HashMap<String, Picks>,
     menu: Option<Menu>,
     scroll: ScrollHandle,
+    /// The country check's last answer blocked Claude: while it asks again, the banner says so.
+    region_blocked: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -224,10 +232,20 @@ impl EventEmitter<ClaudeConsoleEvent> for ClaudeConsole {}
 impl ClaudeConsole {
     pub fn new(store: Entity<ClaudeStore>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| TextInput::new(tr("Filter sessions"), cx).icon(IconName::Search));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe(&filter, |_, _, _: &InputEvent, cx| cx.notify()),
         ];
+        // The console may be drawn from its cache: it follows the country check itself.
+        if let Some(guard) = region_guard::global(cx) {
+            subscriptions.push(cx.observe(&guard, |this, guard, cx| {
+                let verdict = guard.read(cx).verdict();
+                if *verdict != Verdict::Checking {
+                    this.region_blocked = verdict.blocks();
+                }
+                cx.notify()
+            }));
+        }
         store.update(cx, |store, cx| store.refresh_saved(cx));
         Self {
             store,
@@ -242,6 +260,7 @@ impl ClaudeConsole {
             picks: HashMap::new(),
             menu: None,
             scroll: ScrollHandle::new(),
+            region_blocked: region_guard::verdict(cx).blocks(),
             _subscriptions: subscriptions,
         }
     }
@@ -707,6 +726,25 @@ impl ClaudeConsole {
         let ui = Theme::ui(cx);
         let ready = self.store.read(cx).is_ready();
         let new_keys = ui::shortcut_for(&claude::NewSession, cx);
+        // Where the network sees this Mac: the flag, the rest in its tooltip.
+        let region = region_status::mark(
+            &region_guard::verdict(cx),
+            13.,
+            "claude-console-region-pulse",
+            ui,
+        )
+        .map(|mark| {
+            div()
+                .id("claude-console-region")
+                .flex_none()
+                .flex()
+                .items_center()
+                .child(mark)
+                .tooltip(|window, cx| {
+                    let text = region_status::tooltip_text(&region_guard::verdict(cx));
+                    ui::tooltip(text, None)(window, cx)
+                })
+        });
         div()
             .flex_none()
             .h(px(HEADER_HEIGHT))
@@ -730,7 +768,8 @@ impl ClaudeConsole {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(ui.foreground)
                             .child(tr("Claude")),
-                    ),
+                    )
+                    .children(region),
             )
             .when(ready, |header| {
                 header.child(
@@ -752,6 +791,77 @@ impl ClaudeConsole {
                         }),
                     ),
             )
+    }
+
+    /// Over the list while Claude is blocked: why, and Check Again; asked again after a block —
+    /// that Flux is checking.
+    fn render_region_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ui = Theme::ui(cx);
+        let verdict = region_guard::verdict(cx);
+        let banner = div()
+            .flex_none()
+            .mx(px(ROW_INSET))
+            .mt_0p5()
+            .mb_1()
+            .py(px(10.))
+            .px(px(ROW_PADDING))
+            .flex()
+            .gap(px(10.))
+            .rounded(px(RADIUS_MD))
+            .border_1()
+            .text_size(px(theme::TEXT_SM));
+        if verdict == Verdict::Checking && self.region_blocked {
+            return Some(
+                banner
+                    .items_center()
+                    .border_color(ui.island_border)
+                    .bg(ui.input_background)
+                    .text_color(ui.text_muted)
+                    .child(spinner_dot(ui))
+                    .child(tr("Checking the country…"))
+                    .into_any_element(),
+            );
+        }
+        let refusal = verdict.refusal()?;
+        let mark = region_status::mark(&verdict, 15., "claude-console-banner-pulse", ui);
+        Some(
+            banner
+                .border_color(UiColors::tint(ui.error, 0.32))
+                .bg(UiColors::tint(ui.error, 0.09))
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .children(mark),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .line_height(px(18.))
+                                .text_color(ui.foreground)
+                                .child(refusal.message()),
+                        )
+                        .child(
+                            ui::text_button(
+                                "claude-console-check-country",
+                                tr("Check Again"),
+                                false,
+                                ui,
+                            )
+                            .on_click(|_, _, cx| region_guard::check_again(cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// A group's caption: "Now", "Recent", "This Week".
@@ -1940,6 +2050,7 @@ impl Render for ClaudeConsole {
             .font_family(theme::UI_FONT)
             .text_size(px(theme::TEXT_MD))
             .child(self.render_header(cx))
+            .children(self.render_region_banner(cx))
             .child(body)
             .children(limits)
             .children(menu)

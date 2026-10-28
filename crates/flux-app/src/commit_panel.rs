@@ -38,6 +38,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
 
 use flux_core::Rope;
@@ -722,6 +723,8 @@ pub struct CommitPanel {
     claude_checked: HashSet<EntityId>,
     /// Claude writes the commit message.
     generating: Option<Task<()>>,
+    /// Kills its `claude -p`: a second click, or the country check blocking Claude.
+    generating_stop: Option<Arc<AtomicBool>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -783,6 +786,7 @@ impl CommitPanel {
             claude_groups: ClaudeGroups::default(),
             claude_checked: HashSet::new(),
             generating: None,
+            generating_stop: None,
             _subscriptions: subscriptions,
         };
         panel.claude_lists = panel.read_claude_lists(cx);
@@ -2117,7 +2121,27 @@ impl CommitPanel {
     /// answer replaces the message, one undoable edit. A second click stops it.
     fn generate_message(&mut self, cx: &mut Context<Self>) {
         if self.generating.take().is_some() {
+            if let Some(stop) = self.generating_stop.take() {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             return cx.notify();
+        }
+        // Part «Флаг страны»: only where the country check allows Claude.
+        match crate::region_guard::gate(true, cx) {
+            crate::region_guard::Gate::Go => {}
+            crate::region_guard::Gate::Wait => {
+                let this = cx.weak_entity();
+                return crate::region_guard::wait(cx, move |outcome, cx| {
+                    this.update(cx, |this, cx| match outcome {
+                        Ok(()) => this.generate_message(cx),
+                        Err(refusal) => this.message_refused(&refusal, cx),
+                    })
+                    .ok();
+                });
+            }
+            crate::region_guard::Gate::Refuse(refusal) => {
+                return self.message_refused(&refusal, cx);
+            }
         }
         let cli = self
             .claude
@@ -2169,6 +2193,8 @@ impl CommitPanel {
                 }
             })
             .collect();
+        let stop = crate::region_guard::stop_flag(cx);
+        self.generating_stop = Some(stop.clone());
         self.generating = Some(cx.spawn(async move |this, cx| {
             let mut files = Vec::new();
             for ((change, partial), base) in items.into_iter().zip(bases) {
@@ -2205,11 +2231,20 @@ impl CommitPanel {
                     let subjects =
                         flux_git::recent_messages(&repo, MESSAGE_EXAMPLES).unwrap_or_default();
                     let prompt = message_prompt(&files, &subjects);
-                    cli.ask(&repo.work_dir, &prompt, Some(MESSAGE_MODEL))
+                    cli.ask(&repo.work_dir, &prompt, Some(MESSAGE_MODEL), &stop)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.generating = None;
+                this.generating_stop = None;
+                // Stopped by the country check: it tells why itself.
+                if let Some(refusal) = crate::region_guard::verdict(cx).refusal()
+                    && answer
+                        .as_ref()
+                        .is_err_and(|err| err == flux_claude::cli::ASK_STOPPED)
+                {
+                    return this.message_refused(&refusal, cx);
+                }
                 let failure = match answer.map(|text| clean_message(&text)) {
                     Ok(message) if !message.is_empty() => {
                         let message = this.with_template_prefix(message, cx);
@@ -2229,6 +2264,15 @@ impl CommitPanel {
             })
             .ok();
         }));
+        cx.notify();
+    }
+
+    /// The country check blocks Claude: no commit message (part «Флаг страны»).
+    fn message_refused(&mut self, refusal: &crate::region_guard::Refusal, cx: &mut Context<Self>) {
+        let notification = Notification::error(tr("Claude couldn't write the commit message"))
+            .body(refusal.message())
+            .action(tr("Check Again"), crate::region_guard::CheckCountry);
+        self.git.update(cx, |git, cx| git.notify(notification, cx));
         cx.notify();
     }
 

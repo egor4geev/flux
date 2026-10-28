@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -98,8 +99,15 @@ impl Cli {
     /// One question without a session (part 9.2: a commit message): `claude -p` in `cwd` with no
     /// tools and no MCP servers, nothing saved to the history; the prompt goes through stdin.
     /// Blocks — run it on a background thread. `model` — an alias ("haiku") or an id; `None` — the
-    /// account's default. The answer's text, or why there is none.
-    pub fn ask(&self, cwd: &Path, prompt: &str, model: Option<&str>) -> Result<String, String> {
+    /// account's default. `stop` set — the process is killed at once (the country check blocked
+    /// Claude, part «Флаг страны»): [`ASK_STOPPED`]. The answer's text, or why there is none.
+    pub fn ask(
+        &self,
+        cwd: &Path,
+        prompt: &str,
+        model: Option<&str>,
+        stop: &AtomicBool,
+    ) -> Result<String, String> {
         let mut child = self
             .command()
             .args(ask_args(model))
@@ -126,6 +134,11 @@ impl Cli {
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
+                Ok(None) if stop.load(Ordering::Relaxed) => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    return Err(ASK_STOPPED.to_string());
+                }
                 Ok(None) if started.elapsed() > ASK_TIMEOUT => {
                     child.kill().ok();
                     child.wait().ok();
@@ -160,6 +173,8 @@ impl Cli {
 
 /// How long [`Cli::ask`] waits for the answer.
 const ASK_TIMEOUT: Duration = Duration::from_secs(90);
+/// Why [`Cli::ask`] gave no answer when told to stop.
+pub const ASK_STOPPED: &str = "Stopped.";
 
 /// The arguments of [`Cli::ask`]: print mode with the result as JSON, no tools, no MCP servers
 /// of the user's configuration, no transcript.
