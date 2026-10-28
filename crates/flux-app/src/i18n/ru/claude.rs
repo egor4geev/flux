@@ -165,8 +165,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Claude отвечает на вывод команд !",
     ),
     (
-        "A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message.",
-        "Команда после ! выполняется в корне проекта, её вывод получает Claude. Включено — Claude сразу отвечает на него; выключено — увидит вывод вместе с вашим следующим сообщением.",
+        "A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message. ⌘↵ runs a command the other way.",
+        "Команда после ! выполняется в корне проекта, её вывод получает Claude. Включено — Claude сразу отвечает на него; выключено — увидит вывод вместе с вашим следующим сообщением. ⌘↵ запускает команду наоборот.",
     ),
     (
         "Notify when a session finishes or waits",

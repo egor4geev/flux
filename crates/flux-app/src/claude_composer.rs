@@ -807,8 +807,10 @@ impl Composer {
                 return;
             }
             let command = body.to_string();
+            // ⌘↵ (`SendNow`) runs it the other way than Settings → Claude Code says.
+            let answer = settings::claude(cx).answer_commands != priority.is_some();
             self.session
-                .update(cx, |session, cx| session.run_shell(command, cx));
+                .update(cx, |session, cx| session.run_shell(command, answer, cx));
             self.shell_mode = false;
             self.input.update(cx, |input, cx| input.set_text("", cx));
             self.was_empty = true;
@@ -1581,10 +1583,19 @@ impl Composer {
         let send = self.render_send(ui, has_message, cx);
         let row = div().h(px(FOOTER_HEIGHT)).flex().items_center().gap(px(1.));
         if self.shell_mode {
-            let note = if settings::claude(cx).respond_to_commands {
-                tr("Claude answers the output")
+            // What ↵ does with the output, and how ⌘↵ runs it the other way.
+            let answer = settings::claude(cx).answer_commands;
+            let other_keys = ui::shortcut_for(&SendNow, cx).unwrap_or_default();
+            let (note, other) = if answer {
+                (
+                    tr("Claude answers the output"),
+                    trf("{0} without an answer", &[&other_keys]),
+                )
             } else {
-                tr("the output goes to Claude")
+                (
+                    tr("Claude only reads the output"),
+                    trf("{0} with an answer", &[&other_keys]),
+                )
             };
             return row
                 .child(
@@ -1610,7 +1621,7 @@ impl Composer {
                         .child(if self.narrow() {
                             note.to_string()
                         } else {
-                            format!("· {note}")
+                            format!("· {note} · {other}")
                         }),
                 )
                 .child(div().flex_1())

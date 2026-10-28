@@ -111,6 +111,7 @@ mod settings_view;
 mod start_screen;
 mod stash_panel;
 mod system_notify;
+mod system_shortcuts;
 mod task_contexts;
 mod terminal_element;
 mod terminal_group;
@@ -236,6 +237,7 @@ fn main() {
         plugins::init(cx);
         plugin_view::init(cx);
         claude::init(cx);
+        system_shortcuts::init(cx);
         claude_console::init(cx);
         claude_composer::init(cx);
         claude_transcript::init(cx);

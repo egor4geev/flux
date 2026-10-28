@@ -1909,9 +1909,9 @@ impl SettingsView {
             .child(switch_row(
                 "claude-respond-to-commands",
                 tr("Claude answers the output of ! commands"),
-                tr("A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message."),
-                current.respond_to_commands,
-                |claude, on| claude.respond_to_commands = on,
+                tr("A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message. ⌘↵ runs a command the other way."),
+                current.answer_commands,
+                |claude, on| claude.answer_commands = on,
                 cx,
             ))
             .child(switch_row(

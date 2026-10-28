@@ -192,6 +192,9 @@ struct ShellRun {
     /// The user stopped it.
     stopped: bool,
     ended: bool,
+    /// Claude answers its output (Settings → Claude Code, ⌘↵ the other way); otherwise the output
+    /// is context for the next message.
+    answer: bool,
     _pump: Option<Task<()>>,
 }
 
@@ -528,8 +531,9 @@ impl ClaudeSession {
 
     /// Runs a `!` command (part 10.2): in the project's root, through the user's shell with the
     /// login shell's environment (a terminal's `PATH`, also when Flux started from the Dock). Its
-    /// entry shows the output as it comes; when it ends, Claude gets it.
-    pub fn run_shell(&mut self, command: String, cx: &mut Context<Self>) {
+    /// entry shows the output as it comes; when it ends, Claude gets it — and answers it when
+    /// `answer`.
+    pub fn run_shell(&mut self, command: String, answer: bool, cx: &mut Context<Self>) {
         let command = command.trim().to_string();
         if command.is_empty() {
             return;
@@ -589,6 +593,7 @@ impl ClaudeSession {
                 exit_code: None,
                 stopped: false,
                 ended: false,
+                answer,
                 _pump: Some(pump),
             },
         );
@@ -674,7 +679,11 @@ impl ClaudeSession {
         if self.held.is_empty() || busy && self.process.is_some() {
             return;
         }
-        let respond = crate::settings::claude(cx).respond_to_commands;
+        // One turn after all the records, when any of the commands asked for an answer.
+        let respond = self
+            .held
+            .iter()
+            .any(|id| self.shells.get(id).is_some_and(|run| run.answer));
         self.deliver_held(respond, cx);
     }
 

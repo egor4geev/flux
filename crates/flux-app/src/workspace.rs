@@ -951,6 +951,8 @@ impl Workspace {
             // editor): the watcher reports them, and a refresh on return makes sure.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
+                    // Another Flux that quit may have given ⌘Esc back to macOS.
+                    crate::system_shortcuts::claim();
                     this.git.update(cx, |git, cx| git.refresh(cx));
                     this.sync_documents(None, cx);
                     // The window in front is the one to come back in front after a restart.

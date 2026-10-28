@@ -323,8 +323,10 @@ pub struct ClaudeSettings {
     /// After an edit of Claude, the problems language servers find in the file go back to Claude.
     pub report_problems: bool,
     /// After a `!` command, Claude answers its output at once (a turn starts); off — the output
-    /// only goes to Claude as context for the next message (part 10.2).
-    pub respond_to_commands: bool,
+    /// only goes to Claude as context for the next message (part 10.2); ⌘↵ runs a command the
+    /// other way. Saved as `answer_commands`: the earlier `respond_to_commands` was off by default
+    /// and every saved file kept that `false`, so a new key lets the new default (on) take hold.
+    pub answer_commands: bool,
     /// A macOS notification when a session finishes or waits for an answer while Flux isn't the
     /// active app (part 10.2).
     pub system_notifications: bool,
@@ -345,7 +347,7 @@ impl Default for ClaudeSettings {
             restore_sessions: true,
             flux_tools: true,
             report_problems: true,
-            respond_to_commands: false,
+            answer_commands: true,
             system_notifications: true,
         }
     }
@@ -1152,9 +1154,9 @@ fn parse_claude(value: &Value) -> ClaudeSettings {
         report_problems: value["report_problems"]
             .as_bool()
             .unwrap_or(defaults.report_problems),
-        respond_to_commands: value["respond_to_commands"]
+        answer_commands: value["answer_commands"]
             .as_bool()
-            .unwrap_or(defaults.respond_to_commands),
+            .unwrap_or(defaults.answer_commands),
         system_notifications: value["system_notifications"]
             .as_bool()
             .unwrap_or(defaults.system_notifications),
@@ -1217,7 +1219,7 @@ fn known_json(settings: &Settings) -> Value {
             "restore_sessions": settings.claude.restore_sessions,
             "flux_tools": settings.claude.flux_tools,
             "report_problems": settings.claude.report_problems,
-            "respond_to_commands": settings.claude.respond_to_commands,
+            "answer_commands": settings.claude.answer_commands,
             "system_notifications": settings.claude.system_notifications,
         },
         "projects": {
@@ -1281,7 +1283,7 @@ mod tests {
                 restore_sessions: false,
                 flux_tools: false,
                 report_problems: false,
-                respond_to_commands: true,
+                answer_commands: false,
                 system_notifications: false,
             },
             appearance: AppearanceSettings {

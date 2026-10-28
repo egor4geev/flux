@@ -69,6 +69,8 @@ const ROW_HEIGHT: f32 = 26.;
 const DETAIL_INSET: f32 = 22.;
 /// Output lines shown before "Show more".
 const CLIP_LINES: usize = 12;
+/// The longest answer to one question its row shows alone; a longer one also opens in the details.
+const ANSWER_IN_ROW: usize = 40;
 /// Diff lines an edit card shows before "Show more".
 const DIFF_PREVIEW_LINES: usize = 8;
 /// A running subagent's latest steps on its card.
@@ -2787,12 +2789,16 @@ impl Renderer<'_> {
                     .child(summary.title.clone()),
             )
             .child(div().flex_1().min_w_0().flex().child(detail_label))
+            // A meta keeps a part of the row: a long one (an "Other" answer, a deep path) ends in
+            // an ellipsis instead of pushing the row past the chat's edge.
             .children(summary.meta.clone().map(|meta| {
                 div()
                     .flex_none()
+                    .max_w(gpui::relative(0.45))
+                    .truncate()
                     .text_size(px(theme::TEXT_XS))
                     .text_color(ui.dim)
-                    .child(meta)
+                    .child(meta.replace('\n', " "))
             }))
             .children(mark)
             .when(details.is_some(), |row| {
@@ -3021,8 +3027,13 @@ impl Renderer<'_> {
                             .collect()
                     })
                     .unwrap_or_default();
-                // One question: the row already says it and the answer.
-                if answers.len() <= 1 {
+                // One question: the row already says it and the answer, unless the answer is too long
+                // for the row (an "Other" text) — then the details show both in full.
+                if answers.len() <= 1
+                    && answers
+                        .first()
+                        .is_none_or(|(_, answer)| fits_in_row(answer))
+                {
                     return None;
                 }
                 div()
@@ -5189,6 +5200,11 @@ fn plain_text(markdown: &str) -> String {
         .collect()
 }
 
+/// Whether an answer to Claude's question reads whole in its row ([`ANSWER_IN_ROW`]).
+fn fits_in_row(answer: &str) -> bool {
+    answer.chars().count() <= ANSWER_IN_ROW && !answer.contains('\n')
+}
+
 /// The first `count` lines, joined (an answer in short).
 fn first_lines(text: &str, count: usize) -> String {
     text.trim()
@@ -5518,5 +5534,13 @@ mod tests {
         assert_eq!(clip_lines(text, 5), (text, 0));
         assert_eq!(clip_chars("abcdef", 3), "abc…");
         assert_eq!(host("https://docs.rs/gpui/latest"), "docs.rs");
+    }
+
+    #[test]
+    fn a_long_answer_opens_in_the_details() {
+        assert!(fits_in_row("Option B"));
+        assert!(fits_in_row(&"a".repeat(ANSWER_IN_ROW)));
+        assert!(!fits_in_row(&"a".repeat(ANSWER_IN_ROW + 1)));
+        assert!(!fits_in_row("two\nlines"));
     }
 }
