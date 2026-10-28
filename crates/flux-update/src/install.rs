@@ -3,7 +3,8 @@
 //! 1. [`prepare`]: unpack the archive (`ditto -x -k`) next to it, check that it holds `Flux.app`
 //!    of the manifest's version, and that its code signature is valid and satisfies the running
 //!    app's designated requirement (`codesign --verify --deep --strict -R=<requirement>`): the same
-//!    identifier and certificate — the Keychain keeps «Always Allow» of plugin secrets.
+//!    identifier and certificate — the Keychain keeps «Always Allow» of the plugin secrets an
+//!    older Flux kept there, for the update to move them into its own store.
 //! 2. [`schedule`]: after Flux quits, a helper (`/bin/sh` script, detached) waits for Flux's
 //!    process to exit, moves the old bundle to the Trash, puts the new one in its place and opens
 //!    it ([`relaunch`] arguments: the projects reopen as on any start).

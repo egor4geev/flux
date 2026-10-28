@@ -16,6 +16,8 @@ httparse = "1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Flux's log (`flux.log`): what happens to the plugins' secrets (already in Flux's tree).
+log = "0.4"
 # Only the `AsyncWrite` trait of the stdout and stderr streams (`wasmtime-wasi` runs on tokio).
 tokio = { version = "1", default-features = false }
 toml = "1"
@@ -31,8 +33,8 @@ ureq = { version = "3.4", default-features = false, features = [
     "platform-verifier",
     "rustls-no-provider",
 ] }
-# The catalog's packages (stage 8.3): their SHA-256 is checked before installing (ring is in Flux's
-# tree already, through rustls).
+# The catalog's packages (stage 8.3): their SHA-256 is checked before installing; the plugins'
+# secrets are sealed with ChaCha20-Poly1305 (ring is in Flux's tree already, through rustls).
 ring = "0.17.14"
 # Redirects (a relative `Location` against the request's URL) and the URLs of the plugins' requests.
 url = "2"
@@ -53,7 +55,7 @@ wasmtime = { version = "48.0.5", default-features = false, features = [
 # stdout and stderr into the plugin's log.
 wasmtime-wasi = { version = "48.0.5", default-features = false, features = ["p2"] }
 
-# The plugins' secrets (`secrets`): generic passwords in the macOS keychain (the crate is in the tree
-# already, through rustls).
+# The plugins' secrets kept as generic passwords in the macOS keychain before (`secrets`): moved out
+# once, and removed with their plugin (the crate is in the tree already, through rustls).
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3", default-features = false }

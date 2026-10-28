@@ -237,7 +237,7 @@ default = "Hello!"
 
 | Key | | |
 |-----|-|-|
-| `id` | required | Lowercase letters and digits, words joined by `.` or `-`: `someone.hello-world`. The plugin's key everywhere: its folder, settings, notification group, keychain items. |
+| `id` | required | Lowercase letters and digits, words joined by `.` or `-`: `someone.hello-world`. The plugin's key everywhere: its folder, settings, notification group, secrets. |
 | `name` | required | Shown in the manager, the palette's chips, Settings. |
 | `version` | required | The plugin's version. |
 | `api` | required | The plugin API it is built for: `"0.3"`. Flux runs 0.3 and 0.2 ([From 0.2 to 0.3](#from-02-to-03)); a plugin with code names the version of the SDK it was built with — Flux checks it against the component. |
@@ -305,8 +305,8 @@ or a tab among the editor's tabs ([Tool windows](#tool-windows)).
 `status-bar.set` (`status::set`).
 
 **`[[settings]]`** — a setting; Settings → the plugin shows a form of them, in their order. Values
-are kept in `settings.json` under `plugins.settings.<id>` (a secret — in the keychain); a change comes
-as the `settings-changed` event.
+are kept in `settings.json` under `plugins.settings.<id>` (a secret — apart, encrypted); a change
+comes as the `settings-changed` event.
 
 | Key | | |
 |-----|-|-|
@@ -323,8 +323,8 @@ The kinds without a value make the page a plugin's own place — a sign-in, an o
 plugin asks of the user once ([The settings page](#the-settings-page)):
 
 - `section` — a heading with its description; the settings below it are its group.
-- `secret` — a masked field, kept in the macOS keychain, never in `settings.json`: the plugin's
-  secret named by the setting's key (`secrets::get(key)`); `setting(key)` reads none.
+- `secret` — a masked field, kept with the plugin's secrets, never in `settings.json`: the
+  plugin's secret named by the setting's key (`secrets::get(key)`); `setting(key)` reads none.
 - `button` — runs the plugin's command with `argument` in its context; grayed out while the plugin
   isn't running. Buttons in a row share a line.
 - `status` — a line the plugin writes (`settings::status`): «Signed in as anna@example.com».
@@ -896,8 +896,9 @@ The user has the same without plugins: **Save Context…**, **Load Context…** 
 
 ### Secrets, timers and the system
 
-`secrets` keeps tokens and passwords in the macOS keychain, not in files: only this plugin reads
-them, and they go when it is uninstalled. Keep a sign-in's tokens there, not in `storage`.
+`secrets` keeps tokens and passwords apart from the plugin's files: Flux keeps them encrypted in a
+file only the user can read (`~/Library/Application Support/flux/secrets.bin`); only this plugin
+reads them, and they go when it is uninstalled. Keep a sign-in's tokens there, not in `storage`.
 
 ```rust
 secrets::set("token", &token)?;
@@ -1007,7 +1008,7 @@ server = true
        self.exchange(request.query("code"));
    }
    ```
-4. **Exchange the code** for tokens and keep them in the keychain:
+4. **Exchange the code** for tokens and keep them in `secrets`:
 
    ```rust
    let response = http::post("https://oauth.example.com/token")
@@ -1234,7 +1235,7 @@ tar czf hello-0.1.0.tar.gz flux-plugin.toml locales icons \
 ```
 
 The plugin's data is in `~/Library/Application Support/flux/plugin-data/<id>/`; removing the plugin
-keeps it, so a reinstalled plugin finds its settings again (its secrets in the keychain go).
+keeps it, so a reinstalled plugin finds its settings again (its secrets go).
 
 To publish a plugin for everyone, add it to the catalog — the Marketplace of Settings → Plugins:
 [The plugin catalog](catalog.md).

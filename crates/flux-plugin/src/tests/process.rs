@@ -229,15 +229,12 @@ fn folders_outside_the_project_follow_their_permissions() {
     );
 }
 
-/// Uses the login keychain of the user who runs the tests (no prompt: the test binary creates,
-/// reads and deletes its own item), so it runs only when asked:
-/// `cargo test -p flux-plugin -- --ignored secrets`.
+/// The secrets of this run's folder (`paths::secrets_dir`): never the user's.
 #[test]
-#[ignore]
-fn secrets_are_kept_in_the_keychain() {
+fn secrets_are_kept_by_flux() {
     let id = "test.flux-secrets-probe";
-    let service = crate::keychain::service(id);
-    crate::keychain::delete_all(&service).unwrap();
+    let service = crate::secrets::service(id);
+    crate::secrets::delete_all(&service).unwrap();
     let Some(entry) = proc_probe(id, "") else {
         return;
     };
@@ -249,8 +246,8 @@ fn secrets_are_kept_in_the_keychain() {
     assert_eq!(probe.run("proc:secret-get"), "secret: None");
     // Uninstalling removes every secret of the plugin.
     assert_eq!(probe.run("proc:secret-set"), "secret set");
-    crate::keychain::set(&service, "other", "x").unwrap();
-    crate::keychain::delete_all(&service).unwrap();
+    crate::secrets::set(&service, "other", "x").unwrap();
+    crate::secrets::delete_all(&service).unwrap();
     assert_eq!(probe.run("proc:secret-get"), "secret: None");
-    assert_eq!(crate::keychain::get(&service, "other").unwrap(), None);
+    assert_eq!(crate::secrets::get(&service, "other").unwrap(), None);
 }

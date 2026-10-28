@@ -13,6 +13,8 @@
 //!   ([`runtime::PluginMessage`]); limits on time and memory; the sandbox. `host` answers the
 //!   API's functions on the plugin's side of the thread: what needs the window becomes a message,
 //!   the rest (the network, the server, programs, timers, secrets) is done right there.
+//! - [`secrets`] — the plugins' secrets, kept by Flux encrypted ([`keychain`] — where they were
+//!   before).
 //! - [`api`] — the types of the WIT interfaces, shared with the window.
 //! - [`log`], [`locales`], [`dev`], [`paths`] — the plugin's log, its translations, building a
 //!   plugin under development, where everything lives on disk.
@@ -30,6 +32,7 @@ pub mod manifest;
 pub mod paths;
 pub mod registry;
 pub mod runtime;
+pub(crate) mod secrets;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -51,16 +54,17 @@ pub fn supports_api(api: &str) -> bool {
 }
 
 /// A plugin's secret, as its `secrets.get` reads it: Settings keeps a plugin's `secret` settings
-/// there (API 0.3). The keychain may ask the user to unlock it — call it off the UI thread.
+/// there (API 0.3). It may wait for another Flux writing them, and the first time for the secrets
+/// to move from the keychain (macOS may ask the user) — call it off the UI thread.
 pub fn plugin_secret(plugin: &str, key: &str) -> Result<Option<String>, String> {
-    keychain::get(&keychain::service(plugin), key)
+    secrets::get(&secrets::service(plugin), key)
 }
 
 /// Saves a plugin's secret (none removes it), as its `secrets.set` does.
 pub fn set_plugin_secret(plugin: &str, key: &str, value: Option<&str>) -> Result<(), String> {
-    let service = keychain::service(plugin);
+    let service = secrets::service(plugin);
     match value {
-        Some(value) => keychain::set(&service, key, value),
-        None => keychain::delete(&service, key),
+        Some(value) => secrets::set(&service, key, value),
+        None => secrets::delete(&service, key),
     }
 }

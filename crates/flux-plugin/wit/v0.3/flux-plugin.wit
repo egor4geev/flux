@@ -340,7 +340,7 @@ interface storage {
 /// The plugin's settings, declared in the manifest (`[[settings]]`) and edited in Settings → the
 /// plugin. A change comes as the `settings-changed` event.
 ///
-/// A `secret` setting (a token, a password) is kept in the macOS keychain, not with the other
+/// A `secret` setting (a token, a password) is kept with the plugin's secrets, not with the other
 /// settings: the plugin reads it with `secrets.get(<key>)`. A `button` runs one of the plugin's
 /// commands; a `status` is a line the plugin writes ("Signed in as …").
 interface settings {
@@ -898,8 +898,8 @@ interface diagnostics {
     clear: func();
 }
 
-/// The plugin's secrets — tokens, passwords — in the macOS keychain rather than in files: only
-/// this plugin reads them, and they go when it is uninstalled.
+/// The plugin's secrets — tokens, passwords — apart from its files: Flux keeps them encrypted in a
+/// file only the user can read. Only this plugin reads them, and they go when it is uninstalled.
 interface secrets {
     get: func(key: string) -> option<string>;
     /// None removes the secret.

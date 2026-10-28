@@ -127,7 +127,7 @@ impl Section {
             Section::Review => "A proposed edit of the active file in a diff: accept or reject it.",
             Section::Git => "The project's repositories, read-only.",
             Section::Problems => "Read the problems; publish the plugin's own.",
-            Section::Secrets => "A value in the macOS keychain.",
+            Section::Secrets => "A value Flux keeps encrypted.",
             Section::Timers => "A clock in the status bar, every second.",
             Section::System => "The clipboard, the home folder, the browser.",
             Section::Context => {
@@ -426,7 +426,7 @@ impl Playground {
             "secrets-save" => {
                 self.secret_question = Some(
                     AskText::new(&tr("Save a Secret"), &tr("Save"))
-                        .message(&tr("The value goes to the macOS keychain under \"demo\"."))
+                        .message(&tr("Flux keeps the value encrypted under \"demo\"."))
                         .placeholder(&tr("A token, a password…"))
                         .send(),
                 );
@@ -956,7 +956,7 @@ impl Playground {
     fn save_secret(&mut self, answer: Option<String>) {
         let text = match answer {
             Some(value) => match secrets::set(SECRET, &value) {
-                Ok(()) => tr("Saved in the keychain. Read reads it back — after a restart too."),
+                Ok(()) => tr("Saved. Read reads it back — after a restart too."),
                 Err(err) => failed(&err),
             },
             None => tr("Cancelled."),

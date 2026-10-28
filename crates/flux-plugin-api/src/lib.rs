@@ -30,7 +30,7 @@
 //! Beyond the window, as the manifest's permissions allow: [`http`] — requests to web services,
 //! [`server`] — the plugin's server on 127.0.0.1, [`process`] — programs, [`terminal`] — terminal
 //! tabs, [`review`] — edits the user reviews in a diff, [`git`] — the repositories, [`diagnostics`]
-//! — problems in files; and for every plugin: [`secrets`] in the keychain, [`timers`],
+//! — problems in files; and for every plugin: [`secrets`] kept encrypted, [`timers`],
 //! [`system`] (the browser, the clipboard, the home folder, the local time), [`status`] items.
 //!
 //! API 0.3: [`dialog::Form`] — a dialog with fields; [`picker`] — a popup list (a search, a menu

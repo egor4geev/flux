@@ -2,11 +2,11 @@
 //! lines, sections (agent B); text and records (agent H2).
 
 pub(super) const STRINGS: &[(&str, &str)] = &[
-    // A plugin's secret setting (a token, a password): kept in the macOS keychain.
+    // A plugin's secret setting (a token, a password), which Flux keeps encrypted: "Saved" and
+    // "Reading…" are translated elsewhere.
     ("Not set", "Не задан"),
-    ("Saved in the keychain", "Сохранён в Связке ключей"),
-    ("Reading the keychain…", "Читаю Связку ключей…"),
-    ("The keychain refused: {0}", "Связка ключей отказала: {0}"),
+    ("Couldn't read: {0}", "Не удалось прочитать: {0}"),
+    ("Couldn't save: {0}", "Не удалось сохранить: {0}"),
     // A record of a `records` setting (a plugin's own action): removing one with something typed.
     ("Remove “{0}”?", "Удалить «{0}»?"),
     (
