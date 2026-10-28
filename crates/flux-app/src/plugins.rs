@@ -2358,8 +2358,9 @@ pub(crate) fn handle_call(
                 id: *id,
                 question: question.clone(),
             };
-            if workspace.modal_open() {
-                // A dialog or a popup of the user's is open: the question waits for it.
+            if !workspace.can_ask_plugin_question() {
+                // A dialog or a popup of the user's is open: the question waits for it (over
+                // Settings it comes at once — the plugin's page asked).
                 workspace
                     .plugins
                     .update(cx, |store, _| store.queue_question(pending));
@@ -2446,7 +2447,7 @@ fn ask_text(
     cx: &mut Context<Workspace>,
 ) {
     let (sender, receiver) = oneshot::channel::<String>();
-    workspace.toggle_dialog(window, cx, move |window, cx| {
+    workspace.open_plugin_dialog(window, cx, move |window, cx| {
         let placeholder = question.placeholder.clone().unwrap_or_default();
         let mut dialog = InputDialog::new(question.title.clone(), placeholder, window, cx)
             .text(&question.text, cx)
@@ -2471,13 +2472,14 @@ fn ask_text(
     .detach();
 }
 
-/// The overlay window closed: a plugin's question that waited for it is asked now.
+/// The overlay window (or the dialog over Settings) closed: a plugin's question that waited for
+/// it is asked now.
 pub(crate) fn ask_pending(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if workspace.modal_open() || !workspace.plugins.read(cx).has_pending_question() {
+    if !workspace.can_ask_plugin_question() || !workspace.plugins.read(cx).has_pending_question() {
         return;
     }
     let pending = workspace

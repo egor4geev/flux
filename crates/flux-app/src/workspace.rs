@@ -208,6 +208,12 @@ pub struct Workspace {
     modal: Option<Modal>,
     /// The overlay window that just closed, fading out without input (`crate::motion`).
     leaving_modal: Option<crate::motion::Leaving<Modal>>,
+    /// A plugin's form or text question over Settings (a sign-in from the plugin's page): the one
+    /// overlay window allowed above another, with a backdrop of its own; closing it gives Settings
+    /// the focus back.
+    over: Option<Modal>,
+    /// [`Self::over`] that just closed, fading out.
+    leaving_over: Option<crate::motion::Leaving<Modal>>,
     /// Back / Forward along go-to-definition jumps, and the language server request in flight.
     pub(crate) navigation: crate::navigation::NavState,
     /// The in-document find bar (between the tabs and the text).
@@ -1012,6 +1018,8 @@ impl Workspace {
             edited: false,
             modal: None,
             leaving_modal: None,
+            over: None,
+            leaving_over: None,
             navigation: Default::default(),
             find_bar,
             project_search,
@@ -4471,6 +4479,9 @@ impl Workspace {
                 self.focus_active(window, cx);
             }
         }
+        if let Some(over) = self.over.take() {
+            self.leave_over(over);
+        }
         let previous_focus = match self.modal.take() {
             Some(modal) => {
                 let previous_focus = modal.previous_focus.clone();
@@ -4547,6 +4558,7 @@ impl Workspace {
     /// Closes the overlay window. Focus returns to its previous place only if it was inside the
     /// window: on a click outside, focus has already moved to wherever was clicked.
     pub fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_over(window, cx);
         let Some(modal) = self.modal.take() else {
             return;
         };
@@ -4564,9 +4576,76 @@ impl Workspace {
         cx.notify();
     }
 
-    /// An overlay window (a popup or a dialog) is open.
-    pub(crate) fn modal_open(&self) -> bool {
-        self.modal.is_some()
+    /// A plugin's form or text question can be shown now: no overlay window is open, or Settings
+    /// are and nothing is over them yet — the plugin's own page asked (Other Ways to sign in, an
+    /// organization's ID). Otherwise it waits ([`plugins::ask_pending`]).
+    pub(crate) fn can_ask_plugin_question(&self) -> bool {
+        self.modal.is_none() || (crate::settings_view::is_open(self) && self.over.is_none())
+    }
+
+    /// Opens a plugin's dialog: over Settings when they are open ([`Self::over`]), as the overlay
+    /// window otherwise.
+    pub(crate) fn open_plugin_dialog<V: ManagedView>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+    ) {
+        if !crate::settings_view::is_open(self) {
+            return self.toggle_dialog(window, cx, build);
+        }
+        if let Some(over) = self.over.take() {
+            self.leave_over(over);
+        }
+        let previous_focus = window.focused(cx);
+        let view = cx.new(|cx| build(window, cx));
+        let focus_handle = view.focus_handle(cx);
+        let subscriptions =
+            vec![
+                cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
+                    this.dismiss_over(window, cx)
+                }),
+            ];
+        window.focus(&focus_handle);
+        self.over = Some(Modal {
+            view: view.into(),
+            kind: ModalKind::Dialog,
+            focus_handle,
+            previous_focus,
+            anchor: None,
+            anchor_corner: Corner::TopLeft,
+            _subscriptions: subscriptions,
+        });
+        cx.notify();
+    }
+
+    /// Closes the dialog over Settings: they get the focus back, and a plugin's question that
+    /// waited comes next.
+    fn dismiss_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(over) = self.over.take() else {
+            return;
+        };
+        if over.focus_handle.contains_focused(window, cx) || window.focused(cx).is_none() {
+            let back = over
+                .previous_focus
+                .clone()
+                .or_else(|| self.modal.as_ref().map(|modal| modal.focus_handle.clone()));
+            match back {
+                Some(back) => window.focus(&back),
+                None => self.focus_active(window, cx),
+            }
+        }
+        self.leave_over(over);
+        cx.defer_in(window, |this, window, cx| {
+            plugins::ask_pending(this, window, cx)
+        });
+        cx.notify();
+    }
+
+    /// [`Self::leave`] for the dialog over Settings.
+    fn leave_over(&mut self, mut over: Modal) {
+        over._subscriptions.clear();
+        self.leaving_over = crate::motion::enabled().then(|| crate::motion::Leaving::new(over));
     }
 
     /// A closed overlay window fades out (`crate::motion`): drawn without input — its
@@ -4654,6 +4733,59 @@ impl Workspace {
                 None => crate::motion::Appear::dialog().apply(id, view),
             };
             layers.push(Self::place_modal(modal, view));
+        }
+        layers.extend(self.render_over(ui, window));
+        layers
+    }
+
+    /// The dialog over Settings ([`Self::over`]) and its backdrop, which dims Settings and takes
+    /// their clicks while it is open.
+    fn render_over(&mut self, ui: UiColors, window: &mut Window) -> Vec<AnyElement> {
+        if self
+            .leaving_over
+            .as_ref()
+            .is_some_and(|leaving| leaving.done())
+        {
+            self.leaving_over = None;
+        }
+        let mut layers = Vec::new();
+        if self.over.is_none() && self.leaving_over.is_none() {
+            return layers;
+        }
+        let open = self.over.is_some();
+        let backdrop = ui::modal_backdrop(ui)
+            .id("over-backdrop")
+            .absolute()
+            .top(px(TITLE_BAR_HEIGHT))
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .with_transition_from(
+                "over-backdrop-fade",
+                0.,
+                if open { 1. } else { 0. },
+                crate::motion::FADE,
+                |backdrop, opacity| backdrop.opacity(opacity),
+            );
+        layers.push(if open {
+            backdrop.into_any_element()
+        } else {
+            crate::motion::inert(backdrop).into_any_element()
+        });
+        if let Some(leaving) = &self.leaving_over {
+            let progress = leaving.progress(window);
+            let over = &leaving.value;
+            let view = div()
+                .id(("over-leaving", over.view.entity_id().as_u64()))
+                .child(over.view.clone());
+            let view = crate::motion::leaving_style(view, progress, Self::modal_origin(over));
+            layers.push(Self::place_modal(over, crate::motion::inert(view)));
+        }
+        if let Some(over) = &self.over {
+            let view = div().occlude().child(over.view.clone());
+            let view = crate::motion::Appear::dialog()
+                .apply(("over", over.view.entity_id().as_u64()), view);
+            layers.push(Self::place_modal(over, view));
         }
         layers
     }
