@@ -16,7 +16,7 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
+    AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Axis, Bounds, ClickEvent,
     DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
     Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
     KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
@@ -2612,6 +2612,15 @@ impl Interactivity {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let delta = event.delta.pixel_delta(line_height);
+                    // Flux patch (scroll axis): only the movement along the gesture's axis
+                    // (`ScrollGesture`) — a swipe down doesn't move the content sideways; an
+                    // element that allows concurrent scroll takes all of it.
+                    let delta = match window.scroll_gesture.axis() {
+                        _ if allow_concurrent_scroll => delta,
+                        Some(Axis::Vertical) => point(Pixels::ZERO, delta.y),
+                        Some(Axis::Horizontal) => point(delta.x, Pixels::ZERO),
+                        None => delta,
+                    };
 
                     let mut delta_x = Pixels::ZERO;
                     if overflow.x == Overflow::Scroll {

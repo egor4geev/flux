@@ -102,6 +102,23 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
     (the bounds stay for whoever measures with them): a popover fading out after it closed is
     drawn but takes no hover, clicks, wheel or tooltips.
 
+- **Scroll axis** (2026-10-29): a trackpad's swipe down always moves a little sideways too, and every
+  scroll container under the pointer takes the event — a plugin board (a row scrolling sideways
+  around lanes scrolling down, `crates/flux-app/src/plugin_view.rs`) slid left and right under
+  every swipe down. Now a gesture keeps to its predominant axis, as native scroll views do.
+  - `src/window.rs`: `ScrollGesture` (public, unit-tested in `plugin_view.rs` — the crate's own
+    tests need the dev-dependencies left out), kept by the window and updated in `dispatch_event`
+    before the listeners. A trackpad gesture's axis is decided once it has moved 4 px (until then
+    each event goes its own way), sideways only when that movement is 1.2 times larger, and kept
+    through the gesture and its momentum until `TouchPhase::Started` — or a 300 ms pause, for a
+    device with precise deltas but no phases. A mouse wheel's step is a gesture by itself (macOS
+    sends Shift+wheel sideways).
+  - `src/elements/div.rs` (`paint_scroll_listener`): an element takes only the movement along the
+    gesture's axis; with `allow_concurrent_scroll`, all of it. gpui's turning a scroll along the
+    other axis into the element's own (a wheel scrolls a tab strip sideways) stays: an element
+    that must not do it sets `restrict_scroll_to_axis` (Flux's board row and plugin trees).
+    Elements with their own wheel listeners (the editor, the terminal) get the events unchanged.
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,
@@ -115,4 +132,5 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
    (paths relative to `vendor/gpui`).
 4. Check by hand: the mouse, scrolling, file drops and the input method (Japanese, Pinyin) at 125 %,
    the traffic lights at 80 % and 125 %; Quit in the Dock with an unsaved document (the question,
-   Cancel keeps Flux, Don't Save quits).
+   Cancel keeps Flux, Don't Save quits); a swipe down over a plugin board in a narrow tab scrolls a
+   lane and doesn't slide the board, a sideways swipe slides it.

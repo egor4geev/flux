@@ -1381,7 +1381,8 @@ impl PluginView {
             // A row of trees (a board's columns, each a heading and a tree) takes the height left,
             // and its children stretch down it: each tree scrolls by itself.
             // A row of columns of cards (a board) keeps each column readable and scrolls sideways
-            // when the tab is too narrow for all of them.
+            // when the tab is too narrow for all of them — by a sideways swipe or Shift+wheel: a
+            // scroll down over the board goes to its lanes.
             ElementKind::Row if self.holds_cards.get(index).copied().unwrap_or(false) => div()
                 .id(SharedString::from(format!("plugin-row-{id}")))
                 .w_full()
@@ -1393,6 +1394,7 @@ impl PluginView {
                 .px(px(ROW_INSET))
                 .pb(px(ROW_INSET))
                 .overflow_x_scroll()
+                .map(own_axis_only)
                 .children(children(cx, Parent::Row))
                 .into_any_element(),
             ElementKind::Row => div()
@@ -1954,6 +1956,8 @@ impl PluginView {
             }),
         )
         .track_scroll(tree.scroll.clone())
+        // A sideways swipe over a board's lane slides the board, not the lane down.
+        .map(own_axis_only)
         .size_full();
         div()
             .flex_1()
@@ -2381,6 +2385,13 @@ fn in_sight(element: Bounds<Pixels>, area: Bounds<Pixels>) -> bool {
         && element.bottom() <= area.bottom() + px(1.)
         && element.right() > area.left()
         && element.left() < area.right()
+}
+
+/// The element scrolls along its own axis only. gpui turns a scroll along the other axis into its
+/// own: a wheel's or a swipe's scroll down would slide a board's row sideways under its lanes.
+fn own_axis_only<E: Styled>(mut element: E) -> E {
+    element.style().restrict_scroll_to_axis = Some(true);
+    element
 }
 
 /// Line breaks and tabs as spaces: the byte length stays the same.
@@ -3048,5 +3059,110 @@ mod tests {
         let text = "a\tb\nc\r";
         assert_eq!(single_line(text), "a b c ");
         assert_eq!(single_line(text).len(), text.len());
+    }
+
+    /// A trackpad's scroll event (gpui's patch, `ScrollGesture`: a board's row and its lanes take
+    /// only the movement along the gesture's axis).
+    fn swipe(phase: gpui::TouchPhase, x: f32, y: f32) -> gpui::ScrollWheelEvent {
+        gpui::ScrollWheelEvent {
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(x), px(y))),
+            touch_phase: phase,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_swipe_keeps_to_its_predominant_axis() {
+        use gpui::{Axis, ScrollGesture, TouchPhase};
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut gesture = ScrollGesture::default();
+        // Fingers down (no movement yet), then a swipe down that drifts a little sideways: an
+        // event of it alone would scroll sideways, the gesture doesn't.
+        assert_eq!(
+            gesture.update(&swipe(TouchPhase::Started, 0., 0.), at(0)),
+            None
+        );
+        let down = [(0.5, -2.), (1., -3.), (-1., -6.), (3., -1.), (-2., 0.)];
+        for (i, (x, y)) in down.into_iter().enumerate() {
+            let event = swipe(TouchPhase::Moved, x, y);
+            assert_eq!(
+                gesture.update(&event, at(8 * i as u64)),
+                Some(Axis::Vertical)
+            );
+        }
+        // The fingers lift; the momentum keeps the axis.
+        assert_eq!(
+            gesture.update(&swipe(TouchPhase::Ended, 0., 0.), at(48)),
+            None
+        );
+        let momentum = swipe(TouchPhase::Moved, 2., -1.);
+        assert_eq!(gesture.update(&momentum, at(56)), Some(Axis::Vertical));
+        // The next gesture decides again: sideways, with a little vertical movement.
+        let sideways = [(3., 0.5), (5., -1.), (4., 2.), (0., -1.)];
+        for (i, (x, y)) in sideways.into_iter().enumerate() {
+            let phase = if i == 0 {
+                TouchPhase::Started
+            } else {
+                TouchPhase::Moved
+            };
+            let event = swipe(phase, x, y);
+            assert_eq!(
+                gesture.update(&event, at(64 + 8 * i as u64)),
+                Some(Axis::Horizontal)
+            );
+        }
+        // Until the gesture has moved enough, each event goes its own way.
+        assert_eq!(
+            gesture.update(&swipe(TouchPhase::Started, 0.5, -1.), at(200)),
+            Some(Axis::Vertical)
+        );
+        assert_eq!(
+            gesture.update(&swipe(TouchPhase::Moved, 1.5, 0.), at(208)),
+            Some(Axis::Horizontal)
+        );
+    }
+
+    #[test]
+    fn a_scroll_without_phases_starts_anew_after_a_pause() {
+        use gpui::{Axis, ScrollGesture, TouchPhase};
+        let start = Instant::now();
+        let mut gesture = ScrollGesture::default();
+        assert_eq!(
+            gesture.update(&swipe(TouchPhase::Moved, 0., -6.), start),
+            Some(Axis::Vertical)
+        );
+        let sideways = swipe(TouchPhase::Moved, 6., 0.);
+        let soon = start + Duration::from_millis(16);
+        assert_eq!(gesture.update(&sideways, soon), Some(Axis::Vertical));
+        let later = soon + ScrollGesture::PAUSE + Duration::from_millis(1);
+        assert_eq!(gesture.update(&sideways, later), Some(Axis::Horizontal));
+    }
+
+    #[test]
+    fn a_wheel_step_is_a_gesture_by_itself() {
+        use gpui::{Axis, ScrollDelta, ScrollGesture, ScrollWheelEvent};
+        let wheel = |x: f32, y: f32| ScrollWheelEvent {
+            delta: ScrollDelta::Lines(gpui::point(x, y)),
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let mut gesture = ScrollGesture::default();
+        assert_eq!(gesture.update(&wheel(0., -1.), now), Some(Axis::Vertical));
+        // Shift+wheel: macOS sends it sideways.
+        assert_eq!(gesture.update(&wheel(-1., 0.), now), Some(Axis::Horizontal));
+        assert_eq!(gesture.axis(), Some(Axis::Horizontal));
+    }
+
+    #[test]
+    fn a_diagonal_scroll_goes_down() {
+        use gpui::{Axis, ScrollGesture};
+        let axis = |x: f32, y: f32| ScrollGesture::predominant_axis(gpui::point(px(x), px(y)));
+        assert_eq!(axis(0., 0.), None);
+        assert_eq!(axis(5., -5.), Some(Axis::Vertical));
+        assert_eq!(axis(-5.5, 5.), Some(Axis::Vertical));
+        assert_eq!(axis(-6.5, 5.), Some(Axis::Horizontal));
+        assert_eq!(axis(0.5, 0.), Some(Axis::Horizontal));
+        assert_eq!(axis(0., 0.5), Some(Axis::Vertical));
     }
 }
