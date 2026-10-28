@@ -101,8 +101,9 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("enter", NewLine, Some("PluginFormLines"))]);
 }
 
-/// Shows a plugin's form; the answer goes back to the plugin as `form-answered`. With a dialog or
-/// a popup of the user's open, the form waits for it.
+/// Shows a plugin's form; the answer goes back to the plugin as `form-answered`. Over Settings
+/// (the plugin's page asked for it) it opens on top of them; with another dialog or a popup of
+/// the user's open, it waits for it.
 pub(crate) fn ask_form(
     workspace: &mut Workspace,
     plugin: &str,
@@ -112,7 +113,7 @@ pub(crate) fn ask_form(
     cx: &mut Context<Workspace>,
 ) {
     let plugin: Arc<str> = Arc::from(plugin);
-    if workspace.modal_open() {
+    if !workspace.can_ask_plugin_question() {
         let pending = PendingQuestion::Form {
             plugin,
             id,
@@ -126,7 +127,7 @@ pub(crate) fn ask_form(
     }
 }
 
-/// Shows a form now (the overlay window is free).
+/// Shows a form now (the overlay window is free, or Settings are open with nothing over them).
 pub(crate) fn show_form(
     workspace: &mut Workspace,
     plugin: Arc<str>,
@@ -137,7 +138,7 @@ pub(crate) fn show_form(
 ) {
     bind_keys(cx);
     let (sender, receiver) = oneshot::channel::<Vec<(String, String)>>();
-    workspace.toggle_dialog(window, cx, move |window, cx| {
+    workspace.open_plugin_dialog(window, cx, move |window, cx| {
         FormDialog::new(form, sender, window, cx)
     });
     let plugins = workspace.plugins.downgrade();

@@ -39,7 +39,7 @@
 //! default = ["\\bTODO\\b", "\\bFIXME\\b"]
 //! ```
 //!
-//! API 0.3 adds settings that aren't values — `type = "secret"` (a token in the keychain),
+//! API 0.3 adds settings that aren't values — `type = "secret"` (a token kept encrypted),
 //! `"button"` (`command`, `argument`), `"status"` (a line the plugin writes), `"section"` (a
 //! heading) — commands only buttons and notifications run (`palette = false`), and the `claude`
 //! permission.
@@ -499,9 +499,9 @@ pub enum SettingKind {
     Choice(Vec<ChoiceOption>),
     /// A list of strings, a row each.
     StringList,
-    /// A token or a password (API 0.3): a masked field whose value Flux keeps in the macOS keychain
-    /// — the plugin's secret named by the setting's key (`secrets.get`) — never in
-    /// `settings.json`. No default.
+    /// A token or a password (API 0.3): a masked field whose value Flux keeps encrypted — the
+    /// plugin's secret named by the setting's key (`secrets.get`) — never in `settings.json`. No
+    /// default.
     Secret,
     /// A button (API 0.3) that runs one of the plugin's commands, with `argument` in the
     /// command's context: "Sign In…", "Check Connection". It has no value.

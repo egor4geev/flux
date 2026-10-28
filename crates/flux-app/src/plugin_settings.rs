@@ -7,11 +7,11 @@
 //! the typing stops, so a pattern being typed doesn't make a plugin redo its work at every key.
 //!
 //! API 0.3 (part 10.3) adds what a sign-in needs: a `section` — a heading with its description
-//! over the settings that follow; a `secret` — a masked field whose value goes to the macOS
-//! keychain (the plugin's secret of that key, `secrets.get`), never to `settings.json`; a `button`
-//! — runs one of the plugin's commands (buttons in a row share a line); a `status` — a line the
-//! plugin writes (`settings.set-status`: "Signed in as …", a spinner while it works). A value the
-//! plugin writes itself (`settings.set`) shows at once.
+//! over the settings that follow; a `secret` — a masked field whose value Flux keeps encrypted (the
+//! plugin's secret of that key, `secrets.get`), never in `settings.json`; a `button` — runs one of
+//! the plugin's commands (buttons in a row share a line); a `status` — a line the plugin writes
+//! (`settings.set-status`: "Signed in as …", a spinner while it works). A value the plugin writes
+//! itself (`settings.set`) shows at once.
 //!
 //! And what a plugin's own actions need: `text` — several lines (a prompt, a template), growing
 //! with the text; `records` — a list of records with the same fields (a name, a prompt, a mode, a
@@ -157,7 +157,7 @@ pub struct PluginSettingsPage {
 struct Field {
     spec: SettingSpec,
     state: FieldState,
-    /// Why the typed value isn't saved: not a number, out of range; a secret the keychain refused.
+    /// Why the typed value isn't saved: not a number, out of range; a secret that couldn't be.
     error: Option<SharedString>,
     /// The value the fields were filled with or saved: a different stored one — the plugin wrote
     /// it (`settings.set`) — refills them.
@@ -171,8 +171,8 @@ enum FieldState {
     Input(Row),
     /// A list of strings: a field per row.
     List(Vec<Row>),
-    /// A secret: a masked field. What is typed goes to the keychain once the typing stops; the
-    /// field stays empty when a value is there already — it isn't shown.
+    /// A secret: a masked field. What is typed is saved once the typing stops; the field stays
+    /// empty when a value is there already — it isn't shown.
     Secret(Secret),
     /// Several lines of text.
     Lines(Lines),
@@ -205,7 +205,7 @@ enum RecordInput {
 
 struct Secret {
     row: Row,
-    /// The keychain has a value: none until it is read (in the background, when the page opens).
+    /// A value is saved: none until it is read (in the background, when the page opens).
     saved: Option<bool>,
     /// Bumped by every keystroke: the typed value is saved only if no newer one came.
     generation: Rc<Cell<u64>>,
@@ -526,8 +526,8 @@ impl PluginSettingsPage {
 
     // --- Secrets, buttons, status lines (API 0.3) ---
 
-    /// Whether the keychain has the secrets of the page: read in the background (the keychain may
-    /// ask the user to unlock it).
+    /// Whether the secrets of the page are saved: read in the background (the first read may wait
+    /// for them to move from the keychain, which may ask the user).
     fn read_secrets(&mut self, cx: &mut Context<Self>) {
         for index in 0..self.fields.len() {
             if !matches!(self.fields[index].state, FieldState::Secret(_)) {
@@ -544,7 +544,7 @@ impl PluginSettingsPage {
                     if let FieldState::Secret(secret) = &mut field.state {
                         match result {
                             Ok(value) => secret.mark_saved(value.is_some(), cx),
-                            Err(err) => field.error = Some(keychain_error(&err)),
+                            Err(err) => field.error = Some(read_error(&err)),
                         }
                     }
                     cx.notify();
@@ -555,8 +555,8 @@ impl PluginSettingsPage {
         }
     }
 
-    /// Typed into a secret: once the typing stops, the text goes to the keychain (an emptied field
-    /// keeps the saved value: Clear takes it away).
+    /// Typed into a secret: once the typing stops, the text is saved (an emptied field keeps the
+    /// saved value: Clear takes it away).
     fn save_secret_later(&mut self, index: usize, text: String, cx: &mut Context<Self>) {
         let FieldState::Secret(secret) = &self.fields[index].state else {
             return;
@@ -597,7 +597,7 @@ impl PluginSettingsPage {
                         }
                         this.tell_plugin(false, cx);
                     }
-                    Err(err) => field.error = Some(keychain_error(&err)),
+                    Err(err) => field.error = Some(save_error(&err)),
                 }
                 cx.notify();
             })
@@ -606,7 +606,7 @@ impl PluginSettingsPage {
         .detach();
     }
 
-    /// Clear of a secret: out of the keychain, and the field emptied.
+    /// Clear of a secret: removed, and the field emptied.
     fn clear_secret(&mut self, index: usize, cx: &mut Context<Self>) {
         if let FieldState::Secret(secret) = &self.fields[index].state {
             // A save still waiting for the typing to stop doesn't come after the removal.
@@ -1013,7 +1013,7 @@ fn record_is_empty(card: &RecordCard, cx: &App) -> bool {
 }
 
 impl Secret {
-    /// The keychain has a value or not: an empty field shows dots for a saved one.
+    /// A value is saved or not: an empty field shows dots for a saved one.
     fn mark_saved(&mut self, saved: bool, cx: &mut App) {
         self.saved = Some(saved);
         let placeholder = if saved {
@@ -1027,9 +1027,14 @@ impl Secret {
     }
 }
 
-/// A keychain error as a line under a secret's field.
-fn keychain_error(error: &str) -> SharedString {
-    trf("The keychain refused: {0}", &[&error]).into()
+/// A secret that couldn't be read, as a line under its field.
+fn read_error(error: &str) -> SharedString {
+    trf("Couldn't read: {0}", &[&error]).into()
+}
+
+/// A secret that couldn't be saved, as a line under its field.
+fn save_error(error: &str) -> SharedString {
+    trf("Couldn't save: {0}", &[&error]).into()
 }
 
 /// A number field's text as a value: an error tells what's wrong.
@@ -1576,8 +1581,8 @@ impl PluginSettingsPage {
             .into_any_element()
     }
 
-    /// A secret's masked field: "Saved in the keychain" while it is empty and a value is there;
-    /// Clear takes the value away.
+    /// A secret's masked field: "Saved" while it is empty and a value is there; Clear takes the
+    /// value away.
     fn render_secret(
         &self,
         index: usize,
@@ -1588,9 +1593,9 @@ impl PluginSettingsPage {
         let typed = !secret.row.input.read(cx).is_empty();
         let hint = match secret.saved {
             _ if typed => None,
-            Some(true) => Some((tr("Saved in the keychain"), true)),
+            Some(true) => Some((tr("Saved"), true)),
             Some(false) => None,
-            None => Some((tr("Reading the keychain…"), false)),
+            None => Some((tr("Reading…"), false)),
         };
         div()
             .flex()

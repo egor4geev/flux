@@ -19,6 +19,8 @@ use crate::{
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     point, prelude::*, px, rems, size, transparent_black,
 };
+// Flux patch (scroll axis): see `ScrollGesture`.
+use crate::{Axis, TouchPhase};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
@@ -895,6 +897,8 @@ pub struct Window {
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Flux patch (input rate): see [`InputRateTracker`].
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+    /// Flux patch (scroll axis): see [`ScrollGesture`].
+    pub(crate) scroll_gesture: ScrollGesture,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -956,6 +960,86 @@ impl InputRateTracker {
 
     pub fn is_high_rate(&self) -> bool {
         Instant::now() < self.sustain_until
+    }
+}
+
+/// Flux patch (scroll axis, 2026-10-29): the axis each scroll event moves along. A trackpad gesture
+/// keeps to its predominant axis, as native scroll views do: a swipe down always moves a little
+/// sideways too, and a board whose lanes scroll down inside a row that scrolls sideways slid left
+/// and right under every swipe down. The axis is decided once the gesture has moved
+/// [`Self::DECIDE_AFTER`] (until then each event goes its own way) and kept through the gesture and
+/// its momentum, until the next one starts (`TouchPhase::Started`, or a pause for a device without
+/// phases); a mouse wheel's step is a gesture by itself. Scroll containers take only the movement
+/// along the axis (`Interactivity::paint_scroll_listener`), unless they allow concurrent scroll.
+#[derive(Clone, Debug, Default)]
+pub struct ScrollGesture {
+    /// The axis of the last event.
+    axis: Option<Axis>,
+    /// The axis the gesture keeps to, once decided.
+    locked: Option<Axis>,
+    /// How far the gesture has moved before that.
+    moved: Point<Pixels>,
+    /// When its last event came.
+    last_event: Option<Instant>,
+}
+
+impl ScrollGesture {
+    /// How far a gesture moves before its axis is decided: its first events may go a pixel or two
+    /// either way.
+    pub const DECIDE_AFTER: Pixels = px(4.);
+    /// A pause after which a device without gesture phases starts a new gesture.
+    pub const PAUSE: Duration = Duration::from_millis(300);
+    /// How many times larger than the vertical movement the horizontal one must be to scroll
+    /// sideways: most scrolling is up and down, and a diagonal swipe goes down.
+    pub const HORIZONTAL_BIAS: f32 = 1.2;
+
+    /// Takes the next scroll event, which came at `now`: the axis it moves along, `None` when it
+    /// doesn't move.
+    pub fn update(&mut self, event: &ScrollWheelEvent, now: Instant) -> Option<Axis> {
+        self.axis = match event.delta {
+            ScrollDelta::Lines(delta) => {
+                *self = Self::default();
+                Self::predominant_axis(delta.map(px))
+            }
+            ScrollDelta::Pixels(delta) => {
+                let paused = self
+                    .last_event
+                    .is_none_or(|last| now.duration_since(last) > Self::PAUSE);
+                if paused || matches!(event.touch_phase, TouchPhase::Started) {
+                    self.locked = None;
+                    self.moved = Point::default();
+                }
+                self.last_event = Some(now);
+                if self.locked.is_none() {
+                    self.moved = self.moved + delta;
+                    if self.moved.x.abs() + self.moved.y.abs() >= Self::DECIDE_AFTER {
+                        self.locked = Self::predominant_axis(self.moved);
+                    }
+                }
+                // An event that doesn't move has no axis; one that does keeps to the gesture's.
+                let own = Self::predominant_axis(delta);
+                own.and(self.locked).or(own)
+            }
+        };
+        self.axis
+    }
+
+    /// The axis of the last event (see [`Self::update`]).
+    pub fn axis(&self) -> Option<Axis> {
+        self.axis
+    }
+
+    /// The axis `delta` moves along most, `None` when it doesn't move: sideways only when that
+    /// movement is [`Self::HORIZONTAL_BIAS`] times larger.
+    pub fn predominant_axis(delta: Point<Pixels>) -> Option<Axis> {
+        let (x, y) = (delta.x.abs(), delta.y.abs());
+        if x.is_zero() && y.is_zero() {
+            None
+        } else if x > y * Self::HORIZONTAL_BIAS {
+            Some(Axis::Horizontal)
+        } else {
+            Some(Axis::Vertical)
+        }
     }
 }
 
@@ -1331,6 +1415,7 @@ impl Window {
             hovered,
             needs_present,
             input_rate_tracker,
+            scroll_gesture: ScrollGesture::default(),
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -3959,6 +4044,8 @@ impl Window {
             PlatformInput::ScrollWheel(scroll_wheel) => {
                 self.mouse_position = scroll_wheel.position;
                 self.modifiers = scroll_wheel.modifiers;
+                // Flux patch (scroll axis): the axis this event moves along, for the listeners.
+                self.scroll_gesture.update(&scroll_wheel, Instant::now());
                 PlatformInput::ScrollWheel(scroll_wheel)
             }
             // Translate dragging and dropping of external files from the operating system

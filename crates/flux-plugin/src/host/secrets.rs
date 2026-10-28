@@ -1,19 +1,20 @@
-//! `secrets`: the plugin's secrets in the macOS keychain — a generic password per key, under the
-//! plugin's service ([`keychain::service`]) — rather than in files. [`crate::install::uninstall`]
-//! removes them with the plugin. A locked keychain asks the user to unlock it; the wait doesn't
-//! count toward the plugin's time limit.
+//! `secrets`: the plugin's secrets, which Flux keeps encrypted ([`crate::secrets`]) under the
+//! plugin's service ([`store::service`]), apart from its files. [`crate::install::uninstall`]
+//! removes them with the plugin. Waiting for them — another Flux writing them; the first time,
+//! moving them from the keychain, where macOS may ask the user — doesn't count toward the plugin's
+//! time limit.
 
 use std::time::Instant;
 
 use crate::api::bindings::flux::plugin::secrets;
-use crate::keychain;
 use crate::runtime::State;
+use crate::secrets as store;
 
 impl secrets::Host for State {
     fn get(&mut self, key: String) -> Option<String> {
-        let service = keychain::service(&self.host.id);
+        let service = store::service(&self.host.id);
         let started = Instant::now();
-        let secret = keychain::get(&service, &key);
+        let secret = store::get(&service, &key);
         self.host.waited += started.elapsed();
         match secret {
             Ok(secret) => secret,
@@ -29,11 +30,11 @@ impl secrets::Host for State {
         if key.is_empty() {
             return Err("A secret needs a key".into());
         }
-        let service = keychain::service(&self.host.id);
+        let service = store::service(&self.host.id);
         let started = Instant::now();
         let result = match &value {
-            Some(value) => keychain::set(&service, &key, value),
-            None => keychain::delete(&service, &key),
+            Some(value) => store::set(&service, &key, value),
+            None => store::delete(&service, &key),
         };
         self.host.waited += started.elapsed();
         result.map_err(|err| format!("Couldn't save the secret \"{key}\": {err}"))

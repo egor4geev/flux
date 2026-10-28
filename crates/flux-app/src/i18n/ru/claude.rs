@@ -75,9 +75,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Claude работает в этой сессии. Закрытие сессии остановит Claude. Сделанные изменения останутся.",
     ),
     ("Stop and Close", "Остановить и закрыть"),
-    ("Stop Claude?", "Остановить Claude?"),
     ("Stop", "Остановить"),
-    ("Claude is working in “{0}”.", "Claude работает в «{0}»."),
     // Rename.
     ("Rename Session", "Переименовать сессию"),
     ("Session name", "Название сессии"),
@@ -206,11 +204,4 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Open Settings", "Открыть настройки"),
 ];
 
-pub(super) const PLURALS: &[(&str, [&str; 3])] = &[(
-    "Claude is working in {n} session.",
-    [
-        "Claude работает в {n} сессии.",
-        "Claude работает в {n} сессиях.",
-        "Claude работает в {n} сессиях.",
-    ],
-)];
+pub(super) const PLURALS: &[(&str, [&str; 3])] = &[];

@@ -2094,6 +2094,7 @@ dependencies = [
  "futures",
  "httparse",
  "libc",
+ "log",
  "ring",
  "security-framework",
  "serde",

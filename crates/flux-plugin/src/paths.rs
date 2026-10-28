@@ -1,5 +1,5 @@
 //! Where plugins live on disk. `FLUX_PLUGINS_HOME` puts everything into one folder instead (tests,
-//! UI scenarios): `plugins/`, `plugin-data/`, `cache/`, `logs/` inside it.
+//! UI scenarios): `plugins/`, `plugin-data/`, `cache/`, `logs/` and the secrets inside it.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -31,7 +31,8 @@ fn user_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-fn overridden() -> bool {
+/// Everything is in a folder of `FLUX_PLUGINS_HOME` or of the process itself, not the user's.
+pub(crate) fn overridden() -> bool {
     HOME.get().is_some() || std::env::var_os("FLUX_PLUGINS_HOME").is_some()
 }
 
@@ -43,6 +44,15 @@ pub fn plugins_dir() -> PathBuf {
 /// The plugin's own folder (storage, its files): `plugin-data/<id>/`.
 pub fn data_dir(id: &str) -> PathBuf {
     home().join("plugin-data").join(id)
+}
+
+/// The plugins' secrets (`crate::secrets`): `secrets.bin`, its key and its lock, in
+/// `~/Library/Application Support/flux`.
+pub(crate) fn secrets_dir() -> PathBuf {
+    // A test never reaches the user's secrets, whichever test comes first.
+    #[cfg(test)]
+    crate::tests::scratch();
+    home()
 }
 
 /// Compiled components: `~/Library/Caches/flux/plugins`.

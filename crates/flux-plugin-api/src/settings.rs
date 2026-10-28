@@ -1,5 +1,6 @@
 //! Writing the plugin's settings (API 0.3) and the lines of its settings page; reading is
-//! [`crate::setting`]. A `secret` setting is in the keychain: [`crate::secrets::get`] with its key.
+//! [`crate::setting`]. A `secret` setting is one of the plugin's secrets: [`crate::secrets::get`]
+//! with its key.
 //!
 //! ```ignore
 //! settings::busy("connection-status", &tr("Checking…"));

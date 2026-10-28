@@ -154,8 +154,8 @@ fn main() {
         // SAFETY: nothing else runs yet: no thread reads the environment.
         unsafe { std::env::set_var("FLUX_PLUGINS_HOME", home) };
     }
-    // Nor the user's keychain: plugins' secrets go to a file in the plugins' folder (a rebuilt
-    // unsigned Flux isn't on a keychain item's access list — macOS would ask the user).
+    // Nor the user's secrets: plugins' secrets go to a plain JSON file in the plugins' folder,
+    // which a scenario can read and fill (and nothing is moved from the keychain).
     #[cfg(feature = "scenario")]
     if std::env::var_os("FLUX_SCENARIO").is_some()
         && std::env::var_os("FLUX_PLUGIN_SECRETS_FILE").is_none()
