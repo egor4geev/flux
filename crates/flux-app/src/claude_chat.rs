@@ -21,11 +21,12 @@ use flux_claude::{Session, Status, UserInput};
 use crate::claude_agent_view::{self, AgentView};
 use crate::claude_cards::{self, CardsState};
 use crate::claude_composer::{Composer, Returned, follow_block};
-use crate::claude_search::{self, ChatSearch};
+use crate::claude_search::{self, ChatSearch, SearchSlide};
 use crate::claude_session::{ClaudeSession, SessionEvent};
 use crate::claude_transcript::{self, TranscriptState};
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
+use crate::motion::Appear;
 use crate::region_guard::{self, Refusal};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD};
@@ -43,7 +44,7 @@ pub struct DraggedClaudeChat {
 impl Render for DraggedClaudeChat {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        div()
+        let label = div()
             .flex()
             .items_center()
             .gap_1p5()
@@ -60,7 +61,10 @@ impl Render for DraggedClaudeChat {
             .text_size(px(theme::TEXT_MD))
             .text_color(ui.foreground)
             .child(icon(IconName::Claude, ui.accent_text).size(px(13.)))
-            .child(crate::claude::shorten(&self.title, DRAG_LABEL_MAX_CHARS))
+            .child(crate::claude::shorten(&self.title, DRAG_LABEL_MAX_CHARS));
+        // Lifted off the tabs: it grows out of its middle as the drag starts (each drag is a new
+        // view). Dropped, it is simply gone — the tab is already in its place.
+        Appear::pop((0.5, 0.5)).apply(("claude-chat-drag", cx.entity_id().as_u64()), label)
     }
 }
 
@@ -103,6 +107,8 @@ pub struct ClaudeChat {
     pub(crate) agents: Vec<AgentView>,
     /// The search (⌘F) while its bar is open (`claude_search`, part 10.2).
     pub(crate) search: Option<ChatSearch>,
+    /// The search bar sliding in and out.
+    pub(crate) search_slide: SearchSlide,
     /// Redraws the chat each second while Claude works.
     ticker: Option<Task<()>>,
     /// A resumed session without a process: it starts when the chat is first drawn.
@@ -175,6 +181,7 @@ impl ClaudeChat {
             focus_handle: cx.focus_handle(),
             agents: Vec::new(),
             search: None,
+            search_slide: SearchSlide::default(),
             ticker: None,
             region_refusal,
             _subscriptions: subscriptions,

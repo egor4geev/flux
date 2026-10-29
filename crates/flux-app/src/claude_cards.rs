@@ -26,6 +26,7 @@ use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
 use crate::input::TextInput;
 use crate::markdown::{self, Block};
+use crate::motion::{Disclosure, unfold_style};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 
@@ -98,6 +99,9 @@ pub struct CardsState {
     keyboard: Option<String>,
     focus: Option<FocusHandle>,
     tasks_collapsed: bool,
+    /// The task list folding and unfolding under the user's click: the chevron turns, the rows
+    /// drop into place.
+    tasks_disclosure: Disclosure<()>,
     /// The plans' Markdown by request, highlighted in the background.
     plans: HashMap<String, Arc<Vec<Block>>>,
 }
@@ -155,7 +159,7 @@ pub fn render(
             )
         })
         .collect();
-    let tasks = render_tasks(state, model, ui, cx);
+    let tasks = render_tasks(state, model, ui, window, cx);
     let background = render_background(session, model, ui, cx);
     if cards.is_empty() && tasks.is_none() && background.is_none() {
         return None;
@@ -1705,6 +1709,7 @@ fn render_tasks(
     state: &CardsState,
     model: &Session,
     ui: UiColors,
+    window: &Window,
     cx: &mut Context<ClaudeChat>,
 ) -> Option<AnyElement> {
     if model.tasks.is_empty() {
@@ -1725,6 +1730,8 @@ fn render_tasks(
                 .unwrap_or_else(|| task.subject.clone())
         });
     let collapsed = state.tasks_collapsed;
+    let count = model.tasks.len();
+    let openness = state.tasks_disclosure.chevron(&(), !collapsed, window);
     let header = div()
         .id("claude-tasks-header")
         .flex()
@@ -1735,21 +1742,17 @@ fn render_tasks(
         .rounded(px(ui::RADIUS_SM))
         .cursor_pointer()
         .hover(move |style| style.bg(ui.hover))
-        .on_click(cx.listener(|chat, _: &ClickEvent, _, cx| {
-            chat.cards.tasks_collapsed = !chat.cards.tasks_collapsed;
+        .on_click(cx.listener(move |chat, _: &ClickEvent, _, cx| {
+            let cards = &mut chat.cards;
+            cards.tasks_collapsed = !cards.tasks_collapsed;
+            let open = !cards.tasks_collapsed;
+            cards.tasks_disclosure.toggled((), open);
+            cards
+                .tasks_disclosure
+                .rows_changed(|_| open.then_some(0..count));
             cx.notify();
         }))
-        .child(
-            icon(
-                if collapsed {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                },
-                ui.dim,
-            )
-            .size(px(12.)),
-        )
+        .child(crate::icons::chevron(openness, ui.dim).size(px(12.)))
         .child(icon(IconName::Checklist, ui.text_muted).size(px(14.)))
         .child(
             div()
@@ -1796,7 +1799,7 @@ fn render_tasks(
                         task.subject.clone(),
                     ),
                 };
-                div()
+                let row = div()
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -1814,7 +1817,8 @@ fn render_tasks(
                                 text.font_weight(FontWeight::MEDIUM)
                             })
                             .child(text),
-                    )
+                    );
+                unfold_style(row, state.tasks_disclosure.unfold(index, window))
             }),
         )
     });

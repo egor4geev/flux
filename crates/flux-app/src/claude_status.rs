@@ -17,7 +17,7 @@ use crate::claude_session::ClaudeSession;
 use crate::claude_transcript::first_line;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, icon};
-use crate::motion::TransitionExt;
+use crate::motion::{Appear, TransitionExt};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_SM};
 
@@ -229,7 +229,9 @@ pub fn glyph(glance: &Glance, unseen: bool, id: impl Into<ElementId>, ui: UiColo
 /// color crossfades as the state changes (`FADE`): the same elements in every state keep the fade.
 pub fn dot(glance: &Glance, unseen: bool, id: impl Into<ElementId>, ui: UiColors) -> AnyElement {
     let id = id.into();
-    let pulsing = matches!(glance.state, GlanceState::Working | GlanceState::Starting);
+    // Animations off (the setting, Reduce Motion): a steady dot, no repeating frames.
+    let pulsing = matches!(glance.state, GlanceState::Working | GlanceState::Starting)
+        && crate::motion::enabled();
     let fill = match glance.state {
         GlanceState::Working | GlanceState::Starting => ui.accent,
         GlanceState::Waiting => ui.warning,
@@ -305,11 +307,12 @@ pub fn tooltip(
     finished: Option<Instant>,
     hint: bool,
 ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-    move |_, cx| {
+    move |window, cx| {
         let tooltip = StatusTooltip {
             session: session.clone(),
             finished,
             hint,
+            handoff: window.tooltip_handoff(),
         };
         cx.new(|_| tooltip).into()
     }
@@ -319,6 +322,8 @@ struct StatusTooltip {
     session: Entity<ClaudeSession>,
     finished: Option<Instant>,
     hint: bool,
+    /// Shown at once after another tooltip (moving along the tabs): it only fades in.
+    handoff: bool,
 }
 
 impl Render for StatusTooltip {
@@ -402,35 +407,48 @@ impl Render for StatusTooltip {
                 .text_color(ui.dim)
                 .child(tr("Click — to the place in the conversation"))
         });
-        // The chrome of `ui::tooltip`, with lines.
+        // The chrome of `ui::tooltip`, with lines; it pops out of the corner by the pointer as
+        // `ui::tooltip` does, once: a tooltip is made anew each time it shows. Right after another
+        // one it shows at once and only fades in.
+        let appear = if self.handoff {
+            Appear::fade()
+        } else {
+            Appear::pop((0., 0.)).scale(TOOLTIP_SCALE)
+        };
         div().pl(px(10.)).pt(px(18.)).child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .max_w(px(420.))
-                .when(long, |tooltip| tooltip.w(px(420.)))
-                .px_2()
-                .py_1p5()
-                .rounded(px(RADIUS_SM))
-                .bg(ui.elevated)
-                .border_1()
-                .border_color(ui.elevated_border)
-                .shadow(ui::popover_shadow(ui))
-                .font_family(theme::UI_FONT)
-                .text_size(px(theme::TEXT_SM))
-                .text_color(ui.foreground)
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .line_clamp(3)
-                        .child(title),
-                )
-                .children(rows)
-                .children(hint),
+            appear.apply(
+                "claude-status-tooltip",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .max_w(px(420.))
+                    .when(long, |tooltip| tooltip.w(px(420.)))
+                    .px_2()
+                    .py_1p5()
+                    .rounded(px(RADIUS_SM))
+                    .bg(ui.elevated)
+                    .border_1()
+                    .border_color(ui.elevated_border)
+                    .shadow(ui::popover_shadow(ui))
+                    .font_family(theme::UI_FONT)
+                    .text_size(px(theme::TEXT_SM))
+                    .text_color(ui.foreground)
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .line_clamp(3)
+                            .child(title),
+                    )
+                    .children(rows)
+                    .children(hint),
+            ),
         )
     }
 }
+
+/// The tooltip grows from this scale, as `ui::tooltip`'s (a tooltip is smaller than a popover).
+const TOOLTIP_SCALE: f32 = 0.94;
 
 /// A title or question longer than this wraps: the tooltip takes its full width then — gpui sizes
 /// an auto-width box before wrapping, and a wrapped line ran into the status under it.

@@ -9,12 +9,15 @@
 //! The transcript draws the marks ([`SearchMarks`] in its state, `markdown::Marks` per entry); what
 //! is counted here ([`entry_texts`]) is what it marks, in the same order.
 
+use std::cell::Cell;
 use std::path::Path;
+use std::rc::Rc;
+use std::time::Instant;
 
 use flux_claude::{Entry, EntryId, EntryKind, ShellEntry, TaskItem, ToolCall, ToolEntry};
 use gpui::{
     Action, AnyElement, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    Subscription, Window, div, prelude::*, px,
+    Subscription, Window, canvas, div, prelude::*, px,
 };
 
 use crate::claude_chat::ClaudeChat;
@@ -24,6 +27,7 @@ use crate::i18n::tr;
 use crate::icons::IconName;
 use crate::input::{InputEvent, TextInput};
 use crate::markdown;
+use crate::motion;
 use crate::theme::{self, Theme};
 use crate::ui;
 
@@ -42,6 +46,41 @@ pub struct ChatSearch {
     _subscription: Subscription,
 }
 
+/// The bar sliding down from the top of the chat as it opens and back up as it closes, as the
+/// file's find bar does (`find_bar`): how much of it shows, from and to, since when; the bar's
+/// height as last laid out; a search that closed, drawn without input until its bar has slid away
+/// (its marks and the focus have gone at once).
+pub struct SearchSlide {
+    reveal: (f32, f32, Instant),
+    height: Rc<Cell<f32>>,
+    closed: Option<ChatSearch>,
+}
+
+impl Default for SearchSlide {
+    fn default() -> Self {
+        Self {
+            reveal: (0., 0., Instant::now()),
+            height: Rc::default(),
+            closed: None,
+        }
+    }
+}
+
+impl SearchSlide {
+    /// How far the slide has come (0 → 1) and how much of the bar shows.
+    fn revealed(&self) -> (f32, f32) {
+        let (from, to, since) = self.reveal;
+        let (t, _) = motion::SMOOTH.at(since.elapsed());
+        (t, motion::lerp(from, to, t))
+    }
+
+    /// The bar opens or closes: it slides from where it is.
+    fn slide(&mut self, open: bool) {
+        let (_, shown) = self.revealed();
+        self.reveal = (shown, if open { 1. } else { 0. }, Instant::now());
+    }
+}
+
 /// What the transcript marks: the query and the current match (its entry and its number among the
 /// entry's own matches).
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +93,9 @@ impl ClaudeChat {
     /// ⌘F: opens the bar (or takes the keyboard back to it) with the query selected.
     pub fn deploy_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search.is_none() {
+            // A bar still sliding away gives way to the new one, which slides from where it is.
+            self.search_slide.closed = None;
+            self.search_slide.slide(true);
             let query = cx.new(|cx| TextInput::new(tr("Find in Chat"), cx).icon(IconName::Search));
             let subscription = cx.subscribe_in(&query, window, Self::search_query_changed);
             self.search = Some(ChatSearch {
@@ -77,9 +119,12 @@ impl ClaudeChat {
     /// Esc in the bar: closes it, the marks go, the keyboard returns to the message field (or to the
     /// subagent's view).
     pub fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search.take().is_none() {
+        let Some(search) = self.search.take() else {
             return;
-        }
+        };
+        // The bar slides away, taking no input.
+        self.search_slide.slide(false);
+        self.search_slide.closed = motion::enabled().then_some(search);
         self.set_search_marks(None);
         if self.agents.is_empty() {
             self.focus_composer(window, cx);
@@ -111,7 +156,7 @@ impl ClaudeChat {
         match event {
             InputEvent::Changed => {
                 self.run_search(true, cx);
-                self.reveal_current(cx);
+                self.reveal_current(false, cx);
             }
         }
     }
@@ -198,12 +243,13 @@ impl ClaudeChat {
             current: current_entry(search),
         };
         self.set_search_marks(Some(marks));
-        self.reveal_current(cx);
+        self.reveal_current(true, cx);
         cx.notify();
     }
 
-    /// Brings the current match into view.
-    fn reveal_current(&mut self, cx: &mut Context<Self>) {
+    /// Brings the current match into view: gliding there (`glide`, a step to the next match), or at
+    /// once — the first match of a query being typed follows the keys, as in the file's find bar.
+    fn reveal_current(&mut self, glide: bool, cx: &mut Context<Self>) {
         let Some(entry) = self
             .search
             .as_ref()
@@ -212,7 +258,12 @@ impl ClaudeChat {
         else {
             return;
         };
-        self.shown_transcript_mut().reveal(entry);
+        let transcript = self.shown_transcript_mut();
+        if glide {
+            transcript.reveal(entry);
+        } else {
+            transcript.reveal_at_once(entry);
+        }
         cx.notify();
     }
 
@@ -343,13 +394,18 @@ pub fn actions(root: gpui::Div, cx: &mut Context<ClaudeChat>) -> gpui::Div {
 }
 
 /// The bar at the top of the chat while the search is open: the query, "3 / 12", the arrows,
-/// close.
+/// close. It slides down as it opens and back up after it closed, taking no input then.
 pub fn render_bar(
     chat: &mut ClaudeChat,
     window: &mut Window,
     cx: &mut Context<ClaudeChat>,
 ) -> Option<AnyElement> {
-    let search = chat.search.as_ref()?;
+    let open = chat.search.is_some();
+    let (t, shown) = chat.search_slide.revealed();
+    if !open && (t >= 1. || shown <= 0.) {
+        chat.search_slide.closed = None;
+    }
+    let search = chat.search.as_ref().or(chat.search_slide.closed.as_ref())?;
     let ui = Theme::ui(cx);
     let query = search.query.clone();
     let focus = query.focus_handle(cx);
@@ -396,7 +452,7 @@ pub fn render_bar(
                     cx.listener(|chat, _: &ClickEvent, window, cx| chat.close_search(window, cx)),
                 ),
         );
-    Some(
+    let bar =
         claude_transcript::column(
             div()
                 .key_context("FindBar")
@@ -421,10 +477,46 @@ pub fn render_bar(
                 .child(row),
         )
         .flex_none()
+        .relative()
         .border_b_1()
         .border_color(ui.divider)
-        .into_any_element(),
-    )
+        // Its height, for the slide (the first slide starts from the frame that measured it).
+        .child({
+            let height = chat.search_slide.height.clone();
+            canvas(
+                move |bounds, window, _| {
+                    let measured = f32::from(bounds.size.height);
+                    if height.replace(measured) != measured {
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full()
+        });
+    // Sliding down from the top of the chat: the room it takes grows, the bar comes down within
+    // it, fading in over the first half; closing, it slides back up. At rest, it lays out as is.
+    if t >= 1. {
+        return Some(bar.into_any_element());
+    }
+    window.request_animation_frame();
+    let height = chat.search_slide.height.get();
+    let bar = div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .h(px(height * shown))
+        .child(
+            bar.opacity((shown / 0.5).clamp(0., 1.))
+                .transform_translate(px(0.), px(-height * (1. - shown))),
+        );
+    Some(if open {
+        bar.into_any_element()
+    } else {
+        motion::inert(bar).into_any_element()
+    })
 }
 
 #[cfg(test)]

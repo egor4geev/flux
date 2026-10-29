@@ -25,9 +25,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui::{
     Animation, AnimationExt, AnyElement, App, BoxShadow, ClipboardItem, Context, Div, Entity,
     FontWeight, Hsla, Image, ImageFormat, InteractiveText, ListAlignment, ListOffset, ListState,
-    Pixels, SharedString, Stateful, StyledImage, StyledText, TextRun, Transformation, WeakEntity,
-    Window, div, font, img, linear_color_stop, linear_gradient, list, point, prelude::*, px,
-    radians,
+    Pixels, SharedString, Stateful, StyledImage, StyledText, Svg, TextRun, Transformation,
+    WeakEntity, Window, div, font, img, linear_color_stop, linear_gradient, list, point,
+    prelude::*, px, radians,
 };
 use serde_json::Value;
 
@@ -78,8 +78,6 @@ const DIFF_PREVIEW_LINES: usize = 8;
 const AGENT_STEPS: usize = 3;
 /// The cards' corners.
 const CARD_RADIUS: f32 = 10.;
-/// How long a copy button shows its check mark.
-const COPIED_FOR: Duration = Duration::from_millis(1500);
 /// How long an entry a click brought into sight stays highlighted, then how long the highlight
 /// takes to fade.
 pub(crate) const REVEALED_HOLD: Duration = Duration::from_millis(1600);
@@ -126,9 +124,11 @@ pub struct TranscriptState {
     /// The transcript's draws, counted: a message's texts are numbered anew in each.
     frame: Cell<u64>,
     /// The copy button that shows a check mark, and since when.
-    copied: Option<(EntryId, Instant)>,
+    copied: Option<(EntryId, ui::Copied)>,
     /// An entry to bring into view at the next sync ([`TranscriptState::reveal`]).
     reveal: Option<EntryId>,
+    /// The view goes to it at once rather than gliding ([`TranscriptState::reveal_at_once`]).
+    reveal_at_once: bool,
     /// The session changed since the last sync.
     dirty: bool,
     /// What it shows: `None` — the session's conversation; an Agent call — its subagent's (the
@@ -166,6 +166,62 @@ pub struct TranscriptState {
     live_group: Option<EntryId>,
     /// A redraw at the next animation tick is on its way ([`request_tick`]).
     tick_pending: Rc<Cell<bool>>,
+    /// A jump gliding to its place ([`Glide`]); the wheel drops it (the list's scroll handler).
+    glide: Rc<Cell<Option<Glide>>>,
+    /// The "↓" button was drawn last frame, and since when it leaves: it fades out, taking no
+    /// input, once the view is back at the end.
+    jump_shown: Cell<bool>,
+    jump_left: Cell<Option<Instant>>,
+}
+
+/// Where a [`Glide`] of the conversation goes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GlideTo {
+    /// The end: there the list follows new content again.
+    End,
+    /// A scroll position, an item and the offset into it: an entry revealed, a match.
+    Place(usize, Pixels),
+}
+
+/// A jump of the conversation gliding to its place ([`motion::SCROLL`]): "Jump to Latest", the
+/// user's message sent while scrolled up, an entry revealed, the search's next match. The list
+/// knows the heights of its items only once it has measured them, so the glide keeps no pixel
+/// positions: each frame it puts the list at the target and back by what is left of the way —
+/// it lands exactly on the target however the heights on the way turn out, and a glide to the
+/// end goes along with content growing there. A way longer than the view starts a view short of
+/// the target: the list jumps most of a long way and glides the last screen. Scrolling by hand
+/// takes over (the list's scroll handler drops the glide).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Glide {
+    to: GlideTo,
+    /// How far short of the target the glide starts, in pixels: above it when positive.
+    short: f32,
+    since: Instant,
+}
+
+impl Glide {
+    /// A glide over the way from the view's top at `from` to `target` (pixels down the list), at
+    /// most `limit` of it; `None` if there is nowhere to go.
+    fn new(to: GlideTo, from: f32, target: f32, limit: f32, now: Instant) -> Option<Self> {
+        let limit = limit.max(0.);
+        let short = (target - from).clamp(-limit, limit);
+        (short.abs() >= 0.5).then_some(Self {
+            to,
+            short,
+            since: now,
+        })
+    }
+
+    /// How far short of the target the view is at `now`, and whether the glide has ended (at once
+    /// with animations off).
+    fn left(&self, now: Instant) -> (f32, bool) {
+        let (t, done) = motion::SCROLL.at(now.saturating_duration_since(self.since));
+        if done {
+            (0., true)
+        } else {
+            (self.short * (1. - t), false)
+        }
+    }
 }
 
 /// How often something moving in the conversation asks to be drawn again.
@@ -228,9 +284,14 @@ pub(crate) enum Item {
 impl TranscriptState {
     pub fn new(chat: WeakEntity<ClaudeChat>) -> Self {
         let list = ListState::new(0, ListAlignment::Bottom, px(600.));
-        // The "↓" button follows the scroll position.
-        list.set_scroll_handler(move |_, _, cx| {
-            chat.update(cx, |_, cx| cx.notify()).ok();
+        let glide: Rc<Cell<Option<Glide>>> = Rc::default();
+        // The "↓" button follows the scroll position; scrolling by hand stops a glide.
+        list.set_scroll_handler({
+            let glide = glide.clone();
+            move |_, _, cx| {
+                glide.set(None);
+                chat.update(cx, |_, cx| cx.notify()).ok();
+            }
         });
         Self {
             list,
@@ -248,6 +309,7 @@ impl TranscriptState {
             frame: Cell::new(0),
             copied: None,
             reveal: None,
+            reveal_at_once: false,
             dirty: true,
             scope: None,
             search: None,
@@ -261,6 +323,9 @@ impl TranscriptState {
             fold_heights: Rc::default(),
             live_group: None,
             tick_pending: Rc::default(),
+            glide,
+            jump_shown: Cell::new(false),
+            jump_left: Cell::new(None),
         }
     }
 
@@ -291,9 +356,18 @@ impl TranscriptState {
     /// call, a step by its group (opened) — when the chat is drawn next: the caller redraws it
     /// (`cx.notify()` on the chat). A click on a session tab's status, a match of the search
     /// (part 10.2).
+    /// The view glides there ([`motion::SCROLL`]).
     pub fn reveal(&mut self, id: EntryId) {
         self.reveal = Some(id);
+        self.reveal_at_once = false;
         self.dirty = true;
+    }
+
+    /// [`TranscriptState::reveal`] at once: the first match of a query being typed follows the
+    /// keys.
+    pub fn reveal_at_once(&mut self, id: EntryId) {
+        self.reveal(id);
+        self.reveal_at_once = true;
     }
 
     /// Like [`TranscriptState::reveal`], and the entry opens and shows highlighted for a moment:
@@ -322,11 +396,87 @@ impl TranscriptState {
             .filter(|elapsed| *elapsed < REVEALED_HOLD + REVEALED_FADE)
     }
 
+    /// Takes the view to the end ("Jump to Latest", the user's message sent while scrolled up),
+    /// gliding there.
     pub fn scroll_to_bottom(&self) {
-        self.list.scroll_to(ListOffset {
-            item_ix: self.list.item_count(),
-            offset_in_item: px(0.),
-        });
+        if self.at_bottom() {
+            self.glide.set(None);
+            self.place(GlideTo::End, 0.);
+            return;
+        }
+        let from = self.view_top();
+        self.place(GlideTo::End, 0.);
+        let target = self.view_top();
+        self.glide_from(GlideTo::End, from, target);
+    }
+
+    /// The view's top, in pixels down the list as far as its items are measured.
+    fn view_top(&self) -> f32 {
+        // At the end the list keeps no position of its own: its top is a view above the end.
+        let end = f32::from(self.list.max_offset_for_scrollbar().height);
+        self.list_top().min(end).max(0.)
+    }
+
+    /// The list's scroll position in pixels down the list, as it was set: past the end when it
+    /// was set there (the list draws it at the end).
+    fn list_top(&self) -> f32 {
+        -f32::from(self.list.scroll_px_offset_for_scrollbar().y)
+    }
+
+    /// Puts the list `short` pixels short of `to` (above it when positive).
+    fn place(&self, to: GlideTo, short: f32) {
+        match to {
+            GlideTo::End => {
+                self.list.scroll_to(ListOffset {
+                    item_ix: self.list.item_count(),
+                    offset_in_item: px(0.),
+                });
+                if short > 0. {
+                    let view = f32::from(self.list.viewport_bounds().size.height);
+                    self.list.scroll_by(px(-(view + short)));
+                }
+            }
+            GlideTo::Place(item_ix, offset_in_item) => {
+                self.list.scroll_to(ListOffset {
+                    item_ix,
+                    offset_in_item,
+                });
+                self.list.scroll_by(px(-short));
+            }
+        }
+    }
+
+    /// The list is at `to` (whose top is at `target`): it glides there from the view's top at
+    /// `from` when animations are on.
+    fn glide_from(&self, to: GlideTo, from: f32, target: f32) {
+        let limit = f32::from(self.list.viewport_bounds().size.height);
+        let glide = (motion::enabled() && limit > 0.)
+            .then(|| Glide::new(to, from, target, limit, Instant::now()))
+            .flatten();
+        if let Some(glide) = glide {
+            self.place(to, glide.short);
+        }
+        self.glide.set(glide);
+    }
+
+    /// This frame's step of a glide: the list goes where the glide has it now. Taken before the
+    /// list learns what changed, while the heights it knows are those it has just drawn.
+    fn step_glide(&self) {
+        let Some(glide) = self.glide.get() else {
+            return;
+        };
+        let (short, done) = glide.left(Instant::now());
+        self.place(glide.to, short);
+        if done {
+            self.glide.set(None);
+        }
+    }
+
+    /// The view glides to the end: the "↓" button has done its job.
+    fn gliding_to_end(&self) -> bool {
+        self.glide
+            .get()
+            .is_some_and(|glide| glide.to == GlideTo::End)
     }
 
     fn expanded(&self, id: EntryId, default: bool) -> bool {
@@ -395,7 +545,7 @@ impl TranscriptState {
 
     fn just_copied(&self, id: EntryId) -> bool {
         self.copied
-            .is_some_and(|(copied, at)| copied == id && at.elapsed() < COPIED_FOR)
+            .is_some_and(|(copied, at)| copied == id && at.showing())
     }
 }
 
@@ -406,6 +556,7 @@ pub fn sync(
     session: &Entity<ClaudeSession>,
     cx: &mut Context<ClaudeChat>,
 ) {
+    state.step_glide();
     if !state.dirty {
         return;
     }
@@ -483,8 +634,13 @@ pub fn sync(
     if user_sent {
         state.scroll_to_bottom();
     }
+    let at_once = std::mem::take(&mut state.reveal_at_once);
     if let Some(index) = reveal {
+        if at_once {
+            state.glide.set(None);
+        }
         // Not flush with the edge: a little of what's around shows too.
+        let from = state.view_top();
         let top = state.list.logical_scroll_top();
         state.list.scroll_to_reveal_item(index);
         let moved = state.list.logical_scroll_top();
@@ -494,6 +650,13 @@ pub fn sync(
             } else {
                 REVEAL_MARGIN
             }));
+            // A place past the end (the margin under the last entry) is drawn at the end: the
+            // glide toward it stops there a little early.
+            if !at_once {
+                let to = state.list.logical_scroll_top();
+                let target = state.list_top();
+                state.glide_from(GlideTo::Place(to.item_ix, to.offset_in_item), from, target);
+            }
         }
     }
 
@@ -957,10 +1120,14 @@ pub fn column(child: impl IntoElement) -> Div {
 
 /// The conversation filling the chat (the "↓" button over it while scrolled up), and the line of
 /// what Claude does now under it; tips in an empty session.
-pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeChat>) -> AnyElement {
+pub fn render(chat: &ClaudeChat, window: &mut Window, cx: &mut Context<ClaudeChat>) -> AnyElement {
     let ui = Theme::ui(cx);
     let weak = cx.weak_entity();
     let state = chat.shown_transcript();
+    // A glide steps each frame (in `sync`) while it runs.
+    if state.glide.get().is_some() {
+        window.request_animation_frame();
+    }
     state.frame.set(state.frame.get() + 1);
     claude_select::prune(&state.drawn, state.frame.get(), state.selection.as_ref());
     let model = chat.session().read(cx).model();
@@ -994,7 +1161,7 @@ pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeCh
             .children(activity)
             .into_any_element();
     }
-    let jump = (!state.at_bottom()).then(|| {
+    let jump_button = || {
         let weak = weak.clone();
         div().absolute().bottom(px(10.)).right(px(12.)).child(
             div()
@@ -1021,9 +1188,29 @@ pub fn render(chat: &ClaudeChat, _window: &mut Window, cx: &mut Context<ClaudeCh
                     .ok();
                 }),
         )
-    });
-    // It pops up where it sits as the user leaves the end.
-    let jump = jump.map(|jump| Appear::pop((1., 1.)).apply("claude-jump-appear", jump));
+    };
+    // It pops up where it sits as the user leaves the end; as the view comes back (or sets off
+    // there after a click), it fades out into its corner, taking no input.
+    let away = !state.at_bottom() && !state.gliding_to_end();
+    if away {
+        state.jump_left.set(None);
+    } else if state.jump_shown.get() && motion::enabled() {
+        state.jump_left.set(Some(Instant::now()));
+    }
+    state.jump_shown.set(away);
+    let jump = if away {
+        Some(Appear::pop((1., 1.)).apply("claude-jump-appear", jump_button()))
+    } else {
+        state
+            .jump_left
+            .get()
+            .filter(|since| motion::running(*since, motion::EXIT))
+            .map(|since| {
+                let progress = motion::animate(since, motion::EXIT, window);
+                motion::inert(motion::leaving_style(jump_button(), progress, (1., 1.)))
+                    .into_any_element()
+            })
+    };
     let items = {
         let weak = weak.clone();
         list(state.list.clone(), move |index, window, cx| {
@@ -1528,29 +1715,16 @@ impl Renderer<'_> {
             let prompt = !user.text.trim_start().starts_with('/');
             let copied = self.state.just_copied(id);
             let chat = self.chat.clone();
-            let copy = small_button(
-                ("claude-user-copy", id),
-                if copied {
-                    IconName::Check
-                } else {
-                    IconName::Copy
-                },
-                ui,
-            )
-            .tooltip(ui::tooltip(tr("Copy"), None))
-            .on_click(move |_, _, cx| {
-                chat.update(cx, |chat, cx| {
-                    chat.copy_message(id, cx);
-                    chat.shown_transcript_mut().copied = Some((id, Instant::now()));
-                    cx.notify();
-                    cx.spawn(async move |chat, cx| {
-                        cx.background_executor().timer(COPIED_FOR).await;
-                        chat.update(cx, |_, cx| cx.notify()).ok();
+            let copy = small_button_frame(("claude-user-copy", id), ui)
+                .child(copy_icon(copied, 13., ui.text_muted, ui.text_muted))
+                .tooltip(ui::tooltip(tr("Copy"), None))
+                .on_click(move |_, _, cx| {
+                    chat.update(cx, |chat, cx| {
+                        chat.copy_message(id, cx);
+                        note_copied(chat, id, cx);
                     })
-                    .detach();
-                })
-                .ok();
-            });
+                    .ok();
+                });
             let edit = prompt.then(|| {
                 let chat = self.chat.clone();
                 small_button(("claude-user-edit", id), IconName::Pencil, ui)
@@ -2003,29 +2177,10 @@ impl Renderer<'_> {
             .cursor_pointer()
             .hover(move |style| style.bg(ui.hover))
             .tooltip(ui::tooltip(tr("Copy"), None))
-            .child(
-                icon(
-                    if copied {
-                        IconName::Check
-                    } else {
-                        IconName::Copy
-                    },
-                    if copied { ui.success } else { ui.dim },
-                )
-                .size(px(13.)),
-            )
+            .child(copy_icon(copied, 13., ui.dim, ui.success))
             .on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                chat.update(cx, |chat, cx| {
-                    chat.shown_transcript_mut().copied = Some((id, Instant::now()));
-                    cx.notify();
-                    cx.spawn(async move |chat, cx| {
-                        cx.background_executor().timer(COPIED_FOR).await;
-                        chat.update(cx, |_, cx| cx.notify()).ok();
-                    })
-                    .detach();
-                })
-                .ok();
+                chat.update(cx, |chat, cx| note_copied(chat, id, cx)).ok();
             })
             .into_any_element()
     }
@@ -3742,12 +3897,14 @@ impl Renderer<'_> {
             )
             .child(counts_label(file.added, file.removed, ui))
             .child(div().flex_1())
+            // They fade in under the pointer (an id keeps the fade).
             .child(
                 div()
+                    .id(("claude-done-file-actions", key))
                     .flex()
                     .gap(px(2.))
-                    .invisible()
-                    .group_hover(group, |style| style.visible())
+                    .opacity(0.)
+                    .group_hover(group, |style| style.opacity(1.))
                     .child(review)
                     .child(rollback),
             )
@@ -4376,6 +4533,11 @@ fn counts_label(added: usize, removed: usize, ui: UiColors) -> AnyElement {
 
 /// A small square button with an icon (22 px), for rows and cards.
 fn small_button(id: impl Into<gpui::ElementId>, name: IconName, ui: UiColors) -> Stateful<Div> {
+    small_button_frame(id, ui).child(icon(name, ui.text_muted).size(px(13.)))
+}
+
+/// [`small_button`] without its icon.
+fn small_button_frame(id: impl Into<gpui::ElementId>, ui: UiColors) -> Stateful<Div> {
     div()
         .id(id)
         .flex_none()
@@ -4386,7 +4548,40 @@ fn small_button(id: impl Into<gpui::ElementId>, name: IconName, ui: UiColors) ->
         .rounded(px(ui::RADIUS_XS + 1.))
         .cursor_pointer()
         .hover(move |style| style.bg(ui.hover))
-        .child(icon(name, ui.text_muted).size(px(13.)))
+}
+
+/// The copy button of entry `id` was pressed: it shows its check mark for a moment
+/// ([`ui::Copied`]).
+fn note_copied(chat: &mut ClaudeChat, id: EntryId, cx: &mut Context<ClaudeChat>) {
+    let mut copied = ui::Copied::default();
+    copied.now(cx);
+    chat.shown_transcript_mut().copied = Some((id, copied));
+}
+
+/// The icon of a copy button, `size` pixels: the copy icon (`idle`) and, a moment after a click,
+/// the check mark (`done`) crossfade ([`motion::FADE`]). The button's id keeps the fade.
+fn copy_icon(copied: bool, size: f32, idle: Hsla, done: Hsla) -> AnyElement {
+    let shown = if copied { 1. } else { 0. };
+    let fade = |icon: Svg, value: f32| icon.opacity(value);
+    div()
+        .relative()
+        .flex_none()
+        .size(px(size))
+        .child(icon(IconName::Copy, idle).size(px(size)).with_transition(
+            "copy-idle",
+            1. - shown,
+            motion::FADE,
+            fade,
+        ))
+        .child(div().absolute().top_0().left_0().size(px(size)).child(
+            icon(IconName::Check, done).size(px(size)).with_transition(
+                "copy-done",
+                shown,
+                motion::FADE,
+                fade,
+            ),
+        ))
+        .into_any_element()
 }
 
 /// A link in the accent color (a card's action).
@@ -4405,18 +4600,18 @@ fn link(
         .child(label.into())
 }
 
-/// A pulsing dot: something runs.
-fn pulse(id: impl Into<gpui::ElementId>, ui: UiColors) -> impl IntoElement {
-    div()
-        .flex_none()
-        .size(px(7.))
-        .rounded(px(4.))
-        .bg(ui.accent)
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
-        )
+/// A pulsing dot: something runs. With animations off it shows steady.
+fn pulse(id: impl Into<gpui::ElementId>, ui: UiColors) -> AnyElement {
+    let dot = div().flex_none().size(px(7.)).rounded(px(4.)).bg(ui.accent);
+    if !motion::enabled() {
+        return dot.into_any_element();
+    }
+    dot.with_animation(
+        id,
+        Animation::new(Duration::from_millis(900)).repeat(),
+        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+    )
+    .into_any_element()
 }
 
 /// A row's chevron: points right, and turns down as the row opens (`POP`). The row's id scopes
