@@ -3022,14 +3022,21 @@ impl CommitPanel {
                             }),
                     )
                     .child(
-                        ui::text_button("commit-push-button", tr("Commit and Push…"), false, ui)
-                            .tooltip(ui::tooltip(tr("Commit and Push…"), push_keys))
-                            .when(!can_commit, |button| button.opacity(0.5))
-                            .when(can_commit, |button| {
-                                button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.commit(true, window, cx)
-                                }))
-                            }),
+                        ui::available(
+                            ui::text_button(
+                                "commit-push-button",
+                                tr("Commit and Push…"),
+                                false,
+                                ui,
+                            ),
+                            can_commit,
+                        )
+                        .tooltip(ui::tooltip(tr("Commit and Push…"), push_keys))
+                        .when(can_commit, |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.commit(true, window, cx)
+                            }))
+                        }),
                     ),
             )
     }

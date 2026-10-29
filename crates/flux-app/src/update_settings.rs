@@ -94,15 +94,17 @@ impl UpdatesSettingsPage {
             )
             .child(
                 div().flex().items_center().gap_2().children(buttons).child(
-                    ui::text_button("updates-check-now", tr("Check Now"), false, ui)
-                        .when(busy, |button| button.opacity(0.5))
-                        .when(!busy, |button| {
-                            button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                if let Some(updates) = &this.updates {
-                                    updates.update(cx, |updates, cx| updates.check_now(cx));
-                                }
-                            }))
-                        }),
+                    ui::available(
+                        ui::text_button("updates-check-now", tr("Check Now"), false, ui),
+                        !busy,
+                    )
+                    .when(!busy, |button| {
+                        button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            if let Some(updates) = &this.updates {
+                                updates.update(cx, |updates, cx| updates.check_now(cx));
+                            }
+                        }))
+                    }),
                 ),
             )
     }

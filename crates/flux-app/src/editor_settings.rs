@@ -9,6 +9,7 @@ use gpui::{
 
 use crate::i18n::tr;
 use crate::input::{InputEvent, TextInput};
+use crate::motion::{self, TransitionExt as _};
 use crate::settings::{self, EditorSettings};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
@@ -160,7 +161,6 @@ impl Render for EditorSettingsPage {
             .gap_3()
             .px_3()
             .py_1p5()
-            .when(!indent, |row| row.opacity(0.5))
             .child(
                 div()
                     .flex_1()
@@ -211,7 +211,13 @@ impl Render for EditorSettingsPage {
                     cx.notify();
                 })),
             )
-            .child(extra_row)
+            // It depends on the switch above: dims and comes back with a fade.
+            .child(extra_row.with_transition(
+                "soft-wrap-extra-dim",
+                if indent { 1. } else { 0.5 },
+                motion::FADE,
+                |row, opacity| row.opacity(opacity),
+            ))
             .child(
                 switch_row(
                     "soft-wrap-signs",

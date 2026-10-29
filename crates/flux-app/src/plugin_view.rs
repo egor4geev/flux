@@ -1876,11 +1876,10 @@ impl PluginView {
             Some(tooltip) => button.tooltip(ui::tooltip(single_line(tooltip), None)),
             None => button,
         };
+        // Unavailable: dimmed, no hover or press; the change fades.
+        let button = ui::available(button, spec.enabled);
         if !spec.enabled {
-            return button
-                .opacity(0.45)
-                .cursor(CursorStyle::Arrow)
-                .into_any_element();
+            return button.into_any_element();
         }
         let element = id.to_string();
         button

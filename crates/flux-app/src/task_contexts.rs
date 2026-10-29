@@ -382,7 +382,8 @@ impl PickerDelegate for ContextList {
         } else {
             IconName::Stash
         };
-        // The trash shows on the row under the mouse and on the selected one.
+        // The trash shows on the row under the mouse and on the selected one: it fades in and out
+        // with the row's hover (the button's id keeps the fade).
         let delete = crate::ui::icon_button(("context-delete", index), IconName::Trash, ui)
             .flex_none()
             .tooltip(crate::ui::tooltip(tr("Delete Context"), Some("⌘⌫".into())))
@@ -392,8 +393,8 @@ impl PickerDelegate for ContextList {
             )
             .when(!selected, |button| {
                 button
-                    .invisible()
-                    .group_hover("context-row", |style| style.visible())
+                    .opacity(0.)
+                    .group_hover("context-row", |style| style.opacity(1.))
             });
         div()
             .group("context-row")

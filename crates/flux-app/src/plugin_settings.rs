@@ -40,6 +40,7 @@ use crate::dialog::Dialog;
 use crate::i18n::{lang_code, tr, trf};
 use crate::icons::IconName;
 use crate::input::{InputEvent, TextInput};
+use crate::motion::TransitionExt as _;
 use crate::plugins::{CommandOrigin, PluginStore};
 use crate::prompt_input::{PromptInput, PromptInputEvent};
 use crate::settings;
@@ -152,6 +153,8 @@ pub struct PluginSettingsPage {
     /// The ids of records' cards: unique on the page, so a card's elements stay with it when
     /// records move.
     next_card: Cell<u64>,
+    /// The cards' chevrons turning as the user opens and closes them, by (setting, card).
+    disclosure: crate::motion::Disclosure<(usize, u64)>,
 }
 
 struct Field {
@@ -241,6 +244,7 @@ impl PluginSettingsPage {
             generation: Rc::new(Cell::new(0)),
             _subscription: Some(subscription),
             next_card: Cell::new(0),
+            disclosure: crate::motion::Disclosure::default(),
         };
         let specs = page
             .entry
@@ -797,6 +801,8 @@ impl PluginSettingsPage {
             .and_then(|cards| cards.iter_mut().find(|card| card.id == id))
         {
             card.expanded = !card.expanded;
+            let expanded = card.expanded;
+            self.disclosure.toggled((index, id), expanded);
         }
         cx.notify();
     }
@@ -1165,12 +1171,7 @@ impl PluginSettingsPage {
             (_, FieldState::Input(row)) => card
                 .child(caption(reset))
                 .child(row.input.clone())
-                .children(field.error.clone().map(|error| {
-                    div()
-                        .text_size(px(theme::TEXT_SM))
-                        .text_color(ui.error)
-                        .child(error)
-                }))
+                .children(field.error.clone().map(|error| fading_error(error, ui)))
                 .into_any_element(),
             (_, FieldState::List(rows)) => card
                 .child(caption(reset))
@@ -1179,12 +1180,7 @@ impl PluginSettingsPage {
             (_, FieldState::Secret(secret)) => card
                 .child(caption(None))
                 .child(self.render_secret(index, secret, ui, cx))
-                .children(field.error.clone().map(|error| {
-                    div()
-                        .text_size(px(theme::TEXT_SM))
-                        .text_color(ui.error)
-                        .child(error)
-                }))
+                .children(field.error.clone().map(|error| fading_error(error, ui)))
                 .into_any_element(),
             (_, FieldState::Lines(lines)) => card
                 .child(caption(reset))
@@ -1300,13 +1296,10 @@ impl PluginSettingsPage {
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_card(index, id, cx)),
             )
+            // It turns as the card opens and closes.
             .child(
-                crate::icons::icon(
-                    if card.expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    },
+                crate::icons::chevron(
+                    self.disclosure.chevron(&(index, id), card.expanded, window),
                     ui.text_muted,
                 )
                 .size(px(12.)),
@@ -1321,13 +1314,13 @@ impl PluginSettingsPage {
             )
             .children(summary.into_iter().map(|badge| badge.flex_none()));
         let button = |name: &str, icon: IconName, tooltip: &'static str, enabled: bool| {
-            ui::icon_button(
+            let button = ui::icon_button(
                 SharedString::from(format!("plugin-record-{index}-{id}-{name}")),
                 icon,
                 ui,
             )
-            .tooltip(ui::tooltip(tr(tooltip), None))
-            .when(!enabled, |button| button.opacity(0.35).cursor_default())
+            .tooltip(ui::tooltip(tr(tooltip), None));
+            ui::available(button, enabled)
         };
         let header = div()
             .flex()
@@ -1546,14 +1539,21 @@ impl PluginSettingsPage {
                 busy: false,
             });
         let title = self.tr(&spec.title).to_string();
+        // A new status fades in, its color gliding to the new tone ("Checking…" → "Connected").
+        let text = SharedString::from(status.text);
         let line = div()
             .flex()
             .items_center()
             .gap_2()
             .min_w_0()
-            .text_color(tone_color(status.tone, ui))
             .when(status.busy, |line| line.child(busy_dot(index, ui)))
-            .child(div().min_w_0().child(status.text));
+            .child(crate::motion::Appear::fade().apply(text.clone(), div().min_w_0().child(text)))
+            .with_transition(
+                ("plugin-setting-tone", index),
+                tone_color(status.tone, ui),
+                crate::motion::FADE,
+                |line, color| line.text_color(color),
+            );
         let actions = (!buttons.is_empty()).then(|| self.render_buttons(buttons, false, cx));
         div()
             .id(SharedString::from(format!("plugin-setting-{index}")))
@@ -1653,15 +1653,17 @@ impl PluginSettingsPage {
                     }
                     _ => false,
                 };
-                ui::text_button(
-                    SharedString::from(format!("plugin-setting-{index}")),
-                    self.tr(&spec.title).to_string(),
-                    false,
-                    ui,
+                ui::available(
+                    ui::text_button(
+                        SharedString::from(format!("plugin-setting-{index}")),
+                        self.tr(&spec.title).to_string(),
+                        false,
+                        ui,
+                    )
+                    .h(px(28.))
+                    .px(px(12.)),
+                    enabled,
                 )
-                .h(px(28.))
-                .px(px(12.))
-                .when(!enabled, |button| button.opacity(0.5).cursor_default())
                 .when(enabled, |button| {
                     button.on_click(
                         cx.listener(move |this, _: &ClickEvent, _, cx| this.press(index, cx)),
@@ -1896,18 +1898,29 @@ fn tone_color(tone: Tone, ui: UiColors) -> gpui::Hsla {
     }
 }
 
-/// A pulsing dot: the plugin works ("Checking…").
-fn busy_dot(index: usize, ui: UiColors) -> impl IntoElement {
-    div()
-        .flex_none()
-        .size(px(8.))
-        .rounded(px(4.))
-        .bg(ui.accent)
-        .with_animation(
-            SharedString::from(format!("plugin-setting-busy-{index}")),
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
-        )
+/// A pulsing dot: the plugin works ("Checking…"). With the animations off, a still one.
+fn busy_dot(index: usize, ui: UiColors) -> AnyElement {
+    let dot = div().flex_none().size(px(8.)).rounded(px(4.)).bg(ui.accent);
+    if !crate::motion::enabled() {
+        return dot.opacity(0.65).into_any_element();
+    }
+    dot.with_animation(
+        SharedString::from(format!("plugin-setting-busy-{index}")),
+        Animation::new(Duration::from_millis(900)).repeat(),
+        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+    )
+    .into_any_element()
+}
+
+/// A field's validation message: fades in, and again when it says something else.
+fn fading_error(error: SharedString, ui: UiColors) -> AnyElement {
+    crate::motion::Appear::fade().apply(
+        error.clone(),
+        div()
+            .text_size(px(theme::TEXT_SM))
+            .text_color(ui.error)
+            .child(error),
+    )
 }
 
 /// `settings.set` (API 0.3): a plugin writes one of its settings — checked against the manifest

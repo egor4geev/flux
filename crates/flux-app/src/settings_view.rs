@@ -28,7 +28,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use flux_lsp::config::ServerConfig;
 use flux_lsp::install::{self, Source};
@@ -82,8 +82,6 @@ const ABOUT_LOGO_SIZE: f32 = 64.;
 const ABOUT_LABEL_WIDTH: f32 = 120.;
 /// Claude Code: the column of the CLI's facts (Executable, Version, Account).
 const CLAUDE_LABEL_WIDTH: f32 = 150.;
-/// About → Copy says «Copied» this long.
-const COPIED_FOR: Duration = Duration::from_millis(1500);
 /// Claude Code → Country Check: "checked 5 s ago" counts on this often while the page shows.
 const CLOCK_TICK: Duration = Duration::from_secs(1);
 
@@ -356,9 +354,10 @@ pub struct SettingsView {
     /// country code.
     countries: Entity<TextInput>,
     /// When About → Copy was last clicked: it says «Copied» for a moment.
-    about_copied: Option<Instant>,
-    /// Where each notification group's display choices were drawn, by the group's key: the chosen
-    /// one's pill glides between them.
+    about_copied: ui::Copied,
+    /// Where the segments of each segmented choice were drawn — a notification group's display, a
+    /// default of Claude's new sessions — by the group's key or the choice's id: the chosen one's
+    /// pill glides between them.
     display_choices: RefCell<HashMap<String, Rc<ui::Segments>>>,
     _tasks: Vec<Task<()>>,
     /// Redraws Claude Code's page every second: when the country was checked.
@@ -499,7 +498,7 @@ impl SettingsView {
             claude: handles.claude,
             claude_args,
             countries,
-            about_copied: None,
+            about_copied: ui::Copied::default(),
             display_choices: RefCell::default(),
             _tasks: Vec::new(),
             _clock: clock,
@@ -1817,6 +1816,21 @@ impl SettingsView {
                           selected: Option<String>,
                           set: fn(&mut settings::ClaudeSettings, Option<String>),
                           cx: &mut Context<Self>| {
+            // The chosen one's pill glides to the next one chosen.
+            let segments = self
+                .display_choices
+                .borrow_mut()
+                .entry(id.to_string())
+                .or_default()
+                .clone();
+            let pill = segments.pill(
+                options
+                    .iter()
+                    .position(|(value, _)| selected.as_deref() == *value),
+                "pill",
+                ui,
+            );
+            let own_backdrop = pill.is_none();
             let choices = options
                 .into_iter()
                 .enumerate()
@@ -1831,9 +1845,8 @@ impl SettingsView {
                         .rounded(px(ui::RADIUS_SM))
                         .text_size(px(theme::TEXT_SM))
                         .cursor_pointer()
-                        .when(chosen, |choice| {
-                            choice.bg(ui.list_selected).text_color(ui.foreground)
-                        })
+                        .when(chosen, |choice| choice.text_color(ui.foreground))
+                        .when(chosen && own_backdrop, |choice| choice.bg(ui.list_selected))
                         .when(!chosen, |choice| {
                             choice
                                 .text_color(ui.text_muted)
@@ -1845,6 +1858,7 @@ impl SettingsView {
                             });
                             cx.notify();
                         }))
+                        .child(segments.measure(index))
                         .child(title)
                 });
             div()
@@ -1857,7 +1871,10 @@ impl SettingsView {
                 .child(div().text_color(ui.text_muted).child(label))
                 .child(
                     div()
+                        // The id scopes the pill's glide.
+                        .id(id)
                         .flex_none()
+                        .relative()
                         .flex()
                         .gap_0p5()
                         .p_0p5()
@@ -1865,6 +1882,8 @@ impl SettingsView {
                         .bg(ui.input_background)
                         .border_1()
                         .border_color(ui.input_border)
+                        .child(segments.measure_origin())
+                        .children(pill)
                         .children(choices),
                 )
         };
@@ -2097,7 +2116,7 @@ impl SettingsView {
 
     /// Country Check: the field of the blocked countries with its hint, the countries it holds as
     /// chips (flag and name), and what in it isn't a code. `on` — the check is on (dimmed when not).
-    fn render_countries(&self, on: bool, cx: &mut Context<Self>) -> Div {
+    fn render_countries(&self, on: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let text = self.countries.read(cx).text();
         let invalid = flux_claude::region::invalid_codes(&text);
@@ -2165,7 +2184,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_2()
-            .when(!on, |list| list.opacity(0.6))
             .child(
                 div()
                     .text_color(ui.text_muted)
@@ -2191,6 +2209,13 @@ impl SettingsView {
             })
             .children(note)
             .children(typos)
+            // It depends on the Country Check switch: dims and comes back with a fade.
+            .with_transition(
+                "countries-dim",
+                if on { 1. } else { 0.6 },
+                motion::FADE,
+                |list, opacity| list.opacity(opacity),
+            )
     }
 
     /// Country Check: where the network sees this Mac now, what that means for Claude, when it was
@@ -2269,17 +2294,19 @@ impl SettingsView {
             )
             .when(verdict != Verdict::Off, |row| {
                 row.child(
-                    ui::text_button(
-                        "claude-country-check-again",
-                        if asking {
-                            tr("Checking…")
-                        } else {
-                            tr("Check Again")
-                        },
-                        false,
-                        ui,
+                    ui::available(
+                        ui::text_button(
+                            "claude-country-check-again",
+                            if asking {
+                                tr("Checking…")
+                            } else {
+                                tr("Check Again")
+                            },
+                            false,
+                            ui,
+                        ),
+                        !asking,
                     )
-                    .when(asking, |button| button.opacity(0.6))
                     .when(!asking, |button| {
                         button.on_click(cx.listener(|_, _, _, cx| {
                             region_guard::check_again(cx);
@@ -2354,9 +2381,6 @@ impl SettingsView {
             (tr("Source code"), repository),
         ];
         // Copy last: «Copied» is wider and moves nothing.
-        let copied = self
-            .about_copied
-            .is_some_and(|at| at.elapsed() < COPIED_FOR);
         let buttons = div()
             .flex()
             .items_center()
@@ -2366,18 +2390,12 @@ impl SettingsView {
                     .on_click(|_, _, cx| feedback::report_bug(None, cx)),
             )
             .child(
-                ui::text_button(
-                    "about-copy",
-                    if copied { tr("Copied") } else { tr("Copy") },
-                    false,
-                    ui,
-                )
-                .when(copied, |button| button.text_color(ui.success))
-                .tooltip(ui::tooltip(
-                    tr("The version, macOS, the computer and the plugins — for a report"),
-                    None,
-                ))
-                .on_click(cx.listener(|this, _, _, cx| this.copy_about(cx))),
+                ui::copy_button("about-copy", &self.about_copied, ui)
+                    .tooltip(ui::tooltip(
+                        tr("The version, macOS, the computer and the plugins — for a report"),
+                        None,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_about(cx))),
             );
         div()
             .flex()
@@ -2412,13 +2430,7 @@ impl SettingsView {
     fn copy_about(&mut self, cx: &mut Context<Self>) {
         let text = feedback::system_info_with(&self.plugins, cx).to_text();
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.about_copied = Some(Instant::now());
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(COPIED_FOR).await;
-            this.update(cx, |_, cx| cx.notify()).ok();
-        })
-        .detach();
+        self.about_copied.now(cx);
     }
 }
 
@@ -2542,8 +2554,13 @@ impl Render for SettingsView {
         let appear = motion::Appear::slide(0., PAGE_RISE).curve(motion::POP);
         let page = SharedString::from(format!("settings-page-{}", self.section.key()));
         let content = match content {
+            // Each section scrolls on its own: a page comes in at its top, not where the last
+            // one was scrolled to.
             Some(content) => div()
-                .id("settings-content")
+                .id(SharedString::from(format!(
+                    "settings-content-{}",
+                    self.section.key()
+                )))
                 .flex_1()
                 .min_w_0()
                 .overflow_y_scroll()

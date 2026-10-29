@@ -10,6 +10,12 @@
 //! shows the dialogs one at a time, oldest first. When an answered ticket leaves gpui's slot empty
 //! and more dialogs wait, the layer puts itself back with one more `window.prompt`.
 //!
+//! Motion (ADR-040): a dialog grows in as the workspace's dialogs do ([`motion::Appear::dialog`]),
+//! over a backdrop that fades in; an answered one fades out and shrinks a little, inert. The answer
+//! goes back at once: gpui empties its slot as it sends it, so the layer keeps a copy of the card
+//! and puts itself back for the exit — with a ticket that keeps the focus where the answer left it
+//! — and takes itself out when the exit ends. A dialog giving way to the next keeps the backdrop.
+//!
 //! Keys: ↵ and Space press the focused button (the main one at first), Esc — Cancel, Tab / ← → move
 //! between the buttons, ⌘D — the destructive alternative of a dialog with a main button ("Don't
 //! Save", as in macOS), ⌘C — copy the details.
@@ -18,7 +24,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext as _, AsyncWindowContext, ClickEvent, ClipboardItem, Context, Entity,
@@ -29,6 +35,7 @@ use gpui::{
 
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
+use crate::motion;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, CheckState, RADIUS_MD};
 
@@ -300,9 +307,17 @@ thread_local! {
     /// The dialog [`ask`] is showing: `window.prompt` only carries the title and the labels.
     static PENDING: RefCell<Option<Request>> = const { RefCell::new(None) };
     /// The next `window.prompt` only puts a layer back into gpui's slot.
-    static REATTACH: Cell<bool> = const { Cell::new(false) };
+    static REATTACH: RefCell<Option<Reattach>> = const { RefCell::new(None) };
     /// The layer of each window that has dialogs.
     static LAYERS: RefCell<HashMap<WindowId, Entity<DialogLayer>>> = RefCell::new(HashMap::new());
+}
+
+/// Why a layer goes back into gpui's slot.
+enum Reattach {
+    /// To show the next dialog.
+    Next,
+    /// For the exit of the last one: the ticket keeps the focus on what it was given back to.
+    Exit(Option<FocusHandle>),
 }
 
 /// Installs the Flux dialog as the window prompt builder: every `window.prompt` is drawn by it.
@@ -410,10 +425,19 @@ pub(crate) fn build_with(
             layer
         }
     };
+    let reattach = REATTACH.with_borrow_mut(Option::take);
+    let focus = match &reattach {
+        Some(Reattach::Exit(focus)) => focus.clone(),
+        _ => None,
+    };
     let ticket = cx.new(|_| Ticket {
         layer: layer.clone(),
+        focus,
     });
-    if !REATTACH.replace(false) {
+    if let Some(Reattach::Exit(_)) = reattach {
+        layer.update(cx, |layer, _| layer.exit_ticket = Some(ticket.clone()));
+    }
+    if reattach.is_none() {
         let request = PENDING
             .with_borrow_mut(|pending| pending.take())
             .unwrap_or_else(|| Request {
@@ -474,13 +498,18 @@ fn auto_answer(
 /// What gpui holds in its prompt slot: the layer, and the answer of one dialog.
 struct Ticket {
     layer: Entity<DialogLayer>,
+    /// The focus while it is in the slot (gpui focuses its ticket): the layer's, or — while the
+    /// last dialog fades out — what the answer gave the focus back to.
+    focus: Option<FocusHandle>,
 }
 
 impl EventEmitter<PromptResponse> for Ticket {}
 
 impl Focusable for Ticket {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.layer.read(cx).focus_handle.clone()
+        self.focus
+            .clone()
+            .unwrap_or_else(|| self.layer.read(cx).focus_handle.clone())
     }
 }
 
@@ -496,6 +525,43 @@ struct Queued {
     dont_ask_again: Rc<Cell<bool>>,
 }
 
+/// An answered dialog as it was drawn, for its exit.
+struct Answered {
+    dialog: Dialog,
+    selected: Option<usize>,
+    dont_ask_again: bool,
+    /// Its ticket's entity: the key of its card.
+    key: u64,
+}
+
+/// The backdrop's opacity gliding to `to` ([`motion::FADE`]), in the layer's own time: the layer
+/// outlives the tickets that draw it, so the backdrop stays while one dialog gives way to the next.
+struct Backdrop {
+    from: f32,
+    to: f32,
+    since: Instant,
+}
+
+impl Backdrop {
+    fn value(&self) -> f32 {
+        motion::lerp(
+            self.from,
+            self.to,
+            motion::progress(self.since, motion::FADE),
+        )
+    }
+
+    fn set(&mut self, to: f32) {
+        if self.to != to {
+            *self = Backdrop {
+                from: self.value(),
+                to,
+                since: Instant::now(),
+            };
+        }
+    }
+}
+
 /// The dialogs of a window: the first one shown, the rest wait.
 struct DialogLayer {
     focus_handle: FocusHandle,
@@ -506,6 +572,13 @@ struct DialogLayer {
     selected: Option<usize>,
     dont_ask_again: bool,
     details_scroll: ScrollHandle,
+    /// The details were just copied: the Copy button says so.
+    copied: ui::Copied,
+    backdrop: Backdrop,
+    /// The answered dialog, fading out.
+    leaving: Option<motion::Leaving<Answered>>,
+    /// The ticket that keeps the layer in gpui's slot for the last dialog's exit.
+    exit_ticket: Option<Entity<Ticket>>,
 }
 
 impl DialogLayer {
@@ -517,6 +590,14 @@ impl DialogLayer {
             selected: None,
             dont_ask_again: false,
             details_scroll: ScrollHandle::new(),
+            copied: ui::Copied::default(),
+            backdrop: Backdrop {
+                from: 0.,
+                to: 0.,
+                since: Instant::now(),
+            },
+            leaving: None,
+            exit_ticket: None,
         }
     }
 
@@ -531,6 +612,17 @@ impl DialogLayer {
             self.restore_focus = focused.filter(|focus| *focus != self.focus_handle);
             self.selected = request.dialog.default_button();
             self.dont_ask_again = false;
+            // A dialog during the last one's exit: the new ticket takes the slot.
+            self.exit_ticket = None;
+            if motion::enabled() {
+                self.backdrop.set(1.);
+            } else {
+                self.backdrop = Backdrop {
+                    from: 1.,
+                    to: 1.,
+                    since: Instant::now(),
+                };
+            }
         }
         self.queue.push_back(Queued {
             dialog: request.dialog,
@@ -545,12 +637,22 @@ impl DialogLayer {
             return;
         };
         shown.dont_ask_again.set(self.dont_ask_again);
+        let animate = motion::enabled();
+        self.leaving = animate.then(|| {
+            motion::Leaving::new(Answered {
+                dialog: shown.dialog.clone(),
+                selected: self.selected,
+                dont_ask_again: self.dont_ask_again,
+                key: shown.ticket.entity_id().as_u64(),
+            })
+        });
         // gpui sends the answer, empties its slot and focuses what was focused when the ticket came.
         shown
             .ticket
             .update(cx, |_, cx| cx.emit(PromptResponse(button)));
         self.dont_ask_again = false;
         self.details_scroll = ScrollHandle::new();
+        self.copied = ui::Copied::default();
         self.selected = self
             .queue
             .front()
@@ -559,22 +661,59 @@ impl DialogLayer {
         let restore = if more {
             None
         } else {
+            self.backdrop.set(0.);
             self.restore_focus.take()
         };
         let window_id = window.window_handle().window_id();
         // After gpui's handling of the answer.
         window.defer(cx, move |window, cx| {
             if more {
-                REATTACH.set(true);
+                REATTACH.with_borrow_mut(|reattach| *reattach = Some(Reattach::Next));
                 drop(window.prompt(PromptLevel::Info, "", None, &[tr("OK")], cx));
-            } else {
-                LAYERS.with_borrow_mut(|layers| layers.remove(&window_id));
-                if let Some(focus) = restore {
-                    window.focus(&focus);
-                }
+                return;
             }
+            if let Some(focus) = &restore {
+                window.focus(focus);
+            }
+            if !animate {
+                LAYERS.with_borrow_mut(|layers| layers.remove(&window_id));
+                return;
+            }
+            // Back into the slot for the exit, the focus staying where it is.
+            REATTACH.with_borrow_mut(|reattach| *reattach = Some(Reattach::Exit(restore)));
+            drop(window.prompt(PromptLevel::Info, "", None, &[tr("OK")], cx));
         });
+        if !more && animate {
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .timer(motion::EXIT.duration().max(motion::FADE.duration()))
+                    .await;
+                this.update_in(cx, |this, window, cx| this.exited(window, cx))
+                    .ok();
+            })
+            .detach();
+        }
         cx.notify();
+    }
+
+    /// The last dialog's exit has ended: the layer leaves gpui's slot, unless a new dialog came.
+    fn exited(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.leaving = None;
+        let Some(ticket) = self.exit_ticket.take() else {
+            return;
+        };
+        if !self.queue.is_empty() {
+            return;
+        }
+        LAYERS.with_borrow_mut(|layers| layers.remove(&window.window_handle().window_id()));
+        // gpui focuses what was focused when the ticket came; the user may have moved on since.
+        let focused = window
+            .focused(cx)
+            .filter(|focused| *focused != self.focus_handle);
+        ticket.update(cx, |_, cx| cx.emit(PromptResponse(0)));
+        if let Some(focused) = focused {
+            window.defer(cx, move |window, _| window.focus(&focused));
+        }
     }
 
     fn shown(&self) -> Option<&Dialog> {
@@ -626,6 +765,7 @@ impl DialogLayer {
             .and_then(|dialog| dialog.details.clone().or(dialog.message.clone()));
         if let Some(text) = text {
             cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+            self.copied.now(cx);
         }
     }
 
@@ -633,6 +773,7 @@ impl DialogLayer {
         &self,
         index: usize,
         button: &DialogButton,
+        selected: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
@@ -644,16 +785,11 @@ impl DialogLayer {
                 ui::text_button(id, button.label.clone(), false, ui)
             }
         };
-        element
-            .h(px(28.))
-            .px(px(14.))
-            .text_size(px(theme::TEXT_MD))
-            .when(self.selected == Some(index), |button| {
-                button.shadow(ui::focus_ring(ui))
-            })
-            .on_click(
-                cx.listener(move |this, _: &ClickEvent, window, cx| this.answer(index, window, cx)),
-            )
+        let element = element.h(px(28.)).px(px(14.)).text_size(px(theme::TEXT_MD));
+        // The ring moves with ← → and Tab: it comes in around the next button as the last fades.
+        ui::focus_halo(element, ("dialog-button-ring", index), selected, ui).on_click(
+            cx.listener(move |this, _: &ClickEvent, window, cx| this.answer(index, window, cx)),
+        )
     }
 
     fn render_details(
@@ -689,7 +825,7 @@ impl DialogLayer {
             )
             .child(
                 div().absolute().top(px(6.)).right(px(6.)).child(
-                    ui::text_button("dialog-copy", tr("Copy"), false, ui)
+                    ui::copy_button("dialog-copy", &self.copied, ui)
                         .h(px(22.))
                         .px(px(8.))
                         .bg(ui.elevated)
@@ -707,34 +843,16 @@ impl Focusable for DialogLayer {
     }
 }
 
-impl Render for DialogLayer {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl DialogLayer {
+    /// The card of `dialog`, with `selected` focused and the checkbox as `dont_ask_again`.
+    fn render_card(
+        &self,
+        dialog: &Dialog,
+        selected: Option<usize>,
+        dont_ask_again: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let ui = Theme::ui(cx);
-        let root = div()
-            .id("dialog-layer")
-            .key_context("Dialog")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::confirm))
-            .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::press_danger))
-            .on_action(cx.listener(|this, _: &NextButton, _, cx| this.step(1, cx)))
-            .on_action(cx.listener(|this, _: &PreviousButton, _, cx| this.step(-1, cx)))
-            .on_action(cx.listener(Self::copy_details))
-            .absolute()
-            .size_full()
-            // Modal: the window under the dialog takes no clicks, scrolls or hovers.
-            .occlude()
-            .bg(ui.backdrop)
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(TOP))
-            .font_family(theme::UI_FONT)
-            .text_size(px(theme::TEXT_MD))
-            .text_color(ui.foreground);
-        let Some(dialog) = self.shown().cloned() else {
-            return root;
-        };
         let (glyph, color) = match dialog.level {
             PromptLevel::Info => (IconName::Info, ui.info),
             PromptLevel::Warning => (IconName::Warning, ui.warning),
@@ -745,7 +863,7 @@ impl Render for DialogLayer {
             indices
                 .into_iter()
                 .map(|index| {
-                    this.render_button(index, &dialog.buttons[index], cx)
+                    this.render_button(index, &dialog.buttons[index], selected == Some(index), cx)
                         .into_any_element()
                 })
                 .collect::<Vec<_>>()
@@ -804,7 +922,7 @@ impl Render for DialogLayer {
                 }))
                 .child(ui::checkbox(
                     "dialog-dont-ask-box",
-                    CheckState::from_bool(self.dont_ask_again),
+                    CheckState::from_bool(dont_ask_again),
                     ui,
                 ))
                 .child(tr("Don’t ask again"))
@@ -814,64 +932,139 @@ impl Render for DialogLayer {
         } else {
             WIDTH
         };
-        root.child(
-            ui::popover(ui)
-                .w(px(width))
-                .max_w(gpui::relative(0.9))
-                .p_5()
-                .flex()
-                .flex_col()
-                // Clicks on the dialog stay on it.
-                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex_none()
-                                .pt(px(1.))
-                                .child(icon(glyph, color).size(px(20.))),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap_1p5()
-                                .child(
-                                    div()
-                                        .text_size(px(theme::TEXT_LG))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(dialog.title.clone()),
+        ui::popover(ui)
+            .w(px(width))
+            .max_w(gpui::relative(0.9))
+            .p_5()
+            .flex()
+            .flex_col()
+            // Clicks on the dialog stay on it.
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_none()
+                            .pt(px(1.))
+                            .child(icon(glyph, color).size(px(20.))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_size(px(theme::TEXT_LG))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(dialog.title.clone()),
+                            )
+                            .children(dialog.message.clone().map(|message| {
+                                div().text_color(ui.text_muted).children(
+                                    message
+                                        .split("\n\n")
+                                        .map(|paragraph| div().pb_1().child(paragraph.to_string()))
+                                        .collect::<Vec<_>>(),
                                 )
-                                .children(dialog.message.clone().map(|message| {
-                                    div().text_color(ui.text_muted).children(
-                                        message
-                                            .split("\n\n")
-                                            .map(|paragraph| {
-                                                div().pb_1().child(paragraph.to_string())
-                                            })
-                                            .collect::<Vec<_>>(),
-                                    )
-                                }))
-                                .children(points)
-                                .children(details)
-                                .children(dont_ask),
-                        ),
-                )
-                .child(
-                    div()
-                        .mt_5()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .children(left)
-                        .child(div().flex_1())
-                        .children(right),
-                ),
-        )
+                            }))
+                            .children(points)
+                            .children(details)
+                            .children(dont_ask),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_5()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(left)
+                    .child(div().flex_1())
+                    .children(right),
+            )
+    }
+
+    /// A card in its place: under the title bar, in the middle of the window. Cards are placed
+    /// alone, so one leaving and the next coming overlap.
+    fn place(card: impl IntoElement) -> gpui::Div {
+        div()
+            .absolute()
+            .top(px(TOP))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(card)
+    }
+}
+
+impl Render for DialogLayer {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui = Theme::ui(cx);
+        if self.leaving.as_ref().is_some_and(|leaving| leaving.done()) {
+            self.leaving = None;
+        }
+        let shown = self
+            .queue
+            .front()
+            .map(|queued| (queued.dialog.clone(), queued.ticket.entity_id().as_u64()));
+        let backdrop = self.backdrop.value();
+        if backdrop != self.backdrop.to {
+            window.request_animation_frame();
+        }
+        let mut root = div()
+            .id("dialog-layer")
+            .key_context("Dialog")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::press_danger))
+            .on_action(cx.listener(|this, _: &NextButton, _, cx| this.step(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousButton, _, cx| this.step(-1, cx)))
+            .on_action(cx.listener(Self::copy_details))
+            .absolute()
+            .size_full()
+            .font_family(theme::UI_FONT)
+            .text_size(px(theme::TEXT_MD))
+            .text_color(ui.foreground);
+        let backdrop = div()
+            .absolute()
+            .size_full()
+            .bg(ui.backdrop)
+            .opacity(backdrop);
+        root = if shown.is_some() {
+            // Modal: the window under the dialog takes no clicks, scrolls or hovers.
+            root.child(backdrop.occlude())
+        } else {
+            root.child(motion::inert(backdrop))
+        };
+        if let Some(leaving) = &self.leaving {
+            let progress = leaving.progress(window);
+            let answered = &leaving.value;
+            let card = self.render_card(
+                &answered.dialog,
+                answered.selected,
+                answered.dont_ask_again,
+                cx,
+            );
+            let card = div().id(("dialog-leaving", answered.key)).child(card);
+            root = root.child(motion::inert(Self::place(motion::leaving_style(
+                card,
+                progress,
+                (0.5, 0.),
+            ))));
+        }
+        if let Some((dialog, key)) = shown {
+            let card = self.render_card(&dialog, self.selected, self.dont_ask_again, cx);
+            root = root.child(Self::place(
+                motion::Appear::dialog().apply(("dialog", key), card),
+            ));
+        }
+        root
     }
 }
 

@@ -78,6 +78,34 @@ pub fn set_interaction_transitions(transitions: Option<InteractionTransitions>) 
     INTERACTION_TRANSITIONS.with(|cell| cell.set(transitions));
 }
 
+/// Flux patch (motion, 2026-10-29): how tooltips come and go in every window.
+#[derive(Clone, Copy)]
+pub struct TooltipTransitions {
+    /// A tooltip asked for while another one shows, or less than this after one went because the
+    /// mouse left its element (moving along a toolbar), shows at once instead of after the hover
+    /// delay; its builder sees `Window::tooltip_handoff`. Not after a click or the wheel hid one.
+    pub handoff: Duration,
+    /// A tooltip that has gone fades out this long where it was, drawn but taking no mouse; zero —
+    /// it is gone at once, as before.
+    pub exit: Duration,
+    /// The easing of the fade out.
+    pub easing: fn(f32) -> f32,
+}
+
+thread_local! {
+    static TOOLTIP_TRANSITIONS: Cell<Option<TooltipTransitions>> = const { Cell::new(None) };
+}
+
+/// Flux patch (motion): sets how tooltips come and go in every window; `None` (the default) —
+/// after the hover delay each time, gone at once.
+pub fn set_tooltip_transitions(transitions: Option<TooltipTransitions>) {
+    TOOLTIP_TRANSITIONS.with(|cell| cell.set(transitions));
+}
+
+pub(crate) fn tooltip_transitions() -> Option<TooltipTransitions> {
+    TOOLTIP_TRANSITIONS.with(Cell::get)
+}
+
 /// Flux patch (motion): the fade of one interaction state (hover or press) of an element.
 #[derive(Clone, Copy)]
 struct InteractionFade {
@@ -291,6 +319,17 @@ impl Interactivity {
     #[cfg(not(any(feature = "inspector", debug_assertions)))]
     pub fn new() -> Interactivity {
         Interactivity::default()
+    }
+
+    /// Flux patch (motion, 2026-10-29): drops the hover and press styles set so far, its own and
+    /// its group's, and the group it names — an unavailable button neither lights up nor springs,
+    /// and its icon doesn't brighten. The pointer cursor stays the caller's to change.
+    pub fn clear_interaction_styles(&mut self) {
+        self.hover_style = None;
+        self.group_hover_style = None;
+        self.active_style = None;
+        self.group_active_style = None;
+        self.group = None;
     }
 
     /// Gets the source location of construction. Returns `None` when not in debug mode.
@@ -2919,6 +2958,8 @@ pub(crate) fn clear_active_tooltip_if_not_hoverable(
     };
     if should_clear {
         active_tooltip.borrow_mut().take();
+        // Flux patch (motion): a click or the wheel hid it — the next one waits again.
+        window.tooltip_dismissed = true;
         window.refresh();
     }
 }
@@ -3038,13 +3079,21 @@ fn handle_tooltip_mouse_move(
             active_tooltip.borrow_mut().take();
         }
         Action::ScheduleShow => {
+            // Flux patch (motion): right after another tooltip, at once (`TooltipTransitions`).
+            let handoff = window.tooltip_warm();
+            let delay = if handoff {
+                Duration::ZERO
+            } else {
+                TOOLTIP_SHOW_DELAY
+            };
             let delayed_show_task = window.spawn(cx, {
                 let active_tooltip = active_tooltip.clone();
                 let build_tooltip = build_tooltip.clone();
                 let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
                 async move |cx| {
-                    cx.background_executor().timer(TOOLTIP_SHOW_DELAY).await;
+                    cx.background_executor().timer(delay).await;
                     cx.update(|window, cx| {
+                        window.tooltip_handoff = handoff;
                         let new_tooltip =
                             build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
                                 let active_tooltip = active_tooltip.clone();
@@ -3068,6 +3117,7 @@ fn handle_tooltip_mouse_move(
                                     is_hoverable: tooltip_is_hoverable,
                                 }
                             });
+                        window.tooltip_handoff = false;
                         *active_tooltip.borrow_mut() = new_tooltip;
                         window.refresh();
                     })

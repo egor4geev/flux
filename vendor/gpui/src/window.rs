@@ -877,6 +877,18 @@ pub struct Window {
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
+    /// Flux patch (motion, 2026-10-29): the tooltip drawn last frame, to fade it out once it is
+    /// gone (`TooltipTransitions`).
+    shown_tooltip: Option<(AnyView, Bounds<Pixels>)>,
+    /// Flux patch (motion): a tooltip that has gone, fading out since then.
+    leaving_tooltip: Option<(AnyView, Bounds<Pixels>, Instant)>,
+    /// Flux patch (motion): when a tooltip last went because the mouse left its element — the
+    /// next one shown soon after is a handoff.
+    tooltip_hidden_at: Option<Instant>,
+    /// Flux patch (motion): the tooltip goes because of a click or the wheel — no handoff after.
+    pub(crate) tooltip_dismissed: bool,
+    /// Flux patch (motion): the tooltip being built is a handoff (`Window::tooltip_handoff`).
+    pub(crate) tooltip_handoff: bool,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
@@ -1398,6 +1410,11 @@ impl Window {
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
+            shown_tooltip: None,
+            leaving_tooltip: None,
+            tooltip_hidden_at: None,
+            tooltip_dismissed: false,
+            tooltip_handoff: false,
             dirty_views: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
@@ -2286,14 +2303,22 @@ impl Window {
             element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
             prompt_element = Some(element);
             self.prompt = Some(prompt);
+            // Flux patch (motion): no tooltip fades out over a prompt or after it.
+            self.shown_tooltip = None;
+            self.leaving_tooltip = None;
         } else if let Some(active_drag) = cx.active_drag.take() {
             let mut element = active_drag.view.clone().into_any();
             let offset = self.mouse_position() - active_drag.cursor_offset;
             element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
+            self.shown_tooltip = None;
+            self.leaving_tooltip = None;
         } else {
-            tooltip_element = self.prepaint_tooltip(cx);
+            tooltip_element = self
+                .prepaint_tooltip(cx)
+                .map(|element| (element, 1.))
+                .or_else(|| self.prepaint_leaving_tooltip(cx));
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
@@ -2311,8 +2336,8 @@ impl Window {
             prompt_element.paint(self, cx);
         } else if let Some(mut drag_element) = active_drag_element {
             drag_element.paint(self, cx);
-        } else if let Some(mut tooltip_element) = tooltip_element {
-            tooltip_element.paint(self, cx);
+        } else if let Some((mut tooltip_element, opacity)) = tooltip_element {
+            self.with_element_opacity(Some(opacity), |window| tooltip_element.paint(window, cx));
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2383,9 +2408,62 @@ impl Window {
                 id: tooltip_request.id,
                 bounds: tooltip_bounds,
             });
+            // Flux patch (motion): kept for its fade out; a new one replaces one fading out.
+            self.shown_tooltip = Some((tooltip_request.tooltip.view.clone(), tooltip_bounds));
+            self.leaving_tooltip = None;
+            self.tooltip_dismissed = false;
             return Some(element);
         }
         None
+    }
+
+    /// Flux patch (motion, 2026-10-29): the tooltip drawn last frame has gone — it fades out where
+    /// it was (`TooltipTransitions::exit`), drawn but taking no mouse; the element and its opacity.
+    fn prepaint_leaving_tooltip(&mut self, cx: &mut App) -> Option<(AnyElement, f32)> {
+        let transitions = crate::tooltip_transitions();
+        if let Some((view, bounds)) = self.shown_tooltip.take() {
+            let now = Instant::now();
+            if !mem::take(&mut self.tooltip_dismissed) {
+                self.tooltip_hidden_at = Some(now);
+            }
+            if transitions.is_some_and(|transitions| !transitions.exit.is_zero()) {
+                self.leaving_tooltip = Some((view, bounds, now));
+            }
+        }
+        let (view, bounds, since) = self.leaving_tooltip.clone()?;
+        let transitions = transitions?;
+        let t = since.elapsed().as_secs_f32() / transitions.exit.as_secs_f32().max(0.001);
+        if t >= 1. {
+            self.leaving_tooltip = None;
+            return None;
+        }
+        let mut element = view.into_any();
+        element.layout_as_root(AvailableSpace::min_size(), self, cx);
+        self.with_inert(true, |window| {
+            window.with_absolute_element_offset(bounds.origin, |window| {
+                element.prepaint(window, cx)
+            })
+        });
+        self.on_next_frame(|window, _| window.refresh());
+        Some((element, 1. - (transitions.easing)(t)))
+    }
+
+    /// Flux patch (motion, 2026-10-29): the tooltip being built shows at once after another one
+    /// (`TooltipTransitions::handoff`), instead of after the hover delay — moving along a toolbar.
+    /// For a tooltip view to come in quieter than one that took a while.
+    pub fn tooltip_handoff(&self) -> bool {
+        self.tooltip_handoff
+    }
+
+    /// Flux patch (motion): a tooltip shows now, or went less than the handoff time ago because
+    /// the mouse left its element: the next one shows without the delay.
+    pub(crate) fn tooltip_warm(&self) -> bool {
+        crate::tooltip_transitions().is_some_and(|transitions| {
+            (self.tooltip_bounds.is_some() && !self.tooltip_dismissed)
+                || self
+                    .tooltip_hidden_at
+                    .is_some_and(|at| at.elapsed() < transitions.handoff)
+        })
     }
 
     fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
