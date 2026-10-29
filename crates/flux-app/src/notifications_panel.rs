@@ -10,9 +10,16 @@
 //! Keys (context "NotificationsPanel"): ↑/↓ select, ↵ runs the first action, ⌫ removes, Esc returns
 //! to the editor, ⇧Esc hides the window. No shortcut opens it (as in JetBrains): the launchpad, the
 //! bell in the status bar, the command palette.
+//!
+//! Motion: an entry that arrives while the window is shown fades in and drops into place
+//! ([`arrival`]); a removed one fades out in its place, taking no input, while the gap it leaves
+//! closes ([`Removed`]; Clear All — all of them together); another filter's list fades in. The
+//! selection's color fades as the window gains or loses focus; the close button (over the time,
+//! which fades out), a row's hover and the resize handle fade in under the pointer.
 
+use std::cmp::Reverse;
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     Action, AnyElement, App, ClickEvent, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity,
@@ -23,6 +30,7 @@ use gpui::{
 use crate::context_menu::ContextMenu;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::motion::{self, Leaving, TransitionExt};
 use crate::notification_center::{
     Entry, NotificationCenter, NotificationCenterEvent, NotificationGroup, NotificationId,
 };
@@ -98,7 +106,28 @@ pub struct NotificationsPanel {
     scroll: ScrollHandle,
     resizing: bool,
     menu: Option<Menu>,
+    /// Rows removed from the journal, on their way out.
+    leaving: Vec<Leaving<Removed>>,
+    /// The list changed as a whole (another filter, the last rows gone): it fades in from then.
+    list_in: Option<Instant>,
     _subscription: Subscription,
+}
+
+/// A row removed from the journal (⌫, ×, Clear All), kept for its exit as it looked: it fades out
+/// in its place while the gap it leaves closes ([`motion::SMOOTH`]) and the rows below glide up.
+struct Removed {
+    entry: Entry,
+    look: Look,
+    /// Its height in the list, the gap to close; `None` — it only fades (no rows are left).
+    height: Option<Pixels>,
+}
+
+/// How a row is drawn.
+#[derive(Clone, Copy)]
+struct Look {
+    selected: bool,
+    /// Highlighted as new.
+    fresh: bool,
 }
 
 impl NotificationsPanel {
@@ -130,6 +159,8 @@ impl NotificationsPanel {
             scroll: ScrollHandle::new(),
             resizing: false,
             menu: None,
+            leaving: Vec::new(),
+            list_in: None,
             _subscription: subscription,
         }
     }
@@ -147,6 +178,8 @@ impl NotificationsPanel {
         } else {
             self.fresh.clear();
             self.menu = None;
+            self.leaving.clear();
+            self.list_in = None;
         }
         cx.notify();
     }
@@ -203,11 +236,74 @@ impl NotificationsPanel {
     fn select(&mut self, id: Option<NotificationId>, cx: &mut Context<Self>) {
         self.selected = id;
         if let Some(id) = id
-            && let Some(index) = self.rows(cx).iter().position(|row| *row == id)
+            && let Some(index) = self.child_index(id, cx)
         {
             self.scroll.scroll_to_item(index);
         }
         cx.notify();
+    }
+
+    /// Where row `id` is among the list's children: the removed rows on their way out keep their
+    /// places (newest first, as the rest).
+    fn child_index(&self, id: NotificationId, cx: &App) -> Option<usize> {
+        let index = self.rows(cx).iter().position(|row| *row == id)?;
+        let above = self
+            .leaving
+            .iter()
+            .filter(|removed| removed.value.entry.id > id)
+            .count();
+        Some(index + above)
+    }
+
+    fn look(&self, entry: &Entry) -> Look {
+        Look {
+            selected: self.selected == Some(entry.id),
+            fresh: self.fresh.contains(&entry.id) || !entry.read,
+        }
+    }
+
+    /// Row `id`, about to be removed from the journal, starts its exit — if it is in sight and
+    /// animations are on.
+    fn start_leaving(&mut self, id: NotificationId, cx: &App) {
+        if !self.visible || !motion::enabled() {
+            return;
+        }
+        let Some(entry) = self.entry(id, cx).filter(|entry| self.passes(entry)) else {
+            return;
+        };
+        let height = self
+            .child_index(id, cx)
+            .and_then(|index| self.scroll.bounds_for_item(index))
+            .map(|bounds| bounds.size.height);
+        let look = self.look(&entry);
+        self.leaving.push(Leaving::new(Removed {
+            entry,
+            look,
+            height,
+        }));
+    }
+
+    /// Every row in sight starts its exit together (Clear All): nothing is left to close up.
+    fn start_leaving_all(&mut self, cx: &App) {
+        if !self.visible || !motion::enabled() {
+            return;
+        }
+        let entries: Vec<Entry> = self
+            .center
+            .read(cx)
+            .entries()
+            .iter()
+            .filter(|entry| self.passes(entry))
+            .cloned()
+            .collect();
+        for entry in entries {
+            let look = self.look(&entry);
+            self.leaving.push(Leaving::new(Removed {
+                entry,
+                look,
+                height: None,
+            }));
+        }
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -248,6 +344,7 @@ impl NotificationsPanel {
     }
 
     fn remove(&mut self, id: NotificationId, cx: &mut Context<Self>) {
+        self.start_leaving(id, cx);
         // The selection moves to the next row (older), or the previous one at the end.
         if self.selected == Some(id) {
             let rows = self.rows(cx);
@@ -441,6 +538,7 @@ impl NotificationsPanel {
     fn render_entry(
         &self,
         entry: &Entry,
+        look: Look,
         now: SystemTime,
         focused: bool,
         cx: &mut Context<Self>,
@@ -448,8 +546,7 @@ impl NotificationsPanel {
         let ui = Theme::ui(cx);
         let id = entry.id;
         let notification = &entry.notification;
-        let selected = self.selected == Some(id);
-        let fresh = self.fresh.contains(&id) || !entry.read;
+        let Look { selected, fresh } = look;
         let (glyph, color) = kind_icon(notification.kind, ui);
         let group = format!("notification-entry-{id}");
         let title_only = notification.body.is_none() && notification.actions.is_empty();
@@ -487,17 +584,12 @@ impl NotificationsPanel {
                 }
             })
             .collect();
-        let background = if selected {
-            Some(if focused {
-                ui.list_selected
-            } else {
-                ui.list_selected_inactive
-            })
-        } else if fresh {
-            Some(UiColors::tint(ui.accent, 0.07))
+        let selection = selected.then_some(if focused {
+            ui.list_selected
         } else {
-            None
-        };
+            ui.list_selected_inactive
+        });
+        let tint = (!selected && fresh).then(|| UiColors::tint(ui.accent, 0.07));
         div()
             .id(("notification-entry", id as usize))
             .w_full()
@@ -505,6 +597,8 @@ impl NotificationsPanel {
             .py(px(2.))
             .child(
                 div()
+                    // An id keeps the fade of the hover.
+                    .id(("notification-entry-row", id as usize))
                     .group(group.clone())
                     .relative()
                     .w_full()
@@ -513,8 +607,8 @@ impl NotificationsPanel {
                     .flex()
                     .gap_2()
                     .rounded(px(RADIUS_MD))
-                    .when_some(background, |row, color| row.bg(color))
-                    .when(background.is_none(), |row| {
+                    .when_some(tint, |row, color| row.bg(color))
+                    .when(!selected && !fresh, |row| {
                         row.hover(move |style| style.bg(ui.hover))
                     })
                     .on_mouse_down(
@@ -524,6 +618,23 @@ impl NotificationsPanel {
                             this.select(Some(id), cx);
                         }),
                     )
+                    // The selection, under the row: its color fades as the window gains or loses
+                    // focus; a row the selection moves to has it at once (the layer is drawn only
+                    // under the selected row, so it starts at its color).
+                    .when_some(selection, |row, color| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .rounded(px(RADIUS_MD))
+                                .with_transition(
+                                    ("notification-selection", id as usize),
+                                    color,
+                                    motion::FADE,
+                                    |layer, color| layer.bg(color),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .flex_none()
@@ -560,7 +671,8 @@ impl NotificationsPanel {
                                             .child(notification.title.clone()),
                                     )
                                     .when(title_only, |row| row.child(group_label()))
-                                    // The time; on hover, the close button in its place.
+                                    // The time; on hover, the close button fades in in its
+                                    // place as the time fades out (ids keep the fades).
                                     .child(
                                         div()
                                             .flex_none()
@@ -572,6 +684,7 @@ impl NotificationsPanel {
                                             .justify_end()
                                             .child(
                                                 div()
+                                                    .id("notification-entry-time")
                                                     .flex()
                                                     .items_center()
                                                     .gap(px(6.))
@@ -593,6 +706,7 @@ impl NotificationsPanel {
                                             )
                                             .child(
                                                 div()
+                                                    .id("notification-entry-reveal")
                                                     .absolute()
                                                     .top(px(-4.))
                                                     .right(px(-4.))
@@ -700,10 +814,65 @@ impl Render for NotificationsPanel {
             .filter(|entry| self.passes(entry))
             .cloned()
             .collect();
+        // The removed rows: with rows left, until the gap they leave has closed; else until they
+        // have faded — then the empty window fades in.
+        let close_up = !entries.is_empty();
+        let had_leaving = !self.leaving.is_empty();
+        self.leaving.retain(|removed| {
+            let id = removed.value.entry.id;
+            !entries.iter().any(|entry| entry.id == id) && still_leaving(removed, close_up)
+        });
+        if had_leaving && self.leaving.is_empty() && !close_up {
+            self.list_in = Some(Instant::now());
+        }
+        if !self.leaving.is_empty() {
+            // One frame past the last exit's end drops it, even if that end fell between the
+            // check above and the drawing.
+            window.request_animation_frame();
+        }
+        let list_in = self
+            .list_in
+            .map_or(1., |since| motion::animate(since, motion::FADE, window));
+        if list_in >= 1. {
+            self.list_in = None;
+        }
         let focused = self.focus_handle.contains_focused(window, cx);
-        let rows: Vec<AnyElement> = entries
+        // Newest first; a removed row keeps its place among the rest.
+        let mut order: Vec<(NotificationId, Result<&Entry, &Leaving<Removed>>)> = entries
             .iter()
-            .map(|entry| self.render_entry(entry, now, focused, cx))
+            .map(|entry| (entry.id, Ok(entry)))
+            .chain(
+                self.leaving
+                    .iter()
+                    .map(|removed| (removed.value.entry.id, Err(removed))),
+            )
+            .collect();
+        order.sort_by_key(|(id, _)| Reverse(*id));
+        let rows: Vec<AnyElement> = order
+            .into_iter()
+            .map(|(_, row)| match row {
+                Ok(entry) => {
+                    let row = self.render_entry(entry, self.look(entry), now, focused, cx);
+                    let value = arrival(entry.at, window);
+                    if value >= 1. {
+                        return row;
+                    }
+                    motion::Appear::slide(0., -ARRIVAL_DROP)
+                        .curve(motion::SMOOTH)
+                        .style(div().child(row), value)
+                        .into_any_element()
+                }
+                Err(removed) => {
+                    let row = self.render_entry(
+                        &removed.value.entry,
+                        removed.value.look,
+                        now,
+                        focused,
+                        cx,
+                    );
+                    leaving_row(removed, row, close_up, window)
+                }
+            })
             .collect();
         let list = if rows.is_empty() {
             self.render_empty(cx).into_any_element()
@@ -748,11 +917,17 @@ impl Render for NotificationsPanel {
                     .update(cx, |center, cx| center.mark_all_read(cx));
             }))
             .on_action(cx.listener(|this, _: &ClearAll, _, cx| {
+                this.start_leaving_all(cx);
                 this.fresh.clear();
                 this.selected = None;
                 this.center.update(cx, |center, cx| center.clear(cx));
             }))
             .on_action(cx.listener(|this, action: &SetFilter, _, cx| {
+                if this.filter != action.group {
+                    // Another list: it fades in as a whole; the old one's removed rows go with it.
+                    this.leaving.clear();
+                    this.list_in = Some(Instant::now());
+                }
                 this.filter = action.group.clone();
                 if let Some(id) = this.selected
                     && !this.rows(cx).contains(&id)
@@ -778,6 +953,7 @@ impl Render for NotificationsPanel {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .when(list_in < 1., |content| content.opacity(list_in))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, _| window.focus(&this.focus_handle)),
@@ -789,11 +965,10 @@ impl Render for NotificationsPanel {
                 ui::resize_handle_center(ui::style(cx)),
                 ui,
             ))
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "notifications-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }
 
@@ -806,9 +981,9 @@ impl Render for DraggedEdge {
     }
 }
 
-/// Width handle in the gap to the left of the island: an accent line on hover and while dragged.
-/// Its middle is `center` past the edge (`ui::resize_handle_center`): in the gap between islands,
-/// or on the line between Flat panels (part 10.4).
+/// Width handle in the gap to the left of the island: an accent line fading in on hover, shown
+/// while dragged. Its middle is `center` past the edge (`ui::resize_handle_center`): in the gap
+/// between islands, or on the line between Flat panels (part 10.4).
 fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement {
     div()
         .id("notifications-resize")
@@ -825,19 +1000,66 @@ fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement 
         .on_drag(DraggedEdge, |_, _, _, cx| cx.new(|_| DraggedEdge))
         .child(
             div()
+                // An id keeps the fade.
+                .id("notifications-resize-line")
                 .w(px(2.))
                 .h_full()
                 .rounded(px(1.))
                 .bg(ui.focus_border)
                 .when(!resizing, |line| {
-                    line.invisible()
-                        .group_hover("notifications-resize", |style| style.visible())
+                    line.opacity(0.)
+                        .group_hover("notifications-resize", |style| style.opacity(1.))
                 }),
         )
 }
 
+/// Whether a removed row is still drawn: until the gap it leaves has closed (`close_up` — rows are
+/// left), else until it has faded out.
+fn still_leaving(removed: &Leaving<Removed>, close_up: bool) -> bool {
+    if close_up && removed.value.height.is_some() {
+        motion::running(removed.since, motion::SMOOTH)
+    } else {
+        !removed.done()
+    }
+}
+
+/// `row`, removed, on its way out: fading and shrinking a little, taking no input, while its
+/// height closes up (`close_up`) and the rows below glide into its place.
+fn leaving_row(
+    removed: &Leaving<Removed>,
+    row: AnyElement,
+    close_up: bool,
+    window: &Window,
+) -> AnyElement {
+    let fading = motion::leaving_style(div().child(row), removed.progress(window), (0.5, 0.5));
+    let row = match removed.value.height {
+        Some(height) if close_up => {
+            let open = 1. - motion::animate(removed.since, motion::SMOOTH, window);
+            div().h(height * open).overflow_hidden().child(fading)
+        }
+        _ => div().child(fading),
+    };
+    motion::inert(row).into_any_element()
+}
+
 /// The time of a notification as the journal shows it: "10:42" today, "Yesterday 10:42", else
 /// "2026-10-07 10:42" (local time).
+/// How far a new entry drops into place as it fades in.
+const ARRIVAL_DROP: f32 = 8.;
+
+/// How far the entry that arrived `at` has come in, 0 → 1, asking for the next frame until it has.
+/// The journal draws every entry anew on each change, so the entry's own time drives it, not the
+/// row: one that came while the window was hidden is simply there.
+fn arrival(at: SystemTime, window: &Window) -> f32 {
+    let age = SystemTime::now().duration_since(at).unwrap_or_default();
+    if age >= motion::SMOOTH.duration() {
+        return 1.;
+    }
+    Instant::now()
+        .checked_sub(age)
+        .map_or(1., |since| motion::animate(since, motion::SMOOTH, window))
+}
+
 fn format_time(at: SystemTime, now: SystemTime) -> String {
     let seconds = |time: SystemTime| {
         time.duration_since(UNIX_EPOCH)

@@ -74,6 +74,63 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
     `terminate:` only after `Platform::quit`. Flux's scenario step `app-terminate` sends it from a run
     loop timer for the same reason.
 
+- **Motion** (2026-10-28, `crates/flux-app/src/motion.rs`): the author asked for lively, Liquid
+  Glass-like animations; gpui 0.2.2 can animate a style (`with_animation`) but can't scale or move
+  what an element paints, and its hover and press styles switch at once.
+  - `src/style.rs`, `src/styled.rs`: `Style::transform_scale`, `transform_origin` (fractions of the
+    element's size, the middle by default) and `transform_translate` — `Styled::transform_scale`,
+    `transform_origin`, `transform_translate`. Paint only: layout and hitboxes keep the real
+    bounds, so a popover that grows out of its anchor is clickable where it will be.
+  - `src/window.rs`: `Window::with_element_scale` / `with_element_transform` keep a uniform
+    transform (`p' = p · scale + offset`, nested ones composed) that every `paint_*` applies: the
+    bounds of quads, shadows, paths, underlines, glyphs, SVGs, images and surfaces, their corner
+    radii, borders, blur and thickness, and the content mask (masks pushed inside scale with the
+    content; the mask in effect where the transform began clips in the window's space, as CSS
+    clips a transformed element by its ancestors). Glyphs, SVGs and images keep their raster and
+    are stretched by the sampler, so an animation doesn't rasterize a new size every frame; a
+    rotated SVG's matrix is conjugated into the scaled space. `Interactivity::paint` applies an
+    element's transform around its opacity (`with_style_paint_effects`).
+  - `src/elements/div.rs`: `set_interaction_transitions` — the hover (`hover`, `group_hover`) and
+    press (`active`, `group_active`) styles of elements with an id fade in and out: background
+    (solid), border and text colors, opacity, scale and move are mixed between the style without
+    and with them (`mix_styles`, straight-alpha colors: a transparent end fades the other's alpha
+    only); everything else switches at once, as before. The fade lives in
+    `InteractiveElementState::interaction_fades`, so an element without an id switches at once;
+    a reversed fade starts from where it was; the release may overshoot (a spring: a pressed button
+    springs back past its size). Unset (the default), nothing fades — stock behaviour.
+  - `src/window.rs`: `Window::with_inert` — hitboxes inserted inside get an empty content mask
+    (the bounds stay for whoever measures with them): a popover fading out after it closed is
+    drawn but takes no hover, clicks, wheel or tooltips.
+  - `src/elements/div.rs` (2026-10-29): `Interactivity::clear_interaction_styles` drops the hover
+    and press styles set so far and the group the element names — an unavailable button neither
+    lights up nor springs (`ui::available`).
+  - Tooltips (2026-10-29): `set_tooltip_transitions(TooltipTransitions { handoff, exit, easing })`
+    (`src/elements/div.rs`; `None`, the default — stock behaviour). A tooltip asked for while
+    another one shows, or less than `handoff` after one went because the mouse left its element,
+    shows without the 500 ms delay (`handle_tooltip_mouse_move`, `Window::tooltip_warm`); not
+    after a click or the wheel hid one (`tooltip_dismissed`). The builder sees
+    `Window::tooltip_handoff()` — Flux's tooltip then only fades in. `src/window.rs`: the tooltip
+    drawn last frame is kept (`shown_tooltip`); once it is gone it fades out for `exit` where it
+    was, inert (`prepaint_leaving_tooltip`, painted with its opacity); a new tooltip, a prompt or
+    a drag drops it.
+
+- **Scroll axis** (2026-10-29): a trackpad's swipe down always moves a little sideways too, and every
+  scroll container under the pointer takes the event — a plugin board (a row scrolling sideways
+  around lanes scrolling down, `crates/flux-app/src/plugin_view.rs`) slid left and right under
+  every swipe down. Now a gesture keeps to its predominant axis, as native scroll views do.
+  - `src/window.rs`: `ScrollGesture` (public, unit-tested in `plugin_view.rs` — the crate's own
+    tests need the dev-dependencies left out), kept by the window and updated in `dispatch_event`
+    before the listeners. A trackpad gesture's axis is decided once it has moved 4 px (until then
+    each event goes its own way), sideways only when that movement is 1.2 times larger, and kept
+    through the gesture and its momentum until `TouchPhase::Started` — or a 300 ms pause, for a
+    device with precise deltas but no phases. A mouse wheel's step is a gesture by itself (macOS
+    sends Shift+wheel sideways).
+  - `src/elements/div.rs` (`paint_scroll_listener`): an element takes only the movement along the
+    gesture's axis; with `allow_concurrent_scroll`, all of it. gpui's turning a scroll along the
+    other axis into the element's own (a wheel scrolls a tab strip sideways) stays: an element
+    that must not do it sets `restrict_scroll_to_axis` (Flux's board row and plugin trees).
+    Elements with their own wheel listeners (the editor, the terminal) get the events unchanged.
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,
@@ -87,4 +144,6 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
    (paths relative to `vendor/gpui`).
 4. Check by hand: the mouse, scrolling, file drops and the input method (Japanese, Pinyin) at 125 %,
    the traffic lights at 80 % and 125 %; Quit in the Dock with an unsaved document (the question,
-   Cancel keeps Flux, Don't Save quits).
+   Cancel keeps Flux, Don't Save quits); a swipe down over a plugin board in a narrow tab scrolls a
+   lane and doesn't slide the board, a sideways swipe slides it; along a toolbar the next button's
+   tooltip shows at once, a tooltip fades out when the mouse leaves, and after a click it waits.

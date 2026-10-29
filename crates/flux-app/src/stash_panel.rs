@@ -11,12 +11,17 @@
 //!   A stash's files are read when it is opened and kept by its commit (a stash never changes).
 //! - The flows that need the window (the dialogs) go through actions the workspace handles
 //!   ([`workspace_actions`]); questions and git operations run right here.
+//!
+//! Motion (`crate::motion`), as in the Commit tab: a node the user opens turns its chevron and
+//! unfolds its rows; a stash that arrives (a new one) unfolds, the empty state fades in, the
+//! selection's color fades when the list gains or loses focus. The rows are recycled, so the
+//! arrivals are kept here, by key and time.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flux_git::{FileChange, FileStatus, GitError, Outcome, Stash, StashRequest};
 use gpui::{
@@ -26,14 +31,16 @@ use gpui::{
     Window, actions, div, prelude::*, px, uniform_list,
 };
 
+use crate::commit_panel::{row_id, selection};
 use crate::context_menu::ContextMenu;
 use crate::dialog::Dialog;
 use crate::diff_view::DiffSide;
 use crate::git::{self, GitStore};
 use crate::i18n::{tr, trf, trn};
-use crate::icons::{IconName, file_icon, icon};
+use crate::icons::{self, IconName, file_icon, icon};
 use crate::input::{InputEvent, TextInput};
 use crate::input_dialog::InputDialog;
+use crate::motion::{self, Appear, Disclosure, unfold_style};
 use crate::notifications::Notification;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, CheckState, RADIUS_SM};
@@ -50,6 +57,10 @@ const CHEVRON_SIZE: f32 = 12.;
 const LISTED_FILES: usize = 3;
 const DIALOG_WIDTH: f32 = 440.;
 const ROW_GROUP: &str = "stash-row";
+/// Rows arriving together unfold one after another, this far apart, at most [`ARRIVAL_CAP`] rows'
+/// worth.
+const ARRIVAL_STEP: Duration = Duration::from_millis(16);
+const ARRIVAL_CAP: usize = 12;
 
 // The list (context "StashList").
 actions!(
@@ -181,6 +192,21 @@ impl StashRow {
             | StashKey::Note(repo, _) => *repo,
         }
     }
+}
+
+/// Where the rows under the node `key` are ([`Disclosure::rows_changed`]): the deeper ones right
+/// after it; `None` when it is closed or gone.
+fn rows_under(rows: &[StashRow], key: &StashKey) -> Option<Range<usize>> {
+    let index = rows.iter().position(|row| row.key == *key)?;
+    let node = &rows[index];
+    if !node.expanded {
+        return None;
+    }
+    let end = rows[index + 1..]
+        .iter()
+        .position(|row| row.depth <= node.depth)
+        .map_or(rows.len(), |offset| index + 1 + offset);
+    Some(index + 1..end)
 }
 
 /// The files of a stash, once asked for.
@@ -356,11 +382,17 @@ pub struct StashPanel {
     /// read yet.
     lists: Vec<(usize, String, Arc<Vec<Stash>>)>,
     loading: bool,
+    /// The stashes were read whole once: from now on, new rows arrive.
+    read_once: bool,
     rows: Vec<StashRow>,
+    /// Rows that arrived with a new read, and when they start to unfold: kept until they have.
+    arrivals: HashMap<StashKey, Instant>,
     selected: Option<StashKey>,
     /// Open stashes, by repository and commit; collapsed repository nodes.
     expanded: HashSet<(usize, String)>,
     collapsed: HashSet<usize>,
+    /// The nodes the user opens and closes: their chevrons turn, the rows they show unfold.
+    disclosure: Disclosure<StashKey>,
     files: HashMap<(usize, String), StashFiles>,
     menu: Option<Menu>,
     _subscriptions: Vec<Subscription>,
@@ -379,10 +411,13 @@ impl StashPanel {
             active: false,
             lists: Vec::new(),
             loading: false,
+            read_once: false,
             rows: Vec::new(),
+            arrivals: HashMap::new(),
             selected: None,
             expanded: HashSet::new(),
             collapsed: HashSet::new(),
+            disclosure: Disclosure::default(),
             files: HashMap::new(),
             menu: None,
             _subscriptions: subscriptions,
@@ -448,7 +483,26 @@ impl StashPanel {
         for id in self.expanded.clone() {
             self.load_files(id, cx);
         }
+        // What wasn't there before (a new stash) unfolds as it arrives — not the first read.
+        let before = (self.read_once && motion::enabled()).then(|| {
+            self.rows
+                .iter()
+                .map(|row| row.key.clone())
+                .collect::<HashSet<_>>()
+        });
         self.rebuild(cx);
+        self.read_once |= !self.loading;
+        self.arrivals
+            .retain(|_, since| motion::running(*since, motion::SMOOTH));
+        let Some(before) = before else {
+            return;
+        };
+        let now = Instant::now();
+        let arrived = self.rows.iter().filter(|row| !before.contains(&row.key));
+        for (index, row) in arrived.enumerate() {
+            let delay = motion::stagger(index, ARRIVAL_STEP, ARRIVAL_CAP);
+            self.arrivals.insert(row.key.clone(), now + delay);
+        }
     }
 
     fn load_files(&mut self, id: (usize, String), cx: &mut Context<Self>) {
@@ -494,6 +548,19 @@ impl StashPanel {
             &self.collapsed,
             &self.files,
         );
+        let (rows, files) = (&self.rows, &self.files);
+        self.disclosure.rows_changed(|key| {
+            let range = rows_under(rows, key)?;
+            // A stash's files still being read: the note in their place just shows, the files
+            // unfold when they come.
+            let reading = matches!(key, StashKey::Stash(repo, oid)
+                if matches!(files.get(&(*repo, oid.clone())), None | Some(StashFiles::Loading)));
+            Some(if reading {
+                range.start..range.start
+            } else {
+                range
+            })
+        });
         // A selected row that went away: its stash, else its repository's first row.
         if self.selected_index().is_none() {
             self.selected = match self.selected.take() {
@@ -603,6 +670,8 @@ impl StashPanel {
         })
     }
 
+    /// The user opens or closes a node (a click, → / ←, ↵): its chevron turns, the rows it shows
+    /// unfold.
     fn set_expanded(&mut self, key: &StashKey, open: bool, cx: &mut Context<Self>) {
         match key {
             StashKey::Repo(repo) => {
@@ -623,6 +692,7 @@ impl StashPanel {
             }
             _ => return,
         }
+        self.disclosure.toggled(key.clone(), open);
         self.rebuild(cx);
     }
 
@@ -978,7 +1048,13 @@ impl StashPanel {
             ))
     }
 
-    fn render_row(&self, index: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(
+        &self,
+        index: usize,
+        focused: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let ui = Theme::ui(cx);
         let Some(row) = self.rows.get(index) else {
             return div().into_any_element();
@@ -1030,8 +1106,15 @@ impl StashPanel {
             _ => None,
         };
         let key = row.key.clone();
+        let id = row_id(&key);
+        let arrived = self
+            .arrivals
+            .get(&key)
+            .map_or(1., |since| motion::animate(*since, motion::SMOOTH, window));
         let (click, secondary) = (key.clone(), key);
         let body = div()
+            // An id: the hover backdrop fades.
+            .id(("stash-row-body", id))
             .size_full()
             .flex()
             .items_center()
@@ -1039,12 +1122,14 @@ impl StashPanel {
             .pl(px(ROW_PADDING + row.depth as f32 * INDENT))
             .pr_2()
             .rounded(px(RADIUS_SM))
-            .map(|body| match (selected, focused) {
-                (true, true) => body.bg(ui.list_selected),
-                (true, false) => body.bg(ui.list_selected_inactive),
-                _ => body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover)),
+            .when(!selected, |body| {
+                body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover))
             })
-            .child(chevron(row.expandable(), row.expanded, ui))
+            .child(chevron(
+                row.expandable(),
+                self.disclosure.chevron(&row.key, row.expanded, window),
+                ui,
+            ))
             .child(glyph)
             .child(
                 div()
@@ -1070,7 +1155,8 @@ impl StashPanel {
                     .text_color(ui.dim)
                     .child(detail)
             }));
-        div()
+        let body = selection(body, ("stash-row-selected", id), selected, focused, ui);
+        let row = div()
             .id(index)
             .group(ROW_GROUP)
             .h(px(ROW_HEIGHT))
@@ -1088,19 +1174,27 @@ impl StashPanel {
                     this.secondary_click(Some(secondary.clone()), event.position, window, cx)
                 }),
             )
-            .child(body)
-            .into_any_element()
+            .child(body);
+        let unfold = self.disclosure.unfold(index, window).min(arrived);
+        unfold_style(row, unfold).into_any_element()
     }
 
-    /// No stashes, no repository, or still reading.
-    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// No stashes, no repository, or still reading: it fades in (each of them).
+    fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
         let git = self.git.read(cx);
-        let (glyph, title, hint, button) =
+        let (id, glyph, title, hint, button) =
             if git.is_discovering() || (self.loading && self.rows.is_empty()) {
-                (IconName::Refresh, tr("Reading stashes…"), None, false)
+                (
+                    0usize,
+                    IconName::Refresh,
+                    tr("Reading stashes…"),
+                    None,
+                    false,
+                )
             } else if git.repos().is_empty() {
                 (
+                    1,
                     IconName::Branch,
                     tr("No Git repository"),
                     Some(tr("Open a folder with a repository: ⌘O")),
@@ -1108,13 +1202,14 @@ impl StashPanel {
                 )
             } else {
                 (
+                    2,
                     IconName::Stash,
                     tr("No stashes"),
                     Some(tr("Put local changes aside to come back to them later")),
                     true,
                 )
             };
-        div()
+        let empty = div()
             .size_full()
             .flex()
             .flex_col()
@@ -1137,7 +1232,8 @@ impl StashPanel {
                         |_, window, cx| window.dispatch_action(Box::new(git::StashChanges), cx),
                     ),
                 ))
-            })
+            });
+        Appear::fade().apply(("stash-empty", id), empty)
     }
 
     /// Under the list: the selected stash (its name and branch) and Apply / Pop.
@@ -1212,15 +1308,18 @@ impl Render for StashPanel {
                 .menu
                 .as_ref()
                 .is_some_and(|menu| menu.menu.focus_handle(cx).is_focused(window));
+        // Arrivals that have unfolded are forgotten.
+        self.arrivals
+            .retain(|_, since| motion::running(*since, motion::SMOOTH));
         let list = if self.rows.is_empty() {
-            self.render_empty(cx).into_any_element()
+            self.render_empty(cx)
         } else {
             uniform_list(
                 "stash-rows",
                 self.rows.len(),
-                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                cx.processor(move |this, range: Range<usize>, window, cx| {
                     range
-                        .map(|index| this.render_row(index, focused, cx))
+                        .map(|index| this.render_row(index, focused, window, cx))
                         .collect::<Vec<_>>()
                 }),
             )
@@ -1308,21 +1407,16 @@ impl Render for StashPanel {
                     .child(ui::divider(ui).mx(px(ui::GAP)))
                     .child(self.render_footer(cx))
             })
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "stash-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }
 
-/// A node's chevron (right when closed, down when open); for a file, an empty column.
-fn chevron(expandable: bool, expanded: bool, ui: UiColors) -> impl IntoElement {
-    let glyph = expandable.then_some(if expanded {
-        IconName::ChevronDown
-    } else {
-        IconName::ChevronRight
-    });
+/// A node's chevron: right when closed, down when open, turning in between (`openness` 0 → 1,
+/// [`Disclosure::chevron`]); for a file, an empty column.
+fn chevron(expandable: bool, openness: f32, ui: UiColors) -> impl IntoElement {
     div()
         .flex_none()
         .w(px(CHEVRON_WIDTH))
@@ -1330,7 +1424,7 @@ fn chevron(expandable: bool, expanded: bool, ui: UiColors) -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .children(glyph.map(|glyph| icon(glyph, ui.dim).size(px(CHEVRON_SIZE))))
+        .children(expandable.then(|| icons::chevron(openness, ui.dim).size(px(CHEVRON_SIZE))))
 }
 
 fn now_seconds() -> i64 {

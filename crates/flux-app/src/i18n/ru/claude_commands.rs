@@ -3,8 +3,13 @@
 pub(super) const STRINGS: &[(&str, &str)] = &[
     // Shell mode of the message field
     ("Shell command", "Команда оболочки"),
-    ("the output goes to Claude", "вывод получит Claude"),
     ("Claude answers the output", "Claude ответит на вывод"),
+    (
+        "Claude only reads the output",
+        "Claude только прочтёт вывод",
+    ),
+    ("{0} without an answer", "{0} — без ответа"),
+    ("{0} with an answer", "{0} — с ответом"),
     (
         "A shell command — runs in the project's root",
         "Команда оболочки — выполнится в корне проекта",

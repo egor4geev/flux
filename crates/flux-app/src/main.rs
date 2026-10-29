@@ -1,6 +1,7 @@
 mod app_log;
 mod app_menu;
 mod appearance_settings;
+mod badge;
 mod blame;
 mod branch_dialogs;
 mod branches_popup;
@@ -69,6 +70,7 @@ mod lsp_watch;
 mod markdown;
 mod markdown_preview;
 mod merge_view;
+mod motion;
 mod navigation;
 mod notification_center;
 mod notifications;
@@ -100,6 +102,8 @@ mod push_dialog;
 mod quick_switch;
 mod rebase_dialog;
 mod recent;
+mod region_guard;
+mod region_status;
 mod rename;
 #[cfg(feature = "scenario")]
 mod scenario;
@@ -110,6 +114,8 @@ mod settings_view;
 mod start_screen;
 mod stash_panel;
 mod system_notify;
+mod system_shortcuts;
+mod tab_strip;
 mod task_contexts;
 mod terminal_element;
 mod terminal_group;
@@ -150,8 +156,8 @@ fn main() {
         // SAFETY: nothing else runs yet: no thread reads the environment.
         unsafe { std::env::set_var("FLUX_PLUGINS_HOME", home) };
     }
-    // Nor the user's keychain: plugins' secrets go to a file in the plugins' folder (a rebuilt
-    // unsigned Flux isn't on a keychain item's access list — macOS would ask the user).
+    // Nor the user's secrets: plugins' secrets go to a plain JSON file in the plugins' folder,
+    // which a scenario can read and fill (and nothing is moved from the keychain).
     #[cfg(feature = "scenario")]
     if std::env::var_os("FLUX_SCENARIO").is_some()
         && std::env::var_os("FLUX_PLUGIN_SECRETS_FILE").is_none()
@@ -195,6 +201,8 @@ fn main() {
         go_to_line::init(cx);
         project_search::init(cx);
         settings::init(cx);
+        // Animations on or off, the hover and press fades with them (2026-10-28).
+        motion::apply(cx);
         // The interface language, the theme and the icons as the settings choose them, from
         // the plugins that bring them (stage 8.3): before any window opens.
         i18n::apply_choice(settings::appearance(cx).language);
@@ -233,6 +241,9 @@ fn main() {
         plugins::init(cx);
         plugin_view::init(cx);
         claude::init(cx);
+        region_guard::init(cx);
+        region_status::init(cx);
+        system_shortcuts::init(cx);
         claude_console::init(cx);
         claude_composer::init(cx);
         claude_transcript::init(cx);

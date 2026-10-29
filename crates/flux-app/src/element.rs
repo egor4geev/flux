@@ -3,6 +3,8 @@
 //! ([`crate::wrap`]): the layout is by rows, and whatever is drawn over the text (selections,
 //! matches, problems, the caret) finds its rows here.
 
+use std::time::Instant;
+
 use flux_core::Rope;
 use flux_core::text::{line_len, line_start};
 use gpui::{
@@ -12,7 +14,8 @@ use gpui::{
 };
 
 use crate::display::{display_line, display_range, row_spans, text_runs};
-use crate::editor::{Autoscroll, Editor};
+use crate::editor::{Autoscroll, Editor, Glide};
+use crate::motion;
 use crate::theme::{self, Theme};
 use crate::wrap::WrapParams;
 
@@ -447,7 +450,7 @@ impl Element for EditorElement {
         let (gutter_width, blame_width, text_bounds) = {
             let editor = self.editor.read(cx);
             let digits = editor.document.text().len_lines().to_string().len().max(3);
-            let blame_width = crate::blame::column_width(&editor.blame, em);
+            let blame_width = crate::blame::column_width(&editor.blame, em, window);
             let gutter_width = if editor.message.is_some() {
                 px(0.)
             } else {
@@ -511,6 +514,14 @@ impl Element for EditorElement {
         let head_column = primary.head - line_start(&text, head_line);
         let head_row = wrap.line_to_row(head_line) + wrap.row_in_line(head_line, head_column);
 
+        // A glide (a jump on its way) counts from where the view is going; one that something else
+        // interrupted (the wheel, the scrollbar, a host) is over.
+        let max_scroll = (total_rows - 1) as f32 * lh;
+        let shown = scroll.y.clamp(0., max_scroll);
+        let glide = editor.glide.filter(|glide| glide.shown == scroll.y);
+        let destination = glide.map_or(shown, |glide| glide.to.clamp(0., max_scroll));
+        scroll.y = destination;
+
         // Vertical autoscroll: keep the cursor in the viewport with a margin of a few rows, and
         // when jumping to a match, put a row that is out of view in the middle.
         let top = head_row as f32 * lh;
@@ -533,7 +544,27 @@ impl Element for EditorElement {
             Some(Autoscroll::Middle) => scroll.y = ((top - (height - lh) / 2.) / lh).round() * lh,
             Some(Autoscroll::Center) | None => {}
         }
-        scroll.y = scroll.y.clamp(0., (total_rows - 1) as f32 * lh);
+        scroll.y = scroll.y.clamp(0., max_scroll);
+        // A jump glides from what is on screen to its place; anything else that moved the view
+        // (the caret, typing) takes it there at once; otherwise a glide goes on. Not on the first
+        // frame: a file just opened shows its place at once.
+        let jump = autoscroll.is_some()
+            && editor.glide_next
+            && editor.layout.is_some()
+            && motion::enabled();
+        let glide = Glide::next(
+            glide,
+            destination,
+            scroll.y,
+            jump,
+            shown,
+            height,
+            Instant::now(),
+        );
+        if let Some(glide) = &glide {
+            scroll.y = glide.shown.clamp(0., max_scroll);
+            window.request_animation_frame();
+        }
 
         let first_row = (scroll.y / lh).floor() as usize;
         let last_row = (first_row + (height / lh).ceil() as usize + 1).min(total_rows);
@@ -557,6 +588,11 @@ impl Element for EditorElement {
             .highlighter
             .highlight_lines(&text, first_line..last_line);
         let base = run(0, ui.foreground);
+        // ⌃⌥W: the rewrapped text fades in.
+        let rewrap_fade = editor
+            .rewrapped
+            .map(|since| motion::animate(since, motion::FADE, window))
+            .filter(|value| *value < 1.);
         let mut rows = Vec::with_capacity(last_row.saturating_sub(first_row));
         let mut lines = Vec::with_capacity(last_line - first_line);
         let mut max_width = px(0.);
@@ -578,7 +614,7 @@ impl Element for EditorElement {
                     continue;
                 }
                 let span = wrap.row_span(&text, line, index);
-                let (display, char_to_byte, runs) = if count == 1 {
+                let (display, char_to_byte, mut runs) = if count == 1 {
                     let (display, char_to_byte) = display_line(&text, line);
                     let runs = text_runs(spans, &char_to_byte, &base, |h| theme.syntax_style(h));
                     (display, char_to_byte, runs)
@@ -589,6 +625,11 @@ impl Element for EditorElement {
                     let runs = text_runs(&spans, &char_to_byte, &base, |h| theme.syntax_style(h));
                     (display, char_to_byte, runs)
                 };
+                if let Some(fade) = rewrap_fade {
+                    for run in &mut runs {
+                        run.color = run.color.opacity(fade);
+                    }
+                }
                 let shaped = text_system.shape_line(display.into(), font_size, &runs, None);
                 max_width = max_width.max(shaped.width);
                 rows.push(RowLayout {
@@ -607,26 +648,62 @@ impl Element for EditorElement {
         }
 
         // Horizontal autoscroll: after the rows are laid out, when the cursor's x is known. With
-        // soft wraps the text fits the width: no horizontal scroll.
+        // soft wraps the text fits the width: no horizontal scroll. A jump glides sideways as it
+        // glides down (a long line's end), from what is on screen.
         let visible_width = f32::from(text_bounds.size.width) - theme::TEXT_PADDING * 2.;
+        let mut glide_x = None;
         if wrapped {
             scroll.x = 0.;
         } else {
-            if autoscroll.is_some()
-                && let Some(entry) = lines.get(head_line.wrapping_sub(first_line))
-                && entry.shown > 0
-            {
-                let x = f32::from(rows[entry.first].x_for_column(head_column));
-                let margin = f32::from(em) * 4.;
-                if x < scroll.x {
-                    scroll.x = x - margin;
-                } else if x > scroll.x + visible_width - f32::from(em) {
-                    scroll.x = x - visible_width + margin;
+            let shown_x = scroll.x;
+            let gliding_x = editor.glide_x.filter(|glide| glide.shown == scroll.x);
+            let destination_x = gliding_x.map_or(scroll.x, |glide| glide.to);
+            scroll.x = destination_x;
+            let mut widest = f32::from(max_width);
+            if autoscroll.is_some() {
+                // The caret's line may not be on screen yet: a gliding jump starts a screen away.
+                let x = match lines.get(head_line.wrapping_sub(first_line)) {
+                    Some(entry) if entry.shown > 0 => {
+                        Some(f32::from(rows[entry.first].x_for_column(head_column)))
+                    }
+                    _ if glide.is_some() => {
+                        let (display, char_to_byte) = display_line(&text, head_line);
+                        let runs = [run(display.len(), ui.foreground)];
+                        let shaped = text_system.shape_line(display.into(), font_size, &runs, None);
+                        widest = widest.max(f32::from(shaped.width));
+                        let column = head_column.min(char_to_byte.len().saturating_sub(1));
+                        char_to_byte
+                            .get(column)
+                            .map(|&byte| f32::from(shaped.x_for_index(byte)))
+                    }
+                    _ => None,
+                };
+                if let Some(x) = x {
+                    let margin = f32::from(em) * 4.;
+                    if x < scroll.x {
+                        scroll.x = x - margin;
+                    } else if x > scroll.x + visible_width - f32::from(em) {
+                        scroll.x = x - visible_width + margin;
+                    }
                 }
             }
-            scroll.x = scroll
-                .x
-                .clamp(0., (f32::from(max_width) - visible_width / 2.).max(0.));
+            // While a glide runs, the rows on screen may not reach as far as where it goes.
+            let reach = gliding_x.map_or(0., |glide| glide.to.max(glide.from));
+            let max_x = (widest - visible_width / 2.).max(0.).max(reach);
+            scroll.x = scroll.x.clamp(0., max_x);
+            glide_x = Glide::next(
+                gliding_x,
+                destination_x,
+                scroll.x,
+                jump,
+                shown_x.clamp(0., max_x),
+                visible_width,
+                Instant::now(),
+            );
+            if let Some(glide) = &glide_x {
+                scroll.x = glide.shown.clamp(0., max_x.max(glide.to));
+                window.request_animation_frame();
+            }
         }
 
         let layout = LayoutCache {
@@ -670,6 +747,22 @@ impl Element for EditorElement {
                 ));
             }
         };
+
+        // What another program changed (a reload): tinted a moment, then fading, under the
+        // matches and the selection.
+        let reload_tint = editor
+            .reload_tint
+            .as_ref()
+            .and_then(|(range, since)| Some((range, Editor::reload_tint_alpha(*since, window)?)));
+        if let Some((range, alpha)) = &reload_tint {
+            let len = text.len_chars();
+            range_quads(
+                range.start.min(len),
+                range.end.min(len),
+                ui.diff_modified_bg.opacity(*alpha),
+            );
+        }
+        let reload_tint_over = editor.reload_tint.is_some() && reload_tint.is_none();
 
         // Search matches: only those that intersect the visible lines. The current match goes on
         // top of the selection (it is usually the selected one): otherwise the selection's blue
@@ -809,7 +902,22 @@ impl Element for EditorElement {
 
         let decorations = self.editor.update(cx, |editor, _| {
             editor.scroll = scroll;
+            editor.glide = glide.map(|glide| Glide {
+                shown: scroll.y,
+                ..glide
+            });
+            editor.glide_x = glide_x.map(|glide| Glide {
+                shown: scroll.x,
+                ..glide
+            });
+            editor.glide_next = false;
             editor.autoscroll = None;
+            if reload_tint_over {
+                editor.reload_tint = None;
+            }
+            if rewrap_fade.is_none() {
+                editor.rewrapped = None;
+            }
             editor.blame.column = (blame_width > px(0.)).then_some(blame_column);
             editor.frame_decorations.take()
         });

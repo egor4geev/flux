@@ -17,6 +17,13 @@
 //! transitions); where each element was drawn, for a plugin's picker opened under it. A window of
 //! the manifest's `location = "editor"` is drawn as a tab among the editor's ([`Chrome::Tab`]):
 //! the full width of the editor's island, no header, no resize handle — the tab names it.
+//!
+//! Motion (ADR-040): hover and press styles fade (the parts they light up have ids); a selected
+//! row's color crossfades as the keyboard leaves the list or comes back, while a selection moved
+//! with the keys is at its color at once. On a later view of the same screen, the rows that came
+//! unfold and a card moved to another column of a board slides in from that column's side — the
+//! times are kept by the tree's state ([`Arrival`]): a `uniform_list` recycles its rows. Another
+//! screen (a list → a task's details) fades in as a whole.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -38,9 +45,10 @@ use gpui::{
 };
 
 use crate::i18n::tr;
-use crate::icons::{IconName, icon, plugin_icon};
+use crate::icons::{self, IconName, icon, plugin_icon};
 use crate::input::{InputEvent, TextInput};
 use crate::markdown::{self, Block};
+use crate::motion::{self, Appear, Disclosure, TransitionExt, unfold_style};
 use crate::notifications::{Progress, progress_bar};
 use crate::notifications_panel::{FocusEditor, Hide};
 use crate::prompt_input::{PromptInput, PromptInputEvent};
@@ -179,6 +187,10 @@ const LANE_PADDING: f32 = 6.;
 /// A column of cards in a row of them is never narrower: the row scrolls sideways instead.
 const CARD_COLUMN_MIN_WIDTH: f32 = 220.;
 const DEFAULT_PAGE_ROWS: usize = 20;
+/// The rows that came with one view come one after another, this far apart, at most
+/// [`ARRIVAL_CAP`] rows' worth — as the rows of an opened folder unfold.
+const ARRIVAL_STEP: Duration = Duration::from_millis(16);
+const ARRIVAL_CAP: usize = 12;
 
 pub fn init(cx: &mut App) {
     let context = Some(CONTEXT);
@@ -266,6 +278,8 @@ pub struct PluginView {
     content_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     /// The field that had the keyboard when the view was last drawn (its focus ring).
     focused_field: Option<String>,
+    /// When the plugin last switched to another screen ([`another_screen`]): it fades in.
+    screen_since: Option<Instant>,
 }
 
 /// How long after a click its `activated` counts as the reason of the plugin's `editors.open`.
@@ -368,6 +382,7 @@ impl PluginView {
             element_bounds: Rc::new(RefCell::new(HashMap::new())),
             content_bounds: Rc::new(std::cell::Cell::new(None)),
             focused_field: None,
+            screen_since: None,
         }
     }
 
@@ -400,7 +415,29 @@ impl PluginView {
     /// The plugin's new content. Elements keep their state by id: what the user typed into a field
     /// (unless the plugin changes the field's text), the expanded and the selected rows of a tree,
     /// its scroll.
+    ///
+    /// Another screen fades in as a whole. On the same one, the rows that came unfold and a card
+    /// moved to another column slides in from its side ([`Arrival`]) — not at a tree's first rows,
+    /// not while the user types into a field of the view (a filter: nothing on the path of input
+    /// animates), not in a hidden window.
     pub fn set_view(&mut self, mut view: View, cx: &mut Context<Self>) {
+        let animate = motion::enabled();
+        let screen = self
+            .view
+            .as_ref()
+            .is_some_and(|before| another_screen(before, &view));
+        if screen && animate {
+            self.screen_since = Some(Instant::now());
+        }
+        let arrivals = animate && !screen && self.visible && self.focused_field.is_none();
+        let columns = if arrivals {
+            self.card_columns()
+        } else {
+            HashMap::new()
+        };
+        let now = Instant::now();
+        // Each tree's place among the view's trees: a board's column.
+        let mut column = 0;
         let mut present = HashSet::new();
         let mut first_tree = None;
         for element in &mut view.elements {
@@ -417,10 +454,21 @@ impl PluginView {
                             cards: spec.cards,
                         },
                     );
-                    self.trees
+                    let filled = self.trees.contains_key(&element.id);
+                    let tree = self
+                        .trees
                         .entry(element.id.clone())
-                        .or_insert_with(TreeState::new)
-                        .update(spec);
+                        .or_insert_with(TreeState::new);
+                    let came = if arrivals && filled {
+                        let moves = spec.cards.then_some((&columns, column));
+                        came_in(&tree.rows, &spec.rows, moves)
+                    } else {
+                        Vec::new()
+                    };
+                    tree.update(spec);
+                    tree.arrive(came, now);
+                    tree.column = column;
+                    column += 1;
                     first_tree.get_or_insert_with(|| element.id.clone());
                 }
                 ElementKind::Markdown(source) => self.sync_markdown(&element.id, source, cx),
@@ -449,6 +497,28 @@ impl PluginView {
         self.holds_cards = holds_cards(&view.elements);
         self.view = Some(view);
         cx.notify();
+    }
+
+    /// Each card's column (its tree's place among the view's trees), as the last view had it.
+    fn card_columns(&self) -> HashMap<String, usize> {
+        self.trees
+            .values()
+            .filter(|tree| tree.cards)
+            .flat_map(|tree| tree.rows.iter().map(|row| (row.key.clone(), tree.column)))
+            .collect()
+    }
+
+    /// How far the screen has faded in after the plugin switched to it (1 in place), asking for
+    /// the next frame while it does.
+    fn screen_shown(&mut self, window: &Window) -> f32 {
+        let Some(since) = self.screen_since else {
+            return 1.;
+        };
+        let shown = motion::animate(since, motion::FADE, window);
+        if shown >= 1. {
+            self.screen_since = None;
+        }
+        shown
     }
 
     /// Shown in the island or hidden.
@@ -681,6 +751,7 @@ impl PluginView {
         };
         match tree.expand_selected() {
             TreeMove::Toggled(key, expanded) => {
+                tree.user_toggled(key.clone(), expanded);
                 self.emit(&id, UiEvent::Expanded((key, expanded)), cx)
             }
             TreeMove::Selected(index, key) => {
@@ -698,6 +769,7 @@ impl PluginView {
         };
         match tree.collapse_selected() {
             TreeMove::Toggled(key, expanded) => {
+                tree.user_toggled(key.clone(), expanded);
                 self.emit(&id, UiEvent::Expanded((key, expanded)), cx)
             }
             TreeMove::Selected(index, key) => {
@@ -758,7 +830,11 @@ impl PluginView {
         };
         let key = tree.rows[visible.row].key.clone();
         let selected = tree.select(index);
-        let toggled = (click_count >= 2 && visible.has_children).then(|| tree.toggle(visible.row));
+        let toggled = (click_count >= 2 && visible.has_children).then(|| {
+            let expanded = tree.toggle(visible.row);
+            tree.user_toggled(key.clone(), expanded);
+            expanded
+        });
         if let Some(key) = selected {
             self.emit(tree_id, UiEvent::Selected(key), cx);
         }
@@ -789,6 +865,7 @@ impl PluginView {
         };
         let key = tree.rows[visible.row].key.clone();
         let expanded = tree.toggle(visible.row);
+        tree.user_toggled(key.clone(), expanded);
         self.emit(tree_id, UiEvent::Expanded((key, expanded)), cx);
         cx.notify();
     }
@@ -803,6 +880,9 @@ impl PluginView {
         let ui = Theme::ui(cx);
         let focused =
             self.focus_handle.is_focused(window) && self.active_tree.as_deref() == Some(tree_id);
+        if let Some(tree) = self.trees.get_mut(tree_id) {
+            tree.settle();
+        }
         let Some(tree) = self.trees.get(tree_id) else {
             return Vec::new();
         };
@@ -821,14 +901,27 @@ impl PluginView {
                 let row = &tree.rows[visible.row];
                 let selected = tree.selected.as_ref() == Some(&row.key);
                 let expanded = visible.has_children && tree.is_expanded(visible.row);
+                let mut motion = RowMotion {
+                    chevron: tree.disclosure.chevron(&row.key, expanded, window),
+                    unfold: tree.disclosure.unfold(index, window),
+                    slide: None,
+                };
+                if let Some(arrival) = tree.arrivals.get(&row.key) {
+                    let value = motion::animate(arrival.since, arrival.curve(), window);
+                    if arrival.side == 0. {
+                        motion.unfold = motion.unfold.min(value);
+                    } else {
+                        motion.slide = Some((arrival.side, value));
+                    }
+                }
                 Some(if tree.cards {
                     self.render_tree_card(
-                        tree_id, index, visible, row, selected, expanded, focused, look, window,
-                        ui, cx,
+                        tree_id, index, visible, row, selected, motion, focused, look, window, ui,
+                        cx,
                     )
                 } else {
                     self.render_tree_row(
-                        tree_id, index, visible, row, selected, expanded, focused, ui, cx,
+                        tree_id, index, visible, row, selected, motion, focused, ui, cx,
                     )
                 })
             })
@@ -918,7 +1011,7 @@ impl PluginView {
         visible: Visible,
         row: &TreeRow,
         selected: bool,
-        expanded: bool,
+        motion: RowMotion,
         focused: bool,
         ui: UiColors,
         cx: &mut Context<Self>,
@@ -929,11 +1022,6 @@ impl PluginView {
             .and_then(|name| plugin_icon(&self.plugin, name, &ui));
         let chevron = {
             let tree = tree_id.to_string();
-            let glyph = visible.has_children.then_some(if expanded {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            });
             div()
                 .flex_none()
                 .w(px(CHEVRON_WIDTH))
@@ -950,9 +1038,15 @@ impl PluginView {
                         }),
                     )
                 })
-                .children(glyph.map(|glyph| icon(glyph, ui.dim).size(px(CHEVRON_SIZE))))
+                .children(
+                    visible
+                        .has_children
+                        .then(|| icons::chevron(motion.chevron, ui.dim).size(px(CHEVRON_SIZE))),
+                )
         };
+        // The id lets the hover's backdrop fade.
         let body = div()
+            .id("plugin-tree-body")
             .relative()
             .size_full()
             .overflow_hidden()
@@ -1020,7 +1114,8 @@ impl PluginView {
                     .map(|badge| ui::badge(single_line(&badge), ui.text_muted)),
             )
             // The row's buttons: at its end while it is selected; while it is only hovered, over
-            // its end — so they take no room from the label in the other rows.
+            // its end — so they take no room from the label in the other rows. They fade in under
+            // the pointer (an id keeps the fade).
             .when(!row.actions.is_empty(), |body| {
                 let actions = self.render_row_actions(tree_id, row, ui, cx);
                 if selected {
@@ -1028,14 +1123,15 @@ impl PluginView {
                 } else {
                     body.child(
                         div()
+                            .id("plugin-row-actions")
                             .absolute()
                             .top_0()
                             .bottom_0()
                             .right_0()
                             .flex()
                             .items_center()
-                            .invisible()
-                            .group_hover(ROW_GROUP, |style| style.visible())
+                            .opacity(0.)
+                            .group_hover(ROW_GROUP, |style| style.opacity(1.))
                             .child(
                                 div()
                                     .h_full()
@@ -1051,16 +1147,13 @@ impl PluginView {
                 }
             });
         let body = if selected {
-            body.bg(if focused {
-                ui.list_selected
-            } else {
-                ui.list_selected_inactive
-            })
+            selection_colors(body, &row.key, focused, false, ui).into_any_element()
         } else {
             body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover))
+                .into_any_element()
         };
         let tree = tree_id.to_string();
-        div()
+        let element = div()
             .id(("plugin-tree-row", index))
             .group(ROW_GROUP)
             .h(px(ROW_HEIGHT))
@@ -1070,8 +1163,8 @@ impl PluginView {
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_row(&tree, index, event.click_count(), window, cx)
             }))
-            .child(body)
-            .into_any_element()
+            .child(body);
+        motion.style(element).into_any_element()
     }
 
     /// A row of a tree of cards (a board's column): the icon, the label and the badge, the
@@ -1085,7 +1178,7 @@ impl PluginView {
         visible: Visible,
         row: &TreeRow,
         selected: bool,
-        expanded: bool,
+        motion: RowMotion,
         focused: bool,
         look: RowsLook,
         window: &mut Window,
@@ -1098,11 +1191,6 @@ impl PluginView {
             .and_then(|name| plugin_icon(&self.plugin, name, &ui));
         let chevron = visible.has_children.then(|| {
             let tree = tree_id.to_string();
-            let glyph = if expanded {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            };
             div()
                 .flex_none()
                 .w(px(CHEVRON_WIDTH))
@@ -1116,7 +1204,7 @@ impl PluginView {
                         this.click_chevron(&tree, index, window, cx)
                     }),
                 )
-                .child(icon(glyph, ui.dim).size(px(CHEVRON_SIZE)))
+                .child(icons::chevron(motion.chevron, ui.dim).size(px(CHEVRON_SIZE)))
         });
         let first_line = div()
             .flex_none()
@@ -1140,7 +1228,9 @@ impl PluginView {
                     .clone()
                     .map(|badge| ui::badge(single_line(&badge), ui.text_muted)),
             );
+        // The id lets the hover's backdrop fade.
         let card = div()
+            .id("plugin-tree-card")
             .size_full()
             .overflow_hidden()
             .flex()
@@ -1214,23 +1304,15 @@ impl PluginView {
                 )
             });
         let card = if selected {
-            card.bg(if focused {
-                ui.list_selected
-            } else {
-                ui.list_selected_inactive
-            })
-            .border_color(if focused {
-                ui.focus_border
-            } else {
-                ui.elevated_border
-            })
+            selection_colors(card, &row.key, focused, true, ui).into_any_element()
         } else {
             card.bg(ui.elevated)
                 .border_color(ui.elevated_border)
                 .group_hover(ROW_GROUP, move |style| style.bg(ui.hover))
+                .into_any_element()
         };
         let tree = tree_id.to_string();
-        div()
+        let element = div()
             .id(("plugin-tree-row", index))
             .group(ROW_GROUP)
             .h(px(look.height))
@@ -1240,8 +1322,8 @@ impl PluginView {
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_row(&tree, index, event.click_count(), window, cx)
             }))
-            .child(card)
-            .into_any_element()
+            .child(card);
+        motion.style(element).into_any_element()
     }
 
     // --- Toggles and buttons ---
@@ -1280,8 +1362,9 @@ impl PluginView {
             )
     }
 
-    /// The view's content: the root and what it holds.
-    fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The view's content: the root and what it holds, `shown` of the way faded in
+    /// ([`PluginView::screen_shown`]).
+    fn render_content(&self, shown: f32, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
         let Some(view) = &self.view else {
             return empty_state(tr("Nothing to show"), ui).into_any_element();
@@ -1298,6 +1381,7 @@ impl PluginView {
                 .flex()
                 .flex_col()
                 .pt_1()
+                .when(shown < 1., |content| content.opacity(shown))
                 .child(root)
                 .into_any_element()
         } else {
@@ -1310,6 +1394,7 @@ impl PluginView {
                 .track_scroll(&self.scroll)
                 .pt_1()
                 .pb_3()
+                .when(shown < 1., |content| content.opacity(shown))
                 .child(root)
                 .into_any_element()
         }
@@ -1375,7 +1460,8 @@ impl PluginView {
             // A row of trees (a board's columns, each a heading and a tree) takes the height left,
             // and its children stretch down it: each tree scrolls by itself.
             // A row of columns of cards (a board) keeps each column readable and scrolls sideways
-            // when the tab is too narrow for all of them.
+            // when the tab is too narrow for all of them — by a sideways swipe or Shift+wheel: a
+            // scroll down over the board goes to its lanes.
             ElementKind::Row if self.holds_cards.get(index).copied().unwrap_or(false) => div()
                 .id(SharedString::from(format!("plugin-row-{id}")))
                 .w_full()
@@ -1387,6 +1473,7 @@ impl PluginView {
                 .px(px(ROW_INSET))
                 .pb(px(ROW_INSET))
                 .overflow_x_scroll()
+                .map(own_axis_only)
                 .children(children(cx, Parent::Row))
                 .into_any_element(),
             ElementKind::Row => div()
@@ -1731,7 +1818,8 @@ impl PluginView {
             .into_any_element()
     }
 
-    /// A multi-line field (API 0.3): a box like a text field's around the growing input.
+    /// A multi-line field (API 0.3): a box like a text field's around the growing input; its focus
+    /// ring comes in and fades out as a text field's does ([`ui::focus_field`]).
     fn render_lines(
         &self,
         id: &str,
@@ -1742,7 +1830,7 @@ impl PluginView {
         let focused = self.focused_field.as_deref() == Some(id);
         let (submit, line) = (id.to_string(), id.to_string());
         let focus = input.focus_handle(cx);
-        div()
+        let field = div()
             .id(ElementId::Name(format!("plugin-lines-{id}").into()))
             .key_context(LINES_CONTEXT)
             .w_full()
@@ -1751,12 +1839,6 @@ impl PluginView {
             .rounded(px(ui::RADIUS_MD))
             .bg(ui.input_background)
             .border_1()
-            .border_color(if focused {
-                ui.focus_border
-            } else {
-                ui.input_border
-            })
-            .when(focused, |field| field.shadow(ui::focus_ring(ui)))
             .when(!focused, |field| {
                 field.hover(move |style| style.border_color(ui.elevated_border))
             })
@@ -1767,8 +1849,9 @@ impl PluginView {
                 cx.listener(move |this, _: &SubmitField, _, cx| this.submit_field(&submit, cx)),
             )
             .on_action(cx.listener(move |this, _: &NewLine, _, cx| this.new_line(&line, cx)))
-            .child(input.clone())
-            .into_any_element()
+            .child(input.clone());
+        let ring = ElementId::Name(format!("plugin-lines-focus-{id}").into());
+        ui::focus_field(field, ring, focused, ui).into_any_element()
     }
 
     /// A badge (API 0.3): a colored label; with `menu` it is a dropdown — a button of a toolbar's
@@ -1821,6 +1904,7 @@ impl PluginView {
             .text_color(text_color)
             .cursor_pointer()
             .hover(move |style| style.bg(hover))
+            .active(motion::press)
             .child(div().min_w_0().truncate().child(single_line(&spec.text)))
             .child(
                 icon(
@@ -1868,11 +1952,10 @@ impl PluginView {
             Some(tooltip) => button.tooltip(ui::tooltip(single_line(tooltip), None)),
             None => button,
         };
+        // Unavailable: dimmed, no hover or press; the change fades.
+        let button = ui::available(button, spec.enabled);
         if !spec.enabled {
-            return button
-                .opacity(0.45)
-                .cursor(CursorStyle::Arrow)
-                .into_any_element();
+            return button.into_any_element();
         }
         let element = id.to_string();
         button
@@ -1948,6 +2031,8 @@ impl PluginView {
             }),
         )
         .track_scroll(tree.scroll.clone())
+        // A sideways swipe over a board's lane slides the board, not the lane down.
+        .map(own_axis_only)
         .size_full();
         div()
             .flex_1()
@@ -1976,7 +2061,8 @@ impl Render for PluginView {
             .find(|(_, field)| field.input.focus_handle(cx).is_focused(window))
             .map(|(id, _)| id.clone());
         self.measure_properties(window, cx);
-        let content = self.render_content(cx);
+        let shown = self.screen_shown(window);
+        let content = self.render_content(shown, cx);
         let frame = div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -2081,9 +2167,10 @@ impl Render for DraggedEdge {
     }
 }
 
-/// Width handle in the gap to the left of the island: an accent line on hover and while dragged.
-/// Its middle is `center` past the edge (`ui::resize_handle_center`): in the gap between islands,
-/// or on the line between Flat panels (part 10.4).
+/// Width handle in the gap to the left of the island: an accent line on hover and while dragged,
+/// fading in and out (an id keeps the fade). Its middle is `center` past the edge
+/// (`ui::resize_handle_center`): in the gap between islands, or on the line between Flat panels
+/// (part 10.4).
 fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement {
     div()
         .id("plugin-view-resize")
@@ -2100,14 +2187,13 @@ fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement 
         .on_drag(DraggedEdge, |_, _, _, cx| cx.new(|_| DraggedEdge))
         .child(
             div()
+                .id("plugin-view-resize-line")
                 .w(px(2.))
                 .h_full()
                 .rounded(px(1.))
                 .bg(ui.focus_border)
-                .when(!resizing, |line| {
-                    line.invisible()
-                        .group_hover("plugin-view-resize", |style| style.visible())
-                }),
+                .opacity(if resizing { 1. } else { 0. })
+                .group_hover("plugin-view-resize", |style| style.opacity(1.)),
         )
 }
 
@@ -2150,6 +2236,29 @@ fn indent_guides(depth: usize, ui: UiColors) -> impl IntoElement {
         }))
 }
 
+/// A selected row's colors — the backdrop of the focused list's selection or the inactive one's,
+/// with `border` a card's border too — crossfading as the keyboard leaves the list or comes back
+/// ([`motion::FADE`]). Only a selected row has it, keyed by its key: a selection moved with the
+/// keys is at its color at once, the row that takes it having had none.
+fn selection_colors<E: Styled + IntoElement + 'static>(
+    element: E,
+    key: &str,
+    focused: bool,
+    border: bool,
+    ui: UiColors,
+) -> motion::Transition<E, f32> {
+    let id = ElementId::Name(format!("plugin-row-selected-{key}").into());
+    let target = if focused { 1. } else { 0. };
+    element.with_transition(id, target, motion::FADE, move |element, t| {
+        let element = element.bg(motion::mix(ui.list_selected_inactive, ui.list_selected, t));
+        if border {
+            element.border_color(motion::mix(ui.elevated_border, ui.focus_border, t))
+        } else {
+            element
+        }
+    })
+}
+
 /// [`ui::text_button`] with an icon before the label.
 fn text_button_with_icon(
     id: ElementId,
@@ -2173,7 +2282,7 @@ fn text_button_with_icon(
         .text_color(ui.foreground)
         .cursor_pointer()
         .hover(move |style| style.bg(ui.hover))
-        .active(move |style| style.bg(ui.pressed))
+        .active(move |style| motion::press(style.bg(ui.pressed)))
         .child(button_icon)
         .child(label)
 }
@@ -2377,9 +2486,63 @@ fn in_sight(element: Bounds<Pixels>, area: Bounds<Pixels>) -> bool {
         && element.left() < area.right()
 }
 
+/// The element scrolls along its own axis only. gpui turns a scroll along the other axis into its
+/// own: a wheel's or a swipe's scroll down would slide a board's row sideways under its lanes.
+fn own_axis_only<E: Styled>(mut element: E) -> E {
+    element.style().restrict_scroll_to_axis = Some(true);
+    element
+}
+
 /// Line breaks and tabs as spaces: the byte length stays the same.
 pub(crate) fn single_line(text: &str) -> String {
     text.replace(['\n', '\r', '\t'], " ")
+}
+
+/// The plugin shows another screen (its list → a task's details, the loading → the board): the
+/// root is another element, or most of the elements are new — a plugin may name the roots of all
+/// its screens alike.
+fn another_screen(before: &View, after: &View) -> bool {
+    let (Some(old_root), Some(new_root)) = (before.elements.first(), after.elements.first()) else {
+        return false;
+    };
+    if old_root.id != new_root.id {
+        return true;
+    }
+    let old: HashSet<&str> = before
+        .elements
+        .iter()
+        .map(|element| element.id.as_str())
+        .collect();
+    let kept = after
+        .elements
+        .iter()
+        .filter(|element| old.contains(element.id.as_str()))
+        .count();
+    kept * 2 < after.elements.len()
+}
+
+/// The rows of `new` that `old` didn't have (by key), in their order, each with the side it comes
+/// from ([`Arrival::side`]). In a tree of cards — `moves`: each card's column before, and this
+/// tree's column — a card from another column comes from that column's side; any other row
+/// unfolds in place.
+fn came_in(
+    old: &[TreeRow],
+    new: &[TreeRow],
+    moves: Option<(&HashMap<String, usize>, usize)>,
+) -> Vec<(String, f32)> {
+    let old: HashSet<&str> = old.iter().map(|row| row.key.as_str()).collect();
+    new.iter()
+        .filter(|row| !old.contains(row.key.as_str()))
+        .map(|row| {
+            let from = moves.and_then(|(columns, column)| Some((*columns.get(&row.key)?, column)));
+            let side = match from {
+                Some((from, to)) if from < to => -1.,
+                Some((from, to)) if from > to => 1.,
+                _ => 0.,
+            };
+            (row.key.clone(), side)
+        })
+        .collect()
 }
 
 /// Which elements have a tree inside them (by index), following children as drawn: each element
@@ -2461,6 +2624,56 @@ struct RowsLook {
     tags_width: Option<f32>,
 }
 
+/// A drawn row's motion: how open its chevron is (0 → 1, turning after the user toggled it) and how
+/// far it has unfolded (1 in place) — [`Disclosure::chevron`], [`Disclosure::unfold`], a row that
+/// came ([`Arrival`]).
+#[derive(Clone, Copy)]
+struct RowMotion {
+    chevron: f32,
+    unfold: f32,
+    /// A card come from another column: the side it slides in from ([`Arrival::side`]) and how far
+    /// it has come (0 → 1, overshooting on the way).
+    slide: Option<(f32, f32)>,
+}
+
+impl RowMotion {
+    /// The row unfolding, or sliding in as it fades in; in place, as it is.
+    fn style<E: Styled>(self, element: E) -> E {
+        let element = unfold_style(element, self.unfold);
+        match self.slide {
+            Some((side, value)) if value != 1. => {
+                Appear::slide(side * motion::SLIDE, 0.).style(element, value)
+            }
+            _ => element,
+        }
+    }
+}
+
+/// A row that came into a tree with a later view of the same screen: it unfolds; a card that came
+/// from another column of a board slides in from that column's side, with a bounce. Kept by the
+/// tree's state until it has settled: a `uniform_list` recycles its rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Arrival {
+    /// When it starts: the rows that came together come one after another.
+    since: Instant,
+    /// Where it comes from: -1 the left, 1 the right; 0 — a new row, unfolding in place.
+    side: f32,
+}
+
+impl Arrival {
+    fn curve(&self) -> motion::Curve {
+        if self.side == 0. {
+            motion::SMOOTH
+        } else {
+            motion::BOUNCE
+        }
+    }
+
+    fn running(&self) -> bool {
+        motion::running(self.since, self.curve())
+    }
+}
+
 /// A tree's rows and what the user did to them: expanded rows and the selection by key, the
 /// scroll.
 struct TreeState {
@@ -2475,6 +2688,12 @@ struct TreeState {
     /// Expanded or not, by key: the plugin's `expanded` when the key is first seen, then the
     /// user's choice.
     expanded: HashMap<String, bool>,
+    /// The rows the user expands and collapses: their chevrons turn, the rows they show unfold.
+    disclosure: Disclosure<String>,
+    /// The rows that came with a later view, by key, until they have settled.
+    arrivals: HashMap<String, Arrival>,
+    /// The tree's place among the view's trees — a board's column — as of the last view.
+    column: usize,
     selected: Option<String>,
     scroll: UniformListScrollHandle,
     /// The rows are cards (`tree-spec.cards`).
@@ -2493,6 +2712,9 @@ impl TreeState {
             parents: Vec::new(),
             visible: Vec::new(),
             expanded: HashMap::new(),
+            disclosure: Disclosure::default(),
+            arrivals: HashMap::new(),
+            column: 0,
             selected: None,
             scroll: UniformListScrollHandle::new(),
             cards: false,
@@ -2531,6 +2753,8 @@ impl TreeState {
         }
         let keys: HashSet<&str> = self.rows.iter().map(|row| row.key.as_str()).collect();
         self.expanded.retain(|key, _| keys.contains(key.as_str()));
+        self.arrivals
+            .retain(|key, arrival| keys.contains(key.as_str()) && arrival.running());
         for row in &self.rows {
             self.expanded.entry(row.key.clone()).or_insert(row.expanded);
         }
@@ -2585,6 +2809,53 @@ impl TreeState {
             }
             self.selected = row.map(|index| self.rows[index].key.clone());
         }
+        self.disclosure_rows();
+    }
+
+    /// Tells the disclosure where the rows under each expanded row are drawn now: the deeper ones
+    /// right after it (none yet when the plugin hasn't sent its children).
+    fn disclosure_rows(&mut self) {
+        let (rows, visible, expanded) = (&self.rows, &self.visible, &self.expanded);
+        self.disclosure.rows_changed(|key| {
+            let index = visible.iter().position(|v| rows[v.row].key == *key)?;
+            let node = visible[index];
+            if !expanded
+                .get(key)
+                .copied()
+                .unwrap_or(rows[node.row].expanded)
+            {
+                return None;
+            }
+            let end = visible[index + 1..]
+                .iter()
+                .position(|v| v.depth <= node.depth)
+                .map_or(visible.len(), |offset| index + 1 + offset);
+            Some(index + 1..end)
+        });
+    }
+
+    /// Rows came with the view ([`came_in`]: their keys and sides) — after [`TreeState::update`]:
+    /// they unfold or slide in from `now`, one after another.
+    fn arrive(&mut self, came: Vec<(String, f32)>, now: Instant) {
+        for (index, (key, side)) in came.into_iter().enumerate() {
+            let since = now + motion::stagger(index, ARRIVAL_STEP, ARRIVAL_CAP);
+            self.arrivals.insert(key, Arrival { since, side });
+        }
+    }
+
+    /// Forgets the rows that have come and settled.
+    fn settle(&mut self) {
+        if !self.arrivals.is_empty() {
+            self.arrivals.retain(|_, arrival| arrival.running());
+        }
+    }
+
+    /// The user (a click, a key) expanded or collapsed the row `key` — after
+    /// [`TreeState::toggle`]: its chevron turns, the rows it shows unfold. What the plugin expands
+    /// (`tree-row.expanded`) simply shows.
+    fn user_toggled(&mut self, key: String, expanded: bool) {
+        self.disclosure.toggled(key, expanded);
+        self.disclosure_rows();
     }
 
     /// The selected row's index among the drawn ones.
@@ -2771,6 +3042,80 @@ mod tests {
             cards: false,
         });
         assert_eq!(tree.selected, None);
+    }
+
+    #[test]
+    fn rows_that_came_unfold_and_cards_from_another_column_slide_from_its_side() {
+        let old = [row("a", None, false), row("b", None, false)];
+        let new = [
+            row("b", None, false),
+            row("c", None, false),
+            row("d", None, false),
+            row("e", None, false),
+        ];
+        // A list: what is new unfolds, what stayed doesn't move, in the new rows' order.
+        assert_eq!(
+            came_in(&old, &new, None),
+            [("c".into(), 0.), ("d".into(), 0.), ("e".into(), 0.)]
+        );
+        // The board's third column (2): "c" was in the first, "d" in the fourth, "e" is new.
+        let columns = HashMap::from([
+            ("a".to_string(), 2),
+            ("c".to_string(), 0),
+            ("d".to_string(), 3),
+        ]);
+        assert_eq!(
+            came_in(&old, &new, Some((&columns, 2))),
+            [("c".into(), -1.), ("d".into(), 1.), ("e".into(), 0.)]
+        );
+        // The same rows again: nothing came.
+        assert!(came_in(&new, &new, Some((&columns, 2))).is_empty());
+    }
+
+    #[test]
+    fn arrivals_come_one_after_another_and_leave_with_their_rows() {
+        let mut tree = TreeState::new();
+        tree.update(spec());
+        let now = Instant::now();
+        tree.arrive(vec![("a.rs:1".into(), 0.), ("b.rs".into(), -1.)], now);
+        assert_eq!(tree.arrivals["a.rs:1"].since, now);
+        assert_eq!(tree.arrivals["b.rs"].since, now + ARRIVAL_STEP);
+        assert_eq!(tree.arrivals["b.rs"].curve(), motion::BOUNCE);
+        // A row the plugin no longer sends no longer arrives.
+        let mut without_b = spec();
+        without_b.rows.truncate(3);
+        tree.update(without_b);
+        assert!(!tree.arrivals.contains_key("b.rs"));
+    }
+
+    #[test]
+    fn another_root_or_mostly_new_elements_are_another_screen() {
+        let view = |ids: &[&str]| View {
+            elements: ids
+                .iter()
+                .map(|id| element(id, ElementKind::Column, vec![]))
+                .collect(),
+        };
+        let list = view(&["root", "toolbar", "filter", "refresh", "issues"]);
+        // A refresh of the same screen: a progress bar comes, the rest stays.
+        assert!(!another_screen(
+            &list,
+            &view(&[
+                "root",
+                "toolbar",
+                "filter",
+                "refresh",
+                "refreshing",
+                "issues"
+            ])
+        ));
+        // A task's details under a root named alike: most of the elements are new.
+        let details = view(&["root", "toolbar", "back", "title", "properties", "comments"]);
+        assert!(another_screen(&list, &details));
+        assert!(another_screen(&details, &list));
+        // Another root.
+        assert!(another_screen(&list, &view(&["card", "toolbar"])));
+        assert!(!another_screen(&view(&[]), &list));
     }
 
     #[test]
@@ -3000,5 +3345,110 @@ mod tests {
         let text = "a\tb\nc\r";
         assert_eq!(single_line(text), "a b c ");
         assert_eq!(single_line(text).len(), text.len());
+    }
+
+    /// A trackpad's scroll event (gpui's patch, `ScrollGesture`: a board's row and its lanes take
+    /// only the movement along the gesture's axis).
+    fn swipe(phase: gpui::TouchPhase, x: f32, y: f32) -> gpui::ScrollWheelEvent {
+        gpui::ScrollWheelEvent {
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(x), px(y))),
+            touch_phase: phase,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_swipe_keeps_to_its_predominant_axis() {
+        use gpui::{Axis, ScrollGesture, TouchPhase};
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut gesture = ScrollGesture::default();
+        // Fingers down (no movement yet), then a swipe down that drifts a little sideways: an
+        // event of it alone would scroll sideways, the gesture doesn't.
+        assert_eq!(
+            gesture.update(&swipe(TouchPhase::Started, 0., 0.), at(0)),
+            None
+        );
+        let down = [(0.5, -2.), (1., -3.), (-1., -6.), (3., -1.), (-2., 0.)];
+        for (i, (x, y)) in down.into_iter().enumerate() {
+            let event = swipe(TouchPhase::Moved, x, y);
+            assert_eq!(
+                gesture.update(&event, at(8 * i as u64)),
+                Some(Axis::Vertical)
+            );
+        }
+        // The fingers lift; the momentum keeps the axis.
+        assert_eq!(
+            gesture.update(&swipe(TouchPhase::Ended, 0., 0.), at(48)),
+            None
+        );
+        let momentum = swipe(TouchPhase::Moved, 2., -1.);
+        assert_eq!(gesture.update(&momentum, at(56)), Some(Axis::Vertical));
+        // The next gesture decides again: sideways, with a little vertical movement.
+        let sideways = [(3., 0.5), (5., -1.), (4., 2.), (0., -1.)];
+        for (i, (x, y)) in sideways.into_iter().enumerate() {
+            let phase = if i == 0 {
+                TouchPhase::Started
+            } else {
+                TouchPhase::Moved
+            };
+            let event = swipe(phase, x, y);
+            assert_eq!(
+                gesture.update(&event, at(64 + 8 * i as u64)),
+                Some(Axis::Horizontal)
+            );
+        }
+        // Until the gesture has moved enough, each event goes its own way.
+        assert_eq!(
+            gesture.update(&swipe(TouchPhase::Started, 0.5, -1.), at(200)),
+            Some(Axis::Vertical)
+        );
+        assert_eq!(
+            gesture.update(&swipe(TouchPhase::Moved, 1.5, 0.), at(208)),
+            Some(Axis::Horizontal)
+        );
+    }
+
+    #[test]
+    fn a_scroll_without_phases_starts_anew_after_a_pause() {
+        use gpui::{Axis, ScrollGesture, TouchPhase};
+        let start = Instant::now();
+        let mut gesture = ScrollGesture::default();
+        assert_eq!(
+            gesture.update(&swipe(TouchPhase::Moved, 0., -6.), start),
+            Some(Axis::Vertical)
+        );
+        let sideways = swipe(TouchPhase::Moved, 6., 0.);
+        let soon = start + Duration::from_millis(16);
+        assert_eq!(gesture.update(&sideways, soon), Some(Axis::Vertical));
+        let later = soon + ScrollGesture::PAUSE + Duration::from_millis(1);
+        assert_eq!(gesture.update(&sideways, later), Some(Axis::Horizontal));
+    }
+
+    #[test]
+    fn a_wheel_step_is_a_gesture_by_itself() {
+        use gpui::{Axis, ScrollDelta, ScrollGesture, ScrollWheelEvent};
+        let wheel = |x: f32, y: f32| ScrollWheelEvent {
+            delta: ScrollDelta::Lines(gpui::point(x, y)),
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let mut gesture = ScrollGesture::default();
+        assert_eq!(gesture.update(&wheel(0., -1.), now), Some(Axis::Vertical));
+        // Shift+wheel: macOS sends it sideways.
+        assert_eq!(gesture.update(&wheel(-1., 0.), now), Some(Axis::Horizontal));
+        assert_eq!(gesture.axis(), Some(Axis::Horizontal));
+    }
+
+    #[test]
+    fn a_diagonal_scroll_goes_down() {
+        use gpui::{Axis, ScrollGesture};
+        let axis = |x: f32, y: f32| ScrollGesture::predominant_axis(gpui::point(px(x), px(y)));
+        assert_eq!(axis(0., 0.), None);
+        assert_eq!(axis(5., -5.), Some(Axis::Vertical));
+        assert_eq!(axis(-5.5, 5.), Some(Axis::Vertical));
+        assert_eq!(axis(-6.5, 5.), Some(Axis::Horizontal));
+        assert_eq!(axis(0.5, 0.), Some(Axis::Horizontal));
+        assert_eq!(axis(0., 0.5), Some(Axis::Vertical));
     }
 }

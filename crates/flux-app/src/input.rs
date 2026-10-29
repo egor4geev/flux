@@ -22,6 +22,7 @@ use gpui::{
 use crate::display::display_line;
 use crate::element::LineLayout;
 use crate::icons::{IconName, icon};
+use crate::motion::{self, TransitionExt};
 use crate::theme::{self, Theme};
 use crate::ui;
 
@@ -596,12 +597,9 @@ impl Render for TextInput {
         use Direction::{Backward, Forward};
         let ui = Theme::ui(cx);
         let focused = self.focus_handle.is_focused(window);
-        let border = if focused {
-            ui.focus_border
-        } else {
-            ui.input_border
-        };
+        // The id lets the hover fade; the field is its own view, so a constant is unique.
         let field = div()
+            .id("text-input")
             .key_context("TextInput")
             .track_focus(&self.focus_handle)
             .w_full()
@@ -621,22 +619,19 @@ impl Render for TextInput {
                 .px_1p5()
                 .rounded(px(ui::RADIUS_SM))
                 .bg(ui.input_background)
-                .border_1()
-                .border_color(border),
+                .border_1(),
             (false, false) => field
                 .h(px(FIELD_HEIGHT))
                 .px_2p5()
                 .rounded(px(ui::RADIUS_MD))
                 .bg(ui.input_background)
                 .border_1()
-                .border_color(border)
-                .when(focused, |field| field.shadow(ui::focus_ring(ui)))
                 .when(!focused, |field| {
                     field.hover(move |style| style.border_color(ui.elevated_border))
                 }),
         };
         let icon_color = if focused { ui.text_muted } else { ui.dim };
-        field
+        let field = field
             .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
                 this.motion(cx, |t, r| {
                     movement::move_horizontally(t, r, Backward, false)
@@ -710,7 +705,26 @@ impl Render for TextInput {
                     .flex_1()
                     .min_w_0()
                     .child(InputElement { input: cx.entity() }),
-            )
+            );
+        // Focused, the border turns accent and the ring comes in around a full field, as macOS
+        // draws it; blurred, both fade (`ui::focus_field`). A borderless field has neither.
+        let focus = if self.borderless { None } else { Some(focused) };
+        let ring = !self.compact;
+        let (target, curve) = match focus {
+            Some(true) => (1., motion::POP),
+            _ => (0., motion::FADE),
+        };
+        field.with_transition("focus", target, curve, move |field, t| {
+            let Some(focused) = focus else {
+                return field;
+            };
+            let field = field.border_color(motion::mix(ui.input_border, ui.focus_border, t));
+            if ring && t > 0. {
+                field.shadow(ui::focus_ring_at(ui, t, focused))
+            } else {
+                field
+            }
+        })
     }
 }
 

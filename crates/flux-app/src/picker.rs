@@ -6,11 +6,14 @@
 //!
 //! A delegate may also (part 10.3, the plugins' popups): have rows that can't be selected (a
 //! group's heading), drop the query field (a short menu: ↑↓ ↵ Esc), say it is still looking (a
-//! pulsing dot), set its width and row height, hide the footer.
+//! pulsing dot), set its width and row height, hide the footer, wait unseen for its place.
+//!
+//! Motion (`crate::motion`): the list's height glides when its items change on their own — a
+//! project still being walked, a plugin's new items, loading → loaded; what the typing changes
+//! comes at once.
 
 use std::ops::Range;
-
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, DismissEvent, Entity,
@@ -22,6 +25,7 @@ use gpui::{
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::motion::{self, TransitionExt as _};
 use crate::theme::{self, Theme};
 use crate::ui::{self, RADIUS_MD};
 
@@ -35,6 +39,11 @@ const HEADER_HEIGHT: f32 = 50.;
 const FOOTER_HEIGHT: f32 = 36.;
 /// Inset of the rows from the panel edges, and of the list from the header and footer.
 const LIST_INSET: f32 = 6.;
+/// The height of the message shown instead of an empty list.
+const EMPTY_HEIGHT: f32 = ROW_HEIGHT * 2.;
+/// A new height of the list this soon after the query changed is still the typing's (a search
+/// finishing in steps): it comes at once.
+const TYPING_SETTLE: Duration = Duration::from_millis(300);
 
 actions!(
     picker,
@@ -154,6 +163,26 @@ pub trait PickerDelegate: Sized + 'static {
     fn show_footer(&self) -> bool {
         true
     }
+
+    /// The list has its place. One that waits for it (a plugin's picker above a status bar item
+    /// not drawn yet) is laid out but not seen and takes no mouse; its query already takes the
+    /// keys.
+    fn placed(&self) -> bool {
+        true
+    }
+}
+
+/// How the list's height changes ([`Picker::height_key`]).
+#[derive(Default)]
+struct ListHeight {
+    /// The height the list was last given.
+    target: Option<f32>,
+    /// The query it was given for.
+    query: String,
+    /// When the query last changed.
+    typed: Option<Instant>,
+    /// The key of the height's glide: a new one starts it over at its target — a jump.
+    key: usize,
 }
 
 pub struct Picker<D: PickerDelegate> {
@@ -163,6 +192,7 @@ pub struct Picker<D: PickerDelegate> {
     focus: FocusHandle,
     selected: usize,
     scroll: UniformListScrollHandle,
+    height: ListHeight,
     _subscription: Subscription,
 }
 
@@ -231,6 +261,7 @@ impl<D: PickerDelegate> Picker<D> {
             focus: cx.focus_handle(),
             selected: 0,
             scroll: UniformListScrollHandle::new(),
+            height: ListHeight::default(),
             _subscription: subscription,
         };
         picker.selected = picker.next_selectable(0).unwrap_or(0);
@@ -246,6 +277,7 @@ impl<D: PickerDelegate> Picker<D> {
     ) {
         match event {
             InputEvent::Changed => {
+                self.height.typed = Some(Instant::now());
                 let text = query.read(cx).text();
                 self.delegate.update_matches(&text, window, cx);
                 self.selected = self.next_selectable(0).unwrap_or(0);
@@ -253,6 +285,28 @@ impl<D: PickerDelegate> Picker<D> {
                 cx.notify();
             }
         }
+    }
+
+    /// The key of the list's height glide for a list `target` high: the height glides to a new
+    /// target when only the items changed — a project still being walked, a plugin's new items,
+    /// loading → loaded; when the query changed since the height last did, or just now (a search
+    /// finishing in steps), it jumps — typing stays instant.
+    fn height_key(&mut self, target: f32, cx: &App) -> usize {
+        let height = &mut self.height;
+        if height.target == Some(target) {
+            return height.key;
+        }
+        let query = self.query.read(cx).text();
+        let typed = height.query != query
+            || height
+                .typed
+                .is_some_and(|typed| typed.elapsed() < TYPING_SETTLE);
+        if height.target.is_some() && typed {
+            height.key += 1;
+        }
+        height.target = Some(target);
+        height.query = query;
+        height.key
     }
 
     fn clamp_selection(&mut self) {
@@ -385,9 +439,9 @@ impl<D: PickerDelegate> Render for Picker<D> {
         let searchable = self.delegate.searchable();
         let loading = self.delegate.loading();
         let row_height = self.delegate.row_height();
-        let list = if count == 0 {
-            div()
-                .h(px(ROW_HEIGHT * 2.))
+        let (list, height) = if count == 0 {
+            let empty = div()
+                .h(px(EMPTY_HEIGHT))
                 .px_4()
                 .flex()
                 .items_center()
@@ -399,10 +453,11 @@ impl<D: PickerDelegate> Render for Picker<D> {
                     empty.child(icon(IconName::Search, ui.dim).size(px(14.)))
                 })
                 .child(div().truncate().child(self.delegate.empty_message()))
-                .into_any_element()
+                .into_any_element();
+            (empty, EMPTY_HEIGHT)
         } else {
             let height = row_height * count.min(MAX_VISIBLE_ROWS) as f32;
-            uniform_list(
+            let list = uniform_list(
                 "picker-matches",
                 count,
                 cx.processor(|this, range: Range<usize>, window, cx| {
@@ -413,8 +468,17 @@ impl<D: PickerDelegate> Render for Picker<D> {
             )
             .track_scroll(self.scroll.clone())
             .h(px(height))
-            .into_any_element()
+            .into_any_element();
+            (list, height)
         };
+        // The list keeps its own height (its scrolling counts on it); what shows of it glides.
+        let key = self.height_key(height, cx);
+        let list = div().overflow_hidden().child(list).with_transition(
+            ("picker-list-height", key),
+            height,
+            motion::SMOOTH,
+            |list, height| list.h(px(height)),
+        );
         let footer = self
             .delegate
             .show_footer()
@@ -454,7 +518,7 @@ impl<D: PickerDelegate> Render for Picker<D> {
                     ui,
                 ))
         });
-        ui::popover(ui)
+        let popover = ui::popover(ui)
             .key_context(self.delegate.key_context())
             .when(!searchable, |popover| popover.track_focus(&self.focus))
             .w(px(self.delegate.width()))
@@ -473,22 +537,29 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .child(div().py(px(LIST_INSET)).child(list))
             .when_some(hints, |popover, hints| {
                 popover.child(ui::divider(ui)).child(hints)
-            })
+            });
+        if self.delegate.placed() {
+            popover.into_any_element()
+        } else {
+            // Waiting for its place: not seen, no mouse — the query field already has the keys.
+            motion::inert(popover.opacity(0.)).into_any_element()
+        }
     }
 }
 
-/// A pulsing dot: the matches are still coming (as Find in Files' search in progress).
-fn pulse(color: Hsla) -> impl IntoElement {
-    div()
-        .flex_none()
-        .size(px(7.))
-        .rounded(px(4.))
-        .bg(color)
-        .with_animation(
-            "picker-loading",
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
-        )
+/// A pulsing dot: the matches are still coming (as Find in Files' search in progress); still when
+/// motion is off.
+fn pulse(color: Hsla) -> AnyElement {
+    let dot = div().flex_none().size(px(7.)).rounded(px(4.)).bg(color);
+    if !motion::enabled() {
+        return dot.into_any_element();
+    }
+    dot.with_animation(
+        "picker-loading",
+        Animation::new(Duration::from_millis(900)).repeat(),
+        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+    )
+    .into_any_element()
 }
 
 /// Text with highlighted characters: `positions` are `char` indices (as in

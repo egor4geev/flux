@@ -181,6 +181,9 @@ pub struct AppearanceSettings {
     /// The interface scale (part 10.4), 1.0 — 100 %: the whole window, the code included, as Zoom
     /// IDE of JetBrains IDEs (`crate::ui_scale`).
     pub ui_scale: f32,
+    /// Animations (2026-10-28, `crate::motion`): off, things simply appear. macOS's "Reduce
+    /// motion" turns them off too.
+    pub animations: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -194,6 +197,7 @@ impl Default for AppearanceSettings {
             language: LanguageChoice::default(),
             ui_style: UiStyle::default(),
             ui_scale: 1.,
+            animations: true,
         }
     }
 }
@@ -319,11 +323,18 @@ pub struct ClaudeSettings {
     /// After an edit of Claude, the problems language servers find in the file go back to Claude.
     pub report_problems: bool,
     /// After a `!` command, Claude answers its output at once (a turn starts); off — the output
-    /// only goes to Claude as context for the next message (part 10.2).
-    pub respond_to_commands: bool,
+    /// only goes to Claude as context for the next message (part 10.2); ⌘↵ runs a command the
+    /// other way. Saved as `answer_commands`: the earlier `respond_to_commands` was off by default
+    /// and every saved file kept that `false`, so a new key lets the new default (on) take hold.
+    pub answer_commands: bool,
     /// A macOS notification when a session finishes or waits for an answer while Flux isn't the
     /// active app (part 10.2).
     pub system_notifications: bool,
+    /// The country check (part «Флаг страны», [`crate::region_guard`]): Claude is blocked while
+    /// the IP address is in one of `blocked_countries` or its country can't be told.
+    pub country_check: bool,
+    /// ISO 3166-1 alpha-2 codes, upper case; Russia by default.
+    pub blocked_countries: Vec<String>,
 }
 
 impl Default for ClaudeSettings {
@@ -341,8 +352,10 @@ impl Default for ClaudeSettings {
             restore_sessions: true,
             flux_tools: true,
             report_problems: true,
-            respond_to_commands: false,
+            answer_commands: true,
             system_notifications: true,
+            country_check: true,
+            blocked_countries: vec!["RU".to_string()],
         }
     }
 }
@@ -710,6 +723,12 @@ pub fn ui_style(cx: &App) -> UiStyle {
 pub fn ui_scale(cx: &App) -> f32 {
     cx.try_global::<Settings>()
         .map_or(1., |settings| settings.appearance.ui_scale)
+}
+
+/// Animations are on in the settings (`crate::motion::enabled` also asks macOS).
+pub fn animations(cx: &App) -> bool {
+    cx.try_global::<Settings>()
+        .is_none_or(|settings| settings.appearance.animations)
 }
 
 /// How a Markdown file opens (part 10.4).
@@ -1102,6 +1121,7 @@ fn parse_appearance(value: &Value) -> AppearanceSettings {
             .map(|scale| scale as f32)
             .filter(|scale| scale.is_finite())
             .map_or(1., crate::ui_scale::clamp),
+        animations: value["animations"].as_bool().unwrap_or(true),
     }
 }
 
@@ -1141,12 +1161,25 @@ fn parse_claude(value: &Value) -> ClaudeSettings {
         report_problems: value["report_problems"]
             .as_bool()
             .unwrap_or(defaults.report_problems),
-        respond_to_commands: value["respond_to_commands"]
+        answer_commands: value["answer_commands"]
             .as_bool()
-            .unwrap_or(defaults.respond_to_commands),
+            .unwrap_or(defaults.answer_commands),
         system_notifications: value["system_notifications"]
             .as_bool()
             .unwrap_or(defaults.system_notifications),
+        country_check: value["country_check"]
+            .as_bool()
+            .unwrap_or(defaults.country_check),
+        // An empty list stays empty (then only a country that can't be told blocks Claude).
+        blocked_countries: value["blocked_countries"]
+            .as_array()
+            .map(|codes| {
+                codes
+                    .iter()
+                    .filter_map(|code| flux_claude::region::normalize(code.as_str()?))
+                    .collect()
+            })
+            .unwrap_or(defaults.blocked_countries),
     }
 }
 
@@ -1191,6 +1224,7 @@ fn known_json(settings: &Settings) -> Value {
             "ui_style": settings.appearance.ui_style.key(),
             // 0.9, not the f32's 0.8999999761581421.
             "ui_scale": (f64::from(settings.appearance.ui_scale) * 100.).round() / 100.,
+            "animations": settings.appearance.animations,
         },
         "claude": {
             "enabled": settings.claude.enabled,
@@ -1205,8 +1239,10 @@ fn known_json(settings: &Settings) -> Value {
             "restore_sessions": settings.claude.restore_sessions,
             "flux_tools": settings.claude.flux_tools,
             "report_problems": settings.claude.report_problems,
-            "respond_to_commands": settings.claude.respond_to_commands,
+            "answer_commands": settings.claude.answer_commands,
             "system_notifications": settings.claude.system_notifications,
+            "country_check": settings.claude.country_check,
+            "blocked_countries": settings.claude.blocked_countries,
         },
         "projects": {
             "open_in": settings.projects.open_in.key(),
@@ -1269,8 +1305,10 @@ mod tests {
                 restore_sessions: false,
                 flux_tools: false,
                 report_problems: false,
-                respond_to_commands: true,
+                answer_commands: false,
                 system_notifications: false,
+                country_check: false,
+                blocked_countries: vec!["RU".to_string(), "BY".to_string()],
             },
             appearance: AppearanceSettings {
                 theme: Some("Flux Day".to_string()),
@@ -1281,6 +1319,7 @@ mod tests {
                 language: LanguageChoice::Russian,
                 ui_style: UiStyle::Flat,
                 ui_scale: 1.25,
+                animations: false,
             },
             check_plugin_updates: false,
             ignored_suggestions: BTreeSet::from(["*.rs".to_string()]),

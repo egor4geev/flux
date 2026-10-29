@@ -13,10 +13,11 @@
 //! Also here: Show History (the active file) and Show History for Selection (its selected lines) —
 //! tabs of the Git window, which `git::ShowHistory` opens.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::text::line_start;
 use flux_core::transaction::Operation;
@@ -34,7 +35,9 @@ use crate::diff_view::DiffSide;
 use crate::editor::Editor;
 use crate::element::LayoutCache;
 use crate::git;
+use crate::git_gutter::PopupMotion;
 use crate::i18n::{tr, trf};
+use crate::motion;
 use crate::popup::{POPUP_GAP, WINDOW_MARGIN};
 use crate::theme::{self, Theme, UiColors};
 use crate::workspace::Workspace;
@@ -76,6 +79,30 @@ pub struct BlameState {
     menu: Option<GutterMenu>,
     /// Where the annotation column was drawn last (the mouse is matched against it).
     pub(crate) column: Option<Bounds<Pixels>>,
+    /// The column's width on its way to a new one.
+    width: Cell<WidthGlide>,
+}
+
+/// The annotation column's width gliding to a new one ([`motion::SMOOTH`]): annotations turned on
+/// or off, a longer author's name read — the text beside it moves over instead of jumping.
+#[derive(Clone, Copy, Default)]
+struct WidthGlide {
+    from: f32,
+    to: f32,
+    since: Option<Instant>,
+}
+
+impl WidthGlide {
+    /// The width now, and whether the glide has ended.
+    fn at(&self) -> (f32, bool) {
+        match self.since {
+            Some(since) => {
+                let (t, done) = motion::SMOOTH.at(since.elapsed());
+                (motion::lerp(self.from, self.to, t), done)
+            }
+            None => (self.to, true),
+        }
+    }
 }
 
 impl BlameState {
@@ -99,11 +126,15 @@ struct Annotations {
     /// The longest author label, in characters (the column's width).
     author_chars: usize,
     loaded: bool,
+    /// When the first annotations came: their labels and shades fade in ([`motion::FADE`]).
+    loaded_at: Option<Instant>,
     version: u64,
     task: Option<Task<()>>,
     /// The commit under the mouse (its lines are highlighted), and the popup.
     hovered: Option<usize>,
     popup: Option<CommitPopup>,
+    /// The popup closing, and moving to another line.
+    popup_motion: PopupMotion<CommitPopup>,
     popup_hovered: bool,
     popup_task: Option<Task<()>>,
     /// Whole messages read for the popup, by commit.
@@ -112,6 +143,7 @@ struct Annotations {
     menu_commit: Option<usize>,
 }
 
+#[derive(Clone)]
 struct CommitPopup {
     commit: usize,
     /// The line the mouse was on: the popup stands next to it.
@@ -159,10 +191,12 @@ pub fn toggle(editor: &mut Editor, cx: &mut Context<Editor>) {
         lines: Vec::new(),
         author_chars: 0,
         loaded: false,
+        loaded_at: None,
         version: 0,
         task: None,
         hovered: None,
         popup: None,
+        popup_motion: PopupMotion::default(),
         popup_hovered: false,
         popup_task: None,
         messages: HashMap::new(),
@@ -245,6 +279,9 @@ impl Annotations {
         self.shades = shades(&blame.commits);
         self.commits = Arc::new(blame.commits);
         self.lines = blame.lines;
+        if !self.loaded && motion::enabled() {
+            self.loaded_at = Some(Instant::now());
+        }
         self.loaded = true;
         self.messages.clear();
         self.popup = None;
@@ -390,16 +427,32 @@ fn short_author(author: &str) -> String {
 
 // --- The column ---
 
-/// The width of the annotation column (0 without annotations): date, author, padding.
-pub fn column_width(state: &BlameState, em: Pixels) -> Pixels {
-    match &state.annotations {
+/// The width of the annotation column (0 without annotations): date, author, padding. A new width
+/// glides in ([`WidthGlide`]), asking for frames while it does.
+pub fn column_width(state: &BlameState, em: Pixels, window: &Window) -> Pixels {
+    let target = match &state.annotations {
         Some(annotations) => {
             let chars = DATE_CHARS + 2 + annotations.author_chars.max(6);
             // The labels are smaller than the code: their characters are narrower.
-            em * (chars as f32 * LABEL_FONT_SIZE / theme::FONT_SIZE) + px(12.)
+            f32::from(em * (chars as f32 * LABEL_FONT_SIZE / theme::FONT_SIZE) + px(12.))
         }
-        None => px(0.),
+        None => 0.,
+    };
+    let mut glide = state.width.get();
+    if (glide.to - target).abs() > 0.01 {
+        // From where it is on its way.
+        glide = WidthGlide {
+            from: glide.at().0,
+            to: target,
+            since: motion::enabled().then(Instant::now),
+        };
+        state.width.set(glide);
     }
+    let (width, done) = glide.at();
+    if !done {
+        window.request_animation_frame();
+    }
+    px(width.max(0.))
 }
 
 /// The column of the visible lines.
@@ -447,6 +500,10 @@ pub fn prepaint(
     if column.size.width <= px(0.) {
         return paint;
     }
+    // The first labels fade in.
+    let shown = annotations
+        .loaded_at
+        .map_or(1., |since| motion::animate(since, motion::FADE, window));
     let text_system = window.text_system().clone();
     let font = font(theme::code_font());
     let font_size = px(LABEL_FONT_SIZE);
@@ -478,7 +535,8 @@ pub fn prepaint(
             ui.hover
         } else {
             UiColors::tint(ui.blame_recent, ui.blame_recent.a * shade)
-        };
+        }
+        .opacity(shown);
         // All the rows of a line that wraps (part 10.5); the labels go on its first.
         paint.quads.push(fill(
             Bounds::new(
@@ -499,7 +557,8 @@ pub fn prepaint(
             ui.foreground
         } else {
             ui.text_muted
-        };
+        }
+        .opacity(shown);
         let y = top + (line_height - font_size * 1.3) / 2.;
         for (text, x) in [(date, date_x), (author, author_x)] {
             let runs = [run(text.len(), color)];
@@ -585,9 +644,9 @@ pub fn mouse_moved(editor: &mut Editor, event: &MouseMoveEvent, cx: &mut Context
     {
         return;
     }
-    // Another commit: its popup replaces the shown one at once, or comes after a moment.
+    // Another commit: its popup takes the shown one's place (gliding there), or comes after a
+    // moment.
     let immediate = annotations.popup.is_some();
-    annotations.popup = None;
     annotations.popup_task = Some(cx.spawn(async move |this, cx| {
         if !immediate {
             cx.background_executor().timer(POPUP_SHOW_DELAY).await;
@@ -598,6 +657,9 @@ pub fn mouse_moved(editor: &mut Editor, event: &MouseMoveEvent, cx: &mut Context
                 if annotations.hovered == Some(commit) {
                     annotations.popup = Some(CommitPopup { commit, line });
                     load_message(editor, commit, cx);
+                    cx.notify();
+                } else if !annotations.popup_hovered && annotations.popup.take().is_some() {
+                    // The mouse went on before it came: the popup of the commit before goes too.
                     cx.notify();
                 }
             }
@@ -813,32 +875,104 @@ pub fn actions(root: Div, editor: &Editor, cx: &mut Context<Editor>) -> Div {
 // --- Popups ---
 
 /// The gutter's menu and the commit popup, over the editor.
-pub fn render(editor: &Editor, window: &mut Window, cx: &mut Context<Editor>) -> Vec<AnyElement> {
+pub fn render(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> Vec<AnyElement> {
+    // The slot is drawn while there is no menu too: a menu that closed fades out.
+    let menu = editor.blame.menu.as_ref();
+    let mut elements = vec![ContextMenu::slot(
+        "blame-menu",
+        menu.map(|menu| (&menu.menu, menu.position)),
+    )];
+    elements.extend(render_popup(editor, window, cx));
+    elements
+}
+
+/// The commit popup beside the line under the mouse. It grows out of the line; moved to another
+/// commit, it glides there and its content fades in; closed, it fades out.
+fn render_popup(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> Vec<AnyElement> {
+    let open = editor
+        .blame
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.popup.clone())
+        .and_then(|popup| Some((place(editor, &popup)?, popup)));
+    let scroll = editor.scroll.y;
+    let Some(annotations) = editor.blame.annotations.as_mut() else {
+        return Vec::new();
+    };
+    let leaving = annotations.popup_motion.frame(
+        open.as_ref()
+            .map(|(position, popup)| (popup, f32::from(position.y) + scroll)),
+        |a, b| a.commit == b.commit,
+        window,
+    );
+    let fade = annotations.popup_motion.content(window);
+    let offset = annotations.popup_motion.offset(window);
     let mut elements = Vec::new();
-    if let Some(menu) = &editor.blame.menu {
-        elements.push(ContextMenu::overlay(&menu.menu, menu.position));
+    if let Some((popup, progress)) = leaving
+        && let Some(position) = place(editor, &popup)
+        && let Some(panel) = panel(editor, &popup, None, cx)
+    {
+        let panel = motion::inert(motion::leaving_from(panel, progress, position));
+        // Its own ids: the popup of another commit may be open beside it.
+        elements.push(overlay(
+            position,
+            div().id("blame-popup-leaving").child(panel),
+        ));
     }
-    if let Some(popup) = render_popup(editor, window, cx) {
-        elements.push(popup);
+    if let Some((position, popup)) = open
+        && let Some(panel) = panel(editor, &popup, Some(fade), cx)
+    {
+        let position = point(position.x, position.y + px(offset));
+        let panel = motion::Appear::pop((0., 0.)).apply_from("blame-popup-pop", position, panel);
+        elements.push(overlay(position, panel));
     }
     elements
 }
 
-fn render_popup(
-    editor: &Editor,
-    window: &mut Window,
-    cx: &mut Context<Editor>,
-) -> Option<AnyElement> {
-    let annotations = editor.blame.annotations.as_ref()?;
-    let popup = annotations.popup.as_ref()?;
+/// Where the popup of the line stands: right of the column, level with the line; `None` while the
+/// line is out of view.
+fn place(editor: &Editor, popup: &CommitPopup) -> Option<Point<Pixels>> {
     let column = editor.blame.column?;
     let layout = editor.layout.as_ref()?;
-    let commit = annotations.commits.get(popup.commit)?;
-    let ui = Theme::ui(cx);
     let top = layout.line_top(popup.line);
     if top < column.top() || top > column.bottom() {
         return None;
     }
+    Some(point(column.right() + px(POPUP_GAP), top))
+}
+
+/// A popup over the window at `position`, kept inside it.
+fn overlay(position: Point<Pixels>, panel: impl IntoElement) -> AnyElement {
+    deferred(
+        anchored()
+            .anchor(Corner::TopLeft)
+            .position(position)
+            .snap_to_window_with_margin(px(WINDOW_MARGIN))
+            .child(panel),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
+/// The popup's panel. `fade`: how far its content has faded in (taking another commit's place);
+/// `None` — a popup leaving, without the listeners that would act on the mouse anywhere.
+fn panel(
+    editor: &Editor,
+    popup: &CommitPopup,
+    fade: Option<f32>,
+    cx: &mut Context<Editor>,
+) -> Option<gpui::Stateful<Div>> {
+    let annotations = editor.blame.annotations.as_ref()?;
+    let commit = annotations.commits.get(popup.commit)?;
+    let ui = Theme::ui(cx);
     let index = popup.commit;
     let message = annotations
         .messages
@@ -917,6 +1051,17 @@ fn render_popup(
         .child(link("blame-copy", tr("Copy Revision Number")).on_click(
             cx.listener(move |editor, _: &ClickEvent, _, cx| copy_revision(editor, index, cx)),
         ));
+    let content = div()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .opacity(fade.unwrap_or(1.))
+        .child(header)
+        .children(email)
+        .children(path_note)
+        .child(div().h(px(1.)).bg(ui.divider))
+        .child(body)
+        .child(footer);
     let panel = crate::popup::panel(ui)
         .id("blame-popup")
         .occlude()
@@ -924,40 +1069,28 @@ fn render_popup(
         .p_3()
         .flex()
         .flex_col()
-        .gap_1p5()
-        .on_hover(cx.listener(|editor, hovered: &bool, _, cx| {
-            if let Some(annotations) = editor.blame.annotations.as_mut() {
-                annotations.popup_hovered = *hovered;
-                if !*hovered && annotations.hovered.is_none() {
-                    annotations.popup = None;
+        .child(content);
+    if fade.is_none() {
+        return Some(panel);
+    }
+    Some(
+        panel
+            .on_hover(cx.listener(|editor, hovered: &bool, _, cx| {
+                if let Some(annotations) = editor.blame.annotations.as_mut() {
+                    annotations.popup_hovered = *hovered;
+                    if !*hovered && annotations.hovered.is_none() {
+                        annotations.popup = None;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_down_out(cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                if let Some(annotations) = editor.blame.annotations.as_mut()
+                    && annotations.popup.take().is_some()
+                {
                     cx.notify();
                 }
-            }
-        }))
-        .on_mouse_down_out(cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-            if let Some(annotations) = editor.blame.annotations.as_mut()
-                && annotations.popup.take().is_some()
-            {
-                cx.notify();
-            }
-        }))
-        .child(header)
-        .children(email)
-        .children(path_note)
-        .child(div().h(px(1.)).bg(ui.divider))
-        .child(body)
-        .child(footer);
-    let _ = window;
-    Some(
-        deferred(
-            anchored()
-                .anchor(Corner::TopLeft)
-                .position(point(column.right() + px(POPUP_GAP), top))
-                .snap_to_window_with_margin(px(WINDOW_MARGIN))
-                .child(panel),
-        )
-        .with_priority(1)
-        .into_any_element(),
+            })),
     )
 }
 

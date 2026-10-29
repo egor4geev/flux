@@ -1211,17 +1211,32 @@ impl Render for NewBranchDialog {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1p5()
-                    .child(self.input.clone())
-                    .when(!prefixes.is_empty(), |field| {
-                        field.child(div().flex().flex_wrap().gap_1p5().children(prefixes))
-                    })
-                    .children(error.map(|error| {
+                    .child(
                         div()
-                            .text_size(px(theme::TEXT_SM))
-                            .text_color(ui.error)
-                            .child(error)
-                    })),
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .child(self.input.clone())
+                            .when(!prefixes.is_empty(), |field| {
+                                field.child(div().flex().flex_wrap().gap_1p5().children(prefixes))
+                            }),
+                    )
+                    // The dialog grows to a message, which fades in (another one too), and shrinks
+                    // back when it goes.
+                    .child(crate::motion::glide_height(
+                        "new-branch-error",
+                        div().children(error.map(|error| {
+                            let key = SharedString::from(error.to_string());
+                            crate::motion::Appear::fade().apply(
+                                key,
+                                div()
+                                    .pt_1p5()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.error)
+                                    .child(error),
+                            )
+                        })),
+                    )),
             )
             .child(
                 div()

@@ -16,8 +16,8 @@ attacker gains.
 - **The plugin sandbox.** A plugin reaching beyond the permissions it was installed with: files
   outside its project or its folder, hosts its `network` permission doesn't name, programs or
   terminals it may not run, the data, settings or secrets of another plugin.
-- **Secrets.** Plugins' tokens and passwords, kept in the macOS keychain, getting out — to another
-  plugin, to `settings.json`, to a log.
+- **Secrets.** Plugins' tokens and passwords, which Flux keeps encrypted in a file only the user
+  can read, getting out — to another plugin, to `settings.json`, to a log.
 - **The Marketplace.** Flux installing a package whose SHA-256 differs from the catalog's index, or
   from somewhere else than the catalog says.
 - **Flux itself.** Opening a project, a file or a link running code you didn't ask for — through a

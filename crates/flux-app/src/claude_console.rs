@@ -13,13 +13,18 @@
 //! go into its chat; F2 renames, ⌘⌫ closes (out of "Now", into the history), the menu archives
 //! (out of the history too), ⇧F10 opens the menu, ⌘F filters "All". While `claude` isn't ready, the console says what to do about it: install (the command
 //! typed into a terminal), sign in, try again.
+//!
+//! The country check (part «Флаг страны», [`crate::region_guard`]): the flag next to the title, and
+//! while Claude is blocked a banner over the list says why, with Check Again; asked again after a
+//! block, it says Flux is checking.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, SystemTime};
+use std::ops::Range;
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
-    Action, Animation, AnimationExt, AnyElement, App, ClickEvent, Context, DismissEvent, Entity,
-    EntityId, EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton,
+    Action, Animation, AnimationExt, AnyElement, App, ClickEvent, Context, DismissEvent, ElementId,
+    Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton,
     MouseDownEvent, NoAction, Pixels, Point, Render, ScrollHandle, SharedString, Subscription,
     Window, actions, div, point, prelude::*, px,
 };
@@ -36,6 +41,9 @@ use crate::git_log::local_offset;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::motion::{self, Appear, Disclosure, Leaving, TransitionExt, unfold_style};
+use crate::region_guard::{self, Verdict};
+use crate::region_status;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 
@@ -88,8 +96,7 @@ const STATUS_WIDTH: f32 = 16.;
 const STATUS_GAP: f32 = 12.;
 /// A history row: one line, the title and when.
 const HISTORY_ROW_HEIGHT: f32 = 28.;
-/// How long a waiting question takes to slide open, and the height it opens to at most.
-const OPEN_DURATION: Duration = Duration::from_millis(220);
+/// The height a waiting question slides open to at most (`motion::SMOOTH`).
 const OPEN_HEIGHT: f32 = 600.;
 /// How many options a question offers in the console (digits 1–9).
 const MAX_OPTIONS: usize = 9;
@@ -98,6 +105,8 @@ const RECENT: Duration = Duration::from_secs(12 * 60 * 60);
 const WEEK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// The onboarding column's width at most.
 const ONBOARDING_WIDTH: f32 = 300.;
+/// How far a row that has just come (a new session, one closed into "Recent") drops into place.
+const ARRIVAL_DROP: f32 = 8.;
 
 pub fn init(cx: &mut App) {
     let context = Some(CONTEXT);
@@ -217,6 +226,23 @@ pub struct ClaudeConsole {
     picks: HashMap<String, Picks>,
     menu: Option<Menu>,
     scroll: ScrollHandle,
+    /// The country check's last answer blocked Claude: while it asks again, the banner says so.
+    region_blocked: bool,
+    /// The history's groups opening and closing: the chevron of one the user clicked turns, the
+    /// rows of one they opened unfold.
+    disclosure: Disclosure<Section>,
+    /// The rows of the last frame, to tell the ones that have just come; `None` before the first.
+    shown: Option<Shown>,
+    /// The rows that came after the first frame, and when: they drop into place.
+    arrivals: HashMap<RowKey, Instant>,
+    /// Each live session's phrase tone, and when it last changed: the phrase fades in in its new
+    /// tone (Working → Done → Asks).
+    tones: HashMap<EntityId, (Tone, Option<Instant>)>,
+    /// What each live session shows open under it — a question card as last drawn, a plan's
+    /// approval — by its request.
+    waiting: HashMap<EntityId, (String, Waiting)>,
+    /// The cards just answered (here or in the chat): drawn on, taking no input, as they collapse.
+    answered: HashMap<EntityId, Leaving<Waiting>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -225,10 +251,20 @@ impl EventEmitter<ClaudeConsoleEvent> for ClaudeConsole {}
 impl ClaudeConsole {
     pub fn new(store: Entity<ClaudeStore>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| TextInput::new(tr("Filter sessions"), cx).icon(IconName::Search));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe(&filter, |_, _, _: &InputEvent, cx| cx.notify()),
         ];
+        // The console may be drawn from its cache: it follows the country check itself.
+        if let Some(guard) = region_guard::global(cx) {
+            subscriptions.push(cx.observe(&guard, |this, guard, cx| {
+                let verdict = guard.read(cx).verdict();
+                if *verdict != Verdict::Checking {
+                    this.region_blocked = verdict.blocks();
+                }
+                cx.notify()
+            }));
+        }
         store.update(cx, |store, cx| store.refresh_saved(cx));
         Self {
             store,
@@ -243,6 +279,13 @@ impl ClaudeConsole {
             picks: HashMap::new(),
             menu: None,
             scroll: ScrollHandle::new(),
+            region_blocked: region_guard::verdict(cx).blocks(),
+            disclosure: Disclosure::default(),
+            shown: None,
+            arrivals: HashMap::new(),
+            tones: HashMap::new(),
+            waiting: HashMap::new(),
+            answered: HashMap::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -464,7 +507,10 @@ impl ClaudeConsole {
     }
 
     fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
-        self.all_open = true;
+        if !self.all_open {
+            self.all_open = true;
+            self.disclosure.toggled(Section::All, true);
+        }
         let focus = self.filter.focus_handle(cx);
         window.focus(&focus);
         self.filter.update(cx, |filter, cx| filter.select_all(cx));
@@ -548,6 +594,11 @@ impl ClaudeConsole {
             return;
         }
         let answers = crate::claude_cards::question_answers(&quick.questions, &picks.chosen, &[]);
+        // The card leaves as it was answered: the last pick checked.
+        if let Some((_, Waiting::Question(shown))) = self.waiting.get_mut(&session.entity_id()) {
+            shown.step = quick.step;
+            shown.chosen = picks.chosen[quick.step].clone();
+        }
         self.picks.remove(&quick.request);
         let request = quick.request;
         session.update(cx, |session, cx| {
@@ -708,6 +759,25 @@ impl ClaudeConsole {
         let ui = Theme::ui(cx);
         let ready = self.store.read(cx).is_ready();
         let new_keys = ui::shortcut_for(&claude::NewSession, cx);
+        // Where the network sees this Mac: the flag, the rest in its tooltip.
+        let region = region_status::mark(
+            &region_guard::verdict(cx),
+            13.,
+            "claude-console-region-pulse",
+            ui,
+        )
+        .map(|mark| {
+            div()
+                .id("claude-console-region")
+                .flex_none()
+                .flex()
+                .items_center()
+                .child(mark)
+                .tooltip(|window, cx| {
+                    let text = region_status::tooltip_text(&region_guard::verdict(cx));
+                    ui::tooltip(text, None)(window, cx)
+                })
+        });
         div()
             .flex_none()
             .h(px(HEADER_HEIGHT))
@@ -731,7 +801,8 @@ impl ClaudeConsole {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(ui.foreground)
                             .child(tr("Claude")),
-                    ),
+                    )
+                    .children(region),
             )
             .when(ready, |header| {
                 header.child(
@@ -753,6 +824,77 @@ impl ClaudeConsole {
                         }),
                     ),
             )
+    }
+
+    /// Over the list while Claude is blocked: why, and Check Again; asked again after a block —
+    /// that Flux is checking.
+    fn render_region_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ui = Theme::ui(cx);
+        let verdict = region_guard::verdict(cx);
+        let banner = div()
+            .flex_none()
+            .mx(px(ROW_INSET))
+            .mt_0p5()
+            .mb_1()
+            .py(px(10.))
+            .px(px(ROW_PADDING))
+            .flex()
+            .gap(px(10.))
+            .rounded(px(RADIUS_MD))
+            .border_1()
+            .text_size(px(theme::TEXT_SM));
+        if verdict == Verdict::Checking && self.region_blocked {
+            return Some(
+                banner
+                    .items_center()
+                    .border_color(ui.island_border)
+                    .bg(ui.input_background)
+                    .text_color(ui.text_muted)
+                    .child(spinner_dot(ui))
+                    .child(tr("Checking the country…"))
+                    .into_any_element(),
+            );
+        }
+        let refusal = verdict.refusal()?;
+        let mark = region_status::mark(&verdict, 15., "claude-console-banner-pulse", ui);
+        Some(
+            banner
+                .border_color(UiColors::tint(ui.error, 0.32))
+                .bg(UiColors::tint(ui.error, 0.09))
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .children(mark),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .line_height(px(18.))
+                                .text_color(ui.foreground)
+                                .child(refusal.message()),
+                        )
+                        .child(
+                            ui::text_button(
+                                "claude-console-check-country",
+                                tr("Check Again"),
+                                false,
+                                ui,
+                            )
+                            .on_click(|_, _, cx| region_guard::check_again(cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// A group's caption: "Now", "Recent", "This Week".
@@ -785,22 +927,43 @@ impl ClaudeConsole {
     /// The common part of every row: selection, hover, click (open), right click (menu).
     fn row_shell(
         &self,
-        index: usize,
         row: &Row,
         focused: bool,
         ui: UiColors,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let key = row.key.clone();
-        let fill = self.row_fill(&key, focused, ui);
+        let selected = self.selected.as_ref() == Some(&key);
+        let fill = self
+            .row_fill(&key, focused, ui)
+            .unwrap_or(gpui::transparent_black());
         let item = row.item.clone();
         div()
-            .id(("claude-console-row", index))
+            .id(row_element_id(&key))
+            .relative()
             .mx(px(ROW_INSET))
             .px(px(ROW_PADDING))
             .rounded(px(RADIUS_MD))
             .cursor_pointer()
-            .when_some(fill, |row, fill| row.bg(fill))
+            // The highlight, under the content: the selected row's fades between the focused and
+            // the unfocused color, a hovered row's in and out. Keyed by the selection — a
+            // selection moved with the keyboard jumps.
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(RADIUS_MD))
+                    .with_transition(
+                        if selected {
+                            "claude-console-selected"
+                        } else {
+                            "claude-console-fill"
+                        },
+                        fill,
+                        motion::FADE,
+                        |layer, fill| layer.bg(fill),
+                    ),
+            )
             .on_hover(cx.listener({
                 let key = key.clone();
                 move |this, hovered: &bool, _, cx| {
@@ -844,10 +1007,11 @@ impl ClaudeConsole {
 
     /// A session of "Now": its dot, its title, what it does; quick actions when hovered or selected.
     fn render_session(
-        &self,
+        &mut self,
         index: usize,
         row: &Row,
         focused: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let ui = Theme::ui(cx);
@@ -855,7 +1019,7 @@ impl ClaudeConsole {
         let active =
             self.selected.as_ref() == Some(&row.key) || self.hovered.as_ref() == Some(&row.key);
         let shell = self
-            .row_shell(index, row, focused, ui, cx)
+            .row_shell(row, focused, ui, cx)
             .py(px(10.))
             .flex()
             .gap(px(STATUS_GAP));
@@ -927,6 +1091,16 @@ impl ClaudeConsole {
                 };
                 let title_text = session.read(cx).title();
                 let id = session.entity_id();
+                // A new tone fades in (`motion::FADE`): the phrase in it, or the question.
+                let fade = self
+                    .note_tone(id, phrase.tone)
+                    .map_or(1., |since| motion::animate(since, motion::FADE, window));
+                let current = request.clone().and_then(|request| match (&quick, plan) {
+                    (Some(quick), _) => Some((request, Waiting::Question(quick.clone()))),
+                    (None, true) => Some((request, Waiting::Plan)),
+                    _ => None,
+                });
+                self.note_waiting(id, current);
                 let mut main = div()
                     .flex_1()
                     .min_w_0()
@@ -948,12 +1122,14 @@ impl ClaudeConsole {
                         .text_size(px(theme::TEXT_SM))
                         .text_color(tone)
                         .line_clamp(3)
+                        .when(fade < 1., |text| text.opacity(fade))
                         .child(text)
                 } else {
                     div()
                         .truncate()
                         .text_size(px(theme::TEXT_SM))
                         .text_color(tone)
+                        .when(fade < 1., |text| text.opacity(fade))
                         .child(phrase.text)
                 });
                 let mut extra: Option<AnyElement> = None;
@@ -963,54 +1139,50 @@ impl ClaudeConsole {
                             .into_any_element(),
                     );
                 } else if plan {
-                    let approve = session.clone();
-                    let open = session.clone();
-                    extra = Some(
-                        div()
-                            .mt_2()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                ui::primary_button(
-                                    ("claude-console-approve", index),
-                                    tr("Approve"),
-                                    true,
-                                    ui,
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _: &ClickEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.approve_plan(&approve, cx)
-                                    },
-                                )),
-                            )
-                            .child(
-                                ui::text_button(
-                                    ("claude-console-plan", index),
-                                    tr("Open the Plan"),
-                                    false,
-                                    ui,
-                                )
-                                .on_click(cx.listener(
-                                    move |_, _: &ClickEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        cx.emit(ClaudeConsoleEvent::Open(SessionRef::Live(
-                                            open.clone(),
-                                        )))
-                                    },
-                                )),
-                            )
+                    extra = Some(self.render_plan(index, session, ui, cx));
+                }
+                // An answered card collapses, fading, taking no input (`motion::EXIT`).
+                if extra.is_none()
+                    && let Some(leaving) = self.answered.get(&id)
+                {
+                    let progress = leaving.progress(window);
+                    let card = match &leaving.value {
+                        Waiting::Question(quick) => self
+                            .render_options(session, quick, ui, cx)
                             .into_any_element(),
-                    );
+                        Waiting::Plan => self.render_plan(index, session, ui, cx),
+                    };
+                    main = main.child(motion::inert(motion::leaving_style(
+                        div()
+                            .id("claude-console-answered")
+                            .overflow_hidden()
+                            .max_h(px(OPEN_HEIGHT * (1. - progress)))
+                            .child(card),
+                        progress,
+                        (0.5, 0.),
+                    )));
                 }
                 // It slides open when the session starts to wait: once per question (the
                 // animation's id), then it stays still — no frames asked for after.
                 if let (Some(extra), Some(request)) = (extra, request) {
-                    main = main.child(div().overflow_hidden().child(extra).with_animation(
-                        SharedString::from(format!("claude-console-open-{request}")),
-                        Animation::new(OPEN_DURATION).with_easing(gpui::ease_out_quint()),
-                        |content, delta| content.max_h(px(OPEN_HEIGHT * delta)).opacity(delta),
-                    ));
+                    let content = div().overflow_hidden().child(extra);
+                    main = main.child(if motion::enabled() {
+                        let curve = motion::SMOOTH;
+                        content
+                            .with_animation(
+                                SharedString::from(format!("claude-console-open-{request}")),
+                                Animation::new(curve.duration())
+                                    .with_easing(move |t| curve.ease(t)),
+                                |content, delta| {
+                                    content
+                                        .max_h(px(OPEN_HEIGHT * delta))
+                                        .opacity(delta.min(1.))
+                                },
+                            )
+                            .into_any_element()
+                    } else {
+                        content.into_any_element()
+                    });
                 }
                 let actions = (active && done && has_changes).then(|| {
                     let review = session.clone();
@@ -1059,6 +1231,80 @@ impl ClaudeConsole {
                     .children(actions)
                     .into_any_element()
             }
+        }
+    }
+
+    /// A waiting plan's approval under its session: Approve, Open the Plan.
+    fn render_plan(
+        &self,
+        index: usize,
+        session: &Entity<ClaudeSession>,
+        ui: UiColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let approve = session.clone();
+        let open = session.clone();
+        div()
+            .mt_2()
+            .flex()
+            .gap_2()
+            .child(
+                ui::primary_button(("claude-console-approve", index), tr("Approve"), true, ui)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.approve_plan(&approve, cx)
+                    })),
+            )
+            .child(
+                ui::text_button(
+                    ("claude-console-plan", index),
+                    tr("Open the Plan"),
+                    false,
+                    ui,
+                )
+                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(ClaudeConsoleEvent::Open(SessionRef::Live(open.clone())))
+                })),
+            )
+            .into_any_element()
+    }
+
+    /// The tone of a live session's phrase this frame, and when it changed — the first time it
+    /// simply shows.
+    fn note_tone(&mut self, id: EntityId, tone: Tone) -> Option<Instant> {
+        match self.tones.get_mut(&id) {
+            Some((before, since)) => {
+                if *before != tone {
+                    *before = tone;
+                    *since = motion::enabled().then(Instant::now);
+                }
+                *since
+            }
+            None => {
+                self.tones.insert(id, (tone, None));
+                None
+            }
+        }
+    }
+
+    /// What a live session shows open under it this frame (`None` — nothing): a card that has gone
+    /// leaves, collapsing; a new one takes the place of one leaving.
+    fn note_waiting(&mut self, id: EntityId, now: Option<(String, Waiting)>) {
+        let waits = now.is_some();
+        let before = match now {
+            Some(now) => self.waiting.insert(id, now),
+            None => self.waiting.remove(&id),
+        };
+        if waits {
+            self.answered.remove(&id);
+        } else if let Some((_, card)) = before
+            && motion::enabled()
+        {
+            self.answered.insert(id, Leaving::new(card));
+        }
+        if self.answered.get(&id).is_some_and(Leaving::done) {
+            self.answered.remove(&id);
         }
     }
 
@@ -1180,7 +1426,7 @@ impl ClaudeConsole {
                 }),
             )
         });
-        self.row_shell(index, row, focused, ui, cx)
+        self.row_shell(row, focused, ui, cx)
             .h(px(HISTORY_ROW_HEIGHT))
             .pl(px(ROW_PADDING + STATUS_WIDTH + STATUS_GAP))
             .flex()
@@ -1221,16 +1467,19 @@ impl ClaudeConsole {
         }
     }
 
-    /// A history group's caption: a chevron, the name, the count; a click opens or closes it.
+    /// A history group's caption: a chevron, the name, the count; a click opens or closes it (the
+    /// chevron turns, the rows unfold).
     fn render_group_caption(
         &self,
         section: Section,
         label: SharedString,
         count: Option<usize>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let open = self.group_open(section);
+        let openness = self.disclosure.chevron(&section, open, window);
         let id: &'static str = match section {
             Section::Recent => "claude-console-recent",
             Section::Week => "claude-console-week",
@@ -1251,17 +1500,7 @@ impl ClaudeConsole {
             .hover(move |style| style.bg(ui.hover))
             .text_size(px(theme::TEXT_SM))
             .text_color(ui.dim)
-            .child(
-                icon(
-                    if open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    },
-                    ui.dim,
-                )
-                .size(px(12.)),
-            )
+            .child(crate::icons::chevron(openness, ui.dim).size(px(12.)))
             .child(label)
             .children(
                 count.map(|count| div().text_color(ui.text_disabled).child(count.to_string())),
@@ -1278,6 +1517,7 @@ impl ClaudeConsole {
                         }
                     }
                 }
+                this.disclosure.toggled(section, this.group_open(section));
                 cx.notify();
             }))
     }
@@ -1320,7 +1560,8 @@ impl ClaudeConsole {
             (tr("7 days"), limits.seven_day),
         ]
         .into_iter()
-        .filter_map(|(label, window)| {
+        .enumerate()
+        .filter_map(|(index, (label, window))| {
             let window = window?;
             let color = match claude::limit_level(window.utilization) {
                 claude::LimitLevel::Normal => ui.accent,
@@ -1340,13 +1581,13 @@ impl ClaudeConsole {
                             .h(px(3.))
                             .rounded(px(2.))
                             .bg(UiColors::tint(ui.foreground, 0.07))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .rounded(px(2.))
-                                    .bg(color)
-                                    .w(gpui::relative(share)),
-                            ),
+                            // A new reading glides the fill to it.
+                            .child(div().h_full().rounded(px(2.)).bg(color).with_transition(
+                                ("claude-console-limit", index),
+                                share,
+                                motion::SMOOTH,
+                                |fill, share| fill.w(gpui::relative(share)),
+                            )),
                     )
                     .child(div().flex_none().text_color(ui.dim).child(trf(
                         "{0}% · {1}",
@@ -1378,10 +1619,97 @@ impl ClaudeConsole {
         )
     }
 
-    fn render_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    /// Before a frame: the rows that have come since the last one start dropping into place (not
+    /// the first frame's, nor "All"'s — typed into its filter, rows come and go at once — nor
+    /// those of a group just opened: they unfold); the groups' unfolding learns where their rows
+    /// are; what has settled or gone is forgotten.
+    fn note_rows(&mut self, rows: &[Row], cx: &App) {
+        let open = (self.recent_open, self.week_open);
+        // Until the history is read, "Now" lacks its unloaded sessions: they simply show.
+        let history = self.store.read(cx).saved_sessions().is_some();
+        let names: Vec<Vec<(Section, RowId)>> = rows.iter().map(|row| row_names(row, cx)).collect();
+        if let Some(shown) = &self.shown
+            && shown.history
+            && history
+            && motion::enabled()
+        {
+            let now = Instant::now();
+            for (row, names) in rows.iter().zip(&names) {
+                let arrives = match row.key.section {
+                    Section::Now => true,
+                    Section::Recent => shown.open.0 == open.0,
+                    Section::Week => shown.open.1 == open.1,
+                    Section::All => false,
+                };
+                if arrives && !names.iter().any(|name| shown.names.contains(name)) {
+                    self.arrivals.insert(row.key.clone(), now);
+                }
+            }
+        }
+        self.arrivals.retain(|key, since| {
+            motion::running(*since, motion::SMOOTH) && rows.iter().any(|row| &row.key == key)
+        });
+        self.shown = Some(Shown {
+            names: names.into_iter().flatten().collect(),
+            open,
+            history,
+        });
+        let live: HashSet<EntityId> = rows
+            .iter()
+            .filter_map(|row| match row.key.id {
+                RowId::Live(id) => Some(id),
+                RowId::Saved(_) => None,
+            })
+            .collect();
+        self.tones.retain(|id, _| live.contains(id));
+        self.waiting.retain(|id, _| live.contains(id));
+        self.answered.retain(|id, _| live.contains(id));
+        let groups: Vec<(Section, Option<Range<usize>>)> =
+            [Section::Recent, Section::Week, Section::All]
+                .into_iter()
+                .map(|section| {
+                    let range = self.group_open(section).then(|| {
+                        let start = rows.iter().position(|row| row.key.section == section);
+                        start.map_or(0..0, |start| {
+                            let count = rows[start..]
+                                .iter()
+                                .take_while(|row| row.key.section == section)
+                                .count();
+                            start..start + count
+                        })
+                    });
+                    (section, range)
+                })
+                .collect();
+        self.disclosure.rows_changed(|section| {
+            groups
+                .iter()
+                .find(|(group, _)| group == section)
+                .and_then(|(_, range)| range.clone())
+        });
+    }
+
+    /// A row as it settles: dropping into place after it came, unfolding with its group.
+    fn settle(&self, index: usize, key: &RowKey, row: AnyElement, window: &Window) -> AnyElement {
+        if let Some(since) = self.arrivals.get(key) {
+            let value = motion::animate(*since, motion::SMOOTH, window);
+            if value < 1. {
+                return Appear::slide(0., -ARRIVAL_DROP)
+                    .curve(motion::SMOOTH)
+                    .style(div().child(row), value)
+                    .into_any_element();
+            }
+        }
+        let unfold = self.disclosure.unfold(index, window);
+        if unfold < 1. {
+            return unfold_style(div().child(row), unfold).into_any_element();
+        }
+        row
+    }
+
+    fn render_list(&mut self, rows: &[Row], window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
         let focused = self.focus_handle.contains_focused(window, cx);
-        let rows = self.rows(cx);
         let saved_count = self
             .store
             .read(cx)
@@ -1426,7 +1754,8 @@ impl ClaudeConsole {
         }
         let mut sessions = div().flex().flex_col().gap(px(SESSION_GAP));
         for (index, row) in now_rows {
-            sessions = sessions.child(self.render_session(index, row, focused, cx));
+            let session = self.render_session(index, row, focused, window, cx);
+            sessions = sessions.child(self.settle(index, &row.key, session, window));
         }
         list = list.child(sessions);
         // The groups' sizes, also while closed (their rows aren't listed then).
@@ -1460,30 +1789,51 @@ impl ClaudeConsole {
             if count == 0 {
                 continue;
             }
-            list = list.child(self.render_group_caption(section, label.into(), Some(count), cx));
+            list = list.child(self.render_group_caption(
+                section,
+                label.into(),
+                Some(count),
+                window,
+                cx,
+            ));
             for (index, row) in rows
                 .iter()
                 .enumerate()
                 .filter(|(_, row)| row.key.section == section)
             {
-                list = list.child(self.render_saved(index, row, focused, now, cx));
+                let saved = self.render_saved(index, row, focused, now, cx);
+                list = list.child(self.settle(index, &row.key, saved, window));
             }
         }
-        list = list.child(self.render_group_caption(Section::All, tr("All").into(), all_count, cx));
+        list = list.child(self.render_group_caption(
+            Section::All,
+            tr("All").into(),
+            all_count,
+            window,
+            cx,
+        ));
         if self.all_open {
-            list = list.child(
-                div()
-                    .mx(px(ROW_INSET + 4.))
-                    .mt_1()
-                    .mb_1p5()
-                    .child(self.filter.clone()),
-            );
-            list = list.child(self.render_show_archived(cx));
             let all: Vec<(usize, &Row)> = rows
                 .iter()
                 .enumerate()
                 .filter(|(_, row)| row.key.section == Section::All)
                 .collect();
+            // The filter and "Show archived" unfold with the group's first row.
+            let unfold = all
+                .first()
+                .map_or(1., |(index, _)| self.disclosure.unfold(*index, window));
+            list = list.child(unfold_style(
+                div()
+                    .mx(px(ROW_INSET + 4.))
+                    .mt_1()
+                    .mb_1p5()
+                    .child(self.filter.clone()),
+                unfold,
+            ));
+            list = list.child(unfold_style(
+                div().child(self.render_show_archived(cx)),
+                unfold,
+            ));
             if all.is_empty() {
                 list = list.child(
                     div()
@@ -1498,7 +1848,8 @@ impl ClaudeConsole {
                 );
             }
             for (index, row) in all {
-                list = list.child(self.render_saved(index, row, focused, now, cx));
+                let saved = self.render_saved(index, row, focused, now, cx);
+                list = list.child(self.settle(index, &row.key, saved, window));
             }
         }
         list.into_any_element()
@@ -1697,6 +2048,54 @@ impl Picks {
     }
 }
 
+/// What a live session's row shows open under it while the session waits.
+#[derive(Clone)]
+enum Waiting {
+    /// A question card, as last drawn (its step, its picks).
+    Question(QuickQuestion),
+    /// A plan's approval.
+    Plan,
+}
+
+/// What the list showed in a frame — to tell a row that has just come from one that was there.
+struct Shown {
+    /// Each row's names in its group ([`row_names`]).
+    names: HashSet<(Section, RowId)>,
+    /// "Recent" and "This Week" were open.
+    open: (bool, bool),
+    /// The history had been read.
+    history: bool,
+}
+
+/// The names of a row in its group: a saved session by its id, a live one by its entity and its
+/// id once it has one — a session resumed in place, or one that has just got its id, is the
+/// same row.
+fn row_names(row: &Row, cx: &App) -> Vec<(Section, RowId)> {
+    let section = row.key.section;
+    let mut names = vec![(section, row.key.id.clone())];
+    if let SessionRef::Live(session) = &row.item
+        && let Some(id) = session.read(cx).session_id()
+    {
+        names.push((section, RowId::Saved(id.to_string())));
+    }
+    names
+}
+
+/// A row's element id: its session in its group, not its place — what a row keeps between frames
+/// (a question sliding open, its highlight's fade) stays with it as rows come and go above it.
+fn row_element_id(key: &RowKey) -> ElementId {
+    let group = match key.section {
+        Section::Now => "claude-console-now",
+        Section::Recent => "claude-console-recent",
+        Section::Week => "claude-console-week",
+        Section::All => "claude-console-all",
+    };
+    match &key.id {
+        RowId::Live(id) => ElementId::NamedInteger(group.into(), id.as_u64()),
+        RowId::Saved(id) => ElementId::NamedChild(Box::new(group.into()), id.clone().into()),
+    }
+}
+
 /// The history in the console's groups: "Recent" — active in the last 12 hours, "This Week" —
 /// before that within 7 days; without the sessions of "Now" and the archived ones. `saved` is the
 /// latest first, and so are the groups.
@@ -1874,17 +2273,19 @@ fn install_option(
         )
 }
 
-/// A pulsing dot while `claude` is looked for.
-fn spinner_dot(ui: UiColors) -> impl IntoElement {
-    div()
-        .size(px(9.))
-        .rounded(px(5.))
-        .bg(ui.accent)
-        .with_animation(
-            "claude-checking",
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
-        )
+/// A pulsing dot while `claude` (or the country) is looked for; a still one with the animations
+/// off.
+fn spinner_dot(ui: UiColors) -> AnyElement {
+    let dot = div().size(px(9.)).rounded(px(5.)).bg(ui.accent);
+    if !motion::enabled() {
+        return dot.into_any_element();
+    }
+    dot.with_animation(
+        "claude-checking",
+        Animation::new(Duration::from_millis(900)).repeat(),
+        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+    )
+    .into_any_element()
 }
 
 impl Focusable for ClaudeConsole {
@@ -1897,15 +2298,17 @@ impl Render for ClaudeConsole {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = self.store.read(cx).is_ready();
         let body = if ready {
-            self.render_list(window, cx)
+            let rows = self.rows(cx);
+            self.note_rows(&rows, cx);
+            self.render_list(&rows, window, cx)
         } else {
             self.render_onboarding(cx)
         };
         let limits = ready.then(|| self.render_limits(cx)).flatten();
-        let menu = self
-            .menu
-            .as_ref()
-            .map(|menu| ContextMenu::overlay(&menu.menu, menu.position));
+        let menu = Some(ContextMenu::slot(
+            "claude-console-menu",
+            self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+        ));
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -1928,6 +2331,7 @@ impl Render for ClaudeConsole {
             .font_family(theme::UI_FONT)
             .text_size(px(theme::TEXT_MD))
             .child(self.render_header(cx))
+            .children(self.render_region_banner(cx))
             .child(body)
             .children(limits)
             .children(menu)

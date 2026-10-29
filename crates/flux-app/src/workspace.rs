@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::{Document, Selection};
 use flux_fs::remap;
@@ -33,11 +33,12 @@ use crate::git::{GitEvent, GitStore};
 use crate::git_log::GitLogView;
 use crate::git_window::{self, DraggedLogTab, GitWindow, GitWindowEvent};
 use crate::i18n::{tr, trf, trn};
-use crate::icons::{IconName, file_icon, icon};
+use crate::icons::{FileIcon, IconName, file_icon, icon};
 use crate::image_view::{self, ImageSource, ImageView, ImageViewEvent};
 use crate::launchpad::{self, Tool};
 use crate::lsp::LspStore;
 use crate::merge_view::{MergeView, MergeViewEvent};
+use crate::motion::TransitionExt;
 use crate::notification_center::NotificationCenter;
 use crate::notification_center::NotificationGroup;
 use crate::notifications::{self, Notification};
@@ -90,6 +91,12 @@ const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 /// The project's state is saved this long after its tabs or layout changed (part 10.1): a burst of
 /// changes is one write, and a crash loses little.
 const STATE_SAVE_DELAY: Duration = Duration::from_millis(1500);
+/// The bell when its unread count grows: the count bumps (`crate::badge`); the icon swings this
+/// many times this far to the sides, dying down.
+const BELL_SWINGS: f32 = 2.5;
+const BELL_SWING: f32 = 2.5;
+const BELL_WOBBLE: crate::motion::Curve =
+    crate::motion::Curve::eased(Duration::from_millis(520), crate::motion::Easing::Linear);
 /// A window's size when nothing else says it (the first launch, a project never opened).
 const WINDOW_SIZE: (f32, f32) = (1240., 820.);
 /// A new window opens this far right and down from the window it was opened from, as in macOS.
@@ -198,6 +205,14 @@ pub struct Workspace {
     edited: bool,
     /// Overlay window above the tabs: command palette, file search.
     modal: Option<Modal>,
+    /// The overlay window that just closed, fading out without input (`crate::motion`).
+    leaving_modal: Option<crate::motion::Leaving<Modal>>,
+    /// A plugin's form or text question over Settings (a sign-in from the plugin's page): the one
+    /// overlay window allowed above another, with a backdrop of its own; closing it gives Settings
+    /// the focus back.
+    over: Option<Modal>,
+    /// [`Self::over`] that just closed, fading out.
+    leaving_over: Option<crate::motion::Leaving<Modal>>,
     /// Back / Forward along go-to-definition jumps, and the language server request in flight.
     pub(crate) navigation: crate::navigation::NavState,
     /// The in-document find bar (between the tabs and the text).
@@ -246,6 +261,20 @@ pub struct Workspace {
     notification_center: Entity<NotificationCenter>,
     /// The island on the right: the tool window shown in it, if any.
     right_tool: Option<RightTool>,
+    /// The width of the island on the right, shared by its tool windows.
+    right_width: ui::RightIslandWidth,
+    /// The islands of tool windows gliding open and closed (`crate::motion`).
+    left_glide: IslandGlide<LeftTool>,
+    bottom_glide: IslandGlide<BottomTool>,
+    right_glide: IslandGlide<RightTool>,
+    /// The tab strip's motion (`crate::tab_strip`): the highlight gliding to the active tab, tabs
+    /// gliding into place, closed ones fading out.
+    tab_strip: crate::tab_strip::TabStrip,
+    /// The editor area fades in: the window took another project ("This Window"), or the first
+    /// tab replaced the start screen. Since when.
+    fade_in: Option<Instant>,
+    /// The bell's unread count as last drawn, and when it last grew (the badge bumps).
+    bell: std::cell::Cell<crate::badge::Bump>,
     /// The Notifications window (the journal of the notification center).
     notifications_panel: Entity<NotificationsPanel>,
     /// The window's plugins: their commands, tool windows (in the island on the right), status
@@ -304,6 +333,212 @@ pub(crate) enum RightTool {
     Notifications,
     Plugin(ToolKey),
 }
+
+/// What the left island shows: the Claude console, the commit window or the tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeftTool {
+    Console,
+    Commit,
+    Tree,
+}
+
+/// What the island under the editor shows: the Git window or the terminals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BottomTool {
+    Git,
+    Terminal,
+}
+
+/// The side of the window an island of tool windows sits at; it glides open from the other edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Left,
+    Bottom,
+    Right,
+}
+
+/// An island of tool windows opening, closing and changing its tool (`crate::motion`): the share
+/// of its size it takes glides with `SMOOTH` from wherever it was; the tool it showed stays —
+/// drawn without input — while it glides closed; after a switch, the tool shown before fades out
+/// over the new one, the size as it was. The focus never waits: it moves when the tool does.
+struct IslandGlide<K> {
+    /// What the island showed in the last frame (`None`: closed); unset before the first frame,
+    /// which shows the island as it is.
+    shown: Option<Option<K>>,
+    /// The glide of its share of the size: from, to, since when.
+    from: f32,
+    to: f32,
+    since: Instant,
+    /// The tool drawn while the island glides closed.
+    leaving: Option<K>,
+    /// The tool shown before a switch, and when it happened.
+    replaced: Option<(K, Instant)>,
+}
+
+/// An island's look in this frame ([`IslandGlide::frame`]).
+struct IslandFrame<K> {
+    tool: K,
+    /// The island has closed: drawn without input until its glide ends.
+    leaving: bool,
+    /// The share of its size it takes, 0 → 1; below 1 it clips its tool.
+    open: f32,
+    /// The tool shown before a switch, and how far its crossfade has come (0 → 1).
+    replaced: Option<(K, f32)>,
+}
+
+impl<K: Copy + PartialEq> IslandGlide<K> {
+    fn new() -> Self {
+        Self {
+            shown: None,
+            from: 0.,
+            to: 0.,
+            since: Instant::now(),
+            leaving: None,
+            replaced: None,
+        }
+    }
+
+    /// The share of its size the island takes now, and whether the glide has ended.
+    fn value(&self) -> (f32, bool) {
+        if self.from == self.to {
+            return (self.to, true);
+        }
+        let (t, done) = crate::motion::SMOOTH.at(self.since.elapsed());
+        if done {
+            (self.to, true)
+        } else {
+            (crate::motion::lerp(self.from, self.to, t), false)
+        }
+    }
+
+    /// Follows what the island shows in this frame (`now`) and returns how to draw it — `None`
+    /// when it is closed and its glide has ended — asking for frames while it moves.
+    fn frame(&mut self, now: Option<K>, window: &Window) -> Option<IslandFrame<K>> {
+        match self.shown.replace(now) {
+            None => {
+                let open = if now.is_some() { 1. } else { 0. };
+                (self.from, self.to) = (open, open);
+            }
+            Some(before) if before != now => {
+                let (current, _) = self.value();
+                let animate = crate::motion::enabled();
+                match (before, now) {
+                    (Some(tool), None) => {
+                        (self.from, self.to, self.since) = (current, 0., Instant::now());
+                        self.leaving = animate.then_some(tool);
+                        self.replaced = None;
+                    }
+                    (None, Some(_)) => {
+                        (self.from, self.to, self.since) = (current, 1., Instant::now());
+                        self.leaving = None;
+                    }
+                    (Some(tool), Some(_)) => {
+                        self.replaced = animate.then(|| (tool, Instant::now()));
+                    }
+                    (None, None) => {}
+                }
+            }
+            Some(_) => {}
+        }
+        let (open, done) = self.value();
+        if !done {
+            window.request_animation_frame();
+        } else if self.to == 0. {
+            self.leaving = None;
+        }
+        if self
+            .replaced
+            .is_some_and(|(_, since)| !crate::motion::running(since, crate::motion::FADE))
+        {
+            self.replaced = None;
+        }
+        let (tool, leaving) = match (now, self.leaving) {
+            (Some(tool), _) => (tool, false),
+            (None, Some(tool)) => (tool, true),
+            (None, None) => return None,
+        };
+        let replaced = self.replaced.map(|(tool, since)| {
+            (
+                tool,
+                crate::motion::animate(since, crate::motion::FADE, window),
+            )
+        });
+        Some(IslandFrame {
+            tool,
+            leaving,
+            open,
+            replaced,
+        })
+    }
+}
+
+/// An island of tool windows in its slot at the window's `side`, at `frame.open` of its `full`
+/// size (its tool's and its borders): the slot takes that share of the room — and of the `gap`
+/// before the editor, so a closed island leaves none — the island fills the slot and clips its
+/// tool, which keeps its own size, slides with the moving edge and fades in over the first half
+/// of the glide. Open, the island lays out as it always did: the resize handles in the gaps show,
+/// a drag resizes it at once. A tool switched away from fades out over the new one, inert.
+fn island_slot(
+    side: Side,
+    open: f32,
+    full: f32,
+    gap: f32,
+    island: gpui::Div,
+    tool: AnyElement,
+    replaced: Option<(AnyElement, f32)>,
+) -> AnyElement {
+    let gliding = open < 1.;
+    let crossfade = replaced.as_ref().map_or(1., |(_, progress)| *progress);
+    // The tool on the left slides in with the island's right edge: it is laid out from that edge.
+    let slide = if gliding && side == Side::Left {
+        -(1. - open) * full
+    } else {
+        0.
+    };
+    let across = |element: gpui::Div| match side {
+        Side::Left | Side::Right => element.flex_none().h_full(),
+        Side::Bottom => element.flex_none(),
+    };
+    let tool = across(div())
+        .ml(px(slide))
+        .when(crossfade < 1., |tool| tool.opacity(crossfade))
+        .child(tool);
+    let replaced = replaced.map(|(element, progress)| {
+        crate::motion::inert(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .when(side != Side::Bottom, |old| old.bottom_0())
+                .when(side == Side::Bottom, |old| old.right_0())
+                .opacity(1. - progress)
+                .child(element),
+        )
+    });
+    let island = island
+        .when(gliding, |island| match side {
+            Side::Left | Side::Right => island.w_full().overflow_hidden(),
+            Side::Bottom => island.h_full().overflow_hidden(),
+        })
+        .child(tool)
+        .children(replaced);
+    let hidden = -(1. - open) * gap;
+    across(div())
+        .when(gliding, |slot| {
+            let slot = slot.overflow_hidden().opacity((open / 0.5).clamp(0., 1.));
+            match side {
+                Side::Left => slot.w(px(full * open)).mr(px(hidden)),
+                Side::Right => slot.w(px(full * open)).ml(px(hidden)),
+                Side::Bottom => slot.h(px(full * open)).mt(px(hidden)),
+            }
+        })
+        .child(island)
+        .into_any_element()
+}
+
+/// The tab strip's inset and the gap between tabs.
+const TAB_STRIP_INSET: f32 = 6.;
+const TAB_GAP: f32 = 4.;
 
 /// The commit window and the subscription to its events; recreated with the git hub.
 struct CommitPanelHandle {
@@ -545,7 +780,7 @@ impl Workspace {
         });
         let claude = cx.new(|cx| ClaudeStore::new(root.clone(), cx));
         let claude_console = cx.new(|cx| ClaudeConsole::new(claude.clone(), window, cx));
-        let plugins = cx.new(|cx| PluginStore::new(root.clone(), right_width, cx));
+        let plugins = cx.new(|cx| PluginStore::new(root.clone(), right_width.clone(), cx));
         plugins.update(cx, |store, cx| {
             store.set_notification_center(notification_center.downgrade());
             store.set_window_parts(git.clone(), lsp.clone(), cx);
@@ -571,6 +806,8 @@ impl Workspace {
             // editor): the watcher reports them, and a refresh on return makes sure.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
+                    // Another Flux that quit may have given ⌘Esc back to macOS.
+                    crate::system_shortcuts::claim();
                     this.git.update(cx, |git, cx| git.refresh(cx));
                     this.sync_documents(None, cx);
                     // The window in front is the one to come back in front after a restart.
@@ -613,12 +850,15 @@ impl Workspace {
             Some(root) => record_recent(root, cx),
             None => recent::load(),
         };
+        let tab_scroll = ScrollHandle::new();
         let mut workspace = Self {
             root,
             tabs: Vec::new(),
             active: 0,
             focus_handle,
-            tab_scroll: ScrollHandle::new(),
+            tab_strip: crate::tab_strip::TabStrip::new(tab_scroll.clone()),
+            fade_in: None,
+            tab_scroll,
             start_drawn: false,
             closing: false,
             loading: 0,
@@ -629,6 +869,9 @@ impl Workspace {
             title: String::new(),
             edited: false,
             modal: None,
+            leaving_modal: None,
+            over: None,
+            leaving_over: None,
             navigation: Default::default(),
             find_bar,
             project_search,
@@ -652,6 +895,12 @@ impl Workspace {
             git_open: false,
             notification_center,
             right_tool: None,
+            right_width,
+            left_glide: IslandGlide::new(),
+            bottom_glide: IslandGlide::new(),
+            right_glide: IslandGlide::new(),
+            // The first frame takes the count as it is, without a bump.
+            bell: Default::default(),
             notifications_panel,
             plugins,
             claude,
@@ -860,7 +1109,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let confirm = self.confirm_close_all(window, cx);
+        let confirm = self.confirm_close_all(Processes::CloseProject, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if !confirm.await {
                 return;
@@ -870,7 +1119,10 @@ impl Workspace {
             }
             cx.update(|window, cx| {
                 window.replace_root(cx, |window, cx| {
-                    Workspace::new(Some(root), files, window, cx)
+                    let mut workspace = Workspace::new(Some(root), files, window, cx);
+                    // The other project's editor area fades in where this one's was.
+                    workspace.fade_in = crate::motion::enabled().then(Instant::now);
+                    workspace
                 });
             })
             .ok();
@@ -1479,7 +1731,8 @@ impl Workspace {
                 }
             }
         }
-        self.tab_scroll.scroll_to_item(index);
+        // Into view, gliding (`TabStrip::reveal`).
+        self.tab_strip.reveal(index);
         self.status_message = None;
         if let TabItem::Terminal(group) = &item {
             group.update(cx, |group, cx| group.clear_bell(cx));
@@ -2804,7 +3057,7 @@ impl Workspace {
             self.window_closing(window, cx);
             return true;
         }
-        let confirm = self.confirm_close_all(window, cx);
+        let confirm = self.confirm_close_all(Processes::CloseWindow, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if confirm.await {
                 this.update_in(cx, |this, window, cx| this.window_closing(window, cx))
@@ -2819,8 +3072,13 @@ impl Workspace {
     /// Before the window closes or the app quits: one question about the commands running in the
     /// window's terminals (the panel's and the tabs'), then the unsaved documents one by one, then
     /// the merge results not applied yet. `true` means everything may go.
-    fn confirm_close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
-        let documents = self.confirm_close_documents(window, cx);
+    fn confirm_close_all(
+        &mut self,
+        processes: Processes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
+        let documents = self.confirm_close_documents(processes, window, cx);
         let merges: Vec<Entity<MergeView>> = self
             .tabs
             .iter()
@@ -2856,9 +3114,12 @@ impl Workspace {
         })
     }
 
-    /// The running commands and the unsaved documents of [`Self::confirm_close_all`].
+    /// The running commands and the unsaved documents of [`Self::confirm_close_all`]: with commands
+    /// running in terminals or Claude at work, one short question first — all of them end with the
+    /// window (a quit has asked once for every window: [`confirm_processes`]).
     fn confirm_close_documents(
         &mut self,
+        processes: Processes,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<bool> {
@@ -2866,24 +3127,17 @@ impl Workspace {
             return Task::ready(false);
         }
         let editors = self.editors(cx);
-        let terminals = running_processes_detail(&self.running_processes(cx));
-        let claude = self.claude_working_detail(cx);
-        // Claude alone is stopped; with terminals, everything is terminated.
-        let (title, button) = if terminals.is_none() {
-            (tr("Stop Claude?"), tr("Stop"))
-        } else {
-            (tr("Terminate running processes?"), tr("Terminate"))
-        };
-        let detail = match (terminals, claude) {
-            (None, None) => return self.confirm(editors, window, cx),
-            (Some(detail), None) | (None, Some(detail)) => detail,
-            (Some(terminals), Some(claude)) => format!("{terminals}\n{claude}"),
+        let title = match processes {
+            _ if !self.has_running_work(cx) => return self.confirm(editors, window, cx),
+            Processes::Asked => return self.confirm(editors, window, cx),
+            Processes::CloseWindow => tr("Close the window?"),
+            Processes::CloseProject => tr("Close the project?"),
         };
         self.closing = true;
         window.activate_window();
         let answer = Dialog::warning(title)
-            .message(detail)
-            .danger(button)
+            .message(tr("All running processes of this window will be stopped."))
+            .danger(tr("Close"))
             .cancel(tr("Cancel"))
             .show(window, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -2899,6 +3153,13 @@ impl Workspace {
             };
             confirm.await
         })
+    }
+
+    /// Commands run in the window's terminals or Claude works in one of its sessions: closing the
+    /// window or quitting asks first.
+    fn has_running_work(&self, cx: &App) -> bool {
+        !self.running_processes(cx).is_empty()
+            || !self.claude.read(cx).working_sessions(cx).is_empty()
     }
 
     /// Names of the commands running in the window's terminals: in the panel and in the tabs.
@@ -3213,6 +3474,81 @@ impl Workspace {
 
     fn tree_panel(&self) -> Option<Entity<FileTreePanel>> {
         self.file_tree.as_ref().map(|tree| tree.panel.clone())
+    }
+
+    /// What the left island shows: the console over the commit window over the tree.
+    fn left_tool(&self) -> Option<LeftTool> {
+        if self.console_open {
+            Some(LeftTool::Console)
+        } else if self.commit_open && self.commit_panel.is_some() {
+            Some(LeftTool::Commit)
+        } else {
+            (self.tree_open && self.file_tree.is_some()).then_some(LeftTool::Tree)
+        }
+    }
+
+    /// A tool of the left island. The tree is a cached view (see the editor's tab in `render`):
+    /// its root style is the panel's own (`FileTreePanel::render`) — but not while it glides or
+    /// fades, which the cache wouldn't see.
+    fn render_left_tool(&self, tool: LeftTool, cached: bool) -> Option<AnyElement> {
+        match tool {
+            LeftTool::Console => Some(
+                div()
+                    .flex_none()
+                    .w(px(self.left_width.get()))
+                    .h_full()
+                    .child(self.claude_console.clone())
+                    .into_any_element(),
+            ),
+            LeftTool::Commit => self
+                .commit_panel
+                .as_ref()
+                .map(|handle| handle.panel.clone().into_any_element()),
+            LeftTool::Tree => self.tree_panel().map(|panel| {
+                if !cached {
+                    return panel.into_any_element();
+                }
+                AnyView::from(panel)
+                    .cached(
+                        StyleRefinement::default()
+                            .relative()
+                            .flex_none()
+                            .w(px(self.left_width.get()))
+                            .h_full(),
+                    )
+                    .into_any_element()
+            }),
+        }
+    }
+
+    /// What the island under the editor shows: the Git window over the terminals.
+    fn bottom_tool(&self) -> Option<BottomTool> {
+        if self.git_open && self.git_window.is_some() {
+            Some(BottomTool::Git)
+        } else {
+            self.terminal_open.then_some(BottomTool::Terminal)
+        }
+    }
+
+    fn render_bottom_tool(&self, tool: BottomTool) -> Option<AnyElement> {
+        match tool {
+            BottomTool::Git => self
+                .git_window
+                .as_ref()
+                .map(|handle| handle.window.clone().into_any_element()),
+            BottomTool::Terminal => Some(self.terminal_panel.clone().into_any_element()),
+        }
+    }
+
+    /// A tool window of the island on the right.
+    fn render_right_tool(&self, tool: RightTool, cx: &App) -> AnyElement {
+        match tool {
+            RightTool::Notifications => self.notifications_panel.clone().into_any_element(),
+            RightTool::Plugin(key) => match self.plugin_tool_view(key, cx) {
+                Some(view) => view.into_any_element(),
+                None => div().into_any_element(),
+            },
+        }
     }
 
     /// The tree follows the active tab: its file is revealed and selected. Called when the tab
@@ -3692,7 +4028,7 @@ impl Workspace {
 
     /// A Git window tab dropped on the tab strip: one already here moves along it.
     fn drop_log(&mut self, view: Entity<GitLogView>, window: &mut Window, cx: &mut Context<Self>) {
-        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        let index = self.take_tab_drop();
         match self.index_of_log(&view) {
             Some(from) => self.move_tab(from, index, window, cx),
             None => self.move_log_to_editor(view, Some(index), window, cx),
@@ -4006,8 +4342,15 @@ impl Workspace {
                 self.focus_active(window, cx);
             }
         }
+        if let Some(over) = self.over.take() {
+            self.leave_over(over);
+        }
         let previous_focus = match self.modal.take() {
-            Some(modal) => modal.previous_focus,
+            Some(modal) => {
+                let previous_focus = modal.previous_focus.clone();
+                self.leave(modal);
+                previous_focus
+            }
             None => window.focused(cx),
         };
         let view = cx.new(|cx| build(window, cx));
@@ -4078,15 +4421,17 @@ impl Workspace {
     /// Closes the overlay window. Focus returns to its previous place only if it was inside the
     /// window: on a click outside, focus has already moved to wherever was clicked.
     pub fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_over(window, cx);
         let Some(modal) = self.modal.take() else {
             return;
         };
         if modal.focus_handle.contains_focused(window, cx) || window.focused(cx).is_none() {
-            match modal.previous_focus {
+            match modal.previous_focus.clone() {
                 Some(previous) => window.focus(&previous),
                 None => self.focus_active(window, cx),
             }
         }
+        self.leave(modal);
         // A plugin's question that waited for the overlay window comes now.
         cx.defer_in(window, |this, window, cx| {
             plugins::ask_pending(this, window, cx)
@@ -4094,43 +4439,249 @@ impl Workspace {
         cx.notify();
     }
 
-    /// An overlay window (a popup or a dialog) is open.
-    pub(crate) fn modal_open(&self) -> bool {
-        self.modal.is_some()
+    /// A plugin's form or text question can be shown now: no overlay window is open, or Settings
+    /// are and nothing is over them yet — the plugin's own page asked (Other Ways to sign in, an
+    /// organization's ID). Otherwise it waits ([`plugins::ask_pending`]).
+    pub(crate) fn can_ask_plugin_question(&self) -> bool {
+        self.modal.is_none() || (crate::settings_view::is_open(self) && self.over.is_none())
     }
 
-    fn render_modal(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let modal = self.modal.as_ref()?;
-        // The popup takes the mouse: a click on its row must not reach what lies under it (a
-        // plugin's board tab, a tree) — that would take the focus and close the popup before the
-        // click's mouse-up chose the row.
-        let view = div()
-            .occlude()
-            .when(modal.kind == ModalKind::Popup, |view| {
-                view.on_mouse_down_out(
-                    cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)),
-                )
-            })
-            .child(modal.view.clone());
-        if modal.kind == ModalKind::Dialog {
-            // Over a backdrop that takes the clicks meant for the window behind; the title bar
-            // stays free, so the window can still be moved.
-            return Some(
-                ui::modal_backdrop(Theme::ui(cx))
-                    .id("dialog-backdrop")
-                    .absolute()
-                    .top(px(TITLE_BAR_HEIGHT))
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .flex()
-                    .justify_center()
-                    .pt(px(MODAL_TOP - TITLE_BAR_HEIGHT))
-                    .child(view)
-                    .into_any_element(),
-            );
+    /// Opens a plugin's dialog: over Settings when they are open ([`Self::over`]), as the overlay
+    /// window otherwise.
+    pub(crate) fn open_plugin_dialog<V: ManagedView>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+    ) {
+        if !crate::settings_view::is_open(self) {
+            return self.toggle_dialog(window, cx, build);
         }
-        Some(match modal.anchor {
+        if let Some(over) = self.over.take() {
+            self.leave_over(over);
+        }
+        let previous_focus = window.focused(cx);
+        let view = cx.new(|cx| build(window, cx));
+        let focus_handle = view.focus_handle(cx);
+        let subscriptions =
+            vec![
+                cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
+                    this.dismiss_over(window, cx)
+                }),
+            ];
+        window.focus(&focus_handle);
+        self.over = Some(Modal {
+            view: view.into(),
+            kind: ModalKind::Dialog,
+            focus_handle,
+            previous_focus,
+            anchor: None,
+            anchor_corner: Corner::TopLeft,
+            _subscriptions: subscriptions,
+        });
+        cx.notify();
+    }
+
+    /// Closes the dialog over Settings: they get the focus back, and a plugin's question that
+    /// waited comes next.
+    fn dismiss_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(over) = self.over.take() else {
+            return;
+        };
+        if over.focus_handle.contains_focused(window, cx) || window.focused(cx).is_none() {
+            let back = over
+                .previous_focus
+                .clone()
+                .or_else(|| self.modal.as_ref().map(|modal| modal.focus_handle.clone()));
+            match back {
+                Some(back) => window.focus(&back),
+                None => self.focus_active(window, cx),
+            }
+        }
+        self.leave_over(over);
+        cx.defer_in(window, |this, window, cx| {
+            plugins::ask_pending(this, window, cx)
+        });
+        cx.notify();
+    }
+
+    /// [`Self::leave`] for the dialog over Settings.
+    fn leave_over(&mut self, mut over: Modal) {
+        over._subscriptions.clear();
+        self.leaving_over = crate::motion::enabled().then(|| crate::motion::Leaving::new(over));
+    }
+
+    /// A closed overlay window fades out (`crate::motion`): drawn without input — its
+    /// subscriptions go now, so it can't close the next one — until its exit ends.
+    fn leave(&mut self, mut modal: Modal) {
+        modal._subscriptions.clear();
+        self.leaving_modal = crate::motion::enabled().then(|| crate::motion::Leaving::new(modal));
+    }
+
+    fn render_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let ui = Theme::ui(cx);
+        if self
+            .leaving_modal
+            .as_ref()
+            .is_some_and(|leaving| leaving.done())
+        {
+            self.leaving_modal = None;
+        }
+        let mut layers = Vec::new();
+        // The backdrop under dialogs, its own layer: it fades in under the first dialog, stays
+        // while one dialog gives way to the next, and fades out after the last.
+        let dialog = self
+            .modal
+            .as_ref()
+            .is_some_and(|modal| modal.kind == ModalKind::Dialog);
+        let dialog_leaving = self
+            .leaving_modal
+            .as_ref()
+            .is_some_and(|leaving| leaving.value.kind == ModalKind::Dialog);
+        if dialog || dialog_leaving {
+            let target = if dialog { 1. } else { 0. };
+            let backdrop = ui::modal_backdrop(ui)
+                .id("dialog-backdrop")
+                .absolute()
+                .top(px(TITLE_BAR_HEIGHT))
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .with_transition_from(
+                    "dialog-backdrop-fade",
+                    0.,
+                    target,
+                    crate::motion::FADE,
+                    |backdrop, opacity| backdrop.opacity(opacity),
+                );
+            layers.push(if dialog {
+                backdrop.into_any_element()
+            } else {
+                crate::motion::inert(backdrop).into_any_element()
+            });
+        }
+        if let Some(leaving) = &self.leaving_modal {
+            let progress = leaving.progress(window);
+            let modal = &leaving.value;
+            let view = div()
+                .id(("modal-leaving", modal.view.entity_id().as_u64()))
+                .child(modal.view.clone());
+            // It shrinks toward where it came from. Inert inside the placement: an anchored
+            // popup is deferred, prepainted after (and outside) whatever is around it.
+            let view = match modal.anchor {
+                Some(anchor) => crate::motion::leaving_from(view, progress, anchor),
+                None => crate::motion::leaving_style(view, progress, Self::modal_origin(modal))
+                    .into_any_element(),
+            };
+            layers.push(Self::place_modal(modal, crate::motion::inert(view)));
+        }
+        if let Some(modal) = &self.modal {
+            // The popup takes the mouse: a click on its row must not reach what lies under it (a
+            // plugin's board tab, a tree) — that would take the focus and close the popup before
+            // the click's mouse-up chose the row.
+            let view = div()
+                .occlude()
+                .when(modal.kind == ModalKind::Popup, |view| {
+                    view.on_mouse_down_out(
+                        cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)),
+                    )
+                })
+                .child(modal.view.clone());
+            // It grows out of where it was called: its anchor point (wherever the window's edges
+            // moved it), or the top middle of the window.
+            let id = ("modal", modal.view.entity_id().as_u64());
+            let view = match modal.anchor {
+                Some(anchor) => crate::motion::Appear::pop(Self::modal_origin(modal))
+                    .apply_from(id, anchor, view),
+                None => crate::motion::Appear::dialog().apply(id, view),
+            };
+            layers.push(Self::place_modal(modal, view));
+        }
+        layers.extend(self.render_over(ui, window));
+        layers
+    }
+
+    /// The dialog over Settings ([`Self::over`]) and its backdrop, which dims Settings and takes
+    /// their clicks while it is open.
+    fn render_over(&mut self, ui: UiColors, window: &mut Window) -> Vec<AnyElement> {
+        if self
+            .leaving_over
+            .as_ref()
+            .is_some_and(|leaving| leaving.done())
+        {
+            self.leaving_over = None;
+        }
+        let mut layers = Vec::new();
+        if self.over.is_none() && self.leaving_over.is_none() {
+            return layers;
+        }
+        let open = self.over.is_some();
+        let backdrop = ui::modal_backdrop(ui)
+            .id("over-backdrop")
+            .absolute()
+            .top(px(TITLE_BAR_HEIGHT))
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .with_transition_from(
+                "over-backdrop-fade",
+                0.,
+                if open { 1. } else { 0. },
+                crate::motion::FADE,
+                |backdrop, opacity| backdrop.opacity(opacity),
+            );
+        layers.push(if open {
+            backdrop.into_any_element()
+        } else {
+            crate::motion::inert(backdrop).into_any_element()
+        });
+        if let Some(leaving) = &self.leaving_over {
+            let progress = leaving.progress(window);
+            let over = &leaving.value;
+            let view = div()
+                .id(("over-leaving", over.view.entity_id().as_u64()))
+                .child(over.view.clone());
+            let view = crate::motion::leaving_style(view, progress, Self::modal_origin(over));
+            layers.push(Self::place_modal(over, crate::motion::inert(view)));
+        }
+        if let Some(over) = &self.over {
+            let view = div().occlude().child(over.view.clone());
+            let view = crate::motion::Appear::dialog()
+                .apply(("over", over.view.entity_id().as_u64()), view);
+            layers.push(Self::place_modal(over, view));
+        }
+        layers
+    }
+
+    /// The point an overlay window grows out of and shrinks toward, as fractions of its size: the
+    /// corner at its anchor, else its top middle.
+    fn modal_origin(modal: &Modal) -> (f32, f32) {
+        match (modal.anchor, modal.anchor_corner) {
+            (None, _) => (0.5, 0.),
+            (Some(_), Corner::TopLeft) => (0., 0.),
+            (Some(_), Corner::TopRight) => (1., 0.),
+            (Some(_), Corner::BottomLeft) => (0., 1.),
+            (Some(_), Corner::BottomRight) => (1., 1.),
+        }
+    }
+
+    /// An overlay window's place: a dialog under the title bar in the middle (over the backdrop),
+    /// a popup at its anchor or under the title bar.
+    fn place_modal(modal: &Modal, view: impl IntoElement) -> AnyElement {
+        if modal.kind == ModalKind::Dialog {
+            return div()
+                .absolute()
+                .top(px(TITLE_BAR_HEIGHT))
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .pt(px(MODAL_TOP - TITLE_BAR_HEIGHT))
+                .child(view)
+                .into_any_element();
+        }
+        match modal.anchor {
             Some(anchor) => deferred(
                 anchored()
                     .anchor(modal.anchor_corner)
@@ -4149,14 +4700,24 @@ impl Workspace {
                 .justify_center()
                 .child(view)
                 .into_any_element(),
-        })
+        }
     }
 
     /// Project search is a window over the islands; a click outside closes it.
+    /// Closed, it fades out a moment, taking no input.
     fn render_project_search(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
-        if !self.project_search.read(cx).is_open() {
-            return None;
-        }
+        let search = self.project_search.read(cx).present(
+            div()
+                .w(relative(SEARCH_WIDTH))
+                .max_w(px(SEARCH_MAX_WIDTH))
+                .h_full()
+                .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                    if this.project_search.read(cx).is_open() {
+                        this.hide_project_search(window, cx)
+                    }
+                }))
+                .child(self.project_search.clone()),
+        )?;
         Some(
             div()
                 .absolute()
@@ -4166,16 +4727,7 @@ impl Workspace {
                 .right_0()
                 .flex()
                 .justify_center()
-                .child(
-                    div()
-                        .w(relative(SEARCH_WIDTH))
-                        .max_w(px(SEARCH_MAX_WIDTH))
-                        .h_full()
-                        .on_mouse_down_out(
-                            cx.listener(|this, _, window, cx| this.hide_project_search(window, cx)),
-                        )
-                        .child(self.project_search.clone()),
-                ),
+                .child(search),
         )
     }
 
@@ -4275,6 +4827,7 @@ impl Workspace {
                                     .border_color(ui.elevated_border)
                                     .text_color(ui.text_muted)
                             })
+                            .active(crate::motion::press)
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(file_finder::Toggle.boxed_clone(), cx)
                             })
@@ -4332,10 +4885,21 @@ impl Workspace {
     /// type color), and line endings.
     /// The bell at the right end of the status bar: the unread count (red with unread errors); a
     /// click shows or hides the Notifications window.
-    fn render_bell(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+    fn render_bell(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let center = self.notification_center.read(cx);
         let unread = center.unread_count();
+        // The count grew: the badge bumps and the bell wobbles once (`crate::badge`).
+        let mut bell = self.bell.get();
+        let grew = bell.track(unread, BELL_WOBBLE);
+        self.bell.set(bell);
+        let bump = crate::badge::progress(grew, window);
+        let wobble = grew.map_or(1., |since| {
+            crate::motion::animate(since, BELL_WOBBLE, window)
+        });
+        // Swings to the sides, dying down.
+        let swing =
+            BELL_SWING * (wobble * BELL_SWINGS * std::f32::consts::TAU).sin() * (1. - wobble);
         let color = if center.unread_kind() == Some(notifications::NotificationKind::Error) {
             ui.error
         } else {
@@ -4359,17 +4923,23 @@ impl Workspace {
                     window.dispatch_action(Box::new(notifications_panel::Toggle), cx)
                 })
                 .child(
-                    icon(
-                        IconName::Bell,
-                        if open {
-                            ui.accent_text
-                        } else if unread > 0 {
-                            color
-                        } else {
-                            ui.text_muted
-                        },
-                    )
-                    .size(px(13.)),
+                    div()
+                        .when(swing != 0., |icon| {
+                            icon.transform_translate(px(swing), px(0.))
+                        })
+                        .child(
+                            icon(
+                                IconName::Bell,
+                                if open {
+                                    ui.accent_text
+                                } else if unread > 0 {
+                                    color
+                                } else {
+                                    ui.text_muted
+                                },
+                            )
+                            .size(px(13.)),
+                        ),
                 )
                 .when(unread > 0, |bell| {
                     bell.child(
@@ -4377,6 +4947,7 @@ impl Workspace {
                             .text_size(px(theme::TEXT_XS))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(color)
+                            .map(|badge| crate::badge::bump_style(badge, bump))
                             .child(if unread > 99 {
                                 "99+".to_string()
                             } else {
@@ -4389,6 +4960,8 @@ impl Workspace {
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
+        // The country check's flag, at the end of every kind of bar (part «Флаг страны»).
+        let region = crate::region_status::status_item;
         let bar = div()
             .flex_none()
             .h(px(STATUS_BAR_HEIGHT))
@@ -4405,24 +4978,33 @@ impl Workspace {
                 Some(editor) => editor,
                 None => {
                     let path = self.display_path(view.read(cx).path());
-                    return bar.child(div().flex_1().min_w_0().truncate().child(path));
+                    let text = div().flex_1().min_w_0().truncate().child(path.clone());
+                    return bar.child(status_text(&path, text)).children(region(cx));
                 }
             },
             Some(TabItem::Log(_) | TabItem::Claude(_) | TabItem::Plugin(..)) => {
                 let left: SharedString = self.status_message.clone().unwrap_or_default();
                 return bar
-                    .child(div().flex_1().min_w_0().truncate().child(left))
-                    .children(crate::git::status_item(self.git.read(cx), ui));
+                    .child(status_text(
+                        &left,
+                        div().flex_1().min_w_0().truncate().child(left.clone()),
+                    ))
+                    .children(crate::git::status_item(self.git.read(cx), ui))
+                    .children(region(cx));
             }
             Some(TabItem::Merge(view)) => {
                 let path = self.display_path(view.read(cx).path());
-                let left = match &self.status_message {
+                let left: SharedString = match &self.status_message {
                     Some(message) => message.clone(),
                     None => path.into(),
                 };
                 return bar
-                    .child(div().flex_1().min_w_0().truncate().child(left))
-                    .children(crate::git::status_item(self.git.read(cx), ui));
+                    .child(status_text(
+                        &left,
+                        div().flex_1().min_w_0().truncate().child(left.clone()),
+                    ))
+                    .children(crate::git::status_item(self.git.read(cx), ui))
+                    .children(region(cx));
             }
             // A picture: its file's path (a chat's picture — its name).
             Some(TabItem::Image(view)) => {
@@ -4432,14 +5014,28 @@ impl Workspace {
                     (None, None) => view.read(cx).title(),
                 };
                 return bar
-                    .child(div().flex_1().min_w_0().truncate().child(left))
-                    .children(crate::git::status_item(self.git.read(cx), ui));
+                    .child(status_text(
+                        &left,
+                        div().flex_1().min_w_0().truncate().child(left.clone()),
+                    ))
+                    .children(crate::git::status_item(self.git.read(cx), ui))
+                    .children(region(cx));
             }
             None => {
-                return bar.child(div().text_color(ui.dim).child(match &self.root {
+                let text = match &self.root {
                     Some(root) => tilde(root),
                     None => tr("No project — open a folder with ⌘O").into(),
-                }));
+                };
+                return bar
+                    .child(status_text(
+                        &text,
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(ui.dim)
+                            .child(text.clone()),
+                    ))
+                    .children(region(cx));
             }
         };
         let editor_id = editor.entity_id();
@@ -4447,60 +5043,73 @@ impl Workspace {
         let status = editor.status_info();
         let path = editor.document.path();
         let file = file_icon(&editor.document.display_name(), &ui);
-        let left = match status.message {
-            Some(message) => div()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .min_w_0()
-                .text_color(ui.foreground)
-                .child(icon(IconName::Info, ui.info).size(px(13.)))
-                .child(div().truncate().child(message)),
-            None => div()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .min_w_0()
-                .child(file.render().size(px(13.)))
-                .child(div().truncate().child(match path {
-                    Some(path) => self.display_path(path),
-                    None => tr("Untitled").into(),
-                })),
-        };
-        let item = |text: String| div().flex_none().whitespace_nowrap().child(text);
-        bar.child(div().flex_1().min_w_0().flex().child(left))
-            .child(item(trf(
-                "Ln {0}, Col {1}",
-                &[&status.line, &status.column],
-            )))
-            .when(status.cursors > 1, |bar| {
-                bar.child(ui::badge(
-                    trn(status.cursors, "{n} cursor", "{n} cursors"),
-                    ui.accent_text,
-                ))
-            })
-            .child(
+        let (key, left): (SharedString, _) = match status.message {
+            Some(message) => (
+                message.clone(),
                 div()
-                    .flex_none()
-                    .h(px(20.))
-                    .px_2()
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .rounded(px(10.))
-                    .bg(UiColors::tint(file.color, 0.12))
-                    .text_color(file.color)
-                    .child(div().size(px(6.)).rounded(px(3.)).bg(file.color))
-                    .child(item(status.language)),
-            )
-            .children(crate::diagnostics::status_item(editor, ui))
-            .children(crate::git::status_item(self.git.read(cx), ui))
-            .children(crate::lsp::status_item(
-                self.lsp.read(cx),
-                Some(editor_id),
-                ui,
+                    .min_w_0()
+                    .text_color(ui.foreground)
+                    .child(icon(IconName::Info, ui.info).size(px(13.)))
+                    .child(div().truncate().child(message)),
+            ),
+            None => {
+                let path: SharedString = match path {
+                    Some(path) => self.display_path(path).into(),
+                    None => tr("Untitled").into(),
+                };
+                (
+                    path.clone(),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .min_w_0()
+                        .child(file.render().size(px(13.)))
+                        .child(div().truncate().child(path)),
+                )
+            }
+        };
+        let item = |text: String| div().flex_none().whitespace_nowrap().child(text);
+        bar.child(status_text(
+            &key,
+            div().flex_1().min_w_0().flex().child(left),
+        ))
+        .child(item(trf(
+            "Ln {0}, Col {1}",
+            &[&status.line, &status.column],
+        )))
+        .when(status.cursors > 1, |bar| {
+            bar.child(ui::badge(
+                trn(status.cursors, "{n} cursor", "{n} cursors"),
+                ui.accent_text,
             ))
-            .child(item(status.line_ending.to_string()).text_color(ui.dim))
+        })
+        .child(
+            div()
+                .flex_none()
+                .h(px(20.))
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .rounded(px(10.))
+                .bg(UiColors::tint(file.color, 0.12))
+                .text_color(file.color)
+                .child(div().size(px(6.)).rounded(px(3.)).bg(file.color))
+                .child(item(status.language)),
+        )
+        .children(crate::diagnostics::status_item(editor, ui))
+        .children(crate::git::status_item(self.git.read(cx), ui))
+        .children(crate::lsp::status_item(
+            self.lsp.read(cx),
+            Some(editor_id),
+            ui,
+        ))
+        .child(item(status.line_ending.to_string()).text_color(ui.dim))
+        .children(region(cx))
     }
 
     /// The status bar under a terminal tab: a message for a few seconds, otherwise the active
@@ -4512,22 +5121,29 @@ impl Workspace {
         cx: &Context<Self>,
     ) -> gpui::Div {
         let ui = Theme::ui(cx);
+        let region = crate::region_status::status_item;
         if let Some(message) = &self.status_message {
-            return bar.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .min_w_0()
-                    .text_color(ui.foreground)
-                    .child(icon(IconName::Info, ui.info).size(px(13.)))
-                    .child(div().truncate().child(message.clone())),
-            );
+            return bar
+                .child(status_text(
+                    message,
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .min_w_0()
+                        .text_color(ui.foreground)
+                        .child(icon(IconName::Info, ui.info).size(px(13.)))
+                        .child(div().truncate().child(message.clone())),
+                ))
+                .children(region(cx));
         }
         let view = group.read(cx).active_view();
         let view = view.read(cx);
         let directory = view.cwd.as_deref().map(tilde);
-        bar.child(
+        // A terminal's process and directory change as it works: they fade in only with the tab.
+        bar.child(status_text(
+            &format!("terminal-{}", group.entity_id()),
             div()
                 .flex_1()
                 .min_w_0()
@@ -4542,7 +5158,8 @@ impl Workspace {
                         .child(view.label()),
                 )
                 .children(directory.map(|directory| div().truncate().child(directory))),
-        )
+        ))
+        .children(region(cx))
     }
 
     /// Display path: relative to the project root, or with `~` outside it.
@@ -4557,9 +5174,23 @@ impl Workspace {
         }
     }
 
-    fn render_tab_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let details = self.tab_details(cx);
+        let ids: Vec<EntityId> = self.tabs.iter().map(|tab| tab.item.entity_id()).collect();
+        let faces = self
+            .tabs
+            .iter()
+            .zip(&details)
+            .enumerate()
+            .map(|(index, (tab, detail))| {
+                let face = tab_face(&tab.item, index == self.active, detail, ui, cx);
+                (tab.item.entity_id(), face)
+            })
+            .collect();
+        self.tab_strip.prepare(faces, window);
+        let drop = self.tab_drop;
+        let count = self.tabs.len();
         let tabs: Vec<_> = self
             .tabs
             .iter()
@@ -4581,30 +5212,20 @@ impl Workspace {
                     .render_plugin_tab(index, *key, view, cx)
                     .into_any_element(),
             })
+            // One element per tab (the scroll handle counts them): it glides and pops in, and the
+            // tabs part where a dragged one would land.
+            .zip(&ids)
+            .enumerate()
+            .map(|(index, (tab, id))| {
+                let room = crate::tab_strip::Room::at(index, count, drop);
+                self.tab_strip.tab(*id, room, tab)
+            })
             .collect();
-        // While a tab is dragged over the strip: a marker where it would land.
-        let marker = self.tab_drop.and_then(|index| {
-            let strip = self.tab_scroll.bounds();
-            let x = match self.tab_scroll.bounds_for_item(index) {
-                Some(tab) => tab.left() - px(3.),
-                None => {
-                    self.tab_scroll
-                        .bounds_for_item(index.checked_sub(1)?)?
-                        .right()
-                        + px(1.)
-                }
-            };
-            Some(
-                div()
-                    .absolute()
-                    .top(px(6.))
-                    .bottom(px(6.))
-                    .left(x - strip.left())
-                    .w(px(2.))
-                    .rounded(px(1.))
-                    .bg(ui.accent),
-            )
-        });
+        // The highlight of the active tab and the marker of a dragged one, behind the tabs:
+        // painted after layout, where the tabs are drawn.
+        let highlight =
+            self.tab_strip
+                .highlight(ids.get(self.active).copied(), drop, RADIUS_MD, ui);
         div()
             .relative()
             .flex_none()
@@ -4658,19 +5279,20 @@ impl Workspace {
                     .h(px(1.))
                     .bg(ui.divider)
             })
+            .child(highlight)
             .child(
                 div()
                     .id("tabs")
                     .size_full()
-                    .px_1p5()
+                    .px(px(TAB_STRIP_INSET))
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(TAB_GAP))
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll)
-                    .children(tabs),
+                    .children(tabs)
+                    .children(self.tab_strip.ghosts(window)),
             )
-            .children(marker)
     }
 
     /// The dimmed label after a tab's name: for files with the same name, their directories; for
@@ -4744,9 +5366,19 @@ impl Workspace {
             )
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .child(file.render().size(px(14.)))
-            .child(match status_color {
-                Some(color) => label(&title).text_color(color),
-                None => label(&title),
+            // The label's git color fades as the file's status changes; settled without one,
+            // it takes the tab's own color (and its hover). Activation draws it anew: no fade.
+            .child({
+                let plain = if active { ui.foreground } else { ui.text_muted };
+                label(&title).with_transition(
+                    if active { "label-active" } else { "label" },
+                    status_color.unwrap_or(plain),
+                    crate::motion::FADE,
+                    move |label, color| match color == plain {
+                        true => label,
+                        false => label.text_color(color),
+                    },
+                )
             })
             .children(detail.map(|detail| label(&detail).text_color(ui.dim)))
             .child(close_button(
@@ -5057,7 +5689,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        let index = self.take_tab_drop();
         match self.index_of_terminal(&group) {
             Some(from) => self.move_tab(from, index, window, cx),
             None => self.move_terminal_to_editor(group, Some(index), window, cx),
@@ -5070,10 +5702,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        let index = self.take_tab_drop();
         if let Some(from) = self.index_of(&editor) {
             self.move_tab(from, index, window, cx);
         }
+    }
+
+    /// A tab dropped on the strip: where it lands (at the end without a marker). The tabs are at
+    /// once where it put them (`TabStrip::settle`).
+    fn take_tab_drop(&mut self) -> usize {
+        self.tab_strip.settle();
+        self.tab_drop.take().unwrap_or(self.tabs.len())
     }
 
     /// Moves a tab to an insertion point (an index between the tabs before the move) and activates
@@ -5095,6 +5734,8 @@ impl Workspace {
             self.start_drawn = true;
             cx.on_next_frame(window, |_, _, cx| cx.notify());
         }
+        // No tab strip meanwhile: the next tabs pop in.
+        self.tab_strip.clear();
         let branch = self.git.read(cx).branch_label(None);
         let screen = StartScreen {
             root: self.root.as_deref(),
@@ -5375,9 +6016,22 @@ impl Render for Workspace {
         };
         let main = match self.active_item() {
             Some(item) => {
-                self.start_drawn = false;
+                // The first tab in place of the start screen: the editor area fades in.
+                if std::mem::take(&mut self.start_drawn) && crate::motion::enabled() {
+                    self.fade_in = Some(Instant::now());
+                }
+                let fade = self
+                    .fade_in
+                    .map(|since| crate::motion::animate(since, crate::motion::FADE, window))
+                    .filter(|fade| *fade < 1.);
+                if fade.is_none() {
+                    self.fade_in = None;
+                }
                 self.retry_tab_scroll(window, cx);
                 let content = match &item {
+                    // Fading in, drawn anew each frame: a cached view keeps the opacity it was
+                    // painted with.
+                    TabItem::Editor(editor) if fade.is_some() => editor.clone().into_any_element(),
                     // A cached view: drawn again only when notified, so that a frame for something
                     // else (a working session's pulse, streamed text) doesn't lay the editor out
                     // again (2026-10-16: ~18 % of such a frame).
@@ -5398,12 +6052,23 @@ impl Render for Workspace {
                     crate::plugin_suggestions::banner(self, &editor, window, cx)
                 });
                 let svg_bar = item.editor().and_then(|editor| self.svg_bar(editor, cx));
-                main.child(self.render_tab_bar(cx))
+                let area = div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .when_some(fade, |area, fade| area.opacity(fade));
+                let area = area
+                    .child(self.render_tab_bar(window, cx))
                     .children(suggestion)
                     .children(svg_bar)
+                    // The find bar slides away after it closed, taking no input.
                     .when(
-                        item.editor().is_some() && self.find_bar.read(cx).is_open(),
-                        |main| main.child(self.find_bar.clone()),
+                        item.editor().is_some() && self.find_bar.read(cx).is_shown(),
+                        |main| match self.find_bar.read(cx).is_open() {
+                            true => main.child(self.find_bar.clone()),
+                            false => main.child(crate::motion::inert(self.find_bar.clone())),
+                        },
                     )
                     .child(body(
                         div()
@@ -5432,50 +6097,47 @@ impl Render for Workspace {
                             })
                             .child(content)
                             .into_any_element(),
-                    ))
+                    ));
+                main.child(area)
             }
             None => main.child(body(self.render_start(window, cx).into_any_element())),
         };
-        // The left island: the commit window in place of the tree, or the tree.
-        let left = match &self.commit_panel {
-            _ if self.console_open => Some(
-                div()
-                    .flex_none()
-                    .w(px(self.left_width.get()))
-                    .h_full()
-                    .child(self.claude_console.clone())
-                    .into_any_element(),
-            ),
-            Some(handle) if self.commit_open => Some(handle.panel.clone().into_any_element()),
-            // The tree is a cached view too (see the editor's tab above): its root style is the
-            // panel's own (`FileTreePanel::render`).
-            _ => self.tree_panel().filter(|_| self.tree_open).map(|panel| {
-                AnyView::from(panel)
-                    .cached(
-                        StyleRefinement::default()
-                            .relative()
-                            .flex_none()
-                            .w(px(self.left_width.get()))
-                            .h_full(),
-                    )
-                    .into_any_element()
-            }),
-        };
-        let tree = left.map(|panel| {
-            ui::island(ui, style)
+        // The islands of tool windows glide open and closed (`IslandGlide`, `island_slot`); their
+        // sizes across the window are their tools' and their borders.
+        let border = if flat { 1. } else { 2. };
+        // The left island: the Claude console, the commit window in place of the tree, or the tree.
+        let left_tool = self.left_tool();
+        let tree = self.left_glide.frame(left_tool, window).and_then(|frame| {
+            let animating = frame.open < 1. || frame.replaced.is_some();
+            let tool = self.render_left_tool(frame.tool, !animating)?;
+            let replaced = frame
+                .replaced
+                .and_then(|(old, progress)| Some((self.render_left_tool(old, false)?, progress)));
+            let island = ui::island(ui, style)
                 .flex_none()
                 .h_full()
-                .when(flat, |tree| tree.border_r_1().border_color(line))
-                .child(panel)
+                .when(flat, |tree| tree.border_r_1().border_color(line));
+            let full = self.left_width.get() + border;
+            let slot = island_slot(Side::Left, frame.open, full, gap, island, tool, replaced);
+            Some(if frame.leaving {
+                crate::motion::inert(slot).into_any_element()
+            } else {
+                slot
+            })
         });
-        // The editor island and, under it, the terminal panel; the tree stays full height. A panel
-        // terminal can move to the editor area: the command is offered inside the panel.
-        let git_island = self
-            .git_window
-            .as_ref()
-            .filter(|_| self.git_open)
-            .map(|handle| {
-                ui::island(ui, style)
+        // The editor island and, under it, the terminal panel or the Git window; the tree stays
+        // full height. A panel terminal can move to the editor area: the command is offered inside
+        // the panel.
+        let bottom_tool = self.bottom_tool();
+        let bottom = self
+            .bottom_glide
+            .frame(bottom_tool, window)
+            .and_then(|frame| {
+                let tool = self.render_bottom_tool(frame.tool)?;
+                let replaced = frame
+                    .replaced
+                    .and_then(|(old, progress)| Some((self.render_bottom_tool(old)?, progress)));
+                let island = ui::island(ui, style)
                     .flex_none()
                     .when(flat, |island| island.border_t_1().border_color(line))
                     .on_action(
@@ -5483,19 +6145,21 @@ impl Render for Workspace {
                             this.move_log_tab_to_editor(window, cx)
                         }),
                     )
-                    .child(handle.window.clone())
+                    .on_action(cx.listener(
+                        |this, _: &terminal_panel::MoveToEditor, window, cx| {
+                            this.move_to_editor(window, cx)
+                        },
+                    ));
+                let max =
+                    f32::from(window.viewport_size().height) * ui::BottomIslandHeight::MAX_SHARE;
+                let full = self.bottom_height.get_within(max) + border;
+                let slot = island_slot(Side::Bottom, frame.open, full, gap, island, tool, replaced);
+                Some(if frame.leaving {
+                    crate::motion::inert(slot).into_any_element()
+                } else {
+                    slot
+                })
             });
-        let terminal = (self.terminal_open && git_island.is_none()).then(|| {
-            ui::island(ui, style)
-                .flex_none()
-                .when(flat, |island| island.border_t_1().border_color(line))
-                .on_action(
-                    cx.listener(|this, _: &terminal_panel::MoveToEditor, window, cx| {
-                        this.move_to_editor(window, cx)
-                    }),
-                )
-                .child(self.terminal_panel.clone())
-        });
         let main = div()
             .flex_1()
             .min_w_0()
@@ -5504,43 +6168,49 @@ impl Render for Workspace {
             .flex_col()
             .gap(px(gap))
             .child(main)
-            .children(terminal)
-            .children(git_island);
-        // The island on the right: a tool window (Notifications), full height like the tree.
-        let right = self.right_tool.map(|tool| {
-            let content = match tool {
-                RightTool::Notifications => self.notifications_panel.clone().into_any_element(),
-                RightTool::Plugin(key) => match self.plugin_tool_view(key, cx) {
-                    Some(view) => view.into_any_element(),
-                    None => div().into_any_element(),
-                },
-            };
-            ui::island(ui, style)
-                .flex_none()
-                .h_full()
-                .when(flat, |island| island.border_l_1().border_color(line))
-                .on_action(
-                    cx.listener(|this, _: &notifications_panel::Hide, window, cx| {
-                        this.hide_right(window, cx)
-                    }),
-                )
-                .on_action(
-                    cx.listener(|this, _: &notifications_panel::FocusEditor, window, cx| {
-                        this.focus_active(window, cx)
-                    }),
-                )
-                .on_action(cx.listener(
-                    |this, _: &notifications_panel::OpenSettings, window, cx| {
-                        crate::settings_view::open(
-                            this,
-                            crate::settings_view::Section::Notifications,
-                            window,
-                            cx,
-                        )
-                    },
-                ))
-                .child(content)
-        });
+            .children(bottom);
+        // The island on the right: a tool window (Notifications, a plugin's), full height like the
+        // tree.
+        let right = self
+            .right_glide
+            .frame(self.right_tool, window)
+            .map(|frame| {
+                let tool = self.render_right_tool(frame.tool, cx);
+                let replaced = frame
+                    .replaced
+                    .map(|(old, progress)| (self.render_right_tool(old, cx), progress));
+                let island = ui::island(ui, style)
+                    .flex_none()
+                    .h_full()
+                    .when(flat, |island| island.border_l_1().border_color(line))
+                    .on_action(
+                        cx.listener(|this, _: &notifications_panel::Hide, window, cx| {
+                            this.hide_right(window, cx)
+                        }),
+                    )
+                    .on_action(cx.listener(
+                        |this, _: &notifications_panel::FocusEditor, window, cx| {
+                            this.focus_active(window, cx)
+                        },
+                    ))
+                    .on_action(cx.listener(
+                        |this, _: &notifications_panel::OpenSettings, window, cx| {
+                            crate::settings_view::open(
+                                this,
+                                crate::settings_view::Section::Notifications,
+                                window,
+                                cx,
+                            )
+                        },
+                    ));
+                let full = self.right_width.get() + border;
+                let slot = island_slot(Side::Right, frame.open, full, gap, island, tool, replaced);
+                if frame.leaving {
+                    crate::motion::inert(slot).into_any_element()
+                } else {
+                    slot
+                }
+            });
         // The cards in the corner, unless the journal is in sight (then they go there, as in
         // JetBrains).
         let cards = (self.right_tool != Some(RightTool::Notifications))
@@ -5574,19 +6244,27 @@ impl Render for Workspace {
                     // The plugins' items stay whatever the tab (part 10.3): the active task, the
                     // next meeting.
                     .children(plugins::status_bar_items(self, cx))
-                    .children(self.render_claude_status(cx))
+                    // They fade in as they come (`crate::motion`).
+                    .children(self.render_claude_status(cx).map(|status| {
+                        crate::motion::Appear::fade()
+                            .apply("claude-status", div().flex_none().child(status))
+                    }))
                     // An update of Flux on its way (part 10.8): the download, a restart to finish.
-                    .children(crate::updates::status_item(cx))
-                    .child(self.render_bell(cx)),
+                    .children(crate::updates::status_item(cx).map(|update| {
+                        crate::motion::Appear::fade()
+                            .apply("update-status", div().flex_none().child(update))
+                    }))
+                    .child(self.render_bell(window, cx)),
             )
             .children(cards)
             .children(self.render_project_search(cx))
-            .children(self.render_modal(cx))
-            .children(
-                self.tab_menu.as_ref().map(|menu| {
-                    crate::context_menu::ContextMenu::overlay(&menu.menu, menu.position)
-                }),
-            )
+            .children(self.render_modal(window, cx))
+            .child(crate::context_menu::ContextMenu::slot(
+                "tab-menu",
+                self.tab_menu
+                    .as_ref()
+                    .map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }
 
@@ -5705,8 +6383,9 @@ fn start_quit_then(cx: &mut App, cancelled: impl FnOnce(&mut App) + 'static) {
         .filter_map(|window| window.downcast())
         .collect();
     cx.spawn(async move |cx| {
-        let confirmed =
-            confirm_windows(windows.clone(), cx).await && confirm_leftovers(&windows, cx).await;
+        let confirmed = confirm_processes(&windows, cx).await
+            && confirm_windows(windows.clone(), cx).await
+            && confirm_leftovers(&windows, cx).await;
         cx.update(|cx| {
             if confirmed {
                 cx.quit();
@@ -5721,10 +6400,59 @@ fn start_quit_then(cx: &mut App, cancelled: impl FnOnce(&mut App) + 'static) {
     .detach();
 }
 
+/// What closing a window asks about the commands running in its terminals and Claude at work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Processes {
+    /// The window closes: "Close the window?".
+    CloseWindow,
+    /// Another project opens in the window: "Close the project?".
+    CloseProject,
+    /// Flux quits and has asked once for every window ([`confirm_processes`]).
+    Asked,
+}
+
+/// Quitting with commands running in terminals or Claude at work in any window: one short
+/// question for all of them, asked in the window in front (or the first busy one) — no list of
+/// what runs where; the processes end with Flux.
+async fn confirm_processes(windows: &[WindowHandle<Workspace>], cx: &mut AsyncApp) -> bool {
+    let busy: Vec<WindowHandle<Workspace>> = windows
+        .iter()
+        .copied()
+        .filter(|handle| {
+            handle
+                .update(cx, |workspace, _, cx| workspace.has_running_work(cx))
+                .unwrap_or(false)
+        })
+        .collect();
+    let Some(&first) = busy.first() else {
+        return true;
+    };
+    let active = cx
+        .update(|cx| {
+            cx.active_window()
+                .and_then(|window| window.downcast::<Workspace>())
+        })
+        .ok()
+        .flatten()
+        .filter(|active| busy.contains(active));
+    let answer = active.unwrap_or(first).update(cx, |_, window, cx| {
+        window.activate_window();
+        Dialog::warning(tr("Quit Flux?"))
+            .message(tr("All running processes will be stopped."))
+            .danger(tr("Quit"))
+            .cancel(tr("Cancel"))
+            .show(window, cx)
+    });
+    let Ok(answer) = answer else {
+        return true;
+    };
+    answer.await == Some(0)
+}
+
 async fn confirm_windows(windows: Vec<WindowHandle<Workspace>>, cx: &mut AsyncApp) -> bool {
     for handle in windows {
         let confirm = handle.update(cx, |workspace, window, cx| {
-            workspace.confirm_close_all(window, cx)
+            workspace.confirm_close_all(Processes::Asked, window, cx)
         });
         // The window was closed in the meantime: there is nothing to ask about.
         let Ok(confirm) = confirm else {
@@ -6157,7 +6885,104 @@ fn shorten(text: &str, max_chars: usize) -> String {
     short
 }
 
-/// A tab: a rounded pill, highlighted when active.
+/// What the left of the status bar says, fading in whenever it changes (`crate::motion::FADE`):
+/// keyed by `text`.
+fn status_text(text: &str, element: gpui::Div) -> AnyElement {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    crate::motion::Appear::fade().apply(("status-text", hasher.finish()), element)
+}
+
+/// The icon of a closed tab's ghost.
+enum FaceIcon {
+    File(FileIcon),
+    Glyph(IconName, gpui::Hsla),
+    /// A plugin's own icon: the ghost keeps its room.
+    Blank,
+}
+
+/// How a tab looks as a ghost when it closes (`crate::tab_strip::Face`): its icon and labels, in
+/// the place of the tab's own, without the item (a closed document's editor is released at once).
+fn tab_face(
+    item: &TabItem,
+    active: bool,
+    detail: &Option<String>,
+    ui: UiColors,
+    cx: &App,
+) -> crate::tab_strip::Face {
+    let (glyph, title, kind) = match item {
+        TabItem::Editor(editor) => {
+            let document = &editor.read(cx).document;
+            let icon = FaceIcon::File(file_icon(&document.display_name(), &ui));
+            (icon, document_name(document), None)
+        }
+        TabItem::Terminal(group) => (
+            FaceIcon::Glyph(IconName::Terminal, ui.green),
+            group.read(cx).title(cx).to_string(),
+            None,
+        ),
+        TabItem::Diff(view) => {
+            let view = view.read(cx);
+            let icon = match view.proposal_icon() {
+                Some(glyph) => FaceIcon::Glyph(glyph, ui.accent_text),
+                None => FaceIcon::Glyph(IconName::Diff, ui.vcs_modified),
+            };
+            let kind = (!view.is_proposal()).then(|| tr("diff").to_string());
+            (icon, view.title().to_string(), kind)
+        }
+        TabItem::Merge(view) => (
+            FaceIcon::Glyph(IconName::Merge, ui.vcs_conflict),
+            view.read(cx).title().to_string(),
+            Some(tr("merge").to_string()),
+        ),
+        TabItem::Log(view) => (
+            FaceIcon::Glyph(IconName::History, ui.accent),
+            view.read(cx).title().to_string(),
+            None,
+        ),
+        TabItem::Claude(chat) => (
+            FaceIcon::Glyph(IconName::Claude, ui.accent_text),
+            chat.read(cx).session().read(cx).title().to_string(),
+            None,
+        ),
+        TabItem::Image(view) => {
+            let title = view.read(cx).title().to_string();
+            (FaceIcon::File(file_icon(&title, &ui)), title, None)
+        }
+        TabItem::Plugin(_, view) => (FaceIcon::Blank, view.read(cx).title().to_string(), None),
+    };
+    let detail = detail.clone().or(kind);
+    let glyph = std::rc::Rc::new(glyph);
+    std::rc::Rc::new(move || {
+        let glyph = match &*glyph {
+            FaceIcon::File(file) => file.render().size(px(14.)).into_any_element(),
+            FaceIcon::Glyph(name, color) => icon(*name, *color).size(px(14.)).into_any_element(),
+            FaceIcon::Blank => div().flex_none().size(px(14.)).into_any_element(),
+        };
+        div()
+            .size_full()
+            .pl_2p5()
+            .pr_1p5()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .text_color(if active { ui.foreground } else { ui.text_muted })
+            .when(active, |face| face.font_weight(FontWeight::MEDIUM))
+            .child(glyph)
+            .child(label(&title))
+            .children(
+                detail
+                    .as_deref()
+                    .map(|detail| label(detail).text_color(ui.dim)),
+            )
+            .into_any_element()
+    })
+}
+
+/// A tab: a rounded pill; the strip highlights the active one.
 fn tab_shell(id: EntityId, active: bool, ui: UiColors) -> gpui::Stateful<gpui::Div> {
     div()
         .id(("tab", id))
@@ -6172,20 +6997,19 @@ fn tab_shell(id: EntityId, active: bool, ui: UiColors) -> gpui::Stateful<gpui::D
         .gap_2()
         .rounded(px(RADIUS_MD))
         .border_1()
+        .border_color(gpui::transparent_black())
         .text_color(if active { ui.foreground } else { ui.text_muted })
-        .when(active, |el| {
-            el.bg(ui.pressed)
-                .border_color(ui.island_border)
-                .font_weight(FontWeight::MEDIUM)
-        })
+        // The active tab's highlight is the strip's, gliding from tab to tab
+        // (`TabStrip::highlight`).
+        .when(active, |el| el.font_weight(FontWeight::MEDIUM))
         .when(!active, |el| {
-            el.border_color(gpui::transparent_black())
-                .hover(|style| style.bg(ui.hover).text_color(ui.foreground))
+            el.hover(|style| style.bg(ui.hover).text_color(ui.foreground))
         })
 }
 
 /// Right edge of a tab: a dot in `dot`'s color (unsaved changes, a terminal's bell), "×" on hover
-/// (always on an active tab without a dot).
+/// (always on an active tab without a dot). The dot pops in and shrinks away; under the pointer, it
+/// and the "×" crossfade (`crate::motion`).
 fn close_button(
     item: TabItem,
     active: bool,
@@ -6193,6 +7017,12 @@ fn close_button(
     cx: &Context<Workspace>,
 ) -> impl IntoElement {
     let ui = Theme::ui(cx);
+    // The color the dot keeps while it shrinks away.
+    let dot_color = dot.unwrap_or(match item {
+        TabItem::Terminal(_) => ui.warning,
+        _ => ui.modified,
+    });
+    let hidden = dot.is_some() || !active;
     let close = div()
         .id("close")
         .group("tab-close")
@@ -6204,11 +7034,6 @@ fn close_button(
         .rounded(px(ui::RADIUS_XS))
         .text_color(ui.dim)
         .hover(move |style| style.bg(ui.pressed).text_color(ui.foreground))
-        .when(dot.is_some() || !active, |close| {
-            close
-                .invisible()
-                .group_hover("tab", |style| style.visible())
-        })
         // Clicking "×" must not activate the tab.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -6219,22 +7044,12 @@ fn close_button(
                 .size(px(12.))
                 .group_hover("tab-close", move |style| style.text_color(ui.foreground)),
         );
-    let dot = dot.map(|color| {
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .group_hover("tab", |style| style.invisible())
-            .child(div().size(px(7.)).rounded(px(4.)).bg(color))
-    });
     div()
         .relative()
         .flex_none()
         .size(px(18.))
-        .children(dot)
-        .child(close)
+        .child(crate::tab_strip::dot(dot.is_some(), dot_color, "tab"))
+        .child(crate::tab_strip::close_reveal(close, !hidden, "tab"))
 }
 
 /// The insertion point for a tab dropped at `x`: the number of tabs whose middle is to its left.
@@ -6273,19 +7088,6 @@ fn terminal_details(terminals: &[Option<(SharedString, Option<PathBuf>)>]) -> Ve
         .collect()
 }
 
-/// The detail of the "Terminate running processes?" question, naming the commands (each once, with
-/// a count when it runs in several terminals); `None` when nothing is running.
-fn running_processes_detail(names: &[String]) -> Option<String> {
-    match names {
-        [] => None,
-        [name] => Some(trf("“{0}” is still running in a terminal.", &[name])),
-        _ => Some(trf(
-            "{0} are still running in terminals.",
-            &[&names_with_counts(names)],
-        )),
-    }
-}
-
 /// "cargo, node ×2": process names in the order first seen, repeats counted.
 fn names_with_counts(names: &[String]) -> String {
     let mut counted: Vec<(&str, usize)> = Vec::new();
@@ -6309,7 +7111,8 @@ impl Render for DraggedEditorTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let file = file_icon(&self.name, &ui);
-        div()
+        // Lifted off the strip: it grows in under the pointer.
+        let preview = div()
             .flex()
             .items_center()
             .gap_2()
@@ -6326,7 +7129,8 @@ impl Render for DraggedEditorTab {
             .text_size(px(theme::TEXT_MD))
             .text_color(ui.foreground)
             .child(file.render().size(px(14.)))
-            .child(self.name.clone())
+            .child(self.name.clone());
+        crate::motion::Appear::pop((0.5, 0.5)).apply("dragged-tab", preview)
     }
 }
 
@@ -6978,7 +7782,7 @@ impl Workspace {
                 SessionRef::Saved(saved) => {
                     if let Some(cli) = self.claude.read(cx).cli().cli().cloned() {
                         let command = claude::resume_command(&cli, Some(&saved.id));
-                        self.type_in_terminal(command, true, window, cx);
+                        self.claude_in_terminal(command, window, cx);
                     }
                 }
             },
@@ -7397,7 +8201,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        let index = self.take_tab_drop();
         if let Some(from) = self
             .tabs
             .iter()
@@ -7524,7 +8328,7 @@ impl Workspace {
         });
         self.claude.update(cx, |_, cx| cx.notify());
         let command = claude::resume_command(&cli, id.as_deref());
-        self.type_in_terminal(command, true, window, cx);
+        self.claude_in_terminal(command, window, cx);
     }
 
     /// "Sign In": `claude auth login` in a new terminal (it opens the browser); Flux checks the
@@ -7537,8 +8341,43 @@ impl Workspace {
             "{} auth login",
             claude::shell_quote(&cli.path.to_string_lossy())
         );
-        self.type_in_terminal(command, true, window, cx);
-        self.claude.update(cx, |store, cx| store.watch_sign_in(cx));
+        let this = cx.weak_entity();
+        let handle = window.window_handle();
+        // Part «Флаг страны»: signing in talks to Anthropic too.
+        crate::region_guard::when_allowed(cx, move |outcome, cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| match outcome {
+                        Ok(()) => {
+                            this.type_in_terminal(command, true, window, cx);
+                            this.claude.update(cx, |store, cx| store.watch_sign_in(cx));
+                        }
+                        Err(refusal) => {
+                            this.notify(crate::region_guard::notification(&refusal), cx)
+                        }
+                    })
+                })
+                .ok();
+        });
+    }
+
+    /// `claude` in a new terminal (the terminal CLI of a session), once the country check allows
+    /// it (part «Флаг страны»); blocked — a notification says why.
+    fn claude_in_terminal(&mut self, command: String, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let handle = window.window_handle();
+        crate::region_guard::when_allowed(cx, move |outcome, cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| match outcome {
+                        Ok(()) => this.type_in_terminal(command, true, window, cx),
+                        Err(refusal) => {
+                            this.notify(crate::region_guard::notification(&refusal), cx)
+                        }
+                    })
+                })
+                .ok();
+        });
     }
 
     /// A new terminal in the panel with `text` typed at its prompt (`run` — and run).
@@ -7555,23 +8394,6 @@ impl Workspace {
             panel.new_terminal_typing(text, run, window, cx)
         });
         cx.notify();
-    }
-
-    /// Closing the window: what Claude does in its sessions (`None` — nothing).
-    fn claude_working_detail(&self, cx: &App) -> Option<String> {
-        let working = self.claude.read(cx).working_sessions(cx);
-        match working.as_slice() {
-            [] => None,
-            [session] => Some(trf(
-                "Claude is working in “{0}”.",
-                &[&session.read(cx).title()],
-            )),
-            sessions => Some(trn(
-                sessions.len(),
-                "Claude is working in {n} session.",
-                "Claude is working in {n} sessions.",
-            )),
-        }
     }
 
     // --- Drawing ---
@@ -7675,9 +8497,10 @@ impl Workspace {
             .limits()
             .filter(|_| crate::settings::claude(cx).show_limits)
             .cloned();
+        // The state as a key too: a new one fades in (`crate::motion`).
         let state = match activity {
-            claude::Activity::Working => Some((tr("Working…"), ui.accent_text)),
-            claude::Activity::Waiting => Some((tr("Waiting for you"), ui.warning)),
+            claude::Activity::Working => Some((tr("Working…"), ui.accent_text, 0usize)),
+            claude::Activity::Waiting => Some((tr("Waiting for you"), ui.warning, 1)),
             _ => None,
         };
         if state.is_none() && limits.is_none() {
@@ -7702,7 +8525,7 @@ impl Workspace {
             claude::LimitLevel::Critical => ui.error,
         };
         let mut tooltip = String::from(tr("Claude Code"));
-        if let Some((label, _)) = &state {
+        if let Some((label, ..)) = &state {
             tooltip.push_str(" — ");
             tooltip.push_str(label);
         }
@@ -7724,16 +8547,27 @@ impl Workspace {
                         &claude::resets_in(window.resets_at, now),
                     ],
                 ));
+                // A new share fades in, its color glides to the new level (`crate::motion`).
+                let percent = format!("{}%", claude::percent(window.utilization));
                 windows.push(
                     div()
+                        .id(short)
                         .flex()
                         .items_center()
                         .gap_1()
                         .child(div().text_color(ui.dim).child(short))
                         .child(
                             div()
-                                .text_color(level_color(window.utilization))
-                                .child(format!("{}%", claude::percent(window.utilization))),
+                                .child(crate::motion::Appear::fade().apply(
+                                    SharedString::from(percent.clone()),
+                                    div().child(percent),
+                                ))
+                                .with_transition(
+                                    "color",
+                                    level_color(window.utilization),
+                                    crate::motion::FADE,
+                                    |percent, color| percent.text_color(color),
+                                ),
                         )
                         .into_any_element(),
                 );
@@ -7758,13 +8592,19 @@ impl Workspace {
                         None => window.dispatch_action(Box::new(claude::ToggleClaude), cx),
                     })
                     .child(
-                        icon(
-                            IconName::Claude,
-                            state.as_ref().map_or(ui.text_muted, |(_, color)| *color),
-                        )
-                        .size(px(13.)),
+                        icon(IconName::Claude, ui.text_muted)
+                            .size(px(13.))
+                            .with_transition(
+                                "icon",
+                                state.as_ref().map_or(ui.text_muted, |(_, color, _)| *color),
+                                crate::motion::FADE,
+                                |icon, color| icon.text_color(color),
+                            ),
                     )
-                    .children(state.map(|(label, color)| div().text_color(color).child(label)))
+                    .children(state.map(|(label, color, key)| {
+                        crate::motion::Appear::fade()
+                            .apply(("state", key), div().text_color(color).child(label))
+                    }))
                     .children(windows),
             ),
         )
@@ -7845,19 +8685,12 @@ mod tests {
     }
 
     #[test]
-    fn the_quit_question_names_the_running_commands_once() {
-        assert_eq!(running_processes_detail(&[]), None);
+    fn running_commands_are_named_once_with_a_count() {
+        assert_eq!(names_with_counts(&[]), "");
+        assert_eq!(names_with_counts(&["cargo".into()]), "cargo");
         assert_eq!(
-            running_processes_detail(&["cargo".into()]).as_deref(),
-            Some("“cargo” is still running in a terminal.")
-        );
-        assert_eq!(
-            running_processes_detail(&["cargo".into(), "vim".into(), "cargo".into()]).as_deref(),
-            Some("cargo ×2, vim are still running in terminals.")
-        );
-        assert_eq!(
-            running_processes_detail(&["cargo".into(), "cargo".into()]).as_deref(),
-            Some("cargo ×2 are still running in terminals.")
+            names_with_counts(&["cargo".into(), "vim".into(), "cargo".into()]),
+            "cargo ×2, vim"
         );
     }
 

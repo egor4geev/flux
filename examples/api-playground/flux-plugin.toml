@@ -109,7 +109,7 @@ description = "A secret, a button, a status line, several lines of text and reco
 key = "playground-token"
 type = "secret"
 title = "A token"
-description = "Kept in the macOS keychain, not with the other settings; the plugin reads it with secrets.get."
+description = "Kept by Flux encrypted, not with the other settings; the plugin reads it with secrets.get."
 
 [[settings]]
 key = "playground-check"

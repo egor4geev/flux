@@ -3,7 +3,8 @@
 //! Project, Commit, Push, New Branch, Checkout Tag or Revision), the recent, local and remote
 //! branches (by prefix: `feature/…` is a folder; remote branches under their remote) and tags;
 //! favorites starred and on top of their section; a branch's actions in a submenu to the right
-//! (→ or ↵ opens it, ← closes it). With several repositories — a node per repository.
+//! (→ or ↵ opens it, ← closes it; over the popup's right part when the window has no room there).
+//! With several repositories — a node per repository.
 //!
 //! The popup only shows and dispatches: a submenu item or an action row closes the popup, gives
 //! focus back to where it was and dispatches its action there; the flows (`branch_dialogs`,
@@ -29,6 +30,7 @@ use crate::git::{self, GitStore};
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, folder_icon, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::motion;
 use crate::picker::highlighted_text;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_SM};
@@ -173,6 +175,7 @@ pub fn branch_chip(workspace: &Workspace, cx: &Context<Workspace>) -> Option<Any
         .text_color(ui.violet)
         .cursor_pointer()
         .hover(move |style| style.bg(UiColors::tint(ui.violet, 0.2)))
+        .active(crate::motion::press)
         .tooltip(ui::tooltip(tr("Branches"), keys))
         // A press while the popup is open only closes it (the popup's own "click outside"): the
         // capture phase sees the popup before it goes.
@@ -202,13 +205,29 @@ pub fn branch_chip(workspace: &Workspace, cx: &Context<Workspace>) -> Option<Any
             }
         })
         .child(icon(IconName::Branch, ui.violet).size(px(12.)))
-        .child(label)
-        .when(behind > 0, |chip| {
-            chip.child(counter(IconName::ArrowDown, behind, ui.vcs_modified))
-        })
-        .when(ahead > 0, |chip| {
-            chip.child(counter(IconName::ArrowUp, ahead, ui.vcs_added))
-        });
+        // Another branch checked out: its name fades in (`crate::motion`).
+        .child(crate::motion::Appear::fade().apply(
+            gpui::ElementId::NamedChild(Box::new("name".into()), label.clone()),
+            div().child(label),
+        ))
+        // A commit, a push, a fetch: a count that grew bumps (`crate::badge`); out of the flow
+        // while it is zero, it keeps its count to bump when it comes.
+        .child(crate::badge::bump(
+            "behind",
+            behind as usize,
+            match behind {
+                0 => div().absolute(),
+                _ => counter(IconName::ArrowDown, behind, ui.vcs_modified),
+            },
+        ))
+        .child(crate::badge::bump(
+            "ahead",
+            ahead as usize,
+            match ahead {
+                0 => div().absolute(),
+                _ => counter(IconName::ArrowUp, ahead, ui.vcs_added),
+            },
+        ));
     Some(
         div()
             .flex()
@@ -932,6 +951,16 @@ pub(crate) fn submenu_items(branch: &BranchRow, current: &str) -> Vec<Option<Sub
 }
 
 /// The open submenu of a branch row.
+/// Where the popup and its submenu were drawn (window coordinates), for the submenu's side: to the
+/// right of the popup when the window has room for it there, else over the popup's right part —
+/// the popup itself never moves for it (the window's edge would push the two along).
+#[derive(Default)]
+struct SubmenuPlacement {
+    popup: Cell<Option<Bounds<Pixels>>>,
+    /// The submenu's width as laid out, and its row.
+    submenu: Cell<Option<(usize, Pixels)>>,
+}
+
 struct Submenu {
     /// The row it belongs to.
     row: usize,
@@ -959,7 +988,11 @@ pub struct BranchesPopup {
     selected: usize,
     /// Nodes opened or closed against their default.
     toggled: HashSet<NodeKey>,
+    /// The nodes the user opens and closes: chevrons turn, rows unfold (`crate::motion`).
+    disclosure: motion::Disclosure<NodeKey>,
     submenu: Option<Submenu>,
+    /// Where the popup and its submenu were drawn: the submenu's side.
+    placement: Rc<SubmenuPlacement>,
     /// The row under the pointer, and what resting on it will do (open its submenu, close another).
     hovered: Option<RowId>,
     hover_task: Option<Task<()>>,
@@ -1002,6 +1035,8 @@ impl BranchesPopup {
             rows: Vec::new(),
             selected: 0,
             toggled: HashSet::new(),
+            disclosure: Default::default(),
+            placement: Rc::default(),
             submenu: None,
             hovered: None,
             hover_task: None,
@@ -1051,6 +1086,19 @@ impl BranchesPopup {
         let query = self.query.read(cx).text();
         let inputs = self.inputs(cx);
         self.rows = build_rows(&inputs, &query, &self.toggled);
+        // The rows under a node: those after it, deeper than it.
+        let rows = &self.rows;
+        self.disclosure.rows_changed(|key| {
+            let at = rows
+                .iter()
+                .position(|row| row.node().as_ref() == Some(key))?;
+            let node = rows.get(at).filter(|row| row.expanded)?;
+            let end = rows[at + 1..]
+                .iter()
+                .position(|row| row.depth <= node.depth)
+                .map_or(rows.len(), |len| at + 1 + len);
+            Some(at + 1..end)
+        });
         if let Some(selected) = selected
             && let Some(index) = self
                 .rows
@@ -1182,6 +1230,7 @@ impl BranchesPopup {
     }
 
     fn set_expanded(&mut self, key: NodeKey, expanded: bool, cx: &mut Context<Self>) {
+        self.disclosure.toggled(key.clone(), expanded);
         if expanded == key.expanded_by_default() {
             self.toggled.remove(&key);
         } else {
@@ -1490,23 +1539,17 @@ impl BranchesPopup {
             .submenu
             .as_ref()
             .is_some_and(|submenu| submenu.row == index);
-        let chevron = |expanded: bool| {
+        // A node the user opened or closed: its chevron turns (`crate::motion`).
+        let openness = row.node().map_or(0., |key| {
+            self.disclosure.chevron(&key, row.expanded, window)
+        });
+        let chevron = || {
             div()
                 .flex_none()
                 .w(px(CHEVRON_WIDTH))
                 .flex()
                 .justify_center()
-                .child(
-                    icon(
-                        if expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        },
-                        ui.dim,
-                    )
-                    .size(px(12.)),
-                )
+                .child(crate::icons::chevron(openness, ui.dim).size(px(12.)))
         };
         let spacer = || div().flex_none().w(px(CHEVRON_WIDTH));
         let label = |row: &Row, color| {
@@ -1549,7 +1592,7 @@ impl BranchesPopup {
                 .gap_1p5()
                 .flex_1()
                 .min_w_0()
-                .child(chevron(row.expanded))
+                .child(chevron())
                 .child(folder_icon(row.expanded, &ui).render().size(px(14.)))
                 .child(label(row, ui.foreground).font_weight(FontWeight::SEMIBOLD))
                 .children(branch.clone().map(|branch| {
@@ -1566,7 +1609,7 @@ impl BranchesPopup {
                 .gap_1p5()
                 .flex_1()
                 .min_w_0()
-                .child(chevron(row.expanded))
+                .child(chevron())
                 .child(ui::section_label(row.label.clone(), ui))
                 .child(
                     div()
@@ -1581,7 +1624,7 @@ impl BranchesPopup {
                 .gap_1p5()
                 .flex_1()
                 .min_w_0()
-                .child(chevron(row.expanded))
+                .child(chevron())
                 .child(folder_icon(row.expanded, &ui).render().size(px(14.)))
                 .child(label(row, ui.foreground))
                 .into_any_element(),
@@ -1640,10 +1683,13 @@ impl BranchesPopup {
                 .child(text.clone())
                 .into_any_element(),
         };
+        // The rows of a node the user opened unfold (`crate::motion`).
+        let unfold = self.disclosure.unfold(index, window);
         div()
             .w_full()
             .h(px(ROW_HEIGHT))
             .px(px(LIST_INSET))
+            .map(|row| motion::unfold_style(row, unfold))
             .child(
                 div()
                     .id(("branch-row", index))
@@ -1742,7 +1788,7 @@ impl BranchesPopup {
         }
     }
 
-    fn render_submenu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+    fn render_submenu(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let submenu = self.submenu.as_ref()?;
         let ui = Theme::ui(cx);
         // Level with the row: its place in the list, scrolled.
@@ -1778,24 +1824,63 @@ impl BranchesPopup {
                 }
             })
             .collect();
-        Some(
-            div().mt(top).child(
-                crate::popup::panel(ui)
-                    .id("branch-submenu")
-                    .on_hover(
-                        cx.listener(|this, hovered: &bool, _, _| this.hover_submenu(*hovered)),
-                    )
-                    .min_w(px(SUBMENU_MIN_WIDTH))
-                    .p(px(SUBMENU_PADDING))
-                    .flex()
-                    .flex_col()
-                    // A click inside doesn't reach the list behind it.
-                    .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation()
-                    })
-                    .children(items),
-            ),
-        )
+        let panel = crate::popup::panel(ui)
+            .id("branch-submenu")
+            .on_hover(cx.listener(|this, hovered: &bool, _, _| this.hover_submenu(*hovered)))
+            .min_w(px(SUBMENU_MIN_WIDTH))
+            .p(px(SUBMENU_PADDING))
+            .flex()
+            .flex_col()
+            // A click inside doesn't reach the list behind it.
+            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                cx.stop_propagation()
+            })
+            .children(items);
+        // Its width as it is laid out: the frame it opens it is measured unseen, taking no input;
+        // the next one it grows right where it stays, on the side that has room.
+        let row = submenu.row;
+        let placement = self.placement.clone();
+        let measured = div().on_children_prepainted(move |children, _, _| {
+            if let Some(bounds) = children.first() {
+                placement.submenu.set(Some((row, bounds.size.width)));
+            }
+        });
+        let width = self
+            .placement
+            .submenu
+            .get()
+            .filter(|(drawn, _)| *drawn == row)
+            .map(|(_, width)| width);
+        let (Some(width), Some(popup)) = (width, self.placement.popup.get()) else {
+            window.request_animation_frame();
+            return Some(
+                motion::inert(
+                    measured
+                        .absolute()
+                        .top(top)
+                        .left_0()
+                        .invisible()
+                        .child(panel),
+                )
+                .into_any_element(),
+            );
+        };
+        let room = window.viewport_size().width - px(ui::GAP + SUBMENU_GAP) - popup.right();
+        let fits = width <= room;
+        // It grows out of its row's edge (its top corner, level with the row); another row's
+        // submenu grows anew.
+        let panel = motion::Appear::pop(if fits { (0., 0.) } else { (1., 0.) })
+            .apply(("branch-submenu-pop", row), measured.child(panel));
+        Some(if fits {
+            div().mt(top).child(panel).into_any_element()
+        } else {
+            div()
+                .absolute()
+                .top(top)
+                .right(px(LIST_INSET))
+                .child(panel)
+                .into_any_element()
+        })
     }
 
     fn render_empty(&self, cx: &App) -> Option<impl IntoElement + use<>> {
@@ -1846,7 +1931,7 @@ impl Focusable for BranchesPopup {
 }
 
 impl Render for BranchesPopup {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         self.clamp_selection();
         let count = self.rows.len();
@@ -1915,11 +2000,16 @@ impl Render for BranchesPopup {
                     )
                     .child(ui::hint_bar(&self.hints(), ui)),
             );
+        let placement = self.placement.clone();
         div()
             .key_context("BranchesPopup")
+            .relative()
             .flex()
             .items_start()
             .gap(px(SUBMENU_GAP))
+            .on_children_prepainted(move |children, _, _| {
+                placement.popup.set(children.first().copied())
+            })
             .font_family(theme::UI_FONT)
             .text_size(px(theme::TEXT_MD))
             .text_color(ui.foreground)
@@ -1940,7 +2030,7 @@ impl Render for BranchesPopup {
                 cx.emit(DismissEvent)
             }))
             .child(popover)
-            .children(self.render_submenu(cx))
+            .children(self.render_submenu(window, cx))
     }
 }
 

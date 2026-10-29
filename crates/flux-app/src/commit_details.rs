@@ -7,9 +7,18 @@
 //! A double click, ↵ or ⌘D on a file opens its diff with the parent (`git::OpenCompareDiff`); with
 //! several commits — from before the oldest one that touched it to the newest; F4 opens the file.
 //! Everything is read in the background; a newer selection drops the answers to an older one.
+//!
+//! Motion (`crate::motion`): a new selection keeps the commit shown on screen until its own details
+//! are read, then they fade in ("Reading…", late and fading in, only when nothing is shown yet);
+//! commits stepped through quickly follow without the fade. The directories the user opens and
+//! closes turn their chevrons and unfold their rows (a new commit's tree just appears); a selected
+//! row's color fades as focus leaves the pane and comes back.
 
 use std::collections::{BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use flux_git::{CommitDetails, FileChange, FileStatus, GitError};
 use gpui::{
@@ -20,9 +29,11 @@ use gpui::{
 
 use crate::diff_view::DiffSide;
 use crate::git::{self, GitStore};
+use crate::git_log::selected_bg;
 use crate::i18n::{tr, trf, trn};
-use crate::icons::{IconName, file_icon, folder_icon, icon};
+use crate::icons::{self, IconName, file_icon, folder_icon, icon};
 use crate::log_actions::OpenCommitFile;
+use crate::motion::{self, Appear, Disclosure};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_SM};
 
@@ -47,6 +58,11 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const MAX_COMMITS: usize = 50;
 const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 14.;
+/// Commits shown for less than this before the next one comes are being stepped through (the keys
+/// repeating): the next one replaces them at once, without the fade.
+const STEPPING: Duration = Duration::from_millis(400);
+/// "Reading…" fades in only after this: a quick reading shows nothing in between.
+const READING_DELAY: Duration = Duration::from_millis(250);
 
 pub fn init(cx: &mut App) {
     let context = Some("CommitDetails");
@@ -103,9 +119,15 @@ pub struct CommitDetailsView {
     git: Entity<GitStore>,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
-    /// The repository, the selected commits (newest first) and, in a file's history, the file.
+    /// The repository, the commits shown (newest first) and, in a file's history, the file.
     shown: Option<(usize, Vec<String>, Option<String>)>,
+    /// The selection asked for last, as `shown`: until its details are read, the pane keeps
+    /// showing the commits before it.
+    requested: Option<(usize, Vec<String>, Option<String>)>,
+    /// `Reading` — nothing read to show yet.
     loaded: Loaded,
+    /// When what is shown came, and whether it fades in (`crate::motion`).
+    arrived: Option<(Instant, bool)>,
     /// The branches containing the (single) shown commit, once read.
     branches: Option<Result<Vec<String>, String>>,
     /// Answers to an older selection are dropped.
@@ -114,6 +136,8 @@ pub struct CommitDetailsView {
     collapsed: HashSet<String>,
     rows: Vec<Row>,
     selected: Option<usize>,
+    /// The directories the user opens and closes: their chevrons turn, their rows unfold.
+    disclosure: Disclosure<String>,
 }
 
 impl CommitDetailsView {
@@ -123,18 +147,22 @@ impl CommitDetailsView {
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             shown: None,
+            requested: None,
             loaded: Loaded::Reading,
+            arrived: None,
             branches: None,
             generation: 0,
             tree: true,
             collapsed: HashSet::new(),
             rows: Vec::new(),
             selected: None,
+            disclosure: Disclosure::default(),
         }
     }
 
     /// Shows the commits selected in the log (newest first): one — in full; several — their files
-    /// together; none — a hint. `path` — a file's history: that file (relative) is selected.
+    /// together; none — a hint. `path` — a file's history: that file (relative) is selected. What
+    /// was shown stays until the new commits' details are read.
     pub fn show(
         &mut self,
         repo: usize,
@@ -142,20 +170,23 @@ impl CommitDetailsView {
         path: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let shown = Some((repo, oids.clone(), path.clone()));
-        if self.shown == shown {
+        let requested = Some((repo, oids.clone(), path.clone()));
+        if self.requested == requested {
             return;
         }
-        self.shown = shown;
+        self.requested = requested;
         self.generation += 1;
-        self.branches = None;
-        self.rows.clear();
-        self.selected = None;
-        cx.notify();
         if oids.is_empty() {
+            self.shown = self.requested.clone();
+            self.loaded = Loaded::Reading;
+            self.arrived = None;
+            self.branches = None;
+            self.rows.clear();
+            self.selected = None;
+            self.disclosure = Disclosure::default();
+            cx.notify();
             return;
         }
-        self.loaded = Loaded::Reading;
         let generation = self.generation;
         let read = self
             .git
@@ -163,21 +194,38 @@ impl CommitDetailsView {
         cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
-                if this.generation != generation {
-                    return;
+                if this.generation == generation {
+                    this.details_read(result, path.as_deref(), cx);
                 }
-                this.loaded = match result {
-                    Ok((commits, files)) => Loaded::Ready { commits, files },
-                    Err(error) => Loaded::Failed(error.to_string()),
-                };
-                this.rebuild();
-                this.selected = this.initial_selection(path.as_deref());
-                this.read_branches(cx);
-                cx.notify();
             })
             .ok();
         })
         .detach();
+        // After "Select a commit": "Reading…".
+        cx.notify();
+    }
+
+    /// The details of the selection asked for last were read: they replace what was shown.
+    fn details_read(
+        &mut self,
+        result: Result<Details, GitError>,
+        path: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let stepping = self.arrived.is_some_and(|(at, _)| at.elapsed() < STEPPING);
+        self.arrived = Some((Instant::now(), !stepping));
+        self.shown = self.requested.clone();
+        self.branches = None;
+        self.loaded = match result {
+            Ok((commits, files)) => Loaded::Ready { commits, files },
+            Err(error) => Loaded::Failed(error.to_string()),
+        };
+        // A new tree just appears.
+        self.disclosure = Disclosure::default();
+        self.rebuild();
+        self.selected = self.initial_selection(path);
+        self.read_branches(cx);
+        cx.notify();
     }
 
     /// "In N branches" of a single commit: read after the rest (it may take a while).
@@ -228,6 +276,8 @@ impl CommitDetailsView {
                 .map(|index| Row::File { index, depth: 0 })
                 .collect()
         };
+        let rows = &self.rows;
+        self.disclosure.rows_changed(|dir| children_rows(rows, dir));
     }
 
     /// The row of the history's file, else the first file.
@@ -276,19 +326,24 @@ impl CommitDetailsView {
             }
             return;
         };
-        if expanded {
-            self.collapsed.remove(&path);
+        let changed = if expanded {
+            self.collapsed.remove(&path)
         } else {
-            self.collapsed.insert(path);
+            self.collapsed.insert(path.clone())
+        };
+        if changed {
+            self.disclosure.toggled(path, expanded);
         }
         self.rebuild();
         cx.notify();
     }
 
     fn toggle_dir(&mut self, path: &str, cx: &mut Context<Self>) {
-        if !self.collapsed.remove(path) {
+        let open = self.collapsed.remove(path);
+        if !open {
             self.collapsed.insert(path.to_string());
         }
+        self.disclosure.toggled(path.to_string(), open);
         self.rebuild();
         cx.notify();
     }
@@ -646,7 +701,12 @@ impl CommitDetailsView {
         cx.notify();
     }
 
-    fn render_rows(&self, focused: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    fn render_rows(
+        &self,
+        focused: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
         let ui = Theme::ui(cx);
         let files = self.files();
         let highlighted = self.shown.as_ref().and_then(|(_, _, path)| path.clone());
@@ -666,37 +726,42 @@ impl CommitDetailsView {
                     .rounded(px(RADIUS_SM))
                     .whitespace_nowrap()
                     .cursor_pointer()
-                    .map(|row| match (selected, focused) {
-                        (true, true) => row.bg(ui.list_selected),
-                        (true, false) => row.bg(ui.list_selected_inactive),
-                        _ => row.hover(move |style| style.bg(ui.hover)),
-                    })
+                    .when(!selected, |row| row.hover(move |style| style.bg(ui.hover)))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.select_row(at, event, window, cx)
                     }));
-                match row {
+                let (element, key) = match row {
                     Row::Dir {
-                        label, expanded, ..
-                    } => base
-                        .child(
-                            icon(
-                                if *expanded {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                },
+                        path,
+                        label,
+                        expanded,
+                        ..
+                    } => (
+                        base.child(
+                            icons::chevron(
+                                self.disclosure.chevron(path, *expanded, window),
                                 ui.dim,
                             )
                             .size(px(12.)),
                         )
                         .child(folder_icon(*expanded, &ui).render().size(px(14.)))
-                        .child(div().text_color(ui.text_muted).child(label.clone()))
-                        .into_any_element(),
+                        .child(div().text_color(ui.text_muted).child(label.clone())),
+                        path.as_str(),
+                    ),
                     Row::File { index, .. } => {
                         let file = &files[*index];
-                        file_row(base, &file.change, self.tree, highlighted.as_deref(), ui)
-                            .into_any_element()
+                        (
+                            file_row(base, &file.change, self.tree, highlighted.as_deref(), ui),
+                            file.change.path.as_str(),
+                        )
                     }
+                };
+                let element = motion::unfold_style(element, self.disclosure.unfold(at, window));
+                if selected {
+                    let id = SharedString::from(format!("details-selected-{key}"));
+                    selected_bg(element, id, focused, ui)
+                } else {
+                    element.into_any_element()
                 }
             })
             .collect()
@@ -932,22 +997,42 @@ impl Render for CommitDetailsView {
                 .child(div().text_color(color).child(text))
         };
         let empty = self
-            .shown
+            .requested
             .as_ref()
             .is_none_or(|(_, oids, _)| oids.is_empty());
         if empty {
             return root.child(note(tr("Select a commit").into(), ui.text_muted));
         }
+        // What came fades in, once per commits shown.
+        let fade_in = self.arrived.is_some_and(|(_, fade)| fade);
+        let shown = content_key(self.shown.as_ref());
+        let appear = move |name: &'static str, element: gpui::Stateful<gpui::Div>| {
+            if fade_in {
+                Appear::fade().apply((name, shown), element)
+            } else {
+                element.into_any_element()
+            }
+        };
         let commits = match &self.loaded {
-            Loaded::Reading => return root.child(note(tr("Reading…").into(), ui.text_muted)),
-            Loaded::Failed(error) => return root.child(note(error.clone().into(), ui.error)),
+            // Nothing to show yet: "Reading…" comes only if the reading takes a while.
+            Loaded::Reading => {
+                return root.child(Appear::fade().delay(READING_DELAY).apply(
+                    "details-reading",
+                    note(tr("Reading…").into(), ui.text_muted),
+                ));
+            }
+            Loaded::Failed(error) => {
+                let failed = note(error.clone().into(), ui.error).id("details-failed");
+                return root.child(appear("details-failed-in", failed));
+            }
             Loaded::Ready { commits, .. } => commits.clone(),
         };
         let count = self.files().len();
-        let rows = self.render_rows(focused, cx);
+        let rows = self.render_rows(focused, window, cx);
         let info = self.render_info(&commits, cx);
         root.child(self.render_toolbar(count, cx))
-            .child(
+            .child(appear(
+                "details-files-in",
                 div()
                     .id("details-files")
                     .flex_1()
@@ -959,9 +1044,10 @@ impl Render for CommitDetailsView {
                         list.child(div().p_2().text_color(ui.dim).child(tr("No changed files")))
                     })
                     .children(rows),
-            )
+            ))
             .child(div().mx_2().child(ui::divider(ui)))
-            .child(
+            .child(appear(
+                "details-info-in",
                 div()
                     .id("details-info")
                     .flex_none()
@@ -969,8 +1055,36 @@ impl Render for CommitDetailsView {
                     .p_3()
                     .overflow_y_scroll()
                     .child(info),
-            )
+            ))
     }
+}
+
+/// What names the commits shown, for their fade in: one per repository, commits and file.
+fn content_key(shown: Option<&(usize, Vec<String>, Option<String>)>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    shown.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Where the rows under directory `dir` are (for `motion::Disclosure`): `None` when it is closed
+/// or gone.
+fn children_rows(rows: &[Row], dir: &str) -> Option<Range<usize>> {
+    let index = rows
+        .iter()
+        .position(|row| matches!(row, Row::Dir { path, .. } if path == dir))?;
+    let Row::Dir {
+        depth,
+        expanded: true,
+        ..
+    } = &rows[index]
+    else {
+        return None;
+    };
+    let end = rows[index + 1..]
+        .iter()
+        .position(|row| row_depth(row) <= *depth)
+        .map_or(rows.len(), |count| index + 1 + count);
+    Some(index + 1..end)
 }
 
 #[cfg(test)]
@@ -1038,6 +1152,28 @@ mod tests {
         );
         let collapsed = HashSet::from(["a".to_string()]);
         assert_eq!(tree_rows(&paths, &collapsed).len(), 2);
+    }
+
+    #[test]
+    fn a_directory_s_rows_are_the_deeper_ones_after_it() {
+        let paths = ["a/b/c/x.rs", "a/b/c/y.rs", "a/z.rs", "top.rs"];
+        let rows = tree_rows(&paths, &HashSet::new());
+        // a/ · b/c/ · x.rs · y.rs · z.rs · top.rs
+        assert_eq!(children_rows(&rows, "a"), Some(1..5));
+        assert_eq!(children_rows(&rows, "a/b/c"), Some(2..4));
+        assert_eq!(children_rows(&rows, "top.rs"), None);
+        let rows = tree_rows(&paths, &HashSet::from(["a/b/c".to_string()]));
+        assert_eq!(children_rows(&rows, "a/b/c"), None, "a closed directory");
+        assert_eq!(children_rows(&rows, "a"), Some(1..3));
+    }
+
+    #[test]
+    fn each_selection_fades_in_under_its_own_name() {
+        let one = (0, vec!["c1".to_string()], None);
+        let two = (0, vec!["c1".to_string(), "c2".to_string()], None);
+        assert_eq!(content_key(Some(&one)), content_key(Some(&one.clone())));
+        assert_ne!(content_key(Some(&one)), content_key(Some(&two)));
+        assert_ne!(content_key(Some(&one)), content_key(None));
     }
 
     #[test]

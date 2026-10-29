@@ -1260,7 +1260,9 @@ impl PluginCatalog {
                 .items_center()
                 .cursor_pointer()
                 .child(
+                    // An id: the label's color fades under the pointer.
                     ui::section_label(tab.label(), ui)
+                        .id("label")
                         .when(active, |label| label.text_color(ui.foreground))
                         .when(!active, |label| {
                             label.group_hover(group.clone(), move |style| {

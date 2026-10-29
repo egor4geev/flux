@@ -7,11 +7,11 @@
 //! the typing stops, so a pattern being typed doesn't make a plugin redo its work at every key.
 //!
 //! API 0.3 (part 10.3) adds what a sign-in needs: a `section` — a heading with its description
-//! over the settings that follow; a `secret` — a masked field whose value goes to the macOS
-//! keychain (the plugin's secret of that key, `secrets.get`), never to `settings.json`; a `button`
-//! — runs one of the plugin's commands (buttons in a row share a line); a `status` — a line the
-//! plugin writes (`settings.set-status`: "Signed in as …", a spinner while it works). A value the
-//! plugin writes itself (`settings.set`) shows at once.
+//! over the settings that follow; a `secret` — a masked field whose value Flux keeps encrypted (the
+//! plugin's secret of that key, `secrets.get`), never in `settings.json`; a `button` — runs one of
+//! the plugin's commands (buttons in a row share a line); a `status` — a line the plugin writes
+//! (`settings.set-status`: "Signed in as …", a spinner while it works). A value the plugin writes
+//! itself (`settings.set`) shows at once.
 //!
 //! And what a plugin's own actions need: `text` — several lines (a prompt, a template), growing
 //! with the text; `records` — a list of records with the same fields (a name, a prompt, a mode, a
@@ -40,6 +40,7 @@ use crate::dialog::Dialog;
 use crate::i18n::{lang_code, tr, trf};
 use crate::icons::IconName;
 use crate::input::{InputEvent, TextInput};
+use crate::motion::TransitionExt as _;
 use crate::plugins::{CommandOrigin, PluginStore};
 use crate::prompt_input::{PromptInput, PromptInputEvent};
 use crate::settings;
@@ -152,12 +153,14 @@ pub struct PluginSettingsPage {
     /// The ids of records' cards: unique on the page, so a card's elements stay with it when
     /// records move.
     next_card: Cell<u64>,
+    /// The cards' chevrons turning as the user opens and closes them, by (setting, card).
+    disclosure: crate::motion::Disclosure<(usize, u64)>,
 }
 
 struct Field {
     spec: SettingSpec,
     state: FieldState,
-    /// Why the typed value isn't saved: not a number, out of range; a secret the keychain refused.
+    /// Why the typed value isn't saved: not a number, out of range; a secret that couldn't be.
     error: Option<SharedString>,
     /// The value the fields were filled with or saved: a different stored one — the plugin wrote
     /// it (`settings.set`) — refills them.
@@ -171,8 +174,8 @@ enum FieldState {
     Input(Row),
     /// A list of strings: a field per row.
     List(Vec<Row>),
-    /// A secret: a masked field. What is typed goes to the keychain once the typing stops; the
-    /// field stays empty when a value is there already — it isn't shown.
+    /// A secret: a masked field. What is typed is saved once the typing stops; the field stays
+    /// empty when a value is there already — it isn't shown.
     Secret(Secret),
     /// Several lines of text.
     Lines(Lines),
@@ -205,7 +208,7 @@ enum RecordInput {
 
 struct Secret {
     row: Row,
-    /// The keychain has a value: none until it is read (in the background, when the page opens).
+    /// A value is saved: none until it is read (in the background, when the page opens).
     saved: Option<bool>,
     /// Bumped by every keystroke: the typed value is saved only if no newer one came.
     generation: Rc<Cell<u64>>,
@@ -241,6 +244,7 @@ impl PluginSettingsPage {
             generation: Rc::new(Cell::new(0)),
             _subscription: Some(subscription),
             next_card: Cell::new(0),
+            disclosure: crate::motion::Disclosure::default(),
         };
         let specs = page
             .entry
@@ -526,8 +530,8 @@ impl PluginSettingsPage {
 
     // --- Secrets, buttons, status lines (API 0.3) ---
 
-    /// Whether the keychain has the secrets of the page: read in the background (the keychain may
-    /// ask the user to unlock it).
+    /// Whether the secrets of the page are saved: read in the background (the first read may wait
+    /// for them to move from the keychain, which may ask the user).
     fn read_secrets(&mut self, cx: &mut Context<Self>) {
         for index in 0..self.fields.len() {
             if !matches!(self.fields[index].state, FieldState::Secret(_)) {
@@ -544,7 +548,7 @@ impl PluginSettingsPage {
                     if let FieldState::Secret(secret) = &mut field.state {
                         match result {
                             Ok(value) => secret.mark_saved(value.is_some(), cx),
-                            Err(err) => field.error = Some(keychain_error(&err)),
+                            Err(err) => field.error = Some(read_error(&err)),
                         }
                     }
                     cx.notify();
@@ -555,8 +559,8 @@ impl PluginSettingsPage {
         }
     }
 
-    /// Typed into a secret: once the typing stops, the text goes to the keychain (an emptied field
-    /// keeps the saved value: Clear takes it away).
+    /// Typed into a secret: once the typing stops, the text is saved (an emptied field keeps the
+    /// saved value: Clear takes it away).
     fn save_secret_later(&mut self, index: usize, text: String, cx: &mut Context<Self>) {
         let FieldState::Secret(secret) = &self.fields[index].state else {
             return;
@@ -597,7 +601,7 @@ impl PluginSettingsPage {
                         }
                         this.tell_plugin(false, cx);
                     }
-                    Err(err) => field.error = Some(keychain_error(&err)),
+                    Err(err) => field.error = Some(save_error(&err)),
                 }
                 cx.notify();
             })
@@ -606,7 +610,7 @@ impl PluginSettingsPage {
         .detach();
     }
 
-    /// Clear of a secret: out of the keychain, and the field emptied.
+    /// Clear of a secret: removed, and the field emptied.
     fn clear_secret(&mut self, index: usize, cx: &mut Context<Self>) {
         if let FieldState::Secret(secret) = &self.fields[index].state {
             // A save still waiting for the typing to stop doesn't come after the removal.
@@ -797,6 +801,8 @@ impl PluginSettingsPage {
             .and_then(|cards| cards.iter_mut().find(|card| card.id == id))
         {
             card.expanded = !card.expanded;
+            let expanded = card.expanded;
+            self.disclosure.toggled((index, id), expanded);
         }
         cx.notify();
     }
@@ -1013,7 +1019,7 @@ fn record_is_empty(card: &RecordCard, cx: &App) -> bool {
 }
 
 impl Secret {
-    /// The keychain has a value or not: an empty field shows dots for a saved one.
+    /// A value is saved or not: an empty field shows dots for a saved one.
     fn mark_saved(&mut self, saved: bool, cx: &mut App) {
         self.saved = Some(saved);
         let placeholder = if saved {
@@ -1027,9 +1033,14 @@ impl Secret {
     }
 }
 
-/// A keychain error as a line under a secret's field.
-fn keychain_error(error: &str) -> SharedString {
-    trf("The keychain refused: {0}", &[&error]).into()
+/// A secret that couldn't be read, as a line under its field.
+fn read_error(error: &str) -> SharedString {
+    trf("Couldn't read: {0}", &[&error]).into()
+}
+
+/// A secret that couldn't be saved, as a line under its field.
+fn save_error(error: &str) -> SharedString {
+    trf("Couldn't save: {0}", &[&error]).into()
 }
 
 /// A number field's text as a value: an error tells what's wrong.
@@ -1160,12 +1171,7 @@ impl PluginSettingsPage {
             (_, FieldState::Input(row)) => card
                 .child(caption(reset))
                 .child(row.input.clone())
-                .children(field.error.clone().map(|error| {
-                    div()
-                        .text_size(px(theme::TEXT_SM))
-                        .text_color(ui.error)
-                        .child(error)
-                }))
+                .children(field.error.clone().map(|error| fading_error(error, ui)))
                 .into_any_element(),
             (_, FieldState::List(rows)) => card
                 .child(caption(reset))
@@ -1174,12 +1180,7 @@ impl PluginSettingsPage {
             (_, FieldState::Secret(secret)) => card
                 .child(caption(None))
                 .child(self.render_secret(index, secret, ui, cx))
-                .children(field.error.clone().map(|error| {
-                    div()
-                        .text_size(px(theme::TEXT_SM))
-                        .text_color(ui.error)
-                        .child(error)
-                }))
+                .children(field.error.clone().map(|error| fading_error(error, ui)))
                 .into_any_element(),
             (_, FieldState::Lines(lines)) => card
                 .child(caption(reset))
@@ -1295,13 +1296,10 @@ impl PluginSettingsPage {
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_card(index, id, cx)),
             )
+            // It turns as the card opens and closes.
             .child(
-                crate::icons::icon(
-                    if card.expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    },
+                crate::icons::chevron(
+                    self.disclosure.chevron(&(index, id), card.expanded, window),
                     ui.text_muted,
                 )
                 .size(px(12.)),
@@ -1316,13 +1314,13 @@ impl PluginSettingsPage {
             )
             .children(summary.into_iter().map(|badge| badge.flex_none()));
         let button = |name: &str, icon: IconName, tooltip: &'static str, enabled: bool| {
-            ui::icon_button(
+            let button = ui::icon_button(
                 SharedString::from(format!("plugin-record-{index}-{id}-{name}")),
                 icon,
                 ui,
             )
-            .tooltip(ui::tooltip(tr(tooltip), None))
-            .when(!enabled, |button| button.opacity(0.35).cursor_default())
+            .tooltip(ui::tooltip(tr(tooltip), None));
+            ui::available(button, enabled)
         };
         let header = div()
             .flex()
@@ -1541,14 +1539,21 @@ impl PluginSettingsPage {
                 busy: false,
             });
         let title = self.tr(&spec.title).to_string();
+        // A new status fades in, its color gliding to the new tone ("Checking…" → "Connected").
+        let text = SharedString::from(status.text);
         let line = div()
             .flex()
             .items_center()
             .gap_2()
             .min_w_0()
-            .text_color(tone_color(status.tone, ui))
             .when(status.busy, |line| line.child(busy_dot(index, ui)))
-            .child(div().min_w_0().child(status.text));
+            .child(crate::motion::Appear::fade().apply(text.clone(), div().min_w_0().child(text)))
+            .with_transition(
+                ("plugin-setting-tone", index),
+                tone_color(status.tone, ui),
+                crate::motion::FADE,
+                |line, color| line.text_color(color),
+            );
         let actions = (!buttons.is_empty()).then(|| self.render_buttons(buttons, false, cx));
         div()
             .id(SharedString::from(format!("plugin-setting-{index}")))
@@ -1576,8 +1581,8 @@ impl PluginSettingsPage {
             .into_any_element()
     }
 
-    /// A secret's masked field: "Saved in the keychain" while it is empty and a value is there;
-    /// Clear takes the value away.
+    /// A secret's masked field: "Saved" while it is empty and a value is there; Clear takes the
+    /// value away.
     fn render_secret(
         &self,
         index: usize,
@@ -1588,9 +1593,9 @@ impl PluginSettingsPage {
         let typed = !secret.row.input.read(cx).is_empty();
         let hint = match secret.saved {
             _ if typed => None,
-            Some(true) => Some((tr("Saved in the keychain"), true)),
+            Some(true) => Some((tr("Saved"), true)),
             Some(false) => None,
-            None => Some((tr("Reading the keychain…"), false)),
+            None => Some((tr("Reading…"), false)),
         };
         div()
             .flex()
@@ -1648,15 +1653,17 @@ impl PluginSettingsPage {
                     }
                     _ => false,
                 };
-                ui::text_button(
-                    SharedString::from(format!("plugin-setting-{index}")),
-                    self.tr(&spec.title).to_string(),
-                    false,
-                    ui,
+                ui::available(
+                    ui::text_button(
+                        SharedString::from(format!("plugin-setting-{index}")),
+                        self.tr(&spec.title).to_string(),
+                        false,
+                        ui,
+                    )
+                    .h(px(28.))
+                    .px(px(12.)),
+                    enabled,
                 )
-                .h(px(28.))
-                .px(px(12.))
-                .when(!enabled, |button| button.opacity(0.5).cursor_default())
                 .when(enabled, |button| {
                     button.on_click(
                         cx.listener(move |this, _: &ClickEvent, _, cx| this.press(index, cx)),
@@ -1844,12 +1851,21 @@ fn header(name: &str, ui: UiColors) -> Div {
 
 /// A multi-line field in a box like a text field's: ↵ — a new line; a click on the box's padding
 /// puts the caret into it.
-fn render_lines(lines: &Lines, window: &Window, cx: &mut Context<PluginSettingsPage>) -> Div {
+///
+/// Focused, its border and ring come in as a text field's do (`ui::focus_field`).
+fn render_lines(
+    lines: &Lines,
+    window: &Window,
+    cx: &mut Context<PluginSettingsPage>,
+) -> impl IntoElement + use<> {
     let ui = Theme::ui(cx);
     let focus = lines.input.focus_handle(cx);
     let focused = focus.is_focused(window);
     let input = lines.input.clone();
-    div()
+    // Keyed by the field: a page may have several, in rows without ids.
+    let key = lines.input.entity_id().as_u64();
+    let field = div()
+        .id(("lines", key))
         .key_context(LINES_CONTEXT)
         .w_full()
         .px_2p5()
@@ -1857,12 +1873,6 @@ fn render_lines(lines: &Lines, window: &Window, cx: &mut Context<PluginSettingsP
         .rounded(px(ui::RADIUS_MD))
         .bg(ui.input_background)
         .border_1()
-        .border_color(if focused {
-            ui.focus_border
-        } else {
-            ui.input_border
-        })
-        .when(focused, |field| field.shadow(ui::focus_ring(ui)))
         .when(!focused, |field| {
             field.hover(move |style| style.border_color(ui.elevated_border))
         })
@@ -1871,7 +1881,8 @@ fn render_lines(lines: &Lines, window: &Window, cx: &mut Context<PluginSettingsP
             window.focus(&focus)
         })
         .on_action(move |_: &NewLine, _, cx| input.update(cx, |input, cx| input.insert("\n", cx)))
-        .child(lines.input.clone())
+        .child(lines.input.clone());
+    ui::focus_field(field, ("lines-focus", key), focused, ui)
 }
 
 /// The color of a status line's tone, as in the plugins' tool windows.
@@ -1887,18 +1898,29 @@ fn tone_color(tone: Tone, ui: UiColors) -> gpui::Hsla {
     }
 }
 
-/// A pulsing dot: the plugin works ("Checking…").
-fn busy_dot(index: usize, ui: UiColors) -> impl IntoElement {
-    div()
-        .flex_none()
-        .size(px(8.))
-        .rounded(px(4.))
-        .bg(ui.accent)
-        .with_animation(
-            SharedString::from(format!("plugin-setting-busy-{index}")),
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
-        )
+/// A pulsing dot: the plugin works ("Checking…"). With the animations off, a still one.
+fn busy_dot(index: usize, ui: UiColors) -> AnyElement {
+    let dot = div().flex_none().size(px(8.)).rounded(px(4.)).bg(ui.accent);
+    if !crate::motion::enabled() {
+        return dot.opacity(0.65).into_any_element();
+    }
+    dot.with_animation(
+        SharedString::from(format!("plugin-setting-busy-{index}")),
+        Animation::new(Duration::from_millis(900)).repeat(),
+        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+    )
+    .into_any_element()
+}
+
+/// A field's validation message: fades in, and again when it says something else.
+fn fading_error(error: SharedString, ui: UiColors) -> AnyElement {
+    crate::motion::Appear::fade().apply(
+        error.clone(),
+        div()
+            .text_size(px(theme::TEXT_SM))
+            .text_color(ui.error)
+            .child(error),
+    )
 }
 
 /// `settings.set` (API 0.3): a plugin writes one of its settings — checked against the manifest

@@ -16,7 +16,7 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
+    AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Axis, Bounds, ClickEvent,
     DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
     Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
     KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
@@ -25,20 +25,21 @@ use crate::{
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     size,
 };
+use crate::{BackgroundTag, Fill, Hsla, Rgba};
 use collections::HashMap;
 use refineable::Refineable;
 use smallvec::SmallVec;
 use stacksafe::{StackSafe, stacksafe};
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     fmt::Debug,
     marker::PhantomData,
     mem,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use util::ResultExt;
 
@@ -47,6 +48,225 @@ use super::ImageCacheProvider;
 const DRAG_THRESHOLD: f64 = 2.;
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
+
+/// Flux patch (motion, 2026-10-28): how the hover and press styles of elements with an id fade in
+/// and out — their colors, opacity and scale; everything else switches at once, as before. An
+/// element without an id has nowhere to keep the fade and switches at once too.
+#[derive(Clone, Copy)]
+pub struct InteractionTransitions {
+    /// Into the hover style.
+    pub hover_in: Duration,
+    /// Back out of it.
+    pub hover_out: Duration,
+    /// Into the press (`active`) style: the feedback of a mouse down.
+    pub press_in: Duration,
+    /// Back out of it, after the mouse up.
+    pub press_out: Duration,
+    /// The easing of the hover fades and of pressing in.
+    pub easing: fn(f32) -> f32,
+    /// The easing of the release: may overshoot (a spring), for a scale that springs back.
+    pub release_easing: fn(f32) -> f32,
+}
+
+thread_local! {
+    static INTERACTION_TRANSITIONS: Cell<Option<InteractionTransitions>> = const { Cell::new(None) };
+}
+
+/// Flux patch (motion): sets how hover and press styles fade in every window; `None` (the
+/// default) switches them at once.
+pub fn set_interaction_transitions(transitions: Option<InteractionTransitions>) {
+    INTERACTION_TRANSITIONS.with(|cell| cell.set(transitions));
+}
+
+/// Flux patch (motion, 2026-10-29): how tooltips come and go in every window.
+#[derive(Clone, Copy)]
+pub struct TooltipTransitions {
+    /// A tooltip asked for while another one shows, or less than this after one went because the
+    /// mouse left its element (moving along a toolbar), shows at once instead of after the hover
+    /// delay; its builder sees `Window::tooltip_handoff`. Not after a click or the wheel hid one.
+    pub handoff: Duration,
+    /// A tooltip that has gone fades out this long where it was, drawn but taking no mouse; zero —
+    /// it is gone at once, as before.
+    pub exit: Duration,
+    /// The easing of the fade out.
+    pub easing: fn(f32) -> f32,
+}
+
+thread_local! {
+    static TOOLTIP_TRANSITIONS: Cell<Option<TooltipTransitions>> = const { Cell::new(None) };
+}
+
+/// Flux patch (motion): sets how tooltips come and go in every window; `None` (the default) —
+/// after the hover delay each time, gone at once.
+pub fn set_tooltip_transitions(transitions: Option<TooltipTransitions>) {
+    TOOLTIP_TRANSITIONS.with(|cell| cell.set(transitions));
+}
+
+pub(crate) fn tooltip_transitions() -> Option<TooltipTransitions> {
+    TOOLTIP_TRANSITIONS.with(Cell::get)
+}
+
+/// Flux patch (motion): the fade of one interaction state (hover or press) of an element.
+#[derive(Clone, Copy)]
+struct InteractionFade {
+    on: bool,
+    since: Instant,
+    /// Where the fade started: a fade reversed halfway starts from halfway.
+    from: f32,
+    /// Which styles the fade goes to: the group's, the element's own.
+    group: bool,
+    element: bool,
+}
+
+impl InteractionFade {
+    fn settled(on: bool, group: bool, element: bool) -> Self {
+        Self {
+            on,
+            since: Instant::now(),
+            from: if on { 1. } else { 0. },
+            group,
+            element,
+        }
+    }
+
+    fn progress(&self, now: Instant, duration: Duration, easing: fn(f32) -> f32) -> (f32, bool) {
+        let target = if self.on { 1. } else { 0. };
+        if duration.is_zero() || self.from == target {
+            return (target, true);
+        }
+        let t = now.saturating_duration_since(self.since).as_secs_f32() / duration.as_secs_f32();
+        if t >= 1. {
+            return (target, true);
+        }
+        (self.from + (target - self.from) * easing(t), false)
+    }
+
+    /// Follows the state of this frame; returns how far into its styles the element is and
+    /// whether that is still moving.
+    fn update(
+        &mut self,
+        on: bool,
+        group: bool,
+        element: bool,
+        now: Instant,
+        (duration_in, duration_out): (Duration, Duration),
+        (easing_in, easing_out): (fn(f32) -> f32, fn(f32) -> f32),
+    ) -> (f32, bool) {
+        let duration_of = |on: bool| if on { duration_in } else { duration_out };
+        let easing_of = |on: bool| if on { easing_in } else { easing_out };
+        if on != self.on {
+            let (current, _) = self.progress(now, duration_of(self.on), easing_of(self.on));
+            self.on = on;
+            self.since = now;
+            self.from = current.clamp(0., 1.);
+        }
+        if on {
+            self.group = group;
+            self.element = element;
+        }
+        let (progress, done) = self.progress(now, duration_of(on), easing_of(on));
+        (progress, !done)
+    }
+}
+
+/// Flux patch (motion): the fades of an element with an id.
+#[derive(Clone, Copy)]
+pub(crate) struct InteractionFades {
+    hover: InteractionFade,
+    press: InteractionFade,
+}
+
+/// Flux patch (motion): `from` and `to` mixed — straight alpha, so a transparent end fades the
+/// other color's alpha only, as CSS mixes premultiplied colors.
+fn mix_colors(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    if t <= 0. {
+        return from;
+    }
+    if t >= 1. {
+        return to;
+    }
+    let (mut a, mut b) = (from.to_rgb(), to.to_rgb());
+    if a.a == 0. {
+        a = Rgba { a: 0., ..b };
+    } else if b.a == 0. {
+        b = Rgba { a: 0., ..a };
+    }
+    let alpha = (a.a + (b.a - a.a) * t).clamp(0., 1.);
+    let channel = |x: f32, y: f32| {
+        if alpha <= 0. {
+            x + (y - x) * t
+        } else {
+            ((x * a.a + (y * b.a - x * a.a) * t) / alpha).clamp(0., 1.)
+        }
+    };
+    Hsla::from(Rgba {
+        r: channel(a.r, b.r),
+        g: channel(a.g, b.g),
+        b: channel(a.b, b.b),
+        a: alpha,
+    })
+}
+
+/// Flux patch (motion): `to` moved back toward `from` by `1 - t` in what fades — the background
+/// (solid), the border and text colors, opacity and scale. `inherited` is the text color `None`
+/// stands for.
+fn mix_styles(from: &Style, to: &mut Style, t: f32, inherited: Hsla) {
+    if t >= 1. {
+        return;
+    }
+    let solid = |fill: &Option<Fill>| match fill {
+        Some(Fill::Color(background)) if background.tag == BackgroundTag::Solid => {
+            Some(background.solid)
+        }
+        Some(_) => None,
+        None => Some(Hsla::transparent_black()),
+    };
+    if from.background != to.background {
+        match (solid(&from.background), solid(&to.background)) {
+            (Some(a), Some(b)) => to.background = Some(Fill::from(mix_colors(a, b, t))),
+            _ => {
+                if t < 0.5 {
+                    to.background = from.background.clone();
+                }
+            }
+        }
+    }
+    if from.border_color != to.border_color {
+        to.border_color = Some(mix_colors(
+            from.border_color.unwrap_or_default(),
+            to.border_color.unwrap_or_default(),
+            t,
+        ));
+    }
+    if from.text.color != to.text.color {
+        to.text.color = Some(mix_colors(
+            from.text.color.unwrap_or(inherited),
+            to.text.color.unwrap_or(inherited),
+            t,
+        ));
+    }
+    if from.opacity != to.opacity {
+        let (a, b) = (from.opacity.unwrap_or(1.), to.opacity.unwrap_or(1.));
+        to.opacity = Some((a + (b - a) * t).clamp(0., 1.));
+    }
+    if from.transform_translate != to.transform_translate {
+        let (a, b) = (
+            from.transform_translate.unwrap_or_default(),
+            to.transform_translate.unwrap_or_default(),
+        );
+        to.transform_translate = Some(a + (b - a) * t);
+    }
+    if from.transform_scale != to.transform_scale {
+        let (a, b) = (
+            from.transform_scale.unwrap_or(1.),
+            to.transform_scale.unwrap_or(1.),
+        );
+        to.transform_scale = Some(a + (b - a) * t);
+        if to.transform_origin.is_none() {
+            to.transform_origin = from.transform_origin;
+        }
+    }
+}
 
 /// The styling information for a given group.
 pub struct GroupStyle {
@@ -99,6 +319,17 @@ impl Interactivity {
     #[cfg(not(any(feature = "inspector", debug_assertions)))]
     pub fn new() -> Interactivity {
         Interactivity::default()
+    }
+
+    /// Flux patch (motion, 2026-10-29): drops the hover and press styles set so far, its own and
+    /// its group's, and the group it names — an unavailable button neither lights up nor springs,
+    /// and its icon doesn't brighten. The pointer cursor stays the caller's to change.
+    pub fn clear_interaction_styles(&mut self) {
+        self.hover_style = None;
+        self.group_hover_style = None;
+        self.active_style = None;
+        self.group_active_style = None;
+        self.group = None;
     }
 
     /// Gets the source location of construction. Returns `None` when not in debug mode.
@@ -1818,7 +2049,8 @@ impl Interactivity {
                     window.next_frame.tab_stops.insert(focus_handle);
                 }
 
-                window.with_element_opacity(style.opacity, |window| {
+                // Flux patch (motion): opacity, and the scale and move of `transform_*`.
+                window.with_style_paint_effects(&style, bounds, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_content_mask(
@@ -2419,6 +2651,15 @@ impl Interactivity {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let delta = event.delta.pixel_delta(line_height);
+                    // Flux patch (scroll axis): only the movement along the gesture's axis
+                    // (`ScrollGesture`) — a swipe down doesn't move the content sideways; an
+                    // element that allows concurrent scroll takes all of it.
+                    let delta = match window.scroll_gesture.axis() {
+                        _ if allow_concurrent_scroll => delta,
+                        Some(Axis::Vertical) => point(Pixels::ZERO, delta.y),
+                        Some(Axis::Horizontal) => point(delta.x, Pixels::ZERO),
+                        None => delta,
+                    };
 
                     let mut delta_x = Pixels::ZERO;
                     if overflow.x == Overflow::Scroll {
@@ -2473,7 +2714,7 @@ impl Interactivity {
     fn compute_style_internal(
         &self,
         hitbox: Option<&Hitbox>,
-        element_state: Option<&mut InteractiveElementState>,
+        mut element_state: Option<&mut InteractiveElementState>,
         window: &mut Window,
         cx: &mut App,
     ) -> Style {
@@ -2494,19 +2735,73 @@ impl Interactivity {
             }
         }
 
-        if let Some(hitbox) = hitbox {
-            if !cx.has_active_drag() {
-                if let Some(group_hover) = self.group_hover_style.as_ref()
-                    && let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx)
-                    && group_hitbox_id.is_hovered(window)
-                {
-                    style.refine(&group_hover.style);
-                }
+        // Flux patch (motion): hover and press fade, when painting an element with an id.
+        let transitions = INTERACTION_TRANSITIONS.with(Cell::get).filter(|_| {
+            hitbox.is_some()
+                && element_state.is_some()
+                && (self.hover_style.is_some()
+                    || self.group_hover_style.is_some()
+                    || self.active_style.is_some()
+                    || self.group_active_style.is_some())
+        });
+        let now = Instant::now();
+        let mut animating = false;
 
-                if let Some(hover_style) = self.hover_style.as_ref()
-                    && hitbox.is_hovered(window)
-                {
-                    style.refine(hover_style);
+        if let Some(hitbox) = hitbox {
+            let mut group_hovered = false;
+            let mut hovered = false;
+            if !cx.has_active_drag() {
+                group_hovered = self.group_hover_style.as_ref().is_some_and(|group_hover| {
+                    GroupHitboxes::get(&group_hover.group, cx)
+                        .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window))
+                });
+                hovered = self.hover_style.is_some() && hitbox.is_hovered(window);
+            }
+
+            match (transitions, element_state.as_deref_mut()) {
+                (Some(transitions), Some(element_state)) => {
+                    let fades =
+                        element_state
+                            .interaction_fades
+                            .get_or_insert_with(|| InteractionFades {
+                                hover: InteractionFade::settled(
+                                    group_hovered || hovered,
+                                    group_hovered,
+                                    hovered,
+                                ),
+                                press: InteractionFade::settled(false, false, false),
+                            });
+                    let (progress, moving) = fades.hover.update(
+                        group_hovered || hovered,
+                        group_hovered,
+                        hovered,
+                        now,
+                        (transitions.hover_in, transitions.hover_out),
+                        (transitions.easing, transitions.easing),
+                    );
+                    animating |= moving;
+                    let (group, element) = (fades.hover.group, fades.hover.element);
+                    if progress > 0. {
+                        let from = (progress < 1.).then(|| style.clone());
+                        if group && let Some(group_hover) = self.group_hover_style.as_ref() {
+                            style.refine(&group_hover.style);
+                        }
+                        if element && let Some(hover_style) = self.hover_style.as_ref() {
+                            style.refine(hover_style);
+                        }
+                        if let Some(from) = from {
+                            let inherited = window.text_style().color;
+                            mix_styles(&from, &mut style, progress, inherited);
+                        }
+                    }
+                }
+                _ => {
+                    if group_hovered && let Some(group_hover) = self.group_hover_style.as_ref() {
+                        style.refine(&group_hover.style);
+                    }
+                    if hovered && let Some(hover_style) = self.hover_style.as_ref() {
+                        style.refine(hover_style);
+                    }
                 }
             }
 
@@ -2541,21 +2836,52 @@ impl Interactivity {
         }
 
         if let Some(element_state) = element_state {
-            let clicked_state = element_state
+            let clicked_state = *element_state
                 .clicked_state
                 .get_or_insert_with(Default::default)
                 .borrow();
-            if clicked_state.group
-                && let Some(group) = self.group_active_style.as_ref()
-            {
-                style.refine(&group.style)
-            }
+            let group_pressed = clicked_state.group && self.group_active_style.is_some();
+            let pressed = clicked_state.element && self.active_style.is_some();
 
-            if let Some(active_style) = self.active_style.as_ref()
-                && clicked_state.element
-            {
-                style.refine(active_style)
+            match (transitions, element_state.interaction_fades.as_mut()) {
+                (Some(transitions), Some(fades)) => {
+                    let (progress, moving) = fades.press.update(
+                        group_pressed || pressed,
+                        group_pressed,
+                        pressed,
+                        now,
+                        (transitions.press_in, transitions.press_out),
+                        (transitions.easing, transitions.release_easing),
+                    );
+                    animating |= moving;
+                    let (group, element) = (fades.press.group, fades.press.element);
+                    if progress != 0. {
+                        let from = (progress != 1.).then(|| style.clone());
+                        if group && let Some(group) = self.group_active_style.as_ref() {
+                            style.refine(&group.style)
+                        }
+                        if element && let Some(active_style) = self.active_style.as_ref() {
+                            style.refine(active_style)
+                        }
+                        if let Some(from) = from {
+                            let inherited = window.text_style().color;
+                            mix_styles(&from, &mut style, progress, inherited);
+                        }
+                    }
+                }
+                _ => {
+                    if group_pressed && let Some(group) = self.group_active_style.as_ref() {
+                        style.refine(&group.style)
+                    }
+                    if pressed && let Some(active_style) = self.active_style.as_ref() {
+                        style.refine(active_style)
+                    }
+                }
             }
+        }
+
+        if animating {
+            window.request_animation_frame();
         }
 
         style
@@ -2572,6 +2898,8 @@ pub struct InteractiveElementState {
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+    /// Flux patch (motion): the hover and press fades.
+    pub(crate) interaction_fades: Option<InteractionFades>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -2630,6 +2958,8 @@ pub(crate) fn clear_active_tooltip_if_not_hoverable(
     };
     if should_clear {
         active_tooltip.borrow_mut().take();
+        // Flux patch (motion): a click or the wheel hid it — the next one waits again.
+        window.tooltip_dismissed = true;
         window.refresh();
     }
 }
@@ -2749,13 +3079,21 @@ fn handle_tooltip_mouse_move(
             active_tooltip.borrow_mut().take();
         }
         Action::ScheduleShow => {
+            // Flux patch (motion): right after another tooltip, at once (`TooltipTransitions`).
+            let handoff = window.tooltip_warm();
+            let delay = if handoff {
+                Duration::ZERO
+            } else {
+                TOOLTIP_SHOW_DELAY
+            };
             let delayed_show_task = window.spawn(cx, {
                 let active_tooltip = active_tooltip.clone();
                 let build_tooltip = build_tooltip.clone();
                 let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
                 async move |cx| {
-                    cx.background_executor().timer(TOOLTIP_SHOW_DELAY).await;
+                    cx.background_executor().timer(delay).await;
                     cx.update(|window, cx| {
+                        window.tooltip_handoff = handoff;
                         let new_tooltip =
                             build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
                                 let active_tooltip = active_tooltip.clone();
@@ -2779,6 +3117,7 @@ fn handle_tooltip_mouse_move(
                                     is_hoverable: tooltip_is_hoverable,
                                 }
                             });
+                        window.tooltip_handoff = false;
                         *active_tooltip.borrow_mut() = new_tooltip;
                         window.refresh();
                     })

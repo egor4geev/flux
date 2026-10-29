@@ -12,6 +12,7 @@ use gpui::{
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
 use crate::markdown::{self, Block};
+use crate::motion::TransitionExt;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 use crate::update_settings::{channel_color, channel_label};
@@ -147,13 +148,20 @@ impl ReleaseNotes {
                                         &[&((fraction * 100.).floor() as u32)],
                                     )),
                             )
+                            // The download comes in steps: the bar glides from one to the next
+                            // (`crate::motion`).
                             .child(
                                 div().h(px(4.)).rounded(px(2.)).bg(ui.input_border).child(
                                     div()
                                         .h_full()
-                                        .w(relative(fraction))
                                         .rounded(px(2.))
-                                        .bg(ui.accent),
+                                        .bg(ui.accent)
+                                        .with_transition(
+                                            "release-notes-download-fill",
+                                            fraction,
+                                            crate::motion::SMOOTH,
+                                            |fill, fraction| fill.w(relative(fraction)),
+                                        ),
                                 ),
                             ),
                     )

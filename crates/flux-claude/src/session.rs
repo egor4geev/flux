@@ -583,6 +583,9 @@ pub enum Notice {
         code: Option<i32>,
         stderr: Vec<String>,
     },
+    /// Flux kept Claude from starting or stopped it (part «Флаг страны»): the IP address is in a
+    /// country on the user's list (`country`), or its country couldn't be told (`None`).
+    Blocked { country: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -973,6 +976,21 @@ impl Session {
             self.set_working(Activity::Requesting);
         }
         vec![Change::Entries, Change::Status, Change::Queue]
+    }
+
+    /// A notice of the host (Flux) at the end of the conversation (above the queued messages);
+    /// the same notice right before it isn't repeated.
+    pub fn push_notice(&mut self, notice: Notice) -> Vec<Change> {
+        let at = self.queued_tail_start();
+        let repeated = at
+            .checked_sub(1)
+            .and_then(|last| self.entries.get(last))
+            .is_some_and(|entry| matches!(&entry.kind, EntryKind::Notice(last) if *last == notice));
+        if repeated {
+            return Vec::new();
+        }
+        self.push(EntryKind::Notice(notice));
+        vec![Change::Entries]
     }
 
     /// The answer of `initialize`: the commands, the models, the account.

@@ -12,21 +12,28 @@
 //! is scrolled near its end; the log is read again when the repository's refs change (a commit, a
 //! checkout, a fetch), keeping the selection.
 //!
+//! Motion (`crate::motion`): a reading after a change of refs, a Refresh or another filter keeps the
+//! rows on screen until the new ones come (no "Reading…" in between); then the selection and the
+//! cursor stay on their commits (the scroll too, unless the filter changed) and only the commits
+//! that are new unfold. A selected row's color fades as focus leaves the list and comes back (a
+//! selection moved with the keys shows at once); the sections of the branches pane turn their
+//! chevrons and unfold their rows; the filter chips give under the mouse.
+//!
 //! Keys: ↑↓ (⇧ — extend), PageUp / PageDown, Home / End, ⌘A, ⌘C (copy hashes), ⌘F (search), ↵ / ⌘D
 //! (a history's diff), the context menu of commits (`log_actions`).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_git::{FileRevision, FileStatus, GitError, LogCommit, LogFilter, RefKind, Refs};
 use gpui::{
-    Action, AnyElement, App, ClickEvent, ClipboardItem, Context, DismissEvent, Entity,
+    Action, AnyElement, App, ClickEvent, ClipboardItem, Context, DismissEvent, ElementId, Entity,
     EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, MouseButton,
     MouseDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString, Subscription, Task,
-    UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
+    UniformListScrollHandle, Window, actions, div, point, prelude::*, px, uniform_list,
 };
 
 use crate::commit_details::CommitDetailsView;
@@ -35,8 +42,9 @@ use crate::diff_view::DiffSide;
 use crate::git::{self, GitStore};
 use crate::git_graph::{self, GraphLayout};
 use crate::i18n::{tr, trf};
-use crate::icons::{IconName, icon};
+use crate::icons::{self, IconName, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::motion::{self, Disclosure, TransitionExt, unfold_style};
 use crate::push_dialog::now_seconds;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_SM};
@@ -119,6 +127,12 @@ const PAGE: usize = 1000;
 const PREFETCH: usize = 200;
 const ROW_HEIGHT: f32 = 26.;
 const BRANCHES_WIDTH: f32 = 190.;
+/// The collapsible sections of the branches pane, in order: key, title, the refs they list.
+const BRANCH_SECTIONS: [(&str, &str, RefKind); 3] = [
+    ("local", "Local", RefKind::Local),
+    ("remote", "Remote", RefKind::Remote),
+    ("tags", "Tags", RefKind::Tag),
+];
 const DETAILS_WIDTH: f32 = 320.;
 const AUTHOR_WIDTH: f32 = 96.;
 const DATE_WIDTH: f32 = 112.;
@@ -131,6 +145,12 @@ const FILTER_BAR_HEIGHT: f32 = 36.;
 const SEARCH_DELAY: Duration = Duration::from_millis(300);
 /// Ref changes are coalesced for this long before the log is read again.
 const REFRESH_DELAY: Duration = Duration::from_millis(150);
+/// A reading that keeps the rows on screen says "Reading…" only once it has taken this long.
+const QUIET_READING: Duration = Duration::from_millis(600);
+/// The new commits of a reading unfold one after another, this far apart, at most [`ARRIVAL_CAP`]
+/// rows' worth (as a folder's rows do, `motion::Disclosure`).
+const ARRIVAL_STEP: Duration = Duration::from_millis(16);
+const ARRIVAL_CAP: usize = 12;
 
 pub fn init(cx: &mut App) {
     let context = Some("GitLog");
@@ -205,6 +225,14 @@ pub struct GitLogView {
     /// Pages of an older reading are dropped.
     generation: u64,
     loading: bool,
+    /// The rows shown are from before a reading that keeps them on screen ([`GitLogView::refresh`],
+    /// [`GitLogView::refilter`]): its first page replaces them all.
+    stale: Option<Stale>,
+    /// Shows "Reading…" when a reading that keeps the rows takes long.
+    quiet_task: Option<Task<()>>,
+    /// The commits a reading brought that the rows didn't have, and when each starts unfolding
+    /// (`crate::motion`): kept by the model, as the list recycles its rows; forgotten once done.
+    arrivals: HashMap<String, Instant>,
     /// The last page was short: there is nothing more to read.
     exhausted: bool,
     error: Option<SharedString>,
@@ -227,6 +255,8 @@ pub struct GitLogView {
     /// The window was wide in the last frame.
     wide: bool,
     collapsed: BTreeSet<&'static str>,
+    /// The sections the user opens and closes: their chevrons turn, their rows unfold.
+    disclosure: Disclosure<&'static str>,
     search: Entity<TextInput>,
     search_task: Option<Task<()>>,
     editing: Option<Editing>,
@@ -273,6 +303,9 @@ impl GitLogView {
             graph: GraphLayout::new(),
             generation: 0,
             loading: false,
+            stale: None,
+            quiet_task: None,
+            arrivals: HashMap::new(),
             exhausted: false,
             error: None,
             load_task: None,
@@ -288,6 +321,7 @@ impl GitLogView {
             branches_open: None,
             wide: true,
             collapsed: BTreeSet::new(),
+            disclosure: Disclosure::default(),
             search,
             search_task: None,
             editing: None,
@@ -369,14 +403,19 @@ impl GitLogView {
 
     // --- Reading ---
 
-    /// Reads the log again from its start, keeping the selected commits selected.
+    /// Reads the log again from its start, keeping the selected commits selected; the rows go
+    /// until the new ones come ("Reading…") — another repository, a commit to show past the
+    /// filters, nothing on screen to keep.
     fn reload(&mut self, cx: &mut Context<Self>) {
-        self.reselect = self
-            .selected
-            .iter()
-            .filter_map(|index| self.commits.get(*index))
-            .map(|commit| commit.oid.clone())
-            .collect();
+        // Rows are gone while a reading runs: the commits it is to select again stay.
+        if !self.commits.is_empty() {
+            self.reselect = self
+                .selected
+                .iter()
+                .filter_map(|index| self.commits.get(*index))
+                .map(|commit| commit.oid.clone())
+                .collect();
+        }
         self.generation += 1;
         self.commits.clear();
         self.revisions.clear();
@@ -384,29 +423,85 @@ impl GitLogView {
         self.selected.clear();
         self.cursor = None;
         self.anchor = None;
+        self.stale = None;
+        self.quiet_task = None;
+        self.arrivals.clear();
         self.exhausted = false;
         self.error = None;
         self.loading = false;
         self.load_page(cx);
     }
 
-    /// Reads the next page in the background.
+    /// Reads the log again from its start (the refs changed, Refresh) keeping the rows on screen
+    /// until the new ones come: they replace the rows at once ([`GitLogView::replace_rows`]), the
+    /// view staying on its commits.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        // A reading for another filter that is still running stays one.
+        let top = self.stale.is_some_and(|stale| stale.top);
+        self.read_again(top, cx);
+    }
+
+    /// Reads the log for another filter keeping the rows on screen until its first page comes (no
+    /// empty list, no "Reading…" for a quick reading): the page replaces them, shown from its top.
+    fn refilter(&mut self, cx: &mut Context<Self>) {
+        self.read_again(true, cx);
+    }
+
+    /// [`GitLogView::refresh`] (`top` false: as many rows as there are) or
+    /// [`GitLogView::refilter`] (a page, shown from its top).
+    fn read_again(&mut self, top: bool, cx: &mut Context<Self>) {
+        if self.commits.is_empty() {
+            return self.reload(cx);
+        }
+        self.generation += 1;
+        let since = self.stale.map_or_else(Instant::now, |stale| stale.since);
+        let limit = if top {
+            PAGE
+        } else {
+            self.commits.len().max(PAGE)
+        };
+        self.stale = Some(Stale { since, limit, top });
+        self.exhausted = false;
+        self.error = None;
+        self.loading = false;
+        self.load_page(cx);
+        let wait = QUIET_READING.saturating_sub(since.elapsed());
+        self.quiet_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        }));
+    }
+
+    /// The filter bar says "Reading…": a page is being read — quietly for a while when the rows
+    /// stay on screen.
+    fn reading_shown(&self) -> bool {
+        self.loading
+            && self
+                .stale
+                .is_none_or(|stale| stale.since.elapsed() >= QUIET_READING)
+    }
+
+    /// Reads the next page in the background (the first one again, as many rows as there are, when
+    /// it is to replace the rows).
     fn load_page(&mut self, cx: &mut Context<Self>) {
         if self.loading || self.exhausted {
             return;
         }
         self.loading = true;
         let generation = self.generation;
-        let skip = self.commits.len();
+        let (skip, limit) = match self.stale {
+            Some(stale) => (0, stale.limit),
+            None => (self.commits.len(), PAGE),
+        };
         let scope = self.scope.clone();
         let filter = self.filter.clone();
         let repo = self.repo;
         let read = self.git.update(cx, |git, cx| {
             git.read(repo, cx, move |repo| match &scope {
-                LogScope::All => flux_git::log::log(repo, &filter, skip, PAGE)
+                LogScope::All => flux_git::log::log(repo, &filter, skip, limit)
                     .map(|commits| (commits, Vec::new())),
                 LogScope::File { path } => {
-                    flux_git::log::file_history(repo, path, skip, PAGE).map(split_revisions)
+                    flux_git::log::file_history(repo, path, skip, limit).map(split_revisions)
                 }
                 LogScope::Lines { path, start, end } => {
                     // `git log -L` reads every revision at once.
@@ -423,7 +518,7 @@ impl GitLogView {
         });
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
-            this.update(cx, |this, cx| this.page_read(generation, result, cx))
+            this.update(cx, |this, cx| this.page_read(generation, limit, result, cx))
                 .ok();
         }));
         cx.notify();
@@ -432,6 +527,7 @@ impl GitLogView {
     fn page_read(
         &mut self,
         generation: u64,
+        limit: usize,
         result: Result<(Vec<LogCommit>, Vec<FileRevision>), GitError>,
         cx: &mut Context<Self>,
     ) {
@@ -439,22 +535,37 @@ impl GitLogView {
             return;
         }
         self.loading = false;
+        self.quiet_task = None;
+        let replace = self.stale.take();
         match result {
             Err(err) => {
+                if replace.is_some() {
+                    // The error shows in place of the rows, as after any reading.
+                    self.commits.clear();
+                    self.revisions.clear();
+                    self.graph = GraphLayout::new();
+                    self.selected.clear();
+                    self.cursor = None;
+                    self.anchor = None;
+                }
                 self.error = Some(err.to_string().into());
                 self.exhausted = true;
             }
             Ok((commits, revisions)) => {
                 let short = match self.scope {
                     LogScope::Lines { .. } => true,
-                    _ => commits.len() < PAGE,
+                    _ => commits.len() < limit,
                 };
                 self.exhausted = short;
-                if self.scope == LogScope::All {
-                    self.graph.extend(&commits);
+                if let Some(stale) = replace {
+                    self.replace_rows(commits, revisions, stale.top);
+                } else {
+                    if self.scope == LogScope::All {
+                        self.graph.extend(&commits);
+                    }
+                    self.commits.extend(commits);
+                    self.revisions.extend(revisions);
                 }
-                self.commits.extend(commits);
-                self.revisions.extend(revisions);
             }
         }
         // The commits selected before the reading come back.
@@ -488,6 +599,52 @@ impl GitLogView {
         cx.notify();
     }
 
+    /// The first page of a [`GitLogView::refresh`] replaces the rows that stayed on screen: the
+    /// selection, the cursor and the scroll stay on their commits (the selection of a commit that
+    /// is gone goes); the commits the rows didn't have unfold. `top` ([`GitLogView::refilter`]):
+    /// the view goes to the top.
+    fn replace_rows(&mut self, commits: Vec<LogCommit>, revisions: Vec<FileRevision>, top: bool) {
+        let old = std::mem::replace(&mut self.commits, commits);
+        self.revisions = revisions;
+        self.graph = GraphLayout::new();
+        if self.scope == LogScope::All {
+            self.graph.extend(&self.commits);
+        }
+        let moved = moved_rows(&old, &self.commits);
+        let to = |index: usize| moved.get(index).copied().flatten();
+        self.selected = self
+            .selected
+            .iter()
+            .filter_map(|index| to(*index))
+            .collect();
+        self.cursor = self
+            .cursor
+            .and_then(to)
+            .or_else(|| self.selected.first().copied());
+        self.anchor = self.anchor.and_then(to).or(self.cursor);
+        // Scrolled down, the view stays on its commits (at the top, the new ones come into it).
+        let scroll = self.scroll.0.borrow().base_handle.clone();
+        let offset = scroll.offset();
+        let scrolled = -f32::from(offset.y);
+        if top {
+            scroll.set_offset(point(offset.x, px(0.)));
+        } else if scrolled > 0. {
+            let first = (scrolled / ROW_HEIGHT) as usize;
+            if let Some((was, is)) = (first..old.len()).find_map(|index| Some((index, to(index)?)))
+            {
+                let shift = (is as f32 - was as f32) * ROW_HEIGHT;
+                scroll.set_offset(point(offset.x, offset.y - px(shift)));
+            }
+        }
+        if motion::enabled() {
+            let now = Instant::now();
+            for (at, oid) in new_commits(&old, &self.commits).into_iter().enumerate() {
+                let since = now + motion::stagger(at, ARRIVAL_STEP, ARRIVAL_CAP);
+                self.arrivals.insert(oid.to_string(), since);
+            }
+        }
+    }
+
     /// The hub changed: new refs (a commit, a checkout, a fetch) read the log again.
     fn git_changed(&mut self, cx: &mut Context<Self>) {
         let refs = self.git.read(cx).refs(self.repo);
@@ -511,7 +668,7 @@ impl GitLogView {
         }
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(REFRESH_DELAY).await;
-            this.update(cx, |this, cx| this.reload(cx)).ok();
+            this.update(cx, |this, cx| this.refresh(cx)).ok();
         }));
     }
 
@@ -592,7 +749,7 @@ impl GitLogView {
         change(&mut filter);
         if filter != self.filter {
             self.filter = filter;
-            self.reload(cx);
+            self.refilter(cx);
         }
     }
 
@@ -1041,7 +1198,31 @@ impl GitLogView {
         self.set_filter(|filter| filter.revs = branch.into_iter().collect(), cx);
     }
 
-    fn render_branches(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// Where the rows of each open section of the branches pane are (after HEAD's row and the
+    /// headers), for the disclosure: the pane's rows are drawn anew each frame.
+    fn track_sections(&mut self, cx: &App) {
+        let refs = self.git.read(cx).refs(self.repo);
+        let mut at = 1;
+        let mut open = Vec::new();
+        for (key, _, kind) in BRANCH_SECTIONS {
+            let count = section_refs(&refs, kind).len();
+            if count == 0 {
+                continue;
+            }
+            at += 1;
+            if !self.collapsed.contains(key) {
+                open.push((key, at..at + count));
+                at += count;
+            }
+        }
+        self.disclosure.rows_changed(|key| {
+            open.iter()
+                .find(|(section, _)| section == key)
+                .map(|(_, rows)| rows.clone())
+        });
+    }
+
+    fn render_branches(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let refs = self.git.read(cx).refs(self.repo);
         let filtered = self.filter.revs.first().cloned();
@@ -1052,10 +1233,11 @@ impl GitLogView {
                    color: Hsla,
                    rev: Option<String>,
                    checkout: Option<(String, RefKind)>,
+                   unfold: f32,
                    cx: &mut Context<Self>| {
             let selected = rev == filtered;
             let repo = self.repo;
-            div()
+            let element = div()
                 .id(id)
                 .h(px(24.))
                 .mx_1()
@@ -1090,8 +1272,8 @@ impl GitLogView {
                     this.filter_by_branch(branch, cx);
                 }))
                 .child(icon(glyph, color).size(px(13.)))
-                .child(div().min_w_0().truncate().child(label))
-                .into_any_element()
+                .child(div().min_w_0().truncate().child(label));
+            unfold_style(element, unfold).into_any_element()
         };
         let head_label: SharedString = match refs.current() {
             Some(branch) => format!("HEAD ({})", branch.name).into(),
@@ -1104,19 +1286,11 @@ impl GitLogView {
             ui.accent,
             Some("HEAD".into()),
             None,
+            1.,
             cx,
         ));
-        let sections: [(&'static str, &'static str, RefKind); 3] = [
-            ("local", "Local", RefKind::Local),
-            ("remote", "Remote", RefKind::Remote),
-            ("tags", "Tags", RefKind::Tag),
-        ];
-        for (key, title, kind) in sections {
-            let list = match kind {
-                RefKind::Local => &refs.local,
-                RefKind::Remote => &refs.remote,
-                RefKind::Tag => &refs.tags,
-            };
+        for (key, title, kind) in BRANCH_SECTIONS {
+            let list = section_refs(&refs, kind);
             if list.is_empty() {
                 continue;
             }
@@ -1139,18 +1313,12 @@ impl GitLogView {
                         if !this.collapsed.remove(key) {
                             this.collapsed.insert(key);
                         }
+                        this.disclosure.toggled(key, !this.collapsed.contains(key));
                         cx.notify();
                     }))
                     .child(
-                        icon(
-                            if collapsed {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            },
-                            ui.dim,
-                        )
-                        .size(px(12.)),
+                        icons::chevron(self.disclosure.chevron(&key, !collapsed, window), ui.dim)
+                            .size(px(12.)),
                     )
                     .child(tr(title))
                     .child(div().text_color(ui.dim).child(list.len().to_string()))
@@ -1173,6 +1341,7 @@ impl GitLogView {
                     color,
                     Some(reference.name.clone()),
                     checkout,
+                    self.disclosure.unfold(rows.len(), window),
                     cx,
                 ));
             }
@@ -1219,6 +1388,7 @@ impl GitLogView {
                 })
                 .when(active, |chip| chip.bg(ui.accent_soft))
                 .hover(|style| style.bg(ui.hover).text_color(ui.foreground))
+                .active(motion::press)
                 .whitespace_nowrap()
                 .child(label)
                 .child(icon(IconName::ChevronDown, ui.dim).size(px(10.)))
@@ -1347,8 +1517,11 @@ impl GitLogView {
         let _ = window;
         bar.children(editing)
             .child(div().flex_1())
-            .when(self.loading, |bar| {
-                bar.child(div().text_color(ui.dim).child(tr("Reading…")))
+            .when(self.reading_shown(), |bar| {
+                bar.child(motion::Appear::fade().apply(
+                    "git-log-reading",
+                    div().text_color(ui.dim).child(tr("Reading…")),
+                ))
             })
             .when(all && filtered, |bar| {
                 bar.child(
@@ -1362,7 +1535,7 @@ impl GitLogView {
             .child(
                 ui::icon_button("git-log-refresh", IconName::Refresh, ui)
                     .tooltip(ui::tooltip(tr("Refresh"), None))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.reload(cx))),
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx))),
             )
     }
 
@@ -1399,12 +1572,12 @@ impl GitLogView {
         uniform_list(
             "git-log-rows",
             self.commits.len(),
-            cx.processor(move |this, range: Range<usize>, _, cx| {
+            cx.processor(move |this, range: Range<usize>, window, cx| {
                 if range.end + PREFETCH >= this.commits.len() && !this.loading && !this.exhausted {
                     this.load_page(cx);
                 }
                 range
-                    .map(|index| this.render_row(index, graph, focused, now, ui, cx))
+                    .map(|index| this.render_row(index, graph, focused, now, ui, window, cx))
                     .collect::<Vec<_>>()
             }),
         )
@@ -1417,6 +1590,7 @@ impl GitLogView {
         self.branches_open.unwrap_or(self.wide)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_row(
         &self,
         index: usize,
@@ -1424,6 +1598,7 @@ impl GitLogView {
         focused: bool,
         now: i64,
         ui: UiColors,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let commit = &self.commits[index];
@@ -1451,13 +1626,6 @@ impl GitLogView {
             .items_center()
             .gap_2()
             .rounded(px(RADIUS_SM))
-            .when(selected, |row| {
-                row.bg(if focused {
-                    ui.list_selected
-                } else {
-                    ui.list_selected_inactive
-                })
-            })
             .when(!selected, |row| row.hover(|style| style.bg(ui.hover)))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_row(index, event, window, cx)
@@ -1536,8 +1704,69 @@ impl GitLogView {
                     .text_color(ui.dim)
                     .child(format_time(now, commit.author_time)),
             );
-        div().w_full().px_1().flex().child(row).into_any_element()
+        let row = if selected {
+            let id = SharedString::from(format!("git-log-selected-{}", commit.oid));
+            selected_bg(row, id, focused, ui)
+        } else {
+            row.into_any_element()
+        };
+        // A commit a reading brought unfolds (`replace_rows`).
+        let unfold = self
+            .arrivals
+            .get(&commit.oid)
+            .map_or(1., |since| motion::animate(*since, motion::SMOOTH, window));
+        unfold_style(div().w_full().px_1().flex().child(row), unfold).into_any_element()
     }
+}
+
+/// A selected row's background, [`motion::FADE`]-ing between the focused and the unfocused list's
+/// colors as focus leaves and comes back. `id` names the row's item (a commit, a path) and is
+/// drawn only while it is selected: a selection moved to another row shows there at once.
+pub(crate) fn selected_bg<E: Styled + IntoElement + 'static>(
+    row: E,
+    id: impl Into<ElementId>,
+    focused: bool,
+    ui: UiColors,
+) -> AnyElement {
+    let color = if focused {
+        ui.list_selected
+    } else {
+        ui.list_selected_inactive
+    };
+    row.with_transition(id, color, motion::FADE, |row, color| row.bg(color))
+        .into_any_element()
+}
+
+/// Where each row of `old` is among `new`, by commit: `None` for a commit that is gone.
+fn moved_rows(old: &[LogCommit], new: &[LogCommit]) -> Vec<Option<usize>> {
+    let at: HashMap<&str, usize> = new
+        .iter()
+        .enumerate()
+        .map(|(index, commit)| (commit.oid.as_str(), index))
+        .collect();
+    old.iter()
+        .map(|commit| at.get(commit.oid.as_str()).copied())
+        .collect()
+}
+
+/// The commits of `new` that `old` doesn't have, in their order.
+fn new_commits<'a>(old: &[LogCommit], new: &'a [LogCommit]) -> Vec<&'a str> {
+    let known: HashSet<&str> = old.iter().map(|commit| commit.oid.as_str()).collect();
+    new.iter()
+        .map(|commit| commit.oid.as_str())
+        .filter(|oid| !known.contains(oid))
+        .collect()
+}
+
+/// Rows kept on screen while a reading that is to replace them runs.
+#[derive(Clone, Copy)]
+struct Stale {
+    /// Since when (a reading that took over from another keeps its time).
+    since: Instant,
+    /// How many rows the reading reads from the start.
+    limit: usize,
+    /// Another filter: the new rows are shown from the top.
+    top: bool,
 }
 
 /// Which filter menu is open.
@@ -1589,6 +1818,15 @@ fn history_sides(commit: &LogCommit, revision: &FileRevision) -> (DiffSide, Diff
             label: short,
         },
     )
+}
+
+/// The refs a section of the branches pane lists.
+fn section_refs(refs: &Refs, kind: RefKind) -> &[flux_git::Ref] {
+    match kind {
+        RefKind::Local => &refs.local,
+        RefKind::Remote => &refs.remote,
+        RefKind::Tag => &refs.tags,
+    }
 }
 
 /// A branch / tag label's icon and color: the current branch — the accent, local — green, remote —
@@ -1721,6 +1959,9 @@ impl Render for GitLogView {
         let ui = Theme::ui(cx);
         let focused = self.focus_handle.is_focused(window);
         let all = self.scope == LogScope::All;
+        self.track_sections(cx);
+        self.arrivals
+            .retain(|_, since| motion::running(*since, motion::SMOOTH));
         self.wide = f32::from(window.viewport_size().width) >= NARROW_WINDOW;
         let page = (f32::from(window.viewport_size().height) / 3. / ROW_HEIGHT).max(5.) as isize;
         let center = div()
@@ -1783,7 +2024,7 @@ impl Render for GitLogView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ResetFilters, _, cx| this.reset_filters(cx)))
-            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.reload(cx)))
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, action: &SetBranchFilter, _, cx| {
                 this.filter_by_branch(action.branch.clone(), cx)
             }))
@@ -1801,7 +2042,7 @@ impl Render for GitLogView {
             .on_action(cx.listener(|this, action: &SetRepo, _, cx| this.set_repo(action.repo, cx)))
             // In a narrow window the branches pane gives its room to the commits.
             .when(all && self.branches_shown(), |root| {
-                root.child(self.render_branches(cx))
+                root.child(self.render_branches(window, cx))
             })
             .child(center)
             .child(
@@ -1814,11 +2055,10 @@ impl Render for GitLogView {
                     .border_color(ui.divider)
                     .child(self.details.clone()),
             )
-            .children(
-                self.menu
-                    .as_ref()
-                    .map(|menu| ContextMenu::overlay(&menu.menu, menu.position)),
-            )
+            .child(ContextMenu::slot(
+                "log-menu",
+                self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
+            ))
     }
 }
 
@@ -1858,6 +2098,31 @@ mod tests {
         assert_eq!(format_day(day), "2025-03-14");
         assert_eq!(parse_day("2025-13-01"), None);
         assert_eq!(parse_day("yesterday"), None);
+    }
+
+    fn commits(oids: &[&str]) -> Vec<LogCommit> {
+        oids.iter()
+            .map(|oid| LogCommit {
+                oid: oid.to_string(),
+                parents: Vec::new(),
+                summary: String::new(),
+                author: String::new(),
+                author_email: String::new(),
+                author_time: 0,
+                committer: String::new(),
+                commit_time: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reading_that_replaces_the_rows_finds_their_commits() {
+        // A commit on top, `b` amended into `b2`, `d` fetched in between.
+        let old = commits(&["a", "b", "c"]);
+        let new = commits(&["n", "a", "b2", "d", "c"]);
+        assert_eq!(moved_rows(&old, &new), [Some(1), None, Some(4)]);
+        assert_eq!(new_commits(&old, &new), ["n", "b2", "d"]);
+        assert!(new_commits(&new, &new).is_empty(), "a refresh with no news");
     }
 
     #[test]

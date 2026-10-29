@@ -1,6 +1,6 @@
-//! The plugin's secrets — tokens, passwords — in the macOS keychain, not in files: only this
-//! plugin reads them, and they go when it is uninstalled. Keep a sign-in's token here, not in
-//! [`crate::storage`].
+//! The plugin's secrets — tokens, passwords — apart from its files: Flux keeps them encrypted in a
+//! file only the user can read. Only this plugin reads them, and they go when it is uninstalled.
+//! Keep a sign-in's token here, not in [`crate::storage`].
 //!
 //! ```ignore
 //! secrets::set("token", &token)?;

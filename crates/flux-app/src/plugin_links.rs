@@ -303,6 +303,9 @@ pub(crate) fn request_tooltip(
     true
 }
 
+/// A link's tooltip grows from this scale, as the other tooltips (`ui::tooltip`).
+const TOOLTIP_SCALE: f32 = 0.94;
+
 /// The tooltip of a link outside the editor (a commit message, the chat, Markdown): empty until the
 /// plugin answers, then its Markdown in a popup; or a web link's address.
 pub(crate) struct LinkTooltip {
@@ -311,22 +314,30 @@ pub(crate) struct LinkTooltip {
 
 impl Render for LinkTooltip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Nothing at all until the plugin has answered: an empty frame doesn't grow into a popup.
         let Some(blocks) = self.blocks.as_ref().filter(|blocks| !blocks.is_empty()) else {
             return div().into_any_element();
         };
         let theme = Theme::get(cx);
         let ui = theme.ui;
         // gpui puts the tooltip at the mouse point; the offset moves it out from under the cursor.
+        // It pops out of the corner by the pointer when its content is there — once: a tooltip is
+        // made anew each time it shows, and the empty frames before don't draw the panel's id.
         div()
             .pl(px(10.))
             .pt(px(18.))
             .child(
-                crate::popup::panel(ui)
-                    .max_w(px(TOOLTIP_WIDTH))
-                    .px_3()
-                    .py_2()
-                    .text_size(px(theme::TEXT_SM))
-                    .child(markdown::render(blocks, ui.foreground, theme)),
+                crate::motion::Appear::pop((0., 0.))
+                    .scale(TOOLTIP_SCALE)
+                    .apply(
+                        "link-tooltip",
+                        crate::popup::panel(ui)
+                            .max_w(px(TOOLTIP_WIDTH))
+                            .px_3()
+                            .py_2()
+                            .text_size(px(theme::TEXT_SM))
+                            .child(markdown::render(blocks, ui.foreground, theme)),
+                    ),
             )
             .into_any_element()
     }

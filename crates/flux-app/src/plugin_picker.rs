@@ -4,7 +4,8 @@
 //! (fuzzy, as the palette; the groups stay in their order), or a `live-query` plugin searches
 //! itself (`picker-query`, after the typing rests; `update` with a spinner while it looks). It opens
 //! under the title bar, above one of the plugin's status bar items or under an element of its tool
-//! window — at the window's top when that isn't on screen.
+//! window — at the window's top when that isn't on screen. One whose item isn't drawn yet waits for
+//! it unseen (its query already takes the keys) and grows out of it once it is.
 //!
 //! Every picker is answered exactly once with `picker-chosen`: the chosen item's key (↵, a click),
 //! or none — Esc, a click outside, `picker.close`, the plugin's (or another) new picker, a dialog in
@@ -122,15 +123,18 @@ pub(crate) fn open(
     match anchor {
         Some((point, corner)) => workspace.anchor_modal_at(point, corner),
         // The status item or the element isn't drawn yet — the plugin showed its window in the
-        // same call: once a frame has drawn it, the picker moves under it.
-        None if spec.anchor != PickerAnchor::Window => anchor_later(
-            plugin.to_string(),
-            spec.anchor.clone(),
-            picker.entity_id(),
-            ANCHOR_FRAMES,
-            window,
-            cx,
-        ),
+        // same call: the picker waits unseen until a frame has drawn it, then shows under it.
+        None if spec.anchor != PickerAnchor::Window => {
+            picker.update(cx, |picker, _| picker.delegate.placing = true);
+            anchor_later(
+                plugin.to_string(),
+                spec.anchor.clone(),
+                picker.entity_id(),
+                ANCHOR_FRAMES,
+                window,
+                cx,
+            )
+        }
         None => {}
     }
 }
@@ -138,8 +142,9 @@ pub(crate) fn open(
 /// How many frames a picker waits for its status item or element to be drawn.
 const ANCHOR_FRAMES: usize = 4;
 
-/// Places the open picker `picker` under its anchor once a frame has drawn the anchor; gpui runs
-/// a next frame's callbacks before drawing it, so the first try may come too early.
+/// Places the open picker `picker` under its anchor once a frame has drawn the anchor, and shows
+/// it — at the window's top when the anchor never came; gpui runs a next frame's callbacks before
+/// drawing it, so the first try may come too early.
 fn anchor_later(
     plugin: String,
     anchor: PickerAnchor,
@@ -149,20 +154,24 @@ fn anchor_later(
     cx: &mut Context<Workspace>,
 ) {
     cx.on_next_frame(window, move |workspace, window, cx| {
-        let open = workspace
+        let Some(open) = workspace
             .modal_view::<Picker<PluginPicker>>()
-            .is_some_and(|open| open.entity_id() == picker);
-        if !open {
+            .filter(|open| open.entity_id() == picker)
+        else {
             return;
+        };
+        let place = anchor_point(workspace, &plugin, &anchor, window, cx);
+        if place.is_none() && tries > 1 {
+            return anchor_later(plugin, anchor, picker, tries - 1, window, cx);
         }
-        match anchor_point(workspace, &plugin, &anchor, window, cx) {
-            Some((point, corner)) => {
-                workspace.anchor_modal_at(point, corner);
-                cx.notify();
-            }
-            None if tries > 1 => anchor_later(plugin, anchor, picker, tries - 1, window, cx),
-            None => {}
+        if let Some((point, corner)) = place {
+            workspace.anchor_modal_at(point, corner);
         }
+        open.update(cx, |open, cx| {
+            open.delegate.placing = false;
+            cx.notify();
+        });
+        cx.notify();
     });
 }
 
@@ -265,6 +274,8 @@ pub struct PluginPicker {
     searchable: bool,
     /// Opened under an element of a tool window: a dropdown's width.
     under_element: bool,
+    /// Waiting for its status bar item or element to be drawn: not seen until it is placed.
+    placing: bool,
     live: bool,
     empty_text: Option<SharedString>,
     items: Vec<PickerItem>,
@@ -296,6 +307,7 @@ impl PluginPicker {
             placeholder: single_line(&spec.placeholder).into(),
             searchable: spec.searchable,
             under_element: matches!(spec.anchor, PickerAnchor::Element(_)),
+            placing: false,
             live: spec.live_query,
             empty_text: spec
                 .empty_text
@@ -522,6 +534,10 @@ impl PickerDelegate for PluginPicker {
 
     fn show_footer(&self) -> bool {
         self.searchable
+    }
+
+    fn placed(&self) -> bool {
+        !self.placing
     }
 }
 

@@ -384,6 +384,20 @@ impl AssetSource for Assets {
     }
 }
 
+/// A tree's disclosure chevron, `openness` of the way from closed (pointing right, 0) to open
+/// (down, 1): in between, it is turning ([`crate::motion::Disclosure::chevron`]).
+pub fn chevron(openness: f32, color: Hsla) -> Svg {
+    if openness <= 0. {
+        return icon(IconName::ChevronRight, color);
+    }
+    if openness >= 1. {
+        return icon(IconName::ChevronDown, color);
+    }
+    icon(IconName::ChevronRight, color).with_transformation(gpui::Transformation::rotate(
+        gpui::radians(openness * std::f32::consts::FRAC_PI_2),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

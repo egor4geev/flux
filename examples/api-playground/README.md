@@ -40,7 +40,7 @@ and `localhost`, a server, the program `git`, terminals, reading `~/.config`, an
 | Problems | **List** | The problems Flux knows of, by file. |
 | | **Warn Here** | A warning of the plugin's own on the caret's line: underlined, on hover, F2 goes to it, the status bar counts it. |
 | | **Clear** | The warning goes. |
-| Secrets | **Save…**, **Read**, **Delete** | A value in the macOS keychain (an item named after the plugin): it survives a restart of Flux. |
+| Secrets | **Save…**, **Read**, **Delete** | A value Flux keeps encrypted, under the plugin's name: it survives a restart of Flux. |
 | Timers | **Start Clock** | A clock in the status bar, ticking every second; a click on it stops it. |
 | System | **Copy Text** | Text on the clipboard. |
 | | **Home Folder** | `~/.config` is readable (the `folders` permission); `~/Documents` isn't. |
@@ -59,7 +59,7 @@ The sections of API 0.3:
 | Settings Page | **Status**, **Busy** | The `status` line of Settings → API Playground: a green text with the time; a spinner with «Checking…». |
 | | **Set Note** | `settings.set` writes the two-line note: an open settings page shows it at once. |
 | | **Read** | The token (`secrets.get` — only whether it is saved and its length), the note, the bookmarks (`records`). |
-| | **Open Settings** | Settings on the playground's page: the section API 0.3, a token (a masked field — the keychain), Check (runs a command with its argument: the status line says so), the status, the note (several lines), bookmarks (records: add, remove, move). |
+| | **Open Settings** | Settings on the playground's page: the section API 0.3, a token (a masked field — a secret), Check (runs a command with its argument: the status line says so), the status, the note (several lines), bookmarks (records: add, remove, move). |
 | Branches | **List** | The repository's branches, local then remote, the current marked. |
 | | **New Branch** | `playground/<n>` from the current branch, as the Branches popup makes it; «done» when it's checked out (git-done). |
 | | **Back** | Checks out the branch it came from. |

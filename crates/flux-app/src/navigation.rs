@@ -132,7 +132,7 @@ pub fn cmd_click(
     };
     // Right after the last letter counts as on the word; the request goes from inside it.
     let position = position.min(word.end - 1);
-    editor.select_range(position..position, cx);
+    editor.click_caret(position, cx);
     window.dispatch_action(Box::new(GoToDefinition), cx);
     true
 }

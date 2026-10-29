@@ -15,12 +15,15 @@
 //! - [`mcp`]: Flux's own MCP server for Claude — the tools of the window (part 9.2).
 //! - [`shell`]: `!` commands — run by the host in the project's root, their output for Claude in
 //!   the records of the terminal CLI's bash mode (part 10.2).
+//! - [`region`]: the country of the public IP address — Flux blocks Claude in the countries the
+//!   user lists (part «Флаг страны»).
 
 pub mod cli;
 pub mod edits;
 pub mod mcp;
 pub mod process;
 pub mod protocol;
+pub mod region;
 pub mod session;
 pub mod shell;
 pub mod transcript;

@@ -1,159 +1,162 @@
-//! The plugins' secrets in the macOS keychain (`secrets` interface): a generic password per key,
-//! under a service of the plugin's own ([`service`]). Read and written by the plugin's `secrets`;
-//! all of a plugin's are removed when it is uninstalled ([`crate::install::uninstall`]).
+//! The macOS keychain, where Flux kept the plugins' secrets before it kept them itself
+//! ([`crate::secrets`]): a generic password per key, under the plugin's service
+//! ([`crate::secrets::service`]). The store moves them over once; uninstalling a plugin removes
+//! whatever of its items is left (an item whose read the user denied).
 //!
-//! `FLUX_PLUGIN_SECRETS_FILE=<file>` keeps them in a JSON file instead (tests, scenarios): a
-//! rebuilt unsigned Flux isn't on a keychain item's access list, and macOS would ask the user —
-//! the author working next to the run — for the keychain's password.
+//! Only a Flux of its own touches the user's keychain ([`user`]): tests use a fake [`Keychain`].
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::Arc;
 
-/// The secrets of every plugin by service, then account.
-type Secrets = BTreeMap<String, BTreeMap<String, String>>;
-
-/// The file of `FLUX_PLUGIN_SECRETS_FILE`, if set.
-fn secrets_file() -> Option<PathBuf> {
-    std::env::var_os("FLUX_PLUGIN_SECRETS_FILE")
-        .filter(|file| !file.is_empty())
-        .map(PathBuf::from)
+/// The keychain as the store sees it: the plugins' items.
+pub(crate) trait Keychain: Send + Sync {
+    /// The service and account of every plugin's item: their attributes only, which macOS gives
+    /// without asking the user.
+    fn list(&self) -> Result<Vec<(String, String)>, String>;
+    /// An item's secret. macOS may ask the user first (a Flux not on the item's access list).
+    fn read(&self, service: &str, account: &str) -> Result<Option<String>, String>;
+    fn delete(&self, service: &str, account: &str) -> Result<(), String>;
+    /// Deletes every item of the service.
+    fn delete_all(&self, service: &str) -> Result<(), String>;
 }
 
-/// Reads and changes the secrets file under a lock (the plugins' threads share it).
-fn with_file<T>(file: PathBuf, change: impl FnOnce(&mut Secrets) -> T) -> Result<T, String> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut secrets: Secrets = match std::fs::read(&file) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| err.to_string())?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Secrets::new(),
-        Err(err) => return Err(err.to_string()),
-    };
-    let before = secrets.clone();
-    let result = change(&mut secrets);
-    if secrets != before {
-        let text = serde_json::to_vec_pretty(&secrets).map_err(|err| err.to_string())?;
-        std::fs::write(&file, text).map_err(|err| err.to_string())?;
+/// The user's keychain — only for Flux run as an app (`Flux.app`, the build that is on the items'
+/// access lists) with the user's own plugins: never in tests (this crate's or the app's), UI
+/// scenarios, runs with `FLUX_PLUGINS_HOME` or `FLUX_PLUGIN_SECRETS_FILE`, nor a bare binary
+/// (`cargo run`), which macOS would ask the user about for every item.
+pub(crate) fn user() -> Option<Arc<dyn Keychain>> {
+    if cfg!(test) || crate::paths::overridden() {
+        return None;
     }
-    Ok(result)
-}
-
-pub fn get(service: &str, account: &str) -> Result<Option<String>, String> {
-    match secrets_file() {
-        Some(file) => with_file(file, |secrets| {
-            secrets
-                .get(service)
-                .and_then(|accounts| accounts.get(account))
-                .cloned()
-        }),
-        None => platform::get(service, account),
+    let overridden = [
+        "FLUX_PLUGINS_HOME",
+        "FLUX_PLUGIN_SECRETS_FILE",
+        "FLUX_SCENARIO",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some());
+    let bundled = std::env::current_exe().is_ok_and(|exe| in_app_bundle(&exe));
+    if overridden || !bundled {
+        return None;
     }
+    platform::user()
 }
 
-pub fn set(service: &str, account: &str, secret: &str) -> Result<(), String> {
-    match secrets_file() {
-        Some(file) => with_file(file, |secrets| {
-            secrets
-                .entry(service.to_string())
-                .or_default()
-                .insert(account.to_string(), secret.to_string());
-        }),
-        None => platform::set(service, account, secret),
-    }
-}
-
-pub fn delete(service: &str, account: &str) -> Result<(), String> {
-    match secrets_file() {
-        Some(file) => with_file(file, |secrets| {
-            if let Some(accounts) = secrets.get_mut(service) {
-                accounts.remove(account);
-            }
-        }),
-        None => platform::delete(service, account),
-    }
-}
-
-/// Deletes every secret of the service.
-pub fn delete_all(service: &str) -> Result<(), String> {
-    match secrets_file() {
-        Some(file) => with_file(file, |secrets| {
-            secrets.remove(service);
-        }),
-        None => platform::delete_all(service),
-    }
-}
-
-/// The keychain service of a plugin's secrets.
-pub fn service(plugin: &str) -> String {
-    format!("Flux plugin {plugin}")
+/// `exe` is in a `*.app`'s `Contents/MacOS`.
+fn in_app_bundle(exe: &Path) -> bool {
+    exe.ancestors().skip(1).any(|dir| {
+        dir.extension().is_some_and(|ext| ext == "app")
+            && exe.starts_with(dir.join("Contents/MacOS"))
+    })
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use security_framework::item::{ItemClass, ItemSearchOptions};
+    use std::sync::Arc;
+
+    use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
     use security_framework::passwords;
+
+    use super::Keychain;
+    use crate::secrets::SERVICE_PREFIX;
 
     /// `errSecItemNotFound`.
     const NOT_FOUND: i32 = -25300;
 
-    pub fn get(service: &str, account: &str) -> Result<Option<String>, String> {
-        match passwords::get_generic_password(service, account) {
-            Ok(secret) => String::from_utf8(secret)
-                .map(Some)
-                .map_err(|_| "it isn't text".to_string()),
-            Err(err) if err.code() == NOT_FOUND => Ok(None),
-            Err(err) => Err(err.to_string()),
-        }
+    pub fn user() -> Option<Arc<dyn Keychain>> {
+        Some(Arc::new(System))
     }
 
-    pub fn set(service: &str, account: &str, secret: &str) -> Result<(), String> {
-        passwords::set_generic_password(service, account, secret.as_bytes())
-            .map_err(|err| err.to_string())
-    }
+    /// The user's keychain.
+    struct System;
 
-    pub fn delete(service: &str, account: &str) -> Result<(), String> {
-        match passwords::delete_generic_password(service, account) {
-            Err(err) if err.code() != NOT_FOUND => Err(err.to_string()),
-            _ => Ok(()),
-        }
-    }
-
-    /// Deletes every generic password of the service.
-    pub fn delete_all(service: &str) -> Result<(), String> {
-        // `SecItemDelete` may take one matching item at a time: until none is left.
-        for _ in 0..10_000 {
-            let deleted = ItemSearchOptions::new()
+    impl Keychain for System {
+        fn list(&self) -> Result<Vec<(String, String)>, String> {
+            let found = ItemSearchOptions::new()
                 .class(ItemClass::generic_password())
-                .service(service)
-                .delete();
-            match deleted {
-                Ok(()) => continue,
-                Err(err) if err.code() == NOT_FOUND => return Ok(()),
+                .load_attributes(true)
+                .limit(Limit::All)
+                .search();
+            let items = match found {
+                Ok(items) => items,
+                Err(err) if err.code() == NOT_FOUND => return Ok(Vec::new()),
                 Err(err) => return Err(err.to_string()),
+            };
+            Ok(items
+                .iter()
+                .filter_map(|item| item.simplify_dict())
+                .filter_map(|mut attributes| {
+                    let service = attributes.remove("svce")?;
+                    let account = attributes.remove("acct")?;
+                    service
+                        .starts_with(SERVICE_PREFIX)
+                        .then_some((service, account))
+                })
+                .collect())
+        }
+
+        fn read(&self, service: &str, account: &str) -> Result<Option<String>, String> {
+            match passwords::get_generic_password(service, account) {
+                Ok(secret) => String::from_utf8(secret)
+                    .map(Some)
+                    .map_err(|_| "it isn't text".to_string()),
+                Err(err) if err.code() == NOT_FOUND => Ok(None),
+                Err(err) => Err(err.to_string()),
             }
         }
-        Ok(())
+
+        fn delete(&self, service: &str, account: &str) -> Result<(), String> {
+            match passwords::delete_generic_password(service, account) {
+                Err(err) if err.code() != NOT_FOUND => Err(err.to_string()),
+                _ => Ok(()),
+            }
+        }
+
+        fn delete_all(&self, service: &str) -> Result<(), String> {
+            // `SecItemDelete` may take one matching item at a time: until none is left.
+            for _ in 0..10_000 {
+                let deleted = ItemSearchOptions::new()
+                    .class(ItemClass::generic_password())
+                    .service(service)
+                    .delete();
+                match deleted {
+                    Ok(()) => continue,
+                    Err(err) if err.code() == NOT_FOUND => return Ok(()),
+                    Err(err) => return Err(err.to_string()),
+                }
+            }
+            Ok(())
+        }
     }
 }
 
-/// Elsewhere there is no keychain yet: secrets can't be kept.
+/// Elsewhere Flux never kept secrets in a keychain: nothing to move.
 #[cfg(not(target_os = "macos"))]
 mod platform {
-    const UNSUPPORTED: &str = "secrets are kept only on macOS for now";
+    use std::sync::Arc;
 
-    pub fn get(_: &str, _: &str) -> Result<Option<String>, String> {
-        Err(UNSUPPORTED.into())
+    use super::Keychain;
+
+    pub fn user() -> Option<Arc<dyn Keychain>> {
+        None
     }
+}
 
-    pub fn set(_: &str, _: &str, _: &str) -> Result<(), String> {
-        Err(UNSUPPORTED.into())
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn delete(_: &str, _: &str) -> Result<(), String> {
-        Err(UNSUPPORTED.into())
-    }
-
-    pub fn delete_all(_: &str) -> Result<(), String> {
-        Ok(())
+    #[test]
+    fn only_an_app_bundle_counts() {
+        assert!(in_app_bundle(Path::new(
+            "/Applications/Flux.app/Contents/MacOS/flux"
+        )));
+        assert!(!in_app_bundle(Path::new("/src/flux/target/debug/flux")));
+        assert!(!in_app_bundle(Path::new(
+            "/src/flux/target/debug/deps/flux_plugin-0123456789abcdef"
+        )));
+        assert!(!in_app_bundle(Path::new("/Applications/Flux.app/flux")));
+        // A test binary never gets the user's keychain.
+        assert!(user().is_none());
     }
 }

@@ -19,6 +19,8 @@ use crate::{
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     point, prelude::*, px, rems, size, transparent_black,
 };
+// Flux patch (scroll axis): see `ScrollGesture`.
+use crate::{Axis, TouchPhase};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
@@ -830,6 +832,16 @@ impl Frame {
     }
 }
 
+/// Flux patch (motion, 2026-10-28): a uniform scale of what elements paint, `p' = p · scale +
+/// offset` in window pixels (`Window::with_element_scale`).
+#[derive(Clone, Debug)]
+struct ElementTransform {
+    scale: f32,
+    offset: Point<Pixels>,
+    /// The content mask in effect where the scale began, in the window's space.
+    outer_mask: ContentMask<Pixels>,
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -853,6 +865,10 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    /// Flux patch (motion): the scale of what elements paint (`with_element_scale`).
+    element_transform: Option<ElementTransform>,
+    /// Flux patch (motion): how many `with_inert` are around the element being prepainted.
+    inert_depth: usize,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
@@ -861,6 +877,18 @@ pub struct Window {
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
+    /// Flux patch (motion, 2026-10-29): the tooltip drawn last frame, to fade it out once it is
+    /// gone (`TooltipTransitions`).
+    shown_tooltip: Option<(AnyView, Bounds<Pixels>)>,
+    /// Flux patch (motion): a tooltip that has gone, fading out since then.
+    leaving_tooltip: Option<(AnyView, Bounds<Pixels>, Instant)>,
+    /// Flux patch (motion): when a tooltip last went because the mouse left its element — the
+    /// next one shown soon after is a handoff.
+    tooltip_hidden_at: Option<Instant>,
+    /// Flux patch (motion): the tooltip goes because of a click or the wheel — no handoff after.
+    pub(crate) tooltip_dismissed: bool,
+    /// Flux patch (motion): the tooltip being built is a handoff (`Window::tooltip_handoff`).
+    pub(crate) tooltip_handoff: bool,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
@@ -881,6 +909,8 @@ pub struct Window {
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Flux patch (input rate): see [`InputRateTracker`].
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+    /// Flux patch (scroll axis): see [`ScrollGesture`].
+    pub(crate) scroll_gesture: ScrollGesture,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -942,6 +972,86 @@ impl InputRateTracker {
 
     pub fn is_high_rate(&self) -> bool {
         Instant::now() < self.sustain_until
+    }
+}
+
+/// Flux patch (scroll axis, 2026-10-29): the axis each scroll event moves along. A trackpad gesture
+/// keeps to its predominant axis, as native scroll views do: a swipe down always moves a little
+/// sideways too, and a board whose lanes scroll down inside a row that scrolls sideways slid left
+/// and right under every swipe down. The axis is decided once the gesture has moved
+/// [`Self::DECIDE_AFTER`] (until then each event goes its own way) and kept through the gesture and
+/// its momentum, until the next one starts (`TouchPhase::Started`, or a pause for a device without
+/// phases); a mouse wheel's step is a gesture by itself. Scroll containers take only the movement
+/// along the axis (`Interactivity::paint_scroll_listener`), unless they allow concurrent scroll.
+#[derive(Clone, Debug, Default)]
+pub struct ScrollGesture {
+    /// The axis of the last event.
+    axis: Option<Axis>,
+    /// The axis the gesture keeps to, once decided.
+    locked: Option<Axis>,
+    /// How far the gesture has moved before that.
+    moved: Point<Pixels>,
+    /// When its last event came.
+    last_event: Option<Instant>,
+}
+
+impl ScrollGesture {
+    /// How far a gesture moves before its axis is decided: its first events may go a pixel or two
+    /// either way.
+    pub const DECIDE_AFTER: Pixels = px(4.);
+    /// A pause after which a device without gesture phases starts a new gesture.
+    pub const PAUSE: Duration = Duration::from_millis(300);
+    /// How many times larger than the vertical movement the horizontal one must be to scroll
+    /// sideways: most scrolling is up and down, and a diagonal swipe goes down.
+    pub const HORIZONTAL_BIAS: f32 = 1.2;
+
+    /// Takes the next scroll event, which came at `now`: the axis it moves along, `None` when it
+    /// doesn't move.
+    pub fn update(&mut self, event: &ScrollWheelEvent, now: Instant) -> Option<Axis> {
+        self.axis = match event.delta {
+            ScrollDelta::Lines(delta) => {
+                *self = Self::default();
+                Self::predominant_axis(delta.map(px))
+            }
+            ScrollDelta::Pixels(delta) => {
+                let paused = self
+                    .last_event
+                    .is_none_or(|last| now.duration_since(last) > Self::PAUSE);
+                if paused || matches!(event.touch_phase, TouchPhase::Started) {
+                    self.locked = None;
+                    self.moved = Point::default();
+                }
+                self.last_event = Some(now);
+                if self.locked.is_none() {
+                    self.moved = self.moved + delta;
+                    if self.moved.x.abs() + self.moved.y.abs() >= Self::DECIDE_AFTER {
+                        self.locked = Self::predominant_axis(self.moved);
+                    }
+                }
+                // An event that doesn't move has no axis; one that does keeps to the gesture's.
+                let own = Self::predominant_axis(delta);
+                own.and(self.locked).or(own)
+            }
+        };
+        self.axis
+    }
+
+    /// The axis of the last event (see [`Self::update`]).
+    pub fn axis(&self) -> Option<Axis> {
+        self.axis
+    }
+
+    /// The axis `delta` moves along most, `None` when it doesn't move: sideways only when that
+    /// movement is [`Self::HORIZONTAL_BIAS`] times larger.
+    pub fn predominant_axis(delta: Point<Pixels>) -> Option<Axis> {
+        let (x, y) = (delta.x.abs(), delta.y.abs());
+        if x.is_zero() && y.is_zero() {
+            None
+        } else if x > y * Self::HORIZONTAL_BIAS {
+            Some(Axis::Horizontal)
+        } else {
+            Some(Axis::Vertical)
+        }
     }
 }
 
@@ -1291,6 +1401,8 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            element_transform: None,
+            inert_depth: 0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -1298,6 +1410,11 @@ impl Window {
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
+            shown_tooltip: None,
+            leaving_tooltip: None,
+            tooltip_hidden_at: None,
+            tooltip_dismissed: false,
+            tooltip_handoff: false,
             dirty_views: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
@@ -1315,6 +1432,7 @@ impl Window {
             hovered,
             needs_present,
             input_rate_tracker,
+            scroll_gesture: ScrollGesture::default(),
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -2185,14 +2303,22 @@ impl Window {
             element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
             prompt_element = Some(element);
             self.prompt = Some(prompt);
+            // Flux patch (motion): no tooltip fades out over a prompt or after it.
+            self.shown_tooltip = None;
+            self.leaving_tooltip = None;
         } else if let Some(active_drag) = cx.active_drag.take() {
             let mut element = active_drag.view.clone().into_any();
             let offset = self.mouse_position() - active_drag.cursor_offset;
             element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
+            self.shown_tooltip = None;
+            self.leaving_tooltip = None;
         } else {
-            tooltip_element = self.prepaint_tooltip(cx);
+            tooltip_element = self
+                .prepaint_tooltip(cx)
+                .map(|element| (element, 1.))
+                .or_else(|| self.prepaint_leaving_tooltip(cx));
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
@@ -2210,8 +2336,8 @@ impl Window {
             prompt_element.paint(self, cx);
         } else if let Some(mut drag_element) = active_drag_element {
             drag_element.paint(self, cx);
-        } else if let Some(mut tooltip_element) = tooltip_element {
-            tooltip_element.paint(self, cx);
+        } else if let Some((mut tooltip_element, opacity)) = tooltip_element {
+            self.with_element_opacity(Some(opacity), |window| tooltip_element.paint(window, cx));
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2282,9 +2408,62 @@ impl Window {
                 id: tooltip_request.id,
                 bounds: tooltip_bounds,
             });
+            // Flux patch (motion): kept for its fade out; a new one replaces one fading out.
+            self.shown_tooltip = Some((tooltip_request.tooltip.view.clone(), tooltip_bounds));
+            self.leaving_tooltip = None;
+            self.tooltip_dismissed = false;
             return Some(element);
         }
         None
+    }
+
+    /// Flux patch (motion, 2026-10-29): the tooltip drawn last frame has gone — it fades out where
+    /// it was (`TooltipTransitions::exit`), drawn but taking no mouse; the element and its opacity.
+    fn prepaint_leaving_tooltip(&mut self, cx: &mut App) -> Option<(AnyElement, f32)> {
+        let transitions = crate::tooltip_transitions();
+        if let Some((view, bounds)) = self.shown_tooltip.take() {
+            let now = Instant::now();
+            if !mem::take(&mut self.tooltip_dismissed) {
+                self.tooltip_hidden_at = Some(now);
+            }
+            if transitions.is_some_and(|transitions| !transitions.exit.is_zero()) {
+                self.leaving_tooltip = Some((view, bounds, now));
+            }
+        }
+        let (view, bounds, since) = self.leaving_tooltip.clone()?;
+        let transitions = transitions?;
+        let t = since.elapsed().as_secs_f32() / transitions.exit.as_secs_f32().max(0.001);
+        if t >= 1. {
+            self.leaving_tooltip = None;
+            return None;
+        }
+        let mut element = view.into_any();
+        element.layout_as_root(AvailableSpace::min_size(), self, cx);
+        self.with_inert(true, |window| {
+            window.with_absolute_element_offset(bounds.origin, |window| {
+                element.prepaint(window, cx)
+            })
+        });
+        self.on_next_frame(|window, _| window.refresh());
+        Some((element, 1. - (transitions.easing)(t)))
+    }
+
+    /// Flux patch (motion, 2026-10-29): the tooltip being built shows at once after another one
+    /// (`TooltipTransitions::handoff`), instead of after the hover delay — moving along a toolbar.
+    /// For a tooltip view to come in quieter than one that took a while.
+    pub fn tooltip_handoff(&self) -> bool {
+        self.tooltip_handoff
+    }
+
+    /// Flux patch (motion): a tooltip shows now, or went less than the handoff time ago because
+    /// the mouse left its element: the next one shows without the delay.
+    pub(crate) fn tooltip_warm(&self) -> bool {
+        crate::tooltip_transitions().is_some_and(|transitions| {
+            (self.tooltip_bounds.is_some() && !self.tooltip_dismissed)
+                || self
+                    .tooltip_hidden_at
+                    .is_some_and(|at| at.elapsed() < transitions.handoff)
+        })
     }
 
     fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
@@ -2579,6 +2758,166 @@ impl Window {
         let result = f(self);
         self.element_opacity = previous_opacity;
         result
+    }
+
+    /// Flux patch (motion, 2026-10-28): paints what `f` paints scaled by `scale` around `origin`
+    /// (window pixels) — on top of any scale already in effect. Layout, hitboxes and the mouse
+    /// don't see it: an animation that grows a popover out of its anchor or presses a button in
+    /// keeps everything clickable where the layout put it. Content masks pushed inside are scaled
+    /// with the content; the mask in effect here clips in the window's space, as CSS clips a
+    /// transformed element by its ancestors.
+    pub fn with_element_scale<R>(
+        &mut self,
+        scale: Option<f32>,
+        origin: Point<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_element_transform(scale, origin, None, f)
+    }
+
+    /// Flux patch (motion): [`Self::with_element_scale`], then a move by `translate` — a card
+    /// sliding in, painted where it will be clickable a moment later.
+    pub fn with_element_transform<R>(
+        &mut self,
+        scale: Option<f32>,
+        origin: Point<Pixels>,
+        translate: Option<Point<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let scale = scale
+            .filter(|scale| (scale - 1.).abs() > f32::EPSILON)
+            .map(|scale| scale.max(0.));
+        let translate = translate.filter(|translate| !translate.is_zero());
+        if scale.is_none() && translate.is_none() {
+            return f(self);
+        }
+        let scale = scale.unwrap_or(1.);
+        let translate = translate.unwrap_or_default();
+        let previous = self.element_transform.clone();
+        let outer_mask = self.transformed_content_mask();
+        let (outer_scale, outer_offset) = previous
+            .as_ref()
+            .map_or((1., Point::default()), |outer| (outer.scale, outer.offset));
+        self.element_transform = Some(ElementTransform {
+            scale: outer_scale * scale,
+            offset: outer_offset + (origin * (1. - scale) + translate) * outer_scale,
+            outer_mask,
+        });
+        let result = f(self);
+        self.element_transform = previous;
+        result
+    }
+
+    /// Flux patch (motion, 2026-10-28): what `f` prepaints takes no mouse — hover, clicks, the
+    /// wheel and tooltips go to whatever lies beneath. For a popover fading out after it closed:
+    /// still drawn, no longer there.
+    pub fn with_inert<R>(&mut self, inert: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        if !inert {
+            return f(self);
+        }
+        self.inert_depth += 1;
+        let result = f(self);
+        self.inert_depth -= 1;
+        result
+    }
+
+    /// Flux patch (motion): the paint effects of an element's style — its transform (scale
+    /// around its origin point, then the move) around its opacity.
+    pub(crate) fn with_style_paint_effects<R>(
+        &mut self,
+        style: &Style,
+        bounds: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let origin = style.transform_origin.unwrap_or(point(0.5, 0.5));
+        let origin = point(
+            bounds.origin.x + bounds.size.width * origin.x,
+            bounds.origin.y + bounds.size.height * origin.y,
+        );
+        self.with_element_transform(
+            style.transform_scale,
+            origin,
+            style.transform_translate,
+            |window| window.with_element_opacity(style.opacity, f),
+        )
+    }
+
+    /// Flux patch (motion): `bounds` where the scale in effect puts them.
+    fn transform_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        match &self.element_transform {
+            Some(transform) => Bounds {
+                origin: bounds.origin * transform.scale + transform.offset,
+                size: size(
+                    bounds.size.width * transform.scale,
+                    bounds.size.height * transform.scale,
+                ),
+            },
+            None => bounds,
+        }
+    }
+
+    /// Flux patch (motion): device pixel `bounds` where the scale in effect puts them.
+    fn transform_scaled_bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        match &self.element_transform {
+            Some(transform) => {
+                let offset = transform.offset.scale(self.scale_factor());
+                Bounds {
+                    origin: point(
+                        bounds.origin.x * transform.scale + offset.x,
+                        bounds.origin.y * transform.scale + offset.y,
+                    ),
+                    size: size(
+                        bounds.size.width * transform.scale,
+                        bounds.size.height * transform.scale,
+                    ),
+                }
+            }
+            None => bounds,
+        }
+    }
+
+    /// Flux patch (motion): a length (corner radius, border, blur) under the scale in effect.
+    fn transform_length(&self, length: Pixels) -> Pixels {
+        self.element_transform
+            .as_ref()
+            .map_or(length, |transform| length * transform.scale)
+    }
+
+    /// Flux patch (motion): a sprite's own transformation (a rotated SVG) moved into the scaled
+    /// space: `T' = A ∘ T ∘ A⁻¹`, with `A` the scale in effect in device pixels.
+    fn transform_sprite_matrix(&self, matrix: TransformationMatrix) -> TransformationMatrix {
+        let Some(transform) = &self.element_transform else {
+            return matrix;
+        };
+        if matrix == TransformationMatrix::unit() {
+            return matrix;
+        }
+        let offset = transform.offset.scale(self.scale_factor());
+        let (ox, oy) = (offset.x.0, offset.y.0);
+        let r = matrix.rotation_scale;
+        TransformationMatrix {
+            rotation_scale: r,
+            translation: [
+                transform.scale * matrix.translation[0] + ox - (r[0][0] * ox + r[0][1] * oy),
+                transform.scale * matrix.translation[1] + oy - (r[1][0] * ox + r[1][1] * oy),
+            ],
+        }
+    }
+
+    /// Flux patch (motion): the content mask for a primitive painted now — the current mask
+    /// scaled with the content, clipped by the mask in effect where the scale began.
+    fn transformed_content_mask(&self) -> ContentMask<Pixels> {
+        let mask = self.content_mask();
+        match &self.element_transform {
+            Some(transform) => ContentMask {
+                bounds: self
+                    .transform_bounds(mask.bounds)
+                    .intersect(&transform.outer_mask.bounds),
+            },
+            None => mask,
+        }
     }
 
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
@@ -2916,8 +3255,10 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        let content_mask = self.transformed_content_mask();
+        let clipped_bounds = self
+            .transform_bounds(bounds)
+            .intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
             self.next_frame
                 .scene
@@ -2945,13 +3286,17 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let content_mask = self.transformed_content_mask();
         let opacity = self.element_opacity();
+        let corner_radii = corner_radii.map(|radius| self.transform_length(*radius));
         for shadow in shadows {
-            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            let shadow_bounds =
+                self.transform_bounds((bounds + shadow.offset).dilate(shadow.spread_radius));
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
-                blur_radius: shadow.blur_radius.scale(scale_factor),
+                blur_radius: self
+                    .transform_length(shadow.blur_radius)
+                    .scale(scale_factor),
                 bounds: shadow_bounds.scale(scale_factor),
                 content_mask: content_mask.scale(scale_factor),
                 corner_radii: corner_radii.scale(scale_factor),
@@ -2973,16 +3318,22 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let content_mask = self.transformed_content_mask();
         let opacity = self.element_opacity();
+        let corner_radii = quad
+            .corner_radii
+            .map(|radius| self.transform_length(*radius));
+        let border_widths = quad
+            .border_widths
+            .map(|width| self.transform_length(*width));
         self.next_frame.scene.insert_primitive(Quad {
             order: 0,
-            bounds: quad.bounds.scale(scale_factor),
+            bounds: self.transform_bounds(quad.bounds).scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             background: quad.background.opacity(opacity),
             border_color: quad.border_color.opacity(opacity),
-            corner_radii: quad.corner_radii.scale(scale_factor),
-            border_widths: quad.border_widths.scale(scale_factor),
+            corner_radii: corner_radii.scale(scale_factor),
+            border_widths: border_widths.scale(scale_factor),
             border_style: quad.border_style,
         });
     }
@@ -2994,9 +3345,20 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let content_mask = self.transformed_content_mask();
         let opacity = self.element_opacity();
         path.content_mask = content_mask;
+        if self.element_transform.is_some() {
+            path.bounds = self.transform_bounds(path.bounds);
+            for vertex in &mut path.vertices {
+                vertex.xy_position = self
+                    .transform_bounds(Bounds {
+                        origin: vertex.xy_position,
+                        size: Size::default(),
+                    })
+                    .origin;
+            }
+        }
         let color: Background = color.into();
         path.color = color.opacity(opacity);
         self.next_frame
@@ -3021,11 +3383,11 @@ impl Window {
         } else {
             style.thickness
         };
-        let bounds = Bounds {
+        let bounds = self.transform_bounds(Bounds {
             origin,
             size: size(width, height),
-        };
-        let content_mask = self.content_mask();
+        });
+        let content_mask = self.transformed_content_mask();
         let element_opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
@@ -3034,7 +3396,7 @@ impl Window {
             bounds: bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             color: style.color.unwrap_or_default().opacity(element_opacity),
-            thickness: style.thickness.scale(scale_factor),
+            thickness: self.transform_length(style.thickness).scale(scale_factor),
             wavy: if style.wavy { 1 } else { 0 },
         });
     }
@@ -3052,11 +3414,11 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let height = style.thickness;
-        let bounds = Bounds {
+        let bounds = self.transform_bounds(Bounds {
             origin,
             size: size(width, height),
-        };
-        let content_mask = self.content_mask();
+        });
+        let content_mask = self.transformed_content_mask();
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
@@ -3064,7 +3426,7 @@ impl Window {
             pad: 0,
             bounds: bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
-            thickness: style.thickness.scale(scale_factor),
+            thickness: self.transform_length(style.thickness).scale(scale_factor),
             color: style.color.unwrap_or_default().opacity(opacity),
             wavy: 0,
         });
@@ -3114,11 +3476,11 @@ impl Window {
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
-            let bounds = Bounds {
+            let bounds = self.transform_scaled_bounds(Bounds {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.content_mask().scale(scale_factor);
+            });
+            let content_mask = self.transformed_content_mask().scale(scale_factor);
             self.next_frame.scene.insert_primitive(MonochromeSprite {
                 order: 0,
                 pad: 0,
@@ -3171,11 +3533,11 @@ impl Window {
                 })?
                 .expect("Callback above only errors or returns Some");
 
-            let bounds = Bounds {
+            let bounds = self.transform_scaled_bounds(Bounds {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.content_mask().scale(scale_factor);
+            });
+            let content_mask = self.transformed_content_mask().scale(scale_factor);
             let opacity = self.element_opacity();
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
@@ -3227,7 +3589,7 @@ impl Window {
         else {
             return Ok(());
         };
-        let content_mask = self.content_mask().scale(scale_factor);
+        let content_mask = self.transformed_content_mask().scale(scale_factor);
         let svg_bounds = Bounds {
             origin: bounds.center()
                 - Point::new(
@@ -3243,13 +3605,15 @@ impl Window {
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
             pad: 0,
-            bounds: svg_bounds
-                .map_origin(|origin| origin.round())
-                .map_size(|size| size.ceil()),
+            bounds: self.transform_scaled_bounds(
+                svg_bounds
+                    .map_origin(|origin| origin.round())
+                    .map_size(|size| size.ceil()),
+            ),
             content_mask,
             color: color.opacity(element_opacity),
             tile,
-            transformation,
+            transformation: self.transform_sprite_matrix(transformation),
         });
 
         Ok(())
@@ -3288,17 +3652,21 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
-        let content_mask = self.content_mask().scale(scale_factor);
-        let corner_radii = corner_radii.scale(scale_factor);
+        let content_mask = self.transformed_content_mask().scale(scale_factor);
+        let corner_radii = corner_radii
+            .map(|radius| self.transform_length(*radius))
+            .scale(scale_factor);
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
             grayscale,
-            bounds: bounds
-                .map_origin(|origin| origin.floor())
-                .map_size(|size| size.ceil()),
+            bounds: self.transform_scaled_bounds(
+                bounds
+                    .map_origin(|origin| origin.floor())
+                    .map_size(|size| size.ceil()),
+            ),
             content_mask,
             corner_radii,
             tile,
@@ -3317,8 +3685,8 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let bounds = bounds.scale(scale_factor);
-        let content_mask = self.content_mask().scale(scale_factor);
+        let bounds = self.transform_bounds(bounds).scale(scale_factor);
+        let content_mask = self.transformed_content_mask().scale(scale_factor);
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
@@ -3438,7 +3806,12 @@ impl Window {
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
-        let content_mask = self.content_mask();
+        let mut content_mask = self.content_mask();
+        // Flux patch (motion): inside `with_inert` the mouse finds nothing — an empty mask, the
+        // bounds kept for whoever measures with them.
+        if self.inert_depth > 0 {
+            content_mask.bounds.size = Size::default();
+        }
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {
@@ -3749,6 +4122,8 @@ impl Window {
             PlatformInput::ScrollWheel(scroll_wheel) => {
                 self.mouse_position = scroll_wheel.position;
                 self.modifiers = scroll_wheel.modifiers;
+                // Flux patch (scroll axis): the axis this event moves along, for the listeners.
+                self.scroll_gesture.update(&scroll_wheel, Instant::now());
                 PlatformInput::ScrollWheel(scroll_wheel)
             }
             // Translate dragging and dropping of external files from the operating system

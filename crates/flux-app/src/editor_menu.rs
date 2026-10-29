@@ -285,7 +285,7 @@ pub fn secondary_click(
         });
     window.focus(&editor.focus_handle);
     if !in_selection {
-        editor.select_range(position..position, cx);
+        editor.click_caret(position, cx);
     }
     open(editor, event.position, window, cx);
 }
@@ -384,10 +384,13 @@ pub fn actions(root: Div, _editor: &Editor, cx: &mut Context<Editor>) -> Div {
     )
 }
 
-/// The open menu over the window.
+/// The open menu over the window, drawn in every frame: a closed one fades out toward its click.
 pub fn render(editor: &Editor) -> Option<gpui::AnyElement> {
-    let open = editor.menu.open.as_ref()?;
-    Some(ContextMenu::overlay(&open.menu, open.position))
+    let open = editor.menu.open.as_ref();
+    Some(ContextMenu::slot(
+        "editor-menu",
+        open.map(|open| (&open.menu, open.position)),
+    ))
 }
 
 /// The window's handlers of the menu's file items: they act on the active document.

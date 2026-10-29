@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "flux-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "block",
@@ -2031,18 +2031,19 @@ dependencies = [
 
 [[package]]
 name = "flux-claude"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
  "libc",
  "serde_json",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]
 name = "flux-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ropey",
  "unicode-segmentation",
@@ -2050,7 +2051,7 @@ dependencies = [
 
 [[package]]
 name = "flux-fs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ignore",
  "libc",
@@ -2061,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "flux-git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "imara-diff",
  "libc",
@@ -2071,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "flux-lsp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flux-core",
  "futures",
@@ -2086,13 +2087,14 @@ dependencies = [
 
 [[package]]
 name = "flux-plugin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "flux-search",
  "futures",
  "httparse",
  "libc",
+ "log",
  "ring",
  "security-framework",
  "serde",
@@ -2108,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "flux-plugin-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2117,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "flux-search"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flux-core",
  "flux-fs",
@@ -2132,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "flux-syntax"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flux-core",
  "flux-syntax",
@@ -2152,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "flux-term"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "futures",
@@ -2162,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "flux-update"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "libc",

@@ -71,6 +71,8 @@ pub struct ClaudeStep {
     _check: Option<Task<()>>,
     _sign_in: Option<Task<()>>,
     _terminal_events: Option<Subscription>,
+    /// Sign In didn't run: the country check blocks Claude (part «Флаг страны»).
+    region_refusal: Option<crate::region_guard::Refusal>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -93,6 +95,7 @@ impl ClaudeStep {
             _check: None,
             _sign_in: None,
             _terminal_events: None,
+            region_refusal: None,
             _subscriptions: subscriptions,
         };
         step.check(cx);
@@ -135,6 +138,31 @@ impl ClaudeStep {
         let Some(cli) = self.state.cli().cloned() else {
             return self.check(cx);
         };
+        // Part «Флаг страны»: signing in talks to Anthropic too.
+        match crate::region_guard::gate(true, cx) {
+            crate::region_guard::Gate::Go => self.region_refusal = None,
+            crate::region_guard::Gate::Wait => {
+                let this = cx.weak_entity();
+                let handle = window.window_handle();
+                return crate::region_guard::wait(cx, move |outcome, cx| {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            this.update(cx, |this, cx| match outcome {
+                                Ok(()) => this.sign_in(window, cx),
+                                Err(refusal) => {
+                                    this.region_refusal = Some(refusal);
+                                    cx.notify();
+                                }
+                            })
+                        })
+                        .ok();
+                });
+            }
+            crate::region_guard::Gate::Refuse(refusal) => {
+                self.region_refusal = Some(refusal);
+                return cx.notify();
+            }
+        }
         let (program, args) = cli.login_command();
         let spec = SpawnSpec {
             command: Some((program.to_string_lossy().into_owned(), args)),
@@ -241,6 +269,26 @@ impl ClaudeStep {
             .border_1()
             .border_color(ui.island_border)
             .bg(ui.hover);
+        if let Some(refusal) = &self.region_refusal {
+            return card
+                .child(head(
+                    IconName::Warning,
+                    ui.error,
+                    tr("Claude is blocked").into(),
+                    refusal.reason().into(),
+                    ui,
+                ))
+                .child(
+                    actions().child(
+                        ui::text_button("welcome-claude-region", tr("Check Again"), false, ui)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.region_refusal = None;
+                                crate::region_guard::check_again(cx);
+                                this.sign_in(window, cx);
+                            })),
+                    ),
+                );
+        }
         match &self.state {
             CliState::Checking => card.child(
                 div()
@@ -659,18 +707,18 @@ fn actions() -> Div {
     div().mt_3().flex().items_center().gap_2()
 }
 
-/// A pulsing dot: something is awaited.
-fn busy_dot(id: &'static str, ui: UiColors) -> impl IntoElement {
-    div()
-        .flex_none()
-        .size(px(8.))
-        .rounded(px(4.))
-        .bg(ui.accent)
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
-        )
+/// A pulsing dot: something is awaited. Without animations (`crate::motion`) it stays lit.
+fn busy_dot(id: &'static str, ui: UiColors) -> AnyElement {
+    let dot = div().flex_none().size(px(8.)).rounded(px(4.)).bg(ui.accent);
+    if !crate::motion::enabled() {
+        return dot.into_any_element();
+    }
+    dot.with_animation(
+        id,
+        Animation::new(Duration::from_millis(900)).repeat(),
+        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+    )
+    .into_any_element()
 }
 
 /// The Flux window in front (or the last one opened, when none is in front: a scenario).

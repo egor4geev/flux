@@ -18,12 +18,13 @@
 //! document), `#anchor` scrolls the preview to its heading. A task's box toggles `[ ]` / `[x]` in
 //! the text.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Context, ElementId, FontWeight, Hsla, InteractiveText, KeyBinding,
@@ -35,6 +36,7 @@ use crate::editor::Editor;
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
 use crate::markdown::{self, Align, CodeBlock, Span, Table, Tag};
+use crate::motion;
 use crate::plugin_links::{self, Link};
 use crate::settings::{self, MarkdownLayout};
 use crate::theme::{self, Theme, UiColors};
@@ -1079,6 +1081,31 @@ pub struct MarkdownState {
     parse: Option<Task<()>>,
     /// The text changed while the preview was hidden (Editor Only): it parses when shown.
     stale: bool,
+    /// A jump of the preview on its way.
+    glide: Option<ListGlide>,
+    /// When the layout last changed, and from which: the pane that came fades in.
+    switched: Option<(Instant, MarkdownLayout)>,
+    /// When each local picture was first drawn loaded (or failed): it fades in once, not each
+    /// time the list draws its row again.
+    pictures: Rc<RefCell<HashMap<PathBuf, Instant>>>,
+}
+
+/// A jump of the preview gliding ([`motion::SCROLL`]) — Page Up / Down, Space, ⌘↑ / ⌘↓, an
+/// #anchor: `total` pixels from where it started, `done` of them behind. The list goes by steps
+/// (its items are measured as they come into view) and a jump to a place lands on it (`target`)
+/// at the end. `shown` is the scroll drawn last: another one means the wheel, the scrollbar or the
+/// editor moved the list, and the glide gives way.
+struct ListGlide {
+    total: f32,
+    done: f32,
+    target: Option<ListOffset>,
+    since: Instant,
+    shown: ListOffset,
+}
+
+/// The same place of the list.
+fn same_offset(a: ListOffset, b: ListOffset) -> bool {
+    a.item_ix == b.item_ix && (a.offset_in_item - b.offset_in_item).abs() < px(0.5)
 }
 
 impl MarkdownState {
@@ -1094,6 +1121,9 @@ impl MarkdownState {
             synced: Rc::new(Cell::new(None)),
             parse: None,
             stale: false,
+            glide: None,
+            switched: None,
+            pictures: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -1220,6 +1250,8 @@ pub(crate) fn set_layout(
     };
     let mut reparse = false;
     if state.layout != layout {
+        state.switched = motion::enabled().then(|| (Instant::now(), state.layout));
+        state.glide = None;
         state.layout = layout;
         state.synced.set(None);
         settings::set_markdown_layout(layout, cx);
@@ -1234,23 +1266,130 @@ pub(crate) fn set_layout(
     cx.notify();
 }
 
-/// The preview's scrolling in Preview Only.
+/// The preview's scrolling in Preview Only: ↑ / ↓ step at once (the keys repeat), the jumps
+/// glide ([`glide`]).
 fn scroll(editor: &mut Editor, how: ScrollHow, cx: &mut Context<Editor>) {
-    let Some(state) = &editor.markdown else {
+    let Some(state) = &mut editor.markdown else {
         return;
     };
-    let list = &state.list;
+    let list = state.list.clone();
     let page = (list.viewport_bounds().size.height - px(SCROLL_STEP)).max(px(SCROLL_STEP));
     match how {
         ScrollHow::By(step) => list.scroll_by(px(step)),
-        ScrollHow::Page(direction) => list.scroll_by(page * direction),
-        ScrollHow::Top => list.scroll_to(ListOffset::default()),
-        ScrollHow::Bottom => list.scroll_to(ListOffset {
-            item_ix: list.item_count(),
-            offset_in_item: px(0.),
-        }),
+        ScrollHow::Page(direction) => glide(state, Jump::By(f32::from(page) * direction)),
+        ScrollHow::Top => glide(state, Jump::To(ListOffset::default())),
+        ScrollHow::Bottom => glide(
+            state,
+            Jump::To(ListOffset {
+                item_ix: list.item_count(),
+                offset_in_item: px(0.),
+            }),
+        ),
     }
     cx.notify();
+}
+
+/// Where a jump of the preview goes: by pixels (down — positive) or to a place of the list.
+#[derive(Clone, Copy)]
+enum Jump {
+    By(f32),
+    To(ListOffset),
+}
+
+/// Starts a jump of the preview gliding ([`ListGlide`]). A jump during another counts from where
+/// that one goes; a way longer than a screen jumps most of it and glides the last screen, where
+/// the eye can follow the text (as the editor's jumps do). Off: the list is there at once.
+fn glide(state: &mut MarkdownState, jump: Jump) {
+    let list = state.list.clone();
+    let current = list.logical_scroll_top();
+    let ahead = state
+        .glide
+        .take()
+        .filter(|glide| same_offset(glide.shown, current))
+        .map_or(0., |glide| glide.total - glide.done);
+    if !motion::enabled() {
+        match jump {
+            Jump::By(distance) => list.scroll_by(px(ahead + distance)),
+            Jump::To(target) => list.scroll_to(target),
+        }
+        return;
+    }
+    let (total, target) = match jump {
+        Jump::By(distance) => (ahead + distance, None),
+        Jump::To(target) => {
+            // The way in the list's pixels (items not drawn yet count as nothing: the glide lands
+            // on the place whatever it was).
+            let top = |list: &ListState| -f32::from(list.scroll_px_offset_for_scrollbar().y);
+            let max = f32::from(list.max_offset_for_scrollbar().height);
+            let from = top(&list);
+            let to = if target.item_ix >= list.item_count() {
+                max
+            } else {
+                list.scroll_to(target);
+                let to = top(&list).min(max);
+                list.scroll_to(current);
+                to
+            };
+            let limit = f32::from(list.viewport_bounds().size.height).max(SCROLL_STEP);
+            let way = (to - from).clamp(-limit, limit);
+            if way != to - from {
+                list.set_offset_from_scrollbar(gpui::point(px(0.), px(-(to - way).max(0.))));
+            }
+            (way, Some(target))
+        }
+    };
+    if total.abs() < 0.5 {
+        if let Some(target) = target {
+            list.scroll_to(target);
+        }
+        return;
+    }
+    state.glide = Some(ListGlide {
+        total,
+        done: 0.,
+        target,
+        since: Instant::now(),
+        shown: list.logical_scroll_top(),
+    });
+}
+
+/// Moves the preview's glide on to this frame, asking for the next one while it runs.
+fn advance_glide(state: &mut MarkdownState, window: &Window) {
+    let Some(glide) = &mut state.glide else {
+        return;
+    };
+    let list = &state.list;
+    if !same_offset(list.logical_scroll_top(), glide.shown) {
+        state.glide = None;
+        return;
+    }
+    let (t, done) = motion::SCROLL.at(glide.since.elapsed());
+    if done {
+        match glide.target {
+            Some(target) => list.scroll_to(target),
+            None => list.scroll_by(px(glide.total - glide.done)),
+        }
+        state.glide = None;
+        return;
+    }
+    let travelled = glide.total * t;
+    list.scroll_by(px(travelled - glide.done));
+    glide.done = travelled;
+    glide.shown = list.logical_scroll_top();
+    window.request_animation_frame();
+}
+
+/// How far the pane that came with the last switch of layout has faded in — the preview from
+/// Editor Only, the text from Preview Only — and from which layout; `None` once in place.
+fn arriving(editor: &mut Editor, window: &Window) -> Option<(MarkdownLayout, f32)> {
+    let state = editor.markdown.as_mut()?;
+    let (since, from) = state.switched?;
+    let value = motion::animate(since, motion::FADE, window);
+    if value >= 1. {
+        state.switched = None;
+        return None;
+    }
+    Some((from, value))
 }
 
 /// Preview Only → Editor and Preview, letting the command that needs the text go on.
@@ -1332,9 +1471,20 @@ pub(crate) fn render_preview_only(
             }),
         );
     let root = layout_actions(root, cx);
-    root.child(render_preview(editor, false, window, cx))
-        .child(render_toolbar(MarkdownLayout::Preview, cx))
-        .into_any_element()
+    let fade = arriving(editor, window)
+        .filter(|(from, _)| *from == MarkdownLayout::Editor)
+        .map(|(_, value)| value);
+    root.child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .size_full()
+            .flex()
+            .when_some(fade, |pane, value| pane.opacity(value))
+            .child(render_preview(editor, false, window, cx)),
+    )
+    .child(render_toolbar(MarkdownLayout::Preview, cx))
+    .into_any_element()
 }
 
 /// The text area and the preview side by side (Editor and Preview), or the text area alone with the
@@ -1347,19 +1497,43 @@ pub(crate) fn render_with_text(
     cx: &mut Context<Editor>,
 ) -> AnyElement {
     let ui = Theme::ui(cx);
+    // The pane that came with a switch fades in: the preview from Editor Only, the text from
+    // Preview Only (the other one was there and only widens or narrows).
+    let arriving = match layout {
+        MarkdownLayout::Split => arriving(editor, window),
+        _ => None,
+    };
+    let fade = |pane: MarkdownLayout| {
+        arriving
+            .filter(|(from, _)| *from == pane)
+            .map(|(_, value)| value)
+    };
     let content = match layout {
         MarkdownLayout::Split => div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_row()
-            .child(div().flex_1().min_w_0().flex().flex_col().child(text_area))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .when_some(fade(MarkdownLayout::Preview), |pane, value| {
+                        pane.opacity(value)
+                    })
+                    .child(text_area),
+            )
             .child(div().flex_none().w(px(1.)).my_1().bg(ui.divider))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
+                    .when_some(fade(MarkdownLayout::Editor), |pane, value| {
+                        pane.opacity(value)
+                    })
                     .child(render_preview(editor, true, window, cx)),
             )
             .into_any_element(),
@@ -1446,6 +1620,7 @@ struct Ctx {
     list: ListState,
     anchors: HashMap<String, usize>,
     editor: WeakEntity<Editor>,
+    pictures: Rc<RefCell<HashMap<PathBuf, Instant>>>,
 }
 
 impl Ctx {
@@ -1460,12 +1635,18 @@ impl Ctx {
             Destination::Web(url) => plugin_links::open_url(url, cx),
             Destination::Anchor(anchor) => {
                 if let Some(&index) = self.anchors.get(anchor) {
-                    self.list.scroll_to(ListOffset {
+                    let target = ListOffset {
                         item_ix: index,
                         offset_in_item: px(0.),
-                    });
-                    if let Some(editor) = self.editor.upgrade() {
-                        editor.update(cx, |_, cx| cx.notify());
+                    };
+                    match self.editor.upgrade() {
+                        Some(editor) => editor.update(cx, |editor, cx| {
+                            if let Some(state) = &mut editor.markdown {
+                                glide(state, Jump::To(target));
+                            }
+                            cx.notify();
+                        }),
+                        None => self.list.scroll_to(target),
                     }
                 }
             }
@@ -1487,10 +1668,13 @@ impl Ctx {
 fn render_preview(
     editor: &mut Editor,
     follow: bool,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<Editor>,
 ) -> AnyElement {
     let ui = Theme::ui(cx);
+    if let Some(state) = &mut editor.markdown {
+        advance_glide(state, window);
+    }
     let dir = editor
         .document
         .path()
@@ -1506,6 +1690,7 @@ fn render_preview(
         list: state.list.clone(),
         anchors: anchors(&state.doc),
         editor: cx.entity().downgrade(),
+        pictures: state.pictures.clone(),
     });
     // Before the list lays its items out: the column's width for the pictures and, following the
     // editor, the scroll — after the text's element has scrolled in this very frame.
@@ -2021,10 +2206,19 @@ fn render_images(
                 Some(Destination::File(path, _)) => {
                     let (width, height) = picture_box(image, column);
                     let alt = SharedString::from(image.alt.clone());
-                    img(path.clone())
+                    // Into its box as it loads: by when the model saw it come, so a row the list
+                    // draws again doesn't replay it.
+                    let since = ctx.pictures.borrow().get(path).copied();
+                    let shown = match since {
+                        Some(since) => motion::progress(since, motion::FADE),
+                        None if motion::enabled() => 0.,
+                        None => 1.,
+                    };
+                    img(picture_source(path.clone(), ctx.pictures.clone()))
                         .w(px(width))
                         .when_some(height, |picture, height| picture.h(px(height)))
                         .rounded(px(RADIUS_SM))
+                        .when(shown < 1., |picture| picture.opacity(shown))
                         .with_fallback(move || placeholder(alt.clone(), ui))
                         .into_any_element()
                 }
@@ -2059,6 +2253,28 @@ fn render_images(
                 .child(picture)
         }))
         .into_any_element()
+}
+
+/// A local picture as an image source that notes in `pictures` when it is first there (loaded,
+/// or failed — its placeholder fades in as well), asking for frames while it fades in.
+fn picture_source(
+    path: PathBuf,
+    pictures: Rc<RefCell<HashMap<PathBuf, Instant>>>,
+) -> gpui::ImageSource {
+    let resource = gpui::Resource::Path(Arc::from(path.as_path()));
+    gpui::ImageSource::from(move |window: &mut Window, cx: &mut App| {
+        let data = window.use_asset::<gpui::ImgResourceLoader>(&resource, cx);
+        if data.is_some() {
+            let since = *pictures
+                .borrow_mut()
+                .entry(path.clone())
+                .or_insert_with(Instant::now);
+            if motion::running(since, motion::FADE) {
+                window.request_animation_frame();
+            }
+        }
+        data
+    })
 }
 
 /// The size a picture is shown at in a column `column` px wide: its `width` (pixels or a share),

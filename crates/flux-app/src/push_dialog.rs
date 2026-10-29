@@ -614,6 +614,16 @@ impl PushDialog {
                     })
             }
         };
+        // What the body says, to key its fade by.
+        let state: usize = if item.loading {
+            0
+        } else if item.branch.is_none() || item.remotes.is_empty() || item.error.is_some() {
+            1
+        } else if item.commits.is_empty() {
+            2
+        } else {
+            3
+        };
         let body: gpui::AnyElement = if item.loading {
             note(tr("Reading…"), ui).into_any_element()
         } else if item.branch.is_none() {
@@ -678,7 +688,17 @@ impl PushDialog {
                 }))
                 .into_any_element()
         };
-        div().flex().flex_col().pb_2().child(head).child(body)
+        // Read, the commits fade in and the dialog grows to them instead of jumping.
+        let body = crate::motion::Appear::fade().apply(
+            ("push-body-state", state),
+            div().flex().flex_col().child(body),
+        );
+        div()
+            .flex()
+            .flex_col()
+            .pb_2()
+            .child(head)
+            .child(crate::motion::glide_height(("push-body", slot), body))
     }
 
     fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1136,22 +1156,27 @@ impl Render for PushDialog {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        ui::text_button("push-force", tr("Force Push…"), true, ui)
-                            .when(!can_push, |button| button.opacity(0.5))
-                            .when(can_push, |button| {
-                                button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.push(true, window, cx)
-                                }))
-                            }),
+                        ui::available(
+                            ui::text_button("push-force", tr("Force Push…"), true, ui),
+                            can_push,
+                        )
+                        .when(can_push, |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.push(true, window, cx)
+                            }))
+                        }),
                     )
                     .child(
-                        ui::primary_button("push-button", tr("Push"), can_push, ui)
-                            .tooltip(ui::tooltip(tr("Push"), push_keys))
-                            .when(can_push, |button| {
-                                button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.push(false, window, cx)
-                                }))
-                            }),
+                        ui::available(
+                            ui::primary_button("push-button", tr("Push"), can_push, ui),
+                            can_push,
+                        )
+                        .tooltip(ui::tooltip(tr("Push"), push_keys))
+                        .when(can_push, |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.push(false, window, cx)
+                            }))
+                        }),
                     ),
             )
     }

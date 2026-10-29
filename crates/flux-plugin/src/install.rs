@@ -107,10 +107,10 @@ fn install_unpacked(entry: &PluginEntry, unpacked: &Path) -> Result<PluginEntry,
     load_dir(&target, PluginSource::Installed)
 }
 
-/// Removes an installed plugin's folder and its secrets in the keychain (best effort: the plugin is
-/// gone either way); its data (`paths::data_dir`) stays, as JetBrains IDEs keep a removed plugin's
-/// settings. A plugin under development is only unlinked by the caller; a bundled one can't be
-/// removed.
+/// Removes an installed plugin's folder and its secrets (with any of its items left in the
+/// keychain; best effort: the plugin is gone either way); its data (`paths::data_dir`) stays, as
+/// JetBrains IDEs keep a removed plugin's settings. A plugin under development is only unlinked by
+/// the caller; a bundled one can't be removed.
 pub fn uninstall(entry: &PluginEntry) -> Result<(), String> {
     match entry.source {
         PluginSource::Bundled => Err("A bundled plugin can't be removed, only turned off".into()),
@@ -126,7 +126,7 @@ pub fn uninstall(entry: &PluginEntry) -> Result<(), String> {
                 return Err(format!("{} isn't in the plugins folder", dir.display()));
             }
             std::fs::remove_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-            let _ = crate::keychain::delete_all(&crate::keychain::service(entry.id()));
+            let _ = crate::secrets::delete_all(&crate::secrets::service(entry.id()));
             Ok(())
         }
     }
@@ -316,8 +316,12 @@ mod tests {
             pack(&plugin_folder(&id, "2.0.0"), &newer, false);
             let entry = install(inspect(&newer).unwrap()).unwrap();
             assert_eq!(entry.manifest.version, "2.0.0");
+            let service = crate::secrets::service(&id);
+            crate::secrets::set(&service, "token", "x").unwrap();
             uninstall(&entry).unwrap();
             assert!(!installed.exists());
+            // Its secrets go with it.
+            assert_eq!(crate::secrets::get(&service, "token").unwrap(), None);
         }
     }
 

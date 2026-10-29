@@ -13,9 +13,15 @@
 //! accepted: Enter inserts (replaces the word up to the cursor), Tab replaces the whole word. The
 //! item's additional edits (imports) go into the same undo step; if the item still has to be
 //! resolved for them (`completionItem/resolve`), they follow as soon as it is.
+//!
+//! Motion: the menu pops out of its word once a session (typing narrows it in place, on the side
+//! it took when it appeared); a menu that closes without an accepted item fades out where it was,
+//! taking no input. An accepted item's text takes the menu's place at once.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::time::Instant;
 
 use flux_core::text::{CharClass, char_class, indentation, line_start};
 use flux_core::transaction::Operation;
@@ -34,15 +40,16 @@ use flux_search::match_list;
 use flux_syntax::language_for_path;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Corner, Div, FontWeight, HighlightStyle, Hsla,
-    KeyBinding, KeyContext, Pixels, ScrollStrategy, StyledText, Subscription, Task,
-    UniformListScrollHandle, Window, actions, anchored, deferred, div, point, prelude::*, px,
+    KeyBinding, KeyContext, Pixels, Point, ScrollStrategy, Stateful, StyledText, Subscription,
+    Task, UniformListScrollHandle, Window, actions, anchored, deferred, div, point, prelude::*, px,
     uniform_list,
 };
 
 use crate::editor::Editor;
 use crate::markdown::{self, Block};
+use crate::motion::{self, Appear, Leaving};
 use crate::picker::byte_ranges;
-use crate::popup::{self, POPUP_GAP, Side, WINDOW_MARGIN};
+use crate::popup::{self, Anchor, POPUP_GAP, Side, WINDOW_MARGIN};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_SM, RADIUS_XS};
 
@@ -61,6 +68,9 @@ const DOCS_WIDTH: f32 = 360.;
 const DOCS_MAX_HEIGHT: f32 = 320.;
 /// Past this length the "word" is not one (a minified line): the session ends.
 const MAX_QUERY_CHARS: usize = 256;
+/// The menu keeps the side of its word it appeared on while that side has room for this many rows
+/// (or all of them, if fewer); a scroll that leaves it less takes the side anew.
+const KEPT_SIDE_ROWS: usize = 3;
 
 actions!(editor, [ShowCompletions]);
 actions!(
@@ -98,6 +108,8 @@ pub fn init(cx: &mut App) {
 /// whose additional edits are still being resolved. `None` in the editor when there is neither.
 pub struct CompletionMenu {
     session: Option<Session>,
+    /// The menu of a session that ended without an accepted item, fading out where it was.
+    leaving: Option<Leaving<Ghost>>,
     pending: Vec<PendingEdits>,
     next_pending: u64,
 }
@@ -129,7 +141,39 @@ struct Session {
     /// Resolving and preparing the documentation of the selected item: `(list id, item)`.
     details: Option<((u64, usize), Task<()>)>,
     next_list_id: u64,
+    /// When the menu was first drawn — it pops in once a session, not again as the list narrows
+    /// or comes back after a moment without matches — and the side of the word it is on.
+    appeared: Cell<Option<(Instant, Side)>>,
+    /// Where the menu was drawn in the last frame (`None` — it wasn't): where it fades out.
+    placed: Cell<Option<Placement>>,
     _subscriptions: [Subscription; 2],
+}
+
+/// Where a menu is drawn: worked out from its word's place on screen each frame, kept for its
+/// exit.
+#[derive(Clone, Copy)]
+struct Placement {
+    side: Side,
+    /// The window point of the corner on the word's side: the top left below the word, the bottom
+    /// left above it.
+    position: Point<Pixels>,
+    /// Rows shown at once.
+    rows: usize,
+    /// The selected item's documentation, when it is drawn: on the left of the menu (true) or on
+    /// its right; and its height limit.
+    docs_left: Option<bool>,
+    docs_height: Pixels,
+    /// The word's edge by the menu: what the menu grows out of and shrinks back into.
+    anchor: Point<Pixels>,
+}
+
+/// A menu that closed, as it was last drawn: kept while it fades out ([`Leaving`]).
+struct Ghost {
+    list: ItemList,
+    matches: Vec<Match>,
+    selected: usize,
+    scroll: UniformListScrollHandle,
+    placement: Placement,
 }
 
 /// An answer: the items, and the text their edits refer to.
@@ -430,6 +474,8 @@ fn start(
         foreign: false,
         details: None,
         next_list_id: 0,
+        appeared: Cell::new(None),
+        placed: Cell::new(None),
         _subscriptions: [
             cx.observe_self(refresh),
             cx.on_blur(&editor.focus_handle, window, |editor, _, cx| {
@@ -439,9 +485,13 @@ fn start(
     };
     let menu = editor.completion.get_or_insert_with(|| CompletionMenu {
         session: None,
+        leaving: None,
         pending: Vec::new(),
         next_pending: 0,
     });
+    // A trigger character in an open session (`foo.`): the old menu fades out as the new one is
+    // asked for.
+    retire(menu, cx);
     menu.session = Some(session);
     request(editor, context, cx);
 }
@@ -599,15 +649,57 @@ fn refilter(editor: &mut Editor, cx: &mut Context<Editor>) {
     load_details(editor, cx);
 }
 
-/// Ends the session (accepted items keep waiting for their edits).
+/// Ends the session (accepted items keep waiting for their edits); its menu fades out.
 fn close(editor: &mut Editor, cx: &mut Context<Editor>) {
     let Some(menu) = &mut editor.completion else {
         return;
     };
-    if menu.session.take().is_some() {
+    if retire(menu, cx) {
         cx.notify();
     }
-    if menu.pending.is_empty() {
+    if menu.pending.is_empty() && menu.leaving.is_none() {
+        editor.completion = None;
+    }
+}
+
+/// Takes the open session away; if its menu was drawn in the last frame, it becomes the one fading
+/// out (dropped when its exit ends — it holds the whole list). False if there was no session.
+fn retire(menu: &mut CompletionMenu, cx: &mut Context<Editor>) -> bool {
+    let Some(session) = menu.session.take() else {
+        return false;
+    };
+    let ghost = match (session.placed.get(), session.list) {
+        (Some(placement), Some(list)) if motion::enabled() && !session.matches.is_empty() => {
+            Ghost {
+                list,
+                matches: session.matches,
+                selected: session.selected,
+                scroll: session.scroll,
+                placement,
+            }
+        }
+        _ => return true,
+    };
+    menu.leaving = Some(Leaving::new(ghost));
+    cx.spawn(async move |this, cx| {
+        cx.background_executor()
+            .timer(motion::EXIT.duration())
+            .await;
+        this.update(cx, |editor, _| forget_leaving(editor)).ok();
+    })
+    .detach();
+    true
+}
+
+/// The exit of a closed menu has ended: it goes, and the state with it if nothing else is left.
+fn forget_leaving(editor: &mut Editor) {
+    let Some(menu) = &mut editor.completion else {
+        return;
+    };
+    if menu.leaving.as_ref().is_some_and(Leaving::done) {
+        menu.leaving = None;
+    }
+    if menu.session.is_none() && menu.pending.is_empty() && menu.leaving.is_none() {
         editor.completion = None;
     }
 }
@@ -703,6 +795,8 @@ fn confirm(editor: &mut Editor, mode: Mode, window: &mut Window, cx: &mut Contex
     let Some(mut session) = menu.session.take() else {
         return;
     };
+    // The accepted item's text takes the menu's place at once: no menu fades over it.
+    menu.leaving = None;
     let (Some(list), Some(index)) = (
         session.list.take(),
         session.matches.get(session.selected).map(|m| m.item),
@@ -774,7 +868,7 @@ fn apply_pending(
         return;
     };
     let pending = menu.pending.remove(at);
-    if menu.pending.is_empty() && menu.session.is_none() {
+    if menu.pending.is_empty() && menu.session.is_none() && menu.leaving.is_none() {
         editor.completion = None;
     }
     let Some(edits) = resolved.and_then(|item| item.additional_text_edits) else {
@@ -1255,14 +1349,33 @@ fn documentation_blocks(
 
 // --- Drawing ---
 
-/// The menu under (or above) the word, with the selected item's documentation beside it; `None`
-/// while there is nothing to show.
+/// The menu under (or above) the word, with the selected item's documentation beside it, or the
+/// menu that closed fading out; `None` while there is nothing to show.
 pub fn render(
     editor: &Editor,
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) -> Option<AnyElement> {
-    let session = session(editor)?;
+    let session = session(editor);
+    let open = session.and_then(|session| render_open(editor, session, window, cx));
+    if let Some(session) = session {
+        session
+            .placed
+            .set(open.as_ref().map(|(_, placement)| *placement));
+    }
+    match open {
+        Some((menu, _)) => Some(menu),
+        None => render_leaving(editor, window, cx),
+    }
+}
+
+/// The open session's menu, and where it is.
+fn render_open(
+    editor: &Editor,
+    session: &Session,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> Option<(AnyElement, Placement)> {
     let list = session.list.as_ref()?;
     if session.matches.is_empty() || !editor.focus_handle.is_focused(window) {
         return None;
@@ -1273,13 +1386,19 @@ pub fn render(
         window.request_animation_frame();
     }
     let theme = Theme::get(cx);
-    let ui = theme.ui;
     let viewport = window.viewport_size();
 
     let chrome = MENU_PADDING * 2. + 2.;
     let rows = session.matches.len().min(MAX_VISIBLE_ROWS);
-    let height = px(ROW_HEIGHT * rows as f32 + chrome);
-    let (side, room) = popup::side(&anchor, height, viewport.height, Side::Below);
+    let appeared = session.appeared.get();
+    let (side, room) = menu_side(
+        &anchor,
+        rows,
+        appeared.map(|(_, side)| side),
+        viewport.height,
+    );
+    let since = appeared.map_or_else(Instant::now, |(since, _)| since);
+    session.appeared.set(Some((since, side)));
     let rows = rows.min((((room - px(chrome)) / px(ROW_HEIGHT)).floor() as usize).max(1));
 
     // The labels line up with the word.
@@ -1288,10 +1407,11 @@ pub fn render(
         .min(viewport.width - px(MENU_WIDTH + WINDOW_MARGIN))
         .max(px(WINDOW_MARGIN));
     let selected = session.matches.get(session.selected)?;
+    let docs_height = room.min(px(DOCS_MAX_HEIGHT));
     let docs = docs_panel(
         &list.items[selected.item],
         selected.item,
-        room.min(px(DOCS_MAX_HEIGHT)),
+        docs_height,
         theme,
     );
     let docs_width = px(DOCS_WIDTH + POPUP_GAP);
@@ -1303,51 +1423,182 @@ pub fn render(
     } else {
         x
     };
+    let placement = Placement {
+        side,
+        position: match side {
+            Side::Below => point(origin_x, anchor.line_bottom + px(POPUP_GAP)),
+            Side::Above => point(origin_x, anchor.line_top - px(POPUP_GAP)),
+        },
+        rows,
+        docs_left: docs.is_some().then_some(docs_left),
+        docs_height,
+        anchor: match side {
+            Side::Below => point(anchor.x, anchor.line_bottom),
+            Side::Above => point(anchor.x, anchor.line_top),
+        },
+    };
 
-    let menu = popup::panel(ui)
+    let menu = menu_panel(
+        theme.ui,
+        "completions",
+        session.matches.len(),
+        &session.scroll,
+        rows,
+        cx.processor(|editor, range: Range<usize>, _, cx| {
+            range
+                .map(|index| render_row(editor, index, cx))
+                .collect::<Vec<_>>()
+        }),
+    );
+    let content = arrange(menu, docs, &placement);
+    // It pops out of its word once a session: the list narrowing as one types, or coming back
+    // after a moment without matches, doesn't replay it.
+    let content = if motion::running(since, motion::POP) {
+        let width = match placement.docs_left {
+            Some(_) => MENU_WIDTH + DOCS_WIDTH + POPUP_GAP,
+            None => MENU_WIDTH,
+        };
+        let origin_x = ((anchor.x - origin_x) / px(width)).clamp(0., 1.);
+        let origin_y = match side {
+            Side::Below => 0.,
+            Side::Above => 1.,
+        };
+        Appear::pop((origin_x, origin_y))
+            .style(content, motion::animate(since, motion::POP, window))
+    } else {
+        content
+    };
+    Some((place(&placement, content), placement))
+}
+
+/// The side of the word for a menu of `rows` rows, and the room there: the side it appeared on
+/// (`kept`) while that still has room — typing doesn't flip it over the word as the list narrows —
+/// else the one below if the menu fits there.
+fn menu_side(
+    anchor: &Anchor,
+    rows: usize,
+    kept: Option<Side>,
+    window_height: Pixels,
+) -> (Side, Pixels) {
+    let chrome = MENU_PADDING * 2. + 2.;
+    let height = |rows: usize| px(ROW_HEIGHT * rows as f32 + chrome);
+    if let Some(kept) = kept {
+        let (above, below) = popup::space(anchor, window_height);
+        let room = match kept {
+            Side::Above => above,
+            Side::Below => below,
+        };
+        if room >= height(rows.min(KEPT_SIDE_ROWS)) {
+            return (kept, room);
+        }
+    }
+    popup::side(
+        anchor,
+        height(rows),
+        window_height,
+        kept.unwrap_or(Side::Below),
+    )
+}
+
+/// The menu itself: its rows in a list `rows` high.
+fn menu_panel<R: IntoElement>(
+    ui: UiColors,
+    id: &'static str,
+    count: usize,
+    scroll: &UniformListScrollHandle,
+    rows: usize,
+    render_rows: impl 'static + Fn(Range<usize>, &mut Window, &mut App) -> Vec<R>,
+) -> Div {
+    popup::panel(ui)
         .occlude()
         .w(px(MENU_WIDTH))
         .p(px(MENU_PADDING))
         .child(
-            uniform_list(
-                "completions",
-                session.matches.len(),
-                cx.processor(|editor, range: Range<usize>, _, cx| {
-                    range
-                        .map(|index| render_row(editor, index, cx))
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .track_scroll(session.scroll.clone())
-            .h(px(ROW_HEIGHT * rows as f32)),
-        );
-    let content = div()
+            uniform_list(id, count, render_rows)
+                .track_scroll(scroll.clone())
+                .h(px(ROW_HEIGHT * rows as f32)),
+        )
+}
+
+/// The menu and the documentation beside it, their edges by the word in line.
+fn arrange(menu: Div, docs: Option<AnyElement>, placement: &Placement) -> Div {
+    div()
         .flex()
         .gap(px(POPUP_GAP))
-        .map(|row| match side {
+        .map(|row| match placement.side {
             Side::Below => row.items_start(),
             Side::Above => row.items_end(),
         })
-        .map(|row| match docs {
-            Some(docs) if docs_left => row.child(docs).child(menu),
-            Some(docs) => row.child(menu).child(docs),
-            None => row.child(menu),
-        });
-    let (corner, y) = match side {
-        Side::Below => (Corner::TopLeft, anchor.line_bottom + px(POPUP_GAP)),
-        Side::Above => (Corner::BottomLeft, anchor.line_top - px(POPUP_GAP)),
+        .map(|row| match (docs, placement.docs_left) {
+            (Some(docs), Some(true)) => row.child(docs).child(menu),
+            (Some(docs), Some(false)) => row.child(menu).child(docs),
+            _ => row.child(menu),
+        })
+}
+
+/// `content` over the window at the placement's point, shifted inward near the window's edges.
+fn place(placement: &Placement, content: impl IntoElement) -> AnyElement {
+    let corner = match placement.side {
+        Side::Below => Corner::TopLeft,
+        Side::Above => Corner::BottomLeft,
     };
-    Some(
-        deferred(
-            anchored()
-                .anchor(corner)
-                .position(point(origin_x, y))
-                .snap_to_window_with_margin(px(WINDOW_MARGIN))
-                .child(content),
-        )
-        .with_priority(2)
-        .into_any_element(),
+    deferred(
+        anchored()
+            .anchor(corner)
+            .position(placement.position)
+            .snap_to_window_with_margin(px(WINDOW_MARGIN))
+            .child(content),
     )
+    .with_priority(2)
+    .into_any_element()
+}
+
+/// The menu that closed, fading out and shrinking back into its word where it was drawn last; it
+/// takes no input. Not once a newer menu has shown.
+fn render_leaving(
+    editor: &Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> Option<AnyElement> {
+    let menu = editor.completion.as_ref()?;
+    if menu
+        .session
+        .as_ref()
+        .is_some_and(|session| session.appeared.get().is_some())
+    {
+        return None;
+    }
+    let leaving = menu.leaving.as_ref().filter(|leaving| !leaving.done())?;
+    let progress = leaving.progress(window);
+    let ghost = &leaving.value;
+    let placement = ghost.placement;
+    let theme = Theme::get(cx);
+    let docs = placement
+        .docs_left
+        .and_then(|_| ghost.matches.get(ghost.selected))
+        .and_then(|m| {
+            docs_panel(
+                &ghost.list.items[m.item],
+                m.item,
+                placement.docs_height,
+                theme,
+            )
+        });
+    let menu = menu_panel(
+        theme.ui,
+        "completions-leaving",
+        ghost.matches.len(),
+        &ghost.scroll,
+        placement.rows,
+        cx.processor(|editor, range: Range<usize>, _, cx| {
+            range
+                .map(|index| render_leaving_row(editor, index, cx))
+                .collect::<Vec<_>>()
+        }),
+    );
+    let content = arrange(menu, docs, &placement);
+    let content = motion::leaving_from(content, progress, placement.anchor);
+    Some(place(&placement, motion::inert(content)))
 }
 
 fn render_row(editor: &mut Editor, index: usize, cx: &mut Context<Editor>) -> AnyElement {
@@ -1358,8 +1609,48 @@ fn render_row(editor: &mut Editor, index: usize, cx: &mut Context<Editor>) -> An
     let Some(m) = session.matches.get(index) else {
         return div().into_any_element();
     };
-    let item = &list.items[m.item];
-    let selected = index == session.selected;
+    let row = row(&list.items[m.item], m, index, index == session.selected, ui);
+    div()
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .child(
+            row.on_click(cx.listener(move |editor, _: &ClickEvent, window, cx| {
+                if let Some(session) = session_mut(editor) {
+                    session.selected = index;
+                }
+                confirm(editor, Mode::Insert, window, cx)
+            })),
+        )
+        .into_any_element()
+}
+
+/// A row of the menu fading out: as it was, without the click.
+fn render_leaving_row(editor: &mut Editor, index: usize, cx: &mut Context<Editor>) -> AnyElement {
+    let ui = Theme::ui(cx);
+    let ghost = editor
+        .completion
+        .as_ref()
+        .and_then(|menu| menu.leaving.as_ref())
+        .map(|leaving| &leaving.value);
+    let Some((ghost, m)) = ghost.and_then(|ghost| Some((ghost, ghost.matches.get(index)?))) else {
+        return div().into_any_element();
+    };
+    let row = row(
+        &ghost.list.items[m.item],
+        m,
+        index,
+        index == ghost.selected,
+        ui,
+    );
+    div()
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .child(row)
+        .into_any_element()
+}
+
+/// A row: the kind's badge, the label with the matched characters, its detail and description.
+fn row(item: &Item, m: &Match, index: usize, selected: bool, ui: UiColors) -> Stateful<Div> {
     let (letter, color) = kind_style(item.lsp.kind, ui);
     let deprecated = item.deprecated();
     let inline_detail = item
@@ -1370,57 +1661,44 @@ fn render_row(editor: &mut Editor, index: usize, cx: &mut Context<Editor>) -> An
     let description = item.description();
     let label = label_text(&item.lsp.label, &m.positions, ui);
     div()
-        .w_full()
-        .h(px(ROW_HEIGHT))
+        .id(index)
+        .size_full()
+        .px(px(ROW_PADDING))
+        .flex()
+        .items_center()
+        .gap(px(KIND_GAP))
+        .overflow_hidden()
+        .rounded(px(RADIUS_SM))
+        .cursor_pointer()
+        .when(selected, |row| row.bg(ui.list_selected))
+        .when(!selected, |row| row.hover(|style| style.bg(ui.hover)))
+        .child(kind_badge(letter, color))
         .child(
             div()
-                .id(index)
-                .size_full()
-                .px(px(ROW_PADDING))
+                .flex_none()
                 .flex()
-                .items_center()
-                .gap(px(KIND_GAP))
+                .items_baseline()
+                .whitespace_nowrap()
+                .font_family(theme::code_font())
+                .text_color(if deprecated { ui.dim } else { ui.foreground })
+                .when(deprecated, |label| label.line_through())
+                .child(label)
+                .children(inline_detail.map(|detail| div().text_color(ui.dim).child(detail))),
+        )
+        // Right-aligned; a description too long is cut at its end, not at its start.
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
                 .overflow_hidden()
-                .rounded(px(RADIUS_SM))
-                .cursor_pointer()
-                .when(selected, |row| row.bg(ui.list_selected))
-                .when(!selected, |row| row.hover(|style| style.bg(ui.hover)))
-                .on_click(cx.listener(move |editor, _: &ClickEvent, window, cx| {
-                    if let Some(session) = session_mut(editor) {
-                        session.selected = index;
-                    }
-                    confirm(editor, Mode::Insert, window, cx)
-                }))
-                .child(kind_badge(letter, color))
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .items_baseline()
-                        .whitespace_nowrap()
-                        .font_family(theme::code_font())
-                        .text_color(if deprecated { ui.dim } else { ui.foreground })
-                        .when(deprecated, |label| label.line_through())
-                        .child(label)
-                        .children(
-                            inline_detail.map(|detail| div().text_color(ui.dim).child(detail)),
-                        ),
-                )
-                // Right-aligned; a description too long is cut at its end, not at its start.
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .overflow_hidden()
-                        .text_size(px(theme::TEXT_SM))
-                        .text_color(ui.dim)
-                        .children(description.map(|text| {
-                            div().ml_auto().flex_none().whitespace_nowrap().child(text)
-                        })),
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.dim)
+                .children(
+                    description
+                        .map(|text| div().ml_auto().flex_none().whitespace_nowrap().child(text)),
                 ),
         )
-        .into_any_element()
 }
 
 /// The label with the matched characters highlighted.

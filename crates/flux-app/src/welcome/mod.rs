@@ -25,7 +25,7 @@ mod tour;
 mod whats_new;
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui::{
     Action, AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, BoxShadow, ClickEvent,
@@ -36,6 +36,7 @@ use gpui::{
 
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
+use crate::motion::{self, TransitionExt as _};
 use crate::notifications::Notification;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
@@ -87,9 +88,6 @@ pub const HEIGHT: f32 = 660.;
 pub const BAR_HEIGHT: f32 = 56.;
 /// The window keeps this far from the edges of the screen's free part (the menu bar, the Dock).
 const SCREEN_MARGIN: f32 = 16.;
-/// A slide comes in this far from the side it comes from, fading in, over this long.
-const SLIDE_SHIFT: f32 = 24.;
-const TRANSITION: Duration = Duration::from_millis(200);
 /// On the first launch with a project, the guide waits for the project's window to draw (as
 /// JetBrains IDEs wait before their tour).
 const GUIDE_DELAY: Duration = Duration::from_millis(1000);
@@ -459,38 +457,24 @@ fn window_size(scale: f32, room: Size<Pixels>) -> Size<Pixels> {
     )
 }
 
-/// How long a slide takes to come in. A scenario slows it down to catch the middle in a shot
-/// (`FLUX_SCENARIO_TRANSITION_MS`).
-fn transition_time() -> Duration {
-    #[cfg(feature = "scenario")]
-    if let Some(ms) = std::env::var("FLUX_SCENARIO_TRANSITION_MS")
-        .ok()
-        .and_then(|ms| ms.parse().ok())
-    {
-        return Duration::from_millis(ms);
-    }
-    TRANSITION
-}
-
-/// "Reduce motion" is on in the system's accessibility settings: the guide's transitions and the
-/// pictures' shows jump to their end instead of moving.
+/// Animations are off — the system's "Reduce motion" or Flux's own setting (`crate::motion`): the
+/// guide's transitions and the pictures' shows jump to their end instead of moving.
 pub fn reduce_motion() -> bool {
-    #[cfg(target_os = "macos")]
-    return appkit::reduce_motion();
-    #[cfg(not(target_os = "macos"))]
-    false
+    !crate::motion::enabled()
 }
 
 pub struct WelcomeGuide {
     focus_handle: FocusHandle,
     pub(crate) mode: Mode,
     pub(crate) slide: Slide,
-    /// When the slide last changed: the transition runs from then.
-    pub(crate) changed_at: Instant,
     /// The side the slide came in from: 1 — the right (forward), -1 — the left (back).
     direction: f32,
-    /// The current slide moves in (no "Reduce motion" when it came).
+    /// The current slide came in from the side (`motion::Appear`); the one the window opened on
+    /// is simply there.
     moving: bool,
+    /// The slide that was shown before: it fades out where it was, taking no input, as the new
+    /// one comes in.
+    leaving: Option<motion::Leaving<Slide>>,
     /// The Languages slide: the catalog's languages, the chosen ones, their installs.
     pub(crate) languages: Entity<languages::LanguagesStep>,
     /// The Claude Code slide: the command line tool, the sign-in.
@@ -536,9 +520,9 @@ impl WelcomeGuide {
             focus_handle,
             mode: Mode::Guide,
             slide: Slide::Welcome,
-            changed_at: Instant::now(),
             direction: 1.,
             moving: false,
+            leaving: None,
             languages,
             claude,
             tasks: tour::Tasks::default(),
@@ -552,6 +536,9 @@ impl WelcomeGuide {
             _subscriptions: subscriptions,
         };
         guide.go(start, window, cx);
+        // The first slide is there with the window.
+        guide.moving = false;
+        guide.leaving = None;
         guide
     }
 
@@ -559,15 +546,20 @@ impl WelcomeGuide {
     pub fn go(&mut self, start: Start, window: &mut Window, cx: &mut Context<Self>) {
         match start {
             Start::Slide(slide) => {
+                let from_notes = self.mode == Mode::WhatsNew;
                 self.mode = Mode::Guide;
                 self.reference = false;
                 self.show(slide, window, cx);
+                if from_notes {
+                    // What showed was the notes, not a slide: nothing to fade out.
+                    self.leaving = None;
+                }
             }
             Start::WhatsNew => {
                 self.mode = Mode::WhatsNew;
                 self.notes = whats_new::Notes::current();
-                self.changed_at = Instant::now();
                 self.moving = false;
+                self.leaving = None;
                 window.focus(&self.focus_handle);
                 cx.notify();
             }
@@ -585,9 +577,9 @@ impl WelcomeGuide {
             } else {
                 -1.
             };
-            self.slide = slide;
-            self.changed_at = Instant::now();
             self.moving = !reduce_motion();
+            self.leaving = self.moving.then(|| motion::Leaving::new(self.slide));
+            self.slide = slide;
         }
         if let Slide::Tour(tour) = slide {
             self.tasks.shown(tour);
@@ -690,15 +682,6 @@ impl WelcomeGuide {
         }
     }
 
-    /// How far the current slide's transition is: 0 — it starts, 1 — in place (eased out).
-    fn transition(&self) -> f32 {
-        if !self.moving {
-            return 1.;
-        }
-        let t = self.changed_at.elapsed().as_secs_f32() / transition_time().as_secs_f32();
-        if t >= 1. { 1. } else { 1. - (1. - t).powi(3) }
-    }
-
     /// The interface scale changed while the guide is open: the window takes the guide's size at
     /// the new scale (within the screen), around the same middle.
     fn follow_scale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -739,12 +722,17 @@ impl WelcomeGuide {
         }
     }
 
-    /// The slide's content.
-    fn render_slide(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The content of `slide` (What's New in its mode).
+    fn render_slide(
+        &mut self,
+        slide: Slide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         if self.mode == Mode::WhatsNew {
             return whats_new::render(self, window, cx);
         }
-        match self.slide {
+        match slide {
             Slide::Welcome => intro::render(self, window, cx),
             Slide::Appearance => appearance::render(self, window, cx),
             Slide::Languages => self.languages.clone().into_any_element(),
@@ -788,6 +776,12 @@ impl WelcomeGuide {
                     .filter(|(_, slide)| slide.chapter() == chapter)
                     .map(|(index, slide)| {
                         let on = index == current;
+                        let rest = if index < current {
+                            UiColors::tint(ui.accent, 0.55)
+                        } else {
+                            UiColors::tint(ui.text_muted, 0.35)
+                        };
+                        let accent = ui.accent;
                         // A dot's own room is larger than the dot: easy to hit.
                         div()
                             .id(SharedString::from(format!("welcome-dot-{}", slide.id())))
@@ -800,20 +794,23 @@ impl WelcomeGuide {
                             .child(
                                 div()
                                     .h(px(7.))
-                                    .w(px(if on { 22. } else { 7. }))
                                     .rounded(px(4.))
-                                    .bg(if on {
-                                        ui.accent
-                                    } else if index < current {
-                                        UiColors::tint(ui.accent, 0.55)
-                                    } else {
-                                        UiColors::tint(ui.text_muted, 0.35)
-                                    })
                                     .when(!on, |dot| {
                                         dot.group_hover("welcome-dot", move |style| {
                                             style.bg(UiColors::tint(ui.accent, 0.8))
                                         })
-                                    }),
+                                    })
+                                    // The current slide's dot is long and bright: the next
+                                    // one grows as this one shrinks back.
+                                    .with_transition(
+                                        "welcome-dot-pill",
+                                        if on { 1. } else { 0. },
+                                        motion::SMOOTH,
+                                        move |dot, on| {
+                                            dot.w(px(motion::lerp(7., 22., on)))
+                                                .bg(motion::mix(rest, accent, on))
+                                        },
+                                    ),
                             )
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                 this.show(slide, window, cx)
@@ -938,11 +935,10 @@ impl Render for WelcomeGuide {
         let flat = style == crate::settings::UiStyle::Flat;
         self.follow_scale(window, cx);
         self.follow_title(window);
-        let transition = self.transition();
-        if transition < 1. || self.tasks.animating() {
+        if self.tasks.animating() {
             window.request_animation_frame();
         }
-        let content = self.render_slide(window, cx);
+        let content = self.render_slide(self.slide, window, cx);
         let gap = ui::island_gap(style);
         // A window the screen made smaller than the guide scrolls its slide instead of squeezing it.
         let bar = match self.mode {
@@ -951,19 +947,46 @@ impl Render for WelcomeGuide {
         };
         let room = window.viewport_size().height - px(ui::TITLE_BAR_HEIGHT) - px(bar);
         let height = room.max(px(HEIGHT - ui::TITLE_BAR_HEIGHT - bar));
+        // A slide comes in from the side it is on, fading in — keyed by the slide, it plays the
+        // first frame the slide shows. Painted only: the slide is laid out in its place, and takes
+        // the mouse there, from the start.
+        let page = div().relative().w_full().h(height).child(content);
+        let page = if self.moving {
+            let id = SharedString::from(format!("welcome-page-{}", self.slide.id()));
+            motion::Appear::slide(motion::SLIDE * self.direction, 0.).apply(id, page)
+        } else {
+            page.into_any_element()
+        };
+        // The slide that left fades out where it was, drifting the other way, taking no input.
+        if self.leaving.as_ref().is_some_and(motion::Leaving::done) {
+            self.leaving = None;
+        }
+        let left = self
+            .leaving
+            .as_ref()
+            .map(|leaving| (leaving.value, leaving.progress(window)));
+        let left = left.map(|(slide, progress)| {
+            let content = self.render_slide(slide, window, cx);
+            let page = div()
+                .id(SharedString::from(format!("welcome-left-{}", slide.id())))
+                .absolute()
+                .top_0()
+                .left_0()
+                .w_full()
+                .h(height)
+                .child(content);
+            let shift = -motion::SLIDE * self.direction * progress;
+            motion::inert(
+                motion::leaving_style(page, progress, (0.5, 0.5))
+                    .transform_translate(px(shift), px(0.)),
+            )
+        });
         let slide = div()
             .id("welcome-slide")
             .size_full()
             .overflow_y_scroll()
-            .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .h(height)
-                    .left(px((1. - transition) * SLIDE_SHIFT * self.direction))
-                    .opacity(transition)
-                    .child(content),
-            );
+            .children(left)
+            .child(page);
         let title = self.title();
         div()
             .key_context(CONTEXT)
@@ -1141,7 +1164,7 @@ pub fn ghost_button(
 mod appkit {
     use std::ffi::{CStr, c_char};
 
-    use objc::runtime::{BOOL, NO, Object, YES};
+    use objc::runtime::{Object, YES};
     use objc::{class, msg_send, sel, sel_impl};
 
     #[repr(C)]
@@ -1177,16 +1200,6 @@ mod appkit {
     unsafe impl objc::Encode for Rect {
         fn encode() -> objc::Encoding {
             unsafe { objc::Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
-        }
-    }
-
-    /// The system's accessibility setting "Reduce motion".
-    pub fn reduce_motion() -> bool {
-        // SAFETY: AppKit's shared workspace and a BOOL property, on the main thread.
-        unsafe {
-            let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let reduce: BOOL = msg_send![workspace, accessibilityDisplayShouldReduceMotion];
-            reduce != NO
         }
     }
 

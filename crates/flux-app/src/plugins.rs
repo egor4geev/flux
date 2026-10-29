@@ -2358,8 +2358,9 @@ pub(crate) fn handle_call(
                 id: *id,
                 question: question.clone(),
             };
-            if workspace.modal_open() {
-                // A dialog or a popup of the user's is open: the question waits for it.
+            if !workspace.can_ask_plugin_question() {
+                // A dialog or a popup of the user's is open: the question waits for it (over
+                // Settings it comes at once — the plugin's page asked).
                 workspace
                     .plugins
                     .update(cx, |store, _| store.queue_question(pending));
@@ -2446,7 +2447,7 @@ fn ask_text(
     cx: &mut Context<Workspace>,
 ) {
     let (sender, receiver) = oneshot::channel::<String>();
-    workspace.toggle_dialog(window, cx, move |window, cx| {
+    workspace.open_plugin_dialog(window, cx, move |window, cx| {
         let placeholder = question.placeholder.clone().unwrap_or_default();
         let mut dialog = InputDialog::new(question.title.clone(), placeholder, window, cx)
             .text(&question.text, cx)
@@ -2471,13 +2472,14 @@ fn ask_text(
     .detach();
 }
 
-/// The overlay window closed: a plugin's question that waited for it is asked now.
+/// The overlay window (or the dialog over Settings) closed: a plugin's question that waited for
+/// it is asked now.
 pub(crate) fn ask_pending(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if workspace.modal_open() || !workspace.plugins.read(cx).has_pending_question() {
+    if !workspace.can_ask_plugin_question() || !workspace.plugins.read(cx).has_pending_question() {
         return;
     }
     let pending = workspace
@@ -2760,10 +2762,16 @@ pub(crate) fn status_bar_items(workspace: &Workspace, cx: &App) -> Option<AnyEle
         .iter()
         .map(|item| (item.plugin.clone(), item.id.clone()))
         .collect();
-    let items = items.iter().enumerate().map(|(index, item)| {
+    let items = items.iter().map(|item| {
         let command = item.command.clone();
-        div()
-            .id(("plugin-status", index))
+        // Keyed by the plugin and the item: an item coming fades in, its neighbours stay as they
+        // are (`crate::motion`).
+        let key = gpui::ElementId::NamedChild(
+            Box::new(gpui::ElementId::Name(item.plugin.clone())),
+            item.id.clone(),
+        );
+        let element = div()
+            .id(key.clone())
             .flex_none()
             .h(px(20.))
             .px_1()
@@ -2782,7 +2790,11 @@ pub(crate) fn status_bar_items(workspace: &Workspace, cx: &App) -> Option<AnyEle
                         window.dispatch_action(Box::new(command.clone()), cx)
                     })
             })
-            .child(item.text.clone())
+            .child(item.text.clone());
+        crate::motion::Appear::fade().apply(
+            gpui::ElementId::NamedChild(Box::new(key), "appear".into()),
+            element,
+        )
     });
     Some(
         div()

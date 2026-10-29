@@ -914,11 +914,15 @@ struct DraggedRow {
 impl Render for DraggedRow {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        ui::popover(ui)
-            .px_2()
-            .py_1()
-            .text_size(px(theme::TEXT_SM))
-            .child(self.label.clone())
+        // Lifted, it pops out of the row under the pointer (its top left corner).
+        crate::motion::Appear::pop((0., 0.)).apply(
+            ("rebase-drag", self.index),
+            ui::popover(ui)
+                .px_2()
+                .py_1()
+                .text_size(px(theme::TEXT_SM))
+                .child(self.label.clone()),
+        )
     }
 }
 
@@ -1372,45 +1376,45 @@ impl RebaseDialog {
         let preview = (!editable && self.selected.len() == 1)
             .then(|| self.rows.get(self.cursor).map(|row| row.full.clone()))
             .flatten();
+        let field = div()
+            .id("rebase-message")
+            // Esc in the field (with nothing selected in it) goes back to the list.
+            .on_action(cx.listener(|this, _: &crate::editor::Cancel, window, _| {
+                window.focus(&this.list_focus)
+            }))
+            .h(px(MESSAGE_HEIGHT))
+            .rounded(px(RADIUS_MD))
+            .border_1();
+        let field = if editable {
+            // The ring comes and goes with the focus.
+            ui::focus_field(
+                field
+                    .pl_1()
+                    .pt_1()
+                    .bg(ui.input_background)
+                    .child(self.message.clone()),
+                "rebase-message-ring",
+                focused,
+                ui,
+            )
+            .into_any_element()
+        } else {
+            field
+                .p_2()
+                .border_color(ui.divider)
+                .overflow_y_scroll()
+                .font_family(theme::code_font())
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.text_muted)
+                .children(preview)
+                .into_any_element()
+        };
         div()
             .flex()
             .flex_col()
             .gap_1()
             .child(ui::section_label(caption, ui))
-            .child(
-                div()
-                    .id("rebase-message")
-                    // Esc in the field (with nothing selected in it) goes back to the list.
-                    .on_action(cx.listener(|this, _: &crate::editor::Cancel, window, _| {
-                        window.focus(&this.list_focus)
-                    }))
-                    .h(px(MESSAGE_HEIGHT))
-                    .rounded(px(RADIUS_MD))
-                    .border_1()
-                    .when(editable, |field| {
-                        field
-                            .pl_1()
-                            .pt_1()
-                            .bg(ui.input_background)
-                            .border_color(if focused {
-                                ui.focus_border
-                            } else {
-                                ui.input_border
-                            })
-                            .when(focused, |field| field.shadow(ui::focus_ring(ui)))
-                            .child(self.message.clone())
-                    })
-                    .when(!editable, |field| {
-                        field
-                            .p_2()
-                            .border_color(ui.divider)
-                            .overflow_y_scroll()
-                            .font_family(theme::code_font())
-                            .text_size(px(theme::TEXT_SM))
-                            .text_color(ui.text_muted)
-                            .children(preview)
-                    }),
-            )
+            .child(field)
     }
 }
 
@@ -1688,7 +1692,7 @@ impl Render for MessageDialog {
                             .child(self.subtitle.clone()),
                     ),
             )
-            .child(
+            .child(ui::focus_field(
                 div()
                     .h(px(MESSAGE_DIALOG_HEIGHT))
                     .pl_1()
@@ -1696,14 +1700,11 @@ impl Render for MessageDialog {
                     .rounded(px(RADIUS_MD))
                     .bg(ui.input_background)
                     .border_1()
-                    .border_color(if focused {
-                        ui.focus_border
-                    } else {
-                        ui.input_border
-                    })
-                    .when(focused, |field| field.shadow(ui::focus_ring(ui)))
                     .child(self.message.clone()),
-            )
+                "message-dialog-ring",
+                focused,
+                ui,
+            ))
             .child(
                 div()
                     .flex()
