@@ -13,7 +13,8 @@
 //! tooltip ([`crate::plugin_links`]).
 
 use std::ops::Range;
-use std::time::Duration;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use flux_core::Selection;
 use flux_core::movement;
@@ -35,6 +36,7 @@ use crate::editor::Editor;
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
 use crate::markdown::{self, Block, CodeBlock};
+use crate::motion;
 use crate::plugin_links;
 use crate::popup::{self, POPUP_GAP, Side, WINDOW_MARGIN};
 use crate::theme::{self, Theme, UiColors};
@@ -79,6 +81,10 @@ pub struct HoverState {
     link: Option<Range<usize>>,
     /// The plugin's link `link` is (part 10.3).
     plugin_link: Option<plugin_links::Link>,
+    /// What the popup drawn last showed, while it shows the same.
+    content: Option<Rc<Content>>,
+    /// The popup closing, and moving to another place (F2 / ⇧F2).
+    motion: crate::git_gutter::PopupMotion<Shown>,
 }
 
 struct Pending {
@@ -107,6 +113,17 @@ struct Popup {
     link_blocks: Vec<Block>,
     /// The link's plugin hasn't answered yet.
     link_waiting: bool,
+    /// When the documentation and the link's tooltip came, if the popup was showing something
+    /// already: they fade in.
+    blocks_since: Option<Instant>,
+    link_since: Option<Instant>,
+}
+
+impl Popup {
+    /// The popup shows something: what comes now is added to it.
+    fn has_content(&self) -> bool {
+        !self.blocks.is_empty() || !self.diagnostics.is_empty() || !self.link_blocks.is_empty()
+    }
 }
 
 /// From `Editor::text_changed`: an edit hides everything and cancels the waiting.
@@ -117,6 +134,8 @@ pub fn text_changed(editor: &mut Editor) {
     hover.hide_task = None;
     hover.link = None;
     hover.plugin_link = None;
+    // Gone at once: what was typed is where it stood.
+    hover.motion = Default::default();
 }
 
 /// From `Editor::on_mouse_move`: a pause over a symbol shows its popup; leaving the symbol of the
@@ -260,6 +279,8 @@ pub fn show_problem(editor: &mut Editor, position: usize, cx: &mut Context<Edito
         request: None,
         link_blocks: Vec::new(),
         link_waiting: false,
+        blocks_since: None,
+        link_since: None,
     });
     cx.notify();
 }
@@ -301,6 +322,8 @@ fn show(
         request,
         link_blocks: Vec::new(),
         link_waiting,
+        blocks_since: None,
+        link_since: None,
     });
     hover.hide_task = None;
     hover.over_popup = false;
@@ -370,6 +393,9 @@ fn received(
         return;
     };
     popup.request = None;
+    if !blocks.is_empty() && popup.has_content() && motion::enabled() {
+        popup.blocks_since = Some(Instant::now());
+    }
     popup.blocks = blocks;
     // The server knows the symbol better than our word boundaries (`r#type`, `a::b`); a plugin's
     // link keeps its own.
@@ -426,9 +452,13 @@ fn link_received(
         return;
     };
     popup.link_waiting = false;
+    let shown = popup.has_content();
     popup.link_blocks = markdown
         .map(|text| markdown::parse(&text))
         .unwrap_or_default();
+    if !popup.link_blocks.is_empty() && shown && motion::enabled() {
+        popup.link_since = Some(Instant::now());
+    }
     if popup.link_blocks.is_empty()
         && popup.blocks.is_empty()
         && popup.diagnostics.is_empty()
@@ -656,18 +686,41 @@ fn is_visible(editor: &Editor, window: &Window) -> bool {
 
 /// The link under the mouse, and the popup above the symbol's line (below it when there is no
 /// room above).
-pub fn render(editor: &Editor, window: &mut Window, cx: &mut Context<Editor>) -> Vec<AnyElement> {
+pub fn render(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> Vec<AnyElement> {
     let link = render_link(editor, window, cx);
     link.into_iter()
         .chain(render_popup(editor, window, cx))
         .collect()
 }
 
-fn render_popup(
-    editor: &Editor,
-    window: &mut Window,
-    cx: &mut Context<Editor>,
-) -> Option<AnyElement> {
+/// What a popup shows, kept for its exit: drawn again from it while it fades out.
+struct Content {
+    /// The popup's id, and how many blocks of each kind it had: another — the content changed.
+    key: (usize, usize, usize, usize),
+    link_blocks: Vec<Block>,
+    diagnostics: Vec<Diagnostic>,
+    blocks: Vec<Block>,
+    /// When the documentation and the link's tooltip came into a popup already showing something:
+    /// they fade in ([`motion::FADE`]).
+    blocks_since: Option<Instant>,
+    link_since: Option<Instant>,
+}
+
+/// The popup as drawn: its content and its place.
+#[derive(Clone)]
+struct Shown {
+    content: Rc<Content>,
+    corner: Corner,
+    position: Point<Pixels>,
+    max_height: Pixels,
+}
+
+/// The popup to draw this frame, if it is visible, and its y in the document (the scroll added).
+fn shown_popup(editor: &mut Editor, window: &Window) -> Option<(Shown, f32)> {
     if !is_visible(editor, window) {
         return None;
     }
@@ -676,9 +729,6 @@ fn render_popup(
     if editor.autoscroll.is_some() {
         window.request_animation_frame();
     }
-    let actions = problem_actions(editor, popup, cx);
-    let theme = Theme::get(cx);
-    let ui = theme.ui;
     let (above, below) = popup::space(&anchor, window.viewport_size().height);
     let side = if above >= px(MIN_ROOM_ABOVE) || above > below {
         Side::Above
@@ -689,11 +739,161 @@ fn render_popup(
         Side::Above => above,
         Side::Below => below,
     };
+    let x = anchor.x - px(TEXT_INSET);
+    let (corner, y) = match side {
+        Side::Below => (Corner::TopLeft, anchor.line_bottom + px(POPUP_GAP)),
+        Side::Above => (Corner::BottomLeft, anchor.line_top - px(POPUP_GAP)),
+    };
+    let key = (
+        popup.id,
+        popup.link_blocks.len(),
+        popup.diagnostics.len(),
+        popup.blocks.len(),
+    );
+    let content = match &editor.hover.content {
+        Some(content) if content.key == key => content.clone(),
+        _ => Rc::new(Content {
+            key,
+            link_blocks: popup.link_blocks.clone(),
+            diagnostics: popup.diagnostics.clone(),
+            blocks: popup.blocks.clone(),
+            blocks_since: popup.blocks_since,
+            link_since: popup.link_since,
+        }),
+    };
+    editor.hover.content = Some(content.clone());
+    let document_y = f32::from(anchor.line_top) + editor.scroll.y;
+    let shown = Shown {
+        content,
+        corner,
+        position: point(x, y),
+        max_height: room.min(px(MAX_HEIGHT)),
+    };
+    Some((shown, document_y))
+}
 
+/// The popup, and the one that closed fading out. It grows out of its symbol: from its bottom left
+/// corner above the line, its top left below; the server's answer filling it later keeps the same
+/// popup — the new part fades in as the popup's height glides to it. F2 / ⇧F2 glide it to the next
+/// problem, its content crossfading. Closed, it fades out (an edit hides it at once).
+fn render_popup(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> Vec<AnyElement> {
+    let open = shown_popup(editor, window);
+    if open.is_none() {
+        editor.hover.content = None;
+    }
+    let leaving = editor.hover.motion.frame(
+        open.as_ref().map(|(shown, y)| (shown, *y)),
+        |a, b| a.content.key.0 == b.content.key.0,
+        window,
+    );
+    let mut elements = Vec::new();
+    if let Some((shown, progress)) = leaving {
+        let panel = panel(editor, &shown, None, window, cx);
+        let panel = motion::inert(motion::leaving_from(panel, progress, shown.position));
+        // Its own ids: the next popup may be open beside it.
+        elements.push(overlay(
+            shown.corner,
+            shown.position,
+            div().id("hover-leaving").child(panel),
+        ));
+    }
+    if let Some((shown, _)) = open {
+        let fade = editor.hover.motion.content(window);
+        let offset = editor.hover.motion.offset(window);
+        let position = point(shown.position.x, shown.position.y + px(offset));
+        let panel = panel(editor, &shown, Some(fade), window, cx);
+        let panel = motion::Appear::pop((0., 0.)).apply_from("hover-pop", position, panel);
+        elements.push(overlay(shown.corner, position, panel));
+    }
+    elements
+}
+
+/// A popup over the window at `position`, kept inside it.
+fn overlay(corner: Corner, position: Point<Pixels>, panel: impl IntoElement) -> AnyElement {
+    deferred(
+        anchored()
+            .anchor(corner)
+            .position(position)
+            .snap_to_window_with_margin(px(WINDOW_MARGIN))
+            .child(panel),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
+/// The popup's panel. `fade`: how far its content has faded in (taking another popup's place);
+/// `None` — a popup leaving, without the mouse watcher.
+fn panel(
+    editor: &Editor,
+    shown: &Shown,
+    fade: Option<f32>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> Div {
+    let content = &shown.content;
+    let id = content.key.0;
+    let actions = problem_actions(editor, id, &content.diagnostics, cx);
+    let theme = Theme::get(cx);
+    let ui = theme.ui;
+    // A part that came later fades in.
+    let arriving = |since: Option<Instant>, element: AnyElement| match since {
+        Some(since) if motion::running(since, motion::FADE) => div()
+            .opacity(motion::animate(since, motion::FADE, window))
+            .child(element)
+            .into_any_element(),
+        _ => element,
+    };
+    let link = (!content.link_blocks.is_empty()).then(|| {
+        arriving(
+            content.link_since,
+            markdown::render(&content.link_blocks, ui.foreground, theme).into_any_element(),
+        )
+    });
+    let blocks = (!content.blocks.is_empty()).then(|| {
+        arriving(
+            content.blocks_since,
+            markdown::render(&content.blocks, ui.foreground, theme).into_any_element(),
+        )
+    });
+    let body = div()
+        .id(("hover", id))
+        .max_w(px(MAX_WIDTH))
+        .max_h(shown.max_height)
+        .overflow_y_scroll()
+        .p_3()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .when_some(fade, |body, fade| body.opacity(fade))
+        .when_some(link, |body, link| {
+            body.child(link).when(
+                !content.diagnostics.is_empty() || !content.blocks.is_empty(),
+                |body| body.child(ui::divider(ui)),
+            )
+        })
+        .children(content.diagnostics.iter().map(|d| diagnostic_row(d, ui)))
+        .children(actions)
+        .when(
+            !content.diagnostics.is_empty() && !content.blocks.is_empty(),
+            |body| body.child(ui::divider(ui)),
+        )
+        .children(blocks);
+    let panel = popup::panel(ui)
+        .occlude()
+        .child(motion::glide_height("hover-height", body));
+    if fade.is_none() {
+        return panel;
+    }
     // The mouse is watched over the whole window while the popup is shown: leaving the text and
     // the popup hides it, even if the mouse never moves over the text again.
     let editor_entity = cx.entity();
-    let text_bounds = editor.layout.as_ref()?.text_bounds;
+    let Some(text_bounds) = editor.layout.as_ref().map(|layout| layout.text_bounds) else {
+        return panel;
+    };
     let watcher = canvas(
         |_, _, _| {},
         move |bounds, (), window, _| {
@@ -711,72 +911,26 @@ fn render_popup(
     )
     .absolute()
     .inset_0();
-
-    let content = div()
-        .id(("hover", popup.id))
-        .max_w(px(MAX_WIDTH))
-        .max_h(room.min(px(MAX_HEIGHT)))
-        .overflow_y_scroll()
-        .p_3()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .when(!popup.link_blocks.is_empty(), |content| {
-            content
-                .child(markdown::render(&popup.link_blocks, ui.foreground, theme))
-                .when(
-                    !popup.diagnostics.is_empty() || !popup.blocks.is_empty(),
-                    |content| content.child(ui::divider(ui)),
-                )
-        })
-        .children(popup.diagnostics.iter().map(|d| diagnostic_row(d, ui)))
-        .children(actions)
-        .when(
-            !popup.diagnostics.is_empty() && !popup.blocks.is_empty(),
-            |content| content.child(ui::divider(ui)),
-        )
-        .when(!popup.blocks.is_empty(), |content| {
-            content.child(markdown::render(&popup.blocks, ui.foreground, theme))
-        });
-    let panel = popup::panel(ui).occlude().child(content).child(watcher);
-    let x = anchor.x - px(TEXT_INSET);
-    let (corner, y) = match side {
-        Side::Below => (Corner::TopLeft, anchor.line_bottom + px(POPUP_GAP)),
-        Side::Above => (Corner::BottomLeft, anchor.line_top - px(POPUP_GAP)),
-    };
-    // It grows out of its symbol: from its bottom left corner above the line, its top left below.
-    // The server's answer filling it later keeps the same popup, so it doesn't pop again.
-    let panel = crate::motion::Appear::pop((0., 0.)).apply_from(
-        ("hover-pop", popup.id),
-        point(x, y),
-        panel,
-    );
-    Some(
-        deferred(
-            anchored()
-                .anchor(corner)
-                .position(point(x, y))
-                .snap_to_window_with_margin(px(WINDOW_MARGIN))
-                .child(panel),
-        )
-        .with_priority(1)
-        .into_any_element(),
-    )
+    panel.child(watcher)
 }
 
 /// Under the problems: "Fix with Claude" (while Claude Code is on and the document is a file) and
 /// "More actions… ⌥↵" — the context actions at the problem (the caret goes there first).
-fn problem_actions(editor: &Editor, popup: &Popup, cx: &mut Context<Editor>) -> Option<AnyElement> {
-    let problems: Vec<&Diagnostic> = popup
-        .diagnostics
+fn problem_actions(
+    editor: &Editor,
+    id: usize,
+    diagnostics: &[Diagnostic],
+    cx: &mut Context<Editor>,
+) -> Option<AnyElement> {
+    let problems: Vec<&Diagnostic> = diagnostics
         .iter()
         .filter(|d| d.severity != Severity::Hint)
         .collect();
     let first = problems.first()?;
     let ui = Theme::ui(cx);
-    let link = |id: &'static str| {
+    let link = |name: &'static str| {
         div()
-            .id((id, popup.id))
+            .id((name, id))
             .flex()
             .items_center()
             .gap_1()

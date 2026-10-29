@@ -12,6 +12,7 @@
 //! frame: the caret, the mouse, the selection and ↑/↓ use it, and the tests check it without gpui.
 
 use std::ops::Range as Utf16Range;
+use std::time::Instant;
 
 use flux_core::movement::{self, Direction};
 use flux_core::{Document, EditKind, Range, Rope, Selection, Transaction, edit};
@@ -25,6 +26,7 @@ use gpui::{
     size,
 };
 
+use crate::motion;
 use crate::theme::{self, Theme};
 
 /// The message's font size and line height (the interface font).
@@ -165,6 +167,12 @@ pub struct PromptInput {
     selecting: bool,
     /// The parent shows a list for the text at the caret: ↑ ↓ ↵ ⇥ Esc drive it.
     menu_open: bool,
+    /// A change made for the user — the message sent, one from the history, a paste — glides the
+    /// field's height to its new number of rows ([`motion::SMOOTH`]): the height it starts from,
+    /// and since when. Typing changes the height at once.
+    height_glide: Option<(Pixels, Instant)>,
+    /// The height drawn last: where a glide starts from.
+    drawn_height: Pixels,
 }
 
 struct PromptLayout {
@@ -190,6 +198,8 @@ impl PromptInput {
             layout: None,
             selecting: false,
             menu_open: false,
+            height_glide: None,
+            drawn_height: px(0.),
         }
     }
 
@@ -223,11 +233,19 @@ impl PromptInput {
         !self.document.selection().primary().is_empty()
     }
 
-    /// Replaces the entire text (as one edit that can be undone), caret at the end.
+    /// Replaces the entire text (as one edit that can be undone), caret at the end. The field's
+    /// height glides to the new text (a message sent, one from the history).
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = normalize(text);
         let len = self.document.text().len_chars();
+        self.glide_height();
         self.replace(0..len, &text, cx);
+    }
+
+    /// The next change of the text glides the field's height from the height drawn last.
+    fn glide_height(&mut self) {
+        self.height_glide = (motion::enabled() && self.drawn_height > px(0.))
+            .then(|| (self.drawn_height, Instant::now()));
     }
 
     /// Replaces the characters of `range` with `text`, caret after it: a mention or a command
@@ -388,6 +406,7 @@ impl PromptInput {
         };
         if let Some(text) = item.text() {
             let text = normalize(&text);
+            self.glide_height();
             return self.edit(EditKind::Other, cx, |rope, sel| {
                 edit::insert_text(rope, sel, &text)
             });
@@ -1060,6 +1079,12 @@ fn count_rows(text: &Rope, wrap_width: Pixels, window: &mut Window) -> usize {
 
 // --- The element ---
 
+/// The field's height `since` a glide started from `from` toward `to` ([`motion::SMOOTH`]).
+fn glided(from: Pixels, to: Pixels, since: Instant) -> Pixels {
+    let (t, done) = motion::SMOOTH.at(since.elapsed());
+    if done { to } else { from + (to - from) * t }
+}
+
 /// The field's text (or placeholder), selection and caret.
 struct PromptElement {
     input: Entity<PromptInput>,
@@ -1110,17 +1135,22 @@ impl Element for PromptElement {
                 AvailableSpace::Definite(width) => Some(width),
                 _ => None,
             });
-            let (text, max_rows) = {
+            let (text, max_rows, glide) = {
                 let input = input.read(cx);
-                (input.document.text().clone(), input.max_rows)
+                (
+                    input.document.text().clone(),
+                    input.max_rows,
+                    input.height_glide,
+                )
             };
             let rows = match width {
                 Some(width) => count_rows(&text, width - px(CURSOR_WIDTH), window),
                 None => text.len_lines(),
             };
+            let height = px(LINE_HEIGHT) * rows.clamp(1, max_rows) as f32;
             Size {
                 width: width.unwrap_or(px(0.)),
-                height: px(LINE_HEIGHT) * rows.clamp(1, max_rows) as f32,
+                height: glide.map_or(height, |(from, since)| glided(from, height, since)),
             }
         });
         (layout, ())
@@ -1206,10 +1236,23 @@ impl Element for PromptElement {
                 ui.cursor,
             )
         });
-        self.input.update(cx, |input, _| {
+        let gliding = self.input.update(cx, |input, _| {
             input.scroll_y = scroll_y;
             input.autoscroll = false;
+            input.drawn_height = bounds.size.height;
+            // The glide is over, or the rows didn't change: no more frames.
+            let rest = geometry
+                .height()
+                .clamp(line_height, line_height * input.max_rows as f32);
+            input.height_glide.take_if(|(_, since)| {
+                (bounds.size.height - rest).abs() < px(0.5)
+                    || !motion::running(*since, motion::SMOOTH)
+            });
+            input.height_glide.is_some()
         });
+        if gliding {
+            window.request_animation_frame();
+        }
         PromptPrepaint {
             lines,
             geometry,

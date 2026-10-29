@@ -14,8 +14,12 @@
 //!   workspace edit ([`apply_edit`]: open documents through their editors, other files on disk,
 //!   files created, renamed and deleted in order); then the command (`workspace/executeCommand`) —
 //!   during which the server may send its own edits (`workspace/applyEdit`, [`apply_server_edit`]).
+//! - Motion: Claude's rows are there at once, the servers' come later — they fade in where they
+//!   go, the popup's height glides to them, and an action the user has moved to stays highlighted
+//!   as rows come in above it.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use flux_lsp::edit::FileChange;
 use flux_lsp::lsp_types::notification::DidChangeWatchedFiles;
@@ -37,6 +41,7 @@ use crate::diagnostics::{Diagnostic, Severity};
 use crate::editor::Editor;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::motion;
 use crate::navigation::canonical;
 use crate::notification_center::NotificationGroup;
 use crate::notifications::Notification;
@@ -65,6 +70,8 @@ const MAX_WIDTH: f32 = 560.;
 const MAX_VISIBLE_ROWS: usize = 14;
 /// Inset of the rows from the popup edge, as the context menu's.
 const PADDING: f32 = 5.;
+/// The line between Claude's rows and the servers': 1 px and its margins (`my_1`).
+const DIVIDER_HEIGHT: f32 = 9.;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new(
@@ -159,6 +166,9 @@ struct Row {
     /// Offered but not applicable here, and why.
     disabled: Option<SharedString>,
     action: RowAction,
+    /// When the row came with a server's answer, the popup already open: it fades in
+    /// ([`motion::FADE`]). `None` for the rows there from the start.
+    arrived: Option<Instant>,
 }
 
 /// The rows of one server's answer, in its order.
@@ -187,19 +197,29 @@ fn rows_of(server: &LanguageServer, items: Vec<CodeActionOrCommand>) -> Vec<Row>
                     server: server.clone(),
                     item: Box::new(item),
                 },
+                arrived: None,
             }
         })
         .collect()
 }
 
 /// Rows by group, the servers' order within a group (a stable sort); disabled ones after the
-/// enabled ones of their group.
-fn sort_rows(rows: &mut [Row]) {
-    rows.sort_by(|a, b| {
+/// enabled ones of their group. Returns where each row was: `order[new] == old`.
+fn sort_rows(rows: &mut Vec<Row>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&rows[a], &rows[b]);
         a.group
             .cmp(&b.group)
             .then_with(|| a.disabled.is_some().cmp(&b.disabled.is_some()))
     });
+    let mut taken: Vec<Option<Row>> = rows.drain(..).map(Some).collect();
+    rows.extend(
+        order
+            .iter()
+            .filter_map(|&old| taken.get_mut(old).and_then(Option::take)),
+    );
+    order
 }
 
 /// Speed search: the rows whose title has the query's characters in order (case-insensitive).
@@ -364,6 +384,7 @@ fn show(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
                 group: Group::Claude,
                 disabled: None,
                 action: RowAction::Dispatch(Box::new(crate::claude_actions::FixWithClaude)),
+                arrived: None,
             });
         }
         claude_rows.push(Row {
@@ -371,6 +392,7 @@ fn show(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
             group: Group::Claude,
             disabled: None,
             action: RowAction::Dispatch(Box::new(crate::claude_actions::ExplainWithClaude)),
+            arrived: None,
         });
     }
     let anchor = popup::caret_point(workspace, window, cx);
@@ -386,6 +408,8 @@ fn show(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
             waiting: waiting.map(SharedString::from),
             query: String::new(),
             selected: 0,
+            moved: false,
+            grown: None,
             _requests: Vec::new(),
         };
         for (server, response) in requests {
@@ -429,6 +453,12 @@ pub(crate) struct ContextActions {
     query: String,
     /// Among the rows the query lets through.
     selected: usize,
+    /// The user moved the highlight (↑↓): it stays on its action as answers come in. Until then
+    /// it is on the first row — the best fix, once the servers have answered.
+    moved: bool,
+    /// The height of the status line and the rows before the last answer changed it, and when:
+    /// the popup's height glides from there ([`motion::SMOOTH`]).
+    grown: Option<(f32, Instant)>,
     _requests: Vec<Task<()>>,
 }
 
@@ -441,16 +471,82 @@ impl Focusable for ContextActions {
 }
 
 impl ContextActions {
-    /// A server answered: its rows join, in their group; the selection stays on the first row
-    /// until the user moves it.
+    /// A server answered: its rows join, in their group, fading in; the popup's height glides to
+    /// them. The selection stays on the first row until the user moves it — then on its action,
+    /// wherever the new rows push it.
     fn add(&mut self, rows: Vec<Row>, cx: &mut Context<Self>) {
+        let height = self.shown_height();
+        let chosen = self
+            .moved
+            .then(|| self.visible().get(self.selected).copied())
+            .flatten();
         self.pending = self.pending.saturating_sub(1);
-        self.rows.extend(rows);
-        sort_rows(&mut self.rows);
-        if self.selected != 0 {
-            self.selected = self.selected.min(self.visible().len().saturating_sub(1));
+        let arrived = motion::enabled().then(Instant::now);
+        self.rows
+            .extend(rows.into_iter().map(|row| Row { arrived, ..row }));
+        let order = sort_rows(&mut self.rows);
+        let visible = self.visible();
+        let chosen = chosen
+            .and_then(|old| order.iter().position(|&index| index == old))
+            .and_then(|index| visible.iter().position(|&shown| shown == index));
+        self.selected = match chosen {
+            Some(position) => position,
+            None => self.selected.min(visible.len().saturating_sub(1)),
+        };
+        if motion::enabled() && height != self.body_height(&visible) {
+            self.grown = Some((height, Instant::now()));
         }
         cx.notify();
+    }
+
+    /// What the status line says: loading, or why there is nothing from the servers.
+    fn status(&self, visible: &[usize]) -> Option<SharedString> {
+        if self.pending > 0 {
+            Some(tr("Loading…").into())
+        } else if !self.rows.iter().any(|row| row.group != Group::Claude) {
+            Some(
+                self.waiting
+                    .clone()
+                    .unwrap_or_else(|| tr("No actions here").into()),
+            )
+        } else if visible.is_empty() {
+            Some(tr("No matches").into())
+        } else {
+            None
+        }
+    }
+
+    /// The height of the status line and the rows under it as drawn — what glides when an answer
+    /// changes it.
+    fn body_height(&self, visible: &[usize]) -> f32 {
+        let status = if self.status(visible).is_some() {
+            ROW_HEIGHT
+        } else {
+            0.
+        };
+        let mut rows = 0.;
+        let mut previous: Option<Group> = None;
+        for &index in visible {
+            let group = self.rows[index].group;
+            if previous.is_some_and(|previous| is_divided(previous, group)) {
+                rows += DIVIDER_HEIGHT;
+            }
+            previous = Some(group);
+            rows += ROW_HEIGHT;
+        }
+        status + rows.min(ROW_HEIGHT * MAX_VISIBLE_ROWS as f32)
+    }
+
+    /// The body's height now: on its way from where it was before the last answer, or as its
+    /// rows say.
+    fn shown_height(&self) -> f32 {
+        let target = self.body_height(&self.visible());
+        match self.grown {
+            Some((from, since)) => {
+                motion::lerp(from, target, motion::progress(since, motion::SMOOTH))
+            }
+            None => target,
+        }
     }
 
     /// The rows the query lets through, by index.
@@ -467,6 +563,7 @@ impl ContextActions {
         let count = self.visible().len();
         if count > 0 {
             self.selected = (self.selected + 1) % count;
+            self.moved = true;
             cx.notify();
         }
     }
@@ -475,6 +572,7 @@ impl ContextActions {
         let count = self.visible().len();
         if count > 0 {
             self.selected = (self.selected + count - 1) % count;
+            self.moved = true;
             cx.notify();
         }
     }
@@ -492,9 +590,13 @@ impl ContextActions {
         if modifiers.control || modifiers.platform || modifiers.function {
             return;
         }
+        // Typing narrows the list at once (no glide on the path of input), the highlight on its
+        // first row.
         if keystroke.key == "backspace" {
             if self.query.pop().is_some() {
                 self.selected = 0;
+                self.moved = false;
+                self.grown = None;
                 cx.notify();
             }
             cx.stop_propagation();
@@ -508,6 +610,8 @@ impl ContextActions {
         }
         self.query.push_str(typed);
         self.selected = 0;
+        self.moved = false;
+        self.grown = None;
         cx.stop_propagation();
         cx.notify();
     }
@@ -543,21 +647,30 @@ impl ContextActions {
 }
 
 impl Render for ContextActions {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let visible = self.visible();
         let selected = self.selected.min(visible.len().saturating_sub(1));
         let mut items: Vec<AnyElement> = Vec::new();
-        let mut previous_group: Option<Group> = None;
+        let mut previous: Option<&Row> = None;
         for (position, &index) in visible.iter().enumerate() {
             let row = &self.rows[index];
-            // A thin line between Claude and the servers' actions, as JetBrains separates groups.
-            if previous_group
-                .is_some_and(|group| (group == Group::Claude) != (row.group == Group::Claude))
-            {
-                items.push(ui::divider(ui).mx_1p5().my_1().into_any_element());
+            // Rows that came after the popup opened fade in.
+            let fade = |arrived: Option<Instant>| {
+                arrived.map(|since| motion::animate(since, motion::FADE, window))
+            };
+            // A thin line between Claude and the servers' actions, as JetBrains separates groups;
+            // it comes with the servers' rows.
+            if let Some(above) = previous.filter(|above| is_divided(above.group, row.group)) {
+                let divider = ui::divider(ui).mx_1p5().my_1();
+                let divider = match fade(above.arrived.or(row.arrived)) {
+                    Some(opacity) => divider.opacity(opacity),
+                    None => divider,
+                };
+                items.push(divider.into_any_element());
             }
-            previous_group = Some(row.group);
+            previous = Some(row);
+            let fade = fade(row.arrived);
             let (glyph, color) = match row.group {
                 Group::PreferredFix | Group::QuickFix => (IconName::Bulb, ui.error),
                 Group::Claude => (IconName::Claude, ui.accent_text),
@@ -583,6 +696,7 @@ impl Render for ContextActions {
                     })
                     .when(is_selected, |row| row.bg(ui.list_selected))
                     .when(!is_selected, |row| row.hover(|style| style.bg(ui.hover)))
+                    .when_some(fade, |row, opacity| row.opacity(opacity))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.run(index, window, cx)
                     }))
@@ -604,18 +718,18 @@ impl Render for ContextActions {
                     .into_any_element(),
             );
         }
-        let status: Option<SharedString> = if self.pending > 0 {
-            Some(tr("Loading…").into())
-        } else if !self.rows.iter().any(|row| row.group != Group::Claude) {
-            Some(
-                self.waiting
-                    .clone()
-                    .unwrap_or_else(|| tr("No actions here").into()),
-            )
-        } else if visible.is_empty() {
-            Some(tr("No matches").into())
-        } else {
-            None
+        let status = self.status(&visible);
+        // While an answer's rows come in, the body's height glides to them; then it is its own.
+        let height = match self.grown {
+            Some((from, since)) if motion::running(since, motion::SMOOTH) => {
+                let target = self.body_height(&visible);
+                Some(motion::lerp(
+                    from,
+                    target,
+                    motion::animate(since, motion::SMOOTH, window),
+                ))
+            }
+            _ => None,
         };
         popup::panel(ui)
             .key_context("ContextActions")
@@ -646,30 +760,43 @@ impl Render for ContextActions {
                         .child(self.query.clone()),
                 )
             })
-            // Loading, or why there is nothing from the servers: above Claude's rows.
-            .when_some(status, |panel, status| {
-                panel.child(
-                    div()
-                        .h(px(ROW_HEIGHT))
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_color(ui.dim)
-                        .child(icon(IconName::Bulb, ui.text_disabled).size(px(14.)))
-                        .child(status),
-                )
-            })
             .child(
                 div()
-                    .id("context-actions-rows")
-                    .max_h(px(ROW_HEIGHT * MAX_VISIBLE_ROWS as f32))
-                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .children(items),
+                    .when_some(height, |body, height| body.h(px(height)).overflow_hidden())
+                    // Loading, or why there is nothing from the servers: above Claude's rows.
+                    .when_some(status, |body, status| {
+                        body.child(
+                            div()
+                                .flex_none()
+                                .h(px(ROW_HEIGHT))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_color(ui.dim)
+                                .child(icon(IconName::Bulb, ui.text_disabled).size(px(14.)))
+                                .child(status),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("context-actions-rows")
+                            .flex_none()
+                            .max_h(px(ROW_HEIGHT * MAX_VISIBLE_ROWS as f32))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .children(items),
+                    ),
             )
     }
+}
+
+/// A line goes between Claude's rows and the servers'.
+fn is_divided(above: Group, below: Group) -> bool {
+    (above == Group::Claude) != (below == Group::Claude)
 }
 
 // --- Applying ---
@@ -1022,6 +1149,7 @@ mod tests {
             group,
             disabled: disabled.then(|| SharedString::from("no")),
             action: RowAction::Dispatch(Box::new(ShowContextActions)),
+            arrived: None,
         };
         let mut rows = vec![
             make("Extract into function", Group::Refactor, true),

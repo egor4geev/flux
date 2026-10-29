@@ -28,6 +28,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use flux_core::text::{line_len, line_start};
 use flux_core::transaction::Operation as Op;
@@ -45,6 +46,7 @@ use crate::editor::{self, Editor, EditorEvent};
 use crate::git::GitStore;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, icon};
+use crate::motion;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 use crate::workspace::Location;
@@ -670,6 +672,133 @@ struct Panes {
     synced: Option<[Point<f32>; 3]>,
     /// The captions of the sides.
     captions: (String, String),
+    /// Blocks just decided, gliding to their new colors.
+    flashes: Vec<Flash>,
+}
+
+/// A block just decided — a side taken or left out, the magic wand: its colors glide from how they
+/// were to how they are now ([`motion::FADE`]) instead of flipping at once, and the lines it brought
+/// into the result are tinted a moment, then the tint fades. The next edit of the result ends it.
+struct Flash {
+    block: usize,
+    /// The block before the decision.
+    was: Block,
+    /// The lines brought into the result (empty when a side was left out).
+    lines: Range<u32>,
+    since: Instant,
+}
+
+/// How long the lines a decision brought stay tinted before the tint fades.
+const FLASH_HOLD: Duration = Duration::from_millis(600);
+
+impl Flash {
+    /// How far the block's colors have glided, 0 → 1, asking for frames while they do.
+    fn glide(&self, window: &Window) -> f32 {
+        motion::animate(self.since, motion::FADE, window)
+    }
+
+    /// How strong the tint of the brought lines is now, 1 → 0: it holds, then fades, asking for
+    /// frames only while it fades.
+    fn tint(&self, window: &Window) -> f32 {
+        let start = self.since + FLASH_HOLD;
+        if Instant::now() < start {
+            return 1.;
+        }
+        1. - motion::animate(start, motion::FADE, window)
+    }
+
+    fn done(&self) -> bool {
+        !motion::running(self.since + FLASH_HOLD, motion::FADE)
+    }
+}
+
+impl Panes {
+    /// Block `block`, which was `was`, has been decided; `lines` came into the result. True when
+    /// it flashes: the caller wakes the view once the tint's hold is over ([`wake_after_hold`]).
+    fn flash(&mut self, block: usize, was: Block, lines: Range<u32>) -> bool {
+        if !motion::enabled() {
+            return false;
+        }
+        self.flashes.retain(|flash| !flash.done());
+        match self.flashes.iter_mut().find(|flash| flash.block == block) {
+            // Decided again as it glides (a side taken from the keyboard, the other left out):
+            // from how it was before both, with the lines of both.
+            Some(_) if lines.is_empty() => {}
+            Some(flash) if flash.lines.is_empty() => flash.lines = lines,
+            Some(flash) => {
+                flash.lines = flash.lines.start.min(lines.start)..flash.lines.end.max(lines.end)
+            }
+            None => self.flashes.push(Flash {
+                block,
+                was,
+                lines,
+                since: Instant::now(),
+            }),
+        }
+        true
+    }
+
+    /// Block `block`'s flash, if it has one.
+    fn flash_of(&self, block: usize) -> Option<&Flash> {
+        self.flashes.iter().find(|flash| flash.block == block)
+    }
+}
+
+/// Draws the merge tool again once the tint of a decision's lines starts to fade: nothing asks for
+/// frames while it holds.
+fn wake_after_hold(cx: &mut Context<MergeView>) {
+    cx.spawn(async move |this, cx| {
+        cx.background_executor().timer(FLASH_HOLD).await;
+        this.update(cx, |_, cx| cx.notify()).ok();
+    })
+    .detach();
+}
+
+/// A block's colors in a pane — a side's, or the result's (`None`): its lines' background and the
+/// line marking where the pane has none of its lines; `None` when the pane leaves it uncolored.
+fn block_colors(block: &Block, side: Option<Side>, ui: &UiColors) -> Option<(Hsla, Hsla)> {
+    let pending = match side {
+        None => block.pending(),
+        Some(side) => {
+            if !block.changed_on(side) || block.take(side) == Take::Ignored && !block.pending() {
+                return None;
+            }
+            side_pending(block, side)
+        }
+    };
+    Some(if pending {
+        (ui.diff_conflict_bg, ui.diff_conflict)
+    } else {
+        (ui.diff_resolved_bg, ui.diff_deleted)
+    })
+}
+
+/// The side of a conflict still waits for a decision.
+fn side_pending(block: &Block, side: Side) -> bool {
+    block.is_conflict() && block.take(side) == Take::Pending
+}
+
+/// The color of the band joining a side's block to the result; `None` — no band.
+fn band_color(block: &Block, side: Side, ui: &UiColors) -> Option<Hsla> {
+    (block.changed_on(side) && block.take(side) != Take::Ignored).then(|| {
+        if side_pending(block, side) {
+            ui.diff_conflict_bg
+        } else {
+            ui.diff_resolved_bg
+        }
+    })
+}
+
+/// A color on its way from `was` to `now` at `t` (0 → 1): one that comes fades in, one that goes
+/// fades out.
+fn glide_color(was: Option<Hsla>, now: Option<Hsla>, t: f32) -> Option<Hsla> {
+    let clear = Hsla::transparent_black();
+    match (was, now) {
+        (Some(was), Some(now)) => Some(motion::mix(was, now, t)),
+        (Some(was), None) => Some(motion::mix(was, clear, t)),
+        (None, Some(now)) => Some(motion::mix(clear, now, t)),
+        (None, None) => None,
+    }
 }
 
 /// What the merge tool asks the workspace to do.
@@ -888,6 +1017,7 @@ impl MergeView {
             driver: Pane::Result,
             synced: None,
             captions,
+            flashes: Vec::new(),
         }));
         // The first conflict is where the work is.
         self.go_to_conflict(true, window, cx);
@@ -929,6 +1059,8 @@ impl MergeView {
         });
         if !changes.is_empty() {
             panes.model.follow_edits(&changes, &text);
+            // Typing, undo: the lines a decision brought may be anywhere now.
+            panes.flashes.clear();
         }
         self.update_modified(cx);
         cx.notify();
@@ -956,6 +1088,10 @@ impl MergeView {
         let Some((range, insert, lines)) = panes.model.take_edit(index, side, &text) else {
             return;
         };
+        let was = panes.model.blocks[index].clone();
+        // The side's lines end the block: the whole of it, or after the side taken first.
+        let brought = line_count(panes.model.side_text(&was, side));
+        let new_lines = lines.end.saturating_sub(brought).max(lines.start)..lines.end;
         let (changes, text) = panes.result.update(cx, |editor, cx| {
             editor.replace_ranges(vec![(range, insert)], cx);
             let changes = editor
@@ -968,6 +1104,9 @@ impl MergeView {
         // The other blocks move with the edit; this one is exactly the taken text.
         panes.model.follow(&changes, &text);
         panes.model.applied(index, side, lines.clone());
+        if panes.flash(index, was, new_lines) {
+            wake_after_hold(cx);
+        }
         // The cursor stays on the block (the edit left it after the new text): the other side's
         // key works on the same conflict.
         let line = lines.start as usize;
@@ -980,8 +1119,13 @@ impl MergeView {
     }
 
     fn ignore(&mut self, index: usize, side: Side, cx: &mut Context<Self>) {
-        if let State::Ready(panes) = &mut self.state {
+        if let State::Ready(panes) = &mut self.state
+            && let Some(was) = panes.model.blocks.get(index).cloned()
+        {
             panes.model.ignore(index, side);
+            if panes.model.blocks[index] != was {
+                panes.flash(index, was, 0..0);
+            }
         }
         self.update_modified(cx);
         cx.notify();
@@ -1044,6 +1188,7 @@ impl MergeView {
             return;
         };
         let mut merged = 0;
+        let mut flashed = false;
         for index in 0..panes.model.blocks.len() {
             let block = &panes.model.blocks[index];
             if !block.is_conflict() || block.left != Take::Pending || block.right != Take::Pending {
@@ -1060,6 +1205,7 @@ impl MergeView {
             let start = char_of_line(&rope, block.result.start);
             let end = char_of_line(&rope, block.result.end);
             let lines = block.result.start..block.result.start + line_count(&text);
+            let was = block.clone();
             let (changes, rope) = panes.result.update(cx, |editor, cx| {
                 editor.replace_ranges(vec![(start..end, text.clone())], cx);
                 let changes = editor
@@ -1070,8 +1216,12 @@ impl MergeView {
                 (changes, editor.document.text().clone())
             });
             panes.model.follow(&changes, &rope);
-            panes.model.merged(index, text, lines);
+            panes.model.merged(index, text, lines.clone());
+            flashed |= panes.flash(index, was, lines);
             merged += 1;
+        }
+        if flashed {
+            wake_after_hold(cx);
         }
         let message = if merged == 0 {
             tr("No simple conflicts: each one needs a decision").to_string()
@@ -1279,6 +1429,12 @@ impl MergeView {
             panes.result.clone(),
             panes.right.clone(),
         ];
+        // This frame's step of a jump gliding in a pane (F7, go to line), taken before the offsets
+        // are read: the others keep up with the step on screen, not the last frame's (the editor's
+        // own render takes it again, only on to "now"). The pane that glides moves alone and leads.
+        for editor in &editors {
+            editor.update(cx, |editor, _| editor.advance_glide());
+        }
         let scrolls = editors.clone().map(|editor| editor.read(cx).scroll);
         let moved = match panes.synced {
             Some(last) => [0, 1, 2].map(|i| scrolls[i].y != last[i].y),
@@ -1352,8 +1508,9 @@ impl MergeView {
 
     // --- Colors ---
 
-    /// Hands the three editors their colors for this frame.
-    fn decorate(&self, cx: &mut Context<Self>) {
+    /// Hands the three editors their colors for this frame. A block just decided glides to its
+    /// new colors, the lines it brought tinted a moment ([`Flash`]).
+    fn decorate(&self, window: &Window, cx: &mut Context<Self>) {
         let State::Ready(panes) = &self.state else {
             return;
         };
@@ -1363,39 +1520,65 @@ impl MergeView {
         let mut right = Decorations::default();
         let left_text = panes.left.read(cx).document.text().clone();
         let right_text = panes.right.read(cx).document.text().clone();
+        let range = |lines: &Range<u32>| lines.start as usize..lines.end as usize;
         for (index, block) in panes.model.blocks.iter().enumerate() {
-            let pending = block.pending();
-            let (background, line) = if pending {
-                (ui.diff_conflict_bg, ui.diff_conflict)
-            } else {
-                (ui.diff_resolved_bg, ui.diff_deleted)
+            let flash = panes
+                .flash_of(index)
+                .map(|flash| (flash, flash.glide(window)));
+            // The colors in a pane: as the block is, or on their way there from how it was.
+            let colors = |side: Option<Side>| {
+                let now = block_colors(block, side, &ui);
+                let Some((flash, t)) = flash else {
+                    return now;
+                };
+                let was = block_colors(&flash.was, side, &ui);
+                let background = glide_color(was.map(|c| c.0), now.map(|c| c.0), t)?;
+                let line = glide_color(was.map(|c| c.1), now.map(|c| c.1), t)?;
+                Some((background, line))
             };
-            let range = |lines: &Range<u32>| lines.start as usize..lines.end as usize;
-            if block.result.is_empty() {
-                middle.boundaries.push((block.result.start as usize, line));
-            } else {
-                middle.lines.push((range(&block.result), background));
+            if let Some((background, line)) = colors(None) {
+                if block.result.is_empty() {
+                    middle.boundaries.push((block.result.start as usize, line));
+                } else {
+                    middle.lines.push((range(&block.result), background));
+                }
+            }
+            // The lines the decision brought, over the block's color.
+            if let Some((flash, _)) = flash
+                && !flash.lines.is_empty()
+            {
+                let tint = flash.tint(window);
+                if tint > 0. {
+                    middle
+                        .lines
+                        .push((range(&flash.lines), ui.diff_modified_bg.opacity(tint)));
+                }
             }
             for (side, decorations, text) in [
                 (Side::Left, &mut left, &left_text),
                 (Side::Right, &mut right, &right_text),
             ] {
-                if !block.changed_on(side) || block.take(side) == Take::Ignored && !pending {
+                let Some((background, line)) = colors(Some(side)) else {
                     continue;
-                }
-                let lines = block.lines(side);
-                let side_pending = block.is_conflict() && block.take(side) == Take::Pending;
-                let (background, line) = if side_pending {
-                    (ui.diff_conflict_bg, ui.diff_conflict)
-                } else {
-                    (ui.diff_resolved_bg, ui.diff_deleted)
                 };
+                let lines = block.lines(side);
                 if lines.is_empty() {
                     decorations.boundaries.push((lines.start as usize, line));
                 } else {
                     decorations.lines.push((range(lines), background));
                 }
-                if side_pending && let Some((left_words, right_words)) = panes.words.get(index) {
+                // The changed words of a side still waiting; decided, they fade with the rest.
+                let words_shown = if side_pending(block, side) {
+                    1.
+                } else {
+                    match flash {
+                        Some((flash, t)) if side_pending(&flash.was, side) => 1. - t,
+                        _ => 0.,
+                    }
+                };
+                if words_shown > 0.
+                    && let Some((left_words, right_words)) = panes.words.get(index)
+                {
                     let words = match side {
                         Side::Left => left_words,
                         Side::Right => right_words,
@@ -1404,7 +1587,7 @@ impl MergeView {
                         text,
                         lines.start,
                         words,
-                        ui.diff_conflict_word,
+                        ui.diff_conflict_word.opacity(words_shown),
                     ));
                 }
             }
@@ -1590,18 +1773,24 @@ impl MergeView {
         };
         let result_editor = panes.result.clone();
         // Bands: (side lines, result lines, color), drawn with the offsets of this frame.
+        // A block just decided: its band glides to its new color, or fades out (the decorations
+        // ask for the frames).
         let bands: Vec<(Range<u32>, Range<u32>, Hsla)> = panes
             .model
             .blocks
             .iter()
-            .filter(|block| block.changed_on(side) && block.take(side) != Take::Ignored)
-            .map(|block| {
-                let color = if block.is_conflict() && block.take(side) == Take::Pending {
-                    ui.diff_conflict_bg
-                } else {
-                    ui.diff_resolved_bg
-                };
-                (block.lines(side).clone(), block.result.clone(), color)
+            .enumerate()
+            .filter_map(|(index, block)| {
+                let now = band_color(block, side, &ui);
+                let color = match panes.flash_of(index) {
+                    Some(flash) => glide_color(
+                        band_color(&flash.was, side, &ui),
+                        now,
+                        motion::progress(flash.since, motion::FADE),
+                    ),
+                    None => now,
+                }?;
+                Some((block.lines(side).clone(), block.result.clone(), color))
             })
             .collect();
         let bands = canvas(|_, _, _| (), {
@@ -1888,7 +2077,11 @@ impl Render for MergeView {
         let ready = matches!(self.state, State::Ready(_));
         if ready {
             self.sync_scroll(cx);
-            self.decorate(cx);
+            // The flashes that have ended are dropped: no frames once nothing moves.
+            if let State::Ready(panes) = &mut self.state {
+                panes.flashes.retain(|flash| !flash.done());
+            }
+            self.decorate(window, cx);
         }
         let body = if ready {
             self.render_panes(cx)

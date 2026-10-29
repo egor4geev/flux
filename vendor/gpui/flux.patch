@@ -109,7 +109,7 @@ diff -ruN a/src/elements/animation.rs b/src/elements/animation.rs
              ((element.request_layout(window, cx), element), state)
 diff -ruN a/src/elements/div.rs b/src/elements/div.rs
 --- a/src/elements/div.rs	2006-07-24 05:21:28
-+++ b/src/elements/div.rs	2026-10-29 00:36:55
++++ b/src/elements/div.rs	2026-10-29 05:16:45
 @@ -16,7 +16,7 @@
  //! constructed by combining these two systems into an all-in-one element.
  
@@ -143,7 +143,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  };
  use util::ResultExt;
  
-@@ -48,6 +49,197 @@
+@@ -48,6 +49,225 @@
  const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
  const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
  
@@ -174,6 +174,34 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
 +/// default) switches them at once.
 +pub fn set_interaction_transitions(transitions: Option<InteractionTransitions>) {
 +    INTERACTION_TRANSITIONS.with(|cell| cell.set(transitions));
++}
++
++/// Flux patch (motion, 2026-10-29): how tooltips come and go in every window.
++#[derive(Clone, Copy)]
++pub struct TooltipTransitions {
++    /// A tooltip asked for while another one shows, or less than this after one went because the
++    /// mouse left its element (moving along a toolbar), shows at once instead of after the hover
++    /// delay; its builder sees `Window::tooltip_handoff`. Not after a click or the wheel hid one.
++    pub handoff: Duration,
++    /// A tooltip that has gone fades out this long where it was, drawn but taking no mouse; zero —
++    /// it is gone at once, as before.
++    pub exit: Duration,
++    /// The easing of the fade out.
++    pub easing: fn(f32) -> f32,
++}
++
++thread_local! {
++    static TOOLTIP_TRANSITIONS: Cell<Option<TooltipTransitions>> = const { Cell::new(None) };
++}
++
++/// Flux patch (motion): sets how tooltips come and go in every window; `None` (the default) —
++/// after the hover delay each time, gone at once.
++pub fn set_tooltip_transitions(transitions: Option<TooltipTransitions>) {
++    TOOLTIP_TRANSITIONS.with(|cell| cell.set(transitions));
++}
++
++pub(crate) fn tooltip_transitions() -> Option<TooltipTransitions> {
++    TOOLTIP_TRANSITIONS.with(Cell::get)
 +}
 +
 +/// Flux patch (motion): the fade of one interaction state (hover or press) of an element.
@@ -341,7 +369,25 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  /// The styling information for a given group.
  pub struct GroupStyle {
      /// The identifier for this group.
-@@ -1818,7 +2010,8 @@
+@@ -101,6 +321,17 @@
+         Interactivity::default()
+     }
+ 
++    /// Flux patch (motion, 2026-10-29): drops the hover and press styles set so far, its own and
++    /// its group's, and the group it names — an unavailable button neither lights up nor springs,
++    /// and its icon doesn't brighten. The pointer cursor stays the caller's to change.
++    pub fn clear_interaction_styles(&mut self) {
++        self.hover_style = None;
++        self.group_hover_style = None;
++        self.active_style = None;
++        self.group_active_style = None;
++        self.group = None;
++    }
++
+     /// Gets the source location of construction. Returns `None` when not in debug mode.
+     pub fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+         #[cfg(any(feature = "inspector", debug_assertions))]
+@@ -1818,7 +2049,8 @@
                      window.next_frame.tab_stops.insert(focus_handle);
                  }
  
@@ -351,7 +397,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
                      style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                          window.with_text_style(style.text_style().cloned(), |window| {
                              window.with_content_mask(
-@@ -2419,6 +2612,15 @@
+@@ -2419,6 +2651,15 @@
                      let mut scroll_offset = scroll_offset.borrow_mut();
                      let old_scroll_offset = *scroll_offset;
                      let delta = event.delta.pixel_delta(line_height);
@@ -367,7 +413,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  
                      let mut delta_x = Pixels::ZERO;
                      if overflow.x == Overflow::Scroll {
-@@ -2473,7 +2675,7 @@
+@@ -2473,7 +2714,7 @@
      fn compute_style_internal(
          &self,
          hitbox: Option<&Hitbox>,
@@ -376,7 +422,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
          window: &mut Window,
          cx: &mut App,
      ) -> Style {
-@@ -2494,20 +2696,74 @@
+@@ -2494,20 +2735,74 @@
              }
          }
  
@@ -461,7 +507,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
              }
  
              if let Some(drag) = cx.active_drag.take() {
-@@ -2541,23 +2797,54 @@
+@@ -2541,23 +2836,54 @@
          }
  
          if let Some(element_state) = element_state {
@@ -526,7 +572,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
          style
      }
  }
-@@ -2572,6 +2859,8 @@
+@@ -2572,6 +2898,8 @@
      pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
      pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
      pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
@@ -535,6 +581,46 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  }
  
  /// Whether or not the element or a group that contains it is clicked by the mouse.
+@@ -2630,6 +2958,8 @@
+     };
+     if should_clear {
+         active_tooltip.borrow_mut().take();
++        // Flux patch (motion): a click or the wheel hid it — the next one waits again.
++        window.tooltip_dismissed = true;
+         window.refresh();
+     }
+ }
+@@ -2749,13 +3079,21 @@
+             active_tooltip.borrow_mut().take();
+         }
+         Action::ScheduleShow => {
++            // Flux patch (motion): right after another tooltip, at once (`TooltipTransitions`).
++            let handoff = window.tooltip_warm();
++            let delay = if handoff {
++                Duration::ZERO
++            } else {
++                TOOLTIP_SHOW_DELAY
++            };
+             let delayed_show_task = window.spawn(cx, {
+                 let active_tooltip = active_tooltip.clone();
+                 let build_tooltip = build_tooltip.clone();
+                 let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
+                 async move |cx| {
+-                    cx.background_executor().timer(TOOLTIP_SHOW_DELAY).await;
++                    cx.background_executor().timer(delay).await;
+                     cx.update(|window, cx| {
++                        window.tooltip_handoff = handoff;
+                         let new_tooltip =
+                             build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
+                                 let active_tooltip = active_tooltip.clone();
+@@ -2779,6 +3117,7 @@
+                                     is_hoverable: tooltip_is_hoverable,
+                                 }
+                             });
++                        window.tooltip_handoff = false;
+                         *active_tooltip.borrow_mut() = new_tooltip;
+                         window.refresh();
+                     })
 diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
 --- a/src/platform/mac/metal_renderer.rs	2006-07-24 05:21:28
 +++ b/src/platform/mac/metal_renderer.rs	2026-10-15 03:41:33
@@ -965,7 +1051,7 @@ diff -ruN a/src/platform.rs b/src/platform.rs
      }
 diff -ruN a/src/style.rs b/src/style.rs
 --- a/src/style.rs	2006-07-24 05:21:28
-+++ b/src/style.rs	2026-10-28 00:20:40
++++ b/src/style.rs	2026-10-28 01:24:47
 @@ -260,6 +260,19 @@
      /// The opacity of this element
      pub opacity: Option<f32>,
@@ -998,7 +1084,7 @@ diff -ruN a/src/style.rs b/src/style.rs
              grid_location: None,
 diff -ruN a/src/styled.rs b/src/styled.rs
 --- a/src/styled.rs	2006-07-24 05:21:28
-+++ b/src/styled.rs	2026-10-28 00:20:40
++++ b/src/styled.rs	2026-10-28 01:24:47
 @@ -654,6 +654,27 @@
          self
      }
@@ -1041,7 +1127,7 @@ diff -ruN a/src/taffy.rs b/src/taffy.rs
  
 diff -ruN a/src/window.rs b/src/window.rs
 --- a/src/window.rs	2006-07-24 05:21:28
-+++ b/src/window.rs	2026-10-29 00:37:44
++++ b/src/window.rs	2026-10-29 05:16:45
 @@ -7,17 +7,20 @@
      DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
      FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
@@ -1140,7 +1226,26 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
      pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
      pub(crate) image_cache_stack: Vec<AnyImageCache>,
-@@ -856,13 +887,18 @@
+@@ -846,6 +877,18 @@
+     next_hitbox_id: HitboxId,
+     pub(crate) next_tooltip_id: TooltipId,
+     pub(crate) tooltip_bounds: Option<TooltipBounds>,
++    /// Flux patch (motion, 2026-10-29): the tooltip drawn last frame, to fade it out once it is
++    /// gone (`TooltipTransitions`).
++    shown_tooltip: Option<(AnyView, Bounds<Pixels>)>,
++    /// Flux patch (motion): a tooltip that has gone, fading out since then.
++    leaving_tooltip: Option<(AnyView, Bounds<Pixels>, Instant)>,
++    /// Flux patch (motion): when a tooltip last went because the mouse left its element — the
++    /// next one shown soon after is a handoff.
++    tooltip_hidden_at: Option<Instant>,
++    /// Flux patch (motion): the tooltip goes because of a click or the wheel — no handoff after.
++    pub(crate) tooltip_dismissed: bool,
++    /// Flux patch (motion): the tooltip being built is a handoff (`Window::tooltip_handoff`).
++    pub(crate) tooltip_handoff: bool,
+     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+     pub(crate) dirty_views: FxHashSet<EntityId>,
+     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
+@@ -856,13 +899,18 @@
      modifiers: Modifiers,
      capslock: Capslock,
      scale_factor: f32,
@@ -1160,7 +1265,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub(crate) refreshing: bool,
      pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
      pub(crate) focus: Option<FocusId>,
-@@ -882,6 +918,131 @@
+@@ -882,6 +930,131 @@
      saw_keystroke: bool,
  }
  
@@ -1292,7 +1397,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub(crate) enum DrawPhase {
      None,
-@@ -991,7 +1152,7 @@
+@@ -991,7 +1164,7 @@
          let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
          let needs_present = Rc::new(Cell::new(false));
          let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
@@ -1301,7 +1406,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
          platform_window
              .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
-@@ -1021,7 +1182,7 @@
+@@ -1021,7 +1194,7 @@
              let active = active.clone();
              let needs_present = needs_present.clone();
              let next_frame_callbacks = next_frame_callbacks.clone();
@@ -1310,7 +1415,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              move |request_frame_options| {
                  let next_frame_callbacks = next_frame_callbacks.take();
                  if !next_frame_callbacks.is_empty() {
-@@ -1034,12 +1195,12 @@
+@@ -1034,12 +1207,12 @@
                          .log_err();
                  }
  
@@ -1327,7 +1432,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
                  if invalidator.is_dirty() || request_frame_options.force_render {
                      measure("frame duration", || {
-@@ -1125,7 +1286,12 @@
+@@ -1125,7 +1298,12 @@
              let mut cx = cx.to_async();
              Box::new(move |event| {
                  handle
@@ -1341,7 +1446,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                      .log_err()
                      .unwrap_or(DispatchEventResult::default())
              })
-@@ -1223,6 +1389,8 @@
+@@ -1223,6 +1401,8 @@
              element_offset_stack: Vec::new(),
              content_mask_stack: Vec::new(),
              element_opacity: 1.0,
@@ -1350,7 +1455,19 @@ diff -ruN a/src/window.rs b/src/window.rs
              requested_autoscroll: None,
              rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
              next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
-@@ -1239,13 +1407,15 @@
+@@ -1230,6 +1410,11 @@
+             next_hitbox_id: HitboxId(0),
+             next_tooltip_id: TooltipId::default(),
+             tooltip_bounds: None,
++            shown_tooltip: None,
++            leaving_tooltip: None,
++            tooltip_hidden_at: None,
++            tooltip_dismissed: false,
++            tooltip_handoff: false,
+             dirty_views: FxHashSet::default(),
+             focus_listeners: SubscriberSet::new(),
+             focus_lost_listeners: SubscriberSet::new(),
+@@ -1239,13 +1424,15 @@
              modifiers,
              capslock,
              scale_factor,
@@ -1367,7 +1484,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              refreshing: false,
              activation_observers: SubscriberSet::new(),
              focus: None,
-@@ -1673,8 +1843,10 @@
+@@ -1673,8 +1860,10 @@
      }
  
      fn bounds_changed(&mut self, cx: &mut App) {
@@ -1380,7 +1497,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          self.display_id = self.platform_window.display().map(|display| display.id());
  
          self.refresh();
-@@ -1691,7 +1863,9 @@
+@@ -1691,7 +1880,9 @@
  
      /// Set the content size of the window.
      pub fn resize(&mut self, size: Size<Pixels>) {
@@ -1391,7 +1508,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Returns whether or not the window is currently fullscreen
-@@ -1744,7 +1918,9 @@
+@@ -1744,7 +1935,9 @@
  
      /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
      pub fn show_window_menu(&self, position: Point<Pixels>) {
@@ -1402,7 +1519,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Tells the compositor to take control of window movement (Wayland and X11)
-@@ -1816,6 +1992,41 @@
+@@ -1816,6 +2009,41 @@
          self.scale_factor
      }
  
@@ -1444,7 +1561,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// The size of an em for the base font of the application. Adjusting this value allows the
      /// UI to scale, just like zooming a web page.
      pub fn rem_size(&self) -> Pixels {
-@@ -2010,6 +2221,29 @@
+@@ -2010,6 +2238,29 @@
          profiling::finish_frame!();
      }
  
@@ -1474,7 +1591,107 @@ diff -ruN a/src/window.rs b/src/window.rs
      fn draw_roots(&mut self, cx: &mut App) {
          self.invalidator.set_phase(DrawPhase::Prepaint);
          self.tooltip_bounds.take();
-@@ -2448,6 +2682,166 @@
+@@ -2052,14 +2303,22 @@
+             element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+             prompt_element = Some(element);
+             self.prompt = Some(prompt);
++            // Flux patch (motion): no tooltip fades out over a prompt or after it.
++            self.shown_tooltip = None;
++            self.leaving_tooltip = None;
+         } else if let Some(active_drag) = cx.active_drag.take() {
+             let mut element = active_drag.view.clone().into_any();
+             let offset = self.mouse_position() - active_drag.cursor_offset;
+             element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
+             active_drag_element = Some(element);
+             cx.active_drag = Some(active_drag);
++            self.shown_tooltip = None;
++            self.leaving_tooltip = None;
+         } else {
+-            tooltip_element = self.prepaint_tooltip(cx);
++            tooltip_element = self
++                .prepaint_tooltip(cx)
++                .map(|element| (element, 1.))
++                .or_else(|| self.prepaint_leaving_tooltip(cx));
+         }
+ 
+         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+@@ -2077,8 +2336,8 @@
+             prompt_element.paint(self, cx);
+         } else if let Some(mut drag_element) = active_drag_element {
+             drag_element.paint(self, cx);
+-        } else if let Some(mut tooltip_element) = tooltip_element {
+-            tooltip_element.paint(self, cx);
++        } else if let Some((mut tooltip_element, opacity)) = tooltip_element {
++            self.with_element_opacity(Some(opacity), |window| tooltip_element.paint(window, cx));
+         }
+ 
+         #[cfg(any(feature = "inspector", debug_assertions))]
+@@ -2149,11 +2408,64 @@
+                 id: tooltip_request.id,
+                 bounds: tooltip_bounds,
+             });
++            // Flux patch (motion): kept for its fade out; a new one replaces one fading out.
++            self.shown_tooltip = Some((tooltip_request.tooltip.view.clone(), tooltip_bounds));
++            self.leaving_tooltip = None;
++            self.tooltip_dismissed = false;
+             return Some(element);
+         }
+         None
+     }
+ 
++    /// Flux patch (motion, 2026-10-29): the tooltip drawn last frame has gone — it fades out where
++    /// it was (`TooltipTransitions::exit`), drawn but taking no mouse; the element and its opacity.
++    fn prepaint_leaving_tooltip(&mut self, cx: &mut App) -> Option<(AnyElement, f32)> {
++        let transitions = crate::tooltip_transitions();
++        if let Some((view, bounds)) = self.shown_tooltip.take() {
++            let now = Instant::now();
++            if !mem::take(&mut self.tooltip_dismissed) {
++                self.tooltip_hidden_at = Some(now);
++            }
++            if transitions.is_some_and(|transitions| !transitions.exit.is_zero()) {
++                self.leaving_tooltip = Some((view, bounds, now));
++            }
++        }
++        let (view, bounds, since) = self.leaving_tooltip.clone()?;
++        let transitions = transitions?;
++        let t = since.elapsed().as_secs_f32() / transitions.exit.as_secs_f32().max(0.001);
++        if t >= 1. {
++            self.leaving_tooltip = None;
++            return None;
++        }
++        let mut element = view.into_any();
++        element.layout_as_root(AvailableSpace::min_size(), self, cx);
++        self.with_inert(true, |window| {
++            window.with_absolute_element_offset(bounds.origin, |window| {
++                element.prepaint(window, cx)
++            })
++        });
++        self.on_next_frame(|window, _| window.refresh());
++        Some((element, 1. - (transitions.easing)(t)))
++    }
++
++    /// Flux patch (motion, 2026-10-29): the tooltip being built shows at once after another one
++    /// (`TooltipTransitions::handoff`), instead of after the hover delay — moving along a toolbar.
++    /// For a tooltip view to come in quieter than one that took a while.
++    pub fn tooltip_handoff(&self) -> bool {
++        self.tooltip_handoff
++    }
++
++    /// Flux patch (motion): a tooltip shows now, or went less than the handoff time ago because
++    /// the mouse left its element: the next one shows without the delay.
++    pub(crate) fn tooltip_warm(&self) -> bool {
++        crate::tooltip_transitions().is_some_and(|transitions| {
++            (self.tooltip_bounds.is_some() && !self.tooltip_dismissed)
++                || self
++                    .tooltip_hidden_at
++                    .is_some_and(|at| at.elapsed() < transitions.handoff)
++        })
++    }
++
+     fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
+         assert_eq!(self.element_id_stack.len(), 0);
+ 
+@@ -2448,6 +2760,166 @@
          result
      }
  
@@ -1641,7 +1858,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
      /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
      /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
-@@ -2783,8 +3177,10 @@
+@@ -2783,8 +3255,10 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -1654,7 +1871,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          if !clipped_bounds.is_empty() {
              self.next_frame
                  .scene
-@@ -2812,13 +3208,17 @@
+@@ -2812,13 +3286,17 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -1675,7 +1892,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  bounds: shadow_bounds.scale(scale_factor),
                  content_mask: content_mask.scale(scale_factor),
                  corner_radii: corner_radii.scale(scale_factor),
-@@ -2840,16 +3240,22 @@
+@@ -2840,16 +3318,22 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -1702,7 +1919,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              border_style: quad.border_style,
          });
      }
-@@ -2861,9 +3267,20 @@
+@@ -2861,9 +3345,20 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -1724,7 +1941,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let color: Background = color.into();
          path.color = color.opacity(opacity);
          self.next_frame
-@@ -2888,11 +3305,11 @@
+@@ -2888,11 +3383,11 @@
          } else {
              style.thickness
          };
@@ -1739,7 +1956,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let element_opacity = self.element_opacity();
  
          self.next_frame.scene.insert_primitive(Underline {
-@@ -2901,7 +3318,7 @@
+@@ -2901,7 +3396,7 @@
              bounds: bounds.scale(scale_factor),
              content_mask: content_mask.scale(scale_factor),
              color: style.color.unwrap_or_default().opacity(element_opacity),
@@ -1748,7 +1965,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              wavy: if style.wavy { 1 } else { 0 },
          });
      }
-@@ -2919,11 +3336,11 @@
+@@ -2919,11 +3414,11 @@
  
          let scale_factor = self.scale_factor();
          let height = style.thickness;
@@ -1763,7 +1980,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let opacity = self.element_opacity();
  
          self.next_frame.scene.insert_primitive(Underline {
-@@ -2931,7 +3348,7 @@
+@@ -2931,7 +3426,7 @@
              pad: 0,
              bounds: bounds.scale(scale_factor),
              content_mask: content_mask.scale(scale_factor),
@@ -1772,7 +1989,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              color: style.color.unwrap_or_default().opacity(opacity),
              wavy: 0,
          });
-@@ -2981,11 +3398,11 @@
+@@ -2981,11 +3476,11 @@
                      Ok(Some((size, Cow::Owned(bytes))))
                  })?
                  .expect("Callback above only errors or returns Some");
@@ -1787,7 +2004,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              self.next_frame.scene.insert_primitive(MonochromeSprite {
                  order: 0,
                  pad: 0,
-@@ -3038,11 +3455,11 @@
+@@ -3038,11 +3533,11 @@
                  })?
                  .expect("Callback above only errors or returns Some");
  
@@ -1802,7 +2019,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              let opacity = self.element_opacity();
  
              self.next_frame.scene.insert_primitive(PolychromeSprite {
-@@ -3094,7 +3511,7 @@
+@@ -3094,7 +3589,7 @@
          else {
              return Ok(());
          };
@@ -1811,7 +2028,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let svg_bounds = Bounds {
              origin: bounds.center()
                  - Point::new(
-@@ -3110,13 +3527,15 @@
+@@ -3110,13 +3605,15 @@
          self.next_frame.scene.insert_primitive(MonochromeSprite {
              order: 0,
              pad: 0,
@@ -1831,7 +2048,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          });
  
          Ok(())
-@@ -3155,17 +3574,21 @@
+@@ -3155,17 +3652,21 @@
                  )))
              })?
              .expect("Callback above only returns Some");
@@ -1858,7 +2075,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              content_mask,
              corner_radii,
              tile,
-@@ -3184,8 +3607,8 @@
+@@ -3184,8 +3685,8 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -1869,7 +2086,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          self.next_frame.scene.insert_primitive(PaintSurface {
              order: 0,
              bounds,
-@@ -3305,7 +3728,12 @@
+@@ -3305,7 +3806,12 @@
      pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
          self.invalidator.debug_assert_prepaint();
  
@@ -1883,7 +2100,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let mut id = self.next_hitbox_id;
          self.next_hitbox_id = self.next_hitbox_id.next();
          let hitbox = Hitbox {
-@@ -3579,7 +4007,8 @@
+@@ -3579,7 +4085,8 @@
      /// Dispatch a mouse or keyboard event on the window.
      #[profiling::function]
      pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
@@ -1893,7 +2110,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          // Handlers may set this to false by calling `stop_propagation`.
          cx.propagate_event = true;
          // Handlers may set this to true by calling `prevent_default`.
-@@ -3615,6 +4044,8 @@
+@@ -3615,6 +4122,8 @@
              PlatformInput::ScrollWheel(scroll_wheel) => {
                  self.mouse_position = scroll_wheel.position;
                  self.modifiers = scroll_wheel.modifiers;
@@ -1902,7 +2119,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  PlatformInput::ScrollWheel(scroll_wheel)
              }
              // Translate dragging and dropping of external files from the operating system
-@@ -3668,6 +4099,10 @@
+@@ -3668,6 +4177,10 @@
              self.dispatch_key_event(any_key_event, cx);
          }
  
@@ -1913,7 +2130,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          DispatchEventResult {
              propagate: cx.propagate_event,
              default_prevented: self.default_prevented,
-@@ -4128,7 +4563,10 @@
+@@ -4128,7 +4641,10 @@
          self.on_next_frame(|window, cx| {
              if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                  if let Some(bounds) = input_handler.selected_bounds(window, cx) {
@@ -1925,7 +2142,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  }
                  window.platform_window.set_input_handler(input_handler);
              }
-@@ -5099,5 +5537,76 @@
+@@ -5099,5 +5615,76 @@
          border_widths: (1.).into(),
          border_color: border_color.into(),
          border_style,

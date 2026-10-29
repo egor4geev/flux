@@ -203,41 +203,41 @@ fn tool_button(
                 .tooltip(ui::tooltip(tool.label(), keys))
                 .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)),
         ))
-        // A count in the corner: changes waiting for a commit, unread notifications.
-        .children(badge.map(|count| {
-            div()
-                .absolute()
-                .top(px(-3.))
-                .right(px(-5.))
-                .min_w(px(15.))
-                .h(px(15.))
-                .px(px(3.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(8.))
-                .bg(if alarm { ui.error } else { ui.accent })
-                .text_size(px(crate::theme::TEXT_XS - 2.))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(ui.frame)
-                .child(if count > 99 {
-                    "99+".to_string()
-                } else {
-                    count.to_string()
-                })
-        }))
+        // A count in the corner: changes waiting for a commit, unread notifications. It bumps as it
+        // comes and grows (`crate::badge`): drawn empty while there is none, it keeps its count.
+        .child(crate::badge::bump(
+            ("tool-badge", tool as usize),
+            badge.unwrap_or(0),
+            match badge {
+                Some(count) => div()
+                    .absolute()
+                    .top(px(-3.))
+                    .right(px(-5.))
+                    .min_w(px(15.))
+                    .h(px(15.))
+                    .px(px(3.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .bg(if alarm { ui.error } else { ui.accent })
+                    .text_size(px(crate::theme::TEXT_XS - 2.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(ui.frame)
+                    .child(if count > 99 {
+                        "99+".to_string()
+                    } else {
+                        count.to_string()
+                    }),
+                None => div().absolute(),
+            },
+        ))
         // A dot in the corner: Claude working or waiting for the user.
-        .children(dot.filter(|_| badge.is_none()).map(|color| {
-            div()
-                .absolute()
-                .top(px(2.))
-                .right(px(2.))
-                .size(px(8.))
-                .rounded(px(4.))
-                .bg(color)
-                .border_1()
-                .border_color(ui.frame)
-        }))
+        .child(claude_dot(
+            ("tool-dot", tool as usize),
+            dot.filter(|_| badge.is_none()),
+            ui,
+        ))
         .child(open_marker(
             ("tool-marker", tool as usize),
             open,
@@ -282,6 +282,47 @@ fn plugin_tool_button(
             ui::style(cx) == UiStyle::Flat,
             ui,
         ))
+}
+
+/// The dot in a tool button's corner (Claude working or waiting for the user), drawn while there
+/// is none, too: it grows in with a bounce, shrinks away quickly (`motion::EXIT`), and its color
+/// crossfades as the sessions' state changes.
+fn claude_dot(
+    id: impl Into<ElementId>,
+    color: Option<gpui::Hsla>,
+    ui: UiColors,
+) -> impl IntoElement {
+    let shown = color.is_some();
+    let dot = div()
+        .size_full()
+        .rounded(px(4.))
+        .border_1()
+        .border_color(ui.frame)
+        .with_transition(
+            "color",
+            color.unwrap_or(gpui::transparent_black()),
+            motion::FADE,
+            |dot, color| dot.bg(color),
+        );
+    div()
+        .absolute()
+        .top(px(2.))
+        .right(px(2.))
+        .size(px(8.))
+        .child(dot)
+        .with_transition(
+            id,
+            if shown { 1. } else { 0. },
+            if shown { motion::BOUNCE } else { motion::EXIT },
+            |dot, size| {
+                if size <= 0. {
+                    return dot.opacity(0.);
+                }
+                dot.opacity(size.min(1.))
+                    .transform_scale(size)
+                    .transform_origin(0.5, 0.5)
+            },
+        )
 }
 
 /// A tool button whose accent pad fades in as its window opens and out as it closes (`motion`).

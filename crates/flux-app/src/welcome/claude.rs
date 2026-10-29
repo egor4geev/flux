@@ -707,18 +707,18 @@ fn actions() -> Div {
     div().mt_3().flex().items_center().gap_2()
 }
 
-/// A pulsing dot: something is awaited.
-fn busy_dot(id: &'static str, ui: UiColors) -> impl IntoElement {
-    div()
-        .flex_none()
-        .size(px(8.))
-        .rounded(px(4.))
-        .bg(ui.accent)
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
-        )
+/// A pulsing dot: something is awaited. Without animations (`crate::motion`) it stays lit.
+fn busy_dot(id: &'static str, ui: UiColors) -> AnyElement {
+    let dot = div().flex_none().size(px(8.)).rounded(px(4.)).bg(ui.accent);
+    if !crate::motion::enabled() {
+        return dot.into_any_element();
+    }
+    dot.with_animation(
+        id,
+        Animation::new(Duration::from_millis(900)).repeat(),
+        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+    )
+    .into_any_element()
 }
 
 /// The Flux window in front (or the last one opened, when none is in front: a scenario).

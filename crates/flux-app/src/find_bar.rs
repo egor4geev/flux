@@ -125,6 +125,11 @@ pub struct FindBar {
     /// The bar's height as last laid out: how far it slides.
     height: Rc<Cell<f32>>,
     replace_open: bool,
+    /// The Replace row unfolds under the find row and folds back up ([`motion::SMOOTH`], as the
+    /// bar slides): how much of it shows, from and to, since when; the chevron turns with it.
+    replace_reveal: (f32, f32, Instant),
+    /// The Replace row's height as last laid out: how far it unfolds.
+    replace_height: Rc<Cell<f32>>,
     query: Entity<TextInput>,
     replacement: Entity<TextInput>,
     case_sensitive: bool,
@@ -173,6 +178,8 @@ impl FindBar {
             reveal: (0., 0., Instant::now()),
             height: Rc::new(Cell::new(0.)),
             replace_open: false,
+            replace_reveal: (0., 0., Instant::now()),
+            replace_height: Rc::new(Cell::new(0.)),
             query,
             replacement,
             case_sensitive: false,
@@ -208,6 +215,29 @@ impl FindBar {
         (t, motion::lerp(from, to, t))
     }
 
+    /// How far the Replace row's unfolding has come (0 → 1) and how much of it shows.
+    fn replace_revealed(&self) -> (f32, f32) {
+        let (from, to, since) = self.replace_reveal;
+        let (t, _) = motion::SMOOTH.at(since.elapsed());
+        (t, motion::lerp(from, to, t))
+    }
+
+    /// Opens or closes the Replace row: it unfolds or folds from where it is — at once while the
+    /// bar itself is sliding in (`animate` false).
+    fn set_replace_open(&mut self, open: bool, animate: bool) {
+        if self.replace_open == open && animate {
+            return;
+        }
+        self.replace_open = open;
+        let to = if open { 1. } else { 0. };
+        let from = if animate {
+            self.replace_revealed().1
+        } else {
+            to
+        };
+        self.replace_reveal = (from, to, Instant::now());
+    }
+
     /// Opens or closes the bar: it slides from where it is.
     fn set_open(&mut self, open: bool) {
         if self.open == open {
@@ -236,9 +266,9 @@ impl FindBar {
         let focused_here = was_open && self.contains_focus(window, cx);
         self.set_open(true);
         if replace {
-            self.replace_open = true;
+            self.set_replace_open(true, was_open);
         } else if !was_open {
-            self.replace_open = false;
+            self.set_replace_open(false, false);
         }
 
         let seed = (!focused_here).then(|| self.seed(&editor, cx)).flatten();
@@ -583,7 +613,7 @@ impl FindBar {
     }
 
     fn toggle_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.replace_open = !self.replace_open;
+        self.set_replace_open(!self.replace_open, true);
         if !self.replace_open && self.replacement.focus_handle(cx).is_focused(window) {
             window.focus(&self.query.focus_handle(cx));
         }
@@ -668,14 +698,10 @@ impl Render for FindBar {
                     .into_any_element(),
             ),
         };
-        let chevron = if self.replace_open {
-            IconName::ChevronDown
-        } else {
-            IconName::ChevronRight
-        };
+        let (replace_t, replace_shown) = self.replace_revealed();
         let find_row = row()
             .child(
-                ui::icon_button("toggle-replace", chevron, ui)
+                chevron_button("toggle-replace", replace_shown, ui)
                     .tooltip(tip(tr("Toggle Replace"), &DeployReplace, &query_focus))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.toggle_replace(window, cx)
@@ -732,7 +758,7 @@ impl Render for FindBar {
                         cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx)),
                     ),
             );
-        let replace_row = self.replace_open.then(|| {
+        let replace_row = (self.replace_open || replace_shown > 0.).then(|| {
             row()
                 // Nothing under the chevron: the fields are stacked one under the other.
                 .child(div().flex_none().w(px(ICON_BUTTON_SIZE)))
@@ -753,6 +779,50 @@ impl Render for FindBar {
                         .tooltip(tip(tr("Replace All"), &ReplaceAll, &replace_focus))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.replace_all(cx))),
                 )
+        });
+        // Unfolding or folding, the row shows within a clip that grows from nothing (the gap above
+        // it included), so the text below moves with it instead of jumping a row; folded, it takes
+        // no input.
+        let replace_row = replace_row.map(|replace_row| {
+            if replace_t >= 1. {
+                return replace_row.into_any_element();
+            }
+            window.request_animation_frame();
+            let height = self.replace_height.clone();
+            let gap = 0.375 * f32::from(window.rem_size());
+            let unfolding = div()
+                .relative()
+                .flex_none()
+                .pt(px(gap))
+                .child(replace_row)
+                .child(
+                    gpui::canvas(
+                        move |bounds, window, _| {
+                            let measured = f32::from(bounds.size.height);
+                            if height.replace(measured) != measured {
+                                window.request_animation_frame();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .opacity(replace_shown.clamp(0., 1.));
+            let clip = div()
+                .relative()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .mt(px(-gap))
+                .h(px(self.replace_height.get() * replace_shown))
+                .child(unfolding);
+            if self.replace_open {
+                clip.into_any_element()
+            } else {
+                motion::inert(clip).into_any_element()
+            }
         });
 
         let bar =
@@ -836,6 +906,35 @@ impl Render for FindBar {
             )
             .into_any_element()
     }
+}
+
+/// [`ui::icon_button`] with a chevron that turns as the Replace row unfolds (`openness`, 0 → 1:
+/// pointing right → down).
+fn chevron_button(
+    id: &'static str,
+    openness: f32,
+    colors: theme::UiColors,
+) -> gpui::Stateful<gpui::Div> {
+    // The same group as `ui::icon_button`'s: the icon lights up under the mouse.
+    const GROUP: &str = "icon-button";
+    div()
+        .id(id)
+        .group(GROUP)
+        .flex_none()
+        .size(px(ICON_BUTTON_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(ui::RADIUS_SM))
+        .cursor_pointer()
+        .active(move |style| motion::press(style.bg(colors.pressed)))
+        .hover(move |style| style.bg(colors.hover))
+        .child(
+            crate::icons::chevron(openness, colors.text_muted)
+                .size(px(15.))
+                .id("icon")
+                .group_hover(GROUP, move |style| style.text_color(colors.foreground)),
+        )
 }
 
 // --- Choosing a match: matches are in ascending order, non-overlapping ---

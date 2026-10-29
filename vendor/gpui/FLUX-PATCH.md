@@ -101,6 +101,18 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
   - `src/window.rs`: `Window::with_inert` — hitboxes inserted inside get an empty content mask
     (the bounds stay for whoever measures with them): a popover fading out after it closed is
     drawn but takes no hover, clicks, wheel or tooltips.
+  - `src/elements/div.rs` (2026-10-29): `Interactivity::clear_interaction_styles` drops the hover
+    and press styles set so far and the group the element names — an unavailable button neither
+    lights up nor springs (`ui::available`).
+  - Tooltips (2026-10-29): `set_tooltip_transitions(TooltipTransitions { handoff, exit, easing })`
+    (`src/elements/div.rs`; `None`, the default — stock behaviour). A tooltip asked for while
+    another one shows, or less than `handoff` after one went because the mouse left its element,
+    shows without the 500 ms delay (`handle_tooltip_mouse_move`, `Window::tooltip_warm`); not
+    after a click or the wheel hid one (`tooltip_dismissed`). The builder sees
+    `Window::tooltip_handoff()` — Flux's tooltip then only fades in. `src/window.rs`: the tooltip
+    drawn last frame is kept (`shown_tooltip`); once it is gone it fades out for `exit` where it
+    was, inert (`prepaint_leaving_tooltip`, painted with its opacity); a new tooltip, a prompt or
+    a drag drops it.
 
 - **Scroll axis** (2026-10-29): a trackpad's swipe down always moves a little sideways too, and every
   scroll container under the pointer takes the event — a plugin board (a row scrolling sideways
@@ -133,4 +145,5 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
 4. Check by hand: the mouse, scrolling, file drops and the input method (Japanese, Pinyin) at 125 %,
    the traffic lights at 80 % and 125 %; Quit in the Dock with an unsaved document (the question,
    Cancel keeps Flux, Don't Save quits); a swipe down over a plugin board in a narrow tab scrolls a
-   lane and doesn't slide the board, a sideways swipe slides it.
+   lane and doesn't slide the board, a sideways swipe slides it; along a toolbar the next button's
+   tooltip shows at once, a tooltip fades out when the mouse leaves, and after a click it waits.

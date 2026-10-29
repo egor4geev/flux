@@ -1276,13 +1276,16 @@ impl PluginManager {
                     ),
             )
             .when(!essential, |row| {
+                // Unavailable: dimmed, no hover; the change fades.
                 row.child(
-                    ui::switch(
-                        SharedString::from(format!("plugin-switch-{}", plugin.id)),
-                        on,
-                        ui,
+                    ui::available(
+                        ui::switch(
+                            SharedString::from(format!("plugin-switch-{}", plugin.id)),
+                            on,
+                            ui,
+                        ),
+                        available,
                     )
-                    .when(!available, |switch| switch.opacity(0.4).cursor_default())
                     .when(available, |switch| {
                         switch.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
@@ -1600,7 +1603,9 @@ impl PluginManager {
                 .items_center()
                 .cursor_pointer()
                 .child(
+                    // An id: the label's color fades under the pointer.
                     ui::section_label(tab.label(), ui)
+                        .id("label")
                         .when(active, |label| label.text_color(ui.foreground))
                         .when(!active, |label| {
                             label.group_hover(group.clone(), move |style| {

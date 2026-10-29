@@ -114,10 +114,21 @@ pub fn apply(cx: &App) {
     push_interactions();
 }
 
-/// Hands gpui the fades of hover and press styles, or none.
+/// How soon after a tooltip the next one shows at once, without the hover delay: moving along a
+/// toolbar, each button says what it is as the pointer gets there. Not an animation — on with the
+/// animations off too.
+pub const TOOLTIP_HANDOFF: Duration = Duration::from_millis(500);
+
+/// Hands gpui the fades of hover and press styles, or none, and how tooltips go: fading out
+/// ([`EXIT`]), or at once.
 fn push_interactions() {
     let on = SETTING.with(Cell::get) && !REDUCE.with(Cell::get).is_some_and(|(_, reduce)| reduce);
     let slow = slow_motion();
+    gpui::set_tooltip_transitions(Some(gpui::TooltipTransitions {
+        handoff: TOOLTIP_HANDOFF,
+        exit: if on { EXIT.duration() } else { Duration::ZERO },
+        easing: ease_out_cubic,
+    }));
     gpui::set_interaction_transitions(on.then_some(InteractionTransitions {
         hover_in: HOVER_IN.mul_f32(slow),
         hover_out: HOVER_OUT.mul_f32(slow),
@@ -744,6 +755,214 @@ impl<E: IntoElement + 'static, T: Animatable> Element for Transition<E, T> {
         );
         let element = self.element.take().expect("laid out once");
         let mut element = (self.animator)(element, value).into_any_element();
+        let layout_id = element.request_layout(window, cx);
+        (layout_id, element)
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: gpui::Bounds<Pixels>,
+        element: &mut AnyElement,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        element.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: gpui::Bounds<Pixels>,
+        element: &mut AnyElement,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        element.paint(window, cx);
+    }
+}
+
+/// A transition keeps the element it animates buildable: styles, listeners, a tooltip and children
+/// go to that element (`ui::available(..).on_click(..)`), and the animator's styles come last.
+impl<E: IntoElement + Styled + 'static, T: Animatable> Styled for Transition<E, T> {
+    fn style(&mut self) -> &mut gpui::StyleRefinement {
+        self.element
+            .as_mut()
+            .expect("built before it is laid out")
+            .style()
+    }
+}
+
+impl<E, T> gpui::InteractiveElement for Transition<E, T>
+where
+    E: IntoElement + gpui::InteractiveElement + 'static,
+    T: Animatable,
+{
+    fn interactivity(&mut self) -> &mut gpui::Interactivity {
+        self.element
+            .as_mut()
+            .expect("built before it is laid out")
+            .interactivity()
+    }
+}
+
+impl<E, T> gpui::StatefulInteractiveElement for Transition<E, T>
+where
+    E: IntoElement + gpui::StatefulInteractiveElement + 'static,
+    T: Animatable,
+{
+}
+
+impl<E: IntoElement + gpui::ParentElement + 'static, T: Animatable> gpui::ParentElement
+    for Transition<E, T>
+{
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
+        self.element
+            .as_mut()
+            .expect("built before it is laid out")
+            .extend(elements)
+    }
+}
+
+// --- A height that glides ---
+
+/// A box whose height glides ([`SMOOTH`]) to its content's whenever that changes: a dialog whose
+/// rows come and go (a validation error, "Loading…") grows and shrinks instead of snapping — let
+/// the rows that come fade in ([`Appear::fade`]). The content keeps its natural height and is
+/// measured as it is drawn; the box follows from the next frame, clipping the content to its
+/// height — wrap the rows that come and go, not a field whose focus ring draws outside it. As wide
+/// as its parent lays it out. Off: the box is simply as tall as its content.
+pub fn glide_height(id: impl Into<ElementId>, content: impl IntoElement) -> GlideHeight {
+    GlideHeight {
+        id: id.into(),
+        content: Some(content.into_any_element()),
+    }
+}
+
+pub struct GlideHeight {
+    id: ElementId,
+    content: Option<AnyElement>,
+}
+
+/// The height of a [`GlideHeight`]: gliding from `from` to `to` (the content's, once measured)
+/// since `since`.
+#[derive(Default)]
+struct HeightGlide {
+    from: f32,
+    to: Option<f32>,
+    since: Option<Instant>,
+}
+
+impl HeightGlide {
+    /// The box's height now (`None` before the content was measured), and whether it still glides.
+    fn current(&self) -> (Option<f32>, bool) {
+        let Some(to) = self.to else {
+            return (None, false);
+        };
+        match self.since {
+            Some(since) => {
+                let (t, done) = SMOOTH.at(since.elapsed());
+                if done {
+                    (Some(to), false)
+                } else {
+                    (Some(lerp(self.from, to, t)), true)
+                }
+            }
+            None => (Some(to), false),
+        }
+    }
+
+    /// The content measured `natural` high: glide there from where the box is.
+    fn measured(&mut self, natural: f32) -> bool {
+        match self.to {
+            Some(to) if (to - natural).abs() < 0.5 => false,
+            Some(_) if enabled() => {
+                let (current, _) = self.current();
+                self.from = current.unwrap_or(natural);
+                self.to = Some(natural);
+                self.since = Some(Instant::now());
+                true
+            }
+            _ => {
+                *self = HeightGlide {
+                    from: natural,
+                    to: Some(natural),
+                    since: None,
+                };
+                false
+            }
+        }
+    }
+}
+
+impl IntoElement for GlideHeight {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for GlideHeight {
+    type RequestLayoutState = AnyElement;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, AnyElement) {
+        use gpui::{ParentElement as _, Styled as _};
+        let glide = window.with_element_state(
+            global_id.expect("a glide has an id"),
+            |state: Option<std::rc::Rc<std::cell::RefCell<HeightGlide>>>, _| {
+                let state = state.unwrap_or_default();
+                (state.clone(), state)
+            },
+        );
+        let (height, running) = if enabled() {
+            glide.borrow().current()
+        } else {
+            (None, false)
+        };
+        if running {
+            window.request_animation_frame();
+        }
+        let measure = gpui::canvas(
+            move |bounds, window, _| {
+                if glide.borrow_mut().measured(f32::from(bounds.size.height)) {
+                    window.request_animation_frame();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        let content = gpui::div()
+            .flex_none()
+            .relative()
+            .children(self.content.take())
+            .child(measure);
+        let mut element = gpui::div().flex().flex_col();
+        if let Some(height) = height {
+            element = element.h(px(height)).overflow_hidden();
+        }
+        let mut element = element.child(content).into_any_element();
         let layout_id = element.request_layout(window, cx);
         (layout_id, element)
     }

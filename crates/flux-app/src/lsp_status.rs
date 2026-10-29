@@ -12,7 +12,9 @@
 //! read-only (an open tab of it takes the fresh text).
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -27,6 +29,7 @@ use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
 use crate::lsp::{LspStore, ServerKey};
 use crate::lsp_settings::ConfigureServer;
+use crate::motion;
 use crate::notification_center::NotificationGroup;
 use crate::notifications::Notification;
 use crate::settings_view::Section;
@@ -329,6 +332,77 @@ fn log_path(temp: &Path, key: &ServerKey) -> PathBuf {
     temp.join("flux-lsp-logs").join(name)
 }
 
+// --- Motion ---
+
+/// A part of a popover that crossfades ([`motion::FADE`]) when what it shows changes — a server's
+/// state, the country check's verdict — but not when it first shows: it comes with its popover.
+/// `key` names what it shows (a state's kind, not its every percent). A candidate for
+/// `crate::motion`.
+#[derive(Default)]
+pub(crate) struct Crossfade {
+    shown: Option<u64>,
+    changes: usize,
+}
+
+impl Crossfade {
+    /// `element`, showing what `key` names: it fades in when that is new.
+    pub(crate) fn apply<E>(&mut self, id: &'static str, key: u64, element: E) -> AnyElement
+    where
+        E: Styled + IntoElement + 'static,
+    {
+        if self.shown.is_some_and(|shown| shown != key) {
+            self.changes += 1;
+        }
+        self.shown = Some(key);
+        if self.changes == 0 {
+            return element.into_any_element();
+        }
+        motion::Appear::fade().apply((id, self.changes), element)
+    }
+}
+
+/// `value`'s hash: the key of a [`Crossfade`], a stable element id.
+pub(crate) fn key_of(value: impl Hash) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The popup's rows in motion: a server's state crossfades as it changes; a server that comes
+/// while the popup is open fades in. The list's height glides ([`motion::glide_height`]) and the
+/// popup hangs above the status bar by its bottom edge: its top edge moves smoothly as rows grow
+/// (a project problem's cause line), come and go.
+#[derive(Default)]
+struct RowMotion {
+    states: HashMap<ServerKey, Crossfade>,
+    /// The servers of the popup's first frame (`None` before it): they come with the popup.
+    first: Option<HashSet<ServerKey>>,
+}
+
+impl RowMotion {
+    /// The rows of this frame: what is gone is forgotten.
+    fn begin(&mut self, rows: &[ServerRow]) {
+        let keys: HashSet<ServerKey> = rows.iter().map(|row| row.key.clone()).collect();
+        self.states.retain(|key, _| keys.contains(key));
+        self.first.get_or_insert(keys);
+    }
+
+    /// Whether the server `key` came after the popup opened.
+    fn came(&self, key: &ServerKey) -> bool {
+        self.first
+            .as_ref()
+            .is_some_and(|first| !first.contains(key))
+    }
+
+    /// The state line of the server `key`, `kind` naming what it says.
+    fn state(&mut self, key: &ServerKey, kind: u64, line: Div) -> AnyElement {
+        self.states
+            .entry(key.clone())
+            .or_default()
+            .apply("lsp-row-state", kind, line)
+    }
+}
+
 // --- The popup ---
 
 /// A server as the popup shows it ([`LspStore::overview`]).
@@ -474,6 +548,7 @@ pub struct ServersPopup {
     /// it too, as in JetBrains' popups.
     selected: usize,
     focus_handle: FocusHandle,
+    motion: RowMotion,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -496,6 +571,7 @@ impl ServersPopup {
             workspace,
             selected: 0,
             focus_handle: cx.focus_handle(),
+            motion: RowMotion::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -583,7 +659,7 @@ impl ServersPopup {
     }
 
     fn render_row(
-        &self,
+        &mut self,
         index: usize,
         row: &ServerRow,
         roots: bool,
@@ -681,6 +757,12 @@ impl ServersPopup {
             .text_color(color)
             .children(glyph)
             .child(div().min_w_0().truncate().child(state));
+        // Another state (not another percent of the same): it fades in.
+        let state_line = self.motion.state(
+            &row.key,
+            key_of(std::mem::discriminant(&row.state)),
+            state_line,
+        );
         // What it couldn't load the project over, when it printed that (cargo's error).
         let cause = match &row.state {
             RowState::Problem(_) => row
@@ -827,10 +909,19 @@ impl Render for ServersPopup {
             rows.first()
                 .is_some_and(|first| first.key.root != row.key.root)
         });
+        // A server that comes while the popup is open fades in (`crate::motion`).
+        self.motion.begin(&rows);
         let items: Vec<AnyElement> = rows
             .iter()
             .enumerate()
-            .map(|(index, row)| self.render_row(index, row, roots, cx).into_any_element())
+            .map(|(index, row)| {
+                let element = self.render_row(index, row, roots, cx);
+                if self.motion.came(&row.key) {
+                    motion::Appear::fade().apply(("lsp-row-in", key_of(&row.key)), element)
+                } else {
+                    element.into_any_element()
+                }
+            })
             .collect();
         let empty = items.is_empty().then(|| {
             div()
@@ -877,7 +968,9 @@ impl Render for ServersPopup {
                     .pb_1p5()
                     .child(ui::section_label(tr("Language Servers"), ui)),
             )
-            .child(
+            // Rows that grow, come and go: the list's height glides, the popup's top edge with it.
+            .child(motion::glide_height(
+                "lsp-servers-list",
                 div()
                     .px(px(INSET))
                     .pb(px(INSET))
@@ -886,7 +979,7 @@ impl Render for ServersPopup {
                     .gap_0p5()
                     .children(items)
                     .children(empty),
-            )
+            ))
             .child(ui::divider(ui))
             .child(div().p(px(INSET)).child(settings))
             .child(ui::divider(ui))

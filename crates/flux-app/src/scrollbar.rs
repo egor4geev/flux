@@ -81,6 +81,8 @@ const WIDGET_GAP: f32 = 4.;
 const WIDGET_BUTTON: f32 = 20.;
 const WIDGET_HEIGHT: f32 = WIDGET_BUTTON + 2. * 2. + 2.;
 const WIDGET_GROUP: &str = "problems-widget";
+/// The green check pops in from this scale.
+const CHECK_SCALE: f32 = 0.6;
 /// The Markdown layout buttons at the top right of an editor in Editor Only
 /// (`markdown_preview::render_toolbar`: 3 buttons of 26 px with gaps, padding and a border, 14 px
 /// from the edge) take that corner: the widget goes beside them.
@@ -104,6 +106,10 @@ pub struct ScrollbarState {
     drag: Option<Drag>,
     /// The marks under the mouse, for the tooltip.
     hover: Option<Hover>,
+    /// The tooltip leaving, and moving to other marks.
+    tooltip_motion: crate::git_gutter::PopupMotion<Hover>,
+    /// The problems widget's check, and its looks coming and going.
+    widget: WidgetState,
     /// The document's marks by line, while their sources stay the same.
     marks: Option<LineMarks>,
     /// The marks laid out on the lane, while neither they nor the lane change.
@@ -168,7 +174,7 @@ pub fn render(
         blocks,
     };
     let widget = problems_widget(editor, window, cx);
-    let tooltip = marks_tooltip(editor, cx);
+    let tooltip = marks_tooltip(editor, window, cx);
     Some(
         div()
             .absolute()
@@ -1276,11 +1282,19 @@ fn click_track(
         start_drag(editor, vertical, thumb.len / 2., at, true, cx);
         return;
     }
-    let current = editor.read(cx).scroll;
-    let current = if vertical { current.y } else { current.x };
     let towards = if at < thumb.start { -1. } else { 1. };
-    let scroll = (current + towards * page).clamp(0., thumb.max_scroll);
-    set_scroll(editor, vertical, scroll, cx);
+    if !vertical {
+        let scroll = (editor.read(cx).scroll.x + towards * page).clamp(0., thumb.max_scroll);
+        return set_scroll(editor, vertical, scroll, cx);
+    }
+    // A page glides, as Page Down does: from where a glide on its way is going, so quick clicks
+    // add up. A jump to the spot and a drag follow the mouse at once.
+    editor.update(cx, |editor, cx| {
+        let scroll = (editor.scroll_destination() + towards * page).clamp(0., thumb.max_scroll);
+        editor.autoscroll = None;
+        editor.glide_to(scroll);
+        cx.notify();
+    });
 }
 
 fn set_scroll(editor: &Entity<Editor>, vertical: bool, scroll: f32, cx: &mut App) {
@@ -1508,12 +1522,73 @@ fn hover_at(
 }
 
 /// The tooltip of the marks under the mouse: to the left of the lane, level with them (IntelliJ's
-/// error stripe shows its hint there).
-fn marks_tooltip(editor: &Editor, cx: &mut Context<Editor>) -> Option<AnyElement> {
-    let hover = editor.scrollbar.hover.as_ref()?;
-    if editor.scrollbar.drag.is_some() {
-        return None;
+/// error stripe shows its hint there). It grows out of the mark under the mouse; moved to other
+/// marks, it glides there and its rows fade in; gone, it fades out.
+fn marks_tooltip(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) -> Vec<AnyElement> {
+    let open = editor
+        .scrollbar
+        .hover
+        .clone()
+        .filter(|_| editor.scrollbar.drag.is_none());
+    // The lane doesn't scroll: the tooltip's place is the window's.
+    let leaving = editor.scrollbar.tooltip_motion.frame(
+        open.as_ref().map(|hover| (hover, f32::from(hover.y))),
+        |a, b| a.items == b.items && a.more == b.more,
+        window,
+    );
+    let mut elements = Vec::new();
+    if let Some((hover, progress)) = leaving {
+        let position = tooltip_position(&hover);
+        let panel = tooltip_panel(&hover, 1., cx);
+        let panel = crate::motion::inert(crate::motion::leaving_from(
+            panel,
+            progress,
+            point(position.x, hover.y),
+        ));
+        // Its own ids: the tooltip of other marks may be shown beside it.
+        elements.push(tooltip_overlay(
+            position,
+            div().id("scrollbar-marks-leaving").child(panel),
+        ));
     }
+    if let Some(hover) = open {
+        let fade = editor.scrollbar.tooltip_motion.content(window);
+        let offset = px(editor.scrollbar.tooltip_motion.offset(window));
+        let position = tooltip_position(&hover);
+        let position = point(position.x, position.y + offset);
+        let panel = crate::motion::Appear::pop((1., 0.)).apply_from(
+            "scrollbar-marks-pop",
+            point(position.x, hover.y + offset),
+            tooltip_panel(&hover, fade, cx),
+        );
+        elements.push(tooltip_overlay(position, panel));
+    }
+    elements
+}
+
+/// The tooltip's top right corner: left of the lane, its first row level with the marks.
+fn tooltip_position(hover: &Hover) -> Point<Pixels> {
+    point(hover.left - px(POPUP_GAP), hover.y - px(14.))
+}
+
+fn tooltip_overlay(position: Point<Pixels>, panel: impl IntoElement) -> AnyElement {
+    deferred(
+        anchored()
+            .anchor(Corner::TopRight)
+            .position(position)
+            .snap_to_window_with_margin(px(WINDOW_MARGIN))
+            .child(panel),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
+/// The tooltip's panel, its rows faded in to `fade` (0 → 1).
+fn tooltip_panel(hover: &Hover, fade: f32, cx: &mut Context<Editor>) -> gpui::Div {
     let ui = Theme::ui(cx);
     let rows = hover.items.iter().map(|item| match item {
         HoverItem::Problem {
@@ -1586,6 +1661,7 @@ fn marks_tooltip(editor: &Editor, cx: &mut Context<Editor>) -> Option<AnyElement
         .flex()
         .flex_col()
         .gap_1p5()
+        .opacity(fade)
         .children(rows)
         .when(hover.more > 0, |content| {
             content.child(
@@ -1595,24 +1671,7 @@ fn marks_tooltip(editor: &Editor, cx: &mut Context<Editor>) -> Option<AnyElement
                     .child(trf("and {0} more", &[&hover.more])),
             )
         });
-    // It grows out of the mark under the mouse, and follows the mouse along the lane at once.
-    let position = point(hover.left - px(POPUP_GAP), hover.y - px(14.));
-    let panel = crate::motion::Appear::pop((1., 0.)).apply_from(
-        "scrollbar-marks-pop",
-        point(position.x, hover.y),
-        popup::panel(ui).occlude().child(content),
-    );
-    Some(
-        deferred(
-            anchored()
-                .anchor(Corner::TopRight)
-                .position(position)
-                .snap_to_window_with_margin(px(WINDOW_MARGIN))
-                .child(panel),
-        )
-        .with_priority(1)
-        .into_any_element(),
-    )
+    popup::panel(ui).occlude().child(content)
 }
 
 /// "Added lines 3–5", "Lines deleted after line 7" — the lines from 1.
@@ -1634,14 +1693,16 @@ fn change_text(kind: HunkKind, lines: &Range<usize>) -> String {
 /// The problems widget at the editor's top right (IntelliJ's inspection widget): the numbers of
 /// errors, warnings and infos — a click goes to the next problem — and ↑ ↓ (⇧F2 / F2); a green
 /// check when the file's language servers have looked at it and found nothing. Nothing in a field,
-/// in a document no server checks, or while its servers are busy or couldn't load the project.
+/// in a document no server checks, or while its servers are busy or couldn't load the project
+/// before they ever found it clean. The check pops in, new numbers fade in, what it showed before
+/// fades out over them.
 fn problems_widget(
     editor: &mut Editor,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<Editor>,
-) -> Option<AnyElement> {
+) -> Vec<AnyElement> {
     if kind(editor) != Kind::Document {
-        return None;
+        return Vec::new();
     }
     let (errors, warnings) = editor.diagnostics.counts();
     let infos = editor
@@ -1649,26 +1710,130 @@ fn problems_widget(
         .iter()
         .filter(|d| d.severity == Severity::Info)
         .count();
+    let problems = errors + warnings + infos > 0;
     // The green check says the file is clean: only once its servers have looked at it — running,
     // with the project loaded and nothing in progress (a server that couldn't load the project
-    // reports nothing at all).
+    // reports nothing at all). Then it stays while they are busy again (every save sets
+    // rust-analyzer to work), until they find something or the file has no server.
     let settled = !editor.lsp.is_empty()
         && editor
             .lsp_store
             .as_ref()
             .and_then(|store| store.upgrade())
             .is_some_and(|store| store.read(cx).settled(cx.entity_id()));
-    if errors + warnings + infos == 0 && !settled {
-        return None;
+    let unserved = editor.lsp.is_empty();
+    let state = &mut editor.scrollbar.widget;
+    if problems || unserved {
+        state.clean = false;
+    } else if settled {
+        state.clean = true;
     }
+    let look = if problems {
+        Some(Look::Counts {
+            errors,
+            warnings,
+            infos,
+        })
+    } else {
+        state.clean.then_some(Look::Clean)
+    };
+    let since = state.show(look);
+    let leaving = state
+        .leaving
+        .as_ref()
+        .map(|leaving| (leaving.value, leaving.progress(window)));
     // A narrow editor (a split, a small window) keeps its text: the status bar has the numbers too.
     let narrow = editor
         .layout
         .as_ref()
         .is_some_and(|layout| layout.text_bounds.size.width < px(WIDGET_MIN_TEXT_WIDTH));
     if narrow {
-        return None;
+        return Vec::new();
     }
+    let mut elements = Vec::new();
+    if let Some(look) = look {
+        let curve = match look {
+            Look::Clean => crate::motion::BOUNCE,
+            Look::Counts { .. } => crate::motion::FADE,
+        };
+        let value = crate::motion::animate(since, curve, window);
+        elements.push(widget(editor, look, value, cx).into_any_element());
+    }
+    if let Some((look, progress)) = leaving {
+        // Over the new look, shrinking toward the edge it stands at; its own ids.
+        let widget =
+            crate::motion::leaving_style(widget(editor, look, 1., cx), progress, (1., 0.5));
+        elements.push(
+            crate::motion::inert(
+                div()
+                    .id("problems-widget-leaving")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .child(widget),
+            )
+            .into_any_element(),
+        );
+    }
+    elements
+}
+
+/// What the problems widget shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// The green check.
+    Clean,
+    Counts {
+        errors: usize,
+        warnings: usize,
+        infos: usize,
+    },
+}
+
+/// What the problems widget keeps between frames.
+#[derive(Default)]
+struct WidgetState {
+    /// The check is up: the servers found the file clean — it stays while they are busy again.
+    clean: bool,
+    /// What the widget shows, and since when.
+    shown: Option<(Look, Instant)>,
+    /// What it showed before, fading out.
+    leaving: Option<crate::motion::Leaving<Look>>,
+}
+
+impl WidgetState {
+    /// This frame shows `look` (`None` — no widget): since when it does. What it showed before
+    /// starts leaving.
+    fn show(&mut self, look: Option<Look>) -> Instant {
+        let now = Instant::now();
+        if self
+            .leaving
+            .as_ref()
+            .is_some_and(crate::motion::Leaving::done)
+        {
+            self.leaving = None;
+        }
+        match self.shown {
+            Some((shown, since)) if Some(shown) == look => return since,
+            Some((shown, _)) if crate::motion::enabled() => {
+                self.leaving = Some(crate::motion::Leaving::new(shown));
+            }
+            _ => {}
+        }
+        self.shown = look.map(|look| (look, now));
+        now
+    }
+}
+
+/// The widget showing `look`, `value` of its way in (0 → 1): the check grows from small with a
+/// bounce, the numbers fade in.
+fn widget(
+    editor: &mut Editor,
+    look: Look,
+    value: f32,
+    cx: &mut Context<Editor>,
+) -> gpui::Stateful<gpui::Div> {
     let ui = Theme::ui(cx);
     // The Markdown layout buttons sit at the top right in Editor Only.
     let markdown = crate::markdown_preview::layout(editor, cx) == Some(MarkdownLayout::Editor);
@@ -1703,48 +1868,64 @@ fn problems_widget(
             .child(icon(name, color).size(px(13.)))
             .child(count.to_string())
     };
-    let summary: AnyElement = if errors + warnings + infos == 0 {
-        div()
-            .id("problems-widget-none")
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(WIDGET_BUTTON))
-            .rounded(px(ui::RADIUS_SM))
-            .child(icon(IconName::CheckCircle, ui.success).size(px(14.)))
-            .tooltip(ui::tooltip(tr("No problems"), None))
-            .into_any_element()
-    } else {
-        let tooltip = if infos > 0 {
-            trf(
-                "Errors: {0} · Warnings: {1} · Info: {2}",
-                &[&errors, &warnings, &infos],
-            )
-        } else {
-            trf("Errors: {0} · Warnings: {1}", &[&errors, &warnings])
-        };
-        div()
-            .id("problems-widget-counts")
-            .flex()
-            .items_center()
-            .gap_2()
-            .h(px(WIDGET_BUTTON))
-            .px_1p5()
-            .rounded(px(ui::RADIUS_SM))
-            .cursor_pointer()
-            .hover(move |style| style.bg(ui.hover))
-            .when(errors > 0, |item| {
-                item.child(count(IconName::Error, ui.error, errors))
-            })
-            .when(warnings > 0, |item| {
-                item.child(count(IconName::Warning, ui.warning, warnings))
-            })
-            .when(infos > 0, |item| {
-                item.child(count(IconName::Info, ui.info, infos))
-            })
-            .tooltip(ui::tooltip(tooltip, ui::shortcut_for(&NextProblem, cx)))
-            .on_click(go(true))
-            .into_any_element()
+    let (summary, problems, fade): (AnyElement, bool, f32) = match look {
+        Look::Clean => {
+            let check = crate::motion::Appear::pop((0.5, 0.5))
+                .curve(crate::motion::BOUNCE)
+                .scale(CHECK_SCALE)
+                .style(
+                    div()
+                        .flex()
+                        .child(icon(IconName::CheckCircle, ui.success).size(px(14.))),
+                    value,
+                );
+            let summary = div()
+                .id("problems-widget-none")
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(WIDGET_BUTTON))
+                .rounded(px(ui::RADIUS_SM))
+                .child(check)
+                .tooltip(ui::tooltip(tr("No problems"), None));
+            (summary.into_any_element(), false, 1.)
+        }
+        Look::Counts {
+            errors,
+            warnings,
+            infos,
+        } => {
+            let tooltip = if infos > 0 {
+                trf(
+                    "Errors: {0} · Warnings: {1} · Info: {2}",
+                    &[&errors, &warnings, &infos],
+                )
+            } else {
+                trf("Errors: {0} · Warnings: {1}", &[&errors, &warnings])
+            };
+            let summary = div()
+                .id("problems-widget-counts")
+                .flex()
+                .items_center()
+                .gap_2()
+                .h(px(WIDGET_BUTTON))
+                .px_1p5()
+                .rounded(px(ui::RADIUS_SM))
+                .cursor_pointer()
+                .hover(move |style| style.bg(ui.hover))
+                .when(errors > 0, |item| {
+                    item.child(count(IconName::Error, ui.error, errors))
+                })
+                .when(warnings > 0, |item| {
+                    item.child(count(IconName::Warning, ui.warning, warnings))
+                })
+                .when(infos > 0, |item| {
+                    item.child(count(IconName::Info, ui.info, infos))
+                })
+                .tooltip(ui::tooltip(tooltip, ui::shortcut_for(&NextProblem, cx)))
+                .on_click(go(true));
+            (summary.into_any_element(), true, value.clamp(0., 1.))
+        }
     };
     let arrow = |id: &'static str, name: IconName, label: &'static str, forward: bool| {
         let action: Box<dyn gpui::Action> = if forward {
@@ -1768,55 +1949,57 @@ fn problems_widget(
             ))
             .on_click(go(forward))
     };
-    let problems = errors + warnings + infos > 0;
-    Some(
-        div()
-            .id("problems-widget")
-            .absolute()
-            .top(px(top))
-            .right(px(right))
-            .flex()
-            .items_center()
-            .gap(px(2.))
-            .p(px(2.))
-            .rounded(px(ui::RADIUS_MD))
-            // The text under it is hidden: the island's color without its glass; the border as
-            // the Markdown layout buttons have.
-            .bg(UiColors::tint(ui.island, 1.))
-            .border_1()
-            .border_color(ui.divider)
-            .font_family(theme::UI_FONT)
-            .text_size(px(theme::TEXT_SM))
-            .text_color(ui.text_muted)
-            .block_mouse_except_scroll()
-            .group(WIDGET_GROUP)
-            .child(
-                // Quieter until the mouse comes to it, as the Markdown layout buttons.
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .opacity(0.8)
-                    .group_hover(WIDGET_GROUP, |content| content.opacity(1.))
-                    .child(summary)
-                    .when(problems, |content| {
-                        content
-                            .child(arrow(
-                                "problems-widget-previous",
-                                IconName::ArrowUp,
-                                "Previous Problem",
-                                false,
-                            ))
-                            .child(arrow(
-                                "problems-widget-next",
-                                IconName::ArrowDown,
-                                "Next Problem",
-                                true,
-                            ))
-                    }),
-            )
-            .into_any_element(),
-    )
+    div()
+        .id("problems-widget")
+        .absolute()
+        .top(px(top))
+        .right(px(right))
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .p(px(2.))
+        .rounded(px(ui::RADIUS_MD))
+        // The text under it is hidden: the island's color without its glass; the border as
+        // the Markdown layout buttons have.
+        .bg(UiColors::tint(ui.island, 1.))
+        .border_1()
+        .border_color(ui.divider)
+        .font_family(theme::UI_FONT)
+        .text_size(px(theme::TEXT_SM))
+        .text_color(ui.text_muted)
+        .block_mouse_except_scroll()
+        .group(WIDGET_GROUP)
+        .child(
+            // Quieter until the mouse comes to it, as the Markdown layout buttons; an id, so it
+            // brightens and dims smoothly.
+            div()
+                .id("problems-widget-content")
+                .opacity(0.8)
+                .group_hover(WIDGET_GROUP, |content| content.opacity(1.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.))
+                        .opacity(fade)
+                        .child(summary)
+                        .when(problems, |content| {
+                            content
+                                .child(arrow(
+                                    "problems-widget-previous",
+                                    IconName::ArrowUp,
+                                    "Previous Problem",
+                                    false,
+                                ))
+                                .child(arrow(
+                                    "problems-widget-next",
+                                    IconName::ArrowDown,
+                                    "Next Problem",
+                                    true,
+                                ))
+                        }),
+                ),
+        )
 }
 
 // --- macOS ---

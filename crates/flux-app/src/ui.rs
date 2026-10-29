@@ -310,11 +310,6 @@ pub fn popover_shadow(ui: UiColors) -> Vec<BoxShadow> {
     ]
 }
 
-/// Focus ring around a field: an accent border plus a soft glow.
-pub fn focus_ring(ui: UiColors) -> Vec<BoxShadow> {
-    focus_ring_at(ui, 1., false)
-}
-
 /// How wide the focus ring is, and how wide it comes in before it closes around the field.
 const RING_SPREAD: f32 = 3.;
 const HALO_SPREAD: f32 = 10.;
@@ -339,7 +334,7 @@ pub fn focus_ring_at(ui: UiColors, t: f32, coming: bool) -> Vec<BoxShadow> {
     }]
 }
 
-/// A field's [`focus_ring`] that comes and goes: on focus the halo comes in wide and settles around
+/// A field's focus ring ([`focus_ring_at`]) that comes and goes: on focus the halo comes in wide and settles around
 /// the field ([`motion::POP`]), on blur it fades ([`motion::FADE`]). `id` keeps it between frames
 /// (unique among the field's siblings); a field that is drawn focused at once has its ring at once.
 /// Not on the path of typing: it moves when the focus does.
@@ -494,6 +489,11 @@ pub fn text_button(
     danger: bool,
     ui: UiColors,
 ) -> Stateful<Div> {
+    text_button_frame(id, danger, ui).child(label.into())
+}
+
+/// A [`text_button`] without its label.
+fn text_button_frame(id: impl Into<ElementId>, danger: bool, ui: UiColors) -> Stateful<Div> {
     div()
         .id(id)
         .flex_none()
@@ -509,7 +509,81 @@ pub fn text_button(
         .cursor_pointer()
         .hover(move |style| style.bg(ui.hover))
         .active(move |style| motion::press(style.bg(ui.pressed)))
-        .child(label.into())
+}
+
+/// How much an unavailable button is dimmed ([`available`]).
+pub const UNAVAILABLE_OPACITY: f32 = 0.5;
+
+/// A button — [`text_button`], [`icon_button`], [`primary_button`] — available or not: unavailable,
+/// it is dimmed, takes no hover or press (no backdrop, no spring) and shows the arrow; the caller
+/// adds `on_click` only when it is available. Dimming and coming back fade ([`motion::FADE`]), as a
+/// button becomes unavailable while a task runs. The button stays buildable (`on_click`, `tooltip`,
+/// styles); its id keys the fade.
+pub fn available(button: Stateful<Div>, enabled: bool) -> motion::Transition<Stateful<Div>, f32> {
+    let mut button = button;
+    let id = ElementId::NamedChild(
+        Box::new(
+            button
+                .interactivity()
+                .element_id
+                .clone()
+                .unwrap_or_else(|| "button".into()),
+        ),
+        "available".into(),
+    );
+    if !enabled {
+        button.interactivity().clear_interaction_styles();
+        button = button.cursor_default();
+    }
+    let target = if enabled { 1. } else { UNAVAILABLE_OPACITY };
+    button.with_transition(id, target, motion::FADE, |button, opacity| {
+        button.opacity(opacity)
+    })
+}
+
+/// How long a Copy button says "Copied" ([`copy_button`]).
+pub const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// When a Copy button ([`copy_button`]) was last pressed, kept by its view.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Copied(Option<std::time::Instant>);
+
+impl Copied {
+    /// Copied now: the button says so for [`COPIED_FOR`], and the view is drawn again when it stops.
+    pub fn now<V: 'static>(&mut self, cx: &mut Context<V>) {
+        self.0 = Some(std::time::Instant::now());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPIED_FOR).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    /// The button says "Copied".
+    pub fn showing(&self) -> bool {
+        self.0.is_some_and(|at| at.elapsed() < COPIED_FOR)
+    }
+}
+
+/// A [`text_button`] that copies: "Copy", and for a moment after a press ([`Copied::now`]) a check
+/// and "Copied" in the success color; the label crossfades ([`motion::FADE`]) both ways.
+pub fn copy_button(id: impl Into<ElementId>, copied: &Copied, ui: UiColors) -> Stateful<Div> {
+    let copied = copied.showing();
+    let label = if copied {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_color(ui.success)
+            .child(icon(IconName::Check, ui.success).size(px(12.)))
+            .child(crate::i18n::tr("Copied"))
+    } else {
+        div().child(crate::i18n::tr("Copy"))
+    };
+    // Keyed by what it says: the new label fades in where the old one was.
+    text_button_frame(id, false, ui)
+        .child(motion::Appear::fade().apply(if copied { "copied" } else { "copy" }, label))
 }
 
 /// An on/off switch: a pill with a knob, accent when on. Flipped, the knob glides across with a
@@ -703,13 +777,33 @@ fn mark_curve(on: bool) -> motion::Curve {
 }
 
 /// A checkbox: empty, checked (accent with a check), or partly checked (accent with a dash).
-/// Checked, the accent floods in and the mark pops; unchecked, both fade.
+/// Checked, the accent floods in and the mark pops; unchecked, both fade. Between checked and
+/// partly checked the accent stays and the marks swap: the new one pops in as the old one shrinks
+/// away.
 pub fn checkbox(id: impl Into<gpui::ElementId>, state: CheckState, ui: UiColors) -> Stateful<Div> {
     let on = state != CheckState::Unchecked;
-    // What fades out after unchecking was most likely a check.
-    let mark = match state {
-        CheckState::Partial => IconName::Minus,
-        CheckState::Checked | CheckState::Unchecked => IconName::Check,
+    // How much of the fill, the check and the dash shows.
+    let target = match state {
+        CheckState::Checked => [1., 1., 0., 0.],
+        CheckState::Partial => [1., 0., 1., 0.],
+        CheckState::Unchecked => [0., 0., 0., 0.],
+    };
+    // A mark, `t` of the way in (past 1: the bounce's overshoot).
+    let mark = move |name: IconName, t: f32| {
+        (t > 0.).then(|| {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(t.min(1.))
+                .child(
+                    icon(name, ui.on_accent)
+                        .size(px(11.))
+                        .transform_scale(motion::lerp(MARK_SCALE, 1., t)),
+                )
+        })
     };
     div()
         .id(id)
@@ -737,18 +831,17 @@ pub fn checkbox(id: impl Into<gpui::ElementId>, state: CheckState, ui: UiColors)
                 .justify_center()
                 .rounded(px(4.))
                 .with_transition(
-                    "check",
-                    if on { 1. } else { 0. },
+                    "mark",
+                    target,
                     mark_curve(on),
-                    move |fill, t| {
+                    move |fill, [t, check, dash, _]| {
                         if t <= 0. {
                             return fill;
                         }
-                        fill.bg(ui.accent).opacity(t.min(1.)).child(
-                            icon(mark, ui.on_accent)
-                                .size(px(11.))
-                                .transform_scale(motion::lerp(MARK_SCALE, 1., t)),
-                        )
+                        fill.bg(ui.accent)
+                            .opacity(t.min(1.))
+                            .children(mark(IconName::Check, check))
+                            .children(mark(IconName::Minus, dash))
                     },
                 ),
         )
@@ -985,10 +1078,11 @@ pub fn tooltip(
     keys: Option<SharedString>,
 ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     let text = text.into();
-    move |_, cx| {
+    move |window, cx| {
         let tooltip = Tooltip {
             text: text.clone(),
             keys: keys.clone(),
+            handoff: window.tooltip_handoff(),
         };
         cx.new(|_| tooltip).into()
     }
@@ -1000,6 +1094,8 @@ const TOOLTIP_SCALE: f32 = 0.94;
 struct Tooltip {
     text: SharedString,
     keys: Option<SharedString>,
+    /// Shown at once after another tooltip (moving along a toolbar): it only fades in.
+    handoff: bool,
 }
 
 impl Render for Tooltip {
@@ -1007,8 +1103,14 @@ impl Render for Tooltip {
         let ui = Theme::ui(cx);
         // gpui puts the tooltip at the mouse point; the offset moves it out from under the cursor.
         // It pops out of the corner by the pointer, once: a tooltip is made anew each time it shows.
+        // Right after another one it shows at once and only fades in (gpui: `tooltip_handoff`).
+        let appear = if self.handoff {
+            motion::Appear::fade()
+        } else {
+            motion::Appear::pop((0., 0.)).scale(TOOLTIP_SCALE)
+        };
         div().pl(px(10.)).pt(px(18.)).child(
-            motion::Appear::pop((0., 0.)).scale(TOOLTIP_SCALE).apply(
+            appear.apply(
                 "tooltip",
                 div()
                     .flex()

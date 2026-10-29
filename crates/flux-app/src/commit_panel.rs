@@ -32,14 +32,25 @@
 //! no conflicts left; the message comes from git's MERGE_MSG) — the commit concludes the merge.
 //! A rollback asks first, then git puts the files back and the open documents follow (one undoable
 //! edit each, saved).
+//!
+//! Motion (`crate::motion`): a node the user opens turns its chevron and unfolds its rows; rows
+//! that arrive with a new status (a file entering a changelist, a new file) unfold one after
+//! another, and the empty state fades in. The rows are recycled, so their arrivals are kept here, by
+//! key and time. The tab's underline glides to the tab chosen and its content fades in; the
+//! selection's color fades when the list gains or loses focus (a selection moved with the keyboard
+//! is there at once); a message put into the field (Claude's, Amend's, the history's) fades in.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::f32::consts::TAU;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use flux_core::Rope;
 use flux_git::{
@@ -51,7 +62,7 @@ use gpui::{
     CursorStyle, DismissEvent, Div, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, Pixels, Point, Render,
     ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window, actions,
-    div, prelude::*, px, uniform_list,
+    canvas, div, prelude::*, px, uniform_list,
 };
 
 use crate::claude::{self, ClaudeStore, ClaudeStoreEvent};
@@ -61,7 +72,7 @@ use crate::editor::{self, Editor};
 use crate::git::{self, Change, CheckState, GitEvent, GitStore};
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{self, IconName, file_icon, folder_icon, icon};
-use crate::motion::{Disclosure, unfold_style};
+use crate::motion::{self, Appear, Disclosure, TransitionExt, unfold_style};
 use crate::notification_center::NotificationGroup;
 use crate::notifications::Notification;
 use crate::rename::difference;
@@ -99,6 +110,12 @@ const MESSAGE_EXAMPLES: usize = 10;
 const DIFF_CONTEXT: u32 = 3;
 /// The model that writes commit messages: quick and cheap.
 const MESSAGE_MODEL: &str = "haiku";
+/// Rows arriving together unfold one after another, this far apart, at most [`ARRIVAL_CAP`] rows'
+/// worth.
+const ARRIVAL_STEP: Duration = Duration::from_millis(16);
+const ARRIVAL_CAP: usize = 12;
+/// One breath of Claude's mark while it writes the message.
+const GENERATING_PULSE: Duration = Duration::from_millis(1000);
 
 // The list of changes (context "CommitChanges"): the message field is outside it, so Space and the
 // arrows keep typing there.
@@ -684,8 +701,14 @@ pub struct CommitPanel {
     git: Entity<GitStore>,
     /// The tab shown: the commit or the stashes.
     tab: CommitTab,
+    /// Where the tabs are, for the underline gliding between them.
+    tab_places: Rc<TabPlaces>,
+    /// When the tab was switched: its content fades in.
+    tab_switched: Option<Instant>,
     stash: Entity<StashPanel>,
     message: Entity<Editor>,
+    /// When a message was last put into the field (not typed): the text fades in.
+    message_replaced: Option<Instant>,
     /// The message of a merge in progress (git's MERGE_MSG) put into an empty field: it goes away
     /// with the merge, unless it was edited.
     merge_message: Option<String>,
@@ -702,6 +725,10 @@ pub struct CommitPanel {
     /// The changes and the visible rows, rebuilt when the git status or the view changes.
     changes: Vec<Change>,
     rows: Vec<Row>,
+    /// Rows that arrived with a new status, and when they start to unfold: kept until they have.
+    arrivals: HashMap<RowKey, Instant>,
+    /// The rows were built from a status read whole: from now on, new rows arrive.
+    rows_settled: bool,
     selected: Option<RowKey>,
     /// A commit is running: the buttons wait.
     committing: bool,
@@ -723,6 +750,8 @@ pub struct CommitPanel {
     claude_checked: HashSet<EntityId>,
     /// Claude writes the commit message.
     generating: Option<Task<()>>,
+    /// When it started: Claude's mark pulses from then.
+    generating_since: Option<Instant>,
     /// Kills its `claude -p`: a second click, or the country check blocking Claude.
     generating_stop: Option<Arc<AtomicBool>>,
     _subscriptions: Vec<Subscription>,
@@ -741,7 +770,7 @@ impl CommitPanel {
         let message = cx.new(|cx| Editor::message(tr("Commit Message"), window, cx));
         let stash = cx.new(|cx| StashPanel::new(git.clone(), window, cx));
         let subscriptions = vec![
-            cx.observe(&git, |this, _, cx| this.rebuild(cx)),
+            cx.observe(&git, |this, _, cx| this.changes_changed(cx)),
             // Not every event: a streaming answer notifies the store with each token.
             cx.subscribe(
                 &claude,
@@ -762,8 +791,11 @@ impl CommitPanel {
         let mut panel = Self {
             git,
             tab: CommitTab::Commit,
+            tab_places: Rc::default(),
+            tab_switched: None,
             stash,
             message,
+            message_replaced: None,
             merge_message: None,
             amend: false,
             amend_message: None,
@@ -773,6 +805,8 @@ impl CommitPanel {
             disclosure: Disclosure::default(),
             changes: Vec::new(),
             rows: Vec::new(),
+            arrivals: HashMap::new(),
+            rows_settled: false,
             selected: None,
             committing: false,
             focus_handle: cx.focus_handle(),
@@ -786,12 +820,13 @@ impl CommitPanel {
             claude_groups: ClaudeGroups::default(),
             claude_checked: HashSet::new(),
             generating: None,
+            generating_since: None,
             generating_stop: None,
             _subscriptions: subscriptions,
         };
         panel.claude_lists = panel.read_claude_lists(cx);
         panel.claude_groups = ClaudeGroups::build(&panel.claude_lists);
-        panel.rebuild(cx);
+        panel.changes_changed(cx);
         panel
     }
 
@@ -837,6 +872,7 @@ impl CommitPanel {
             return;
         }
         self.tab = tab;
+        self.tab_switched = motion::enabled().then(Instant::now);
         self.stash.update(cx, |stash, cx| {
             stash.set_active(tab == CommitTab::Stash, cx)
         });
@@ -854,6 +890,40 @@ impl CommitPanel {
     }
 
     // --- The tree ---
+
+    /// The changes changed (git's status, Claude's changelists): the rows are rebuilt, and those
+    /// that weren't there before — or were under another node (a file entering a changelist) —
+    /// unfold as they arrive, one after another. Not while the status is still coming in: then the
+    /// list simply shows.
+    fn changes_changed(&mut self, cx: &mut Context<Self>) {
+        let before = (self.rows_settled && motion::enabled())
+            .then(|| places(&self.rows).into_iter().collect::<HashSet<_>>());
+        self.rebuild(cx);
+        self.rows_settled = self.status_loaded(cx);
+        self.arrivals
+            .retain(|_, since| motion::running(*since, motion::SMOOTH));
+        let Some(before) = before else {
+            return;
+        };
+        let now = Instant::now();
+        let arrived = places(&self.rows)
+            .into_iter()
+            .filter(|place| !before.contains(place));
+        for (index, (key, _)) in arrived.enumerate() {
+            let delay = motion::stagger(index, ARRIVAL_STEP, ARRIVAL_CAP);
+            self.arrivals.insert(key, now + delay);
+        }
+    }
+
+    /// Git's status is in for every repository.
+    fn status_loaded(&self, cx: &App) -> bool {
+        let git = self.git.read(cx);
+        !git.is_discovering()
+            && git
+                .repos()
+                .iter()
+                .all(|repo| repo.status.branch != Default::default())
+    }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let git = self.git.read(cx);
@@ -952,7 +1022,7 @@ impl CommitPanel {
         if lists != self.claude_lists {
             self.claude_lists = lists;
             self.claude_groups = ClaudeGroups::build(&self.claude_lists);
-            self.rebuild(cx);
+            self.changes_changed(cx);
         } else {
             // The generate button follows `claude`'s state.
             cx.notify();
@@ -963,15 +1033,7 @@ impl CommitPanel {
     /// since Claude changed them: once git's status is in, those leave its changelist. A session
     /// seen running isn't checked — its newest edit may not be in the status yet.
     fn check_stopped_sessions(&mut self, cx: &mut Context<Self>) {
-        let ready = {
-            let git = self.git.read(cx);
-            !git.is_discovering()
-                && git
-                    .repos()
-                    .iter()
-                    .all(|repo| repo.status.branch != Default::default())
-        };
-        if !ready || self.claude_lists.is_empty() {
+        if !self.status_loaded(cx) || self.claude_lists.is_empty() {
             return;
         }
         let changed: HashSet<&Path> = self
@@ -2037,20 +2099,27 @@ impl CommitPanel {
     }
 
     /// Puts a message into the field (Amend, the history, a merge's message): one undoable edit,
-    /// and the field shows its start (a long first line doesn't leave it scrolled to its end).
+    /// and the field shows its start (a long first line doesn't leave it scrolled to its end). The
+    /// new text fades in (typing never comes here).
     pub(crate) fn set_message(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.message.update(cx, |editor, cx| {
+        let replaced = self.message.update(cx, |editor, cx| {
             let new = Rope::from_str(text);
-            if let Some((range, text)) = difference(editor.document.text(), &new) {
-                editor.replace_ranges(vec![(range, text)], cx);
-                editor
-                    .document
-                    .set_selection(flux_core::Selection::point(0));
-                editor.scroll = gpui::point(0., 0.);
-                editor.autoscroll = None;
-                cx.notify();
-            }
+            let Some((range, text)) = difference(editor.document.text(), &new) else {
+                return false;
+            };
+            editor.replace_ranges(vec![(range, text)], cx);
+            editor
+                .document
+                .set_selection(flux_core::Selection::point(0));
+            editor.scroll = gpui::point(0., 0.);
+            editor.autoscroll = None;
+            cx.notify();
+            true
         });
+        if replaced && motion::enabled() {
+            self.message_replaced = Some(Instant::now());
+            cx.notify();
+        }
     }
 
     /// The repository whose history and last commit the message field uses: of the first checked
@@ -2195,6 +2264,7 @@ impl CommitPanel {
             .collect();
         let stop = crate::region_guard::stop_flag(cx);
         self.generating_stop = Some(stop.clone());
+        self.generating_since = Some(Instant::now());
         self.generating = Some(cx.spawn(async move |this, cx| {
             let mut files = Vec::new();
             for ((change, partial), base) in items.into_iter().zip(bases) {
@@ -2400,9 +2470,12 @@ impl CommitPanel {
 
     // --- Rendering ---
 
-    /// The tabs: "Commit" and "Stash", as the tool window tabs of JetBrains IDEs.
+    /// The tabs: "Commit" and "Stash", as the tool window tabs of JetBrains IDEs. The active one is
+    /// underlined with the accent; the underline glides to the tab chosen ([`motion::SMOOTH`]).
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
+        let places = self.tab_places.clone();
+        let active_place = places.get(self.tab);
         let tab =
             |id: &'static str, label: &'static str, tab: CommitTab, cx: &mut Context<Self>| {
                 let active = self.tab == tab;
@@ -2415,8 +2488,11 @@ impl CommitPanel {
                     .flex()
                     .items_center()
                     .cursor_pointer()
+                    .child(places.measure(tab))
                     .child(
                         ui::section_label(label, ui)
+                            // An id: the hover color fades.
+                            .id(SharedString::from(format!("{id}-label")))
                             .when(active, |label| label.text_color(ui.foreground))
                             .when(!active, |label| {
                                 label.group_hover(group.clone(), move |style| {
@@ -2424,18 +2500,9 @@ impl CommitPanel {
                                 })
                             }),
                     )
-                    // The active tab is underlined with the accent.
-                    .when(active, |tab| {
-                        tab.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .bottom(px(7.))
-                                .h(px(2.))
-                                .rounded(px(1.))
-                                .bg(ui.accent),
-                        )
+                    // Until the tabs are measured (the first frame), the underline sits in the tab.
+                    .when(active && active_place.is_none(), |element| {
+                        element.child(tab_underline(ui).left_0().right_0())
                     })
                     // A click on a tab is a move into it: its list takes focus.
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -2443,14 +2510,24 @@ impl CommitPanel {
                         this.focus_changes(window, cx);
                     }))
             };
+        let underline = active_place.map(|place| {
+            tab_underline(ui).with_transition(
+                "commit-tab-underline",
+                place,
+                motion::SMOOTH,
+                |line, (left, width)| line.left(px(left)).w(px(width)),
+            )
+        });
         div()
             .flex_none()
+            .relative()
             .h(px(HEADER_HEIGHT))
             .pl(px(ROW_INSET + ROW_PADDING + 2.))
             .pr(px(ROW_INSET))
             .flex()
             .items_center()
             .gap_4()
+            .child(places.measure_origin())
             .child(tab(
                 "commit-tab-commit",
                 tr("Commit"),
@@ -2458,6 +2535,7 @@ impl CommitPanel {
                 cx,
             ))
             .child(tab("commit-tab-stash", tr("Stash"), CommitTab::Stash, cx))
+            .children(underline)
     }
 
     /// The toolbar of the tab shown, under the tabs.
@@ -2761,8 +2839,11 @@ impl CommitPanel {
                 })
         });
         let key = row.key.clone();
+        let id = row_id(&key);
         let (click, secondary, toggle) = (key.clone(), key.clone(), key.clone());
         let body = div()
+            // An id: the hover backdrop fades.
+            .id(("commit-row-body", id))
             .size_full()
             .flex()
             .items_center()
@@ -2770,10 +2851,8 @@ impl CommitPanel {
             .pl(px(ROW_PADDING + row.depth as f32 * INDENT))
             .pr_2()
             .rounded(px(RADIUS_SM))
-            .map(|body| match (selected, focused) {
-                (true, true) => body.bg(ui.list_selected),
-                (true, false) => body.bg(ui.list_selected_inactive),
-                _ => body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover)),
+            .when(!selected, |body| {
+                body.group_hover(ROW_GROUP, move |style| style.bg(ui.hover))
             })
             .child(chevron(
                 row.expandable(),
@@ -2781,7 +2860,7 @@ impl CommitPanel {
                 ui,
             ))
             .child(if checkable {
-                ui::checkbox(("check", index), state, ui)
+                ui::checkbox(("commit-check", id), state, ui)
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         window.focus(&this.focus_handle);
                         this.toggle_row(&toggle, cx);
@@ -2812,6 +2891,7 @@ impl CommitPanel {
                     .child(detail)
             }))
             .children(resolve.map(|resolve| div().flex_1().flex().justify_end().child(resolve)));
+        let body = selection(body, ("commit-row-selected", id), selected, focused, ui);
         let row = div()
             .id(index)
             .group(ROW_GROUP)
@@ -2830,29 +2910,41 @@ impl CommitPanel {
                 }),
             )
             .child(body);
-        unfold_style(row, self.disclosure.unfold(index, window)).into_any_element()
+        let arrived = self
+            .arrivals
+            .get(&key)
+            .map_or(1., |since| motion::animate(*since, motion::SMOOTH, window));
+        let unfold = self.disclosure.unfold(index, window).min(arrived);
+        unfold_style(row, unfold).into_any_element()
     }
 
-    /// No changes, no repository, or still looking for repositories.
-    fn render_empty(&self, cx: &App) -> impl IntoElement + use<> {
+    /// No changes, no repository, or still looking for repositories: it fades in (each of them).
+    fn render_empty(&self, cx: &App) -> AnyElement {
         let ui = Theme::ui(cx);
         let git = self.git.read(cx);
-        let (glyph, title, hint) = if git.is_discovering() {
-            (IconName::Refresh, tr("Looking for repositories…"), None)
+        let (id, glyph, title, hint) = if git.is_discovering() {
+            (
+                0usize,
+                IconName::Refresh,
+                tr("Looking for repositories…"),
+                None,
+            )
         } else if git.repos().is_empty() {
             (
+                1,
                 IconName::Branch,
                 tr("No Git repository"),
                 Some(tr("Open a folder with a repository: ⌘O")),
             )
         } else {
             (
+                2,
                 IconName::Check,
                 tr("No changes"),
                 Some(tr("Edits to the project's files show up here")),
             )
         };
-        div()
+        let empty = div()
             .size_full()
             .flex()
             .flex_col()
@@ -2868,16 +2960,22 @@ impl CommitPanel {
                     .text_color(ui.dim)
                     .text_center()
                     .child(hint)
-            }))
+            }));
+        Appear::fade().apply(("commit-empty", id), empty)
     }
 
+    /// The message field: its focus ring comes and goes (`ui::focus_field`); a message put into it
+    /// fades in.
     fn render_message(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let focused = self.message.focus_handle(cx).is_focused(window);
         let generate = self.can_generate(cx);
         // The text keeps clear of the buttons in the corner.
         let buttons = if generate { 2. } else { 1. };
-        div()
+        let shown = self
+            .message_replaced
+            .map_or(1., |since| motion::animate(since, motion::FADE, window));
+        let field = div()
             .flex_none()
             .relative()
             .h(px(MESSAGE_HEIGHT))
@@ -2888,13 +2986,12 @@ impl CommitPanel {
             .rounded(px(RADIUS_MD))
             .bg(ui.input_background)
             .border_1()
-            .border_color(if focused {
-                ui.focus_border
-            } else {
-                ui.input_border
-            })
-            .when(focused, |field| field.shadow(ui::focus_ring(ui)))
-            .child(self.message.clone())
+            .child(
+                div()
+                    .size_full()
+                    .when(shown < 1., |text| text.opacity(shown))
+                    .child(self.message.clone()),
+            )
             .child(
                 div()
                     .absolute()
@@ -2915,36 +3012,49 @@ impl CommitPanel {
                                 }),
                             ),
                     ),
-            )
+            );
+        ui::focus_field(field, "commit-message-field", focused, ui)
     }
 
-    /// Claude's mark in the message field: writes the message; while it does, the mark pulses and
-    /// a click stops it.
+    /// Claude's mark in the message field: writes the message; while it does, the mark is a toggle
+    /// that is on (its backdrop and color crossfade in), it pulses, and a click stops it. With
+    /// motion off it doesn't pulse: the toggle alone shows it.
     fn render_generate_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
         let generating = self.generating.is_some();
-        let button = if generating {
-            ui::toggle_button("commit-generate", IconName::Claude, true, ui)
-                .tooltip(ui::tooltip(tr("Stop Generating"), None))
+        let tooltip = if generating {
+            tr("Stop Generating")
         } else {
-            ui::icon_button("commit-generate", IconName::Claude, ui)
-                .tooltip(ui::tooltip(tr("Generate Commit Message with Claude"), None))
-        }
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-            cx.stop_propagation();
-            this.generate_message(cx)
-        }));
-        if !generating {
-            return button.into_any_element();
-        }
+            tr("Generate Commit Message with Claude")
+        };
+        let button = ui::toggle_button("commit-generate", IconName::Claude, generating, ui)
+            .tooltip(ui::tooltip(tooltip, None))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.generate_message(cx)
+            }));
+        // The pulse breathes from full, from when Claude started, on the 30 fps grid of repeating
+        // animations. Otherwise the animation ends at once (it asks for no frames): it only keeps
+        // the button in the same place among the elements, so its crossfade carries over.
+        let pulse = self
+            .generating_since
+            .filter(|_| generating && motion::enabled());
+        let animation = if pulse.is_some() {
+            Animation::new(GENERATING_PULSE).repeat()
+        } else {
+            Animation::new(Duration::from_nanos(1))
+        };
         div()
             .child(button)
-            .with_animation(
-                "commit-generating",
-                Animation::new(Duration::from_millis(1000)).repeat(),
-                |button, delta| button.opacity(0.45 + 0.55 * (1. - (2. * delta - 1.).abs())),
-            )
+            .with_animation("commit-generating", animation, move |button, _| {
+                let Some(since) = pulse else {
+                    return button;
+                };
+                let phase =
+                    (since.elapsed().as_secs_f32() / GENERATING_PULSE.as_secs_f32()).fract();
+                button.opacity(0.45 + 0.55 * (0.5 + 0.5 * (TAU * phase).cos()))
+            })
             .into_any_element()
     }
 
@@ -3000,10 +3110,13 @@ impl CommitPanel {
                     )
                     .child(div().flex_1())
                     .children(self.committing.then(|| {
-                        div()
-                            .text_size(px(theme::TEXT_SM))
-                            .text_color(ui.dim)
-                            .child(tr("Committing…"))
+                        Appear::fade().apply(
+                            "commit-committing",
+                            div()
+                                .text_size(px(theme::TEXT_SM))
+                                .text_color(ui.dim)
+                                .child(tr("Committing…")),
+                        )
                     })),
             )
             .child(
@@ -3022,14 +3135,21 @@ impl CommitPanel {
                             }),
                     )
                     .child(
-                        ui::text_button("commit-push-button", tr("Commit and Push…"), false, ui)
-                            .tooltip(ui::tooltip(tr("Commit and Push…"), push_keys))
-                            .when(!can_commit, |button| button.opacity(0.5))
-                            .when(can_commit, |button| {
-                                button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.commit(true, window, cx)
-                                }))
-                            }),
+                        ui::available(
+                            ui::text_button(
+                                "commit-push-button",
+                                tr("Commit and Push…"),
+                                false,
+                                ui,
+                            ),
+                            can_commit,
+                        )
+                        .tooltip(ui::tooltip(tr("Commit and Push…"), push_keys))
+                        .when(can_commit, |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.commit(true, window, cx)
+                            }))
+                        }),
                     ),
             )
     }
@@ -3635,15 +3755,139 @@ fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement 
         })
         .child(
             div()
+                // An id: the line fades in and out under the mouse.
+                .id("commit-resize-line")
                 .w(px(2.))
                 .h_full()
                 .rounded(px(1.))
                 .bg(ui.focus_border)
                 .when(!resizing, |line| {
-                    line.invisible()
-                        .group_hover("commit-resize", |style| style.visible())
+                    line.opacity(0.)
+                        .group_hover("commit-resize", |style| style.opacity(1.))
                 }),
         )
+}
+
+/// Each row's key with the key of the node it is under: a file entering a changelist keeps its key
+/// but arrives under another node.
+fn places(rows: &[Row]) -> Vec<(RowKey, Option<RowKey>)> {
+    let mut ancestors: Vec<&Row> = Vec::new();
+    rows.iter()
+        .map(|row| {
+            while ancestors
+                .last()
+                .is_some_and(|parent| parent.depth >= row.depth)
+            {
+                ancestors.pop();
+            }
+            let parent = ancestors.last().map(|parent| parent.key.clone());
+            ancestors.push(row);
+            (row.key.clone(), parent)
+        })
+        .collect()
+}
+
+/// A row's key as the number of an element id: a row that moved to another place in the list never
+/// takes over the hover, checkbox or selection state of the row that was there.
+pub(crate) fn row_id(key: &impl Hash) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A row's body with the selection's backdrop: the focused list's color, or the inactive one.
+/// Keyed by the row (`id`) and its selection, the color fades when only the focus changes — the
+/// list gaining or losing it ([`motion::FADE`]); a selection moved to another row is there at once.
+/// Unselected, the body is left as it is. The stash tab's rows use it too.
+pub(crate) fn selection(
+    body: gpui::Stateful<Div>,
+    id: impl Into<gpui::ElementId>,
+    selected: bool,
+    focused: bool,
+    ui: UiColors,
+) -> AnyElement {
+    if !selected {
+        return body.into_any_element();
+    }
+    let color = if focused {
+        ui.list_selected
+    } else {
+        ui.list_selected_inactive
+    };
+    body.with_transition(id, color, motion::FADE, |body, color| body.bg(color))
+        .into_any_element()
+}
+
+/// The accent line under the active tab.
+fn tab_underline(ui: UiColors) -> Div {
+    div()
+        .absolute()
+        .bottom(px(7.))
+        .h(px(2.))
+        .rounded(px(1.))
+        .bg(ui.accent)
+}
+
+/// Where the tabs were drawn last, relative to the tab bar, so the underline can glide from one to
+/// the other: the labels' widths depend on the language, so they are measured, not counted. A tab
+/// that moved asks for one more frame, and the underline follows (as `ui::Segments`' pill does).
+#[derive(Default)]
+struct TabPlaces {
+    /// The bar's padding box in the window, this frame (measured before its tabs).
+    origin: Cell<Point<Pixels>>,
+    /// Each tab's left edge in the bar and its width: Commit, Stash.
+    places: Cell<[Option<(f32, f32)>; 2]>,
+}
+
+impl TabPlaces {
+    fn slot(tab: CommitTab) -> usize {
+        match tab {
+            CommitTab::Commit => 0,
+            CommitTab::Stash => 1,
+        }
+    }
+
+    /// The place of `tab`, once it has been drawn.
+    fn get(&self, tab: CommitTab) -> Option<(f32, f32)> {
+        self.places.get()[Self::slot(tab)]
+    }
+
+    /// The bar's first child: measures where the bar is, before its tabs.
+    fn measure_origin(self: &Rc<Self>) -> impl IntoElement {
+        let places = self.clone();
+        canvas(
+            move |bounds, _, _| places.origin.set(bounds.origin),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
+    /// A child of each tab: measures its place.
+    fn measure(self: &Rc<Self>, tab: CommitTab) -> impl IntoElement {
+        let places = self.clone();
+        canvas(
+            move |bounds, window, _| {
+                let place = (
+                    f32::from(bounds.origin.x - places.origin.get().x),
+                    f32::from(bounds.size.width),
+                );
+                let mut all = places.places.get();
+                if all[Self::slot(tab)] != Some(place) {
+                    all[Self::slot(tab)] = Some(place);
+                    places.places.set(all);
+                    window.request_animation_frame();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
 }
 
 impl Focusable for CommitPanel {
@@ -3708,12 +3952,29 @@ impl Render for CommitPanel {
             )
             .child(self.render_tabs(cx))
             .child(self.render_toolbar(window, cx));
-        let root = match self.tab {
-            CommitTab::Commit => self.render_commit_tab(root, window, cx),
-            CommitTab::Stash => root.child(div().flex_1().min_h_0().child(self.stash.clone())),
+        // The tab's content fades in when the tab is switched.
+        if self
+            .tab_switched
+            .is_some_and(|since| !motion::running(since, motion::FADE))
+        {
+            self.tab_switched = None;
+        }
+        let shown = self
+            .tab_switched
+            .map_or(1., |since| motion::animate(since, motion::FADE, window));
+        let content = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .when(shown < 1., |content| content.opacity(shown));
+        let content = match self.tab {
+            CommitTab::Commit => self.render_commit_tab(content, window, cx),
+            CommitTab::Stash => content.child(div().flex_1().min_h_0().child(self.stash.clone())),
         };
         let center = ui::resize_handle_center(ui::style(cx));
-        root.child(resize_handle(self.resizing, center, ui))
+        root.child(content)
+            .child(resize_handle(self.resizing, center, ui))
             .child(ContextMenu::slot(
                 "commit-menu",
                 self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
@@ -3725,13 +3986,16 @@ impl CommitPanel {
     /// The Commit tab: the banners of operations in progress, the changes, the message, Commit.
     fn render_commit_tab(&mut self, root: Div, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let ui = Theme::ui(cx);
+        // Arrivals that have unfolded are forgotten.
+        self.arrivals
+            .retain(|_, since| motion::running(*since, motion::SMOOTH));
         let focused = self.focus_handle.contains_focused(window, cx)
             || self
                 .menu
                 .as_ref()
                 .is_some_and(|menu| menu.menu.focus_handle(cx).is_focused(window));
         let list = if self.rows.is_empty() {
-            self.render_empty(cx).into_any_element()
+            self.render_empty(cx)
         } else {
             uniform_list(
                 "commit-rows",

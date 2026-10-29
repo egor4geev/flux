@@ -33,7 +33,7 @@ use crate::git::{GitEvent, GitStore};
 use crate::git_log::GitLogView;
 use crate::git_window::{self, DraggedLogTab, GitWindow, GitWindowEvent};
 use crate::i18n::{tr, trf, trn};
-use crate::icons::{IconName, file_icon, icon};
+use crate::icons::{FileIcon, IconName, file_icon, icon};
 use crate::image_view::{self, ImageSource, ImageView, ImageViewEvent};
 use crate::launchpad::{self, Tool};
 use crate::lsp::LspStore;
@@ -91,9 +91,8 @@ const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 /// The project's state is saved this long after its tabs or layout changed (part 10.1): a burst of
 /// changes is one write, and a crash loses little.
 const STATE_SAVE_DELAY: Duration = Duration::from_millis(1500);
-/// The bell when its unread count grows: the badge starts this much larger and springs back
-/// (`crate::motion::BOUNCE`); the icon swings this many times this far to the sides, dying down.
-const BELL_BUMP: f32 = 0.45;
+/// The bell when its unread count grows: the count bumps (`crate::badge`); the icon swings this
+/// many times this far to the sides, dying down.
 const BELL_SWINGS: f32 = 2.5;
 const BELL_SWING: f32 = 2.5;
 const BELL_WOBBLE: crate::motion::Curve =
@@ -268,10 +267,14 @@ pub struct Workspace {
     left_glide: IslandGlide<LeftTool>,
     bottom_glide: IslandGlide<BottomTool>,
     right_glide: IslandGlide<RightTool>,
-    /// The tab strip's motion: the highlight gliding to the active tab, tabs gliding into place.
-    tab_motion: std::rc::Rc<std::cell::RefCell<TabMotion>>,
+    /// The tab strip's motion (`crate::tab_strip`): the highlight gliding to the active tab, tabs
+    /// gliding into place, closed ones fading out.
+    tab_strip: crate::tab_strip::TabStrip,
+    /// The editor area fades in: the window took another project ("This Window"), or the first
+    /// tab replaced the start screen. Since when.
+    fade_in: Option<Instant>,
     /// The bell's unread count as last drawn, and when it last grew (the badge bumps).
-    bell: std::cell::Cell<(usize, Option<Instant>)>,
+    bell: std::cell::Cell<crate::badge::Bump>,
     /// The Notifications window (the journal of the notification center).
     notifications_panel: Entity<NotificationsPanel>,
     /// The window's plugins: their commands, tool windows (in the island on the right), status
@@ -533,163 +536,9 @@ fn island_slot(
         .into_any_element()
 }
 
-/// The tab strip's inset and the gap between tabs: a tab's place follows from the tabs before it.
+/// The tab strip's inset and the gap between tabs.
 const TAB_STRIP_INSET: f32 = 6.;
 const TAB_GAP: f32 = 4.;
-
-/// A tab's place in the strip: its left edge and its width.
-type TabPlace = (f32, f32);
-
-/// The tab strip's motion (`crate::motion`), kept from frame to frame: the highlight under the
-/// active tab glides to the next active one; when a tab closes or moves, the others glide into
-/// their new places from the old ones; a new tab pops in. Places are left edges and widths in the
-/// strip's content, as last laid out — scrolling the strip moves nothing.
-#[derive(Default)]
-struct TabMotion {
-    /// Where each tab was laid out in the last frame, by item.
-    places: HashMap<EntityId, TabPlace>,
-    /// The highlight's glide: from and to, since when.
-    pill: Option<(TabPlace, TabPlace, Instant)>,
-    /// Tabs gliding into new places: the offset they started at, since when.
-    moves: HashMap<EntityId, (f32, Instant)>,
-    /// Tabs just opened, popping in: since when.
-    opened: HashMap<EntityId, Instant>,
-}
-
-impl TabMotion {
-    /// Before the tabs are drawn: those whose place changed since the last frame — a tab before
-    /// them closed or moved — glide from where they were (their places follow from the widths
-    /// known from the last frame, up to the first new tab); new ones pop in.
-    fn prepare(&mut self, ids: &[EntityId], window: &Window) {
-        if self.places.is_empty() || !crate::motion::enabled() {
-            // The strip's first frame shows the tabs as they are.
-            self.moves.clear();
-            self.opened.clear();
-            return;
-        }
-        let now = Instant::now();
-        let mut x = Some(TAB_STRIP_INSET);
-        for id in ids {
-            match self.places.get(id).copied() {
-                Some((old, width)) => {
-                    if let Some(new) = x
-                        && (old - new).abs() > 0.5
-                    {
-                        let offset = old + self.offset(*id) - new;
-                        self.moves.insert(*id, (offset, now));
-                    }
-                    x = x.map(|x| x + width + TAB_GAP);
-                }
-                None => {
-                    self.opened.entry(*id).or_insert(now);
-                    x = None;
-                }
-            }
-        }
-        self.moves.retain(|id, (_, since)| {
-            ids.contains(id) && crate::motion::running(*since, crate::motion::SMOOTH)
-        });
-        self.opened.retain(|id, since| {
-            ids.contains(id) && crate::motion::running(*since, crate::motion::POP)
-        });
-        if !self.moves.is_empty() || !self.opened.is_empty() {
-            window.request_animation_frame();
-        }
-    }
-
-    /// How far a tab is drawn from its place, gliding back to it.
-    fn offset(&self, id: EntityId) -> f32 {
-        self.moves.get(&id).map_or(0., |(offset, since)| {
-            offset * (1. - crate::motion::progress(*since, crate::motion::SMOOTH))
-        })
-    }
-
-    /// A tab as it moves or pops in.
-    fn style(&self, id: EntityId, tab: gpui::Div) -> gpui::Div {
-        let offset = self.offset(id);
-        let tab = tab.when(offset != 0., |tab| {
-            tab.transform_translate(px(offset), px(0.))
-        });
-        match self.opened.get(&id) {
-            Some(since) => crate::motion::Appear::pop((0.5, 0.5))
-                .style(tab, crate::motion::progress(*since, crate::motion::POP)),
-            None => tab,
-        }
-    }
-
-    /// After layout, behind the tabs: remembers their places and paints the highlight under the
-    /// active one — gliding to it, or riding along with it while it glides into a new place.
-    fn paint_highlight(
-        &mut self,
-        scroll: &ScrollHandle,
-        ids: &[EntityId],
-        active: usize,
-        ui: UiColors,
-        window: &mut Window,
-    ) {
-        let strip = scroll.bounds();
-        self.places.clear();
-        for (index, id) in ids.iter().enumerate() {
-            if let Some(tab) = scroll.bounds_for_item(index) {
-                let place = (
-                    f32::from(tab.left() - strip.left()),
-                    f32::from(tab.size.width),
-                );
-                self.places.insert(*id, place);
-            }
-        }
-        let (Some(tab), Some(id)) = (scroll.bounds_for_item(active), ids.get(active)) else {
-            self.pill = None;
-            return;
-        };
-        let target = (
-            f32::from(tab.left() - strip.left()),
-            f32::from(tab.size.width),
-        );
-        let now = Instant::now();
-        let moving = self.offset(*id);
-        let (x, width) = if moving != 0. {
-            self.pill = Some((target, target, now));
-            (target.0 + moving, target.1)
-        } else {
-            let (from, to, since) = match self.pill {
-                Some(pill) if pill.1 == target => pill,
-                Some((from, to, since)) => {
-                    let (t, done) = crate::motion::SMOOTH.at(since.elapsed());
-                    let current = if done {
-                        to
-                    } else {
-                        <(f32, f32) as crate::motion::Animatable>::lerp(from, to, t)
-                    };
-                    (current, target, now)
-                }
-                None => (target, target, now),
-            };
-            self.pill = Some((from, to, since));
-            let (t, done) = crate::motion::SMOOTH.at(since.elapsed());
-            if done || from == to {
-                to
-            } else {
-                window.request_animation_frame();
-                <(f32, f32) as crate::motion::Animatable>::lerp(from, to, t)
-            }
-        };
-        let bounds = Bounds::new(
-            point(strip.left() + px(x) + scroll.offset().x, tab.top()),
-            size(px(width), tab.size.height),
-        );
-        window.with_content_mask(Some(gpui::ContentMask { bounds: strip }), |window| {
-            window.paint_quad(gpui::quad(
-                bounds,
-                px(RADIUS_MD),
-                ui.pressed,
-                px(1.),
-                ui.island_border,
-                gpui::BorderStyle::Solid,
-            ))
-        });
-    }
-}
 
 /// The commit window and the subscription to its events; recreated with the git hub.
 struct CommitPanelHandle {
@@ -1001,12 +850,15 @@ impl Workspace {
             Some(root) => record_recent(root, cx),
             None => recent::load(),
         };
+        let tab_scroll = ScrollHandle::new();
         let mut workspace = Self {
             root,
             tabs: Vec::new(),
             active: 0,
             focus_handle,
-            tab_scroll: ScrollHandle::new(),
+            tab_strip: crate::tab_strip::TabStrip::new(tab_scroll.clone()),
+            fade_in: None,
+            tab_scroll,
             start_drawn: false,
             closing: false,
             loading: 0,
@@ -1047,9 +899,8 @@ impl Workspace {
             left_glide: IslandGlide::new(),
             bottom_glide: IslandGlide::new(),
             right_glide: IslandGlide::new(),
-            tab_motion: Default::default(),
             // The first frame takes the count as it is, without a bump.
-            bell: std::cell::Cell::new((usize::MAX, None)),
+            bell: Default::default(),
             notifications_panel,
             plugins,
             claude,
@@ -1268,7 +1119,10 @@ impl Workspace {
             }
             cx.update(|window, cx| {
                 window.replace_root(cx, |window, cx| {
-                    Workspace::new(Some(root), files, window, cx)
+                    let mut workspace = Workspace::new(Some(root), files, window, cx);
+                    // The other project's editor area fades in where this one's was.
+                    workspace.fade_in = crate::motion::enabled().then(Instant::now);
+                    workspace
                 });
             })
             .ok();
@@ -1877,7 +1731,8 @@ impl Workspace {
                 }
             }
         }
-        self.tab_scroll.scroll_to_item(index);
+        // Into view, gliding (`TabStrip::reveal`).
+        self.tab_strip.reveal(index);
         self.status_message = None;
         if let TabItem::Terminal(group) = &item {
             group.update(cx, |group, cx| group.clear_bell(cx));
@@ -4173,7 +4028,7 @@ impl Workspace {
 
     /// A Git window tab dropped on the tab strip: one already here moves along it.
     fn drop_log(&mut self, view: Entity<GitLogView>, window: &mut Window, cx: &mut Context<Self>) {
-        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        let index = self.take_tab_drop();
         match self.index_of_log(&view) {
             Some(from) => self.move_tab(from, index, window, cx),
             None => self.move_log_to_editor(view, Some(index), window, cx),
@@ -4849,10 +4704,20 @@ impl Workspace {
     }
 
     /// Project search is a window over the islands; a click outside closes it.
+    /// Closed, it fades out a moment, taking no input.
     fn render_project_search(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
-        if !self.project_search.read(cx).is_open() {
-            return None;
-        }
+        let search = self.project_search.read(cx).present(
+            div()
+                .w(relative(SEARCH_WIDTH))
+                .max_w(px(SEARCH_MAX_WIDTH))
+                .h_full()
+                .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                    if this.project_search.read(cx).is_open() {
+                        this.hide_project_search(window, cx)
+                    }
+                }))
+                .child(self.project_search.clone()),
+        )?;
         Some(
             div()
                 .absolute()
@@ -4862,19 +4727,7 @@ impl Workspace {
                 .right_0()
                 .flex()
                 .justify_center()
-                .child(
-                    crate::motion::Appear::dialog().apply(
-                        "project-search",
-                        div()
-                            .w(relative(SEARCH_WIDTH))
-                            .max_w(px(SEARCH_MAX_WIDTH))
-                            .h_full()
-                            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                                this.hide_project_search(window, cx)
-                            }))
-                            .child(self.project_search.clone()),
-                    ),
-                ),
+                .child(search),
         )
     }
 
@@ -4974,6 +4827,7 @@ impl Workspace {
                                     .border_color(ui.elevated_border)
                                     .text_color(ui.text_muted)
                             })
+                            .active(crate::motion::press)
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(file_finder::Toggle.boxed_clone(), cx)
                             })
@@ -5035,24 +4889,13 @@ impl Workspace {
         let ui = Theme::ui(cx);
         let center = self.notification_center.read(cx);
         let unread = center.unread_count();
-        // The count grew: the badge bumps and the bell wobbles once (`crate::motion`).
-        let (seen, grew) = self.bell.get();
-        let grew = match grew {
-            _ if unread > seen && crate::motion::enabled() => Some(Instant::now()),
-            Some(since)
-                if crate::motion::running(since, crate::motion::BOUNCE)
-                    || crate::motion::running(since, BELL_WOBBLE) =>
-            {
-                Some(since)
-            }
-            _ => None,
-        };
-        self.bell.set((unread, grew));
-        let (bump, wobble) = grew.map_or((1., 1.), |since| {
-            (
-                crate::motion::animate(since, crate::motion::BOUNCE, window),
-                crate::motion::animate(since, BELL_WOBBLE, window),
-            )
+        // The count grew: the badge bumps and the bell wobbles once (`crate::badge`).
+        let mut bell = self.bell.get();
+        let grew = bell.track(unread, BELL_WOBBLE);
+        self.bell.set(bell);
+        let bump = crate::badge::progress(grew, window);
+        let wobble = grew.map_or(1., |since| {
+            crate::motion::animate(since, BELL_WOBBLE, window)
         });
         // Swings to the sides, dying down.
         let swing =
@@ -5104,11 +4947,7 @@ impl Workspace {
                             .text_size(px(theme::TEXT_XS))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(color)
-                            .when(bump < 1., |badge| {
-                                badge
-                                    .transform_scale(1. + BELL_BUMP * (1. - bump))
-                                    .transform_origin(0.5, 0.5)
-                            })
+                            .map(|badge| crate::badge::bump_style(badge, bump))
                             .child(if unread > 99 {
                                 "99+".to_string()
                             } else {
@@ -5339,8 +5178,19 @@ impl Workspace {
         let ui = Theme::ui(cx);
         let details = self.tab_details(cx);
         let ids: Vec<EntityId> = self.tabs.iter().map(|tab| tab.item.entity_id()).collect();
-        self.tab_motion.borrow_mut().prepare(&ids, window);
-        let motion = self.tab_motion.borrow();
+        let faces = self
+            .tabs
+            .iter()
+            .zip(&details)
+            .enumerate()
+            .map(|(index, (tab, detail))| {
+                let face = tab_face(&tab.item, index == self.active, detail, ui, cx);
+                (tab.item.entity_id(), face)
+            })
+            .collect();
+        self.tab_strip.prepare(faces, window);
+        let drop = self.tab_drop;
+        let count = self.tabs.len();
         let tabs: Vec<_> = self
             .tabs
             .iter()
@@ -5362,49 +5212,20 @@ impl Workspace {
                     .render_plugin_tab(index, *key, view, cx)
                     .into_any_element(),
             })
-            // One element per tab (the scroll handle counts them): it glides and pops in.
+            // One element per tab (the scroll handle counts them): it glides and pops in, and the
+            // tabs part where a dragged one would land.
             .zip(&ids)
-            .map(|(tab, id)| motion.style(*id, div().flex_none()).child(tab))
+            .enumerate()
+            .map(|(index, (tab, id))| {
+                let room = crate::tab_strip::Room::at(index, count, drop);
+                self.tab_strip.tab(*id, room, tab)
+            })
             .collect();
-        drop(motion);
-        // The highlight of the active tab, behind the tabs: painted after layout, where the tab is.
-        let highlight = {
-            let (motion, scroll) = (self.tab_motion.clone(), self.tab_scroll.clone());
-            let active = self.active;
-            gpui::canvas(
-                |_, _, _| {},
-                move |_, _, window, _| {
-                    motion
-                        .borrow_mut()
-                        .paint_highlight(&scroll, &ids, active, ui, window)
-                },
-            )
-            .absolute()
-            .size_full()
-        };
-        // While a tab is dragged over the strip: a marker where it would land.
-        let marker = self.tab_drop.and_then(|index| {
-            let strip = self.tab_scroll.bounds();
-            let x = match self.tab_scroll.bounds_for_item(index) {
-                Some(tab) => tab.left() - px(3.),
-                None => {
-                    self.tab_scroll
-                        .bounds_for_item(index.checked_sub(1)?)?
-                        .right()
-                        + px(1.)
-                }
-            };
-            Some(
-                div()
-                    .absolute()
-                    .top(px(6.))
-                    .bottom(px(6.))
-                    .left(x - strip.left())
-                    .w(px(2.))
-                    .rounded(px(1.))
-                    .bg(ui.accent),
-            )
-        });
+        // The highlight of the active tab and the marker of a dragged one, behind the tabs:
+        // painted after layout, where the tabs are drawn.
+        let highlight =
+            self.tab_strip
+                .highlight(ids.get(self.active).copied(), drop, RADIUS_MD, ui);
         div()
             .relative()
             .flex_none()
@@ -5469,9 +5290,9 @@ impl Workspace {
                     .gap(px(TAB_GAP))
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll)
-                    .children(tabs),
+                    .children(tabs)
+                    .children(self.tab_strip.ghosts(window)),
             )
-            .children(marker)
     }
 
     /// The dimmed label after a tab's name: for files with the same name, their directories; for
@@ -5545,9 +5366,19 @@ impl Workspace {
             )
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .child(file.render().size(px(14.)))
-            .child(match status_color {
-                Some(color) => label(&title).text_color(color),
-                None => label(&title),
+            // The label's git color fades as the file's status changes; settled without one,
+            // it takes the tab's own color (and its hover). Activation draws it anew: no fade.
+            .child({
+                let plain = if active { ui.foreground } else { ui.text_muted };
+                label(&title).with_transition(
+                    if active { "label-active" } else { "label" },
+                    status_color.unwrap_or(plain),
+                    crate::motion::FADE,
+                    move |label, color| match color == plain {
+                        true => label,
+                        false => label.text_color(color),
+                    },
+                )
             })
             .children(detail.map(|detail| label(&detail).text_color(ui.dim)))
             .child(close_button(
@@ -5858,7 +5689,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        let index = self.take_tab_drop();
         match self.index_of_terminal(&group) {
             Some(from) => self.move_tab(from, index, window, cx),
             None => self.move_terminal_to_editor(group, Some(index), window, cx),
@@ -5871,10 +5702,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        let index = self.take_tab_drop();
         if let Some(from) = self.index_of(&editor) {
             self.move_tab(from, index, window, cx);
         }
+    }
+
+    /// A tab dropped on the strip: where it lands (at the end without a marker). The tabs are at
+    /// once where it put them (`TabStrip::settle`).
+    fn take_tab_drop(&mut self) -> usize {
+        self.tab_strip.settle();
+        self.tab_drop.take().unwrap_or(self.tabs.len())
     }
 
     /// Moves a tab to an insertion point (an index between the tabs before the move) and activates
@@ -5896,6 +5734,8 @@ impl Workspace {
             self.start_drawn = true;
             cx.on_next_frame(window, |_, _, cx| cx.notify());
         }
+        // No tab strip meanwhile: the next tabs pop in.
+        self.tab_strip.clear();
         let branch = self.git.read(cx).branch_label(None);
         let screen = StartScreen {
             root: self.root.as_deref(),
@@ -6176,9 +6016,22 @@ impl Render for Workspace {
         };
         let main = match self.active_item() {
             Some(item) => {
-                self.start_drawn = false;
+                // The first tab in place of the start screen: the editor area fades in.
+                if std::mem::take(&mut self.start_drawn) && crate::motion::enabled() {
+                    self.fade_in = Some(Instant::now());
+                }
+                let fade = self
+                    .fade_in
+                    .map(|since| crate::motion::animate(since, crate::motion::FADE, window))
+                    .filter(|fade| *fade < 1.);
+                if fade.is_none() {
+                    self.fade_in = None;
+                }
                 self.retry_tab_scroll(window, cx);
                 let content = match &item {
+                    // Fading in, drawn anew each frame: a cached view keeps the opacity it was
+                    // painted with.
+                    TabItem::Editor(editor) if fade.is_some() => editor.clone().into_any_element(),
                     // A cached view: drawn again only when notified, so that a frame for something
                     // else (a working session's pulse, streamed text) doesn't lay the editor out
                     // again (2026-10-16: ~18 % of such a frame).
@@ -6199,7 +6052,14 @@ impl Render for Workspace {
                     crate::plugin_suggestions::banner(self, &editor, window, cx)
                 });
                 let svg_bar = item.editor().and_then(|editor| self.svg_bar(editor, cx));
-                main.child(self.render_tab_bar(window, cx))
+                let area = div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .when_some(fade, |area, fade| area.opacity(fade));
+                let area = area
+                    .child(self.render_tab_bar(window, cx))
                     .children(suggestion)
                     .children(svg_bar)
                     // The find bar slides away after it closed, taking no input.
@@ -6237,7 +6097,8 @@ impl Render for Workspace {
                             })
                             .child(content)
                             .into_any_element(),
-                    ))
+                    ));
+                main.child(area)
             }
             None => main.child(body(self.render_start(window, cx).into_any_element())),
         };
@@ -7033,6 +6894,94 @@ fn status_text(text: &str, element: gpui::Div) -> AnyElement {
     crate::motion::Appear::fade().apply(("status-text", hasher.finish()), element)
 }
 
+/// The icon of a closed tab's ghost.
+enum FaceIcon {
+    File(FileIcon),
+    Glyph(IconName, gpui::Hsla),
+    /// A plugin's own icon: the ghost keeps its room.
+    Blank,
+}
+
+/// How a tab looks as a ghost when it closes (`crate::tab_strip::Face`): its icon and labels, in
+/// the place of the tab's own, without the item (a closed document's editor is released at once).
+fn tab_face(
+    item: &TabItem,
+    active: bool,
+    detail: &Option<String>,
+    ui: UiColors,
+    cx: &App,
+) -> crate::tab_strip::Face {
+    let (glyph, title, kind) = match item {
+        TabItem::Editor(editor) => {
+            let document = &editor.read(cx).document;
+            let icon = FaceIcon::File(file_icon(&document.display_name(), &ui));
+            (icon, document_name(document), None)
+        }
+        TabItem::Terminal(group) => (
+            FaceIcon::Glyph(IconName::Terminal, ui.green),
+            group.read(cx).title(cx).to_string(),
+            None,
+        ),
+        TabItem::Diff(view) => {
+            let view = view.read(cx);
+            let icon = match view.proposal_icon() {
+                Some(glyph) => FaceIcon::Glyph(glyph, ui.accent_text),
+                None => FaceIcon::Glyph(IconName::Diff, ui.vcs_modified),
+            };
+            let kind = (!view.is_proposal()).then(|| tr("diff").to_string());
+            (icon, view.title().to_string(), kind)
+        }
+        TabItem::Merge(view) => (
+            FaceIcon::Glyph(IconName::Merge, ui.vcs_conflict),
+            view.read(cx).title().to_string(),
+            Some(tr("merge").to_string()),
+        ),
+        TabItem::Log(view) => (
+            FaceIcon::Glyph(IconName::History, ui.accent),
+            view.read(cx).title().to_string(),
+            None,
+        ),
+        TabItem::Claude(chat) => (
+            FaceIcon::Glyph(IconName::Claude, ui.accent_text),
+            chat.read(cx).session().read(cx).title().to_string(),
+            None,
+        ),
+        TabItem::Image(view) => {
+            let title = view.read(cx).title().to_string();
+            (FaceIcon::File(file_icon(&title, &ui)), title, None)
+        }
+        TabItem::Plugin(_, view) => (FaceIcon::Blank, view.read(cx).title().to_string(), None),
+    };
+    let detail = detail.clone().or(kind);
+    let glyph = std::rc::Rc::new(glyph);
+    std::rc::Rc::new(move || {
+        let glyph = match &*glyph {
+            FaceIcon::File(file) => file.render().size(px(14.)).into_any_element(),
+            FaceIcon::Glyph(name, color) => icon(*name, *color).size(px(14.)).into_any_element(),
+            FaceIcon::Blank => div().flex_none().size(px(14.)).into_any_element(),
+        };
+        div()
+            .size_full()
+            .pl_2p5()
+            .pr_1p5()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .text_color(if active { ui.foreground } else { ui.text_muted })
+            .when(active, |face| face.font_weight(FontWeight::MEDIUM))
+            .child(glyph)
+            .child(label(&title))
+            .children(
+                detail
+                    .as_deref()
+                    .map(|detail| label(detail).text_color(ui.dim)),
+            )
+            .into_any_element()
+    })
+}
+
 /// A tab: a rounded pill; the strip highlights the active one.
 fn tab_shell(id: EntityId, active: bool, ui: UiColors) -> gpui::Stateful<gpui::Div> {
     div()
@@ -7051,7 +7000,7 @@ fn tab_shell(id: EntityId, active: bool, ui: UiColors) -> gpui::Stateful<gpui::D
         .border_color(gpui::transparent_black())
         .text_color(if active { ui.foreground } else { ui.text_muted })
         // The active tab's highlight is the strip's, gliding from tab to tab
-        // (`TabMotion::paint_highlight`).
+        // (`TabStrip::highlight`).
         .when(active, |el| el.font_weight(FontWeight::MEDIUM))
         .when(!active, |el| {
             el.hover(|style| style.bg(ui.hover).text_color(ui.foreground))
@@ -7059,7 +7008,8 @@ fn tab_shell(id: EntityId, active: bool, ui: UiColors) -> gpui::Stateful<gpui::D
 }
 
 /// Right edge of a tab: a dot in `dot`'s color (unsaved changes, a terminal's bell), "×" on hover
-/// (always on an active tab without a dot).
+/// (always on an active tab without a dot). The dot pops in and shrinks away; under the pointer, it
+/// and the "×" crossfade (`crate::motion`).
 fn close_button(
     item: TabItem,
     active: bool,
@@ -7067,6 +7017,12 @@ fn close_button(
     cx: &Context<Workspace>,
 ) -> impl IntoElement {
     let ui = Theme::ui(cx);
+    // The color the dot keeps while it shrinks away.
+    let dot_color = dot.unwrap_or(match item {
+        TabItem::Terminal(_) => ui.warning,
+        _ => ui.modified,
+    });
+    let hidden = dot.is_some() || !active;
     let close = div()
         .id("close")
         .group("tab-close")
@@ -7078,11 +7034,6 @@ fn close_button(
         .rounded(px(ui::RADIUS_XS))
         .text_color(ui.dim)
         .hover(move |style| style.bg(ui.pressed).text_color(ui.foreground))
-        .when(dot.is_some() || !active, |close| {
-            close
-                .invisible()
-                .group_hover("tab", |style| style.visible())
-        })
         // Clicking "×" must not activate the tab.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -7093,22 +7044,12 @@ fn close_button(
                 .size(px(12.))
                 .group_hover("tab-close", move |style| style.text_color(ui.foreground)),
         );
-    let dot = dot.map(|color| {
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .group_hover("tab", |style| style.invisible())
-            .child(div().size(px(7.)).rounded(px(4.)).bg(color))
-    });
     div()
         .relative()
         .flex_none()
         .size(px(18.))
-        .children(dot)
-        .child(close)
+        .child(crate::tab_strip::dot(dot.is_some(), dot_color, "tab"))
+        .child(crate::tab_strip::close_reveal(close, !hidden, "tab"))
 }
 
 /// The insertion point for a tab dropped at `x`: the number of tabs whose middle is to its left.
@@ -7170,7 +7111,8 @@ impl Render for DraggedEditorTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let file = file_icon(&self.name, &ui);
-        div()
+        // Lifted off the strip: it grows in under the pointer.
+        let preview = div()
             .flex()
             .items_center()
             .gap_2()
@@ -7187,7 +7129,8 @@ impl Render for DraggedEditorTab {
             .text_size(px(theme::TEXT_MD))
             .text_color(ui.foreground)
             .child(file.render().size(px(14.)))
-            .child(self.name.clone())
+            .child(self.name.clone());
+        crate::motion::Appear::pop((0.5, 0.5)).apply("dragged-tab", preview)
     }
 }
 
@@ -8258,7 +8201,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = self.tab_drop.take().unwrap_or(self.tabs.len());
+        let index = self.take_tab_drop();
         if let Some(from) = self
             .tabs
             .iter()
@@ -8554,9 +8497,10 @@ impl Workspace {
             .limits()
             .filter(|_| crate::settings::claude(cx).show_limits)
             .cloned();
+        // The state as a key too: a new one fades in (`crate::motion`).
         let state = match activity {
-            claude::Activity::Working => Some((tr("Working…"), ui.accent_text)),
-            claude::Activity::Waiting => Some((tr("Waiting for you"), ui.warning)),
+            claude::Activity::Working => Some((tr("Working…"), ui.accent_text, 0usize)),
+            claude::Activity::Waiting => Some((tr("Waiting for you"), ui.warning, 1)),
             _ => None,
         };
         if state.is_none() && limits.is_none() {
@@ -8581,7 +8525,7 @@ impl Workspace {
             claude::LimitLevel::Critical => ui.error,
         };
         let mut tooltip = String::from(tr("Claude Code"));
-        if let Some((label, _)) = &state {
+        if let Some((label, ..)) = &state {
             tooltip.push_str(" — ");
             tooltip.push_str(label);
         }
@@ -8603,16 +8547,27 @@ impl Workspace {
                         &claude::resets_in(window.resets_at, now),
                     ],
                 ));
+                // A new share fades in, its color glides to the new level (`crate::motion`).
+                let percent = format!("{}%", claude::percent(window.utilization));
                 windows.push(
                     div()
+                        .id(short)
                         .flex()
                         .items_center()
                         .gap_1()
                         .child(div().text_color(ui.dim).child(short))
                         .child(
                             div()
-                                .text_color(level_color(window.utilization))
-                                .child(format!("{}%", claude::percent(window.utilization))),
+                                .child(crate::motion::Appear::fade().apply(
+                                    SharedString::from(percent.clone()),
+                                    div().child(percent),
+                                ))
+                                .with_transition(
+                                    "color",
+                                    level_color(window.utilization),
+                                    crate::motion::FADE,
+                                    |percent, color| percent.text_color(color),
+                                ),
                         )
                         .into_any_element(),
                 );
@@ -8637,13 +8592,19 @@ impl Workspace {
                         None => window.dispatch_action(Box::new(claude::ToggleClaude), cx),
                     })
                     .child(
-                        icon(
-                            IconName::Claude,
-                            state.as_ref().map_or(ui.text_muted, |(_, color)| *color),
-                        )
-                        .size(px(13.)),
+                        icon(IconName::Claude, ui.text_muted)
+                            .size(px(13.))
+                            .with_transition(
+                                "icon",
+                                state.as_ref().map_or(ui.text_muted, |(_, color, _)| *color),
+                                crate::motion::FADE,
+                                |icon, color| icon.text_color(color),
+                            ),
                     )
-                    .children(state.map(|(label, color)| div().text_color(color).child(label)))
+                    .children(state.map(|(label, color, key)| {
+                        crate::motion::Appear::fade()
+                            .apply(("state", key), div().text_color(color).child(label))
+                    }))
                     .children(windows),
             ),
         )

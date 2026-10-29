@@ -12,19 +12,25 @@
 //!
 //! A field of several lines is in the interface's font, growing with its text; with `code` — in
 //! the code font, as the commit message (Flux's editor).
+//!
+//! Motion (ADR-040): an answered form stays a moment ([`RE_ASK_GRACE`], the answer gone at once):
+//! a plugin that finds a value wrong asks again at once, and the same dialog takes the new form in
+//! place — the error slides in and the dialog grows to it — instead of closing and opening again.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use flux_core::Document;
-use flux_plugin::api::dialogs::{ChoiceOption, DialogLevel, FieldKind, Form};
+use flux_plugin::api::dialogs::{ChoiceOption, DialogLevel, FieldKind, Form, FormField};
 use flux_plugin::api::events::Event;
 use futures::channel::oneshot;
 use gpui::{
     Action, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DismissEvent, Entity,
     EventEmitter, FocusHandle, Focusable, FontWeight, Global, KeyBinding, MouseButton, Pixels,
-    Render, SharedString, Subscription, Window, actions, canvas, div, point, prelude::*, px,
+    Render, SharedString, Subscription, WeakEntity, Window, actions, canvas, div, point,
+    prelude::*, px,
 };
 
 use crate::context_menu::ContextMenu;
@@ -32,6 +38,7 @@ use crate::editor::{self, Editor};
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
 use crate::input::TextInput;
+use crate::motion::{self, TransitionExt as _};
 use crate::plugins::PendingQuestion;
 use crate::prompt_input::PromptInput;
 use crate::theme::{self, Theme, UiColors};
@@ -101,9 +108,23 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("enter", NewLine, Some("PluginFormLines"))]);
 }
 
+/// How long an answered form stays for its plugin to ask again (a wrong value) before it closes:
+/// under what reads as at once, over what a plugin checking its values takes.
+const RE_ASK_GRACE: Duration = Duration::from_millis(60);
+
+/// A dimmed field: its checkbox (`enabled-by`) is off.
+const DISABLED_OPACITY: f32 = 0.45;
+
+thread_local! {
+    /// The form answered last, staying for [`RE_ASK_GRACE`]: its plugin's next form takes it.
+    static ANSWERED: RefCell<Option<(Arc<str>, WeakEntity<FormDialog>)>> =
+        const { RefCell::new(None) };
+}
+
 /// Shows a plugin's form; the answer goes back to the plugin as `form-answered`. Over Settings
 /// (the plugin's page asked for it) it opens on top of them; with another dialog or a popup of
-/// the user's open, it waits for it.
+/// the user's open, it waits for it. Asked again right after an answer, the answered dialog takes
+/// it in place.
 pub(crate) fn ask_form(
     workspace: &mut Workspace,
     plugin: &str,
@@ -113,6 +134,22 @@ pub(crate) fn ask_form(
     cx: &mut Context<Workspace>,
 ) {
     let plugin: Arc<str> = Arc::from(plugin);
+    let answered = ANSWERED
+        .with_borrow(|answered| {
+            answered
+                .as_ref()
+                .filter(|(asker, _)| *asker == plugin)
+                .and_then(|(_, dialog)| dialog.upgrade())
+        })
+        .filter(|dialog| dialog.read(cx).answered.is_some());
+    if let Some(dialog) = answered {
+        let (sender, receiver) = oneshot::channel::<Vec<(String, String)>>();
+        dialog.update(cx, |dialog, cx| {
+            dialog.ask_again(form.clone(), sender, window, cx)
+        });
+        send_answer(workspace, plugin, id, receiver, cx);
+        return;
+    }
     if !workspace.can_ask_plugin_question() {
         let pending = PendingQuestion::Form {
             plugin,
@@ -138,9 +175,21 @@ pub(crate) fn show_form(
 ) {
     bind_keys(cx);
     let (sender, receiver) = oneshot::channel::<Vec<(String, String)>>();
+    let asker = plugin.clone();
     workspace.open_plugin_dialog(window, cx, move |window, cx| {
-        FormDialog::new(form, sender, window, cx)
+        FormDialog::new(asker, form, sender, window, cx)
     });
+    send_answer(workspace, plugin, id, receiver, cx);
+}
+
+/// Sends the plugin the answer the dialog gives through `receiver`.
+fn send_answer(
+    workspace: &Workspace,
+    plugin: Arc<str>,
+    id: u64,
+    receiver: oneshot::Receiver<Vec<(String, String)>>,
+    cx: &mut Context<Workspace>,
+) {
     let plugins = workspace.plugins.downgrade();
     cx.spawn(async move |_, cx| {
         // Cancelled, the dialog drops the sender: the answer is none.
@@ -156,6 +205,8 @@ pub(crate) fn show_form(
 
 /// A plugin's form.
 pub struct FormDialog {
+    /// The plugin that asks.
+    plugin: Arc<str>,
     level: DialogLevel,
     title: SharedString,
     message: Option<SharedString>,
@@ -170,6 +221,8 @@ pub struct FormDialog {
     /// The window focuses the dialog itself: the first field takes the keyboard then (on the first
     /// frame — focus events don't come to a window that isn't active).
     focus_first: bool,
+    /// When the form was answered: it stays [`RE_ASK_GRACE`] for its plugin to ask again.
+    answered: Option<Instant>,
 }
 
 struct Field {
@@ -213,13 +266,62 @@ impl EventEmitter<DismissEvent> for FormDialog {}
 
 impl FormDialog {
     pub fn new(
+        plugin: Arc<str>,
         form: Form,
         sender: oneshot::Sender<Vec<(String, String)>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let fields = form
-            .fields
+        Self {
+            plugin,
+            level: form.level,
+            title: form.title.into(),
+            message: form.message.map(Into::into),
+            error: form.error.map(Into::into),
+            confirm: form.confirm.into(),
+            fields: Self::build_fields(form.fields, window, cx),
+            focus_handle: cx.focus_handle(),
+            sender: Some(sender),
+            menu: None,
+            focus_first: true,
+            answered: None,
+        }
+    }
+
+    /// The plugin asked again right after the answer (`error` says what was wrong): the dialog
+    /// takes the new form in place, the focus staying on the field it was in.
+    fn ask_again(
+        &mut self,
+        form: Form,
+        sender: oneshot::Sender<Vec<(String, String)>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focused = self
+            .focused_field(window, cx)
+            .map(|index| self.fields[index].key.clone());
+        self.level = form.level;
+        self.title = form.title.into();
+        self.message = form.message.map(Into::into);
+        self.error = form.error.map(Into::into);
+        self.confirm = form.confirm.into();
+        self.fields = Self::build_fields(form.fields, window, cx);
+        self.sender = Some(sender);
+        self.menu = None;
+        self.answered = None;
+        let start = focused
+            .and_then(|key| self.fields.iter().position(|field| field.key == key))
+            .unwrap_or(0);
+        self.focus_field(start, true, window, cx);
+        cx.notify();
+    }
+
+    fn build_fields(
+        fields: Vec<FormField>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Field> {
+        fields
             .into_iter()
             .map(|field| {
                 let placeholder: SharedString =
@@ -266,19 +368,7 @@ impl FormDialog {
                     input,
                 }
             })
-            .collect();
-        Self {
-            level: form.level,
-            title: form.title.into(),
-            message: form.message.map(Into::into),
-            error: form.error.map(Into::into),
-            confirm: form.confirm.into(),
-            fields,
-            focus_handle: cx.focus_handle(),
-            sender: Some(sender),
-            menu: None,
-            focus_first: true,
-        }
+            .collect()
     }
 
     /// Whether the field takes input now: its checkbox (`enabled-by`) is on.
@@ -493,11 +583,31 @@ impl FormDialog {
     }
 
     fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        if self.answered.is_some() {
+            return;
+        }
         let values = self.values(cx);
         if let Some(sender) = self.sender.take() {
             sender.send(values).ok();
         }
-        cx.emit(DismissEvent);
+        if !motion::enabled() {
+            cx.emit(DismissEvent);
+            return;
+        }
+        // A moment for the plugin to ask again: then the dialog takes the new form in place.
+        let at = Instant::now();
+        self.answered = Some(at);
+        ANSWERED.set(Some((self.plugin.clone(), cx.entity().downgrade())));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RE_ASK_GRACE).await;
+            this.update(cx, |this, cx| {
+                if this.answered == Some(at) {
+                    cx.emit(DismissEvent);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn dismiss(&mut self, cx: &mut Context<Self>) {
@@ -600,18 +710,22 @@ impl FormDialog {
                 .child(text.clone())
                 .into_any_element(),
         };
-        // A disabled field: dimmed, and the mouse doesn't reach it.
-        let control =
-            div()
-                .relative()
-                .flex_1()
-                .min_w_0()
-                .child(control)
-                .when(!enabled, |control| {
-                    control
-                        .opacity(0.45)
-                        .child(div().absolute().inset_0().occlude())
-                });
+        // A disabled field: dimmed, and the mouse doesn't reach it. Its checkbox flipped, it dims
+        // and comes back with a fade.
+        let control = div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .child(control)
+            .when(!enabled, |control| {
+                control.child(div().absolute().inset_0().occlude())
+            })
+            .with_transition(
+                ("plugin-form-dim", index),
+                if enabled { 1. } else { DISABLED_OPACITY },
+                motion::FADE,
+                |control, opacity| control.opacity(opacity),
+            );
         let label = match &field.input {
             Input::Text(_) | Input::Multiline(_) | Input::Lines(_) | Input::Choice { .. } => {
                 field.label.clone()
@@ -764,20 +878,29 @@ impl Render for FormDialog {
             .when(!fields.is_empty(), |dialog| {
                 dialog.child(div().flex().flex_col().gap_2p5().children(fields))
             })
-            .children(self.error.clone().map(|error| {
-                div()
-                    .flex()
-                    .items_start()
-                    .gap_2()
-                    .text_color(ui.error)
-                    .child(
+            // Asked again with an error, the dialog grows to it and it slides in (another one too);
+            // the wrapper's margin takes back the gap before it while there is none.
+            .child(div().mt(px(-12.)).child(motion::glide_height(
+                "plugin-form-error",
+                div().children(self.error.clone().map(|error| {
+                    motion::Appear::slide(0., -6.).apply(
+                        error.clone(),
                         div()
-                            .flex_none()
-                            .pt(px(2.))
-                            .child(icon(IconName::Error, ui.error).size(px(14.))),
+                            .pt_3()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .text_color(ui.error)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .pt(px(2.))
+                                    .child(icon(IconName::Error, ui.error).size(px(14.))),
+                            )
+                            .child(div().flex_1().min_w_0().child(error)),
                     )
-                    .child(div().flex_1().min_w_0().child(error))
-            }))
+                })),
+            )))
             .child(
                 div()
                     .flex()

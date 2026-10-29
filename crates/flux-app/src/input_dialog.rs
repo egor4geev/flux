@@ -230,14 +230,23 @@ impl Render for InputDialog {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
                     .child(self.input.clone())
-                    .children(error.map(|error| {
-                        div()
-                            .text_size(px(theme::TEXT_SM))
-                            .text_color(ui.error)
-                            .child(error)
-                    })),
+                    // The dialog grows to a message, which fades in (another one too), and shrinks
+                    // back when it goes.
+                    .child(crate::motion::glide_height(
+                        "input-dialog-error",
+                        div().children(error.map(|error| {
+                            let key = SharedString::from(error.to_string());
+                            crate::motion::Appear::fade().apply(
+                                key,
+                                div()
+                                    .pt_1()
+                                    .text_size(px(theme::TEXT_SM))
+                                    .text_color(ui.error)
+                                    .child(error),
+                            )
+                        })),
+                    )),
             )
             .when(!checkboxes.is_empty(), |dialog| {
                 dialog.child(div().flex().flex_col().gap_1p5().children(checkboxes))

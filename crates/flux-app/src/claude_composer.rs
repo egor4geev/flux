@@ -25,8 +25,10 @@
 //!   A message that waits for the check's answer shows "Checking the country…" by Send; one the
 //!   check sends back comes back into the field as it was written ([`Composer::put_back`]).
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -40,8 +42,8 @@ use futures::channel::mpsc;
 use gpui::{
     Action, Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, Corner,
     DismissEvent, Entity, ExternalPaths, FocusHandle, Focusable, Hsla, Image, ImageFormat,
-    KeyBinding, ObjectFit, Pixels, Render, SharedString, Subscription, Task, Window, actions,
-    anchored, canvas, deferred, div, img, point, prelude::*, px,
+    KeyBinding, ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task, Window,
+    actions, anchored, canvas, deferred, div, img, point, prelude::*, px,
 };
 
 use crate::claude_session::{Attachment, ClaudeSession, EditPoint, SessionEvent, with_attachments};
@@ -101,6 +103,8 @@ const LIST_ROW_HEIGHT: f32 = 28.;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const THUMBNAIL_SIZE: f32 = 44.;
 const FOOTER_HEIGHT: f32 = 28.;
+/// The gap between the rows of the card (banners, chips, the field, the bottom row).
+const CARD_GAP: f32 = 4.;
 /// A card narrower than this (the island at its default width) shortens the bottom row: the
 /// model without its version, the effort as the CLI writes it, the context without its percent.
 const NARROW_CARD: f32 = 380.;
@@ -427,6 +431,32 @@ struct OpenMenu {
     _subscriptions: [Subscription; 2],
 }
 
+impl OpenMenu {
+    /// The menu's bottom-left corner: above the chip it opened from.
+    fn corner(&self) -> Point<Pixels> {
+        point(self.anchor.left(), self.anchor.top() - px(popup::POPUP_GAP))
+    }
+}
+
+/// What the chips above the field show: the editor's file, a plugin's attachments, the pictures,
+/// a note — the field's own, or those that went with a sent message as they leave.
+#[derive(Default)]
+struct Chips {
+    context: Option<EditorContext>,
+    attachments: Vec<Attachment>,
+    images: Vec<Arc<Image>>,
+    notice: Option<SharedString>,
+}
+
+impl Chips {
+    fn is_empty(&self) -> bool {
+        self.context.is_none()
+            && self.attachments.is_empty()
+            && self.images.is_empty()
+            && self.notice.is_none()
+    }
+}
+
 pub struct Composer {
     session: Entity<ClaudeSession>,
     input: Entity<PromptInput>,
@@ -448,6 +478,12 @@ pub struct Composer {
     effort_choice: Option<Choice<Option<Effort>>>,
     mode_choice: Option<Choice<PermissionMode>>,
     menu: Option<OpenMenu>,
+    /// The menu that closed, fading out toward its chip without input; its bottom-left corner.
+    menu_leaving: Option<motion::Leaving<(Entity<ContextMenu>, Point<Pixels>)>>,
+    /// The chips that went with a sent message, fading out as their row folds away; the row's
+    /// height as last drawn.
+    chips_leaving: Option<motion::Leaving<Chips>>,
+    chips_height: Rc<Cell<f32>>,
     /// Where the card and the pickers were drawn: the list and the menus open above them.
     card_bounds: Option<Bounds<Pixels>>,
     picker_bounds: HashMap<Picker, Bounds<Pixels>>,
@@ -615,6 +651,9 @@ impl Composer {
             effort_choice: None,
             mode_choice: None,
             menu: None,
+            menu_leaving: None,
+            chips_leaving: None,
+            chips_height: Rc::default(),
             card_bounds: None,
             picker_bounds: HashMap::new(),
             shell_mode: false,
@@ -969,6 +1008,18 @@ impl Composer {
                 },
             },
         );
+        // The chips go with the message: they fade out as their row folds away (when none
+        // stays).
+        let leaving = Chips {
+            context: self.shown_context().cloned(),
+            attachments: if attach {
+                self.attachments.clone()
+            } else {
+                Vec::new()
+            },
+            images: self.images.clone(),
+            notice: self.notice.clone(),
+        };
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.images.clear();
         if attach {
@@ -976,6 +1027,11 @@ impl Composer {
         }
         self.context_hidden = true;
         self.notice = None;
+        self.chips_leaving = (motion::enabled()
+            && !self.shell_mode
+            && !leaving.is_empty()
+            && self.attachments.is_empty())
+        .then(|| motion::Leaving::new(leaving));
         self.close_suggestions(cx);
         self.focus(window, cx);
         cx.notify();
@@ -1467,7 +1523,8 @@ impl Composer {
     }
 
     fn open_menu(&mut self, picker: Picker, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
+        if let Some(open) = self.menu.take() {
+            self.let_go(open);
             cx.notify();
             return;
         }
@@ -1584,28 +1641,50 @@ impl Composer {
             return;
         }
         let had_focus = menu.focus_handle(cx).contains_focused(window, cx);
-        self.menu = None;
+        if let Some(open) = self.menu.take() {
+            self.let_go(open);
+        }
         if had_focus {
             self.focus(window, cx);
         }
         cx.notify();
     }
 
+    /// A closed menu fades out toward its chip, taking no input; its subscriptions go at once.
+    fn let_go(&mut self, open: OpenMenu) {
+        let corner = open.corner();
+        self.menu_leaving = motion::enabled().then(|| motion::Leaving::new((open.menu, corner)));
+    }
+
     // --- Rendering ---
 
-    fn render_chips(&self, ui: UiColors, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let context = self.shown_context().cloned();
-        if context.is_none()
-            && self.attachments.is_empty()
-            && self.images.is_empty()
-            && self.notice.is_none()
-        {
+    /// The chips above the field: `chips`, or the field's own (`None`).
+    fn render_chips(
+        &self,
+        chips: Option<&Chips>,
+        ui: UiColors,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (context, attachments, images, notice) = match chips {
+            Some(chips) => (
+                chips.context.clone(),
+                &chips.attachments,
+                &chips.images,
+                chips.notice.clone(),
+            ),
+            None => (
+                self.shown_context().cloned(),
+                &self.attachments,
+                &self.images,
+                self.notice.clone(),
+            ),
+        };
+        if context.is_none() && attachments.is_empty() && images.is_empty() && notice.is_none() {
             return None;
         }
         // A plugin's attachment (part 10.3): its label; the whole text in the tooltip's place is
         // too long — the tooltip says it goes along.
-        let attachment_chips = self
-            .attachments
+        let attachment_chips = attachments
             .iter()
             .enumerate()
             .map(|(index, attachment)| {
@@ -1680,7 +1759,7 @@ impl Composer {
         });
         let context_chip = context_chip
             .map(|chip| Appear::pop((0.5, 0.5)).apply("claude-context-chip-appear", chip));
-        let thumbnails = self.images.iter().enumerate().map(|(index, image)| {
+        let thumbnails = images.iter().enumerate().map(|(index, image)| {
             let id = image.id();
             let thumbnail = div()
                 .id(("claude-image", index))
@@ -1730,7 +1809,7 @@ impl Composer {
                 .children(attachment_chips)
                 .children(context_chip)
                 .children(thumbnails)
-                .children(self.notice.clone().map(|notice| {
+                .children(notice.map(|notice| {
                     div()
                         .text_size(px(theme::TEXT_SM))
                         .text_color(ui.warning)
@@ -1764,12 +1843,19 @@ impl Composer {
                 .get(&picker)
                 .zip(self.menu.as_ref())
                 .is_some_and(|(bounds, menu)| *bounds == menu.anchor);
+        let id = match picker {
+            Picker::Model => "claude-model",
+            Picker::Effort => "claude-effort",
+            Picker::Mode => "claude-mode",
+        };
+        // Its backdrop crossfades as its menu opens and closes.
+        let backdrop = if open {
+            ui.pressed
+        } else {
+            gpui::transparent_black()
+        };
         div()
-            .id(match picker {
-                Picker::Model => "claude-model",
-                Picker::Effort => "claude-effort",
-                Picker::Mode => "claude-mode",
-            })
+            .id(id)
             .relative()
             .h(px(22.))
             .px(px(if self.narrow() { 4. } else { 6. }))
@@ -1783,8 +1869,8 @@ impl Composer {
             .text_color(color)
             .whitespace_nowrap()
             .cursor_pointer()
-            .when(open, |button| button.bg(ui.pressed))
             .hover(move |style| style.bg(ui.hover))
+            .active(motion::press)
             .tooltip(ui::tooltip(tooltip, None))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.open_menu(picker, window, cx)
@@ -1809,6 +1895,12 @@ impl Composer {
                 .top_0()
                 .left_0()
                 .size_full(),
+            )
+            .with_transition(
+                gpui::ElementId::NamedChild(Box::new(id.into()), "open".into()),
+                backdrop,
+                motion::FADE,
+                |button, backdrop| button.bg(backdrop),
             )
     }
 
@@ -1921,13 +2013,16 @@ impl Composer {
             Appear::fade().apply("claude-region-wait-appear", status)
         });
         let ring = context.filter(|_| !waits).map(|usage| {
-            context_ring(usage.fraction(), !narrow, ui).tooltip(ui::tooltip(
+            context_ring(
+                usage.fraction(),
+                !narrow,
                 trf(
                     "{0} / {1} tokens in the context",
                     &[&short_tokens(usage.used), &short_tokens(usage.max)],
-                ),
-                None,
-            ))
+                )
+                .into(),
+                ui,
+            )
         });
         let attach = ui::icon_button("claude-attach", IconName::Paperclip, ui)
             .tooltip(ui::tooltip(tr("Attach pictures or files"), None))
@@ -2239,32 +2334,72 @@ pub(crate) fn follow_block(kept: &mut Option<Refusal>, verdict: &Verdict) {
     }
 }
 
-/// A pulsing dot: the country is being checked.
-fn pulse_dot(id: &'static str, ui: UiColors) -> impl IntoElement {
+/// A pulsing dot: the country is being checked. Animations off: a steady dot.
+fn pulse_dot(id: &'static str, ui: UiColors) -> AnyElement {
+    let dot = div().flex_none().size(px(7.)).rounded(px(4.)).bg(ui.accent);
+    if !motion::enabled() {
+        return dot.into_any_element();
+    }
+    dot.with_animation(
+        id,
+        Animation::new(Duration::from_millis(900)).repeat(),
+        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+    )
+    .into_any_element()
+}
+
+/// How full the context is: a ring that fills clockwise from the top, and the percentage. A new
+/// reading (after a turn) glides there, its color with it ([`motion::SMOOTH`]).
+fn context_ring(
+    fraction: f32,
+    percent: bool,
+    tooltip: SharedString,
+    ui: UiColors,
+) -> impl IntoElement {
+    let fraction = fraction.clamp(0., 1.);
+    // How alarming it is: 0 calm, 1 a warning (70 %), 2 an error (90 %) — the color glides
+    // through the levels.
+    let level = if fraction >= 0.9 {
+        2.
+    } else if fraction >= 0.7 {
+        1.
+    } else {
+        0.
+    };
+    let label: Option<SharedString> = percent.then(|| format!("{:.0}%", fraction * 100.).into());
     div()
+        .id("claude-context-meter")
+        .flex()
         .flex_none()
-        .size(px(7.))
-        .rounded(px(4.))
-        .bg(ui.accent)
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+        .items_center()
+        .gap(px(5.))
+        .px(px(4.))
+        .text_size(px(theme::TEXT_XS))
+        .tooltip(ui::tooltip(tooltip, None))
+        .with_transition(
+            "claude-context-ring",
+            (fraction, level),
+            motion::SMOOTH,
+            move |meter, (fraction, level)| {
+                let by_level = |colors: [Hsla; 3]| {
+                    if level <= 1. {
+                        motion::mix(colors[0], colors[1], level)
+                    } else {
+                        motion::mix(colors[1], colors[2], level - 1.)
+                    }
+                };
+                let color = by_level([ui.accent_text, ui.warning, ui.error]);
+                meter
+                    .text_color(by_level([ui.text_muted, ui.warning, ui.error]))
+                    .child(ring_canvas(fraction, color, ui.divider))
+                    .children(label.clone())
+            },
         )
 }
 
-/// How full the context is: a ring that fills clockwise from the top, and the percentage.
-fn context_ring(fraction: f32, percent: bool, ui: UiColors) -> gpui::Stateful<gpui::Div> {
-    let fraction = fraction.clamp(0., 1.);
-    let color = if fraction >= 0.9 {
-        ui.error
-    } else if fraction >= 0.7 {
-        ui.warning
-    } else {
-        ui.accent_text
-    };
-    let track = ui.divider;
-    let ring = canvas(
+/// The ring of [`context_ring`]: the track, and the arc of `fraction` over it.
+fn ring_canvas(fraction: f32, color: Hsla, track: Hsla) -> impl IntoElement {
+    canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
             let center = bounds.center();
@@ -2302,24 +2437,7 @@ fn context_ring(fraction: f32, percent: bool, ui: UiColors) -> gpui::Stateful<gp
         },
     )
     .size(px(RING_SIZE))
-    .flex_none();
-    div()
-        .id("claude-context-meter")
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(px(5.))
-        .px(px(4.))
-        .text_size(px(theme::TEXT_XS))
-        .text_color(if fraction >= 0.7 {
-            color
-        } else {
-            ui.text_muted
-        })
-        .child(ring)
-        .when(percent, |meter| {
-            meter.child(format!("{:.0}%", fraction * 100.))
-        })
+    .flex_none()
 }
 
 /// The byte offset of character `index` in `text`.
@@ -2376,17 +2494,56 @@ impl Render for Composer {
         self.note_buttons(has_message, window, cx);
         let focused = self.input.focus_handle(cx).is_focused(window);
         let chips = (!self.shell_mode)
-            .then(|| self.render_chips(ui, cx))
+            .then(|| self.render_chips(None, ui, cx))
             .flatten();
+        if chips.is_some()
+            || self
+                .chips_leaving
+                .as_ref()
+                .is_some_and(motion::Leaving::done)
+        {
+            self.chips_leaving = None;
+        }
+        let chips = match (chips, &self.chips_leaving) {
+            // Measured: the row folds away from its height when the chips go with a message.
+            (Some(chips), _) => {
+                let height = self.chips_height.clone();
+                Some(
+                    div()
+                        .relative()
+                        .child(chips)
+                        .child(
+                            canvas(
+                                move |bounds, _, _| height.set(bounds.size.height.into()),
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                        .into_any_element(),
+                )
+            }
+            (None, Some(leaving)) => {
+                let progress = leaving.progress(window);
+                self.render_chips(Some(&leaving.value), ui, cx)
+                    .map(|chips| {
+                        // The card's gap goes with the row.
+                        div()
+                            .h(px(self.chips_height.get() * (1. - progress)))
+                            .mb(px(-CARD_GAP * progress))
+                            .overflow_hidden()
+                            .child(motion::inert(motion::leaving_style(
+                                div().child(chips),
+                                progress,
+                                (0., 1.),
+                            )))
+                            .into_any_element()
+                    })
+            }
+            (None, None) => None,
+        };
         let footer = self.render_footer(has_message, blocked, cx);
         let region_banner = self.render_region_banner(rechecking, ui, cx);
-        let (border, ring) = if self.shell_mode {
-            (ui.success, UiColors::tint(ui.success, 0.2))
-        } else if focused {
-            (ui.focus_border, ui.focus_ring)
-        } else {
-            (ui.input_border, ui.focus_ring)
-        };
         // The `!` of shell mode: a badge in front of the command.
         let badge = self.shell_mode.then(|| {
             div()
@@ -2473,18 +2630,27 @@ impl Render for Composer {
                 )
         });
         let list = self.render_list(ui, cx);
+        // The menu grows out of its chip; a closed one fades out toward it, without input.
         let menu = self.menu.as_ref().map(|open| {
-            deferred(
-                anchored()
-                    .anchor(Corner::BottomLeft)
-                    .position(point(
-                        open.anchor.left(),
-                        open.anchor.top() - px(popup::POPUP_GAP),
-                    ))
-                    .snap_to_window_with_margin(px(popup::WINDOW_MARGIN))
-                    .child(open.menu.clone()),
-            )
-            .with_priority(1)
+            let corner = open.corner();
+            let view = Appear::pop((0., 1.)).apply_from(
+                ("claude-composer-menu", open.menu.entity_id().as_u64()),
+                corner,
+                div().child(open.menu.clone()),
+            );
+            place_menu(corner, view)
+        });
+        if self
+            .menu_leaving
+            .as_ref()
+            .is_some_and(motion::Leaving::done)
+        {
+            self.menu_leaving = None;
+        }
+        let leaving_menu = self.menu_leaving.as_ref().map(|leaving| {
+            let (menu, corner) = leaving.value.clone();
+            let view = motion::leaving_from(div().child(menu), leaving.progress(window), corner);
+            place_menu(corner, motion::inert(view))
         });
         let this = cx.entity().downgrade();
         let card = div()
@@ -2492,7 +2658,7 @@ impl Render for Composer {
             .relative()
             .flex()
             .flex_col()
-            .gap(px(4.))
+            .gap(px(CARD_GAP))
             .pt(px(8.))
             .pb(px(6.))
             .pl(px(12.))
@@ -2500,15 +2666,6 @@ impl Render for Composer {
             .rounded(px(RADIUS_LG))
             .bg(ui.input_background)
             .border_1()
-            .border_color(border)
-            .when(focused || self.shell_mode, |card| {
-                card.shadow(vec![gpui::BoxShadow {
-                    color: ring,
-                    offset: point(px(0.), px(0.)),
-                    blur_radius: px(0.),
-                    spread_radius: px(3.),
-                }])
-            })
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                 style.border_color(ui.focus_border).bg(ui.drop_target)
             })
@@ -2555,6 +2712,7 @@ impl Render for Composer {
                 .left_0()
                 .size_full(),
             );
+        let card = card_ring(card, focused, self.shell_mode, ui);
         div()
             .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(None, window, cx)))
@@ -2612,8 +2770,56 @@ impl Render for Composer {
             .text_size(px(theme::TEXT_MD))
             .child(card)
             .children(list)
+            .children(leaving_menu)
             .children(menu)
     }
+}
+
+/// The card's focus ring, as [`ui::focus_field`] draws a field's: it comes in wide and settles
+/// around the card when the field takes focus ([`motion::POP`]), fades when it leaves
+/// ([`motion::FADE`]). In shell mode it stays, green: entering and leaving the mode crossfade the
+/// colors.
+fn card_ring(
+    card: gpui::Stateful<gpui::Div>,
+    focused: bool,
+    shell: bool,
+    ui: UiColors,
+) -> impl IntoElement {
+    let on = focused || shell;
+    let target = (if on { 1. } else { 0. }, if shell { 1. } else { 0. });
+    let curve = if on { motion::POP } else { motion::FADE };
+    card.with_transition(
+        "claude-composer-ring",
+        target,
+        curve,
+        move |card, (t, green)| {
+            let ui = UiColors {
+                focus_border: motion::mix(ui.focus_border, ui.success, green),
+                focus_ring: motion::mix(ui.focus_ring, UiColors::tint(ui.success, 0.2), green),
+                ..ui
+            };
+            let card = card.border_color(motion::mix(ui.input_border, ui.focus_border, t));
+            if t <= 0. {
+                card
+            } else {
+                card.shadow(ui::focus_ring_at(ui, t, on))
+            }
+        },
+    )
+}
+
+/// A picker's menu over the window, its bottom-left corner at `corner` (above the chip); near the
+/// window's edge it is shifted inward.
+fn place_menu(corner: Point<Pixels>, view: impl IntoElement) -> AnyElement {
+    deferred(
+        anchored()
+            .anchor(Corner::BottomLeft)
+            .position(corner)
+            .snap_to_window_with_margin(px(popup::WINDOW_MARGIN))
+            .child(view),
+    )
+    .with_priority(1)
+    .into_any_element()
 }
 
 #[cfg(test)]

@@ -10,8 +10,9 @@
 //! checked out with CRLF (`core.autocrlf`) isn't all changed.
 
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::text::line_start;
 use flux_core::{Assoc, ChangeSet, Rope, TextChange};
@@ -19,7 +20,7 @@ use flux_git::{Hunk, HunkKind};
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Corner, CursorStyle,
     DispatchPhase, Div, HighlightStyle, Hitbox, HitboxBehavior, Hsla, KeyBinding, KeyContext,
-    MouseDownEvent, MouseMoveEvent, PaintQuad, Path, PathBuilder, Pixels, StyledText, Task,
+    MouseDownEvent, MouseMoveEvent, PaintQuad, Path, PathBuilder, Pixels, Point, StyledText, Task,
     WeakEntity, Window, actions, anchored, deferred, div, fill, point, prelude::*, px, size,
 };
 
@@ -28,6 +29,7 @@ use crate::element::LayoutCache;
 use crate::git::GitStore;
 use crate::i18n::{tr, trf};
 use crate::icons::IconName;
+use crate::motion::{self, Leaving};
 use crate::popup::{self, Anchor, POPUP_GAP, Side, WINDOW_MARGIN};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
@@ -97,7 +99,9 @@ pub struct GitState {
     /// The hunks were computed for the current text.
     fresh: bool,
     task: Option<Task<()>>,
-    popup: Option<ChangePopup>,
+    popup: Option<Rc<ChangePopup>>,
+    /// The popup closing, and moving to another change.
+    popup_motion: PopupMotion<Rc<ChangePopup>>,
 }
 
 impl GitState {
@@ -426,14 +430,14 @@ fn open_popup(editor: &mut Editor, index: usize, cx: &mut Context<Editor>) {
         }
         _ => Vec::new(),
     };
-    editor.git.popup = Some(ChangePopup {
+    editor.git.popup = Some(Rc::new(ChangePopup {
         hunk,
         number: index + 1,
         total: editor.git.hunks.len(),
         old_text,
         old_raw,
         changed,
-    });
+    }));
     cx.notify();
 }
 
@@ -458,15 +462,61 @@ fn hide_popup(editor: &mut Editor, cx: &mut Context<Editor>) {
 }
 
 /// The popup under the change (above it when there is no room), at the left edge of the text: a
-/// toolbar, then the lines the change replaced.
+/// toolbar, then the lines the change replaced. It grows out of its change; Previous / Next glide
+/// it to the next one, its lines crossfading; closed, it fades out.
 pub fn render(
-    editor: &Editor,
+    editor: &mut Editor,
     window: &mut Window,
     cx: &mut Context<Editor>,
-) -> Option<AnyElement> {
-    let popup = editor.git.popup.as_ref()?;
+) -> Vec<AnyElement> {
+    let open = editor.git.popup.clone().and_then(|popup| {
+        let place = place(editor, &popup, window)?;
+        Some((popup, place))
+    });
+    let scroll = editor.scroll.y;
+    let leaving = editor.git.popup_motion.frame(
+        open.as_ref()
+            .map(|(popup, place)| (popup, f32::from(place.line_y) + scroll)),
+        |a, b| a.hunk == b.hunk,
+        window,
+    );
+    let mut elements = Vec::new();
+    if let Some((popup, progress)) = leaving
+        && let Some(place) = place(editor, &popup, window)
+    {
+        let panel = panel(&popup, &place, None, cx);
+        let position = place.position;
+        let panel = motion::inert(motion::leaving_from(panel, progress, position));
+        elements.push(overlay(
+            place.corner,
+            position,
+            // Its own ids: the next popup may be open beside it.
+            div().id("change-popup-leaving").child(panel),
+        ));
+    }
+    if let Some((popup, place)) = open {
+        let fade = editor.git.popup_motion.content(window);
+        let offset = editor.git.popup_motion.offset(window);
+        let panel = panel(&popup, &place, Some(fade), cx);
+        let position = point(place.position.x, place.position.y + px(offset));
+        let panel = motion::Appear::pop((0., 0.)).apply_from("change-popup-pop", position, panel);
+        elements.push(overlay(place.corner, position, panel));
+    }
+    elements
+}
+
+/// Where the popup of a change stands, while the change is in view.
+struct Place {
+    /// The top of the change's first line (window coordinates).
+    line_y: Pixels,
+    corner: Corner,
+    position: Point<Pixels>,
+    /// The room for the old lines.
+    room: Pixels,
+}
+
+fn place(editor: &Editor, popup: &ChangePopup, window: &Window) -> Option<Place> {
     let layout = editor.layout.as_ref()?;
-    let ui = Theme::ui(cx);
     let bounds = layout.text_bounds;
     let top = layout.line_top(popup.hunk.new.start as usize);
     let bottom = layout.line_top(popup.hunk.new.end as usize);
@@ -486,7 +536,37 @@ pub fn render(
     };
     let height = px(POPUP_TOOLBAR_HEIGHT + lines as f32 * POPUP_LINE_HEIGHT + 16.);
     let (side, room) = popup::side(&anchor, height, window.viewport_size().height, Side::Below);
+    let (corner, y) = match side {
+        Side::Below => (Corner::TopLeft, anchor.line_bottom + px(POPUP_GAP)),
+        Side::Above => (Corner::BottomLeft, anchor.line_top - px(POPUP_GAP)),
+    };
+    Some(Place {
+        line_y: top,
+        corner,
+        position: point(anchor.x, y),
+        room,
+    })
+}
 
+/// A popup over the window at `position`, kept inside it.
+fn overlay(corner: Corner, position: Point<Pixels>, panel: impl IntoElement) -> AnyElement {
+    deferred(
+        anchored()
+            .anchor(corner)
+            .position(position)
+            .snap_to_window_with_margin(px(WINDOW_MARGIN))
+            .child(panel),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
+/// The popup's panel. `fade`: how far its lines have faded in (taking another change's place);
+/// `None` — a popup leaving, without the listeners that would act on the mouse anywhere.
+fn panel(popup: &ChangePopup, place: &Place, fade: Option<f32>, cx: &mut Context<Editor>) -> Div {
+    let ui = Theme::ui(cx);
+    let room = place.room;
+    let content = fade.unwrap_or(1.);
     let button =
         |id: &'static str, name: IconName, label: &'static str, action: &dyn gpui::Action| {
             ui::icon_button(id, name, ui).tooltip(ui::tooltip(label, ui::shortcut_for(action, cx)))
@@ -526,7 +606,7 @@ pub fn render(
             )
             .on_click(cx.listener(|editor, _: &ClickEvent, _, cx| {
                 if let Some(popup) = editor.git.popup.take() {
-                    rollback(editor, &[popup.hunk], cx);
+                    rollback(editor, std::slice::from_ref(&popup.hunk), cx);
                 }
             })),
         )
@@ -549,7 +629,7 @@ pub fn render(
                     .tooltip(ui::tooltip(tr("Copy the previous text"), None))
                     .on_click(cx.listener(|editor, _: &ClickEvent, _, cx| {
                         if let Some(popup) = editor.git.popup.take() {
-                            cx.write_to_clipboard(ClipboardItem::new_string(popup.old_raw));
+                            cx.write_to_clipboard(ClipboardItem::new_string(popup.old_raw.clone()));
                             cx.notify();
                         }
                     })),
@@ -562,6 +642,7 @@ pub fn render(
                 .pr_1p5()
                 .text_size(px(theme::TEXT_SM))
                 .text_color(ui.dim)
+                .opacity(content)
                 .child(trf("{0} of {1}", &[&popup.number, &popup.total])),
         );
     let body = (!popup.old_text.is_empty()).then(|| {
@@ -595,44 +676,112 @@ pub fn render(
             .text_size(px(theme::TEXT_MD))
             .line_height(px(POPUP_LINE_HEIGHT))
             .whitespace_nowrap()
+            .opacity(content)
             .child(StyledText::new(popup.old_text.clone()).with_highlights(highlights))
     });
-    let panel = popup::panel(ui)
+    popup::panel(ui)
         .occlude()
         .min_w(px(320.))
         .max_w(px(POPUP_MAX_WIDTH))
         .flex()
         .flex_col()
-        .on_mouse_down_out(cx.listener(|editor, _: &MouseDownEvent, _, cx| hide_popup(editor, cx)))
+        .when(fade.is_some(), |panel| {
+            panel.on_mouse_down_out(
+                cx.listener(|editor, _: &MouseDownEvent, _, cx| hide_popup(editor, cx)),
+            )
+        })
         .child(toolbar)
-        .children(body);
-    let (corner, y) = match side {
-        Side::Below => (Corner::TopLeft, anchor.line_bottom + px(POPUP_GAP)),
-        Side::Above => (Corner::BottomLeft, anchor.line_top - px(POPUP_GAP)),
-    };
-    // It grows out of its change; Previous / Next move it to the next change at once.
-    let panel = crate::motion::Appear::pop((0., 0.)).apply_from(
-        "change-popup-pop",
-        point(anchor.x, y),
-        panel,
-    );
-    Some(
-        deferred(
-            anchored()
-                .anchor(corner)
-                .position(point(anchor.x, y))
-                .snap_to_window_with_margin(px(WINDOW_MARGIN))
-                .child(panel),
-        )
-        .with_priority(1)
-        .into_any_element(),
-    )
+        .children(body)
 }
 
 /// Previous / Next in the popup: the cursor goes to that change and the popup shows it.
 fn step_popup(editor: &mut Editor, forward: bool, cx: &mut Context<Editor>) {
     if let Some(index) = go_to_change(editor, forward, cx) {
         open_popup(editor, index, cx);
+    }
+}
+
+// --- Popups in motion ---
+
+/// A popup a model draws again every frame — the change popup, the commit popup of the
+/// annotations, the tooltip of the scrollbar's marks — in motion: closed, it fades out
+/// ([`Leaving`], drawn from what it showed); taking another thing's place (Previous / Next,
+/// another line), it glides there and its content fades in. Kept by the model, as the popup is.
+/// A candidate for `motion`.
+pub(crate) struct PopupMotion<T> {
+    /// What was drawn last frame, and the y of what it is about in the document's coordinates
+    /// (the scroll added: scrolling moves the popup with the text at once, it doesn't glide).
+    shown: Option<(T, f32)>,
+    leaving: Option<Leaving<T>>,
+    /// When the popup last took another thing's place: its content fades in.
+    swapped: Option<Instant>,
+    /// When it last moved, and how far it was from its new place then.
+    moved: Option<(Instant, f32)>,
+}
+
+impl<T> Default for PopupMotion<T> {
+    fn default() -> Self {
+        Self {
+            shown: None,
+            leaving: None,
+            swapped: None,
+            moved: None,
+        }
+    }
+}
+
+impl<T: Clone> PopupMotion<T> {
+    /// This frame draws `now` about `y` (`None` — no popup); `same` tells one thing shown from
+    /// another. Returns what is leaving and how far it has come (0 → 1), asking for frames while
+    /// it leaves.
+    pub(crate) fn frame(
+        &mut self,
+        now: Option<(&T, f32)>,
+        same: impl Fn(&T, &T) -> bool,
+        window: &Window,
+    ) -> Option<(T, f32)> {
+        let on = motion::enabled();
+        match (self.shown.take(), now) {
+            (Some((before, _)), None) => self.leaving = on.then(|| Leaving::new(before)),
+            (Some((before, from)), Some((now, to))) if on => {
+                if !same(&before, now) {
+                    self.swapped = Some(Instant::now());
+                }
+                if from != to {
+                    // From where it is on its way; a long way glides only its last screen.
+                    let limit = f32::from(window.viewport_size().height);
+                    let offset = (from + self.offset_now() - to).clamp(-limit, limit);
+                    self.moved = Some((Instant::now(), offset));
+                }
+            }
+            _ => {}
+        }
+        self.shown = now.map(|(value, y)| (value.clone(), y));
+        if self.leaving.as_ref().is_some_and(Leaving::done) {
+            self.leaving = None;
+        }
+        let leaving = self.leaving.as_ref()?;
+        Some((leaving.value.clone(), leaving.progress(window)))
+    }
+
+    /// How far the content shown now has faded in, 0 → 1, asking for frames while it does.
+    pub(crate) fn content(&self, window: &Window) -> f32 {
+        self.swapped
+            .map_or(1., |since| motion::animate(since, motion::FADE, window))
+    }
+
+    /// What to add to the popup's y on its way to its place (0 there), asking for frames while it
+    /// glides.
+    pub(crate) fn offset(&self, window: &Window) -> f32 {
+        self.moved.map_or(0., |(since, offset)| {
+            offset * (1. - motion::animate(since, motion::SMOOTH, window))
+        })
+    }
+
+    fn offset_now(&self) -> f32 {
+        self.moved.map_or(0., |(since, offset)| {
+            offset * (1. - motion::progress(since, motion::SMOOTH))
+        })
     }
 }
 

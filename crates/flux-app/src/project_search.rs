@@ -24,7 +24,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_core::Document;
 use flux_search::{
@@ -44,6 +44,7 @@ use crate::editor::Editor;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::motion;
 use crate::picker::highlighted_text;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
@@ -244,6 +245,11 @@ pub struct ProjectSearch {
     results: Vec<FileMatches>,
     /// Collapsed files (paths relative to the root): only their headers are visible.
     collapsed: HashSet<PathBuf>,
+    /// A file's chevron turning and its rows unfolding when the user expands or collapses it.
+    disclosure: motion::Disclosure<PathBuf>,
+    /// When the window was last closed: it fades out ([`motion::EXIT`]), drawn but taking no
+    /// input ([`ProjectSearch::present`]).
+    closed: Option<Instant>,
     /// Flat list for rendering: a file header, then its rows (for expanded files).
     rows: Vec<Row>,
     /// How many matches and files have arrived so far, for the status during the search.
@@ -293,6 +299,8 @@ impl ProjectSearch {
             regex: false,
             results: Vec::new(),
             collapsed: HashSet::new(),
+            disclosure: motion::Disclosure::default(),
+            closed: None,
             rows: Vec::new(),
             found: (0, 0),
             selected: None,
@@ -333,6 +341,34 @@ impl ProjectSearch {
         self.open
     }
 
+    /// The window as Workspace draws it over the islands (`window` — its frame): growing in as a
+    /// dialog while open; once closed, fading out for [`motion::EXIT`], drawn but taking no input.
+    /// `None` — not shown.
+    pub(crate) fn present<E>(&self, window: E) -> Option<AnyElement>
+    where
+        E: Styled + IntoElement + 'static,
+    {
+        if self.open {
+            return Some(motion::Appear::dialog().apply("project-search", window));
+        }
+        self.closed
+            .filter(|since| motion::running(*since, motion::EXIT))?;
+        let leaving = window.with_animation(
+            "project-search-leaving",
+            Animation::new(motion::EXIT.duration()),
+            |window, t| motion::leaving_style(window, motion::EXIT.ease(t), (0.5, 0.)),
+        );
+        Some(motion::inert(leaving).into_any_element())
+    }
+
+    /// The window closed: it fades out.
+    fn closing(&mut self) {
+        if self.open {
+            self.closed = motion::enabled().then(Instant::now);
+        }
+        self.open = false;
+    }
+
     /// cmd-shift-f: opens a closed window and moves focus to the query field (`seed` is the text
     /// for it, e.g. the selection); focuses an open window that does not have focus; closes a
     /// focused one.
@@ -365,7 +401,7 @@ impl ProjectSearch {
     /// Esc (in the window, or in the editor when there is nothing to clear there), ×, cmd-shift-f
     /// from the field, opening a match: the window hides and focus goes to the editor.
     pub fn close(&mut self, cx: &mut Context<Self>) {
-        self.open = false;
+        self.closing();
         cx.emit(ProjectSearchEvent::FocusEditor);
         cx.notify();
     }
@@ -373,7 +409,7 @@ impl ProjectSearch {
     /// Hides the window without returning focus: a click outside the window, another window on top
     /// (the Workspace manages focus).
     pub fn hide(&mut self, cx: &mut Context<Self>) {
-        self.open = false;
+        self.closing();
         cx.notify();
     }
 
@@ -491,6 +527,14 @@ impl ProjectSearch {
         )
     }
 
+    /// The rows laid out again; a file the user just expanded unfolds its rows.
+    fn set_rows(&mut self) {
+        self.rows = self.layout();
+        let (rows, results) = (&self.rows, &self.results);
+        self.disclosure
+            .rows_changed(|path| rows_of_file(rows, results, path));
+    }
+
     /// The row the user picked (arrows, click), to keep the selection on it when the rows change.
     fn pinned(&self) -> Option<Pick> {
         self.picked().filter(|_| self.selection_pinned)
@@ -519,7 +563,7 @@ impl ProjectSearch {
     /// The rows changed: the selection stays on the row the user picked, otherwise (or when it is
     /// gone) goes to the first row that can be picked — a file found by name, if there is one.
     fn relayout(&mut self, pinned: Option<Pick>, cx: &mut Context<Self>) {
-        self.rows = self.layout();
+        self.set_rows();
         self.selected = match pinned.and_then(|pick| self.row_of_pick(&pick)) {
             Some(row) => Some(row),
             None => {
@@ -607,7 +651,7 @@ impl ProjectSearch {
     fn expand_named(&mut self, cx: &mut Context<Self>) {
         let first_hidden = self.named.shown();
         self.named.expanded = true;
-        self.rows = self.layout();
+        self.set_rows();
         if let Some(row) = row_of_named(&self.rows, first_hidden) {
             self.selected = Some(row);
             self.selection_pinned = true;
@@ -661,7 +705,7 @@ impl ProjectSearch {
     fn select_row(&mut self, row: usize, cx: &mut Context<Self>) {
         self.selected = Some(row);
         self.selection_pinned = true;
-        self.sync_preview(cx);
+        self.show_preview(true, cx);
         cx.notify();
     }
 
@@ -670,10 +714,12 @@ impl ProjectSearch {
     fn toggle_file(&mut self, file: usize, cx: &mut Context<Self>) {
         let picked = self.picked();
         let path = self.results[file].path.clone();
-        if !self.collapsed.remove(&path) {
-            self.collapsed.insert(path);
+        let open = self.collapsed.remove(&path);
+        if !open {
+            self.collapsed.insert(path.clone());
         }
-        self.rows = self.layout();
+        self.disclosure.toggled(path, open);
+        self.set_rows();
         self.selected = picked.and_then(|pick| {
             self.row_of_pick(&pick)
                 .or_else(|| fallback_row(&self.rows, file))
@@ -728,6 +774,13 @@ impl ProjectSearch {
     /// while it is being read). With no selection the preview is removed, except during a search in
     /// progress, when a selection is about to appear.
     fn sync_preview(&mut self, cx: &mut Context<Self>) {
+        self.show_preview(false, cx);
+    }
+
+    /// [`ProjectSearch::sync_preview`]; `glide` — the user moved the selection: within the file
+    /// shown the preview glides to the next result (a file shown anew is there at once, and so is
+    /// what follows typing).
+    fn show_preview(&mut self, glide: bool, cx: &mut Context<Self>) {
         let (path, selected) = match self.selected_row() {
             Some(Row::Line { file, line }) => (self.results[file].path.clone(), Some((file, line))),
             // A file found by name: its beginning.
@@ -746,10 +799,17 @@ impl ProjectSearch {
         {
             self.preview.loading = None;
             self.preview.message = None;
+            let show = move |editor: &mut Editor, position, cx: &mut Context<Editor>| {
+                if glide {
+                    editor.glide_to_position(position, cx);
+                } else {
+                    editor.show_position(position, cx);
+                }
+            };
             let Some((file, line)) = selected else {
                 editor.update(cx, |editor, cx| {
                     editor.clear_search_highlights(cx);
-                    editor.show_position(0, cx);
+                    show(editor, 0, cx);
                 });
                 return;
             };
@@ -767,7 +827,7 @@ impl ProjectSearch {
                     .and_then(|active| ranges.get(active))
                     .map_or_else(|| editor.position(document_line, 0), |r| r.start);
                 editor.set_search_highlights(ranges, active, cx);
-                editor.show_position(position, cx);
+                show(editor, position, cx);
             });
             return;
         }
@@ -981,9 +1041,9 @@ impl ProjectSearch {
         uniform_list(
             "project-search-results",
             self.rows.len(),
-            cx.processor(|this, range: Range<usize>, _, cx| {
+            cx.processor(|this, range: Range<usize>, window, cx| {
                 range
-                    .map(|index| this.render_row(index, cx))
+                    .map(|index| this.render_row(index, window, cx))
                     .collect::<Vec<_>>()
             }),
         )
@@ -1038,7 +1098,23 @@ impl ProjectSearch {
         })
     }
 
-    fn render_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    /// A row of the list; the rows of a file the user just expanded unfold into place.
+    fn render_row(&mut self, index: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let unfold = self.disclosure.unfold(index, window);
+        let row = self.render_row_content(index, window, cx);
+        if unfold < 1. {
+            motion::unfold_style(div().w_full().child(row), unfold).into_any_element()
+        } else {
+            row
+        }
+    }
+
+    fn render_row_content(
+        &mut self,
+        index: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let ui = Theme::ui(cx);
         let row = div().id(index).w_full().h(px(ROW_HEIGHT)).px_1p5();
         let selected = self.selected == Some(index);
@@ -1149,11 +1225,7 @@ impl ProjectSearch {
                 let matches = &self.results[file];
                 let collapsed = self.collapsed.contains(&matches.path);
                 let (name, dir) = split_path(&matches.path);
-                let chevron = if collapsed {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                };
+                let chevron = self.disclosure.chevron(&matches.path, !collapsed, window);
                 row.cursor_pointer()
                     .on_click(
                         cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_file(file, cx)),
@@ -1169,7 +1241,7 @@ impl ProjectSearch {
                             .rounded(px(ui::RADIUS_SM))
                             .whitespace_nowrap()
                             .hover(move |style| style.bg(ui.hover))
-                            .child(icon(chevron, ui.dim).size(px(12.)))
+                            .child(crate::icons::chevron(chevron, ui.dim).size(px(12.)))
                             .child(file_icon(&name, &ui).render().size(px(14.)))
                             .child(
                                 div()
@@ -1468,18 +1540,35 @@ impl Drop for ProjectSearch {
     }
 }
 
-/// A pulsing "search in progress" dot.
-fn pulse(ui: UiColors) -> impl IntoElement {
-    div()
-        .flex_none()
-        .size(px(7.))
-        .rounded(px(4.))
-        .bg(ui.accent)
-        .with_animation(
-            "searching",
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
-        )
+/// A pulsing "search in progress" dot; with animations off, a still one.
+fn pulse(ui: UiColors) -> AnyElement {
+    let dot = div().flex_none().size(px(7.)).rounded(px(4.)).bg(ui.accent);
+    if !motion::enabled() {
+        return dot.into_any_element();
+    }
+    dot.with_animation(
+        "searching",
+        Animation::new(Duration::from_millis(900)).repeat(),
+        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+    )
+    .into_any_element()
+}
+
+/// Where the rows of the matches of the file `path` are in `rows` — `None` when it is collapsed
+/// or gone ([`motion::Disclosure::rows_changed`]).
+fn rows_of_file(rows: &[Row], results: &[FileMatches], path: &PathBuf) -> Option<Range<usize>> {
+    let header = rows
+        .iter()
+        .position(|row| matches!(*row, Row::File(file) if results[file].path == *path))?;
+    let Row::File(file) = rows[header] else {
+        return None;
+    };
+    let start = header + 1;
+    let count = rows[start..]
+        .iter()
+        .take_while(|row| matches!(**row, Row::Line { file: of, .. } if of == file))
+        .count();
+    (count > 0).then_some(start..start + count)
 }
 
 /// Reads a file for the preview (on a background thread); a file that is too large yields a message

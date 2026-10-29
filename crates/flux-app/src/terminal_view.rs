@@ -120,6 +120,31 @@ struct Menu {
     _subscriptions: [Subscription; 2],
 }
 
+/// A jump through the scrollback gliding there (`crate::motion::SCROLL`): ⇧PgUp/PgDn, ⌘Home/End,
+/// the next match. The view steps through the lines on the way, the grid drawn the rest of a line
+/// off in between. Output and typing never glide: new output keeps the view on its lines (the
+/// glide goes on to the same lines), typing (the live screen) and the wheel end it.
+struct ScrollGlide {
+    /// Display offsets (lines back from the live screen): where the screen was, where it goes.
+    from: f32,
+    to: usize,
+    since: Instant,
+    /// The display offset the glide set last.
+    last: usize,
+}
+
+impl ScrollGlide {
+    /// Where the screen is now, in lines back.
+    fn position(&self) -> f32 {
+        let (t, done) = crate::motion::SCROLL.at(self.since.elapsed());
+        if done {
+            self.to as f32
+        } else {
+            crate::motion::lerp(self.from, self.to as f32, t)
+        }
+    }
+}
+
 /// How a terminal starts: the user's shell by default; a plugin's terminal (part 8.2) also gets a
 /// command, more environment, a title, its pane kept after the end, and its owner.
 #[derive(Debug, Clone, Default)]
@@ -176,6 +201,8 @@ pub struct TerminalView {
     reported_cell: Option<(usize, usize)>,
     /// Wheel lines not scrolled yet: a trackpad moves by fractions of a line.
     scroll_remainder: f32,
+    /// A jump through the scrollback gliding there (⇧PgUp/PgDn, ⌘Home/End, the next match).
+    scroll_glide: Option<ScrollGlide>,
     menu: Option<Menu>,
     /// Search in the output: the bar and the matches the element draws.
     pub(crate) search: crate::terminal_search::SearchState,
@@ -277,6 +304,7 @@ impl TerminalView {
                 reported_button: None,
                 reported_cell: None,
                 scroll_remainder: 0.,
+                scroll_glide: None,
                 menu: None,
                 search: Default::default(),
                 links: Default::default(),
@@ -423,9 +451,81 @@ impl TerminalView {
         }
     }
 
+    /// Scrolls by hand (the wheel): at once — a glide under way ends where it is.
     fn scroll(&mut self, delta: ScrollDelta, cx: &mut Context<Self>) {
+        self.scroll_glide = None;
         self.terminal.scroll(delta);
         cx.notify();
+    }
+
+    /// A jump through the scrollback (⇧PgUp/PgDn, ⌘Home/End, the next match): `jump` takes the view
+    /// there at once, and the screen glides there ([`ScrollGlide`]) — from where it is drawn.
+    pub(crate) fn glide_scroll(&mut self, jump: impl FnOnce(&Terminal), cx: &mut Context<Self>) {
+        let mut offset = self.terminal.content().display_offset;
+        let from = match self.scroll_glide.take() {
+            // A glide under way: the next jump starts at its end, the screen from where it is.
+            Some(glide) if glide.last == offset => {
+                self.terminal
+                    .scroll(ScrollDelta::Lines(glide.to as i32 - offset as i32));
+                offset = glide.to;
+                glide.position()
+            }
+            _ => offset as f32,
+        };
+        jump(&self.terminal);
+        let to = self.terminal.content().display_offset;
+        if crate::motion::enabled() && to != offset && (to as f32 - from).abs() >= 1. {
+            // Back to where the screen is; the frames take it on line by line.
+            let start = from.round().max(0.) as usize;
+            self.terminal
+                .scroll(ScrollDelta::Lines(start as i32 - to as i32));
+            self.scroll_glide = Some(ScrollGlide {
+                from,
+                to,
+                since: Instant::now(),
+                last: start,
+            });
+        }
+        cx.notify();
+    }
+
+    /// The view was moved at once (a search as the query is typed): a glide under way ends.
+    pub(crate) fn stop_scroll_glide(&mut self) {
+        self.scroll_glide = None;
+    }
+
+    /// This frame's step of a glide: the view moves to the line it passes, and the grid is drawn
+    /// the rest of a line off — how far down, in lines. Asks for the next frame until it ends.
+    fn step_scroll_glide(&mut self, window: &mut Window) -> Option<f32> {
+        let glide = self.scroll_glide.as_mut()?;
+        let actual = self.terminal.content().display_offset;
+        if actual != glide.last {
+            if actual == 0 {
+                // Back on the live screen (typing): the glide ends.
+                self.scroll_glide = None;
+                return None;
+            }
+            // New output kept the view on its lines (the history grew under it): on to the same
+            // lines.
+            let shift = actual as f32 - glide.last as f32;
+            glide.from += shift;
+            glide.to = (glide.to as f32 + shift).max(0.) as usize;
+            glide.last = actual;
+        }
+        let done = !crate::motion::running(glide.since, crate::motion::SCROLL);
+        let position = glide.position();
+        let line = position.round().max(0.) as usize;
+        if line != glide.last {
+            self.terminal
+                .scroll(ScrollDelta::Lines(line as i32 - glide.last as i32));
+            glide.last = line;
+        }
+        if done {
+            self.scroll_glide = None;
+            return None;
+        }
+        window.request_animation_frame();
+        Some(position - line as f32)
     }
 
     // --- Mouse ---
@@ -949,6 +1049,13 @@ impl Render for TerminalView {
         } else {
             CursorStyle::IBeam
         };
+        // A glide through the scrollback: the grid drawn the rest of a line off (paint only).
+        let glide = self.step_scroll_glide(window).map(|lines| {
+            let line_height = self
+                .layout
+                .map_or(px(theme::TERMINAL_LINE_HEIGHT), |layout| layout.line_height);
+            line_height * lines
+        });
         div()
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
@@ -966,20 +1073,19 @@ impl Render for TerminalView {
                 this.terminal.clear();
                 cx.notify();
             }))
-            .on_action(
-                cx.listener(|this, _: &ScrollPageUp, _, cx| this.scroll(ScrollDelta::PageUp, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &ScrollPageDown, _, cx| {
-                    this.scroll(ScrollDelta::PageDown, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &ScrollToTop, _, cx| this.scroll(ScrollDelta::Top, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &ScrollToBottom, _, cx| this.scroll(ScrollDelta::Bottom, cx)),
-            )
+            // Jumps through the scrollback glide there (`ScrollGlide`).
+            .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| {
+                this.glide_scroll(|terminal| terminal.scroll(ScrollDelta::PageUp), cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollPageDown, _, cx| {
+                this.glide_scroll(|terminal| terminal.scroll(ScrollDelta::PageDown), cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollToTop, _, cx| {
+                this.glide_scroll(|terminal| terminal.scroll(ScrollDelta::Top), cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollToBottom, _, cx| {
+                this.glide_scroll(|terminal| terminal.scroll(ScrollDelta::Bottom), cx)
+            }))
             .map(|root| crate::terminal_search::actions(root, cx))
             .children(crate::terminal_search::render_bar(self, window, cx))
             .child(
@@ -1005,7 +1111,12 @@ impl Render for TerminalView {
                     .on_modifiers_changed(cx.listener(|this, event, window, cx| {
                         crate::terminal_links::modifiers_changed(this, event, window, cx)
                     }))
-                    .child(TerminalElement::new(cx.entity())),
+                    .child(
+                        div()
+                            .size_full()
+                            .when_some(glide, |grid, y| grid.transform_translate(px(0.), y))
+                            .child(TerminalElement::new(cx.entity())),
+                    ),
             )
             .children(self.render_exit_note(window, cx))
             .child(ContextMenu::slot(

@@ -1,6 +1,7 @@
 mod app_log;
 mod app_menu;
 mod appearance_settings;
+mod badge;
 mod blame;
 mod branch_dialogs;
 mod branches_popup;
@@ -114,6 +115,7 @@ mod start_screen;
 mod stash_panel;
 mod system_notify;
 mod system_shortcuts;
+mod tab_strip;
 mod task_contexts;
 mod terminal_element;
 mod terminal_group;

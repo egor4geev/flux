@@ -17,10 +17,11 @@
 //! block parser on the helpers here, and their inline text with [`parse_inline_document`]: the
 //! inline HTML of READMEs (`<kbd>`, `<b>`, `<a href>`…) and `~~strikethrough~~` on top of the rest.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use flux_core::Rope;
 use flux_lsp::lsp_types::{MarkupContent, MarkupKind};
@@ -34,6 +35,7 @@ use gpui::{
 
 use crate::claude_select::{Collect, Joint};
 use crate::display::{display_line, text_runs};
+use crate::motion::{self, TransitionExt};
 use crate::plugin_links::Target;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
@@ -1606,14 +1608,7 @@ pub(crate) fn chat_code_block(
                 .text_size(px(theme::TEXT_XS))
                 .text_color(ui.dim)
                 .child(div().flex_1().child(language))
-                .child(
-                    ui::icon_button(id, crate::icons::IconName::Copy, ui)
-                        .size(px(22.))
-                        .tooltip(ui::tooltip(crate::i18n::tr("Copy"), None))
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
-                        }),
-                ),
+                .child(copy_button(id, text, ui)),
         )
         .child(
             div()
@@ -1624,6 +1619,71 @@ pub(crate) fn chat_code_block(
                 .child(code_text(code, theme, marks, select)),
         )
         .into_any_element()
+}
+
+thread_local! {
+    /// The copy button of a code block clicked last, and when: it shows a check for a moment.
+    static COPIED: RefCell<Option<(ElementId, Instant)>> = const { RefCell::new(None) };
+}
+
+/// The copy button of a chat's code block: a click copies the code and the icon crossfades to a
+/// check ([`motion::FADE`]), back after [`ui::COPIED_FOR`] as the other Copy buttons — one redraw
+/// then, no frames in between. The block is drawn by a function, not a view: no [`ui::Copied`] to
+/// keep, the last click is the thread's.
+fn copy_button(id: ElementId, text: String, ui: crate::theme::UiColors) -> impl IntoElement {
+    use crate::icons::{IconName, icon};
+    let copied = COPIED.with_borrow(|copied| {
+        copied
+            .as_ref()
+            .is_some_and(|(copied, since)| *copied == id && since.elapsed() < ui::COPIED_FOR)
+    });
+    let (clicked, transition) = (id.clone(), id.clone());
+    div()
+        .id(id)
+        .group("code-copy")
+        .flex_none()
+        .size(px(22.))
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(RADIUS_SM))
+        .cursor_pointer()
+        .hover(move |style| style.bg(ui.hover))
+        .active(move |style| motion::press(style.bg(ui.pressed)))
+        .tooltip(ui::tooltip(crate::i18n::tr("Copy"), None))
+        .on_click(move |_, window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            COPIED.with_borrow_mut(|copied| *copied = Some((clicked.clone(), Instant::now())));
+            window.refresh();
+            window
+                .spawn(cx, async move |cx| {
+                    cx.background_executor().timer(ui::COPIED_FOR).await;
+                    cx.update(|window, _| window.refresh()).ok();
+                })
+                .detach();
+        })
+        // Keyed by the block: a message's code blocks share their parent's id scope.
+        .with_transition(
+            transition,
+            if copied { 1. } else { 0. },
+            motion::FADE,
+            move |button, value: f32| {
+                button
+                    .child(
+                        icon(IconName::Copy, ui.text_muted)
+                            .size(px(15.))
+                            .group_hover("code-copy", move |style| style.text_color(ui.foreground))
+                            .opacity(1. - value),
+                    )
+                    .child(
+                        icon(IconName::Check, ui.success)
+                            .absolute()
+                            .size(px(15.))
+                            .opacity(value),
+                    )
+            },
+        )
 }
 
 /// Spans as the text and the runs of styled text; in the chat (`chat`), inline code is a lighter,

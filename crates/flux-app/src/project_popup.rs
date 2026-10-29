@@ -138,6 +138,7 @@ pub fn project_chip(workspace: &Workspace, cx: &Context<Workspace>) -> AnyElemen
             chip.text_color(ui.text_muted)
                 .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
         })
+        .active(crate::motion::press)
         .tooltip(ui::tooltip(tooltip, None))
         // A press while the popup is open only closes it (the popup's own "click outside"): the
         // capture phase sees the popup before it goes.

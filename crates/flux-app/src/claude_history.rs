@@ -224,7 +224,8 @@ impl PickerDelegate for HistoryDelegate {
         });
         // Without a prompt of its own, the title takes the row (a long first prompt as a title).
         let alone = prompt.is_none();
-        // The trash shows on the row under the mouse and on the selected one.
+        // The trash shows on the row under the mouse and on the selected one; under the mouse it
+        // fades in (the button's id keeps the fade), moved to with the arrows it is there at once.
         let delete = crate::ui::icon_button(("history-delete", index), IconName::Trash, ui)
             .flex_none()
             .tooltip(crate::ui::tooltip(tr("Delete Session"), Some("⌘⌫".into())))
@@ -234,8 +235,8 @@ impl PickerDelegate for HistoryDelegate {
             )
             .when(!selected, |button| {
                 button
-                    .invisible()
-                    .group_hover("history-row", |style| style.visible())
+                    .opacity(0.)
+                    .group_hover("history-row", |style| style.opacity(1.))
             });
         div()
             .group("history-row")
