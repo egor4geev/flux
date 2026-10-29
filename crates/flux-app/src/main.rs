@@ -1,6 +1,7 @@
 mod app_log;
 mod app_menu;
 mod appearance_settings;
+mod badge;
 mod blame;
 mod branch_dialogs;
 mod branches_popup;

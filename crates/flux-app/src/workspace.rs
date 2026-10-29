@@ -91,9 +91,8 @@ const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 /// The project's state is saved this long after its tabs or layout changed (part 10.1): a burst of
 /// changes is one write, and a crash loses little.
 const STATE_SAVE_DELAY: Duration = Duration::from_millis(1500);
-/// The bell when its unread count grows: the badge starts this much larger and springs back
-/// (`crate::motion::BOUNCE`); the icon swings this many times this far to the sides, dying down.
-const BELL_BUMP: f32 = 0.45;
+/// The bell when its unread count grows: the count bumps (`crate::badge`); the icon swings this
+/// many times this far to the sides, dying down.
 const BELL_SWINGS: f32 = 2.5;
 const BELL_SWING: f32 = 2.5;
 const BELL_WOBBLE: crate::motion::Curve =
@@ -275,7 +274,7 @@ pub struct Workspace {
     /// tab replaced the start screen. Since when.
     fade_in: Option<Instant>,
     /// The bell's unread count as last drawn, and when it last grew (the badge bumps).
-    bell: std::cell::Cell<(usize, Option<Instant>)>,
+    bell: std::cell::Cell<crate::badge::Bump>,
     /// The Notifications window (the journal of the notification center).
     notifications_panel: Entity<NotificationsPanel>,
     /// The window's plugins: their commands, tool windows (in the island on the right), status
@@ -901,7 +900,7 @@ impl Workspace {
             bottom_glide: IslandGlide::new(),
             right_glide: IslandGlide::new(),
             // The first frame takes the count as it is, without a bump.
-            bell: std::cell::Cell::new((usize::MAX, None)),
+            bell: Default::default(),
             notifications_panel,
             plugins,
             claude,
@@ -4830,6 +4829,7 @@ impl Workspace {
                                     .border_color(ui.elevated_border)
                                     .text_color(ui.text_muted)
                             })
+                            .active(crate::motion::press)
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(file_finder::Toggle.boxed_clone(), cx)
                             })
@@ -4891,24 +4891,13 @@ impl Workspace {
         let ui = Theme::ui(cx);
         let center = self.notification_center.read(cx);
         let unread = center.unread_count();
-        // The count grew: the badge bumps and the bell wobbles once (`crate::motion`).
-        let (seen, grew) = self.bell.get();
-        let grew = match grew {
-            _ if unread > seen && crate::motion::enabled() => Some(Instant::now()),
-            Some(since)
-                if crate::motion::running(since, crate::motion::BOUNCE)
-                    || crate::motion::running(since, BELL_WOBBLE) =>
-            {
-                Some(since)
-            }
-            _ => None,
-        };
-        self.bell.set((unread, grew));
-        let (bump, wobble) = grew.map_or((1., 1.), |since| {
-            (
-                crate::motion::animate(since, crate::motion::BOUNCE, window),
-                crate::motion::animate(since, BELL_WOBBLE, window),
-            )
+        // The count grew: the badge bumps and the bell wobbles once (`crate::badge`).
+        let mut bell = self.bell.get();
+        let grew = bell.track(unread, BELL_WOBBLE);
+        self.bell.set(bell);
+        let bump = crate::badge::progress(grew, window);
+        let wobble = grew.map_or(1., |since| {
+            crate::motion::animate(since, BELL_WOBBLE, window)
         });
         // Swings to the sides, dying down.
         let swing =
@@ -4960,11 +4949,7 @@ impl Workspace {
                             .text_size(px(theme::TEXT_XS))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(color)
-                            .when(bump < 1., |badge| {
-                                badge
-                                    .transform_scale(1. + BELL_BUMP * (1. - bump))
-                                    .transform_origin(0.5, 0.5)
-                            })
+                            .map(|badge| crate::badge::bump_style(badge, bump))
                             .child(if unread > 99 {
                                 "99+".to_string()
                             } else {
@@ -8514,9 +8499,10 @@ impl Workspace {
             .limits()
             .filter(|_| crate::settings::claude(cx).show_limits)
             .cloned();
+        // The state as a key too: a new one fades in (`crate::motion`).
         let state = match activity {
-            claude::Activity::Working => Some((tr("Working…"), ui.accent_text)),
-            claude::Activity::Waiting => Some((tr("Waiting for you"), ui.warning)),
+            claude::Activity::Working => Some((tr("Working…"), ui.accent_text, 0usize)),
+            claude::Activity::Waiting => Some((tr("Waiting for you"), ui.warning, 1)),
             _ => None,
         };
         if state.is_none() && limits.is_none() {
@@ -8541,7 +8527,7 @@ impl Workspace {
             claude::LimitLevel::Critical => ui.error,
         };
         let mut tooltip = String::from(tr("Claude Code"));
-        if let Some((label, _)) = &state {
+        if let Some((label, ..)) = &state {
             tooltip.push_str(" — ");
             tooltip.push_str(label);
         }
@@ -8563,16 +8549,27 @@ impl Workspace {
                         &claude::resets_in(window.resets_at, now),
                     ],
                 ));
+                // A new share fades in, its color glides to the new level (`crate::motion`).
+                let percent = format!("{}%", claude::percent(window.utilization));
                 windows.push(
                     div()
+                        .id(short)
                         .flex()
                         .items_center()
                         .gap_1()
                         .child(div().text_color(ui.dim).child(short))
                         .child(
                             div()
-                                .text_color(level_color(window.utilization))
-                                .child(format!("{}%", claude::percent(window.utilization))),
+                                .child(crate::motion::Appear::fade().apply(
+                                    SharedString::from(percent.clone()),
+                                    div().child(percent),
+                                ))
+                                .with_transition(
+                                    "color",
+                                    level_color(window.utilization),
+                                    crate::motion::FADE,
+                                    |percent, color| percent.text_color(color),
+                                ),
                         )
                         .into_any_element(),
                 );
@@ -8597,13 +8594,19 @@ impl Workspace {
                         None => window.dispatch_action(Box::new(claude::ToggleClaude), cx),
                     })
                     .child(
-                        icon(
-                            IconName::Claude,
-                            state.as_ref().map_or(ui.text_muted, |(_, color)| *color),
-                        )
-                        .size(px(13.)),
+                        icon(IconName::Claude, ui.text_muted)
+                            .size(px(13.))
+                            .with_transition(
+                                "icon",
+                                state.as_ref().map_or(ui.text_muted, |(_, color, _)| *color),
+                                crate::motion::FADE,
+                                |icon, color| icon.text_color(color),
+                            ),
                     )
-                    .children(state.map(|(label, color)| div().text_color(color).child(label)))
+                    .children(state.map(|(label, color, key)| {
+                        crate::motion::Appear::fade()
+                            .apply(("state", key), div().text_color(color).child(label))
+                    }))
                     .children(windows),
             ),
         )

@@ -487,27 +487,31 @@ pub fn status_item(editor: &Editor, ui: UiColors) -> Option<impl IntoElement + u
             .child(count.to_string())
     };
     let tooltip = trf("Errors: {0} · Warnings: {1}", &[&errors, &warnings]);
+    // It fades in as the first problem comes (`crate::motion`).
     Some(
-        div()
-            .id("diagnostics-status")
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_1p5()
-            .h(px(20.))
-            .rounded(px(ui::RADIUS_SM))
-            .whitespace_nowrap()
-            .cursor_pointer()
-            .hover(move |style| style.bg(ui.hover))
-            .when(errors > 0, |item| {
-                item.child(count(IconName::Error, ui.error, errors))
-            })
-            .when(warnings > 0, |item| {
-                item.child(count(IconName::Warning, ui.warning, warnings))
-            })
-            .tooltip(ui::tooltip(tooltip, Some("F2".into())))
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(NextProblem), cx)),
+        crate::motion::Appear::fade().apply(
+            "diagnostics-status-appear",
+            div()
+                .id("diagnostics-status")
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_1p5()
+                .h(px(20.))
+                .rounded(px(ui::RADIUS_SM))
+                .whitespace_nowrap()
+                .cursor_pointer()
+                .hover(move |style| style.bg(ui.hover))
+                .when(errors > 0, |item| {
+                    item.child(count(IconName::Error, ui.error, errors))
+                })
+                .when(warnings > 0, |item| {
+                    item.child(count(IconName::Warning, ui.warning, warnings))
+                })
+                .tooltip(ui::tooltip(tooltip, Some("F2".into())))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(NextProblem), cx)),
+        ),
     )
 }
 

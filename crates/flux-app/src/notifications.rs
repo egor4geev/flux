@@ -12,19 +12,23 @@
 //!
 //! Motion: a card slides in from the right with a bounce ([`motion::BOUNCE`]); one that goes slides
 //! out to the right and fades, drawn without input until its exit ends ([`motion::Leaving`] — the
-//! cards keep it meanwhile); the rest of the stack glides to its new place ([`Glide`]).
+//! cards keep it meanwhile); the rest of the stack glides to its new place ([`Glide`]). A card
+//! changed in place fades its new icon and text in ([`motion::FADE`]; a success's check bounces),
+//! the done part of its bar glides to the new fraction ([`motion::SMOOTH`]); an unknown amount of
+//! work sweeps across the bar while it goes on. The close button fades in under the pointer.
 
 use std::panic::Location;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Action, AnyElement, App, Bounds, ClickEvent, Context, Div, ElementId, Entity, EventEmitter,
-    FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Render,
-    SharedString, Stateful, Task, Window, div, point, prelude::*, px, relative,
+    Action, Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, Div, ElementId,
+    Entity, EventEmitter, FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement,
+    LayoutId, Pixels, Render, SharedString, Stateful, Task, Window, div, point, prelude::*, px,
+    relative,
 };
 
 use crate::icons::{IconName, icon};
-use crate::motion::{self, Leaving};
+use crate::motion::{self, Leaving, TransitionExt};
 use crate::notification_center::{NotificationGroup, NotificationId};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, GAP, RADIUS_LG, RADIUS_SM, STATUS_BAR_HEIGHT};
@@ -43,6 +47,15 @@ const EXIT_SLIDE: f32 = 2. * motion::SLIDE;
 /// A card glides to its new place in the stack only when it has moved by more than this (layout
 /// rounding is not a move).
 const GLIDE_MIN: f32 = 0.5;
+/// The icon of a card that has become a success grows from this scale, with a bounce.
+const SUCCESS_SCALE: f32 = 0.5;
+/// A card's text that changes again within this long of its last change is a live one (a counter,
+/// the file being read): it just changes, without fading in anew each time.
+const LIVE_TEXT: Duration = Duration::from_millis(600);
+/// An unknown amount of work: a segment of this share of the bar sweeps across it, again and again.
+const SWEEP_WIDTH: f32 = 0.35;
+const SWEEP: motion::Curve =
+    motion::Curve::eased(Duration::from_millis(1300), motion::Easing::InOutCubic);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationKind {
@@ -209,6 +222,29 @@ struct Shown {
     /// The card has been on screen: one pushed out before it ever was (a burst of notifications)
     /// has nothing to slide out.
     drawn: bool,
+    /// When the card last changed in place: its kind (the icon fades in anew), its text (fades in
+    /// anew, unless it is a live one — [`LIVE_TEXT`]).
+    kind_changed: Option<Instant>,
+    text_changed: Option<Instant>,
+    /// When its text last changed, faded or not.
+    text_at: Option<Instant>,
+}
+
+impl Shown {
+    /// The card is about to show `next` in place: what changes fades in anew.
+    fn note_changes(&mut self, next: &Notification) {
+        let now = Instant::now();
+        if next.kind != self.notification.kind {
+            self.kind_changed = Some(now);
+        }
+        if next.title != self.notification.title || next.body != self.notification.body {
+            let live = self
+                .text_at
+                .is_some_and(|at| now.duration_since(at) < LIVE_TEXT);
+            self.text_changed = (!live).then_some(now);
+            self.text_at = Some(now);
+        }
+    }
 }
 
 /// A place in the stack: a card on screen, or one that has gone and slides out.
@@ -263,6 +299,7 @@ impl Notifications {
             .position(|slot| slot.shown().is_some_and(|shown| shown.id == id));
         if let Some(Slot::Shown(shown)) = index.map(|index| &mut self.slots[index]) {
             let restart = shown.life != life;
+            shown.note_changes(&notification);
             shown.notification = notification;
             shown.source = source;
             if restart {
@@ -279,6 +316,9 @@ impl Notifications {
                 life,
                 _timer: Self::timer(id, life, cx),
                 drawn: false,
+                kind_changed: None,
+                text_changed: None,
+                text_at: None,
             }));
             if self.live() > MAX_SHOWN
                 && let Some(oldest) = self.slots.iter().position(|slot| slot.shown().is_some())
@@ -371,11 +411,24 @@ impl Notifications {
         self.slots.is_empty()
     }
 
-    fn render_card(&self, shown: &Shown, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_card(&self, shown: &Shown, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let ui = Theme::ui(cx);
         let notification = &shown.notification;
         let id = shown.id;
         let (glyph, color) = kind_icon(notification.kind, ui);
+        // Changed in place: the new icon and the new text fade in; a check of a task that has
+        // succeeded grows in with a bounce.
+        let fade_in = |since: Option<Instant>| {
+            since.map_or(1., |since| motion::animate(since, motion::FADE, window))
+        };
+        let (icon_in, text_in) = (fade_in(shown.kind_changed), fade_in(shown.text_changed));
+        let pop = shown
+            .kind_changed
+            .filter(|since| {
+                notification.kind == NotificationKind::Success
+                    && motion::running(*since, motion::BOUNCE)
+            })
+            .map(|since| motion::animate(since, motion::BOUNCE, window));
         let actions: Vec<_> = notification
             .actions
             .iter()
@@ -422,6 +475,11 @@ impl Notifications {
                 div()
                     .flex_none()
                     .pt(px(1.))
+                    .when(icon_in < 1., |icon| icon.opacity(icon_in))
+                    .when_some(pop, |icon, value| {
+                        icon.transform_scale(motion::lerp(SUCCESS_SCALE, 1., value))
+                            .transform_origin(0.5, 0.5)
+                    })
                     .child(icon(glyph, color).size(px(16.))),
             )
             .child(
@@ -443,19 +501,20 @@ impl Notifications {
                         div()
                             .pr_5()
                             .font_weight(FontWeight::SEMIBOLD)
+                            .when(text_in < 1., |title| title.opacity(text_in))
                             .child(notification.title.clone()),
                     )
                     .children(notification.body.clone().map(|body| {
                         div()
                             .text_size(px(theme::TEXT_SM))
                             .text_color(ui.text_muted)
+                            .when(text_in < 1., |body| body.opacity(text_in))
                             .child(body)
                     }))
-                    .children(
-                        notification
-                            .progress
-                            .map(|progress| progress_bar(progress, ui)),
-                    )
+                    .children(notification.progress.map(|progress| {
+                        // The card's id scopes the fraction's glide.
+                        bar(progress, Some("notification-progress".into()), ui)
+                    }))
                     .when(!actions.is_empty(), |column| {
                         column.child(
                             div()
@@ -469,8 +528,11 @@ impl Notifications {
                         )
                     }),
             )
+            // Fades in under the pointer (an id keeps the fade); invisible, it still closes the
+            // card.
             .child(
                 div()
+                    .id("notification-close-reveal")
                     .absolute()
                     .top(px(6.))
                     .right(px(6.))
@@ -487,9 +549,15 @@ impl Notifications {
     }
 }
 
-/// A thin bar: the done part in the accent color; an unknown amount is the whole bar, dimmer (no
-/// animation — the design system has none).
+/// A thin bar: the done part in the accent color; an unknown amount is a segment sweeping across
+/// the bar, again and again while it is drawn (with animations off, the whole bar, dimmer).
 pub fn progress_bar(progress: Progress, ui: UiColors) -> impl IntoElement + use<> {
+    bar(progress, None, ui)
+}
+
+/// [`progress_bar`]; with `glide`, the done part glides to each new fraction ([`motion::SMOOTH`]),
+/// `glide` keeping the fraction between frames (unique among the bar's siblings).
+fn bar(progress: Progress, glide: Option<ElementId>, ui: UiColors) -> Div {
     let track = div()
         .mt_1()
         .w_full()
@@ -497,20 +565,44 @@ pub fn progress_bar(progress: Progress, ui: UiColors) -> impl IntoElement + use<
         .rounded(px(PROGRESS_HEIGHT / 2.))
         .overflow_hidden()
         .bg(ui.input_border);
+    let part = || div().h_full().rounded(px(PROGRESS_HEIGHT / 2.));
     match progress {
-        Progress::Indeterminate => track.child(
-            div()
-                .size_full()
-                .rounded(px(PROGRESS_HEIGHT / 2.))
-                .bg(UiColors::tint(ui.accent, 0.45)),
+        // A repeating animation: it ticks on the shared 30 fps grid, and only while the bar is
+        // drawn — while the work goes on.
+        Progress::Indeterminate if motion::enabled() => track.relative().child(
+            part()
+                .absolute()
+                .top_0()
+                .w(relative(SWEEP_WIDTH))
+                .bg(ui.accent)
+                .with_animation(
+                    "progress-sweep",
+                    Animation::new(SWEEP.duration()).repeat(),
+                    |segment, t| {
+                        segment.left(relative(motion::lerp(-SWEEP_WIDTH, 1., SWEEP.ease(t))))
+                    },
+                ),
         ),
-        Progress::Fraction(done) => track.child(
-            div()
-                .h_full()
-                .w(relative(done.clamp(0., 1.)))
-                .rounded(px(PROGRESS_HEIGHT / 2.))
-                .bg(ui.accent),
-        ),
+        Progress::Indeterminate => track.child(part().w_full().bg(UiColors::tint(ui.accent, 0.45))),
+        Progress::Fraction(done) => {
+            // Not a number (a plugin's 0 / 0) is nothing done: a target that never equals itself
+            // would glide forever.
+            let done = if done.is_nan() {
+                0.
+            } else {
+                done.clamp(0., 1.)
+            };
+            let fill = part().bg(ui.accent);
+            match glide {
+                Some(id) => track.child(fill.with_transition(
+                    id,
+                    done,
+                    motion::SMOOTH,
+                    |fill, done| fill.w(relative(done)),
+                )),
+                None => track.child(fill.w(relative(done))),
+            }
+        }
     }
 }
 
@@ -542,12 +634,12 @@ impl Render for Notifications {
                 let card = match slot {
                     // In from the right, with a bounce — once: the card keeps its id.
                     Slot::Shown(shown) => motion::Appear::slide(motion::SLIDE, 0.)
-                        .apply(("notification-in", id), self.render_card(shown, cx)),
+                        .apply(("notification-in", id), self.render_card(shown, window, cx)),
                     // Out to the right, fading, taking no input.
                     Slot::Leaving(leaving) => {
                         let progress = leaving.progress(window);
                         let card = self
-                            .render_card(&leaving.value, cx)
+                            .render_card(&leaving.value, window, cx)
                             .opacity(1. - progress)
                             .transform_translate(px(EXIT_SLIDE * progress), px(0.));
                         motion::inert(card).into_any_element()

@@ -2135,10 +2135,14 @@ pub fn status_item(
         Some(tooltip) => item.tooltip(ui::tooltip(tooltip, None)),
         None => item.tooltip(ui::tooltip(tr("Language Servers"), None)),
     };
-    Some(crate::lsp_status::clickable_status(
-        item,
-        &store.status_ui,
-        ui,
+    // It fades in as it comes (`crate::motion`).
+    Some(crate::motion::Appear::fade().apply(
+        "lsp-status-appear",
+        div().flex_none().child(crate::lsp_status::clickable_status(
+            item,
+            &store.status_ui,
+            ui,
+        )),
     ))
 }
 

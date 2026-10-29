@@ -2762,10 +2762,16 @@ pub(crate) fn status_bar_items(workspace: &Workspace, cx: &App) -> Option<AnyEle
         .iter()
         .map(|item| (item.plugin.clone(), item.id.clone()))
         .collect();
-    let items = items.iter().enumerate().map(|(index, item)| {
+    let items = items.iter().map(|item| {
         let command = item.command.clone();
-        div()
-            .id(("plugin-status", index))
+        // Keyed by the plugin and the item: an item coming fades in, its neighbours stay as they
+        // are (`crate::motion`).
+        let key = gpui::ElementId::NamedChild(
+            Box::new(gpui::ElementId::Name(item.plugin.clone())),
+            item.id.clone(),
+        );
+        let element = div()
+            .id(key.clone())
             .flex_none()
             .h(px(20.))
             .px_1()
@@ -2784,7 +2790,11 @@ pub(crate) fn status_bar_items(workspace: &Workspace, cx: &App) -> Option<AnyEle
                         window.dispatch_action(Box::new(command.clone()), cx)
                     })
             })
-            .child(item.text.clone())
+            .child(item.text.clone());
+        crate::motion::Appear::fade().apply(
+            gpui::ElementId::NamedChild(Box::new(key), "appear".into()),
+            element,
+        )
     });
     Some(
         div()

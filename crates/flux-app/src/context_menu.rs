@@ -15,9 +15,11 @@
 //! menu.
 //!
 //! Motion (`crate::motion`): the menu grows out of its click — the point itself, wherever the
-//! window's edges pushed the menu — and a submenu out of its item's edge. An owner that draws
-//! [`ContextMenu::slot`] in every frame, open or not, also gets the exit: the menu it dropped fades
-//! out toward its click, taking no input.
+//! window's edges pushed the menu — and a submenu out of its item's edge. A submenu is laid out
+//! unseen the frame it opens, so its side is chosen by its real width and it grows right where it
+//! stays; when it closes, it fades out toward that edge, taking no input. An owner that draws
+//! [`ContextMenu::slot`] in every frame, open or not, also gets the menu's exit: the menu it
+//! dropped fades out toward its click, taking no input.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -172,6 +174,16 @@ struct Open {
     selected: Option<usize>,
 }
 
+/// A submenu as it was drawn — its item, its row selected with the keyboard, its place and the
+/// point it grew out of: what its exit draws once it has closed.
+#[derive(Clone, Copy)]
+struct ShownChild {
+    index: usize,
+    selected: Option<usize>,
+    origin: Point<Pixels>,
+    anchor: Point<Pixels>,
+}
+
 /// Where the menu was drawn in the last frame (window coordinates): the child menu is placed next
 /// to its item, and a click inside the child is not a click outside the menu.
 #[derive(Default)]
@@ -189,6 +201,10 @@ pub struct ContextMenu {
     /// The item selected with the arrow keys; the mouse highlights its own item on its own.
     selected: Option<usize>,
     open: Option<Open>,
+    /// The submenu drawn in the last frame…
+    shown_child: Option<ShownChild>,
+    /// …and the one that closed, fading out.
+    leaving_child: Option<Leaving<ShownChild>>,
     /// The item under the pointer and what resting on it will do (open its submenu, close one).
     hovered: Option<usize>,
     hover_task: Option<Task<()>>,
@@ -210,6 +226,8 @@ impl ContextMenu {
             items: Vec::new(),
             selected: None,
             open: None,
+            shown_child: None,
+            leaving_child: None,
             hovered: None,
             hover_task: None,
             geometry: Rc::default(),
@@ -555,17 +573,29 @@ impl ContextMenu {
             .children(keys.map(|keys| ui::keys(&keys, ui).when(!enabled, |keys| keys.opacity(0.5))))
     }
 
-    fn render_child(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let open = self.open.as_ref()?;
-        let items = self.child_items()?;
-        let geometry = &self.geometry;
-        let panel = geometry.panel.get()?;
-        let item = geometry.items.borrow().get(&open.index).copied()?;
+    /// The rows of the submenu of item `index`, `selected` the row the keyboard is on; `live` —
+    /// the open one, taking clicks, else one fading out (rows of its own, so the two never share
+    /// an element's state).
+    fn child_rows(
+        &self,
+        index: usize,
+        selected: Option<usize>,
+        live: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(Item::Submenu { items, .. }) = self.items.get(index) else {
+            return Vec::new();
+        };
         let ui = Theme::ui(cx);
         let last = items.len().saturating_sub(1);
-        let index = open.index;
         let check_room = has_switches(items);
-        let rows: Vec<AnyElement> = items
+        let id = if live {
+            "context-submenu-item"
+        } else {
+            "context-submenu-leaving-item"
+        };
+        items
             .iter()
             .enumerate()
             .filter(|(child, item)| !(matches!(item, Item::Separator) && *child == last))
@@ -577,12 +607,7 @@ impl ContextMenu {
                     checked,
                 } => self
                     .render_entry(
-                        item_row(
-                            ("context-submenu-item", child),
-                            *enabled,
-                            open.selected == Some(child),
-                            cx,
-                        ),
+                        item_row((id, child), *enabled, selected == Some(child), cx),
                         label,
                         action.as_ref(),
                         *enabled,
@@ -591,7 +616,7 @@ impl ContextMenu {
                         window,
                         cx,
                     )
-                    .when(*enabled, |row| {
+                    .when(live && *enabled, |row| {
                         row.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.run_child(index, child, window, cx)
                         }))
@@ -602,11 +627,70 @@ impl ContextMenu {
                     ui::divider(ui).mx_1p5().my_1().into_any_element()
                 }
             })
-            .collect();
-        // The child's width as drawn last time (the same submenu), else as its labels suggest.
+            .collect()
+    }
+
+    /// The panel of the submenu of item `index` with its rows ([`Self::child_rows`]).
+    fn child_panel(
+        &self,
+        index: usize,
+        selected: Option<usize>,
+        live: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        popup::panel(Theme::ui(cx))
+            .id(if live {
+                "context-submenu"
+            } else {
+                "context-submenu-leaving"
+            })
+            .min_w(px(MENU_MIN_WIDTH))
+            .p(px(MENU_PADDING))
+            .flex()
+            .flex_col()
+            .children(self.child_rows(index, selected, live, window, cx))
+    }
+
+    /// The open submenu, next to its item: to the right of the menu, or to its left when the
+    /// window has no room there. The side needs its real width: the frame it opens it is laid out
+    /// unseen, taking no input, to be measured; the next frame it grows out of its item's edge
+    /// right where it stays (as it was, it was placed by a guessed width and moved, or even
+    /// changed sides, a frame into its pop).
+    fn render_child(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let open = self.open.as_ref()?;
+        let (index, selected) = (open.index, open.selected);
+        self.child_items()?;
+        let geometry = self.geometry.clone();
+        let panel = geometry.panel.get()?;
+        let item = geometry.items.borrow().get(&index).copied()?;
         let width = match geometry.child.get() {
-            Some((drawn, bounds)) if drawn == index => bounds.size.width,
-            _ => px(estimated_width(items)),
+            Some((drawn, bounds)) if drawn == index => Some(bounds.size.width),
+            _ => None,
+        };
+        let recorded = geometry.clone();
+        let view = self
+            .child_panel(index, selected, true, window, cx)
+            .occlude()
+            .on_hover(cx.listener(|this, hovered: &bool, _, _| this.hover_child(*hovered)))
+            .child(
+                canvas(
+                    move |bounds, _, _| recorded.child.set(Some((index, bounds))),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
+        let place = anchored().snap_to_window_with_margin(px(popup::WINDOW_MARGIN));
+        let Some(width) = width else {
+            // Measured this frame, shown the next.
+            window.request_animation_frame();
+            return Some(
+                place
+                    .position(point(panel.right(), item.top()))
+                    .child(motion::inert(view.invisible()))
+                    .into_any_element(),
+            );
         };
         let origin = child_origin(panel, item, width, window.viewport_size().width);
         // It grows out of its item's edge: the menu's right edge, or its left one when the window
@@ -617,38 +701,50 @@ impl ContextMenu {
             panel.left()
         };
         let anchor = point(edge, item.center().y);
-        let recorded = self.geometry.clone();
+        self.shown_child = Some(ShownChild {
+            index,
+            selected,
+            origin,
+            anchor,
+        });
+        Some(
+            place
+                .position(origin)
+                .child(Appear::pop((0., 0.)).apply_from(
+                    ("context-submenu-pop", index),
+                    anchor,
+                    view,
+                ))
+                .into_any_element(),
+        )
+    }
+
+    /// The submenu that closed (or gave way to another one), fading out toward the edge it grew
+    /// out of, taking no input.
+    fn render_leaving_child(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let open = self.open.as_ref().map(|open| open.index);
+        if let Some(shown) = self.shown_child.take_if(|shown| Some(shown.index) != open) {
+            self.leaving_child = motion::enabled().then(|| Leaving::new(shown));
+        }
+        if self.leaving_child.as_ref().is_some_and(Leaving::done) {
+            self.leaving_child = None;
+        }
+        let leaving = self.leaving_child.as_ref()?;
+        let (shown, progress) = (leaving.value, leaving.progress(window));
+        let view = self.child_panel(shown.index, shown.selected, false, window, cx);
         Some(
             anchored()
-                .position(origin)
+                .position(shown.origin)
                 .snap_to_window_with_margin(px(popup::WINDOW_MARGIN))
-                .child(
-                    Appear::pop((0., 0.)).apply_from(
-                        ("context-submenu-pop", index),
-                        anchor,
-                        popup::panel(ui)
-                            .id("context-submenu")
-                            .occlude()
-                            .min_w(px(MENU_MIN_WIDTH))
-                            .p(px(MENU_PADDING))
-                            .flex()
-                            .flex_col()
-                            .on_hover(
-                                cx.listener(|this, hovered: &bool, _, _| {
-                                    this.hover_child(*hovered)
-                                }),
-                            )
-                            .child(
-                                canvas(
-                                    move |bounds, _, _| recorded.child.set(Some((index, bounds))),
-                                    |_, _, _, _| {},
-                                )
-                                .absolute()
-                                .size_full(),
-                            )
-                            .children(rows),
-                    ),
-                )
+                .child(motion::inert(motion::leaving_from(
+                    view,
+                    progress,
+                    shown.anchor,
+                )))
                 .into_any_element(),
         )
     }
@@ -819,19 +915,6 @@ fn child_origin(
     point(x, y)
 }
 
-/// A child menu's width as its labels suggest (before it was drawn): the widest label and its
-/// shortcut, at least the menu's minimum.
-fn estimated_width(items: &[Item]) -> f32 {
-    let widest = items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Entry { label, .. } => Some(label.chars().count() as f32 * 7.2 + 90.),
-            _ => None,
-        })
-        .fold(0., f32::max);
-    widest.max(MENU_MIN_WIDTH)
-}
-
 /// The row of an item: highlighted when selected (the keyboard, an open submenu), else under the
 /// pointer.
 fn item_row(
@@ -951,6 +1034,7 @@ impl Render for ContextMenu {
             })
             .collect();
         let recorded = self.geometry.clone();
+        let leaving_child = self.render_leaving_child(window, cx);
         let child = self.render_child(window, cx);
         if child.is_none() {
             self.geometry.child.set(None);
@@ -999,6 +1083,7 @@ impl Render for ContextMenu {
                     }))
                     .children(items),
             )
+            .children(leaving_child)
             .children(child)
     }
 }
@@ -1054,7 +1139,5 @@ mod tests {
     fn empty_submenus_are_left_out_and_trailing_separators_dropped() {
         let built = Submenu::default().entry("a", Cancel).separator();
         assert_eq!(built.items.len(), 2);
-        let estimated = estimated_width(&entries(&[Some("Show History for Selection")]));
-        assert!(estimated >= MENU_MIN_WIDTH);
     }
 }

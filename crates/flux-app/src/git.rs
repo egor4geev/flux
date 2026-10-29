@@ -2381,16 +2381,21 @@ pub fn file_color(git: &Entity<GitStore>, path: &Path, ui: &UiColors, cx: &App) 
 /// state a repository is left in ("Merging · 2 conflicts", "Rebasing 2/5") — a click shows the
 /// conflicts, or the commit window that concludes the operation.
 pub fn status_item(git: &GitStore, ui: UiColors) -> Option<gpui::AnyElement> {
+    // Each fades in as it comes (`crate::motion`); the activity's icon pulses while git works.
     if let Some(activity) = git.activity() {
         return Some(
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .child(icon(IconName::Branch, ui.violet).size(px(13.)))
-                .child(activity.clone())
-                .into_any_element(),
+            crate::motion::Appear::fade().apply(
+                "git-activity-appear",
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(busy_pulse(
+                        div().child(icon(IconName::Branch, ui.violet).size(px(13.))),
+                    ))
+                    .child(activity.clone()),
+            ),
         );
     }
     let conflicts = git.conflicts().len();
@@ -2421,28 +2426,49 @@ pub fn status_item(git: &GitStore, ui: UiColors) -> Option<gpui::AnyElement> {
         ui.warning
     };
     Some(
-        div()
-            .id("git-operation")
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .px_1p5()
-            .rounded(px(crate::ui::RADIUS_SM))
-            .cursor_pointer()
-            .text_color(color)
-            .hover(move |style| style.bg(ui.hover))
-            .on_click(move |_, window, cx| {
-                if conflicts > 0 {
-                    window.dispatch_action(Box::new(ResolveConflicts), cx)
-                } else {
-                    window.dispatch_action(Box::new(Commit), cx)
-                }
-            })
-            .child(icon(IconName::Merge, color).size(px(13.)))
-            .child(text)
-            .into_any_element(),
+        crate::motion::Appear::fade().apply(
+            "git-operation-appear",
+            div()
+                .id("git-operation")
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .px_1p5()
+                .rounded(px(crate::ui::RADIUS_SM))
+                .cursor_pointer()
+                .text_color(color)
+                .hover(move |style| style.bg(ui.hover))
+                .on_click(move |_, window, cx| {
+                    if conflicts > 0 {
+                        window.dispatch_action(Box::new(ResolveConflicts), cx)
+                    } else {
+                        window.dispatch_action(Box::new(Commit), cx)
+                    }
+                })
+                .child(icon(IconName::Merge, color).size(px(13.)))
+                .child(text),
+        ),
     )
+}
+
+/// How long one pulse of the activity's icon takes.
+const BUSY_PULSE: Duration = Duration::from_millis(1100);
+
+/// `element` pulsing while it is drawn — git at work (a repeating animation ticks at 30 fps; still
+/// when motion is off).
+fn busy_pulse(element: Div) -> gpui::AnyElement {
+    use gpui::AnimationExt as _;
+    if !crate::motion::enabled() {
+        return element.into_any_element();
+    }
+    element
+        .with_animation(
+            "git-activity-pulse",
+            gpui::Animation::new(BUSY_PULSE).repeat(),
+            |element, delta| element.opacity(0.35 + 0.65 * (1. - (2. * delta - 1.).abs())),
+        )
+        .into_any_element()
 }
 
 /// Window-level git actions: handled by the workspace (they open its windows).

@@ -8,7 +8,9 @@
 //! a pulsing globe while Flux asks. Its tooltip says where, when it was asked and what that means
 //! for Claude. A press opens the popover above it, as the language servers' item does: the big
 //! flag and the country's name, the address, what it means for Claude, when it was checked, Check
-//! Again (↵) and Settings… (⌘,); Esc closes.
+//! Again (↵) and Settings… (⌘,); Esc closes. A new answer (Check Again) fades its words in, the
+//! state's color glides to its new tone and the popover's height to its new text
+//! (`crate::motion`).
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -23,6 +25,8 @@ use gpui::{
 use crate::claude;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::lsp_status::{Crossfade, key_of};
+use crate::motion::{self, TransitionExt as _};
 use crate::notification_center::NotificationGroup;
 use crate::notifications::Notification;
 use crate::region_guard::{self, CheckCountry, Refusal, RegionEvent, Verdict};
@@ -300,6 +304,9 @@ fn open_popover(item: Option<Bounds<Pixels>>, window: &mut Window, cx: &mut App)
 
 pub struct RegionPopover {
     focus_handle: FocusHandle,
+    /// The country and the address, and what the answer means: each fades in anew as it changes.
+    identity: Crossfade,
+    meaning: Crossfade,
     _subscription: Option<Subscription>,
     _tick: Task<()>,
 }
@@ -327,6 +334,8 @@ impl RegionPopover {
         });
         Self {
             focus_handle: cx.focus_handle(),
+            identity: Crossfade::default(),
+            meaning: Crossfade::default(),
             _subscription: subscription,
             _tick: tick,
         }
@@ -379,24 +388,28 @@ impl Render for RegionPopover {
                     .children(mark(&verdict, FLAG_SIZE, "region-popover-pulse", ui)),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_size(px(theme::TEXT_LG))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::TEXT_SM))
-                            .text_color(ui.dim)
-                            .child(subtitle),
-                    ),
+                self.identity.apply(
+                    "region-identity",
+                    key_of((&title, &subtitle)),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_size(px(theme::TEXT_LG))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::TEXT_SM))
+                                .text_color(ui.dim)
+                                .child(subtitle),
+                        ),
+                ),
             );
         let state_icon = match &verdict {
             Verdict::Allowed(_) => icon(IconName::CheckCircle, ui.success),
@@ -408,6 +421,7 @@ impl Render for RegionPopover {
             (_, true) if verdict != Verdict::Checking => Some(tr("Checking now…").to_string()),
             (checked, _) => checked,
         };
+        let meaning_key = key_of((state(&verdict), detail(&verdict)));
         let meaning = div()
             .flex()
             .gap_2()
@@ -426,12 +440,8 @@ impl Render for RegionPopover {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(tone(&verdict, ui))
-                            .child(state(&verdict)),
-                    )
+                    // Its color comes from around the fade, gliding to the new tone.
+                    .child(div().font_weight(FontWeight::MEDIUM).child(state(&verdict)))
                     .child(
                         div()
                             .text_size(px(theme::TEXT_SM))
@@ -481,7 +491,19 @@ impl Render for RegionPopover {
             .on_action(cx.listener(|this, _: &CheckCountry, _, cx| this.check_again(cx)))
             .child(div().px_4().pt_4().pb_3().child(identity))
             .child(ui::divider(ui).mx_4())
-            .child(div().px_4().py_3().child(meaning))
+            .child(motion::glide_height(
+                "region-meaning-height",
+                div().px_4().py_3().child(
+                    div()
+                        .child(self.meaning.apply("region-meaning", meaning_key, meaning))
+                        .with_transition(
+                            "region-tone",
+                            tone(&verdict, ui),
+                            motion::FADE,
+                            |meaning, color| meaning.text_color(color),
+                        ),
+                ),
+            ))
             .child(
                 div()
                     .px_4()

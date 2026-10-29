@@ -39,6 +39,7 @@ use serde_json::{Value, json};
 use crate::dialog::Dialog;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::motion::TransitionExt;
 use crate::notification_center::NotificationGroup;
 use crate::notifications::Notification;
 use crate::theme::{self, Theme};
@@ -877,12 +878,18 @@ pub fn status_item(cx: &Context<Workspace>) -> Option<AnyElement> {
             .h(px(2.))
             .rounded(px(1.))
             .bg(ui.input_border)
+            // The download comes in steps: the bar glides from one to the next (`crate::motion`).
             .child(
                 div()
                     .h_full()
-                    .w(relative(fraction))
                     .rounded(px(1.))
-                    .bg(ui.accent),
+                    .bg(ui.accent)
+                    .with_transition(
+                        "download-fill",
+                        fraction,
+                        crate::motion::SMOOTH,
+                        |fill, fraction| fill.w(relative(fraction)),
+                    ),
             )
     });
     Some(
