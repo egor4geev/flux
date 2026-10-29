@@ -8,6 +8,7 @@
 //! share to the rest, and a split left with one child dissolves into its parent.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use gpui::{
     AnyElement, App, AppContext, Axis, Context, CursorStyle, DragMoveEvent, ElementId, Entity,
@@ -18,6 +19,7 @@ use gpui::{
 use crate::dialog::Dialog;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::motion::{self, TransitionExt};
 use crate::terminal_view::{SpawnSpec, TerminalLink, TerminalView, TerminalViewEvent};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
@@ -53,6 +55,8 @@ const DIVIDER_HIT: f32 = 8.;
 const DIVIDER_GROUP: &str = "terminal-pane-divider";
 /// The bar marking the active pane when there are several.
 const ACTIVE_MARKER_WIDTH: f32 = 28.;
+/// A pane a split adds slides in on this curve (that of [`motion::Appear::slide`]).
+const PANE_APPEAR: motion::Curve = motion::BOUNCE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalGroupEvent {
@@ -216,6 +220,8 @@ pub struct TerminalGroup {
     resizing: bool,
     /// Why the last split couldn't start its shell; cleared by the next split.
     error: Option<SharedString>,
+    /// The pane the last split added, the way it was split, and when: it slides in.
+    appeared: Option<(EntityId, Axis, Instant)>,
     /// Subscriptions to the panes, dropped with their pane.
     subscriptions: Vec<(EntityId, Subscription)>,
 }
@@ -254,6 +260,7 @@ impl TerminalGroup {
                 bell: false,
                 resizing: false,
                 error: None,
+                appeared: None,
                 subscriptions: vec![(view.entity_id(), subscription)],
             }
         }))
@@ -375,6 +382,7 @@ impl TerminalGroup {
             return;
         }
         self.error = None;
+        self.appeared = Some((view.entity_id(), axis, Instant::now()));
         let subscription = Self::subscribe(&view, window, cx);
         self.subscriptions.push((view.entity_id(), subscription));
         self.active = view.clone();
@@ -514,14 +522,17 @@ impl TerminalGroup {
         path: &[usize],
         several: bool,
         focused: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let ui = Theme::ui(cx);
         match pane {
             Pane::Leaf(view) => {
                 // With several panes, the one that has (or last had) focus is marked by a short
-                // bar at its top left corner, like the open tool in the launchpad.
+                // bar at its top left corner, like the open tool in the launchpad. It fades in on
+                // the pane that takes focus, and between its colors as the tab gains or loses it.
                 let marker = (several && *view == self.active).then(|| {
+                    let color = if focused { ui.accent } else { ui.text_disabled };
                     div()
                         .absolute()
                         .top(px(1.))
@@ -529,14 +540,34 @@ impl TerminalGroup {
                         .w(px(ACTIVE_MARKER_WIDTH))
                         .h(px(2.))
                         .rounded(px(1.))
-                        .bg(if focused { ui.accent } else { ui.text_disabled })
+                        .with_transition_from(
+                            ("terminal-pane-marker", view.entity_id()),
+                            gpui::transparent_black(),
+                            color,
+                            motion::FADE,
+                            |marker, color| marker.bg(color),
+                        )
                 });
-                div()
+                let pane = div()
                     .relative()
                     .size_full()
                     .child(view.clone())
-                    .children(marker)
-                    .into_any_element()
+                    .children(marker);
+                // A pane a split just added slides in from the side it was added on, within its
+                // cell; the space was shared anew at once (the terminals reflow once).
+                match self.appeared {
+                    Some((id, axis, since)) if id == view.entity_id() => {
+                        let (dx, dy) = match axis {
+                            Axis::Horizontal => (motion::SLIDE, 0.),
+                            Axis::Vertical => (0., motion::SLIDE),
+                        };
+                        let value = motion::animate(since, PANE_APPEAR, window);
+                        motion::Appear::slide(dx, dy)
+                            .style(pane, value)
+                            .into_any_element()
+                    }
+                    _ => pane.into_any_element(),
+                }
             }
             Pane::Split(split) => {
                 let horizontal = split.axis == Axis::Horizontal;
@@ -548,7 +579,8 @@ impl TerminalGroup {
                     .map(|(index, (child, ratio))| {
                         let mut child_path = path.to_vec();
                         child_path.push(index);
-                        let element = self.render_pane(child, &child_path, several, focused, cx);
+                        let element =
+                            self.render_pane(child, &child_path, several, focused, window, cx);
                         div()
                             .flex_none()
                             .relative()
@@ -606,7 +638,9 @@ impl TerminalGroup {
         };
         let id = ElementId::Name(format!("terminal-divider-{path:?}-{index}").into());
         let lit = self.resizing && cx.has_active_drag();
+        // With an id, its hover fades in and out (scoped by the divider's id).
         let line = div()
+            .id("line")
             .flex_none()
             .rounded(px(1.))
             .when(horizontal, |line| line.w(px(1.)).h_full())
@@ -656,12 +690,18 @@ impl Render for TerminalGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         self.resizing &= cx.has_active_drag();
+        if self
+            .appeared
+            .is_some_and(|(_, _, since)| !motion::running(since, PANE_APPEAR))
+        {
+            self.appeared = None;
+        }
         let several = self.views().len() > 1;
         let focused = several && self.contains_focus(window, cx);
         let panes = self
             .panes
             .as_ref()
-            .map(|panes| self.render_pane(panes, &[], several, focused, cx));
+            .map(|panes| self.render_pane(panes, &[], several, focused, window, cx));
         let error = self.error.clone().map(|error| {
             div()
                 .flex_none()
@@ -714,9 +754,9 @@ pub struct DraggedTerminal {
 }
 
 impl Render for DraggedTerminal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        div()
+        let label = div()
             .flex()
             .items_center()
             .gap_1p5()
@@ -733,7 +773,14 @@ impl Render for DraggedTerminal {
             .text_size(px(theme::TEXT_MD))
             .text_color(ui.foreground)
             .child(icon(IconName::Terminal, ui.green).size(px(14.)))
-            .child(self.title.clone())
+            .child(self.title.clone());
+        // Lifted as the drag starts: it grows in under the pointer (the drag's preview is a new
+        // view each time, so this plays once per drag).
+        motion::Appear::pop((0.5, 0.5)).apply_from(
+            "terminal-drag-lift",
+            window.mouse_position(),
+            label,
+        )
     }
 }
 

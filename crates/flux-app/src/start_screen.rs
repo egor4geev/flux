@@ -371,7 +371,8 @@ fn open_folder_card(keys: Option<SharedString>, ui: UiColors) -> Div {
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(on_accent)
                 .hover(|style| style.opacity(0.9))
-                .active(|style| style.opacity(0.8))
+                // Shrinks while held, springs back when let go.
+                .active(|style| motion::press(style.opacity(0.8)))
                 .tooltip(ui::tooltip(tr("Open a folder or files"), keys))
                 .on_click(|_, window, cx| window.dispatch_action(workspace::Open.boxed_clone(), cx))
                 .child(icon(IconName::FolderOpen, on_accent).size(px(14.)))

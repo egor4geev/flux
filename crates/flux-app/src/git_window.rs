@@ -8,8 +8,8 @@ use std::path::Path;
 use gpui::{
     AnyElement, App, ClickEvent, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity,
     EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent,
-    MouseUpEvent, Pixels, Point, Render, SharedString, Subscription, Window, actions, div,
-    prelude::*, px,
+    MouseUpEvent, Pixels, Point, Render, ScrollHandle, SharedString, Subscription, Window, actions,
+    div, prelude::*, px,
 };
 
 use crate::context_menu::ContextMenu;
@@ -17,6 +17,8 @@ use crate::git::GitStore;
 use crate::git_log::{GitLogView, LogScope, relative_in_repo};
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
+use crate::motion;
+use crate::tab_strip::{self, Room, TabStrip};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, GAP, RADIUS_LG, RADIUS_MD};
 use crate::workspace::{NextTab, PrevTab};
@@ -48,9 +50,9 @@ pub struct DraggedLogTab {
 }
 
 impl Render for DraggedLogTab {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
-        ui::popover(ui)
+        let label = ui::popover(ui)
             .h(px(TAB_HEIGHT))
             .px_2()
             .flex()
@@ -58,7 +60,14 @@ impl Render for DraggedLogTab {
             .gap_1p5()
             .text_size(px(theme::TEXT_SM))
             .child(icon(IconName::History, ui.accent).size(px(13.)))
-            .child(self.title.clone())
+            .child(self.title.clone());
+        // Lifted as the drag starts: it grows in under the pointer (the drag's preview is a new
+        // view each time, so this plays once per drag).
+        motion::Appear::pop((0.5, 0.5)).apply_from(
+            "git-tab-drag-lift",
+            window.mouse_position(),
+            label,
+        )
     }
 }
 
@@ -101,6 +110,10 @@ pub struct GitWindow {
     height: ui::BottomIslandHeight,
     resizing: bool,
     focus_handle: FocusHandle,
+    tab_scroll: ScrollHandle,
+    /// The strip's motion (`crate::tab_strip`): the highlight gliding to the active tab, tabs
+    /// gliding into place, closed ones fading out.
+    tab_strip: TabStrip,
     drop_index: Option<usize>,
     menu: Option<Menu>,
 }
@@ -114,6 +127,7 @@ impl GitWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let tab_scroll = ScrollHandle::new();
         Self {
             git,
             tabs: Vec::new(),
@@ -121,6 +135,8 @@ impl GitWindow {
             height,
             resizing: false,
             focus_handle: cx.focus_handle(),
+            tab_strip: TabStrip::new(tab_scroll.clone()),
+            tab_scroll,
             drop_index: None,
             menu: None,
         }
@@ -260,6 +276,8 @@ impl GitWindow {
             return;
         };
         self.active = index;
+        // Into view, gliding (`TabStrip::reveal`).
+        self.tab_strip.reveal(index);
         window.focus(&tab.view.focus_handle(cx));
         cx.notify();
     }
@@ -371,6 +389,8 @@ impl GitWindow {
 
     fn drop_tab(&mut self, dragged: &DraggedLogTab, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.drop_index.take().unwrap_or(self.tabs.len());
+        // The tabs are at once where the drop put them.
+        self.tab_strip.settle();
         cx.notify();
         let view = dragged.view.clone();
         let Some(from) = self.index_of(&view) else {
@@ -384,12 +404,51 @@ impl GitWindow {
 
     // --- Display ---
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
         let drop_index = self.drop_index.filter(|_| cx.has_active_drag());
-        let tabs: Vec<AnyElement> = (0..self.tabs.len())
-            .map(|index| self.render_tab(index, drop_index, cx))
+        let faces = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let view = tab.view.read(cx);
+                let is_log = *view.scope() == LogScope::All;
+                let face = tab_face(view.title(), is_log, index == self.active, ui);
+                (tab.view.entity_id(), face)
+            })
             .collect();
+        self.tab_strip.prepare(faces, window);
+        let count = self.tabs.len();
+        // One element per tab (the scroll handle counts them): it glides and pops in, and the tabs
+        // part where a dragged one would land.
+        let tabs: Vec<AnyElement> = (0..count)
+            .map(|index| {
+                let room = Room::at(index, count, drop_index);
+                let id = self.tabs[index].view.entity_id();
+                self.tab_strip.tab(id, room, self.render_tab(index, cx))
+            })
+            .collect();
+        // The highlight of the active tab and the marker of a dragged one, behind the tabs.
+        let highlight = self.tab_strip.highlight(
+            self.active_view().map(|view| view.entity_id()),
+            drop_index,
+            RADIUS_MD,
+            ui,
+        );
+        // The tabs take what they need and scroll when they don't fit.
+        let strip = div()
+            .id("git-window-tabs")
+            .flex_initial()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .gap_1()
+            .overflow_x_scroll()
+            .track_scroll(&self.tab_scroll)
+            .children(tabs)
+            .children(self.tab_strip.ghosts(window));
         let tail = div()
             .id("git-window-tail")
             .flex_1()
@@ -429,7 +488,8 @@ impl GitWindow {
                     .font_weight(FontWeight::MEDIUM)
                     .child(tr("Git")),
             )
-            .children(tabs)
+            .child(highlight)
+            .child(strip)
             .child(tail)
             .child(
                 ui::icon_button("git-window-hide", IconName::ChevronDown, ui)
@@ -441,12 +501,7 @@ impl GitWindow {
             )
     }
 
-    fn render_tab(
-        &self,
-        index: usize,
-        drop_index: Option<usize>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_tab(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
         let active = index == self.active;
         let view = self.tabs[index].view.clone();
@@ -458,27 +513,27 @@ impl GitWindow {
             view: view.clone(),
             title: title.clone(),
         };
+        // The × of an inactive tab fades in under the pointer.
         let close = (!is_log).then(|| {
             let view = view.clone();
-            div()
+            let close = div()
                 .id("close")
-                .flex_none()
-                .size(px(18.))
+                .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded(px(ui::RADIUS_XS))
                 .hover(move |style| style.bg(ui.pressed))
-                .when(!active, |close| {
-                    close
-                        .invisible()
-                        .group_hover(TAB_GROUP, |style| style.visible())
-                })
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.close_tab(&view, window, cx)
                 }))
-                .child(icon(IconName::Close, ui.dim).size(px(12.)))
+                .child(icon(IconName::Close, ui.dim).size(px(12.)));
+            div()
+                .relative()
+                .flex_none()
+                .size(px(18.))
+                .child(tab_strip::close_reveal(close, active, TAB_GROUP))
         });
         let (activate, middle) = (view.clone(), view.clone());
         div()
@@ -495,15 +550,13 @@ impl GitWindow {
             .gap_1p5()
             .rounded(px(RADIUS_MD))
             .border_1()
+            .border_color(gpui::transparent_black())
             .text_color(if active { ui.foreground } else { ui.text_muted })
-            .when(active, |tab| {
-                tab.bg(ui.pressed)
-                    .border_color(ui.island_border)
-                    .font_weight(FontWeight::MEDIUM)
-            })
+            // The active tab's highlight is the strip's, gliding from tab to tab
+            // (`TabStrip::highlight`).
+            .when(active, |tab| tab.font_weight(FontWeight::MEDIUM))
             .when(!active, |tab| {
-                tab.border_color(gpui::transparent_black())
-                    .hover(|style| style.bg(ui.hover).text_color(ui.foreground))
+                tab.hover(|style| style.bg(ui.hover).text_color(ui.foreground))
             })
             .when_some(tooltip, |tab, tooltip| {
                 tab.tooltip(ui::tooltip(tooltip, None))
@@ -535,13 +588,6 @@ impl GitWindow {
                     this.drag_over_tab(index, event, cx)
                 }),
             )
-            .when(drop_index == Some(index), |tab| {
-                tab.child(drop_marker(false, ui))
-            })
-            .when(
-                drop_index == Some(self.tabs.len()) && index + 1 == self.tabs.len(),
-                |tab| tab.child(drop_marker(true, ui)),
-            )
             .child(
                 icon(
                     if is_log {
@@ -559,16 +605,29 @@ impl GitWindow {
     }
 }
 
-fn drop_marker(after: bool, ui: UiColors) -> impl IntoElement {
-    div()
-        .absolute()
-        .top(px(3.))
-        .bottom(px(3.))
-        .when(after, |marker| marker.right(px(-3.)))
-        .when(!after, |marker| marker.left(px(-3.)))
-        .w(px(2.))
-        .rounded(px(1.))
-        .bg(ui.accent)
+/// How a tab looks as a ghost when it closes (`crate::tab_strip::Face`): its icon and title, in
+/// the place of the tab's own.
+fn tab_face(title: SharedString, is_log: bool, active: bool, ui: UiColors) -> tab_strip::Face {
+    std::rc::Rc::new(move || {
+        let glyph = if is_log {
+            IconName::Commit
+        } else {
+            IconName::History
+        };
+        div()
+            .size_full()
+            .pl_2()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .text_color(if active { ui.foreground } else { ui.text_muted })
+            .when(active, |face| face.font_weight(FontWeight::MEDIUM))
+            .child(icon(glyph, ui.accent).size(px(13.)))
+            .child(div().whitespace_nowrap().child(title.clone()))
+            .into_any_element()
+    })
 }
 
 /// Its middle is `center` past the edge (`ui::resize_handle_center`): in the gap between islands,
@@ -587,15 +646,17 @@ fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement 
         .items_center()
         .cursor(CursorStyle::ResizeUpDown)
         .on_drag(DraggedEdge, |_, _, _, cx| cx.new(|_| DraggedEdge))
+        // With an id, the line fades in and out under the pointer.
         .child(
             div()
+                .id("line")
                 .w_full()
                 .h(px(2.))
                 .rounded(px(1.))
                 .bg(ui.focus_border)
                 .when(!resizing, |line| {
-                    line.invisible()
-                        .group_hover(RESIZE_GROUP, |style| style.visible())
+                    line.opacity(0.)
+                        .group_hover(RESIZE_GROUP, |style| style.opacity(1.))
                 }),
         )
 }
@@ -642,7 +703,7 @@ impl Render for GitWindow {
                     cx.notify();
                 }),
             )
-            .child(self.render_header(cx))
+            .child(self.render_header(window, cx))
             .child(ui::divider(ui).mx(px(GAP)))
             .child(
                 div()

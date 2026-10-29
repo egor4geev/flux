@@ -114,6 +114,7 @@ mod start_screen;
 mod stash_panel;
 mod system_notify;
 mod system_shortcuts;
+mod tab_strip;
 mod task_contexts;
 mod terminal_element;
 mod terminal_group;

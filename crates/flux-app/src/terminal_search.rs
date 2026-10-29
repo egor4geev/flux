@@ -25,6 +25,7 @@ use crate::find_bar;
 use crate::i18n::tr;
 use crate::icons::{IconName, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::motion;
 use crate::terminal_view::TerminalView;
 use crate::theme::{self, Theme};
 use crate::ui::{self, GAP};
@@ -34,6 +35,10 @@ const INPUT_MIN_WIDTH: f32 = 120.;
 const INPUT_MAX_WIDTH: f32 = 380.;
 /// A query error message is no wider than this.
 const COUNTER_MAX_WIDTH: f32 = 320.;
+/// The bar opening drops this far into its place as it fades in, on this curve (the file's find bar
+/// slides on it too).
+const BAR_DROP: f32 = 8.;
+const BAR_CURVE: motion::Curve = motion::SMOOTH;
 /// A search after new output waits at least this long, and ten times as long as the last search
 /// took, up to the maximum: a flood of output takes a bounded share of the UI thread.
 const REFRESH_MIN: Duration = Duration::from_millis(150);
@@ -58,6 +63,8 @@ enum Status {
 #[derive(Default)]
 pub struct SearchState {
     open: bool,
+    /// When the bar last opened: its drawing slides in.
+    opened: Option<Instant>,
     /// The bar has just opened: the first search waits until the grid has made room for it.
     opening: bool,
     /// The query field, created when the bar first opens; it keeps the query between openings.
@@ -120,6 +127,7 @@ pub fn deploy(view: &mut TerminalView, window: &mut Window, cx: &mut Context<Ter
     let focused_here = was_open && query.focus_handle(cx).is_focused(window);
     view.search.open = true;
     if !was_open {
+        view.search.opened = Some(Instant::now());
         search_after_layout(view, window, cx);
     }
     let seed = if focused_here { None } else { seed(view) };
@@ -296,6 +304,7 @@ fn find_next(
         query.update(cx, |query, cx| query.set_text(&seed, cx));
     }
     view.search.open = true;
+    view.search.opened = Some(Instant::now());
     search_after_layout(view, window, cx);
     cx.notify();
 }
@@ -311,13 +320,23 @@ fn step(view: &mut TerminalView, up: bool, cx: &mut Context<TerminalView>) {
         return;
     }
     view.search.active = index;
-    reveal_active(view);
+    // ⌘G / ↵: the view glides to the match (as `reveal_active` shows it).
+    if let Some(found) = view.search.active_match() {
+        view.glide_scroll(
+            |terminal| {
+                terminal.scroll_to(found.end);
+                terminal.scroll_to(found.start);
+            },
+            cx,
+        );
+    }
     cx.notify();
 }
 
 /// Scrolls the scrollback so that the current match is visible: its end first, then its start, so
-/// that a match taller than the view shows its beginning.
+/// that a match taller than the view shows its beginning. At once (the query is being typed).
 fn reveal_active(view: &mut TerminalView) {
+    view.stop_scroll_glide();
     if let Some(found) = view.search.active_match() {
         view.terminal.scroll_to(found.end);
         view.terminal.scroll_to(found.start);
@@ -362,6 +381,7 @@ fn viewport_bottom(view: &TerminalView) -> GridPoint {
 fn close(view: &mut TerminalView, window: &mut Window, cx: &mut Context<TerminalView>) {
     let search = &mut view.search;
     search.open = false;
+    search.opened = None;
     search.opening = false;
     search.clear_results();
     search.refresh = None;
@@ -511,54 +531,68 @@ pub fn render_bar(
                 .on_click(cx.listener(|view, _: &ClickEvent, window, cx| close(view, window, cx))),
         );
 
+    let bar = div()
+        .key_context("FindBar")
+        .relative()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .px_2()
+        .py_2()
+        .font_family(theme::UI_FONT)
+        .text_size(px(theme::TEXT_SM))
+        .text_color(ui.foreground)
+        // ↵ goes up, to older output: see the module notes.
+        .on_action(cx.listener(|view, _: &find_bar::SelectNextMatch, _, cx| step(view, true, cx)))
+        .on_action(
+            cx.listener(|view, _: &find_bar::SelectPreviousMatch, _, cx| step(view, false, cx)),
+        )
+        .on_action(cx.listener(|view, _: &find_bar::Dismiss, window, cx| close(view, window, cx)))
+        .on_action(
+            cx.listener(|view, _: &find_bar::ToggleCaseSensitive, _, cx| {
+                toggle(view, |search| &mut search.case_sensitive, cx)
+            }),
+        )
+        .on_action(cx.listener(|view, _: &find_bar::ToggleWholeWord, _, cx| {
+            toggle(view, |search| &mut search.whole_word, cx)
+        }))
+        .on_action(cx.listener(|view, _: &find_bar::ToggleRegex, _, cx| {
+            toggle(view, |search| &mut search.regex, cx)
+        }))
+        // ⌥↵ (select all matches) and ⇥ (next field) have nothing to do in a one-field bar on
+        // a terminal; caught here, they don't reach the program.
+        .on_action(cx.listener(|_, _: &find_bar::SelectAllMatches, _, _| {}))
+        .on_action(cx.listener(|_, _: &find_bar::FocusNextField, _, _| {}))
+        .child(row)
+        // The divider under the bar runs from edge to edge of the pane, inset like the file's.
+        .child(
+            div()
+                .absolute()
+                .left(px(GAP))
+                .right(px(GAP))
+                .bottom_0()
+                .h(px(1.))
+                .bg(ui.divider),
+        );
+    // Opening, the bar takes its room at once (the grid gives up its rows once) and takes keys from
+    // its first frame; only its drawing drops into place within that room as it fades in.
+    let shown = view
+        .search
+        .opened
+        .map_or(1., |since| motion::animate(since, BAR_CURVE, window));
+    if shown >= 1. {
+        return Some(bar.into_any_element());
+    }
+    let bar = motion::Appear::slide(0., -BAR_DROP)
+        .curve(BAR_CURVE)
+        .style(bar, shown);
     Some(
         div()
-            .key_context("FindBar")
-            .relative()
             .flex_none()
             .flex()
             .flex_col()
-            .px_2()
-            .py_2()
-            .font_family(theme::UI_FONT)
-            .text_size(px(theme::TEXT_SM))
-            .text_color(ui.foreground)
-            // ↵ goes up, to older output: see the module notes.
-            .on_action(
-                cx.listener(|view, _: &find_bar::SelectNextMatch, _, cx| step(view, true, cx)),
-            )
-            .on_action(
-                cx.listener(|view, _: &find_bar::SelectPreviousMatch, _, cx| step(view, false, cx)),
-            )
-            .on_action(
-                cx.listener(|view, _: &find_bar::Dismiss, window, cx| close(view, window, cx)),
-            )
-            .on_action(
-                cx.listener(|view, _: &find_bar::ToggleCaseSensitive, _, cx| {
-                    toggle(view, |search| &mut search.case_sensitive, cx)
-                }),
-            )
-            .on_action(cx.listener(|view, _: &find_bar::ToggleWholeWord, _, cx| {
-                toggle(view, |search| &mut search.whole_word, cx)
-            }))
-            .on_action(cx.listener(|view, _: &find_bar::ToggleRegex, _, cx| {
-                toggle(view, |search| &mut search.regex, cx)
-            }))
-            // ⌥↵ (select all matches) and ⇥ (next field) have nothing to do in a one-field bar on
-            // a terminal; caught here, they don't reach the program.
-            .on_action(cx.listener(|_, _: &find_bar::SelectAllMatches, _, _| {}))
-            .on_action(cx.listener(|_, _: &find_bar::FocusNextField, _, _| {}))
-            .child(row)
-            // The divider under the bar runs from edge to edge of the pane, inset like the file's.
-            .child(
-                div()
-                    .absolute()
-                    .left(px(GAP))
-                    .right(px(GAP))
-                    .bottom_0()
-                    .h(px(1.))
-                    .bg(ui.divider),
-            )
+            .overflow_hidden()
+            .child(bar)
             .into_any_element(),
     )
 }

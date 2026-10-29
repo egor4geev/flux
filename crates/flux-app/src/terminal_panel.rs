@@ -21,6 +21,7 @@ use crate::context_menu::ContextMenu;
 use crate::dialog::Dialog;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::tab_strip::{self, Room, TabStrip};
 use crate::terminal_group::{
     DraggedTerminal, SplitDown, SplitRight, TerminalGroup, TerminalGroupEvent,
 };
@@ -123,6 +124,9 @@ pub struct TerminalPanel {
     /// Why the last terminal couldn't start.
     error: Option<SharedString>,
     tab_scroll: ScrollHandle,
+    /// The strip's motion (`crate::tab_strip`): the highlight gliding to the active tab, tabs
+    /// gliding into place, closed ones fading out.
+    tab_strip: TabStrip,
     /// Where a dragged terminal tab would land in the strip: the index it would get.
     drop_index: Option<usize>,
     menu: Option<Menu>,
@@ -137,6 +141,7 @@ impl TerminalPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let tab_scroll = ScrollHandle::new();
         Self {
             tabs: Vec::new(),
             active: 0,
@@ -145,7 +150,8 @@ impl TerminalPanel {
             resizing: false,
             focus_handle: cx.focus_handle(),
             error: None,
-            tab_scroll: ScrollHandle::new(),
+            tab_strip: TabStrip::new(tab_scroll.clone()),
+            tab_scroll,
             drop_index: None,
             menu: None,
         }
@@ -258,7 +264,7 @@ impl TerminalPanel {
             self.activate(index, window, cx);
         } else {
             self.active = index;
-            self.tab_scroll.scroll_to_item(index);
+            self.tab_strip.reveal(index);
             group.update(cx, |group, cx| group.clear_bell(cx));
             cx.notify();
         }
@@ -307,7 +313,8 @@ impl TerminalPanel {
         };
         let group = tab.group.clone();
         self.active = index;
-        self.tab_scroll.scroll_to_item(index);
+        // Into view, gliding (`TabStrip::reveal`).
+        self.tab_strip.reveal(index);
         group.update(cx, |group, cx| group.clear_bell(cx));
         window.focus(&group.focus_handle(cx));
         cx.notify();
@@ -518,6 +525,8 @@ impl TerminalPanel {
     /// area is handed over by the window ([`TerminalPanelEvent::MoveToPanel`]).
     fn drop_tab(&mut self, dragged: &DraggedTerminal, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.drop_index.take().unwrap_or(self.tabs.len());
+        // The tabs are at once where the drop put them.
+        self.tab_strip.settle();
         cx.notify();
         let group = dragged.group.clone();
         let Some(from) = self.index_of(&group) else {
@@ -543,23 +552,53 @@ impl TerminalPanel {
             .map(|tab| tab.group.read(cx).title(cx))
             .collect();
         let drop_index = self.drop_index.filter(|_| cx.has_active_drag());
-        let tabs: Vec<AnyElement> = self
+        // Tabs named alike tell themselves apart by their directory.
+        let details: Vec<Option<String>> = self
             .tabs
             .iter()
             .enumerate()
             .map(|(index, tab)| {
-                // Tabs named alike tell themselves apart by their directory.
                 let repeated = titles
                     .iter()
                     .enumerate()
                     .any(|(other, title)| other != index && *title == titles[index]);
-                let detail = repeated
+                repeated
                     .then(|| tab.group.read(cx).cwd(cx))
                     .flatten()
-                    .and_then(|cwd| directory_name(&cwd));
-                self.render_tab(index, tab, titles[index].clone(), detail, drop_index, cx)
+                    .and_then(|cwd| directory_name(&cwd))
             })
             .collect();
+        let faces = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let face = tab_face(&titles[index], &details[index], index == self.active, ui);
+                (tab.group.entity_id(), face)
+            })
+            .collect();
+        self.tab_strip.prepare(faces, window);
+        let count = self.tabs.len();
+        // One element per tab (the scroll handle counts them): it glides and pops in, and the tabs
+        // part where a dragged one would land.
+        let tabs: Vec<AnyElement> = self
+            .tabs
+            .iter()
+            .zip(details)
+            .enumerate()
+            .map(|(index, (tab, detail))| {
+                let element = self.render_tab(index, tab, titles[index].clone(), detail, cx);
+                let room = Room::at(index, count, drop_index);
+                self.tab_strip.tab(tab.group.entity_id(), room, element)
+            })
+            .collect();
+        // The highlight of the active tab and the marker of a dragged one, behind the tabs.
+        let highlight = self.tab_strip.highlight(
+            self.active_group().map(|group| group.entity_id()),
+            drop_index,
+            RADIUS_MD,
+            ui,
+        );
         // The pills take what they need and scroll when they don't fit; "+" follows them, the
         // free space after it also takes a dropped tab (to the end).
         let strip = div()
@@ -574,7 +613,8 @@ impl TerminalPanel {
             .gap_1()
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll)
-            .children(tabs);
+            .children(tabs)
+            .children(self.tab_strip.ghosts(window));
         let new_terminal = ui::icon_button("terminal-new", IconName::Plus, ui)
             .tooltip(ui::tooltip(
                 tr("New Terminal"),
@@ -646,6 +686,7 @@ impl TerminalPanel {
             .on_drop(cx.listener(|this, dragged: &DraggedTerminal, window, cx| {
                 this.drop_tab(dragged, window, cx)
             }))
+            .child(highlight)
             .child(strip)
             .child(new_terminal)
             .child(tail)
@@ -678,7 +719,6 @@ impl TerminalPanel {
         tab: &PanelTab,
         title: SharedString,
         detail: Option<String>,
-        drop_index: Option<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let ui = Theme::ui(cx);
@@ -702,11 +742,6 @@ impl TerminalPanel {
                 .justify_center()
                 .rounded(px(ui::RADIUS_XS))
                 .hover(move |style| style.bg(ui.pressed))
-                .when(bell || !active, |close| {
-                    close
-                        .invisible()
-                        .group_hover(TAB_GROUP, |style| style.visible())
-                })
                 // Clicking × must not activate the tab or start dragging it.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -720,16 +755,6 @@ impl TerminalPanel {
                         }),
                 )
         };
-        let bell_dot = bell.then(|| {
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .group_hover(TAB_GROUP, |style| style.invisible())
-                .child(div().size(px(7.)).rounded(px(4.)).bg(ui.warning))
-        });
         let activate = group.clone();
         let middle_close = group.clone();
         div()
@@ -745,15 +770,13 @@ impl TerminalPanel {
             .gap_1p5()
             .rounded(px(RADIUS_MD))
             .border_1()
+            .border_color(gpui::transparent_black())
             .text_color(if active { ui.foreground } else { ui.text_muted })
-            .when(active, |tab| {
-                tab.bg(ui.pressed)
-                    .border_color(ui.island_border)
-                    .font_weight(FontWeight::MEDIUM)
-            })
+            // The active tab's highlight is the strip's, gliding from tab to tab
+            // (`TabStrip::highlight`).
+            .when(active, |tab| tab.font_weight(FontWeight::MEDIUM))
             .when(!active, |tab| {
-                tab.border_color(gpui::transparent_black())
-                    .hover(|style| style.bg(ui.hover).text_color(ui.foreground))
+                tab.hover(|style| style.bg(ui.hover).text_color(ui.foreground))
             })
             .when_some(tooltip, |tab, cwd| tab.tooltip(ui::tooltip(cwd, None)))
             .on_mouse_down(
@@ -783,13 +806,6 @@ impl TerminalPanel {
                     this.drag_over_tab(index, event, cx)
                 },
             ))
-            .when(drop_index == Some(index), |tab| {
-                tab.child(drop_marker(false, ui))
-            })
-            .when(
-                drop_index == Some(self.tabs.len()) && index + 1 == self.tabs.len(),
-                |tab| tab.child(drop_marker(true, ui)),
-            )
             .child(icon(IconName::Terminal, ui.green).size(px(13.)))
             .child(
                 div()
@@ -802,13 +818,14 @@ impl TerminalPanel {
                     .text_color(ui.dim)
                     .child(shorten(&detail, TAB_LABEL_MAX_CHARS))
             }))
+            // The bell's dot pops in and shrinks away; under the pointer, it and the × crossfade.
             .child(
                 div()
                     .relative()
                     .flex_none()
                     .size(px(18.))
-                    .children(bell_dot)
-                    .child(close),
+                    .child(tab_strip::dot(bell, ui.warning, TAB_GROUP))
+                    .child(tab_strip::close_reveal(close, !bell && active, TAB_GROUP)),
             )
             .into_any_element()
     }
@@ -874,18 +891,39 @@ impl TerminalPanel {
     }
 }
 
-/// The marker of where a dragged tab would land: an accent bar in the gap before a pill, or after
-/// the last one (`after`).
-fn drop_marker(after: bool, ui: UiColors) -> impl IntoElement {
-    div()
-        .absolute()
-        .top(px(3.))
-        .bottom(px(3.))
-        .when(after, |marker| marker.right(px(-3.)))
-        .when(!after, |marker| marker.left(px(-3.)))
-        .w(px(2.))
-        .rounded(px(1.))
-        .bg(ui.accent)
+/// How a tab looks as a ghost when it closes (`crate::tab_strip::Face`): its icon and labels, in
+/// the place of the tab's own.
+fn tab_face(
+    title: &SharedString,
+    detail: &Option<String>,
+    active: bool,
+    ui: UiColors,
+) -> tab_strip::Face {
+    let title = shorten(title, TAB_LABEL_MAX_CHARS);
+    let detail = detail
+        .as_deref()
+        .map(|detail| shorten(detail, TAB_LABEL_MAX_CHARS));
+    std::rc::Rc::new(move || {
+        div()
+            .size_full()
+            .pl_2()
+            .pr_1()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .text_color(if active { ui.foreground } else { ui.text_muted })
+            .when(active, |face| face.font_weight(FontWeight::MEDIUM))
+            .child(icon(IconName::Terminal, ui.green).size(px(13.)))
+            .child(div().whitespace_nowrap().child(title.clone()))
+            .children(
+                detail
+                    .clone()
+                    .map(|detail| div().whitespace_nowrap().text_color(ui.dim).child(detail)),
+            )
+            .into_any_element()
+    })
 }
 
 /// The panel's top edge, in the gap between islands: an accent line on hover and while dragged.
@@ -905,15 +943,17 @@ fn resize_handle(resizing: bool, center: f32, ui: UiColors) -> impl IntoElement 
         .items_center()
         .cursor(CursorStyle::ResizeUpDown)
         .on_drag(DraggedEdge, |_, _, _, cx| cx.new(|_| DraggedEdge))
+        // With an id, the line fades in and out under the pointer.
         .child(
             div()
+                .id("line")
                 .w_full()
                 .h(px(2.))
                 .rounded(px(1.))
                 .bg(ui.focus_border)
                 .when(!resizing, |line| {
-                    line.invisible()
-                        .group_hover(RESIZE_GROUP, |style| style.visible())
+                    line.opacity(0.)
+                        .group_hover(RESIZE_GROUP, |style| style.opacity(1.))
                 }),
         )
 }
