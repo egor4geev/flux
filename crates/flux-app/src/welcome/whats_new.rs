@@ -25,6 +25,7 @@ use crate::{settings, ui};
 const NOTES: &[&str] = &[
     include_str!("../../assets/whats-new/0.1.0.toml"),
     include_str!("../../assets/whats-new/0.2.0.toml"),
+    include_str!("../../assets/whats-new/0.3.0.toml"),
 ];
 
 /// Where a version's full release notes are read: the release of its tag.

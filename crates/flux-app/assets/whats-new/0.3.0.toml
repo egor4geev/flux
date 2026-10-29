@@ -1,0 +1,35 @@
+# What's New in Flux 0.3: motion, the country check for Claude, plugin secrets kept by Flux (format: 0.1.0.toml).
+version = "0.3.0"
+date = "2026-10-29"
+
+[[items]]
+icon = "sparkle"
+color = "violet"
+title = "Motion everywhere"
+text = "Popups grow out of where you called them, tabs and rows glide into place, dialogs and tooltips fade in and out. Typing stays instant. Turn it off in Settings → Appearance → Interface."
+ru.title = "Живое движение"
+ru.text = "Попапы вырастают из места вызова, вкладки и строки скользят на свои места, диалоги и подсказки плавно появляются и уходят. Набор — мгновенный. Выключается в Настройках → Внешний вид → Интерфейс."
+
+[[items]]
+icon = "globe"
+color = "teal"
+title = "Country check for Claude"
+text = "Flux checks which country your connection comes from and stops Claude in the countries you list, so a dropped VPN sends nothing from there. The flag is in the status bar."
+ru.title = "Флаг страны для Claude"
+ru.text = "Flux проверяет, из какой страны идёт соединение, и останавливает Claude в странах из списка: упавший VPN ничего оттуда не отправит. Флаг — в строке состояния."
+
+[[items]]
+icon = "puzzle"
+color = "blue"
+title = "No more keychain prompts"
+text = "Plugins keep their tokens in Flux's own encrypted file: macOS no longer asks for access after updates. Plugin forms open right over Settings."
+ru.title = "Без вопросов связки ключей"
+ru.text = "Токены плагинов теперь хранит сам Flux в зашифрованном файле: macOS больше не спрашивает доступ после обновлений. Формы плагинов открываются прямо поверх настроек."
+
+[[items]]
+icon = "terminal"
+color = "claude"
+title = "Claude answers ! commands"
+text = "Run a command with ! in the chat and Claude replies to its output; ⌘↵ runs it without an answer."
+ru.title = "Claude отвечает на !-команды"
+ru.text = "Команда с ! в чате — Claude отвечает на её вывод; ⌘↵ — выполнить без ответа."
