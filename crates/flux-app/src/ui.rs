@@ -310,11 +310,6 @@ pub fn popover_shadow(ui: UiColors) -> Vec<BoxShadow> {
     ]
 }
 
-/// Focus ring around a field: an accent border plus a soft glow.
-pub fn focus_ring(ui: UiColors) -> Vec<BoxShadow> {
-    focus_ring_at(ui, 1., false)
-}
-
 /// How wide the focus ring is, and how wide it comes in before it closes around the field.
 const RING_SPREAD: f32 = 3.;
 const HALO_SPREAD: f32 = 10.;
@@ -339,7 +334,7 @@ pub fn focus_ring_at(ui: UiColors, t: f32, coming: bool) -> Vec<BoxShadow> {
     }]
 }
 
-/// A field's [`focus_ring`] that comes and goes: on focus the halo comes in wide and settles around
+/// A field's focus ring ([`focus_ring_at`]) that comes and goes: on focus the halo comes in wide and settles around
 /// the field ([`motion::POP`]), on blur it fades ([`motion::FADE`]). `id` keeps it between frames
 /// (unique among the field's siblings); a field that is drawn focused at once has its ring at once.
 /// Not on the path of typing: it moves when the focus does.
