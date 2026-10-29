@@ -45,6 +45,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use flux_core::text::{line_len, line_start};
 use flux_core::{Document, Rope};
@@ -62,6 +63,7 @@ use crate::element::LayoutCache;
 use crate::git::GitStore;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::motion;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 use crate::workspace::Location;
@@ -552,6 +554,10 @@ pub struct DiffView {
     driver: Side,
     /// The scroll offsets of both sides as of the last frame: the one that moved alone leads.
     synced: Option<(Point<f32>, Point<f32>)>,
+    /// A block just reverted, fading out.
+    reverted: Option<Reverted>,
+    /// When side by side ↔ unified last switched: the new body fades in ([`motion::FADE`]).
+    switched: Option<Instant>,
     /// A comparison of two revisions (or a revision and the working copy) instead of HEAD and the
     /// working copy.
     compare: Option<Compare>,
@@ -559,6 +565,23 @@ pub struct DiffView {
     proposal: Option<Proposal>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A block just reverted (its arrow, ⌃⌘→): instead of its color snapping off when the diff comes
+/// back, it fades out ([`motion::FADE`]) — on the HEAD lines, on the lines put back into the working
+/// copy, and on the band between them. The next edit of the working copy ends it.
+struct Reverted {
+    /// The model the block is in, and its index there: until the diff comes back, that model still
+    /// has the block — the fade draws it instead.
+    model: Rc<DiffModel>,
+    index: usize,
+    kind: HunkKind,
+    /// The block's lines after the revert: HEAD's, and the same lines in the working copy.
+    old: Range<u32>,
+    new: Range<u32>,
+    /// The working copy right after the revert: another text is a later edit.
+    text: Rope,
+    since: Instant,
 }
 
 /// An edit proposed for review: whose it is, and the text proposed (an untouched right side allows
@@ -741,11 +764,22 @@ impl DiffView {
         })];
         let mut binary = false;
         if let Some(editor) = &working {
-            subscriptions.push(cx.subscribe(editor, |this, _, event: &EditorEvent, cx| {
-                if *event == EditorEvent::Edited {
-                    this.recompute(cx);
-                }
-            }));
+            subscriptions.push(
+                cx.subscribe(editor, |this, editor, event: &EditorEvent, cx| {
+                    if *event == EditorEvent::Edited {
+                        // A later edit ends a revert's fade: its lines may be anywhere now.
+                        let text = editor.read(cx).document.text();
+                        if this
+                            .reverted
+                            .as_ref()
+                            .is_some_and(|reverted| reverted.text != *text)
+                        {
+                            this.reverted = None;
+                        }
+                        this.recompute(cx);
+                    }
+                }),
+            );
             binary = editor
                 .read(cx)
                 .document
@@ -772,6 +806,8 @@ impl DiffView {
             unified_text: None,
             driver: Side::Right,
             synced: None,
+            reverted: None,
+            switched: None,
             compare,
             proposal: None,
             focus_handle: cx.focus_handle(),
@@ -1483,6 +1519,7 @@ impl DiffView {
         }
         let lh = theme::LINE_HEIGHT;
         self.unified = unified;
+        self.switched = motion::enabled().then(Instant::now);
         if unified {
             self.ensure_unified(window, cx);
             let top = self
@@ -1565,11 +1602,11 @@ impl DiffView {
             return;
         };
         let old = block(&model.base, &line_ranges(&model.base), &hunk.old).to_string();
-        working.update(cx, |editor, cx| {
+        let reverted = working.update(cx, |editor, cx| {
             let text = editor.document.text();
             // The model must be of this text: a block of a stale diff would land elsewhere.
             if *normalize(&text.to_string()) != *model.text {
-                return;
+                return None;
             }
             let start = char_of_line(text, hunk.new.start as usize);
             let end = char_of_line(text, hunk.new.end as usize);
@@ -1578,7 +1615,22 @@ impl DiffView {
                 _ => old,
             };
             editor.replace_ranges(vec![(start..end, old)], cx);
+            Some(editor.document.text().clone())
         });
+        // The block fades out where it is rather than snapping off when the diff comes back.
+        if let Some(text) = reverted.filter(|_| motion::enabled()) {
+            let lines = hunk.old.len() as u32;
+            self.reverted = Some(Reverted {
+                model,
+                index,
+                kind: hunk.kind(),
+                old: hunk.old.clone(),
+                new: hunk.new.start..hunk.new.start + lines,
+                text,
+                since: Instant::now(),
+            });
+            cx.notify();
+        }
     }
 
     /// ⌃⌘→: reverts the block under the cursor of the focused side (side by side).
@@ -1649,6 +1701,13 @@ impl DiffView {
         ) else {
             return;
         };
+        // This frame's step of a jump gliding on either side (F7, go to line), taken before the
+        // offsets are read: the follower keeps up with the step on screen, not the last frame's
+        // (the editor's own render takes it again, only on to "now"). The side that glides moves
+        // alone and leads; a follower that had a glide of its own gives it up once it's set here.
+        for editor in [&left, &right] {
+            editor.update(cx, |editor, _| editor.advance_glide());
+        }
         let l = left.read(cx).scroll;
         let r = right.read(cx).scroll;
         let (left_moved, right_moved) = match self.synced {
@@ -1702,12 +1761,28 @@ impl DiffView {
 
     // --- Colors ---
 
+    /// The block of `model` a revert's fade draws instead (the diff hasn't come back yet).
+    fn reverted_index(&self, model: &Rc<DiffModel>) -> Option<usize> {
+        self.reverted
+            .as_ref()
+            .filter(|reverted| Rc::ptr_eq(&reverted.model, model))
+            .map(|reverted| reverted.index)
+    }
+
     /// Hands both sides their colors for this frame.
-    fn decorate_sides(&self, cx: &mut Context<Self>) {
+    fn decorate_sides(&self, window: &Window, cx: &mut Context<Self>) {
         let Some(model) = &self.model else {
             return;
         };
         let ui = Theme::ui(cx);
+        // A block just reverted fades out, in place of the stale diff's block.
+        let fade = self.reverted.as_ref().map(|reverted| {
+            (
+                reverted,
+                motion::animate(reverted.since, motion::FADE, window),
+            )
+        });
+        let replaced = self.reverted_index(model);
         let mut left = Decorations::default();
         let mut right = Decorations::default();
         let left_text = self
@@ -1718,7 +1793,10 @@ impl DiffView {
             .working
             .as_ref()
             .map(|editor| editor.read(cx).document.text().clone());
-        for (hunk, words) in model.hunks.iter().zip(&model.words) {
+        for (index, (hunk, words)) in model.hunks.iter().zip(&model.words).enumerate() {
+            if replaced == Some(index) {
+                continue;
+            }
             let old = hunk.old.start as usize..hunk.old.end as usize;
             let new = hunk.new.start as usize..hunk.new.end as usize;
             match hunk.kind() {
@@ -1749,6 +1827,18 @@ impl DiffView {
                             ui.diff_modified_word,
                         ));
                     }
+                }
+            }
+        }
+        if let Some((reverted, t)) = fade {
+            let (background, line) = block_colors(reverted.kind, &ui);
+            let (background, line) = (faded(background, t), faded(line, t));
+            for (decorations, lines) in [(&mut left, &reverted.old), (&mut right, &reverted.new)] {
+                if lines.is_empty() {
+                    decorations.boundaries.push((lines.start as usize, line));
+                } else {
+                    let lines = lines.start as usize..lines.end as usize;
+                    decorations.lines.push((lines, background));
                 }
             }
         }
@@ -2119,6 +2209,17 @@ impl DiffView {
                 )
                 .into_any_element();
         };
+        // A block just reverted: its band fades out where the block is now (the decorations ask
+        // for the frames).
+        let replaced = self.reverted_index(&model);
+        let fading = self.reverted.as_ref().map(|reverted| {
+            let band = Hunk {
+                old: reverted.old.clone(),
+                new: reverted.new.clone(),
+            };
+            let t = motion::progress(reverted.since, motion::FADE);
+            (band, faded(block_colors(reverted.kind, &ui).0, t))
+        });
         let bands = canvas(|_, _, _| (), {
             let model = model.clone();
             let (left, right) = (left.clone(), right.clone());
@@ -2126,16 +2227,18 @@ impl DiffView {
                 // The final offsets of this frame: both editors are laid out by now.
                 let ly = left.read(cx).scroll.y;
                 let ry = right.read(cx).scroll.y;
-                for hunk in &model.hunks {
+                let blocks = model
+                    .hunks
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| replaced != Some(*index))
+                    .map(|(_, hunk)| (hunk, block_colors(hunk.kind(), &ui).0))
+                    .chain(fading.as_ref().map(|(hunk, color)| (hunk, *color)));
+                for (hunk, color) in blocks {
                     let geometry = BandGeometry::new(hunk, ly, ry);
                     if !geometry.visible(f32::from(bounds.size.height)) {
                         continue;
                     }
-                    let color = match hunk.kind() {
-                        HunkKind::Added => ui.diff_added_bg,
-                        HunkKind::Deleted => ui.diff_deleted_bg,
-                        HunkKind::Modified => ui.diff_modified_bg,
-                    };
                     paint_band(bounds, &geometry, color, window);
                 }
             }
@@ -2149,6 +2252,9 @@ impl DiffView {
         let git = self.git.read(cx);
         let mut buttons = Vec::new();
         for (index, hunk) in model.hunks.iter().enumerate() {
+            if replaced == Some(index) {
+                continue;
+            }
             let geometry = BandGeometry::new(hunk, ly, ry);
             // The buttons are laid out before the editors settle: a frame late while scrolling.
             if geometry.left_top.max(geometry.right_top) < -100.
@@ -2413,6 +2519,14 @@ impl Render for DiffView {
             (Base::NoRepository, _) => Some(tr("Not in a Git repository")),
             (Base::Loading | Base::Text(_), false) => None,
         };
+        // The fades that have ended are dropped: no frames once nothing moves.
+        if self
+            .reverted
+            .as_ref()
+            .is_some_and(|reverted| !motion::running(reverted.since, motion::FADE))
+        {
+            self.reverted = None;
+        }
         let body = match note_text {
             Some(text) => note(IconName::Info, text, ui).into_any_element(),
             None if matches!(self.base, Base::Loading) || self.right_loading() => {
@@ -2421,8 +2535,23 @@ impl Render for DiffView {
             None if self.unified => self.render_unified(window, cx),
             None => {
                 self.sync_scroll(cx);
-                self.decorate_sides(cx);
+                self.decorate_sides(window, cx);
                 self.render_side_by_side(cx)
+            }
+        };
+        // Side by side ↔ unified: the new body fades in.
+        let body = match self.switched {
+            Some(since) if motion::running(since, motion::FADE) => div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .opacity(motion::animate(since, motion::FADE, window))
+                .child(body)
+                .into_any_element(),
+            _ => {
+                self.switched = None;
+                body
             }
         };
         let comparable = self.comparable();
@@ -2464,6 +2593,21 @@ impl Render for DiffView {
 }
 
 // --- Helpers ---
+
+/// A block's colors by its kind: its lines' background, and the line marking where a side has none
+/// of its lines.
+fn block_colors(kind: HunkKind, ui: &UiColors) -> (Hsla, Hsla) {
+    match kind {
+        HunkKind::Added => (ui.diff_added_bg, ui.diff_added),
+        HunkKind::Deleted => (ui.diff_deleted_bg, ui.diff_deleted),
+        HunkKind::Modified => (ui.diff_modified_bg, ui.diff_modified),
+    }
+}
+
+/// `color` faded out by `t` (0 → 1): its alpha going to nothing.
+fn faded(color: Hsla, t: f32) -> Hsla {
+    motion::mix(color, Hsla::transparent_black(), t)
+}
 
 /// A centered note in place of a side or the whole view.
 fn note(icon_name: IconName, text: &str, ui: UiColors) -> gpui::Div {

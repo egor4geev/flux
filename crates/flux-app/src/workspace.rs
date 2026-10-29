@@ -4704,10 +4704,20 @@ impl Workspace {
     }
 
     /// Project search is a window over the islands; a click outside closes it.
+    /// Closed, it fades out a moment, taking no input.
     fn render_project_search(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
-        if !self.project_search.read(cx).is_open() {
-            return None;
-        }
+        let search = self.project_search.read(cx).present(
+            div()
+                .w(relative(SEARCH_WIDTH))
+                .max_w(px(SEARCH_MAX_WIDTH))
+                .h_full()
+                .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                    if this.project_search.read(cx).is_open() {
+                        this.hide_project_search(window, cx)
+                    }
+                }))
+                .child(self.project_search.clone()),
+        )?;
         Some(
             div()
                 .absolute()
@@ -4717,19 +4727,7 @@ impl Workspace {
                 .right_0()
                 .flex()
                 .justify_center()
-                .child(
-                    crate::motion::Appear::dialog().apply(
-                        "project-search",
-                        div()
-                            .w(relative(SEARCH_WIDTH))
-                            .max_w(px(SEARCH_MAX_WIDTH))
-                            .h_full()
-                            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                                this.hide_project_search(window, cx)
-                            }))
-                            .child(self.project_search.clone()),
-                    ),
-                ),
+                .child(search),
         )
     }
 

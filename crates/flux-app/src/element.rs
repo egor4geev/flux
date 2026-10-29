@@ -450,7 +450,7 @@ impl Element for EditorElement {
         let (gutter_width, blame_width, text_bounds) = {
             let editor = self.editor.read(cx);
             let digits = editor.document.text().len_lines().to_string().len().max(3);
-            let blame_width = crate::blame::column_width(&editor.blame, em);
+            let blame_width = crate::blame::column_width(&editor.blame, em, window);
             let gutter_width = if editor.message.is_some() {
                 px(0.)
             } else {
@@ -588,6 +588,11 @@ impl Element for EditorElement {
             .highlighter
             .highlight_lines(&text, first_line..last_line);
         let base = run(0, ui.foreground);
+        // ⌃⌥W: the rewrapped text fades in.
+        let rewrap_fade = editor
+            .rewrapped
+            .map(|since| motion::animate(since, motion::FADE, window))
+            .filter(|value| *value < 1.);
         let mut rows = Vec::with_capacity(last_row.saturating_sub(first_row));
         let mut lines = Vec::with_capacity(last_line - first_line);
         let mut max_width = px(0.);
@@ -609,7 +614,7 @@ impl Element for EditorElement {
                     continue;
                 }
                 let span = wrap.row_span(&text, line, index);
-                let (display, char_to_byte, runs) = if count == 1 {
+                let (display, char_to_byte, mut runs) = if count == 1 {
                     let (display, char_to_byte) = display_line(&text, line);
                     let runs = text_runs(spans, &char_to_byte, &base, |h| theme.syntax_style(h));
                     (display, char_to_byte, runs)
@@ -620,6 +625,11 @@ impl Element for EditorElement {
                     let runs = text_runs(&spans, &char_to_byte, &base, |h| theme.syntax_style(h));
                     (display, char_to_byte, runs)
                 };
+                if let Some(fade) = rewrap_fade {
+                    for run in &mut runs {
+                        run.color = run.color.opacity(fade);
+                    }
+                }
                 let shaped = text_system.shape_line(display.into(), font_size, &runs, None);
                 max_width = max_width.max(shaped.width);
                 rows.push(RowLayout {
@@ -638,26 +648,62 @@ impl Element for EditorElement {
         }
 
         // Horizontal autoscroll: after the rows are laid out, when the cursor's x is known. With
-        // soft wraps the text fits the width: no horizontal scroll.
+        // soft wraps the text fits the width: no horizontal scroll. A jump glides sideways as it
+        // glides down (a long line's end), from what is on screen.
         let visible_width = f32::from(text_bounds.size.width) - theme::TEXT_PADDING * 2.;
+        let mut glide_x = None;
         if wrapped {
             scroll.x = 0.;
         } else {
-            if autoscroll.is_some()
-                && let Some(entry) = lines.get(head_line.wrapping_sub(first_line))
-                && entry.shown > 0
-            {
-                let x = f32::from(rows[entry.first].x_for_column(head_column));
-                let margin = f32::from(em) * 4.;
-                if x < scroll.x {
-                    scroll.x = x - margin;
-                } else if x > scroll.x + visible_width - f32::from(em) {
-                    scroll.x = x - visible_width + margin;
+            let shown_x = scroll.x;
+            let gliding_x = editor.glide_x.filter(|glide| glide.shown == scroll.x);
+            let destination_x = gliding_x.map_or(scroll.x, |glide| glide.to);
+            scroll.x = destination_x;
+            let mut widest = f32::from(max_width);
+            if autoscroll.is_some() {
+                // The caret's line may not be on screen yet: a gliding jump starts a screen away.
+                let x = match lines.get(head_line.wrapping_sub(first_line)) {
+                    Some(entry) if entry.shown > 0 => {
+                        Some(f32::from(rows[entry.first].x_for_column(head_column)))
+                    }
+                    _ if glide.is_some() => {
+                        let (display, char_to_byte) = display_line(&text, head_line);
+                        let runs = [run(display.len(), ui.foreground)];
+                        let shaped = text_system.shape_line(display.into(), font_size, &runs, None);
+                        widest = widest.max(f32::from(shaped.width));
+                        let column = head_column.min(char_to_byte.len().saturating_sub(1));
+                        char_to_byte
+                            .get(column)
+                            .map(|&byte| f32::from(shaped.x_for_index(byte)))
+                    }
+                    _ => None,
+                };
+                if let Some(x) = x {
+                    let margin = f32::from(em) * 4.;
+                    if x < scroll.x {
+                        scroll.x = x - margin;
+                    } else if x > scroll.x + visible_width - f32::from(em) {
+                        scroll.x = x - visible_width + margin;
+                    }
                 }
             }
-            scroll.x = scroll
-                .x
-                .clamp(0., (f32::from(max_width) - visible_width / 2.).max(0.));
+            // While a glide runs, the rows on screen may not reach as far as where it goes.
+            let reach = gliding_x.map_or(0., |glide| glide.to.max(glide.from));
+            let max_x = (widest - visible_width / 2.).max(0.).max(reach);
+            scroll.x = scroll.x.clamp(0., max_x);
+            glide_x = Glide::next(
+                gliding_x,
+                destination_x,
+                scroll.x,
+                jump,
+                shown_x.clamp(0., max_x),
+                visible_width,
+                Instant::now(),
+            );
+            if let Some(glide) = &glide_x {
+                scroll.x = glide.shown.clamp(0., max_x.max(glide.to));
+                window.request_animation_frame();
+            }
         }
 
         let layout = LayoutCache {
@@ -701,6 +747,22 @@ impl Element for EditorElement {
                 ));
             }
         };
+
+        // What another program changed (a reload): tinted a moment, then fading, under the
+        // matches and the selection.
+        let reload_tint = editor
+            .reload_tint
+            .as_ref()
+            .and_then(|(range, since)| Some((range, Editor::reload_tint_alpha(*since, window)?)));
+        if let Some((range, alpha)) = &reload_tint {
+            let len = text.len_chars();
+            range_quads(
+                range.start.min(len),
+                range.end.min(len),
+                ui.diff_modified_bg.opacity(*alpha),
+            );
+        }
+        let reload_tint_over = editor.reload_tint.is_some() && reload_tint.is_none();
 
         // Search matches: only those that intersect the visible lines. The current match goes on
         // top of the selection (it is usually the selected one): otherwise the selection's blue
@@ -844,8 +906,18 @@ impl Element for EditorElement {
                 shown: scroll.y,
                 ..glide
             });
+            editor.glide_x = glide_x.map(|glide| Glide {
+                shown: scroll.x,
+                ..glide
+            });
             editor.glide_next = false;
             editor.autoscroll = None;
+            if reload_tint_over {
+                editor.reload_tint = None;
+            }
+            if rewrap_fade.is_none() {
+                editor.rewrapped = None;
+            }
             editor.blame.column = (blame_width > px(0.)).then_some(blame_column);
             editor.frame_decorations.take()
         });

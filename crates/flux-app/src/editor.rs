@@ -253,6 +253,9 @@ pub struct Editor {
     pub(crate) autoscroll: Option<Autoscroll>,
     /// A jump gliding to its place; `None` at rest.
     pub(crate) glide: Option<Glide>,
+    /// The same jump gliding sideways, to a long line's far end ([`Editor::scroll`]`.x`; soft wraps
+    /// off).
+    pub(crate) glide_x: Option<Glide>,
     /// The next autoscroll is a jump's and glides: a range selected from outside
     /// ([`Editor::select_range`]), ⌘↑ / ⌘↓, Page Up / Page Down. Input clears it: what typing and
     /// the caret scroll happens at once.
@@ -318,8 +321,20 @@ pub struct Editor {
     pub(crate) soft_wrap: Option<bool>,
     /// The scrollbar's own state: when the thumb last showed, a drag in progress (part 10.5).
     pub(crate) scrollbar: crate::scrollbar::ScrollbarState,
+    /// What another program changed in the file (a reload), and when: tinted a moment, then the
+    /// tint fades ([`motion::FADE`]). Gone with the next edit.
+    pub(crate) reload_tint: Option<(std::ops::Range<usize>, Instant)>,
+    /// ⌃⌥W: where the caret's row was on screen (pixels from the top of the view), to keep it there
+    /// once the rows change; `None` — the line at the top stays instead.
+    pub(crate) rewrap_caret: Option<f32>,
+    /// When soft wraps were last turned on or off by hand: the rewrapped text fades in
+    /// ([`motion::FADE`]).
+    pub(crate) rewrapped: Option<Instant>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// How long the tint of a reloaded change holds before it fades.
+const RELOAD_TINT_HOLD: Duration = Duration::from_millis(700);
 
 /// Document status for the window's status bar: position, cursors, language, line endings, and a
 /// message (I/O error, etc.).
@@ -331,6 +346,19 @@ pub(crate) struct StatusInfo {
     pub cursors: usize,
     pub language: String,
     pub line_ending: &'static str,
+}
+
+/// Where a position of the text before a reload is after it, `range` (of the old text) replaced
+/// by `inserted` characters: before the change it stays, after it (or where text was only
+/// inserted) it moves along, inside it keeps its offset within what is there now.
+fn reloaded_position(pos: usize, range: &std::ops::Range<usize>, inserted: usize) -> usize {
+    if pos >= range.end {
+        pos - range.end + range.start + inserted
+    } else if pos <= range.start {
+        pos
+    } else {
+        pos.min(range.start + inserted)
+    }
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -395,6 +423,7 @@ impl Editor {
             scroll: point(0., 0.),
             autoscroll: Some(Autoscroll::Fit),
             glide: None,
+            glide_x: None,
             glide_next: false,
             marked_range: None,
             layout: None,
@@ -424,6 +453,9 @@ impl Editor {
             wrap: Default::default(),
             soft_wrap: None,
             scrollbar: Default::default(),
+            reload_tint: None,
+            rewrap_caret: None,
+            rewrapped: None,
             _subscriptions: subscriptions,
         };
         editor.wrap.reset(editor.document.text());
@@ -443,6 +475,13 @@ impl Editor {
         self.glide_next = false;
         cx.emit(EditorEvent::SelectionsChanged);
         cx.notify();
+    }
+
+    /// [`Editor::show_position`] as a jump: the view glides there from where it is — the project
+    /// search's preview moving between results in the same file.
+    pub fn glide_to_position(&mut self, position: usize, cx: &mut Context<Self>) {
+        self.show_position(position, cx);
+        self.glide_next = true;
     }
 
     fn set_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
@@ -504,6 +543,7 @@ impl Editor {
     /// The text changed: the highlighter shifts the tree and starts a parse; the matches are
     /// shifted until fresh results arrive; subscribers are notified of the edit.
     fn text_changed(&mut self, changes: &[TextChange], cx: &mut Context<Self>) {
+        self.reload_tint = None;
         self.wrap.edited(self.document.text(), changes);
         for change in changes {
             self.highlighter.edit(change);
@@ -575,13 +615,31 @@ impl Editor {
             && self.recorded_changes.is_none()
     }
 
-    /// ⌃⌥W: soft wraps on or off in this editor; the caret stays in view.
+    /// ⌃⌥W: soft wraps on or off in this editor. The caret's row stays where it is on screen while
+    /// the text rewraps around it (a caret out of sight leaves the line at the top where it is), and
+    /// the rewrapped text fades in.
     fn toggle_soft_wrap(&mut self, _: &ToggleSoftWrap, _: &mut Window, cx: &mut Context<Self>) {
         if !self.can_toggle_soft_wrap() {
             return;
         }
         self.soft_wrap = Some(!self.soft_wrap_wanted(cx));
-        self.autoscroll = Some(Autoscroll::Fit);
+        let text = self.document.text();
+        let head = self
+            .document
+            .selection()
+            .primary()
+            .head
+            .min(text.len_chars());
+        let on_screen = self.wrap.row_of(text, head) as f32 * theme::LINE_HEIGHT - self.scroll.y;
+        let height = self
+            .layout
+            .as_ref()
+            .map_or(0., |layout| f32::from(layout.text_bounds.size.height));
+        self.rewrap_caret = (0. ..height).contains(&on_screen).then_some(on_screen);
+        self.autoscroll = None;
+        self.glide = None;
+        self.glide_x = None;
+        self.rewrapped = motion::enabled().then(Instant::now);
         cx.notify();
     }
 
@@ -766,6 +824,12 @@ impl Editor {
         self.select_ranges(vec![range], 0, cx);
     }
 
+    /// The caret put at `position` by a click — the right button, ⌘-click: on the input path, so
+    /// the view only keeps it in sight, at once, as a left click does (no recentering glide).
+    pub(crate) fn click_caret(&mut self, position: usize, cx: &mut Context<Self>) {
+        self.set_selection(Selection::point(position), cx);
+    }
+
     /// Several selections at once (for example, all found matches); scrolls to `primary`.
     pub fn select_ranges(
         &mut self,
@@ -812,17 +876,29 @@ impl Editor {
     }
 
     /// This frame's step of a glide, taken before anything reads the scroll: the popups anchored to
-    /// the text are drawn where the text is. The element asks for the next frame.
-    fn advance_glide(&mut self) {
+    /// the text are drawn where the text is, and a host keeping two sides together (the diff
+    /// viewer, the merge tool) follows this frame's step, not the last one. The element asks for
+    /// the next frame.
+    pub(crate) fn advance_glide(&mut self) {
+        let now = Instant::now();
+        if let Some(glide) = self.glide_x {
+            // Something else scrolled (the wheel, the scrollbar, a host): it wins.
+            if glide.shown != self.scroll.x {
+                self.glide_x = None;
+            } else {
+                let (x, done) = glide.at(now);
+                self.scroll.x = x;
+                self.glide_x = (!done).then_some(Glide { shown: x, ..glide });
+            }
+        }
         let Some(glide) = self.glide else {
             return;
         };
         if glide.shown != self.scroll.y {
-            // Something else scrolled: the wheel, the scrollbar, a host. It wins.
             self.glide = None;
             return;
         }
-        let (y, done) = glide.at(Instant::now());
+        let (y, done) = glide.at(now);
         self.scroll.y = y;
         self.glide = (!done).then_some(Glide { shown: y, ..glide });
     }
@@ -1030,19 +1106,54 @@ impl Editor {
         let Some((range, text)) = crate::rename::difference(self.document.text(), &new) else {
             return false;
         };
-        // Neither the cursor nor the view jumps to the change: both stay where they were.
-        let selection = self.document.selection().clone();
-        let scroll = self.scroll;
-        self.replace_ranges(vec![(range, text)], cx);
+        // Neither the cursor nor the text on screen jumps to the change: lines added or removed
+        // above them move the caret and the view along, so the line at the top stays there.
+        let inserted = text.chars().count();
+        let old = self.document.text().clone();
+        let selection = self.document.selection().transform(|r| {
+            Range::new(
+                reloaded_position(r.anchor, &range, inserted),
+                reloaded_position(r.head, &range, inserted),
+            )
+            .with_goal_column(r.goal_column)
+        });
+        let mut top = crate::wrap::Anchor::of(&self.wrap, self.scroll.y);
+        let top_start = line_start(&old, top.line.min(old.len_lines() - 1));
+        let changed = range.start..range.start + inserted;
+        self.replace_ranges(vec![(range.clone(), text)], cx);
         self.document.set_selection(selection);
         self.document.mark_saved();
         // The text is the file's now, as after a save: servers that check on save (rust-analyzer's
         // `cargo check`) check it again — a file Claude fixed doesn't keep its old errors.
         crate::lsp::saved(self);
-        self.scroll = scroll;
+        let new = self.document.text();
+        top.line =
+            new.char_to_line(reloaded_position(top_start, &range, inserted).min(new.len_chars()));
+        self.scroll.y = top.offset(&self.wrap);
+        self.glide = None;
         self.autoscroll = None;
+        // What changed is tinted a moment, then fades: the eye finds what Claude wrote.
+        if inserted > 0 && motion::enabled() {
+            self.reload_tint = Some((changed, Instant::now()));
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(RELOAD_TINT_HOLD).await;
+                this.update(cx, |_, cx| cx.notify()).ok();
+            })
+            .detach();
+        }
         cx.notify();
         true
+    }
+
+    /// How opaque the tint of a reloaded change is now, 1 → 0: it holds, then fades
+    /// ([`motion::FADE`]), asking for frames only while it fades; `None` once it has.
+    pub(crate) fn reload_tint_alpha(since: Instant, window: &Window) -> Option<f32> {
+        let start = since + RELOAD_TINT_HOLD;
+        if Instant::now() < start {
+            return Some(1.);
+        }
+        let faded = motion::animate(start, motion::FADE, window);
+        (faded < 1.).then_some(1. - faded)
     }
 
     /// A status bar message, until the next edit or cursor movement.
@@ -1106,6 +1217,7 @@ impl Editor {
         window.focus(&self.focus_handle);
         // A click stops a glide where it is: the view under the mouse is the one clicked.
         self.glide = None;
+        self.glide_x = None;
         if crate::navigation::cmd_click(self, event, window, cx)
             || crate::git_gutter::mouse_down(self, event, window, cx)
             || crate::blame::mouse_down(self, event, window, cx)
@@ -1168,6 +1280,7 @@ impl Editor {
         self.autoscroll = None;
         // The wheel takes over from a glide, from where the view is.
         self.glide = None;
+        self.glide_x = None;
         cx.notify();
     }
 

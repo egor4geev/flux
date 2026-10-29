@@ -285,7 +285,7 @@ pub fn secondary_click(
         });
     window.focus(&editor.focus_handle);
     if !in_selection {
-        editor.select_range(position..position, cx);
+        editor.click_caret(position, cx);
     }
     open(editor, event.position, window, cx);
 }

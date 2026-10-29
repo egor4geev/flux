@@ -11,7 +11,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, MouseButton,
@@ -23,6 +23,7 @@ use resvg::{tiny_skia, usvg};
 
 use crate::i18n::{tr, trf};
 use crate::icons::IconName;
+use crate::motion;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 
@@ -163,6 +164,32 @@ struct Pan {
     offset: Point<Pixels>,
 }
 
+/// A zoom step on its way (⌘= / ⌘−, 1:1, Fit — keys, buttons, the menu): the scale glides from
+/// `from` to `to` ([`motion::SMOOTH`]), the point of the picture in the middle of the view staying
+/// there. The wheel and the trackpad zoom by hand, at once: they don't glide.
+struct ZoomGlide {
+    from: f32,
+    to: f32,
+    /// The zoom once the glide has ended (Fit stays Fit as the tab is resized).
+    target: Zoom,
+    since: Instant,
+    /// The point in the middle of the view, as [`ImageView::middle`] has it.
+    middle: (f32, f32),
+}
+
+impl ZoomGlide {
+    /// The scale now, and whether the glide has ended (at once with animations off). The scale
+    /// moves evenly in ratio: each part of the way looks as large as the last.
+    fn at(&self) -> (f32, bool) {
+        let (t, done) = motion::SMOOTH.at(self.since.elapsed());
+        if done {
+            (self.to, true)
+        } else {
+            (self.from * (self.to / self.from).powf(t), false)
+        }
+    }
+}
+
 pub struct ImageView {
     source: ImageSource,
     title: SharedString,
@@ -180,6 +207,12 @@ pub struct ImageView {
     modified: Option<SystemTime>,
     /// The text of an SVG being edited in its tab, shown instead of the file's (live preview).
     text: Option<String>,
+    /// When the picture in sight came: it fades in ([`motion::FADE`]) — on its own after
+    /// "Loading…", over the picture it replaced after a reload. `None` once in place.
+    appeared: Option<Instant>,
+    /// The picture a reload replaced, fading out under the new one.
+    previous: Option<Arc<RenderImage>>,
+    glide: Option<ZoomGlide>,
     _loading: Option<Task<()>>,
 }
 
@@ -207,6 +240,9 @@ impl ImageView {
             format: "",
             modified: None,
             text: None,
+            appeared: None,
+            previous: None,
+            glide: None,
             _loading: None,
         };
         view.load(cx);
@@ -290,6 +326,11 @@ impl ImageView {
         if loaded.modified.is_some() {
             self.modified = loaded.modified;
         }
+        // Typing in an SVG's text redraws it at once: the path of input doesn't animate.
+        let previous = self.current_image();
+        let fade = self.text.is_none() && loaded.picture.is_ok() && motion::enabled();
+        self.appeared = fade.then(Instant::now);
+        self.previous = previous.filter(|_| fade);
         self.load = match loaded.picture {
             Ok(Decoded::Raster(image, width, height)) => Load::Ready(Picture::Raster {
                 image,
@@ -304,6 +345,17 @@ impl ImageView {
             Err(error) => Load::Failed(error),
         };
         cx.notify();
+    }
+
+    /// The picture drawn now: a raster one, or an SVG's drawing.
+    fn current_image(&self) -> Option<Arc<RenderImage>> {
+        match &self.load {
+            Load::Ready(Picture::Raster { image, .. }) => Some(image.clone()),
+            Load::Ready(Picture::Svg { raster, .. }) => {
+                raster.as_ref().map(|(_, image)| image.clone())
+            }
+            _ => None,
+        }
     }
 
     /// The picture's own size: pixels, or the SVG's units.
@@ -324,74 +376,153 @@ impl ImageView {
     fn scale(&self, viewport: Size<Pixels>) -> f32 {
         match self.zoom {
             Zoom::Scale(scale) => scale,
-            Zoom::Fit => {
-                let Some((width, height)) = self.natural_size() else {
-                    return 1.;
-                };
-                let room_w = (f32::from(viewport.width) - 2. * PADDING).max(1.);
-                let room_h = (f32::from(viewport.height) - 2. * PADDING).max(1.);
-                (room_w / width.max(1.))
-                    .min(room_h / height.max(1.))
-                    .min(1.)
-            }
+            Zoom::Fit => self.fit_scale(viewport),
         }
     }
 
-    fn set_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
+    /// The scale of Fit: the whole picture in the viewport, never larger than it is.
+    fn fit_scale(&self, viewport: Size<Pixels>) -> f32 {
+        let Some((width, height)) = self.natural_size() else {
+            return 1.;
+        };
+        let room_w = (f32::from(viewport.width) - 2. * PADDING).max(1.);
+        let room_h = (f32::from(viewport.height) - 2. * PADDING).max(1.);
+        (room_w / width.max(1.))
+            .min(room_h / height.max(1.))
+            .min(1.)
+    }
+
+    /// The zoom the toolbar shows: where a glide goes.
+    fn target_zoom(&self) -> Zoom {
+        self.glide.as_ref().map_or(self.zoom, |glide| glide.target)
+    }
+
+    /// The point in the middle of the view, shown at `scale`: the scroll's coordinates over it.
+    fn middle(&self, scale: f32) -> (f32, f32) {
         let viewport = self.viewport.get();
-        let old = self.scale(viewport);
-        let scale = scale.clamp(MIN_ZOOM, MAX_ZOOM);
-        // The point in the middle of the view stays in the middle.
         let offset = self.scroll.offset();
-        let half = point(viewport.width / 2., viewport.height / 2.);
-        let middle = point(
-            (f32::from(half.x) - f32::from(offset.x)) / old,
-            (f32::from(half.y) - f32::from(offset.y)) / old,
-        );
-        self.zoom = Zoom::Scale(scale);
+        (
+            (f32::from(viewport.width) / 2. - f32::from(offset.x)) / scale,
+            (f32::from(viewport.height) / 2. - f32::from(offset.y)) / scale,
+        )
+    }
+
+    /// Scrolls `middle` ([`Self::middle`]) back to the middle of the view at `scale`.
+    fn center(&self, middle: (f32, f32), scale: f32) {
+        let viewport = self.viewport.get();
         self.scroll.set_offset(point(
-            px(f32::from(half.x) - middle.x * scale).min(px(0.)),
-            px(f32::from(half.y) - middle.y * scale).min(px(0.)),
+            px(f32::from(viewport.width) / 2. - middle.0 * scale).min(px(0.)),
+            px(f32::from(viewport.height) / 2. - middle.1 * scale).min(px(0.)),
         ));
+    }
+
+    /// Zooms at once (the wheel, the trackpad): the point in the middle of the view stays there.
+    fn set_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
+        let old = self.scale(self.viewport.get());
+        let scale = scale.clamp(MIN_ZOOM, MAX_ZOOM);
+        let middle = self.middle(old);
+        self.zoom = Zoom::Scale(scale);
+        self.center(middle, scale);
         cx.notify();
     }
 
+    /// A zoom step of a key, a button or the menu: the picture glides to it ([`ZoomGlide`]).
+    fn zoom_to(&mut self, zoom: Zoom, cx: &mut Context<Self>) {
+        let viewport = self.viewport.get();
+        let from = self.scale(viewport);
+        let (to, zoom) = match zoom {
+            Zoom::Fit => (self.fit_scale(viewport), Zoom::Fit),
+            Zoom::Scale(scale) => {
+                let scale = scale.clamp(MIN_ZOOM, MAX_ZOOM);
+                (scale, Zoom::Scale(scale))
+            }
+        };
+        let glide = ZoomGlide {
+            from,
+            to,
+            target: zoom,
+            since: Instant::now(),
+            middle: self.middle(from),
+        };
+        let far = (to / from - 1.).abs() > 0.001;
+        self.glide = Some(glide);
+        if !far || !motion::enabled() {
+            self.settle_zoom();
+        }
+        cx.notify();
+    }
+
+    /// Moves a zoom glide on to this frame (asking for the next one while it runs).
+    fn advance_zoom(&mut self, window: &Window) {
+        let Some(glide) = &self.glide else {
+            return;
+        };
+        let (scale, done) = glide.at();
+        if done {
+            return self.settle_zoom();
+        }
+        self.zoom = Zoom::Scale(scale);
+        self.center(glide.middle, scale);
+        window.request_animation_frame();
+    }
+
+    /// Ends a zoom glide where it goes: the hand takes over (a drag, the wheel), or it is done.
+    fn settle_zoom(&mut self) {
+        let Some(glide) = self.glide.take() else {
+            return;
+        };
+        self.zoom = glide.target;
+        match glide.target {
+            Zoom::Fit => self.scroll.set_offset(Point::default()),
+            Zoom::Scale(scale) => self.center(glide.middle, scale),
+        }
+    }
+
+    /// The scale zoom steps count from: where a glide goes, so quick presses don't lag behind.
+    fn step_base(&self) -> f32 {
+        match &self.glide {
+            Some(glide) => glide.to,
+            None => self.scale(self.viewport.get()),
+        }
+    }
+
     fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
-        let scale = self.scale(self.viewport.get());
+        let scale = self.step_base();
         let next = STEPS
             .iter()
             .copied()
             .find(|step| *step > scale * 1.001)
             .unwrap_or(MAX_ZOOM);
-        self.set_scale(next, cx);
+        self.zoom_to(Zoom::Scale(next), cx);
     }
 
     fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
-        let scale = self.scale(self.viewport.get());
+        let scale = self.step_base();
         let next = STEPS
             .iter()
             .rev()
             .copied()
             .find(|step| *step < scale * 0.999)
             .unwrap_or(MIN_ZOOM);
-        self.set_scale(next, cx);
+        self.zoom_to(Zoom::Scale(next), cx);
     }
 
     fn actual_size(&mut self, _: &ActualSize, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_scale(1., cx);
+        self.zoom_to(Zoom::Scale(1.), cx);
     }
 
     fn fit_to_window(&mut self, _: &FitToWindow, _: &mut Window, cx: &mut Context<Self>) {
-        self.zoom = Zoom::Fit;
-        self.scroll.set_offset(Point::default());
-        cx.notify();
+        self.zoom_to(Zoom::Fit, cx);
     }
 
-    /// ⌘ with the wheel or the trackpad zooms; otherwise the wheel scrolls.
+    /// ⌘ with the wheel or the trackpad zooms; otherwise the wheel scrolls. Either is the hand:
+    /// a zoom glide stops where it is (⌘ — zooming on from there) or ends at its step.
     fn on_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !event.modifiers.platform {
+            self.settle_zoom();
             return;
         }
+        self.glide = None;
         let delta = event.delta.pixel_delta(px(20.));
         let step = f32::from(delta.y).clamp(-60., 60.);
         if step == 0. {
@@ -410,6 +541,7 @@ impl ImageView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        self.settle_zoom();
         self.pan = Some(Pan {
             start: event.position,
             offset: self.scroll.offset(),
@@ -488,7 +620,8 @@ impl ImageView {
     }
 
     fn render_toolbar(&self, scale: f32, ui: UiColors, cx: &mut Context<Self>) -> impl IntoElement {
-        let fit = self.zoom == Zoom::Fit;
+        let zoom = self.target_zoom();
+        let fit = zoom == Zoom::Fit;
         let percent = format!("{}%", (scale * 100.).round());
         let mut details: Vec<String> = Vec::new();
         if let Some((width, height)) = self.natural_size() {
@@ -536,15 +669,13 @@ impl ImageView {
                     .flex()
                     .items_center()
                     .rounded(px(ui::RADIUS_SM))
-                    .text_color(if self.zoom == Zoom::Scale(1.) {
+                    .text_color(if zoom == Zoom::Scale(1.) {
                         ui.accent_text
                     } else {
                         ui.text_muted
                     })
-                    .when(self.zoom == Zoom::Scale(1.), |button| {
-                        button.bg(ui.accent_soft)
-                    })
-                    .when(self.zoom != Zoom::Scale(1.), |button| {
+                    .when(zoom == Zoom::Scale(1.), |button| button.bg(ui.accent_soft))
+                    .when(zoom != Zoom::Scale(1.), |button| {
                         button.hover(move |style| style.bg(ui.hover))
                     })
                     .cursor_pointer()
@@ -564,11 +695,14 @@ impl ImageView {
                         cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx)),
                     ),
             )
+            // On one line whatever the interface's scale: "200%" mustn't wrap onto the details.
             .child(
                 div()
+                    .flex_none()
                     .min_w(px(44.))
                     .flex()
                     .justify_center()
+                    .whitespace_nowrap()
                     .text_color(ui.text_muted)
                     .child(percent),
             )
@@ -670,8 +804,18 @@ impl Focusable for ImageView {
 impl Render for ImageView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
+        self.advance_zoom(window);
         let viewport = self.viewport.get();
         let scale = self.scale(viewport);
+        // A picture that came fades in: on its own, or over the one a reload replaced.
+        let appear = self
+            .appeared
+            .map_or(1., |since| motion::animate(since, motion::FADE, window));
+        if appear >= 1. {
+            self.appeared = None;
+            self.previous = None;
+        }
+        let previous = self.previous.clone();
         let body = match &self.load {
             Load::Loading => message(tr("Loading…").to_string(), ui).into_any_element(),
             Load::Failed(error) => {
@@ -684,7 +828,12 @@ impl Render for ImageView {
                 let image = match &self.load {
                     Load::Ready(Picture::Raster { image, .. }) => Some(image.clone()),
                     _ => {
-                        let device = (scale * window.scale_factor())
+                        // While a zoom glides, the SVG is drawn once, for the larger end.
+                        let sharp = self
+                            .glide
+                            .as_ref()
+                            .map_or(scale, |glide| glide.from.max(glide.to));
+                        let device = (sharp * window.scale_factor())
                             .min(MAX_RASTER / width.max(height).max(1.));
                         self.svg_image(device, cx)
                     }
@@ -695,17 +844,27 @@ impl Render for ImageView {
                 );
                 let large = f32::from(shown.width) + 2. * PADDING > f32::from(viewport.width)
                     || f32::from(shown.height) + 2. * PADDING > f32::from(viewport.height);
+                let crossfade = previous.is_some();
                 let picture = div()
                     .relative()
                     .flex_none()
                     .w(shown.width)
                     .h(shown.height)
+                    .when(appear < 1. && !crossfade, |picture| picture.opacity(appear))
                     .child(checkerboard(ui).absolute().size_full())
+                    .children(previous.map(|image| {
+                        img(gpui::ImageSource::Render(image))
+                            .absolute()
+                            .size_full()
+                            .object_fit(ObjectFit::Fill)
+                            .opacity(1. - appear)
+                    }))
                     .children(image.map(|image| {
                         img(gpui::ImageSource::Render(image))
                             .absolute()
                             .size_full()
                             .object_fit(ObjectFit::Fill)
+                            .when(crossfade, |image| image.opacity(appear))
                     }));
                 div()
                     .id("image-scroll")

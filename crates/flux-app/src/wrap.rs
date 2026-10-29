@@ -815,18 +815,23 @@ pub fn update(
         .primary()
         .head
         .min(text.len_chars());
-    let focus = match editor.autoscroll {
-        Some(_) => {
-            let line = text.char_to_line(head);
-            line.saturating_sub(visible_rows)..line + visible_rows
-        }
-        None => top_line..top_line + visible_rows + 1,
+    // ⌃⌥W: the caret's row stays where it was on screen.
+    let rewrap_caret = editor.rewrap_caret.take();
+    let focus = if editor.autoscroll.is_some() || rewrap_caret.is_some() {
+        let line = text.char_to_line(head);
+        line.saturating_sub(visible_rows)..line + visible_rows
+    } else {
+        top_line..top_line + visible_rows + 1
     };
     let changed = editor
         .wrap
         .layout(&text, params, focus, text_system, font, font_size)
         || was != wanted;
-    if changed && editor.autoscroll.is_none() {
+    if let Some(on_screen) = rewrap_caret.filter(|_| changed && editor.autoscroll.is_none()) {
+        let row_top = editor.wrap.row_of(&text, head) as f32 * theme::LINE_HEIGHT;
+        editor.scroll.y = (row_top - on_screen).max(0.);
+        editor.glide = None;
+    } else if changed && editor.autoscroll.is_none() {
         editor.scroll.y = top.offset(&editor.wrap);
         if let Some((glide, from, to)) = glide {
             editor.glide = Some(crate::editor::Glide {
@@ -840,15 +845,16 @@ pub fn update(
 }
 
 /// A scroll offset as a place in the text — a line, a row of it, the pixels into that row — to put
-/// it back on the same line once the rows change.
-struct Anchor {
-    line: usize,
+/// it back on the same line once the rows change (or once the line moved: a reload keeps the line
+/// at the top of the view where it is).
+pub(crate) struct Anchor {
+    pub(crate) line: usize,
     into: usize,
     fraction: f32,
 }
 
 impl Anchor {
-    fn of(wrap: &WrapMap, offset: f32) -> Self {
+    pub(crate) fn of(wrap: &WrapMap, offset: f32) -> Self {
         let lh = theme::LINE_HEIGHT;
         let offset = offset.max(0.);
         let row = (offset / lh).floor() as usize;
@@ -860,7 +866,7 @@ impl Anchor {
         }
     }
 
-    fn offset(&self, wrap: &WrapMap) -> f32 {
+    pub(crate) fn offset(&self, wrap: &WrapMap) -> f32 {
         let rows = wrap.line_rows(self.line);
         let row = wrap.line_to_row(self.line) + self.into.min(rows - 1);
         row as f32 * theme::LINE_HEIGHT + self.fraction
