@@ -10,6 +10,7 @@ name = "flux-release"
 path = "src/bin/flux-release.rs"
 
 [dependencies]
+flux-platform.workspace = true
 # Ed25519 signatures of the update archives and their SHA-256 (ring is in Flux's tree already,
 # through rustls).
 ring = "0.17.14"

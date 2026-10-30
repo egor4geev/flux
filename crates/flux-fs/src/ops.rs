@@ -134,6 +134,7 @@ pub fn copy_into(path: &Path, dir: &Path) -> io::Result<PathBuf> {
 /// controlling Finder and no sound (but "Put Back" in Finder may be unavailable; the file can be
 /// dragged out of the Trash with the mouse). A symlink itself is trashed, not what it points to.
 pub fn trash(paths: &[PathBuf]) -> io::Result<()> {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut context = trash::TrashContext::default();
     #[cfg(target_os = "macos")]
     {

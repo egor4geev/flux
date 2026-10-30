@@ -1,3 +1,7 @@
+// Windows: a windowed app — no console window comes up with it. Debug builds keep theirs: the log
+// echoes there.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app_log;
 mod app_menu;
 mod appearance_settings;

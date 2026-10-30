@@ -34,7 +34,6 @@ use std::cell::RefCell;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
-use std::os::fd::AsRawFd as _;
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -294,10 +293,8 @@ fn default_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FLUX_LOG_DIR").filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir);
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Library/Logs/Flux")
+    flux_platform::paths::logs_dir()
+        .unwrap_or_else(|| flux_platform::paths::logs_dir_in(&std::env::temp_dir()))
 }
 
 impl Sink {
@@ -305,12 +302,11 @@ impl Sink {
     /// `flux-<pid>.log`; stderr that goes nowhere goes into it.
     fn open(dir: &Path) -> io::Result<Sink> {
         let mut sink = Sink::open_in(dir)?;
-        if stderr_goes_nowhere() {
-            // SAFETY: both descriptors are open; dup2 replaces fd 2 atomically.
-            if unsafe { libc::dup2(lock(&sink.file).as_raw_fd(), libc::STDERR_FILENO) } >= 0 {
-                sink.stderr = true;
-                sink.echo = false;
-            }
+        if flux_platform::process::stderr_unread()
+            && flux_platform::process::redirect_stderr(&lock(&sink.file))
+        {
+            sink.stderr = true;
+            sink.echo = false;
         }
         Ok(sink)
     }
@@ -324,8 +320,8 @@ impl Sink {
             .create(true)
             .truncate(false)
             .open(dir.join(LOCK))?;
-        // SAFETY: flock on a descriptor this function owns; LOCK_NB — it doesn't wait.
-        let owner = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        // An exclusive lock that doesn't wait (`flock`, `LockFileEx`).
+        let owner = lock.try_lock().is_ok();
         let (stem, keep) = if owner {
             rotate(dir, MAIN_STEM, KEEP_LOGS);
             (MAIN_STEM.to_string(), KEEP_LOGS)
@@ -363,8 +359,7 @@ impl Sink {
             return false;
         };
         if self.stderr {
-            // SAFETY: as in `open`.
-            unsafe { libc::dup2(next.as_raw_fd(), libc::STDERR_FILENO) };
+            flux_platform::process::redirect_stderr(&next);
         }
         *file = next;
         let line = header_line(
@@ -442,28 +437,7 @@ fn second_log_pid(name: &str) -> Option<u32> {
 }
 
 fn process_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 only checks that the process exists.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-    // EPERM: it does, someone else's.
-    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Nobody reads stderr: it's closed or `/dev/null` (Finder, the Dock and `open` start apps so).
-fn stderr_goes_nowhere() -> bool {
-    // SAFETY: fstat and stat write only into the zeroed structs, which outlive the calls.
-    unsafe {
-        let mut stderr: libc::stat = std::mem::zeroed();
-        if libc::fstat(libc::STDERR_FILENO, &mut stderr) != 0 {
-            return true;
-        }
-        let mut null: libc::stat = std::mem::zeroed();
-        if libc::stat(c"/dev/null".as_ptr(), &mut null) != 0 {
-            return false;
-        }
-        (stderr.st_mode & libc::S_IFMT) == libc::S_IFCHR && stderr.st_rdev == null.st_rdev
-    }
+    flux_platform::process::alive(pid)
 }
 
 /// Every few seconds: a log past [`MAX_LOG_BYTES`] moves on to a new file.
@@ -667,19 +641,16 @@ fn is_flux(target: &str) -> bool {
 /// Local time of `at`: (year, month, day, hour, minute, second, millisecond).
 fn local(at: SystemTime) -> (i64, u32, u32, u32, u32, u32, u32) {
     let since = at.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let seconds = since.as_secs() as libc::time_t;
-    // SAFETY: `localtime_r` writes only into `tm`, which outlives the call.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() {
-        return (1970, 1, 1, 0, 0, 0, 0);
-    }
+    let seconds = since.as_secs() as i64;
+    let local = seconds + i64::from(flux_platform::time::local_utc_offset(seconds));
+    let (year, month, day, hour, minute, second) = flux_platform::time::civil(local);
     (
-        tm.tm_year as i64 + 1900,
-        tm.tm_mon as u32 + 1,
-        tm.tm_mday as u32,
-        tm.tm_hour as u32,
-        tm.tm_min as u32,
-        tm.tm_sec as u32,
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
         since.subsec_millis(),
     )
 }

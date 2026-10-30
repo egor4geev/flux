@@ -42,9 +42,9 @@ pub fn detached() -> Vec<Leftover> {
 }
 
 /// Asks the processes to end (SIGTERM), skipping a pid that now belongs to another process.
+#[cfg(target_os = "macos")]
 pub fn terminate(leftovers: &[Leftover]) {
     for leftover in leftovers {
-        #[cfg(target_os = "macos")]
         if info(leftover.pid).is_none_or(|(now, _)| now.started != leftover.started) {
             continue;
         }
@@ -54,6 +54,10 @@ pub fn terminate(leftovers: &[Leftover]) {
         }
     }
 }
+
+/// Elsewhere none are found ([`detached`]).
+#[cfg(not(target_os = "macos"))]
+pub fn terminate(_leftovers: &[Leftover]) {}
 
 /// The process names, for a dialog.
 pub fn names(leftovers: &[Leftover]) -> Vec<String> {

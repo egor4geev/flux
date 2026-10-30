@@ -1,0 +1,20 @@
+[package]
+name = "flux-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# What differs between the systems Flux runs on (part 10.9): where its files live, how it starts
+# other programs, the local time. Every crate may use it.
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }

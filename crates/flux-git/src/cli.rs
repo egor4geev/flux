@@ -379,6 +379,7 @@ fn collect(
 
 /// The child starts its own session: without a controlling terminal, ssh and credential helpers
 /// fail instead of prompting on the terminal Flux was started from.
+#[cfg(unix)]
 fn new_session(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: `setsid` is async-signal-safe; nothing else runs between fork and exec.
@@ -388,6 +389,13 @@ fn new_session(command: &mut Command) {
             Ok(())
         });
     }
+}
+
+/// Windows has no controlling terminals; the child only must not open a console window.
+#[cfg(windows)]
+fn new_session(command: &mut Command) {
+    use flux_platform::process::Background;
+    command.background();
 }
 
 #[cfg(test)]

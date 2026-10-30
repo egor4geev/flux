@@ -3,16 +3,24 @@
 //! macOS asks the kernel through libproc; Linux reads `/proc`. Everything here is a few syscalls,
 //! cheap enough to call after each burst of output.
 
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
 /// The process group in the foreground of the PTY (its leader's pid): the shell while it waits for a
 /// command, the command while it runs. An interactive shell puts every command into a group of its
 /// own (job control); a non-interactive `sh -c` doesn't, so its children never show up here.
+#[cfg(unix)]
 pub(crate) fn foreground_pid(pty: RawFd) -> Option<u32> {
     // SAFETY: `tcgetpgrp` only reads the terminal's state; an invalid descriptor makes it fail.
     let pgid = unsafe { libc::tcgetpgrp(pty) };
     u32::try_from(pgid).ok().filter(|&pgid| pgid > 0)
+}
+
+/// A Windows console has no foreground process group: the shell stands for whatever runs in it.
+#[cfg(windows)]
+pub(crate) fn foreground_pid(shell: u32) -> Option<u32> {
+    (shell > 0).then_some(shell)
 }
 
 /// The process name ("zsh", "cargo").
@@ -124,6 +132,7 @@ mod tests {
         assert_eq!(cwd(u32::MAX / 2), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_descriptor_that_is_not_a_terminal_has_no_foreground() {
         assert_eq!(foreground_pid(-1), None);

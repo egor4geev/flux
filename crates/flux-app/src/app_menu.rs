@@ -35,8 +35,10 @@ actions!(
 );
 
 /// The Window menu's place in the menu bar: after the application menu.
+#[cfg(target_os = "macos")]
 const WINDOW_MENU: usize = 1;
 /// The Help menu's place: the last one, after Window.
+#[cfg(target_os = "macos")]
 const HELP_MENU: usize = 2;
 
 pub fn init(cx: &mut App) {

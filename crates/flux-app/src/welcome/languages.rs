@@ -672,9 +672,13 @@ fn found_on_this_mac(dirs: &[PathBuf], is_program: impl Fn(&Path) -> bool) -> Ha
     TOOLCHAINS
         .iter()
         .filter(|(_, programs)| {
-            programs
-                .iter()
-                .any(|program| dirs.iter().any(|dir| is_program(&dir.join(program))))
+            programs.iter().any(|program| {
+                dirs.iter().any(|dir| {
+                    flux_platform::process::program_files(dir, program)
+                        .iter()
+                        .any(|file| is_program(file))
+                })
+            })
         })
         .map(|(plugin, _)| plugin.to_string())
         .collect()
@@ -695,9 +699,7 @@ fn preselected(found: &HashSet<String>) -> BTreeSet<String> {
 
 /// An executable file (a link to one counts: Homebrew's programs are links).
 fn is_program(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    flux_platform::process::is_executable(path)
 }
 
 #[cfg(test)]
@@ -727,6 +729,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn toolchains_found_on_disk_choose_their_languages() {
         let root = std::env::temp_dir().join(format!("flux-welcome-langs-{}", std::process::id()));

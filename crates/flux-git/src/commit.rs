@@ -207,11 +207,34 @@ fn committed(repo: &Repo, request: &CommitRequest) -> Result<CommitResult, GitEr
 }
 
 /// The mode of a file for the index: executable bits survive a partial commit.
+#[cfg(unix)]
 fn file_mode(repo: &Repo, path: &str) -> &'static str {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::symlink_metadata(repo.absolute(path)) {
         Ok(meta) if meta.file_type().is_symlink() => "120000",
         Ok(meta) if meta.permissions().mode() & 0o111 != 0 => "100755",
+        _ => "100644",
+    }
+}
+
+/// Windows files have no executable bit (git keeps `core.fileMode` off there): the mode the index
+/// already has for the file survives, a new file is a plain one.
+#[cfg(not(unix))]
+fn file_mode(repo: &Repo, path: &str) -> &'static str {
+    if std::fs::symlink_metadata(repo.absolute(path))
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return "120000";
+    }
+    let staged = repo
+        .git()
+        .read_only()
+        .args(["ls-files", "--stage", "--", path])
+        .output_string()
+        .unwrap_or_default();
+    match staged.split_whitespace().next() {
+        Some("100755") => "100755",
+        Some("120000") => "120000",
         _ => "100644",
     }
 }

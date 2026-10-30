@@ -8,6 +8,7 @@
 //! process group (what the command started in the background too).
 
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -22,6 +23,7 @@ use futures::channel::mpsc;
 /// background may keep the pipes open.
 const DRAIN: Duration = Duration::from_secs(2);
 /// After SIGTERM, how long a stopped command has before SIGKILL.
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(2);
 /// What Claude gets of each stream at most (the CLI's own limit for a command's output); a longer
 /// one keeps its beginning and its end around a marker.
@@ -50,6 +52,7 @@ pub struct ShellCommand {
 impl ShellCommand {
     /// Ends the command and everything it started: SIGTERM to its group, SIGKILL if it's still
     /// there after a grace period.
+    #[cfg(unix)]
     pub fn stop(&self) {
         if self.ended.load(Ordering::SeqCst) || self.group <= 0 {
             return;
@@ -66,11 +69,28 @@ impl ShellCommand {
             });
     }
 
+    /// Windows has no signals to ask with: the command's whole process tree ends at once.
+    #[cfg(windows)]
+    pub fn stop(&self) {
+        use flux_platform::process::Background;
+        if self.ended.load(Ordering::SeqCst) || self.group <= 0 {
+            return;
+        }
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &self.group.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .background()
+            .status();
+    }
+
     pub fn pid(&self) -> u32 {
         self.group as u32
     }
 }
 
+#[cfg(unix)]
 fn signal(group: i32, signal: libc::c_int) {
     // SAFETY: `kill` only sends a signal; a negative pid is the process group of a command this
     // runner started (a group of its own) and hasn't reaped yet.
@@ -80,11 +100,53 @@ fn signal(group: i32, signal: libc::c_int) {
 }
 
 /// The user's shell: `$SHELL` when it's a path, otherwise zsh (the macOS default).
+#[cfg(unix)]
 pub fn user_shell() -> String {
     std::env::var("SHELL")
         .ok()
         .filter(|shell| shell.starts_with('/'))
         .unwrap_or_else(|| "/bin/zsh".into())
+}
+
+/// Windows: the Git Bash the Claude CLI itself runs commands in (`CLAUDE_CODE_GIT_BASH_PATH`, else
+/// Git's own folder), so `!` commands read as in Claude's bash mode; without Git — PowerShell.
+#[cfg(windows)]
+pub fn user_shell() -> String {
+    let git_bash = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("ProgramFiles")
+                .map(|dir| Path::new(&dir).join("Git").join("bin").join("bash.exe"))
+        })
+        .filter(|bash| bash.is_file());
+    match git_bash {
+        Some(bash) => bash.to_string_lossy().into_owned(),
+        None => "powershell.exe".into(),
+    }
+}
+
+/// How a shell takes a command line: `-c` for the POSIX shells (and Git Bash), `-Command` for
+/// PowerShell, `/C` for `cmd`.
+fn command_args(shell: &str, command: &str, login: bool) -> Vec<String> {
+    let name = Path::new(shell)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "pwsh" | "powershell" => [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ]
+        .map(String::from)
+        .to_vec(),
+        "cmd" => ["/D", "/S", "/C", command].map(String::from).to_vec(),
+        _ if login => ["-l", "-c", command].map(String::from).to_vec(),
+        _ => ["-c", command].map(String::from).to_vec(),
+    }
 }
 
 /// Runs `command` with `shell -c` in `cwd`. `env` — the whole environment (the login shell's, so
@@ -97,17 +159,16 @@ pub fn spawn(
     env: Option<&[(String, String)]>,
 ) -> io::Result<(ShellCommand, mpsc::UnboundedReceiver<ShellEvent>)> {
     let mut process = Command::new(shell);
-    if env.is_none() {
-        process.arg("-l");
-    }
     process
-        .arg("-c")
-        .arg(command)
+        .args(command_args(shell, command, env.is_none()))
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    process.process_group(0);
+    #[cfg(windows)]
+    flux_platform::process::Background::background(&mut process);
     if let Some(env) = env {
         process
             .env_clear()

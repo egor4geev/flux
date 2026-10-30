@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+flux-platform.workspace = true
 # The plugin's stdout and stderr: the stream types of `wasmtime-wasi` (already in its tree).
 bytes = "1"
 flux-search.workspace = true
@@ -59,3 +60,7 @@ wasmtime-wasi = { version = "48.0.5", default-features = false, features = ["p2"
 # once, and removed with their plugin (the crate is in the tree already, through rustls).
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3", default-features = false }
+
+# Windows (part 10.9): DPAPI seals the secrets' key.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
