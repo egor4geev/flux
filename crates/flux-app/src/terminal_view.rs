@@ -7,7 +7,9 @@
 //!
 //! Keys: a bound action wins (⌘C, ⌘V, ⌘F, ⌘W, the window's shortcuts); other keys that aren't
 //! text are encoded by [`flux_term::keys`] in `on_key_down`; text, including what Option types and
-//! IME compositions, arrives through the input handler and is written as UTF-8.
+//! IME compositions, arrives through the input handler and is written as UTF-8. On Windows Ctrl and
+//! a letter go to the program over the window's keys ([`program_keys`]), Ctrl+C copies a selection
+//! ([`copies_selection`]) and Ctrl+V pastes, as in the system's terminal.
 //!
 //! The mouse: when the program asked for mouse reports (vim with `mouse=a`, htop) presses, drags,
 //! and the wheel go to it ([`flux_term::mouse`]); ⇧ keeps the mouse for selection. Otherwise a drag
@@ -31,13 +33,16 @@ use futures::StreamExt;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, DismissEvent, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent,
-    SharedString, Subscription, Task, UTF16Selection, Window, actions, div, prelude::*, px,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NoAction, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection, Window, actions, div,
+    prelude::*, px,
 };
 
 use crate::context_menu::ContextMenu;
+use crate::find_bar;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon};
+use crate::keymap::KeyOs;
 use crate::terminal_element::{TerminalElement, TerminalLayout};
 use crate::theme::{self, Theme};
 use crate::ui;
@@ -58,16 +63,52 @@ actions!(
 
 pub fn init(cx: &mut App) {
     let context = Some("Terminal");
-    cx.bind_keys([
-        KeyBinding::new("cmd-c", Copy, context),
-        KeyBinding::new("cmd-v", Paste, context),
-        KeyBinding::new("cmd-a", SelectAll, context),
-        KeyBinding::new("cmd-k", Clear, context),
-        KeyBinding::new("shift-pageup", ScrollPageUp, context),
-        KeyBinding::new("shift-pagedown", ScrollPageDown, context),
-        KeyBinding::new("cmd-home", ScrollToTop, context),
-        KeyBinding::new("cmd-end", ScrollToBottom, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-c", Copy, context),
+            KeyBinding::new("cmd-v", Paste, context),
+            KeyBinding::new("cmd-a", SelectAll, context),
+            KeyBinding::new("cmd-k", Clear, context),
+            KeyBinding::new("shift-pageup", ScrollPageUp, context),
+            KeyBinding::new("shift-pagedown", ScrollPageDown, context),
+            KeyBinding::new("cmd-home", ScrollToTop, context),
+            KeyBinding::new("cmd-end", ScrollToBottom, context),
+        ],
+    );
+    // These are the system's keys already.
+    let os = KeyOs::current();
+    cx.bind_keys(
+        program_keys(os)
+            .iter()
+            .map(|keys| KeyBinding::new(keys, NoAction, context)),
+    );
+    if os == KeyOs::Windows {
+        cx.bind_keys([KeyBinding::new("ctrl-shift-f", find_bar::Deploy, context)]);
+    }
+}
+
+/// The keys the terminal leaves to its program over the window's bindings. On Windows Ctrl and a
+/// letter, as ⌃ on macOS: the window's Ctrl+K (commit), Ctrl+T (update), Ctrl+R (replace) are ^K,
+/// ^T, ^R here, as in the system's terminal — except Ctrl+V, which pastes; the terminal's find is
+/// Ctrl+Shift+F then. None on macOS: the window's keys are ⌘ there.
+fn program_keys(os: KeyOs) -> Vec<String> {
+    match os {
+        KeyOs::Mac => Vec::new(),
+        KeyOs::Windows => ('a'..='z')
+            .filter(|letter| *letter != 'v')
+            .map(|letter| format!("ctrl-{letter}"))
+            .collect(),
+    }
+}
+
+/// Whether `keystroke` copies the selection, when there is one, instead of going to the program:
+/// Ctrl+C on Windows, as in the system's terminal (without a selection it's ^C); on macOS ⌘C is
+/// bound to [`Copy`] and ⌃C is always the program's.
+fn copies_selection(os: KeyOs, keystroke: &gpui::Keystroke) -> bool {
+    os == KeyOs::Windows
+        && keystroke.key == "c"
+        && keystroke.modifiers == gpui::Modifiers::control()
 }
 
 /// How long the process name and directory may lag behind: they are re-read at most this often
@@ -413,6 +454,16 @@ impl TerminalView {
             return;
         }
         let keystroke = &event.keystroke;
+        if copies_selection(KeyOs::current(), keystroke)
+            && let Some(text) = self.terminal.selection_text()
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            // The selection goes, so the next Ctrl+C interrupts the program.
+            self.terminal.clear_selection();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let modifiers = key_modifiers(&keystroke.modifiers);
         if let Some(bytes) = keys::encode(&keystroke.key, modifiers, self.terminal.mode()) {
             self.terminal.input(bytes);
@@ -1123,5 +1174,45 @@ impl Render for TerminalView {
                 "terminal-menu",
                 self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
             ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keystroke(text: &str) -> gpui::Keystroke {
+        gpui::Keystroke::parse(text).unwrap()
+    }
+
+    /// Windows: Ctrl+C copies a selection; Ctrl+Shift+C is bound to Copy, ⌃C on macOS is the
+    /// program's.
+    #[test]
+    fn ctrl_c_copies_a_selection_on_windows_only() {
+        assert!(copies_selection(KeyOs::Windows, &keystroke("ctrl-c")));
+        assert!(!copies_selection(
+            KeyOs::Windows,
+            &keystroke("ctrl-shift-c")
+        ));
+        assert!(!copies_selection(KeyOs::Windows, &keystroke("ctrl-x")));
+        assert!(!copies_selection(KeyOs::Mac, &keystroke("ctrl-c")));
+    }
+
+    /// Windows: Ctrl and a letter go to the program over the window's keys, except Ctrl+V (paste).
+    #[test]
+    fn ctrl_letters_belong_to_the_program_on_windows() {
+        let keys = program_keys(KeyOs::Windows);
+        assert!(keys.contains(&"ctrl-c".to_string()));
+        assert!(keys.contains(&"ctrl-k".to_string()));
+        assert!(keys.contains(&"ctrl-w".to_string()));
+        assert!(!keys.contains(&"ctrl-v".to_string()));
+        assert_eq!(keys.len(), 25);
+        assert!(program_keys(KeyOs::Mac).is_empty());
+        let paste = crate::keymap::windows_keys("terminal::Paste", "cmd-v");
+        assert_eq!(paste, ["ctrl-v", "ctrl-shift-v"]);
+        assert_eq!(
+            crate::keymap::windows_keys("terminal::Copy", "cmd-c"),
+            ["ctrl-shift-c"]
+        );
     }
 }

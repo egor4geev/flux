@@ -90,15 +90,18 @@ actions!(
 
 pub fn init(cx: &mut App) {
     let context = Some("DiffView");
-    cx.bind_keys([
-        // As in the diff of JetBrains IDEs.
-        KeyBinding::new("f7", NextDifference, context),
-        KeyBinding::new("shift-f7", PreviousDifference, context),
-        KeyBinding::new("f4", JumpToSource, context),
-        // "Accept Left Side": the HEAD block replaces the working copy's.
-        KeyBinding::new("cmd-ctrl-right", RevertChange, context),
-        KeyBinding::new("cmd-enter", AcceptProposal, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            // As in the diff of JetBrains IDEs.
+            KeyBinding::new("f7", NextDifference, context),
+            KeyBinding::new("shift-f7", PreviousDifference, context),
+            KeyBinding::new("f4", JumpToSource, context),
+            // "Accept Left Side": the HEAD block replaces the working copy's.
+            KeyBinding::new("cmd-ctrl-right", RevertChange, context),
+            KeyBinding::new("cmd-enter", AcceptProposal, context),
+        ],
+    );
 }
 
 /// The toolbar above the sides, and the captions under it.

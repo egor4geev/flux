@@ -73,16 +73,19 @@ actions!(
 
 pub fn init(cx: &mut App) {
     let context = Some("MergeView");
-    cx.bind_keys([
-        // As in the merge window of JetBrains IDEs.
-        KeyBinding::new("f7", NextConflict, context),
-        KeyBinding::new("shift-f7", PreviousConflict, context),
-        // The same keys as "Accept Left Side" in the diff: the arrow points where the text goes.
-        KeyBinding::new("cmd-ctrl-right", AcceptLeftChange, context),
-        KeyBinding::new("cmd-ctrl-left", AcceptRightChange, context),
-        KeyBinding::new("cmd-enter", ApplyResult, context),
-        KeyBinding::new("f4", JumpToSource, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            // As in the merge window of JetBrains IDEs.
+            KeyBinding::new("f7", NextConflict, context),
+            KeyBinding::new("shift-f7", PreviousConflict, context),
+            // The same keys as "Accept Left Side" in the diff: the arrow points where the text goes.
+            KeyBinding::new("cmd-ctrl-right", AcceptLeftChange, context),
+            KeyBinding::new("cmd-ctrl-left", AcceptRightChange, context),
+            KeyBinding::new("cmd-enter", ApplyResult, context),
+            KeyBinding::new("f4", JumpToSource, context),
+        ],
+    );
 }
 
 /// The toolbar above the panes, the captions under it, the footer with the buttons.
@@ -1942,9 +1945,21 @@ impl MergeView {
                 ready && f32::from(window.viewport_size().width) >= HINTS_MIN_WINDOW,
                 |footer| {
                     footer.child(
-                        ui::hint_bar(&[("F7", tr("next conflict")), ("⌃⌘→", tr("accept"))], ui)
-                            .gap_3()
-                            .mr_2(),
+                        ui::hint_bar(
+                            &[
+                                ("F7", tr("next conflict")),
+                                (
+                                    &crate::keymap::shortcut(
+                                        "merge_tool::AcceptLeftChange",
+                                        "cmd-ctrl-right",
+                                    ),
+                                    tr("accept"),
+                                ),
+                            ],
+                            ui,
+                        )
+                        .gap_3()
+                        .mr_2(),
                     )
                 },
             )

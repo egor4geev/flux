@@ -19,8 +19,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Looking for repositories…", "Поиск репозиториев…"),
     ("No Git repository", "Нет репозитория Git"),
     (
-        "Open a folder with a repository: ⌘O",
-        "Откройте папку с репозиторием: ⌘O",
+        "Open a folder with a repository: {0}",
+        "Откройте папку с репозиторием: {0}",
     ),
     ("No changes", "Нет изменений"),
     (

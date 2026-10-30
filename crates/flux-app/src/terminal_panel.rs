@@ -46,14 +46,17 @@ actions!(terminal, [CloseTab, CloseOtherTabs]);
 
 pub fn init(cx: &mut App) {
     let workspace = Some("Workspace");
-    cx.bind_keys([
-        // As in JetBrains IDEs: ⌘T is a new terminal in a terminal; elsewhere it is Update Project
-        // (`git`).
-        KeyBinding::new("cmd-t", NewTerminal, Some("Terminal")),
-        // As the Terminal tool window in JetBrains IDEs.
-        KeyBinding::new("alt-f12", TogglePanel, workspace),
-        KeyBinding::new("shift-escape", HidePanel, Some("Terminal")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            // As in JetBrains IDEs: ⌘T is a new terminal in a terminal; elsewhere it is Update Project
+            // (`git`).
+            KeyBinding::new("cmd-t", NewTerminal, Some("Terminal")),
+            // As the Terminal tool window in JetBrains IDEs.
+            KeyBinding::new("alt-f12", TogglePanel, workspace),
+            KeyBinding::new("shift-escape", HidePanel, Some("Terminal")),
+        ],
+    );
 }
 
 /// The tab strip at the top of the panel, and its pills.

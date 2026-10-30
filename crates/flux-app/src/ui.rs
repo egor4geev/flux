@@ -15,6 +15,7 @@ use gpui::{
 
 use crate::command_palette::keystroke_label;
 use crate::icons::{IconName, icon};
+use crate::keymap::{self, KeyOs};
 use crate::motion::{self, TransitionExt};
 use crate::settings::{self, UiStyle};
 use crate::theme::{self, Theme, UiColors};
@@ -915,8 +916,11 @@ pub fn primary_button(
 }
 
 /// Shortcut keys: "⇧⌘F" → ⇧ ⌘ F, "⌘K ⌘S" → two groups. Modifiers get one key each; the rest of a
-/// group is a single key.
+/// group is a single key. A label written in macOS symbols reads the system's way on Windows
+/// ("Ctrl+Shift+F" → Ctrl Shift F, [`keymap::label`]).
 pub fn keys(label: &str, ui: UiColors) -> Div {
+    let os = KeyOs::current();
+    let label = keymap::label(os, label);
     div().flex().flex_none().items_center().gap_1p5().children(
         label
             .split(' ')
@@ -926,7 +930,7 @@ pub fn keys(label: &str, ui: UiColors) -> Div {
                     .flex()
                     .items_center()
                     .gap_0p5()
-                    .children(split_keys(group).into_iter().map(|key| keycap(key, ui)))
+                    .children(split_keys(os, group).into_iter().map(|key| keycap(key, ui)))
             }),
     )
 }
@@ -951,10 +955,24 @@ pub fn keycap(key: impl Into<SharedString>, ui: UiColors) -> Div {
         .child(key.into())
 }
 
-/// A keystroke group → keys: modifiers ⌃⌥⇧⌘ one by one, the remainder as a single key.
-fn split_keys(group: &str) -> Vec<String> {
+/// A keystroke group → keys: modifiers ⌃⌥⇧⌘ one by one, the remainder as a single key; on Windows
+/// the parts between `+` ("Ctrl+Shift+F"), a `+` key included ("Ctrl++").
+fn split_keys(os: KeyOs, group: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let mut rest = group;
+    if os == KeyOs::Windows {
+        while let Some((modifier, tail)) = rest.split_once('+') {
+            if tail.is_empty() || !["Ctrl", "Alt", "Shift", "Win", "Fn"].contains(&modifier) {
+                break;
+            }
+            keys.push(modifier.to_string());
+            rest = tail;
+        }
+        if !rest.is_empty() {
+            keys.push(rest.to_string());
+        }
+        return keys;
+    }
     while let Some(c) = rest.chars().next().filter(|c| "⌃⌥⇧⌘".contains(*c)) {
         keys.push(c.to_string());
         rest = &rest[c.len_utf8()..];
@@ -965,7 +983,7 @@ fn split_keys(group: &str) -> Vec<String> {
     keys
 }
 
-/// The shortcut of an action in macOS symbols ("⇧⌘P"), for tooltips and buttons: its first binding
+/// The shortcut of an action in the system's notation ("⇧⌘P", "Ctrl+Shift+P"), for tooltips and buttons: its first binding
 /// that works at the window's level, else its first binding in the key context it has (a panel's
 /// own keys). It doesn't depend on the focus: gpui's `Window::bindings_for_action` goes by the key
 /// contexts of whatever the last frame painted last — a dialog, a tooltip, a popup — and the labels
@@ -1014,7 +1032,7 @@ fn label_binding(keymap: &Keymap, action: &dyn Action) -> Option<KeyBinding> {
     first
 }
 
-/// A binding's keys in macOS symbols, a chord's keystrokes apart.
+/// A binding's keys in the system's notation ([`keystroke_label`]), a chord's keystrokes apart.
 pub fn shortcut_label(binding: &KeyBinding) -> SharedString {
     binding
         .keystrokes()
@@ -1139,10 +1157,18 @@ mod tests {
 
     #[test]
     fn shortcuts_split_into_keys() {
-        assert_eq!(split_keys("⇧⌘F"), ["⇧", "⌘", "F"]);
-        assert_eq!(split_keys("⌘PgUp"), ["⌘", "PgUp"]);
-        assert_eq!(split_keys("F2"), ["F2"]);
-        assert_eq!(split_keys("⌥⌘"), ["⌥", "⌘"]);
+        let mac = |group| split_keys(KeyOs::Mac, group);
+        assert_eq!(mac("⇧⌘F"), ["⇧", "⌘", "F"]);
+        assert_eq!(mac("⌘PgUp"), ["⌘", "PgUp"]);
+        assert_eq!(mac("F2"), ["F2"]);
+        assert_eq!(mac("⌥⌘"), ["⌥", "⌘"]);
+        let windows = |group| split_keys(KeyOs::Windows, group);
+        assert_eq!(windows("Ctrl+Shift+F"), ["Ctrl", "Shift", "F"]);
+        assert_eq!(windows("Ctrl+PgUp"), ["Ctrl", "PgUp"]);
+        assert_eq!(windows("F2"), ["F2"]);
+        assert_eq!(windows("Ctrl++"), ["Ctrl", "+"]);
+        assert_eq!(windows("Shift+↑↓"), ["Shift", "↑↓"]);
+        assert_eq!(windows("+"), ["+"]);
     }
 
     gpui::actions!(

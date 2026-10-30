@@ -2,8 +2,8 @@
 
 pub(super) const STRINGS: &[(&str, &str)] = &[
     (
-        "No project — open a folder with ⌘O",
-        "Нет проекта — откройте папку через ⌘O",
+        "No project — open a folder with {0}",
+        "Нет проекта — откройте папку через {0}",
     ),
     (
         "Deleted files with unsaved changes stay open — save to restore them",

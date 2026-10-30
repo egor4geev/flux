@@ -70,33 +70,42 @@ const LISTED_COMMITS: usize = 5;
 
 pub fn init(cx: &mut App) {
     let list = Some("RebaseList");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, list),
-        KeyBinding::new("up", SelectPrevious, list),
-        KeyBinding::new("shift-down", ExtendNext, list),
-        KeyBinding::new("shift-up", ExtendPrevious, list),
-        KeyBinding::new("p", Pick, list),
-        KeyBinding::new("e", Edit, list),
-        KeyBinding::new("r", Reword, list),
-        KeyBinding::new("s", Squash, list),
-        KeyBinding::new("f", Fixup, list),
-        KeyBinding::new("d", Drop, list),
-        KeyBinding::new("backspace", Drop, list),
-        KeyBinding::new("delete", Drop, list),
-        KeyBinding::new("alt-shift-up", MoveUp, list),
-        KeyBinding::new("alt-shift-down", MoveDown, list),
-        KeyBinding::new("tab", FocusMessage, list),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, list),
+            KeyBinding::new("up", SelectPrevious, list),
+            KeyBinding::new("shift-down", ExtendNext, list),
+            KeyBinding::new("shift-up", ExtendPrevious, list),
+            KeyBinding::new("p", Pick, list),
+            KeyBinding::new("e", Edit, list),
+            KeyBinding::new("r", Reword, list),
+            KeyBinding::new("s", Squash, list),
+            KeyBinding::new("f", Fixup, list),
+            KeyBinding::new("d", Drop, list),
+            KeyBinding::new("backspace", Drop, list),
+            KeyBinding::new("delete", Drop, list),
+            KeyBinding::new("alt-shift-up", MoveUp, list),
+            KeyBinding::new("alt-shift-down", MoveDown, list),
+            KeyBinding::new("tab", FocusMessage, list),
+        ],
+    );
     let dialog = Some("RebaseDialog");
-    cx.bind_keys([
-        KeyBinding::new("cmd-enter", Start, dialog),
-        KeyBinding::new("escape", Dismiss, dialog),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-enter", Start, dialog),
+            KeyBinding::new("escape", Dismiss, dialog),
+        ],
+    );
     let message = Some("CommitMessageDialog");
-    cx.bind_keys([
-        KeyBinding::new("cmd-enter", ConfirmMessage, message),
-        KeyBinding::new("escape", DismissMessage, message),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-enter", ConfirmMessage, message),
+            KeyBinding::new("escape", DismissMessage, message),
+        ],
+    );
 }
 
 /// The window-level actions: `InteractiveRebase`, `EditCommitMessage`, `MeldCommits`,
@@ -1287,7 +1296,7 @@ impl RebaseDialog {
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         window.focus(&this.list_focus);
                         let modifiers = event.modifiers();
-                        if modifiers.platform {
+                        if modifiers.secondary() {
                             this.toggle_selected(index, cx);
                         } else {
                             this.select(index, modifiers.shift, cx);

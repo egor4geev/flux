@@ -66,15 +66,18 @@ const READING_DELAY: Duration = Duration::from_millis(250);
 
 pub fn init(cx: &mut App) {
     let context = Some("CommitDetails");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-        KeyBinding::new("right", Expand, context),
-        KeyBinding::new("left", Collapse, context),
-        KeyBinding::new("enter", ShowDiff, context),
-        KeyBinding::new("cmd-d", ShowDiff, context),
-        KeyBinding::new("f4", JumpToSource, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+            KeyBinding::new("right", Expand, context),
+            KeyBinding::new("left", Collapse, context),
+            KeyBinding::new("enter", ShowDiff, context),
+            KeyBinding::new("cmd-d", ShowDiff, context),
+            KeyBinding::new("f4", JumpToSource, context),
+        ],
+    );
 }
 
 /// A changed file of the shown commits and the revisions its diff compares.

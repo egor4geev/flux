@@ -46,11 +46,14 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "shift-f10",
-        ShowContextMenu,
-        Some("Editor"),
-    )]);
+    crate::keymap::bind_keys(
+        cx,
+        [KeyBinding::new(
+            "shift-f10",
+            ShowContextMenu,
+            Some("Editor"),
+        )],
+    );
 }
 
 /// The open menu of an editor (`Editor::menu`).

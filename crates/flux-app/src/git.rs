@@ -386,22 +386,25 @@ const MAX_BASE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn init(cx: &mut App) {
     let workspace = Some("Workspace");
-    cx.bind_keys([
-        // As in JetBrains IDEs (macOS keymap).
-        KeyBinding::new("cmd-k", Commit, workspace),
-        KeyBinding::new("cmd-shift-k", Push, workspace),
-        KeyBinding::new("cmd-0", ToggleCommitWindow, workspace),
-        KeyBinding::new("ctrl-v", VcsOperations, workspace),
-        // The author's own key: JetBrains has none for the branches popup on macOS.
-        KeyBinding::new("cmd-shift-b", Branches, workspace),
-        // In a terminal, ⌘T is a new terminal (`terminal_panel`), as in JetBrains IDEs.
-        KeyBinding::new("cmd-t", UpdateProject, workspace),
-        KeyBinding::new("cmd-9", ToggleGitWindow, workspace),
-        // The author's own key: JetBrains has none for Annotate on macOS.
-        KeyBinding::new("alt-cmd-a", Annotate, workspace),
-        // Programs in a terminal need ⌃V (vim's visual block, a literal next character).
-        KeyBinding::new("ctrl-v", NoAction, Some("Terminal")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            // As in JetBrains IDEs (macOS keymap).
+            KeyBinding::new("cmd-k", Commit, workspace),
+            KeyBinding::new("cmd-shift-k", Push, workspace),
+            KeyBinding::new("cmd-0", ToggleCommitWindow, workspace),
+            KeyBinding::new("ctrl-v", VcsOperations, workspace),
+            // The author's own key: JetBrains has none for the branches popup on macOS.
+            KeyBinding::new("cmd-shift-b", Branches, workspace),
+            // In a terminal, ⌘T is a new terminal (`terminal_panel`), as in JetBrains IDEs.
+            KeyBinding::new("cmd-t", UpdateProject, workspace),
+            KeyBinding::new("cmd-9", ToggleGitWindow, workspace),
+            // The author's own key: JetBrains has none for Annotate on macOS.
+            KeyBinding::new("alt-cmd-a", Annotate, workspace),
+            // Programs in a terminal need ⌃V (vim's visual block, a literal next character).
+            KeyBinding::new("ctrl-v", NoAction, Some("Terminal")),
+        ],
+    );
 }
 
 /// What changed, for those who watch the store.

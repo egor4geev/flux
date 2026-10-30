@@ -570,7 +570,16 @@ impl Render for ClaudeStep {
                         div()
                             .text_size(px(theme::TEXT_SM))
                             .text_color(ui.dim)
-                            .child(tr("The Claude console in the launchpad, ⌘Esc and ⌥⌘K.")),
+                            .child(trf(
+                                "The Claude console in the launchpad, {0} and {1}.",
+                                &[
+                                    &crate::keymap::shortcut("claude::ToggleClaude", "cmd-escape"),
+                                    &crate::keymap::shortcut(
+                                        "claude::AddSelectionToClaude",
+                                        "alt-cmd-k",
+                                    ),
+                                ],
+                            )),
                     ),
             )
             .child(
@@ -613,7 +622,8 @@ fn bind_keys(cx: &mut App) {
     static BOUND: Once = Once::new();
     BOUND.call_once(|| {
         let terminal = format!("{CONTEXT} > Terminal");
-        cx.bind_keys(
+        crate::keymap::bind_keys(
+            cx,
             ["enter", "left", "right", "escape"]
                 .map(|key| KeyBinding::new(key, NoAction, Some(terminal.as_str()))),
         );

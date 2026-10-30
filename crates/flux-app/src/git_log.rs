@@ -154,21 +154,24 @@ const ARRIVAL_CAP: usize = 12;
 
 pub fn init(cx: &mut App) {
     let context = Some("GitLog");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-        KeyBinding::new("shift-down", ExtendNext, context),
-        KeyBinding::new("shift-up", ExtendPrevious, context),
-        KeyBinding::new("pagedown", PageDown, context),
-        KeyBinding::new("pageup", PageUp, context),
-        KeyBinding::new("home", SelectFirst, context),
-        KeyBinding::new("end", SelectLast, context),
-        KeyBinding::new("cmd-a", SelectAll, context),
-        KeyBinding::new("cmd-c", CopyHash, context),
-        KeyBinding::new("enter", OpenDiff, context),
-        KeyBinding::new("cmd-d", OpenDiff, context),
-        KeyBinding::new("cmd-f", FocusSearch, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+            KeyBinding::new("shift-down", ExtendNext, context),
+            KeyBinding::new("shift-up", ExtendPrevious, context),
+            KeyBinding::new("pagedown", PageDown, context),
+            KeyBinding::new("pageup", PageUp, context),
+            KeyBinding::new("home", SelectFirst, context),
+            KeyBinding::new("end", SelectLast, context),
+            KeyBinding::new("cmd-a", SelectAll, context),
+            KeyBinding::new("cmd-c", CopyHash, context),
+            KeyBinding::new("enter", OpenDiff, context),
+            KeyBinding::new("cmd-d", OpenDiff, context),
+            KeyBinding::new("cmd-f", FocusSearch, context),
+        ],
+    );
 }
 
 /// What a log shows.
@@ -1011,7 +1014,7 @@ impl GitLogView {
             let anchor = self.anchor.unwrap_or(index);
             self.selected = (anchor.min(index)..=anchor.max(index)).collect();
             self.cursor = Some(index);
-        } else if modifiers.platform {
+        } else if modifiers.secondary() {
             if !self.selected.remove(&index) {
                 self.selected.insert(index);
             }

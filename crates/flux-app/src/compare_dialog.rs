@@ -46,15 +46,18 @@ const ROW_HEIGHT: f32 = 28.;
 
 pub fn init(cx: &mut App) {
     let context = Some("CompareDialog");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-        KeyBinding::new("right", FocusFiles, context),
-        KeyBinding::new("left", FocusCommits, context),
-        KeyBinding::new("tab", SwitchTab, context),
-        KeyBinding::new("enter", OpenDiff, context),
-        KeyBinding::new("escape", Dismiss, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+            KeyBinding::new("right", FocusFiles, context),
+            KeyBinding::new("left", FocusCommits, context),
+            KeyBinding::new("tab", SwitchTab, context),
+            KeyBinding::new("enter", OpenDiff, context),
+            KeyBinding::new("escape", Dismiss, context),
+        ],
+    );
 }
 
 /// The dialog's window-level actions: `CompareWithCurrent`, `DiffWithWorkingTree`.

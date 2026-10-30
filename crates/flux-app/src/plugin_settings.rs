@@ -79,13 +79,16 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("tab", NextField, Some(PAGE_CONTEXT)),
-        KeyBinding::new("shift-tab", PreviousField, Some(PAGE_CONTEXT)),
-        KeyBinding::new("enter", NewLine, Some(LINES_CONTEXT)),
-        KeyBinding::new("alt-shift-up", MoveRecordUp, Some(RECORD_CONTEXT)),
-        KeyBinding::new("alt-shift-down", MoveRecordDown, Some(RECORD_CONTEXT)),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("tab", NextField, Some(PAGE_CONTEXT)),
+            KeyBinding::new("shift-tab", PreviousField, Some(PAGE_CONTEXT)),
+            KeyBinding::new("enter", NewLine, Some(LINES_CONTEXT)),
+            KeyBinding::new("alt-shift-up", MoveRecordUp, Some(RECORD_CONTEXT)),
+            KeyBinding::new("alt-shift-down", MoveRecordDown, Some(RECORD_CONTEXT)),
+        ],
+    );
     // Without the keyboard in the page, the record actions still reach the open one.
     cx.on_action(|_: &AddRecord, cx| {
         with_open_page(cx, |page, window, cx| page.add_record_action(window, cx))

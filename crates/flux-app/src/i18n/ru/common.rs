@@ -31,8 +31,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Searching…", "Поиск…"),
     ("Loading…", "Загрузка…"),
     (
-        "No project folder — open one with ⌘O",
-        "Нет папки проекта — откройте её через ⌘O",
+        "No project folder — open one with {0}",
+        "Нет папки проекта — откройте её через {0}",
     ),
     ("{0} of {1}", "{0} из {1}"),
     // Hints at the bottom of panels: "↑↓ navigate · ↵ open · esc close".

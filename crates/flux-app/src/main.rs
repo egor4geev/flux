@@ -63,6 +63,7 @@ mod icons;
 mod image_view;
 mod input;
 mod input_dialog;
+mod keymap;
 mod launchpad;
 mod leftovers;
 mod locations;

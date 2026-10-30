@@ -131,7 +131,7 @@ pub fn init(cx: &mut App) {
             Some("ClaudeConsole > TextInput"),
         ));
     }
-    cx.bind_keys(bindings);
+    crate::keymap::bind_keys(cx, bindings);
 }
 
 /// A session the console acts on: a live one (its process may be running or not yet started) or

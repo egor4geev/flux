@@ -74,17 +74,20 @@ thread_local! {
 
 pub fn init(cx: &mut App) {
     let popup = Some("ProjectPopup");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, popup),
-        KeyBinding::new("up", SelectPrevious, popup),
-        KeyBinding::new("ctrl-n", SelectNext, popup),
-        KeyBinding::new("ctrl-p", SelectPrevious, popup),
-        KeyBinding::new("enter", Confirm, popup),
-        KeyBinding::new("alt-enter", ConfirmInNewWindow, popup),
-        KeyBinding::new("backspace", Remove, popup),
-        KeyBinding::new("delete", Remove, popup),
-        KeyBinding::new("escape", Dismiss, popup),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, popup),
+            KeyBinding::new("up", SelectPrevious, popup),
+            KeyBinding::new("ctrl-n", SelectNext, popup),
+            KeyBinding::new("ctrl-p", SelectPrevious, popup),
+            KeyBinding::new("enter", Confirm, popup),
+            KeyBinding::new("alt-enter", ConfirmInNewWindow, popup),
+            KeyBinding::new("backspace", Remove, popup),
+            KeyBinding::new("delete", Remove, popup),
+            KeyBinding::new("escape", Dismiss, popup),
+        ],
+    );
 }
 
 /// The popup's window-level action: Recent Projects from the palette.

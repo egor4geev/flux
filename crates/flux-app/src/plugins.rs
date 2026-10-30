@@ -2237,7 +2237,9 @@ fn bind_plugin_keys<A: Action + std::fmt::Debug>(
     if !cx.default_global::<BoundKeys>().0.insert(marker) {
         return;
     }
-    let Some(strokes) = parse_keystrokes(keys) else {
+    // A manifest's keys are macOS keys, as Flux's own; the check and the binding use the system's.
+    let system_keys = crate::keymap::system_keys(keys);
+    let Some(strokes) = parse_keystrokes(&system_keys) else {
         return log.write(
             Level::Warn,
             &format!("The keys \"{keys}\" of the {what} aren't valid"),
@@ -2255,7 +2257,7 @@ fn bind_plugin_keys<A: Action + std::fmt::Debug>(
             &format!("The keys \"{keys}\" of the {what} are taken by {name}"),
         );
     }
-    cx.bind_keys([KeyBinding::new(keys, action, Some("Workspace"))]);
+    cx.bind_keys([KeyBinding::new(&system_keys, action, Some("Workspace"))]);
 }
 
 /// `cmd-shift-t`, `cmd-k cmd-t`: the keystrokes, none if any of them is invalid.

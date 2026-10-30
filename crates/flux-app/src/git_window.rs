@@ -29,11 +29,14 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "shift-escape",
-        HideWindow,
-        Some("GitWindow"),
-    )]);
+    crate::keymap::bind_keys(
+        cx,
+        [KeyBinding::new(
+            "shift-escape",
+            HideWindow,
+            Some("GitWindow"),
+        )],
+    );
 }
 
 const HEADER_HEIGHT: f32 = 38.;

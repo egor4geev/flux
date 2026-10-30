@@ -85,7 +85,7 @@ pub fn init(cx: &mut App) {
     for n in 1..=9 {
         bindings.push(KeyBinding::new(&n.to_string(), PickRow(n - 1), rows));
     }
-    cx.bind_keys(bindings);
+    crate::keymap::bind_keys(cx, bindings);
 }
 
 /// The cards' state in their chat: which card has the keyboard, the highlighted rows, the open

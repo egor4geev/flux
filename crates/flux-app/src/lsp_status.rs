@@ -85,17 +85,20 @@ const ANCHOR_GAP: f32 = 6.;
 
 pub fn init(cx: &mut App) {
     let popup = Some("LspServersPopup");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, popup),
-        KeyBinding::new("up", SelectPrevious, popup),
-        KeyBinding::new("ctrl-n", SelectNext, popup),
-        KeyBinding::new("ctrl-p", SelectPrevious, popup),
-        KeyBinding::new("enter", Confirm, popup),
-        KeyBinding::new("cmd-f2", StopSelected, popup),
-        KeyBinding::new("cmd-,", ConfigureSelected, popup),
-        KeyBinding::new("cmd-l", LogSelected, popup),
-        KeyBinding::new("escape", Dismiss, popup),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, popup),
+            KeyBinding::new("up", SelectPrevious, popup),
+            KeyBinding::new("ctrl-n", SelectNext, popup),
+            KeyBinding::new("ctrl-p", SelectPrevious, popup),
+            KeyBinding::new("enter", Confirm, popup),
+            KeyBinding::new("cmd-f2", StopSelected, popup),
+            KeyBinding::new("cmd-,", ConfigureSelected, popup),
+            KeyBinding::new("cmd-l", LogSelected, popup),
+            KeyBinding::new("escape", Dismiss, popup),
+        ],
+    );
 }
 
 /// The window-level actions: the popup from the palette or the status item, and the actions of
@@ -729,7 +732,16 @@ impl ServersPopup {
             let name = row.key.name.clone();
             buttons.push(
                 ui::icon_button(("lsp-row-configure", index), IconName::Settings, ui)
-                    .tooltip(ui::tooltip(tr("Configure…"), Some("⌘,".into())))
+                    .tooltip(ui::tooltip(
+                        tr("Configure…"),
+                        Some(
+                            crate::keymap::shortcut(
+                                "lsp_servers_popup::ConfigureSelected",
+                                "cmd-,",
+                            )
+                            .into(),
+                        ),
+                    ))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         let action = ConfigureServer { name: name.clone() };
                         this.close_and(Box::new(action), window, cx)

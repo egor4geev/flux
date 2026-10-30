@@ -49,7 +49,7 @@ pub fn mouse_moved(
     _: &mut Window,
     cx: &mut Context<TerminalView>,
 ) {
-    let pointing = event.modifiers.platform && event.pressed_button.is_none();
+    let pointing = event.modifiers.secondary() && event.pressed_button.is_none();
     hover(view, pointing.then_some(event.position), cx);
 }
 
@@ -61,7 +61,7 @@ pub fn modifiers_changed(
     window: &mut Window,
     cx: &mut Context<TerminalView>,
 ) {
-    let position = event.modifiers.platform.then(|| window.mouse_position());
+    let position = event.modifiers.secondary().then(|| window.mouse_position());
     hover(view, position, cx);
 }
 
@@ -72,7 +72,7 @@ pub fn cmd_click(
     _: &mut Window,
     cx: &mut Context<TerminalView>,
 ) -> bool {
-    if !event.modifiers.platform || event.button != MouseButton::Left {
+    if !event.modifiers.secondary() || event.button != MouseButton::Left {
         return false;
     }
     let Some(found) = point_at(view, event.position).and_then(|point| find(view, point)) else {

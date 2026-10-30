@@ -52,11 +52,14 @@ const PULSE: Duration = Duration::from_millis(1100);
 
 pub fn init(cx: &mut App) {
     let popover = Some(CONTEXT);
-    cx.bind_keys([
-        KeyBinding::new("escape", Dismiss, popover),
-        KeyBinding::new("enter", CheckCountry, popover),
-        KeyBinding::new("cmd-,", claude::OpenSettings, popover),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("escape", Dismiss, popover),
+            KeyBinding::new("enter", CheckCountry, popover),
+            KeyBinding::new("cmd-,", claude::OpenSettings, popover),
+        ],
+    );
 }
 
 // --- Words and marks ---

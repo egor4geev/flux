@@ -38,7 +38,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("escape", Back, Some(CONTEXT))]);
+    crate::keymap::bind_keys(cx, [KeyBinding::new("escape", Back, Some(CONTEXT))]);
 }
 
 /// One level of subagents in sight: the Agent call and its own list.

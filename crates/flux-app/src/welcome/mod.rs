@@ -243,15 +243,18 @@ pub enum Start {
 }
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("right", Next, Some(CONTEXT)),
-        KeyBinding::new("enter", Next, Some(CONTEXT)),
-        KeyBinding::new("left", Previous, Some(CONTEXT)),
-        KeyBinding::new("escape", Close, Some(CONTEXT)),
-        KeyBinding::new("cmd-w", CloseWindow, Some(CONTEXT)),
-        // On the first launch the guide may be Flux's only window: ⌘Q works in it too.
-        KeyBinding::new("cmd-q", workspace::Quit, Some(CONTEXT)),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("right", Next, Some(CONTEXT)),
+            KeyBinding::new("enter", Next, Some(CONTEXT)),
+            KeyBinding::new("left", Previous, Some(CONTEXT)),
+            KeyBinding::new("escape", Close, Some(CONTEXT)),
+            KeyBinding::new("cmd-w", CloseWindow, Some(CONTEXT)),
+            // On the first launch the guide may be Flux's only window: ⌘Q works in it too.
+            KeyBinding::new("cmd-q", workspace::Quit, Some(CONTEXT)),
+        ],
+    );
     tour::bind_keys(cx);
     // Global: from the menu bar and the palette of any window, and with no window at all. After
     // the action's own update, when the window it came from can be read (its screen).

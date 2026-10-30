@@ -96,10 +96,13 @@ const SIGN_IN_WAIT: Duration = Duration::from_secs(300);
 
 pub fn init(cx: &mut App) {
     crate::system_notify::init(cx);
-    cx.bind_keys([
-        KeyBinding::new("cmd-escape", ToggleClaude, Some("Workspace")),
-        KeyBinding::new("alt-cmd-k", AddSelectionToClaude, Some("Editor")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-escape", ToggleClaude, Some("Workspace")),
+            KeyBinding::new("alt-cmd-k", AddSelectionToClaude, Some("Editor")),
+        ],
+    );
 }
 
 /// Whether Claude Code is on (Settings → Claude Code): off hides the launchpad icon and keys.

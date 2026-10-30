@@ -194,27 +194,33 @@ const ARRIVAL_CAP: usize = 12;
 
 pub fn init(cx: &mut App) {
     let context = Some(CONTEXT);
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-        KeyBinding::new("home", SelectFirst, context),
-        KeyBinding::new("end", SelectLast, context),
-        KeyBinding::new("pagedown", SelectNextPage, context),
-        KeyBinding::new("pageup", SelectPreviousPage, context),
-        KeyBinding::new("right", Expand, context),
-        KeyBinding::new("left", Collapse, context),
-        KeyBinding::new("enter", Activate, context),
-        KeyBinding::new("cmd-enter", RunRowAction, context),
-        KeyBinding::new("tab", FocusNextField, context),
-        // The island on the right handles them for whichever window it shows.
-        KeyBinding::new("escape", FocusEditor, context),
-        KeyBinding::new("shift-escape", Hide, context),
-    ]);
-    cx.bind_keys([
-        KeyBinding::new("enter", SubmitField, Some(FIELD_CONTEXT)),
-        KeyBinding::new("enter", NewLine, Some(LINES_CONTEXT)),
-        KeyBinding::new("cmd-enter", SubmitField, Some(LINES_CONTEXT)),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+            KeyBinding::new("home", SelectFirst, context),
+            KeyBinding::new("end", SelectLast, context),
+            KeyBinding::new("pagedown", SelectNextPage, context),
+            KeyBinding::new("pageup", SelectPreviousPage, context),
+            KeyBinding::new("right", Expand, context),
+            KeyBinding::new("left", Collapse, context),
+            KeyBinding::new("enter", Activate, context),
+            KeyBinding::new("cmd-enter", RunRowAction, context),
+            KeyBinding::new("tab", FocusNextField, context),
+            // The island on the right handles them for whichever window it shows.
+            KeyBinding::new("escape", FocusEditor, context),
+            KeyBinding::new("shift-escape", Hide, context),
+        ],
+    );
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", SubmitField, Some(FIELD_CONTEXT)),
+            KeyBinding::new("enter", NewLine, Some(LINES_CONTEXT)),
+            KeyBinding::new("cmd-enter", SubmitField, Some(LINES_CONTEXT)),
+        ],
+    );
 }
 
 pub enum PluginViewEvent {

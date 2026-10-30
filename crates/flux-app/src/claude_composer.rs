@@ -121,12 +121,15 @@ const SENT_KEPT: usize = 16;
 
 pub fn init(cx: &mut App) {
     let context = Some(CONTEXT);
-    cx.bind_keys([
-        KeyBinding::new("enter", Send, context),
-        KeyBinding::new("cmd-enter", SendNow, context),
-        KeyBinding::new("escape", Stop, context),
-        KeyBinding::new("shift-tab", CycleMode, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Send, context),
+            KeyBinding::new("cmd-enter", SendNow, context),
+            KeyBinding::new("escape", Stop, context),
+            KeyBinding::new("shift-tab", CycleMode, context),
+        ],
+    );
 }
 
 /// The editor the user works in, as the message mentions it (`@src/main.rs#L12-20`).
@@ -1831,7 +1834,7 @@ impl Composer {
         picker: Picker,
         label: SharedString,
         color: Hsla,
-        tooltip: &'static str,
+        tooltip: SharedString,
         shrink: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -1988,7 +1991,7 @@ impl Composer {
                 Picker::Effort,
                 label.into(),
                 ui.text_muted,
-                tr("Effort"),
+                tr("Effort").into(),
                 false,
                 cx,
             )
@@ -2033,19 +2036,28 @@ impl Composer {
             Picker::Model,
             model_name,
             ui.text_muted,
-            tr("Model"),
+            tr("Model").into(),
             false,
             cx,
         ))
         .children(effort_picker)
-        .child(self.render_picker(
-            Picker::Mode,
-            mode_label(mode).into(),
-            mode_color(mode, &ui),
-            tr("Permission mode (⇧⇥)"),
-            true,
-            cx,
-        ))
+        .child(
+            self.render_picker(
+                Picker::Mode,
+                mode_label(mode).into(),
+                mode_color(mode, &ui),
+                trf(
+                    "Permission mode ({0})",
+                    &[&crate::keymap::shortcut(
+                        "claude_composer::CycleMode",
+                        "shift-tab",
+                    )],
+                )
+                .into(),
+                true,
+                cx,
+            ),
+        )
         .child(div().flex_1())
         .children(checking)
         .children(ring)

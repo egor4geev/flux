@@ -60,33 +60,42 @@ actions!(
 
 pub fn init(cx: &mut App) {
     let workspace = Some("Workspace");
-    cx.bind_keys([
-        KeyBinding::new("cmd-f", Deploy, workspace),
-        KeyBinding::new("cmd-alt-f", DeployReplace, workspace),
-        // As in JetBrains.
-        KeyBinding::new("cmd-r", DeployReplace, workspace),
-        KeyBinding::new("cmd-g", FindNext, workspace),
-        KeyBinding::new("cmd-shift-g", FindPrevious, workspace),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-f", Deploy, workspace),
+            KeyBinding::new("cmd-alt-f", DeployReplace, workspace),
+            // As in JetBrains.
+            KeyBinding::new("cmd-r", DeployReplace, workspace),
+            KeyBinding::new("cmd-g", FindNext, workspace),
+            KeyBinding::new("cmd-shift-g", FindPrevious, workspace),
+        ],
+    );
     let bar = Some("FindBar");
-    cx.bind_keys([
-        KeyBinding::new("enter", SelectNextMatch, bar),
-        KeyBinding::new("shift-enter", SelectPreviousMatch, bar),
-        KeyBinding::new("alt-enter", SelectAllMatches, bar),
-        KeyBinding::new("escape", Dismiss, bar),
-        KeyBinding::new("tab", FocusNextField, bar),
-        KeyBinding::new("shift-tab", FocusNextField, bar),
-        KeyBinding::new("alt-cmd-c", ToggleCaseSensitive, bar),
-        KeyBinding::new("alt-cmd-w", ToggleWholeWord, bar),
-        KeyBinding::new("alt-cmd-r", ToggleRegex, bar),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", SelectNextMatch, bar),
+            KeyBinding::new("shift-enter", SelectPreviousMatch, bar),
+            KeyBinding::new("alt-enter", SelectAllMatches, bar),
+            KeyBinding::new("escape", Dismiss, bar),
+            KeyBinding::new("tab", FocusNextField, bar),
+            KeyBinding::new("shift-tab", FocusNextField, bar),
+            KeyBinding::new("alt-cmd-c", ToggleCaseSensitive, bar),
+            KeyBinding::new("alt-cmd-w", ToggleWholeWord, bar),
+            KeyBinding::new("alt-cmd-r", ToggleRegex, bar),
+        ],
+    );
     // The replace field is nested inside the bar: its context is deeper, and Enter here means
     // "replace".
     let replace = Some("ReplaceField");
-    cx.bind_keys([
-        KeyBinding::new("enter", ReplaceNext, replace),
-        KeyBinding::new("cmd-enter", ReplaceAll, replace),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", ReplaceNext, replace),
+            KeyBinding::new("cmd-enter", ReplaceAll, replace),
+        ],
+    );
 }
 
 /// What to do with the selection when the search results arrive.

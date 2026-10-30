@@ -51,10 +51,13 @@ const DIALOG_WIDTH: f32 = 460.;
 
 pub fn init(cx: &mut App) {
     let context = Some("NewBranchDialog");
-    cx.bind_keys([
-        KeyBinding::new("enter", Confirm, context),
-        KeyBinding::new("escape", Dismiss, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, context),
+            KeyBinding::new("escape", Dismiss, context),
+        ],
+    );
 }
 
 /// The flows' window-level actions: `NewBranch`, `NewBranchFrom`, `RenameBranch`,

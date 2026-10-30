@@ -143,26 +143,30 @@ pub fn init(cx: &mut App) {
 
 fn bind_keys(cx: &mut App) {
     let context = Some("Workspace");
-    cx.bind_keys([
-        KeyBinding::new("cmd-o", Open, context),
-        KeyBinding::new("cmd-n", NewFile, context),
-        KeyBinding::new("cmd-w", CloseTab, context),
-        KeyBinding::new("cmd-shift-w", CloseWindow, context),
-        KeyBinding::new("cmd-q", Quit, context),
-        // macOS sends cmd-shift-] as cmd-}: shift is already accounted for in the character.
-        KeyBinding::new("cmd-}", NextTab, context),
-        KeyBinding::new("cmd-{", PrevTab, context),
-        KeyBinding::new("cmd-shift-]", NextTab, context),
-        KeyBinding::new("cmd-shift-[", PrevTab, context),
-        KeyBinding::new("ctrl-tab", NextTab, context),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, context),
-        KeyBinding::new("ctrl-9", LastTab, context),
-        // When focus is outside the editor (file tree, search fields), the active document is
-        // saved.
-        KeyBinding::new("cmd-s", editor::Save, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-o", Open, context),
+            KeyBinding::new("cmd-n", NewFile, context),
+            KeyBinding::new("cmd-w", CloseTab, context),
+            KeyBinding::new("cmd-shift-w", CloseWindow, context),
+            KeyBinding::new("cmd-q", Quit, context),
+            // macOS sends cmd-shift-] as cmd-}: shift is already accounted for in the character.
+            KeyBinding::new("cmd-}", NextTab, context),
+            KeyBinding::new("cmd-{", PrevTab, context),
+            KeyBinding::new("cmd-shift-]", NextTab, context),
+            KeyBinding::new("cmd-shift-[", PrevTab, context),
+            KeyBinding::new("ctrl-tab", NextTab, context),
+            KeyBinding::new("ctrl-shift-tab", PrevTab, context),
+            KeyBinding::new("ctrl-9", LastTab, context),
+            // When focus is outside the editor (file tree, search fields), the active document is
+            // saved.
+            KeyBinding::new("cmd-s", editor::Save, context),
+        ],
+    );
     // cmd-1 belongs to the file tree (as in JetBrains IDEs), so tabs by number are on ctrl.
-    cx.bind_keys(
+    crate::keymap::bind_keys(
+        cx,
         (1..=8).map(|n| KeyBinding::new(&format!("ctrl-{n}"), ActivateTab(n - 1), context)),
     );
 }
@@ -3572,7 +3576,14 @@ impl Workspace {
     /// cmd-1: show or hide the file tree.
     fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.tree_panel() else {
-            return self.show_message(tr("No project folder — open one with ⌘O").into(), cx);
+            return self.show_message(
+                trf(
+                    "No project folder — open one with {0}",
+                    &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+                )
+                .into(),
+                cx,
+            );
         };
         let focused = panel.focus_handle(cx).contains_focused(window, cx);
         // The commit window gives its place back to the tree, and its focus with it: a hidden panel
@@ -3607,7 +3618,14 @@ impl Workspace {
     /// editor.
     fn toggle_tree_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.tree_panel() else {
-            return self.show_message(tr("No project folder — open one with ⌘O").into(), cx);
+            return self.show_message(
+                trf(
+                    "No project folder — open one with {0}",
+                    &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+                )
+                .into(),
+                cx,
+            );
         };
         let handle = panel.focus_handle(cx);
         if self.tree_open && handle.contains_focused(window, cx) {
@@ -5024,7 +5042,10 @@ impl Workspace {
             None => {
                 let text = match &self.root {
                     Some(root) => tilde(root),
-                    None => tr("No project — open a folder with ⌘O").into(),
+                    None => trf(
+                        "No project — open a folder with {0}",
+                        &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+                    ),
                 };
                 return bar
                     .child(status_text(

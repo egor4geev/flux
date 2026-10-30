@@ -37,14 +37,17 @@ actions!(
 
 pub fn init(cx: &mut App) {
     let context = Some("Terminal");
-    cx.bind_keys([
-        KeyBinding::new("cmd-d", SplitRight, context),
-        KeyBinding::new("cmd-shift-d", SplitDown, context),
-        KeyBinding::new("cmd-w", ClosePane, context),
-        // As "Goto Next Splitter" in JetBrains IDEs.
-        KeyBinding::new("alt-tab", FocusNextPane, context),
-        KeyBinding::new("alt-shift-tab", FocusPreviousPane, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-d", SplitRight, context),
+            KeyBinding::new("cmd-shift-d", SplitDown, context),
+            KeyBinding::new("cmd-w", ClosePane, context),
+            // As "Goto Next Splitter" in JetBrains IDEs.
+            KeyBinding::new("alt-tab", FocusNextPane, context),
+            KeyBinding::new("alt-shift-tab", FocusPreviousPane, context),
+        ],
+    );
 }
 
 /// Dragging a divider stops short of making a pane narrower or lower than this.

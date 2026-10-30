@@ -67,10 +67,13 @@ const LOG_LINE_HEIGHT: f32 = 18.;
 pub fn init(cx: &mut App) {
     // ↑ / ↓ go through the list from its search field.
     let context = Some("PluginManager");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+        ],
+    );
 }
 
 /// Opens Settings on Plugins: the palette's «Plugins…», a notification about a plugin.
@@ -2344,9 +2347,11 @@ fn contribution_row(
 }
 
 /// A shortcut of a manifest in gpui's notation ("alt-cmd-shift-t", "cmd-k cmd-s") as the
-/// palette shows it ("⌥⇧⌘T", "⌘K ⌘S"); none when it doesn't parse.
+/// palette shows it ("⌥⇧⌘T", "⌘K ⌘S"; in the system's keys, `keymap::system_keys`); none when it
+/// doesn't parse.
 fn keys_label(keys: &str) -> Option<String> {
-    keys.split_whitespace()
+    crate::keymap::system_keys(keys)
+        .split_whitespace()
         .map(|part| {
             Keystroke::parse(part)
                 .ok()

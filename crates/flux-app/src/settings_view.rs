@@ -90,10 +90,13 @@ const DEVELOPER: &str = "Egor Ageev";
 const REPOSITORY: &str = "github.com/egor4geev/flux";
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-,", Toggle, Some("Workspace")),
-        KeyBinding::new("escape", Dismiss, Some("Settings")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-,", Toggle, Some("Workspace")),
+            KeyBinding::new("escape", Dismiss, Some("Settings")),
+        ],
+    );
     // Open Settings switch to About themselves (they have focus); otherwise the action reaches the
     // app, and the active window opens them on About.
     cx.on_action(about);
@@ -1327,8 +1330,9 @@ impl SettingsView {
             .gap_3()
             .child(section_header(
                 tr("Version Control"),
-                tr(
-                    "Git: how Update Project (⌘T) brings the commits of the upstream into the current branch. Local changes are stashed for the update and come back after it.",
+                trf(
+                    "Git: how Update Project ({0}) brings the commits of the upstream into the current branch. Local changes are stashed for the update and come back after it.",
+                    &[&crate::keymap::shortcut("git::UpdateProject", "cmd-t")],
                 ),
                 ui,
             ))
@@ -1638,7 +1642,7 @@ impl SettingsView {
         let state = store.cli().clone();
         let switch_row = |id: &'static str,
                           title: &'static str,
-                          detail: &'static str,
+                          detail: SharedString,
                           on: bool,
                           change: fn(&mut settings::ClaudeSettings, bool),
                           cx: &mut Context<Self>| {
@@ -1945,7 +1949,7 @@ impl SettingsView {
             .child(switch_row(
                 "claude-diff-tabs",
                 tr("Show proposed edits in a diff tab"),
-                tr("An edit Claude asks about also opens next to your tabs, where hunks can be taken one by one."),
+                tr("An edit Claude asks about also opens next to your tabs, where hunks can be taken one by one.").into(),
                 current.diff_tabs,
                 |claude, on| claude.diff_tabs = on,
                 cx,
@@ -1953,7 +1957,7 @@ impl SettingsView {
             .child(switch_row(
                 "claude-share-selection",
                 tr("Share the editor's selection"),
-                tr("The file and the selected lines go along with a message as a mention."),
+                tr("The file and the selected lines go along with a message as a mention.").into(),
                 current.share_selection,
                 |claude, on| claude.share_selection = on,
                 cx,
@@ -1961,7 +1965,7 @@ impl SettingsView {
             .child(switch_row(
                 "claude-show-limits",
                 tr("Show subscription limits in the status bar"),
-                tr("How much of the 5-hour and the weekly limits is used."),
+                tr("How much of the 5-hour and the weekly limits is used.").into(),
                 current.show_limits,
                 |claude, on| claude.show_limits = on,
                 cx,
@@ -1969,7 +1973,7 @@ impl SettingsView {
             .child(switch_row(
                 "claude-restore-sessions",
                 tr("Reopen sessions with the project"),
-                tr("The sessions open when the project closed come back, their history read from Claude Code's transcripts."),
+                tr("The sessions open when the project closed come back, their history read from Claude Code's transcripts.").into(),
                 current.restore_sessions,
                 |claude, on| claude.restore_sessions = on,
                 cx,
@@ -1977,7 +1981,7 @@ impl SettingsView {
             .child(switch_row(
                 "claude-respond-to-commands",
                 tr("Claude answers the output of ! commands"),
-                tr("A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message. ⌘↵ runs a command the other way."),
+                trf("A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message. {0} runs a command the other way.", &[&crate::keymap::shortcut("claude_composer::SendNow", "cmd-enter")]).into(),
                 current.answer_commands,
                 |claude, on| claude.answer_commands = on,
                 cx,
@@ -1985,7 +1989,7 @@ impl SettingsView {
             .child(switch_row(
                 "claude-system-notifications",
                 tr("Notify when a session finishes or waits"),
-                tr("A macOS notification while Flux isn't the active app."),
+                tr("A macOS notification while Flux isn't the active app.").into(),
                 current.system_notifications,
                 |claude, on| claude.system_notifications = on,
                 cx,
@@ -1994,7 +1998,7 @@ impl SettingsView {
             .child(switch_row(
                 "claude-flux-tools",
                 tr("Give Claude the tools of Flux"),
-                tr("Problems the language servers find, definitions, usages and symbols, the open files. Takes effect in new sessions."),
+                tr("Problems the language servers find, definitions, usages and symbols, the open files. Takes effect in new sessions.").into(),
                 current.flux_tools,
                 |claude, on| claude.flux_tools = on,
                 cx,
@@ -2002,7 +2006,7 @@ impl SettingsView {
             .child(switch_row(
                 "claude-report-problems",
                 tr("Tell Claude about new problems after its edits"),
-                tr("After an edit, the errors the language server finds in the file go back to Claude, so it fixes them at once."),
+                tr("After an edit, the errors the language server finds in the file go back to Claude, so it fixes them at once.").into(),
                 current.report_problems,
                 |claude, on| claude.report_problems = on,
                 cx,
@@ -2028,7 +2032,7 @@ impl SettingsView {
             .child(switch_row(
                 "claude-country-check",
                 tr("Block Claude by the country of the IP address"),
-                tr("Flux finds out which country the network shows for this Mac and stops Claude while that country is on the list below or can't be found out."),
+                tr("Flux finds out which country the network shows for this Mac and stops Claude while that country is on the list below or can't be found out.").into(),
                 current.country_check,
                 |claude, on| claude.country_check = on,
                 cx,
@@ -2053,8 +2057,9 @@ impl SettingsView {
             .gap_3()
             .child(section_header(
                 tr("Claude Code"),
-                tr(
-                    "Claude Code in Flux: chats in editor tabs, the console on the left (⌘Esc). Flux runs your claude command line tool, signed in with your Claude subscription.",
+                trf(
+                    "Claude Code in Flux: chats in editor tabs, the console on the left ({0}). Flux runs your claude command line tool, signed in with your Claude subscription.",
+                    &[&crate::keymap::shortcut("claude::ToggleClaude", "cmd-escape")],
                 ),
                 ui,
             ))
@@ -2067,7 +2072,11 @@ impl SettingsView {
                     .child(switch_row(
                         "claude-enabled",
                         tr("Enable Claude Code"),
-                        tr("The Claude console in the launchpad, ⌘Esc and ⌥⌘K."),
+                        trf(
+                            "The Claude console in the launchpad, {0} and {1}.",
+                            &[&crate::keymap::shortcut("claude::ToggleClaude", "cmd-escape"), &crate::keymap::shortcut("claude::AddSelectionToClaude", "alt-cmd-k")],
+                        )
+                        .into(),
                         enabled,
                         |claude, on| claude.enabled = on,
                         cx,
@@ -2496,7 +2505,7 @@ fn server_rows(plugins: &Entity<PluginStore>, cx: &App) -> Vec<ServerRow> {
 }
 
 /// A section's title and its description.
-fn section_header(title: &'static str, description: &'static str, ui: UiColors) -> Div {
+fn section_header(title: &'static str, description: impl Into<SharedString>, ui: UiColors) -> Div {
     div()
         .flex()
         .flex_col()
@@ -2507,7 +2516,7 @@ fn section_header(title: &'static str, description: &'static str, ui: UiColors) 
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(title),
         )
-        .child(div().text_color(ui.text_muted).child(description))
+        .child(div().text_color(ui.text_muted).child(description.into()))
 }
 
 /// A value in About: plain text that can be selected by eye, not edited.

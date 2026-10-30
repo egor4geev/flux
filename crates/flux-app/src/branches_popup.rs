@@ -77,23 +77,26 @@ const CHIP_GAP: f32 = 4.;
 
 pub fn init(cx: &mut App) {
     let popup = Some("BranchesPopup");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, popup),
-        KeyBinding::new("up", SelectPrevious, popup),
-        KeyBinding::new("ctrl-n", SelectNext, popup),
-        KeyBinding::new("ctrl-p", SelectPrevious, popup),
-        KeyBinding::new("pagedown", SelectNextPage, popup),
-        KeyBinding::new("pageup", SelectPreviousPage, popup),
-        KeyBinding::new("enter", Confirm, popup),
-        KeyBinding::new("escape", Dismiss, popup),
-        // Branch names can't contain spaces: Space stars the selected branch (as in JetBrains
-        // IDEs); on any other row it types a space.
-        KeyBinding::new("space", ToggleFavorite, popup),
-        // ←/→ open and close the tree's nodes and a branch's actions, as in JetBrains' popups: the
-        // search field gives them up (bound deeper than the field's own keys, and later).
-        KeyBinding::new("right", Expand, Some("BranchesPopup > TextInput")),
-        KeyBinding::new("left", Collapse, Some("BranchesPopup > TextInput")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, popup),
+            KeyBinding::new("up", SelectPrevious, popup),
+            KeyBinding::new("ctrl-n", SelectNext, popup),
+            KeyBinding::new("ctrl-p", SelectPrevious, popup),
+            KeyBinding::new("pagedown", SelectNextPage, popup),
+            KeyBinding::new("pageup", SelectPreviousPage, popup),
+            KeyBinding::new("enter", Confirm, popup),
+            KeyBinding::new("escape", Dismiss, popup),
+            // Branch names can't contain spaces: Space stars the selected branch (as in JetBrains
+            // IDEs); on any other row it types a space.
+            KeyBinding::new("space", ToggleFavorite, popup),
+            // ←/→ open and close the tree's nodes and a branch's actions, as in JetBrains' popups: the
+            // search field gives them up (bound deeper than the field's own keys, and later).
+            KeyBinding::new("right", Expand, Some("BranchesPopup > TextInput")),
+            KeyBinding::new("left", Collapse, Some("BranchesPopup > TextInput")),
+        ],
+    );
 }
 
 /// Opens the popup (or closes it, when open): under the branch chip when `anchor` is given (a
@@ -1892,7 +1895,10 @@ impl BranchesPopup {
             (
                 IconName::Branch,
                 tr("No Git repository"),
-                Some(tr("Open a folder with a repository: ⌘O")),
+                Some(SharedString::from(trf(
+                    "Open a folder with a repository: {0}",
+                    &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+                ))),
             )
         } else {
             return None;

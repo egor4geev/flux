@@ -42,15 +42,18 @@ const WINDOW_MENU: usize = 1;
 const HELP_MENU: usize = 2;
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-h", Hide, None),
-        KeyBinding::new("alt-cmd-h", HideOthers, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-`", NextWindow, None),
-        // macOS may send ⇧⌘` as cmd-~: shift is already in the character.
-        KeyBinding::new("cmd-shift-`", PreviousWindow, None),
-        KeyBinding::new("cmd-~", PreviousWindow, None),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-h", Hide, None),
+            KeyBinding::new("alt-cmd-h", HideOthers, None),
+            KeyBinding::new("cmd-m", Minimize, None),
+            KeyBinding::new("cmd-`", NextWindow, None),
+            // macOS may send ⇧⌘` as cmd-~: shift is already in the character.
+            KeyBinding::new("cmd-shift-`", PreviousWindow, None),
+            KeyBinding::new("cmd-~", PreviousWindow, None),
+        ],
+    );
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());

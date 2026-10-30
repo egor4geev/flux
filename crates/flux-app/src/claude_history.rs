@@ -46,18 +46,21 @@ const MAX_OPEN: usize = 20;
 const CONTEXT: &str = "Picker ClaudeHistory";
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new(
-            "cmd-backspace",
-            picker::DeleteSelected,
-            Some("ClaudeHistory > TextInput"),
-        ),
-        KeyBinding::new(
-            "cmd-backspace",
-            picker::DeleteSelected,
-            Some("ClaudeHistory"),
-        ),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new(
+                "cmd-backspace",
+                picker::DeleteSelected,
+                Some("ClaudeHistory > TextInput"),
+            ),
+            KeyBinding::new(
+                "cmd-backspace",
+                picker::DeleteSelected,
+                Some("ClaudeHistory"),
+            ),
+        ],
+    );
 }
 
 thread_local! {
@@ -228,7 +231,10 @@ impl PickerDelegate for HistoryDelegate {
         // fades in (the button's id keeps the fade), moved to with the arrows it is there at once.
         let delete = crate::ui::icon_button(("history-delete", index), IconName::Trash, ui)
             .flex_none()
-            .tooltip(crate::ui::tooltip(tr("Delete Session"), Some("⌘⌫".into())))
+            .tooltip(crate::ui::tooltip(
+                tr("Delete Session"),
+                Some(crate::keymap::shortcut("picker::DeleteSelected", "cmd-backspace").into()),
+            ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(
                 cx.listener(move |picker, _, window, cx| picker.delegate.delete(index, window, cx)),

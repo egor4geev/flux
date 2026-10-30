@@ -19,6 +19,7 @@ use gpui::{
 
 use crate::command_usage;
 use crate::i18n::{tr, trn};
+use crate::keymap::KeyOs;
 use crate::picker::{Picker, PickerDelegate, highlighted_text};
 use crate::plugins::{PaletteCommand, PaletteToolWindow};
 use crate::theme::{self, Theme, UiColors};
@@ -31,7 +32,10 @@ const NAMESPACE_WIDTH: f32 = 108.;
 actions!(command_palette, [Toggle]);
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-shift-p", Toggle, Some("Workspace"))]);
+    crate::keymap::bind_keys(
+        cx,
+        [KeyBinding::new("cmd-shift-p", Toggle, Some("Workspace"))],
+    );
 }
 
 pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -55,7 +59,7 @@ struct Command {
     namespace_chars: usize,
     /// English namespace («file tree»): it picks the color of the chip, whatever the language.
     namespace: String,
-    /// Key binding in macOS symbols, if there is one.
+    /// Key binding in the system's notation, if there is one.
     keys: Option<SharedString>,
     action: Box<dyn Action>,
     /// A plugin grayed the command out: it is shown dimmed and doesn't run.
@@ -390,9 +394,9 @@ impl PickerDelegate for CommandPalette {
 /// The chip's namespace of the plugins' commands: one color for all of them.
 const PLUGIN_NAMESPACE: &str = "plugin";
 
-/// The first key binding of an action where focus was, in macOS symbols. Our primary binding is
-/// registered first, with the alternates (`home` for cmd-left, `shift-backspace` for backspace)
-/// after it. Without a focus, the window's own keys ([`ui::action_binding`]).
+/// The first key binding of an action where focus was, in the system's notation. Our primary
+/// binding is registered first, with the alternates (`home` for cmd-left, `shift-backspace` for
+/// backspace) after it. Without a focus, the window's own keys ([`ui::action_binding`]).
 fn keys_label(
     action: &dyn Action,
     focus: Option<&FocusHandle>,
@@ -525,8 +529,18 @@ pub fn humanize_action_name(name: &str) -> String {
     label
 }
 
-/// A keystroke in macOS symbols, in the standard order ⌃⌥⇧⌘: `cmd-shift-p` → "⇧⌘P".
+/// A keystroke in the notation of the system Flux runs on ([`keystroke_label_for`]).
 pub fn keystroke_label(modifiers: &Modifiers, key: &str) -> String {
+    keystroke_label_for(KeyOs::current(), modifiers, key)
+}
+
+/// A keystroke as `os` writes it: in macOS symbols, in the standard order ⌃⌥⇧⌘ (`cmd-shift-p` →
+/// "⇧⌘P"); on Windows by name, Ctrl, Alt, Shift, then the key, joined by `+` (`ctrl-shift-p` →
+/// "Ctrl+Shift+P").
+pub fn keystroke_label_for(os: KeyOs, modifiers: &Modifiers, key: &str) -> String {
+    if os == KeyOs::Windows {
+        return windows_keystroke_label(modifiers, key);
+    }
     let mut label = String::new();
     if modifiers.function {
         label.push_str("fn ");
@@ -543,6 +557,33 @@ pub fn keystroke_label(modifiers: &Modifiers, key: &str) -> String {
     }
     label.push_str(&key_label(key));
     label
+}
+
+/// Windows: Ctrl, Alt, Shift by name, then the key by name; arrows, PgUp/PgDn, Home/End and the
+/// rest as on macOS ([`key_label`]).
+fn windows_keystroke_label(modifiers: &Modifiers, key: &str) -> String {
+    let mut parts: Vec<String> = [
+        (modifiers.control, "Ctrl"),
+        (modifiers.alt, "Alt"),
+        (modifiers.shift, "Shift"),
+        (modifiers.platform, "Win"),
+        (modifiers.function, "Fn"),
+    ]
+    .into_iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, name)| name.to_string())
+    .collect();
+    parts.push(match key {
+        "enter" => "Enter".to_string(),
+        "escape" => "Esc".to_string(),
+        "backspace" => "Backspace".to_string(),
+        "delete" => "Delete".to_string(),
+        "insert" => "Insert".to_string(),
+        "tab" => "Tab".to_string(),
+        "space" => "Space".to_string(),
+        key => key_label(key),
+    });
+    parts.join("+")
 }
 
 fn key_label(key: &str) -> String {
@@ -664,6 +705,31 @@ mod tests {
     fn label(keystroke: &str) -> String {
         let keystroke = gpui::Keystroke::parse(keystroke).unwrap();
         keystroke_label(&keystroke.modifiers, &keystroke.key)
+    }
+
+    fn windows_label(keystroke: &str) -> String {
+        let keystroke = gpui::Keystroke::parse(keystroke).unwrap();
+        keystroke_label_for(KeyOs::Windows, &keystroke.modifiers, &keystroke.key)
+    }
+
+    #[test]
+    fn keystrokes_on_windows_use_names_joined_by_plus() {
+        assert_eq!(windows_label("ctrl-shift-p"), "Ctrl+Shift+P");
+        assert_eq!(windows_label("shift-alt-ctrl-z"), "Ctrl+Alt+Shift+Z");
+        assert_eq!(windows_label("ctrl-enter"), "Ctrl+Enter");
+        assert_eq!(windows_label("ctrl-backspace"), "Ctrl+Backspace");
+        assert_eq!(windows_label("shift-delete"), "Shift+Delete");
+        assert_eq!(windows_label("alt-insert"), "Alt+Insert");
+        assert_eq!(windows_label("ctrl-tab"), "Ctrl+Tab");
+        assert_eq!(windows_label("escape"), "Esc");
+        assert_eq!(windows_label("space"), "Space");
+        assert_eq!(windows_label("ctrl-alt-left"), "Ctrl+Alt+←");
+        assert_eq!(windows_label("ctrl-pagedown"), "Ctrl+PgDn");
+        assert_eq!(windows_label("ctrl-home"), "Ctrl+Home");
+        assert_eq!(windows_label("ctrl-f4"), "Ctrl+F4");
+        assert_eq!(windows_label("alt-1"), "Alt+1");
+        assert_eq!(windows_label("ctrl-+"), "Ctrl++");
+        assert_eq!(windows_label("alt-`"), "Alt+`");
     }
 
     #[test]

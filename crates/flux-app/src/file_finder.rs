@@ -31,12 +31,19 @@ actions!(file_finder, [Toggle]);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(16);
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-p", Toggle, Some("Workspace"))]);
+    crate::keymap::bind_keys(cx, [KeyBinding::new("cmd-p", Toggle, Some("Workspace"))]);
 }
 
 pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let Some(root) = workspace.root().map(Path::to_path_buf) else {
-        workspace.show_message(tr("No project folder — open one with ⌘O").into(), cx);
+        workspace.show_message(
+            trf(
+                "No project folder — open one with {0}",
+                &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+            )
+            .into(),
+            cx,
+        );
         return;
     };
     let weak = cx.entity().downgrade();

@@ -36,10 +36,13 @@ actions!(
 
 pub fn init(cx: &mut App) {
     let context = Some("ClaudeChat");
-    cx.bind_keys([
-        KeyBinding::new("cmd-c", CopySelection, context),
-        KeyBinding::new("escape", ClearSelection, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-c", CopySelection, context),
+            KeyBinding::new("escape", ClearSelection, context),
+        ],
+    );
 }
 
 /// A place in a message's text: the text's index in drawing order, a byte in it.

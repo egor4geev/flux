@@ -323,17 +323,20 @@ enum Reattach {
 /// Installs the Flux dialog as the window prompt builder: every `window.prompt` is drawn by it.
 pub fn init(cx: &mut App) {
     let context = Some("Dialog");
-    cx.bind_keys([
-        KeyBinding::new("enter", Confirm, context),
-        KeyBinding::new("space", Confirm, context),
-        KeyBinding::new("escape", Cancel, context),
-        KeyBinding::new("cmd-d", PressDanger, context),
-        KeyBinding::new("tab", NextButton, context),
-        KeyBinding::new("right", NextButton, context),
-        KeyBinding::new("shift-tab", PreviousButton, context),
-        KeyBinding::new("left", PreviousButton, context),
-        KeyBinding::new("cmd-c", CopyDetails, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, context),
+            KeyBinding::new("space", Confirm, context),
+            KeyBinding::new("escape", Cancel, context),
+            KeyBinding::new("cmd-d", PressDanger, context),
+            KeyBinding::new("tab", NextButton, context),
+            KeyBinding::new("right", NextButton, context),
+            KeyBinding::new("shift-tab", PreviousButton, context),
+            KeyBinding::new("left", PreviousButton, context),
+            KeyBinding::new("cmd-c", CopyDetails, context),
+        ],
+    );
     cx.set_prompt_builder(build);
 }
 

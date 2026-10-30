@@ -56,11 +56,14 @@ const UNDERLINE_THICKNESS: f32 = 1.;
 
 pub fn init(cx: &mut App) {
     let context = Some("Editor");
-    cx.bind_keys([
-        // As in JetBrains: Next / Previous Highlighted Error.
-        KeyBinding::new("f2", NextProblem, context),
-        KeyBinding::new("shift-f2", PreviousProblem, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            // As in JetBrains: Next / Previous Highlighted Error.
+            KeyBinding::new("f2", NextProblem, context),
+            KeyBinding::new("shift-f2", PreviousProblem, context),
+        ],
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
