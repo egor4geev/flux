@@ -1385,7 +1385,12 @@ mod tests {
             text.starts_with("Flux crash report\n\nTime: 2026-10-15 14:03:12\n"),
             "{text}"
         );
-        assert!(text.contains("\nmacOS: macOS 26.1 (25B78)\nHardware: Apple M3 Pro, arm64\n"));
+        // The line is labeled with the system's name: "macOS:", on Windows "Windows:".
+        let system = format!(
+            "\n{}: macOS 26.1 (25B78)\nHardware: Apple M3 Pro, arm64\n",
+            crate::feedback::SYSTEM_NAME
+        );
+        assert!(text.contains(&system), "{text}");
         assert!(
             text.contains("\nMessage:\n    index out of bounds"),
             "{text}"

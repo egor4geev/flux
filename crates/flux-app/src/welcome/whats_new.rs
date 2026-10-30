@@ -578,8 +578,9 @@ mod tests {
         let home = Some("/Users/someone".into());
         assert_eq!(
             last_version_path(None, false, home.clone()),
-            Some(PathBuf::from(
-                "/Users/someone/Library/Application Support/flux/last-version"
+            Some(crate::settings::support_file(
+                "/Users/someone",
+                "last-version"
             ))
         );
         assert_eq!(

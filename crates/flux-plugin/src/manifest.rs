@@ -968,9 +968,11 @@ impl RawPermissions {
             }
         }
         for folder in &self.folders {
+            // A full path of the system counts too: `C:\Users\me\notes` on Windows.
             if !(folder.path.starts_with("~/")
                 || folder.path == "~"
-                || folder.path.starts_with('/'))
+                || folder.path.starts_with('/')
+                || flux_platform::PathStyle::NATIVE.is_absolute(&folder.path))
             {
                 return error(format!(
                     "permissions.folders: \"{}\" — an absolute path or one in the home folder \

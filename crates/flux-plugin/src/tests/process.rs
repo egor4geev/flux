@@ -88,6 +88,8 @@ fn running(pattern: &str) -> bool {
 /// Whether a program with this command line runs: Windows has no `pgrep`, PowerShell asks WMI.
 #[cfg(windows)]
 fn running(pattern: &str) -> bool {
+    // The program may be started by its full path: `"C:\…\sleep.exe" 31.517`.
+    let pattern = pattern.replace(' ', "*");
     let script = format!(
         "if (Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and \
          $_.CommandLine -like '*{pattern}*' }}) {{ exit 0 }} else {{ exit 1 }}"

@@ -631,6 +631,8 @@ mod tests {
 
     #[test]
     fn long_paths_are_shortened_in_the_middle() {
+        // macOS paths, split on `/` whatever the system (Windows ones: the test above).
+        let shorten_path = |path, max_chars| shorten_path_with(path, max_chars, '/');
         assert_eq!(shorten_path("~/dev/flux", 44), "~/dev/flux");
         let scratch = "/private/tmp/claude-501/-Users-me-dev/fc0c1149-64b3/scratchpad/wt-start";
         let short = shorten_path(scratch, 32);

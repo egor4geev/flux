@@ -766,9 +766,7 @@ mod tests {
         assert_eq!(store_path_for(None, true, home.clone()), None);
         assert_eq!(
             store_path_for(None, false, home),
-            Some(PathBuf::from(
-                "/Users/u/Library/Application Support/flux/contexts.json"
-            ))
+            Some(crate::settings::support_file("/Users/u", "contexts.json"))
         );
     }
 

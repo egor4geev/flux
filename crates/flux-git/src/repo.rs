@@ -55,7 +55,8 @@ impl Repo {
         } else {
             dir.join(common)
         };
-        let canonical = |path: PathBuf| fs::canonicalize(&path).unwrap_or(path);
+        let canonical =
+            |path: PathBuf| flux_platform::path_style::canonicalize(&path).unwrap_or(path);
         Some(Repo {
             work_dir: canonical(work_dir),
             git_dir: canonical(git_dir),
@@ -167,7 +168,7 @@ pub(crate) mod tests {
     #[test]
     fn a_repository_is_found_from_inside() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let repo = init_repo(&root);
         assert_eq!(repo.work_dir, root);
         assert_eq!(repo.git_dir, root.join(".git"));
@@ -186,7 +187,7 @@ pub(crate) mod tests {
     #[test]
     fn nested_repositories_are_found_under_the_root() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         for name in ["app", "libs/core", "node_modules/pkg"] {
             let path = root.join(name);
             fs::create_dir_all(&path).unwrap();

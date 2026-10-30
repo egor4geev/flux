@@ -577,9 +577,7 @@ mod tests {
         let home = Some(OsString::from("/Users/me"));
         assert_eq!(
             store_path_for(None, false, home.clone()),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/projects.json"
-            ))
+            Some(crate::settings::support_file("/Users/me", "projects.json"))
         );
         assert_eq!(store_path_for(None, true, home.clone()), None);
         assert_eq!(

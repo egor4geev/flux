@@ -2358,9 +2358,7 @@ mod tests {
         let home = Some(OsString::from("/Users/me"));
         assert_eq!(
             servers_dir_for(None, home.clone()),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/servers"
-            ))
+            Some(crate::settings::support_file("/Users/me", "servers"))
         );
         assert_eq!(
             servers_dir_for(Some("/tmp/servers".into()), home.clone()),
@@ -2368,9 +2366,7 @@ mod tests {
         );
         assert_eq!(
             servers_dir_for(Some("".into()), home),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/servers"
-            ))
+            Some(crate::settings::support_file("/Users/me", "servers"))
         );
         assert_eq!(servers_dir_for(None, None), None);
     }

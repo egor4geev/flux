@@ -652,16 +652,23 @@ mod tests {
 
     #[test]
     fn file_urls_are_paths() {
+        // Windows writes the path with `\`, a host is a share's.
+        let windows = PathStyle::NATIVE == PathStyle::Windows;
+        let notes = if windows {
+            r"\Users\me\My Notes\a.md"
+        } else {
+            "/Users/me/My Notes/a.md"
+        };
         assert_eq!(
             link("file:///Users/me/My%20Notes/a.md", "Users"),
             Some((
                 "file:///Users/me/My%20Notes/a.md".into(),
-                path("/Users/me/My Notes/a.md", None, None)
+                path(notes, None, None)
             ))
         );
         assert_eq!(
             file_url_path("file://host/tmp/x").as_deref(),
-            Some("/tmp/x")
+            Some(if windows { r"\\host\tmp\x" } else { "/tmp/x" })
         );
     }
 
@@ -771,7 +778,13 @@ mod tests {
             (link.start, link.end),
             (GridPoint::new(0, 5), GridPoint::new(0, 12))
         );
-        assert_eq!(link.target, path("/tmp/My a.rs", None, None));
+        // On Windows the host's share.
+        let file = if PathStyle::NATIVE == PathStyle::Windows {
+            r"\\host\tmp\My a.rs"
+        } else {
+            "/tmp/My a.rs"
+        };
+        assert_eq!(link.target, path(file, None, None));
     }
 
     #[test]

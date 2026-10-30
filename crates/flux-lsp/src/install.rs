@@ -1461,6 +1461,8 @@ mod tests {
             }
         }
 
+        // The fixtures of macOS releases only.
+        #[cfg(unix)]
         fn write(&self, relative: &str, contents: impl AsRef<[u8]>) -> PathBuf {
             let path = self.root.path().join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1469,6 +1471,7 @@ mod tests {
         }
 
         /// A tarball at `relative` with `entries` (path, contents, executable).
+        #[cfg(unix)]
         fn tarball(&self, relative: &str, entries: &[(&str, &str)]) -> PathBuf {
             let source = tempfile::tempdir().unwrap();
             for (path, contents) in entries {
@@ -1507,6 +1510,8 @@ mod tests {
     }
 
     #[test]
+    // The fixture is a macOS release: a tarball of a shell script that runs as the program.
+    #[cfg(unix)]
     fn github_release_install_with_checksum_and_progress() {
         let fixture = Fixture::new();
         let arch = github_arch().unwrap();
@@ -1573,6 +1578,8 @@ mod tests {
     }
 
     #[test]
+    // The fixture is a macOS release: a tarball of a shell script that runs as the program.
+    #[cfg(unix)]
     fn bad_checksums_and_missing_assets_fail_cleanly() {
         let fixture = Fixture::new();
         let arch = github_arch().unwrap();
@@ -1638,6 +1645,8 @@ mod tests {
     }
 
     #[test]
+    // The fixture is the macOS and Linux Node.js: a `.tar.xz` with `bin/node` (Windows': a `.zip`).
+    #[cfg(unix)]
     fn node_downloads_from_its_dist_with_checksum() {
         // Node.js itself, from a fake dist: index, checksums, tarball with bin/node.
         let fixture = Fixture::new();
@@ -1713,7 +1722,8 @@ mod tests {
             "tool",
             Install::GitHubRelease {
                 repo: "acme/tool".into(),
-                asset: "tool".into(),
+                // Named for the Rust target: Windows has its own asset.
+                asset: "tool-{arch}-apple-darwin.tar.gz".into(),
                 bin: "tool".into(),
             },
         );
@@ -1852,7 +1862,11 @@ mod tests {
             )
         };
         let old = tool("tool-1.gz");
-        let bin = dir.path().join("tool/bin/tool");
+        let bin = dir
+            .path()
+            .join("tool")
+            .join("bin")
+            .join(program_name("tool", WINDOWS));
         fs::create_dir_all(bin.parent().unwrap()).unwrap();
         fs::write(&bin, "").unwrap();
         make_executable(&bin).unwrap();
@@ -1869,7 +1883,7 @@ mod tests {
     #[test]
     fn npm_servers_of_the_same_packages_share_an_install() {
         let dir = tempfile::tempdir().unwrap();
-        let node = dir.path().join("node/bin/node");
+        let node = NodePaths::of(&dir.path().join("node"), WINDOWS).node;
         fs::create_dir_all(node.parent().unwrap()).unwrap();
         fs::write(&node, "").unwrap();
         make_executable(&node).unwrap();
@@ -1886,7 +1900,7 @@ mod tests {
         let html = server("vscode-html-language-server", "vscode-html-language-server");
         let home = dir.path().join("vscode-json-language-server");
         for bin in ["vscode-json-language-server", "vscode-html-language-server"] {
-            let path = home.join("node_modules/.bin").join(bin);
+            let path = npm_command(&home, bin, WINDOWS);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, "").unwrap();
             make_executable(&path).unwrap();
@@ -1902,7 +1916,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             installed_in(dir.path(), &html),
-            Some(home.join("node_modules/.bin/vscode-html-language-server"))
+            Some(npm_command(&home, "vscode-html-language-server", WINDOWS))
         );
         assert_eq!(
             installed_version(&installed_home(dir.path(), &html).unwrap().0, &html).as_deref(),
@@ -1926,9 +1940,15 @@ mod tests {
             packages: vec!["pyright".into()],
             bin: "pyright-langserver".into(),
         };
+        // On Windows npm's `.cmd` and the `.exe`.
+        let (npm_bin, exe) = if WINDOWS {
+            ("pyright-langserver.cmd", "rust-analyzer.exe")
+        } else {
+            ("pyright-langserver", "rust-analyzer")
+        };
         assert_eq!(
             command_path(dir, "pyright", &npm),
-            Path::new("/servers/pyright/node_modules/.bin/pyright-langserver")
+            Path::new("/servers/pyright/node_modules/.bin").join(npm_bin)
         );
         let rustup = Install::Rustup {
             component: "rust-analyzer".into(),
@@ -1940,7 +1960,7 @@ mod tests {
         };
         assert_eq!(
             command_path(dir, "rust-analyzer", &rustup),
-            Path::new("/servers/rust-analyzer/bin/rust-analyzer")
+            Path::new("/servers/rust-analyzer/bin").join(exe)
         );
     }
 }

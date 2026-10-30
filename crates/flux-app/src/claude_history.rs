@@ -897,8 +897,9 @@ mod tests {
         );
         assert_eq!(
             file_path_for("claude-console.json", None, false, Some("/Users/me".into())),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/claude-console.json"
+            Some(crate::settings::support_file(
+                "/Users/me",
+                "claude-console.json"
             ))
         );
         fs::remove_dir_all(dir).ok();
@@ -914,8 +915,9 @@ mod tests {
         assert_eq!(store_path_for(None, true, home.clone()), None);
         assert_eq!(
             store_path_for(None, false, home),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/claude-sessions.json"
+            Some(crate::settings::support_file(
+                "/Users/me",
+                "claude-sessions.json"
             ))
         );
     }

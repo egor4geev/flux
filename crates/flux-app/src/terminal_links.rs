@@ -233,8 +233,19 @@ mod tests {
     fn a_location_printed_by_a_program_opens_its_file() {
         let sandbox = Sandbox::new("pty");
         let script = "printf 'error: src/main.rs:12:5: oops'; sleep 2";
+        // A POSIX shell: on Windows Git's, found on `PATH` as git is.
+        let sh = if cfg!(windows) {
+            std::env::var_os("PATH")
+                .and_then(|path| flux_platform::process::find_in_path("sh", &path))
+                .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Git\bin\sh.exe"))
+        } else {
+            PathBuf::from("/bin/sh")
+        };
         let options = flux_term::TerminalOptions {
-            command: Some(("/bin/sh".into(), vec!["-c".into(), script.into()])),
+            command: Some((
+                sh.to_string_lossy().into_owned(),
+                vec!["-c".into(), script.into()],
+            )),
             cwd: Some(sandbox.0.clone()),
             ..Default::default()
         };

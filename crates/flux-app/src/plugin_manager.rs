@@ -2470,6 +2470,12 @@ authors = ["Someone", "Another"]
 
     #[test]
     fn permissions_read_in_plain_words() {
+        // Worded for the system: Windows says "this computer".
+        let server = if cfg!(windows) {
+            "Accept connections from programs on this computer"
+        } else {
+            "Accept connections from programs on this Mac"
+        };
         assert_eq!(
             lines(
                 "project = \"write\"\nnetwork = [\"api.tracker.yandex.net\", \"*.yandex.ru\"]\n\
@@ -2485,7 +2491,7 @@ authors = ["Someone", "Another"]
                     "Connect to api.tracker.yandex.net, *.yandex.ru".into(),
                     false
                 ),
-                ("Accept connections from programs on this Mac".into(), false),
+                (server.into(), false),
                 ("Run programs: git, gh".into(), false),
                 ("Read the folder ~/.config/gh".into(), false),
                 ("Read and change the folder /tmp/x".into(), false),

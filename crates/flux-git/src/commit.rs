@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn only_checked_files_are_committed() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let repo = init_repo(&root);
         fs::write(root.join("a.txt"), "a\n").unwrap();
         fs::write(root.join("b.txt"), "b\n").unwrap();
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn partial_content_is_committed_and_the_rest_stays_changed() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let repo = init_repo(&root);
         fs::write(root.join("a.txt"), "1\n2\n3\n").unwrap();
         commit(&repo, &request(vec![whole("a.txt")]), &Cancel::new()).unwrap();

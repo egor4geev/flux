@@ -1371,10 +1371,15 @@ mod tests {
         let cli = Cli {
             path: PathBuf::from("/opt/homebrew/bin/claude"),
         };
+        // The terminal's shell: on Windows PowerShell, which runs a program after `&`.
+        let call = if cfg!(windows) { "& " } else { "" };
         assert_eq!(
             resume_command(&cli, Some("3615c7de-b3bc")),
-            "/opt/homebrew/bin/claude --resume 3615c7de-b3bc"
+            format!("{call}/opt/homebrew/bin/claude --resume 3615c7de-b3bc")
         );
-        assert_eq!(resume_command(&cli, None), "/opt/homebrew/bin/claude");
+        assert_eq!(
+            resume_command(&cli, None),
+            format!("{call}/opt/homebrew/bin/claude")
+        );
     }
 }

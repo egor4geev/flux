@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn push_to_a_local_remote() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let server = root.join("server.git");
         crate::cli::GitCommand::new(&root)
             .args(["init", "-q", "--bare", "-b", "main", "server.git"])

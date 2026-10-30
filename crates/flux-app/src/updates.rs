@@ -1124,9 +1124,7 @@ mod tests {
     fn the_state_file_lives_next_to_the_settings() {
         assert_eq!(
             state_path_for(None, false, Some("/Users/me".into())),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/updates.json"
-            ))
+            Some(crate::settings::support_file("/Users/me", "updates.json"))
         );
         assert_eq!(
             state_path_for(Some("/tmp/u.json".into()), true, None),

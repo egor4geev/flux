@@ -430,7 +430,8 @@ mod tests {
 
     fn target(path: &str, line: u32, from: u32, to: u32) -> NavTarget {
         NavTarget {
-            path: PathBuf::from(path),
+            // The path the URI names: on Windows `/p/a.rs` is a file of the current drive.
+            path: std::path::absolute(path).unwrap(),
             range: range(line, from, to),
         }
     }

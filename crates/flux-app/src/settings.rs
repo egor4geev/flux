@@ -874,6 +874,19 @@ fn store_path_for(
     Some(flux_platform::paths::support_dir_in(std::path::Path::new(&home?)).join("settings.json"))
 }
 
+/// A file of the support folder of a user whose home is `home`, as each system writes it: what the
+/// tests of the files kept there expect.
+#[cfg(test)]
+pub(crate) fn support_file(home: &str, name: &str) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from(format!("{home}/Library/Application Support/flux/{name}"))
+    } else if cfg!(windows) {
+        PathBuf::from(format!(r"{home}\AppData\Local\Flux\{name}"))
+    } else {
+        PathBuf::from(format!("{home}/.local/share/flux/{name}"))
+    }
+}
+
 /// Broken files fall back to the defaults.
 #[cfg(test)]
 fn parse(text: &str) -> Settings {
@@ -1375,9 +1388,7 @@ mod tests {
         let home = Some(OsString::from("/Users/me"));
         assert_eq!(
             store_path_for(None, false, home.clone()),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/settings.json"
-            ))
+            Some(crate::settings::support_file("/Users/me", "settings.json"))
         );
         assert_eq!(store_path_for(None, true, home.clone()), None);
         assert_eq!(

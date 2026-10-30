@@ -418,7 +418,9 @@ mod tests {
         );
         assert!(resolve(Some(root), "  ").is_err());
         assert!(resolve(None, "src/main.rs").is_err());
-        assert_eq!(resolve(None, "/tmp/x"), Ok(PathBuf::from("/tmp/x")));
+        // Without a project only a full path of the system does.
+        let absolute = if cfg!(windows) { r"C:\tmp\x" } else { "/tmp/x" };
+        assert_eq!(resolve(None, absolute), Ok(PathBuf::from(absolute)));
     }
 
     #[test]

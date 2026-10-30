@@ -17,7 +17,7 @@ pub(crate) struct Sandbox {
 impl Sandbox {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         Self { _dir: dir, root }
     }
 

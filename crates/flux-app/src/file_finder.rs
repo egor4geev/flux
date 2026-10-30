@@ -277,7 +277,13 @@ mod tests {
     fn path_splits_into_name_and_directory() {
         let got = row("crates/flux-app/src/editor.rs", &[0, 16, 20, 21]);
         assert_eq!(got.name, "editor.rs");
-        assert_eq!(got.dir, "crates/flux-app/src");
+        // The directory in the system's separators.
+        let dir = if cfg!(windows) {
+            r"crates\flux-app\src"
+        } else {
+            "crates/flux-app/src"
+        };
+        assert_eq!(got.dir, dir);
         // 20, 21 are "ed" in the name (the name starts at the 20th character); 0 and 16 are in the
         // directory.
         assert_eq!(got.name_positions, vec![0, 1]);

@@ -190,11 +190,23 @@ mod tests {
         dir
     }
 
+    /// A full path of the system: `/a/one`, on Windows `C:\a\one`.
+    fn full(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", path.replace('/', "\\"))
+        } else {
+            path.to_string()
+        }
+    }
+
     #[test]
     fn parse_skips_blanks_relative_paths_and_repeats() {
-        let text = "/a/one\n\nrelative/two\n/a/one\r\n/b/three\n";
-        assert_eq!(parse(text), paths(&["/a/one", "/b/three"]));
-        let many: String = (0..MAX_RECENT + 5).map(|n| format!("/p/{n}\n")).collect();
+        let (one, three) = (full("/a/one"), full("/b/three"));
+        let text = format!("{one}\n\nrelative/two\n{one}\r\n{three}\n");
+        assert_eq!(parse(&text), paths(&[&one, &three]));
+        let many: String = (0..MAX_RECENT + 5)
+            .map(|n| full(&format!("/p/{n}")) + "\n")
+            .collect();
         assert_eq!(parse(&many).len(), MAX_RECENT);
     }
 
@@ -230,8 +242,9 @@ mod tests {
         let home = Some(OsString::from("/Users/me"));
         assert_eq!(
             store_path_for(None, false, home.clone()),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/recent-projects"
+            Some(crate::settings::support_file(
+                "/Users/me",
+                "recent-projects"
             ))
         );
         assert_eq!(store_path_for(None, true, home.clone()), None);
@@ -241,8 +254,9 @@ mod tests {
         );
         assert_eq!(
             store_path_for(Some(OsString::new()), false, home),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/recent-projects"
+            Some(crate::settings::support_file(
+                "/Users/me",
+                "recent-projects"
             ))
         );
         assert_eq!(store_path_for(None, false, None), None);

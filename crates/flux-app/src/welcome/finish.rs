@@ -522,6 +522,8 @@ fn read_recent_menu(text: &str, modified: u64) -> Vec<(u64, PathBuf)> {
         .iter()
         .filter(|item| item["id"] == "openRecentFolder" && item["uri"]["scheme"] == "file")
         .filter_map(|item| item["uri"]["path"].as_str())
+        // A URI's path: on Windows `/c:/Users/me/dev` is `C:\Users\me\dev`.
+        .filter_map(|path| flux_platform::PathStyle::NATIVE.file_url_path("", path))
         .enumerate()
         .map(|(index, path)| {
             (
@@ -535,6 +537,28 @@ fn read_recent_menu(text: &str, modified: u64) -> Vec<(u64, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full path as the IDEs of this system write it: `/p/a`, on Windows `C:/p/a`.
+    fn written(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
+    /// The path Flux keeps for it: on Windows `C:\p\a`.
+    fn kept(path: &str) -> PathBuf {
+        PathBuf::from(
+            flux_platform::PathStyle::NATIVE
+                .native(&written(path))
+                .as_ref(),
+        )
+    }
+
+    fn xml() -> String {
+        XML.replace("/Volumes/work/api", &written("/Volumes/work/api"))
+    }
 
     const XML: &str = r#"<application>
   <component name="RecentProjectsManager">
@@ -569,18 +593,15 @@ mod tests {
 
     #[test]
     fn xml_entries_carry_their_times_and_the_home_folder() {
-        let home = Path::new("/Users/someone");
-        let found = read_recent_xml(XML, 1_750_000_000_000, Some(home));
+        let home = kept("/Users/someone");
+        let found = read_recent_xml(&xml(), 1_750_000_000_000, Some(&home));
         assert_eq!(
             found,
             vec![
-                (1_700_000_000_000, PathBuf::from("/Users/someone/dev/old")),
-                (
-                    1_760_000_000_000,
-                    PathBuf::from("/Users/someone/dev/R&D tools")
-                ),
+                (1_700_000_000_000, kept("/Users/someone/dev/old")),
+                (1_760_000_000_000, kept("/Users/someone/dev/R&D tools")),
                 // No time of its own: just before the file's change.
-                (1_749_999_999_999, PathBuf::from("/Volumes/work/api")),
+                (1_749_999_999_999, kept("/Volumes/work/api")),
             ]
         );
     }
@@ -595,11 +616,8 @@ mod tests {
       </list>
     </option>
   </component></application>"#;
-        let found = read_recent_xml(xml, 1000, Some(Path::new("/h")));
-        assert_eq!(
-            found,
-            vec![(999, PathBuf::from("/h/a")), (998, PathBuf::from("/h/b"))]
-        );
+        let found = read_recent_xml(xml, 1000, Some(&kept("/h")));
+        assert_eq!(found, vec![(999, kept("/h/a")), (998, kept("/h/b"))]);
         // Without a home folder, `$USER_HOME$` paths can't be told.
         assert!(read_recent_xml(xml, 1000, None).is_empty());
     }
@@ -616,11 +634,17 @@ mod tests {
                 {"id": "openRecentFolder", "uri": {"path": "/Users/someone/dev/api", "scheme": "file"}}
             ]}}
         ]}}}}"#;
+        // The URIs' paths: on Windows with the drive, `/c:/Users/…`.
+        let json = if cfg!(windows) {
+            json.replace("\"/Users/", "\"/c:/Users/")
+        } else {
+            json.to_string()
+        };
         assert_eq!(
-            read_recent_menu(json, 5000),
+            read_recent_menu(&json, 5000),
             vec![
-                (4999, PathBuf::from("/Users/someone/dev/flux")),
-                (4998, PathBuf::from("/Users/someone/dev/api")),
+                (4999, kept("/Users/someone/dev/flux")),
+                (4998, kept("/Users/someone/dev/api")),
             ]
         );
         assert!(read_recent_menu("not json", 5000).is_empty());
@@ -635,8 +659,12 @@ mod tests {
         fs::create_dir_all(&options).unwrap();
         fs::write(
             options.join("recentProjects.xml"),
-            r#"<map><entry key="/p/older"><option name="activationTimestamp" value="10" /></entry>
-<entry key="/p/shared"><option name="activationTimestamp" value="30" /></entry></map>"#,
+            format!(
+                r#"<map><entry key="{}"><option name="activationTimestamp" value="10" /></entry>
+<entry key="{}"><option name="activationTimestamp" value="30" /></entry></map>"#,
+                written("/p/older"),
+                written("/p/shared")
+            ),
         )
         .unwrap();
         let (vendor, prefix) = XML_IDE_VENDOR;
@@ -644,7 +672,10 @@ mod tests {
         fs::create_dir_all(&studio).unwrap();
         fs::write(
             studio.join("recentProjects.xml"),
-            r#"<entry key="/p/newest"><option name="projectOpenTimestamp" value="40" /></entry>"#,
+            format!(
+                r#"<entry key="{}"><option name="projectOpenTimestamp" value="40" /></entry>"#,
+                written("/p/newest")
+            ),
         )
         .unwrap();
         // Another vendor folder that isn't an IDE of the list.
@@ -652,25 +683,24 @@ mod tests {
         fs::create_dir_all(&other).unwrap();
         fs::write(
             other.join("recentProjects.xml"),
-            r#"<entry key="/p/not-an-ide"><option name="projectOpenTimestamp" value="99" /></entry>"#,
+            format!(
+                r#"<entry key="{}"><option name="projectOpenTimestamp" value="99" /></entry>"#,
+                written("/p/not-an-ide")
+            ),
         )
         .unwrap();
         let found = other_projects(&support);
         assert_eq!(
             found,
-            vec![
-                PathBuf::from("/p/newest"),
-                PathBuf::from("/p/shared"),
-                PathBuf::from("/p/older"),
-            ]
+            vec![kept("/p/newest"), kept("/p/shared"), kept("/p/older")]
         );
         fs::remove_dir_all(&support).ok();
     }
 
     #[test]
     fn macros_other_than_the_home_folder_are_skipped() {
-        assert_eq!(expand("/abs/path", None), Some(PathBuf::from("/abs/path")));
-        assert_eq!(expand("$PROJECT_DIR$/x", Some(Path::new("/h"))), None);
+        assert_eq!(expand(&written("/abs/path"), None), Some(kept("/abs/path")));
+        assert_eq!(expand("$PROJECT_DIR$/x", Some(&kept("/h"))), None);
         assert_eq!(expand("relative/path", None), None);
         assert_eq!(unescape("a &amp; b &quot;c&quot;"), "a & b \"c\"");
     }
