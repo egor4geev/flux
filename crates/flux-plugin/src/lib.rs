@@ -13,8 +13,7 @@
 //!   ([`runtime::PluginMessage`]); limits on time and memory; the sandbox. `host` answers the
 //!   API's functions on the plugin's side of the thread: what needs the window becomes a message,
 //!   the rest (the network, the server, programs, timers, secrets) is done right there.
-//! - [`secrets`] — the plugins' secrets, kept by Flux encrypted ([`keychain`] — where they were
-//!   before).
+//! - [`secrets`] — the plugins' secrets, kept by Flux encrypted.
 //! - [`api`] — the types of the WIT interfaces, shared with the window.
 //! - [`log`], [`locales`], [`dev`], [`paths`] — the plugin's log, its translations, building a
 //!   plugin under development, where everything lives on disk.
@@ -25,7 +24,6 @@ pub(crate) mod compat;
 pub mod dev;
 mod host;
 pub mod install;
-pub(crate) mod keychain;
 pub mod locales;
 pub mod log;
 pub mod manifest;
@@ -54,8 +52,7 @@ pub fn supports_api(api: &str) -> bool {
 }
 
 /// A plugin's secret, as its `secrets.get` reads it: Settings keeps a plugin's `secret` settings
-/// there (API 0.3). It may wait for another Flux writing them, and the first time for the secrets
-/// to move from the keychain (macOS may ask the user) — call it off the UI thread.
+/// there (API 0.3). It may wait for another Flux writing them — call it off the UI thread.
 pub fn plugin_secret(plugin: &str, key: &str) -> Result<Option<String>, String> {
     secrets::get(&secrets::service(plugin), key)
 }

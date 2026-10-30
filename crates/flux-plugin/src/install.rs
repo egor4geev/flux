@@ -107,8 +107,8 @@ fn install_unpacked(entry: &PluginEntry, unpacked: &Path) -> Result<PluginEntry,
     load_dir(&target, PluginSource::Installed)
 }
 
-/// Removes an installed plugin's folder and its secrets (with any of its items left in the
-/// keychain; best effort: the plugin is gone either way); its data (`paths::data_dir`) stays, as
+/// Removes an installed plugin's folder and its secrets (best effort: the plugin is gone either
+/// way); its data (`paths::data_dir`) stays, as
 /// JetBrains IDEs keep a removed plugin's settings. A plugin under development is only unlinked by
 /// the caller; a bundled one can't be removed.
 pub fn uninstall(entry: &PluginEntry) -> Result<(), String> {

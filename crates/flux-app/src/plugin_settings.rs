@@ -533,8 +533,8 @@ impl PluginSettingsPage {
 
     // --- Secrets, buttons, status lines (API 0.3) ---
 
-    /// Whether the secrets of the page are saved: read in the background (the first read may wait
-    /// for them to move from the keychain, which may ask the user).
+    /// Whether the secrets of the page are saved: read in the background (a read may wait for
+    /// another Flux writing them).
     fn read_secrets(&mut self, cx: &mut Context<Self>) {
         for index in 0..self.fields.len() {
             if !matches!(self.fields[index].state, FieldState::Secret(_)) {

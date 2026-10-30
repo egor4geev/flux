@@ -173,7 +173,7 @@ fn main() {
         unsafe { std::env::set_var("FLUX_PLUGINS_HOME", home) };
     }
     // Nor the user's secrets: plugins' secrets go to a plain JSON file in the plugins' folder,
-    // which a scenario can read and fill (and nothing is moved from the keychain).
+    // which a scenario can read and fill.
     #[cfg(feature = "scenario")]
     if std::env::var_os("FLUX_SCENARIO").is_some()
         && std::env::var_os("FLUX_PLUGIN_SECRETS_FILE").is_none()
