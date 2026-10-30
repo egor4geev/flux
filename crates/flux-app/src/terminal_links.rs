@@ -230,6 +230,10 @@ mod tests {
     /// The way of a ⌘-click without the mouse: a location a program printed, found in the real grid
     /// by the terminal, resolved against the shell's directory.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "ConPTY may put a program's first line below the top row (it clears the screen first)"
+    )]
     fn a_location_printed_by_a_program_opens_its_file() {
         let sandbox = Sandbox::new("pty");
         let script = "printf 'error: src/main.rs:12:5: oops'; sleep 2";
