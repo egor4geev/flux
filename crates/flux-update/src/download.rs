@@ -154,9 +154,14 @@ pub(crate) mod tests {
         platforms.insert(
             platform_key(),
             Platform {
+                // `/` between the names on Windows too: the URL's last one is the file's.
                 url: format!(
                     "file://{}",
-                    archive.display().to_string().replace(' ', "%20")
+                    archive
+                        .display()
+                        .to_string()
+                        .replace('\\', "/")
+                        .replace(' ', "%20")
                 ),
                 size: bytes.len() as u64,
                 sha256: sha256_hex(bytes),

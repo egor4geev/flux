@@ -116,13 +116,18 @@ pub(crate) mod tests {
         dir
     }
 
+    /// A relative path with `/` between its names, as the expectations spell it on every system.
+    fn slashed(path: &Path) -> String {
+        path.components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
     fn walk(root: &Path) -> Vec<String> {
         let found = Mutex::new(Vec::new());
         let summary = walk_files(root, &AtomicBool::new(false), |path| {
-            found
-                .lock()
-                .unwrap()
-                .push(path.to_string_lossy().into_owned());
+            found.lock().unwrap().push(slashed(path));
         });
         let mut found = found.into_inner().unwrap();
         found.sort();
@@ -287,7 +292,7 @@ pub(crate) mod tests {
             match entry.kind {
                 flux_fs::EntryKind::Dir => list_tree(root, &path, entry.ignored, files),
                 flux_fs::EntryKind::File if !entry.ignored => {
-                    files.push(relative(root, &path).to_string_lossy().into_owned())
+                    files.push(slashed(relative(root, &path)))
                 }
                 flux_fs::EntryKind::File => {}
             }

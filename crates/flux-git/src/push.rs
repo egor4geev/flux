@@ -321,7 +321,7 @@ mod tests {
         fs::create_dir(&work).unwrap();
         let repo = init_repo(&work);
         repo.git()
-            .args(["remote", "add", "origin", server.to_str().unwrap()])
+            .args(["remote", "add", "origin", &crate::testing::url(&server)])
             .output()
             .unwrap();
         fs::write(work.join("a.txt"), "a\n").unwrap();

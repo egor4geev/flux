@@ -159,6 +159,8 @@ pub(crate) mod tests {
         git(&["config", "user.name", "Flux Test"]);
         git(&["config", "user.email", "test@flux.dev"]);
         git(&["config", "commit.gpgsign", "false"]);
+        // Git for Windows checks files out with `\r\n` by default.
+        git(&["config", "core.autocrlf", "false"]);
         Repo::discover(dir).unwrap()
     }
 

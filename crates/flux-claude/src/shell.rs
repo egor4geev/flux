@@ -476,9 +476,22 @@ mod tests {
     use futures::StreamExt;
     use futures::executor::block_on;
 
+    /// A POSIX shell to run the commands in: Git Bash on Windows.
+    fn sh() -> String {
+        if cfg!(windows) {
+            user_shell()
+        } else {
+            "/bin/sh".into()
+        }
+    }
+
+    /// How a command ended when Stop ended it: by a signal (no code), or on Windows, which has no
+    /// signals, by `taskkill` (code 1).
+    const STOPPED: Option<i32> = if cfg!(windows) { Some(1) } else { None };
+
     fn run(command: &str) -> (String, String, Option<i32>) {
         let cwd = std::env::temp_dir();
-        let (_, events) = spawn(command, &cwd, "/bin/sh", None).unwrap();
+        let (_, events) = spawn(command, &cwd, &sh(), None).unwrap();
         let events: Vec<ShellEvent> = block_on(events.collect());
         let (mut stdout, mut stderr, mut code) = (String::new(), String::new(), None);
         for event in events {
@@ -510,10 +523,12 @@ mod tests {
     fn the_command_runs_in_its_folder_with_the_given_environment() {
         let dir = tempfile::tempdir().unwrap();
         let env = [("FLUX_SHELL_PROBE".to_string(), "42".to_string())];
+        // Git Bash prints its own `/c/…` paths unless asked for the Windows one.
+        let pwd = if cfg!(windows) { "pwd -W" } else { "pwd" };
         let (_, events) = spawn(
-            "pwd; echo $FLUX_SHELL_PROBE",
+            &format!("{pwd}; echo $FLUX_SHELL_PROBE"),
             dir.path(),
-            "/bin/sh",
+            &sh(),
             Some(&env),
         )
         .unwrap();
@@ -525,7 +540,14 @@ mod tests {
             })
             .collect();
         let real = dir.path().canonicalize().unwrap();
-        assert_eq!(stdout, format!("{}\n42\n", real.display()));
+        if cfg!(windows) {
+            // `C:/Users/RUNNER~1/…`: the same folder, spelled another way.
+            let (folder, rest) = stdout.split_once('\n').unwrap();
+            assert_eq!(Path::new(folder).canonicalize().unwrap(), real);
+            assert_eq!(rest, "42\n");
+        } else {
+            assert_eq!(stdout, format!("{}\n42\n", real.display()));
+        }
     }
 
     #[test]
@@ -533,7 +555,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let started = Instant::now();
         let (command, mut events) =
-            spawn("sleep 30 & sleep 30; echo never", &cwd, "/bin/sh", None).unwrap();
+            spawn("sleep 30 & sleep 30; echo never", &cwd, &sh(), None).unwrap();
         thread::sleep(Duration::from_millis(200));
         command.stop();
         let exited = block_on(async {
@@ -544,7 +566,7 @@ mod tests {
             }
             None
         });
-        assert_eq!(exited, Some(None), "ended by the signal");
+        assert_eq!(exited, Some(STOPPED), "ended by Stop");
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 

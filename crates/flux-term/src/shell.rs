@@ -173,10 +173,22 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_login_shell_is_an_absolute_path() {
         let (shell, args) = login_shell();
         assert!(shell.starts_with('/'), "{shell}");
         assert_eq!(args, ["-l"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_shell_is_powershell() {
+        let (shell, args) = login_shell();
+        assert!(
+            ["pwsh.exe", "powershell.exe"].contains(&shell.as_str()),
+            "{shell}"
+        );
+        assert_eq!(args, ["-NoLogo"]);
     }
 }

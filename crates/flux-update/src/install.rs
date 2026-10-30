@@ -457,6 +457,7 @@ fn run(command: &mut Command) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::Version;
     use crate::download::tests::temp_dir;
 
@@ -504,6 +505,8 @@ mod tests {
         ));
     }
 
+    // `/bin/sh` quoting for the macOS helper script.
+    #[cfg(unix)]
     #[test]
     fn quoting() {
         assert_eq!(quote("plain"), "'plain'");
@@ -646,6 +649,8 @@ mod tests {
         assert!(text.contains("not opening Flux"), "{text}");
     }
 
+    // The macOS helper is a `/bin/sh` script.
+    #[cfg(unix)]
     #[test]
     fn script_relaunches_with_arguments() {
         let prepared = Prepared {

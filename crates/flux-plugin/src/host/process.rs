@@ -673,6 +673,12 @@ mod tests {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
             .unwrap();
-        assert!(path.1.contains("/usr/bin"), "{}", path.1);
+        // The system's own programs are always there.
+        let system = if cfg!(windows) {
+            path.1.to_ascii_lowercase().contains(r"\windows\system32")
+        } else {
+            path.1.contains("/usr/bin")
+        };
+        assert!(system, "{}", path.1);
     }
 }

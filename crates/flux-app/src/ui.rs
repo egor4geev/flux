@@ -1199,12 +1199,17 @@ mod tests {
         let label = |action: &dyn Action| {
             label_binding(&keymap, action).map(|binding| shortcut_label(&binding).to_string())
         };
-        assert_eq!(label(&Commit).as_deref(), Some("⌘K"));
-        assert_eq!(label(&ClearTerminal).as_deref(), Some("⌘K"));
-        assert_eq!(label(&MentionSelection).as_deref(), Some("⌥⌘K"));
-        assert_eq!(label(&HideApp).as_deref(), Some("⌘H"));
+        // The keys as they are bound, in the system's labels.
+        let on = |mac, windows| match crate::keymap::KeyOs::current() {
+            crate::keymap::KeyOs::Mac => Some(mac),
+            crate::keymap::KeyOs::Windows => Some(windows),
+        };
+        assert_eq!(label(&Commit).as_deref(), on("⌘K", "Win+K"));
+        assert_eq!(label(&ClearTerminal).as_deref(), on("⌘K", "Win+K"));
+        assert_eq!(label(&MentionSelection).as_deref(), on("⌥⌘K", "Alt+Win+K"));
+        assert_eq!(label(&HideApp).as_deref(), on("⌘H", "Win+H"));
         // Bound in a panel first, at the window's level after: the window's key is shown.
-        assert_eq!(label(&NewTab).as_deref(), Some("⌃T"));
+        assert_eq!(label(&NewTab).as_deref(), on("⌃T", "Ctrl+T"));
         assert_eq!(label(&Unbound), None);
     }
 

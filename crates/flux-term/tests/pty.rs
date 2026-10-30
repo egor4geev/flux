@@ -34,12 +34,26 @@ fn spawn_in(
     Terminal::spawn(options).expect("spawn")
 }
 
+/// A POSIX shell: on Windows, Git Bash's (on the runners' `PATH`, as git's).
+fn sh() -> String {
+    if cfg!(windows) {
+        std::env::var_os("PATH")
+            .and_then(|path| flux_platform::process::find_in_path("sh", &path))
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Git\bin\sh.exe"))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        "/bin/sh".into()
+    }
+}
+
 fn spawn(script: &str) -> (Terminal, TerminalEvents) {
-    spawn_in("/bin/sh", &["-c", script], None, 40)
+    spawn_in(&sh(), &["-c", script], None, 40)
 }
 
 /// An interactive zsh without the user's startup files: it puts commands into their own process
 /// groups (job control), as the user's shell does.
+#[cfg(unix)]
 fn zsh(cwd: &Path) -> (Terminal, TerminalEvents) {
     let (terminal, events) = spawn_in("/bin/zsh", &["-f", "-i"], Some(cwd), 60);
     wait_until("the prompt", || {
@@ -62,6 +76,7 @@ fn screen(content: &Content) -> Vec<String> {
 }
 
 /// Waits until `done` holds, or fails after a few seconds.
+#[cfg(unix)]
 fn wait_until(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !done() {
@@ -141,6 +156,8 @@ fn resize_reaches_the_program() {
     wait_for(&terminal, |rows| rows.iter().any(|row| row == "7 33"));
 }
 
+// zsh's job control: Windows consoles have no foreground process group.
+#[cfg(unix)]
 #[test]
 fn the_foreground_process_follows_commands() {
     let dir = tempfile::tempdir().unwrap();
@@ -164,6 +181,8 @@ fn the_foreground_process_follows_commands() {
     });
 }
 
+// Windows doesn't tell another process's directory: the terminal keeps the one it started in.
+#[cfg(unix)]
 #[test]
 fn the_directory_follows_cd() {
     let dir = tempfile::tempdir().unwrap();
@@ -245,6 +264,8 @@ fn scroll_to_shows_a_line_from_the_history() {
     assert!(content.viewport_row(first.start.line).is_some());
 }
 
+// A raw tty: ConPTY turns input into console key events, a program doesn't read the bytes sent.
+#[cfg(unix)]
 #[test]
 fn paste_is_bracketed_when_the_program_asks() {
     let dir = tempfile::tempdir().unwrap();
@@ -262,6 +283,8 @@ fn paste_is_bracketed_when_the_program_asks() {
     assert_eq!(std::fs::read(&out).unwrap(), b"\x1b[200~a\nb\x1b[201~");
 }
 
+// A raw tty: ConPTY turns input into console key events, a program doesn't read the bytes sent.
+#[cfg(unix)]
 #[test]
 fn paste_turns_line_breaks_into_enter_otherwise() {
     let dir = tempfile::tempdir().unwrap();
@@ -283,7 +306,7 @@ fn links_in_live_output() {
     std::fs::create_dir(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
     let (terminal, _events) = spawn_in(
-        "/bin/sh",
+        &sh(),
         &["-c", "printf 'error at src/main.rs:3:7 here'; sleep 2"],
         Some(dir.path()),
         40,
@@ -340,6 +363,8 @@ fn search_in_live_output() {
     assert_eq!(results.matches.len(), 1);
 }
 
+// zsh's prompt and its own clear.
+#[cfg(unix)]
 #[test]
 fn clear_keeps_the_prompt_at_the_top() {
     let dir = tempfile::tempdir().unwrap();
@@ -379,6 +404,8 @@ fn clear_keeps_the_prompt_at_the_top() {
     }
 }
 
+// zsh's job control.
+#[cfg(unix)]
 #[test]
 fn clear_leaves_a_running_command_alone() {
     let dir = tempfile::tempdir().unwrap();
@@ -398,6 +425,8 @@ fn clear_leaves_a_running_command_alone() {
     terminal.input(b"\x03".to_vec());
 }
 
+// A raw tty; ConPTY takes focus reports for itself.
+#[cfg(unix)]
 #[test]
 fn focus_is_reported_when_the_program_asks() {
     let dir = tempfile::tempdir().unwrap();

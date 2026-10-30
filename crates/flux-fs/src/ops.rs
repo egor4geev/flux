@@ -45,7 +45,13 @@ pub fn create_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
         .write(true)
         .create_new(true)
         .open(&path)
-        .map_err(|err| describe(err, &path))?;
+        .map_err(|err| {
+            // Windows denies a new file over a folder instead of saying the name is taken.
+            if cfg!(windows) && err.kind() == ErrorKind::PermissionDenied && path.is_dir() {
+                return describe(ErrorKind::AlreadyExists.into(), &path);
+            }
+            describe(err, &path)
+        })?;
     Ok(path)
 }
 
@@ -284,7 +290,17 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows: the real path of each (`GetFinalPathNameByHandle`), with the file's own case; stable
+/// Rust has no file ids there.
+#[cfg(windows)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn same_file(_: &Path, _: &Path) -> bool {
     false
 }

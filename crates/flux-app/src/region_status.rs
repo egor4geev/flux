@@ -584,15 +584,23 @@ mod tests {
 
     #[test]
     fn the_tooltip_says_where_when_and_what_for_claude() {
+        // The country as the system names it ("Finland (FI)" on a Mac: `countries_have_names`).
+        let country = region_guard::country_label;
         let allowed = Verdict::Allowed(check("FI", Some("203.0.113.7")));
         assert_eq!(
             tooltip_text(&allowed),
-            "Finland (FI) · 203.0.113.7\nChecked just now\nClaude's requests are allowed"
+            format!(
+                "{} · 203.0.113.7\nChecked just now\nClaude's requests are allowed",
+                country("FI")
+            )
         );
         let blocked = Verdict::Blocked(check("RU", None));
         assert_eq!(
             tooltip_text(&blocked),
-            "Russia (RU)\nChecked just now\nClaude is blocked: the country is on your list"
+            format!(
+                "{}\nChecked just now\nClaude is blocked: the country is on your list",
+                country("RU")
+            )
         );
         let unknown = Verdict::Unknown(Failure {
             error: "offline".into(),

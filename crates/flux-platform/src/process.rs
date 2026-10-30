@@ -291,16 +291,26 @@ pub fn executable(pid: u32) -> Option<PathBuf> {
         if process.is_null() {
             return None;
         }
-        let mut buffer = vec![0u16; 32_768];
-        let mut len = buffer.len() as u32;
-        let read =
-            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut len);
-        CloseHandle(process);
-        if read == 0 {
-            return None;
+        // The name comes back through a counted string of at most 65 535 bytes: a buffer of 32 768
+        // characters (65 536 bytes) is more than it holds. A usual size first, then the most.
+        let mut path = None;
+        for size in [1024, 32_767] {
+            let mut buffer = vec![0u16; size];
+            let mut len = size as u32;
+            let read = QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                buffer.as_mut_ptr(),
+                &mut len,
+            );
+            if read != 0 {
+                buffer.truncate(len as usize);
+                path = Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer)));
+                break;
+            }
         }
-        buffer.truncate(len as usize);
-        Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
+        CloseHandle(process);
+        path
     }
 }
 
@@ -385,6 +395,16 @@ mod tests {
         assert_eq!(found, [20, 30, 40]);
         // A parent whose start can't be read leads nowhere.
         assert!(descendants(&list, 10, |_| None).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn this_process_has_its_executable() {
+        let path = executable(std::process::id()).expect("the test's executable");
+        assert_eq!(
+            path.file_name(),
+            std::env::current_exe().unwrap().file_name()
+        );
     }
 
     #[test]

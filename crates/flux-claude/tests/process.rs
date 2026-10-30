@@ -10,6 +10,24 @@ use flux_claude::{Answer, Cli, LaunchOptions, Process, Session, Status, UserInpu
 use futures::StreamExt;
 use futures::executor::block_on;
 
+/// The fake CLI, if Python is there to run it: the script itself, or on Windows, which starts no
+/// scripts by their `#!` line, the `.cmd` that runs it.
+fn fake_cli() -> Option<Cli> {
+    let (python, script) = if cfg!(windows) {
+        ("python", "fake/fake-claude.cmd")
+    } else {
+        ("python3", "fake/fake-claude.py")
+    };
+    let version = std::process::Command::new(python).arg("--version").output();
+    // Windows' `python` may be the Store's stand-in, which only says how to install Python.
+    if version.is_err() || cfg!(windows) && !version.is_ok_and(|out| out.status.success()) {
+        return None;
+    }
+    Some(Cli {
+        path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(script),
+    })
+}
+
 fn fake(
     fixture: &str,
     cwd: PathBuf,
@@ -17,17 +35,8 @@ fn fake(
     Process,
     futures::channel::mpsc::UnboundedReceiver<ProcessEvent>,
 )> {
-    // The fake needs python3; without it there is nothing to test against.
-    if std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        return None;
-    }
-    let cli = Cli {
-        path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fake/fake-claude.py"),
-    };
+    // The fake needs Python; without it there is nothing to test against.
+    let cli = fake_cli()?;
     let options = LaunchOptions {
         cwd,
         extra_args: vec![
@@ -127,13 +136,7 @@ fn fake_with(
     Process,
     futures::channel::mpsc::UnboundedReceiver<ProcessEvent>,
 )> {
-    std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-        .ok()?;
-    let cli = Cli {
-        path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fake/fake-claude.py"),
-    };
+    let cli = fake_cli()?;
     let mut extra_args = vec![
         format!("--fake-fixture={fixture}"),
         "--fake-delay-ms=0".into(),
@@ -317,8 +320,13 @@ fn an_allowed_edit_asks_the_edit_hook() {
     let input = hook_input.expect("the edit hook ran");
     assert_eq!(input["hook_event_name"], "PostToolUse");
     assert_eq!(input["tool_name"], "Edit");
-    // The fake works in the real directory (`/private/var/…` behind `/var/…`).
-    let root = dir.path().canonicalize().unwrap();
+    // The fake works in the real directory (`/private/var/…` behind `/var/…`); Windows keeps the
+    // folder as it was given (`C:\Users\RUNNER~1\…`).
+    let root = if cfg!(windows) {
+        dir.path().to_path_buf()
+    } else {
+        dir.path().canonicalize().unwrap()
+    };
     assert!(
         input["tool_input"]["file_path"]
             .as_str()
@@ -336,15 +344,8 @@ fn an_allowed_edit_asks_the_edit_hook() {
 /// A question without a session: one JSON result.
 #[test]
 fn a_question_without_a_session() {
-    if std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    let Some(cli) = fake_cli() else {
         return;
-    }
-    let cli = Cli {
-        path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fake/fake-claude.py"),
     };
     let dir = tempfile::tempdir().unwrap();
     let answer = cli.ask(

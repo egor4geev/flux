@@ -415,17 +415,26 @@ fn write(file: &Path, value: &Value) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// An absolute path of this system: `/p/a.rs`, on Windows `C:\p\a.rs`.
+    fn abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", path.replace('/', "\\"))
+        } else {
+            path.to_string()
+        }
+    }
+
     fn state() -> ProjectState {
         ProjectState {
             tabs: vec![
                 SavedTab {
-                    path: PathBuf::from("/p/src/main.rs"),
+                    path: PathBuf::from(abs("/p/src/main.rs")),
                     line: 12,
                     column: 4,
                     scroll: 3.5,
                 },
                 SavedTab {
-                    path: PathBuf::from("/p/README.md"),
+                    path: PathBuf::from(abs("/p/README.md")),
                     line: 0,
                     column: 0,
                     scroll: 0.,
@@ -448,15 +457,15 @@ mod tests {
     #[test]
     fn a_project_round_trips_through_the_json() {
         let mut value = json!({});
-        put_project(&mut value, Path::new("/p"), &state(), 7);
+        put_project(&mut value, Path::new(&abs("/p")), &state(), 7);
         let text = serde_json::to_string(&value).unwrap();
         let back: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parse_project(&back["projects"]["/p"]), Some(state()));
-        assert_eq!(back["projects"]["/p"]["saved_at"], 7);
+        assert_eq!(parse_project(&back["projects"][&abs("/p")]), Some(state()));
+        assert_eq!(back["projects"][&abs("/p")]["saved_at"], 7);
         let empty = ProjectState::default();
-        put_project(&mut value, Path::new("/q"), &empty, 8);
-        assert_eq!(parse_project(&value["projects"]["/q"]), Some(empty));
-        assert_eq!(parse_project(&value["projects"]["/r"]), None);
+        put_project(&mut value, Path::new(&abs("/q")), &empty, 8);
+        assert_eq!(parse_project(&value["projects"][&abs("/q")]), Some(empty));
+        assert_eq!(parse_project(&value["projects"][&abs("/r")]), None);
     }
 
     #[test]
@@ -470,7 +479,7 @@ mod tests {
     #[test]
     fn broken_entries_fall_back_to_defaults() {
         let value = json!({
-            "tabs": [{"path": "relative.rs"}, {"path": "/p/a.rs", "line": "x"}, 5],
+            "tabs": [{"path": "relative.rs"}, {"path": abs("/p/a.rs"), "line": "x"}, 5],
             "active": 9,
             "left": "nowhere",
             "bounds": {"x": 1, "y": 2, "width": 0, "height": 10},
@@ -479,7 +488,7 @@ mod tests {
         assert_eq!(
             state.tabs,
             vec![SavedTab {
-                path: PathBuf::from("/p/a.rs"),
+                path: PathBuf::from(abs("/p/a.rs")),
                 line: 0,
                 column: 0,
                 scroll: 0.,
@@ -496,37 +505,37 @@ mod tests {
         put_open(
             &mut value,
             &OpenProjects {
-                roots: vec![PathBuf::from("/p0")],
+                roots: vec![PathBuf::from(abs("/p0"))],
                 active: None,
             },
         );
         for n in 0..MAX_PROJECTS + 2 {
-            let root = PathBuf::from(format!("/p{n}"));
+            let root = PathBuf::from(abs(&format!("/p{n}")));
             put_project(&mut value, &root, &ProjectState::default(), n as u64);
         }
         let projects = value["projects"].as_object().unwrap();
         assert_eq!(projects.len(), MAX_PROJECTS);
         // /p0 is the oldest, but open: /p1 and /p2 went instead.
-        assert!(projects.contains_key("/p0"));
-        assert!(!projects.contains_key("/p1"));
-        assert!(!projects.contains_key("/p2"));
-        assert!(projects.contains_key(&format!("/p{}", MAX_PROJECTS + 1)));
+        assert!(projects.contains_key(&abs("/p0")));
+        assert!(!projects.contains_key(&abs("/p1")));
+        assert!(!projects.contains_key(&abs("/p2")));
+        assert!(projects.contains_key(&abs(&format!("/p{}", MAX_PROJECTS + 1))));
     }
 
     #[test]
     fn open_projects_keep_their_order_and_the_active_one() {
         let mut value = json!({"projects": {}});
         let open = OpenProjects {
-            roots: vec![PathBuf::from("/b"), PathBuf::from("/a")],
-            active: Some(PathBuf::from("/b")),
+            roots: vec![PathBuf::from(abs("/b")), PathBuf::from(abs("/a"))],
+            active: Some(PathBuf::from(abs("/b"))),
         };
         put_open(&mut value, &open);
         assert_eq!(parse_open(&value["open"]), open);
-        let odd = json!({"roots": ["/a", "/a", "rel", 3], "active": "/c"});
+        let odd = json!({"roots": [abs("/a"), abs("/a"), "rel", 3], "active": abs("/c")});
         assert_eq!(
             parse_open(&odd),
             OpenProjects {
-                roots: vec![PathBuf::from("/a")],
+                roots: vec![PathBuf::from(abs("/a"))],
                 active: None,
             }
         );
@@ -543,12 +552,12 @@ mod tests {
         )
         .unwrap();
         let mut value = read(&file);
-        put_project(&mut value, Path::new("/p"), &state(), 1);
+        put_project(&mut value, Path::new(&abs("/p")), &state(), 1);
         write(&file, &value).unwrap();
         let back = read(&file);
         assert_eq!(back["future"], 1);
         assert!(back["projects"]["/other"].is_object());
-        assert_eq!(parse_project(&back["projects"]["/p"]), Some(state()));
+        assert_eq!(parse_project(&back["projects"][&abs("/p")]), Some(state()));
         fs::remove_dir_all(&dir).ok();
     }
 

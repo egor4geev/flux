@@ -2528,8 +2528,19 @@ authors = ["Someone", "Another"]
 
     #[test]
     fn shortcuts_read_as_the_palette_shows_them() {
-        assert_eq!(keys_label("alt-cmd-shift-t").as_deref(), Some("⌥⇧⌘T"));
-        assert_eq!(keys_label("cmd-k cmd-s").as_deref(), Some("⌘K ⌘S"));
+        // The system's keys: a manifest names macOS keys.
+        let on = |mac, windows| match crate::keymap::KeyOs::current() {
+            crate::keymap::KeyOs::Mac => Some(mac),
+            crate::keymap::KeyOs::Windows => Some(windows),
+        };
+        assert_eq!(
+            keys_label("alt-cmd-shift-t").as_deref(),
+            on("⌥⇧⌘T", "Ctrl+Alt+Shift+T")
+        );
+        assert_eq!(
+            keys_label("cmd-k cmd-s").as_deref(),
+            on("⌘K ⌘S", "Ctrl+K Ctrl+S")
+        );
         assert_eq!(keys_label(""), None);
     }
 

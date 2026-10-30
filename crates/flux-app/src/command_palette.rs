@@ -702,9 +702,9 @@ mod tests {
         );
     }
 
-    fn label(keystroke: &str) -> String {
+    fn mac_label(keystroke: &str) -> String {
         let keystroke = gpui::Keystroke::parse(keystroke).unwrap();
-        keystroke_label(&keystroke.modifiers, &keystroke.key)
+        keystroke_label_for(KeyOs::Mac, &keystroke.modifiers, &keystroke.key)
     }
 
     fn windows_label(keystroke: &str) -> String {
@@ -734,18 +734,18 @@ mod tests {
 
     #[test]
     fn keystrokes_use_mac_symbols_in_mac_order() {
-        assert_eq!(label("cmd-shift-p"), "⇧⌘P");
-        assert_eq!(label("alt-left"), "⌥←");
-        assert_eq!(label("ctrl-alt-shift-cmd-z"), "⌃⌥⇧⌘Z");
-        assert_eq!(label("cmd-}"), "⌘}");
-        assert_eq!(label("ctrl-tab"), "⌃⇥");
-        assert_eq!(label("enter"), "↵");
-        assert_eq!(label("escape"), "Esc");
-        assert_eq!(label("alt-backspace"), "⌥⌫");
-        assert_eq!(label("delete"), "⌦");
-        assert_eq!(label("pagedown"), "PgDn");
-        assert_eq!(label("space"), "␣");
-        assert_eq!(label("cmd-9"), "⌘9");
-        assert_eq!(label("f12"), "F12");
+        assert_eq!(mac_label("cmd-shift-p"), "⇧⌘P");
+        assert_eq!(mac_label("alt-left"), "⌥←");
+        assert_eq!(mac_label("ctrl-alt-shift-cmd-z"), "⌃⌥⇧⌘Z");
+        assert_eq!(mac_label("cmd-}"), "⌘}");
+        assert_eq!(mac_label("ctrl-tab"), "⌃⇥");
+        assert_eq!(mac_label("enter"), "↵");
+        assert_eq!(mac_label("escape"), "Esc");
+        assert_eq!(mac_label("alt-backspace"), "⌥⌫");
+        assert_eq!(mac_label("delete"), "⌦");
+        assert_eq!(mac_label("pagedown"), "PgDn");
+        assert_eq!(mac_label("space"), "␣");
+        assert_eq!(mac_label("cmd-9"), "⌘9");
+        assert_eq!(mac_label("f12"), "F12");
     }
 }

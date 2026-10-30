@@ -855,7 +855,8 @@ mod tests {
                 .iter()
                 .any(|name| name.starts_with("secrets.key.unreadable-"))
         );
-        assert_eq!(fs::read(dir.join(KEY)).unwrap().len(), KEY_LEN);
+        // A whole key (sealed on Windows).
+        assert!(key_file::decode(fs::read(dir.join(KEY)).unwrap()).is_some());
     }
 
     #[test]
