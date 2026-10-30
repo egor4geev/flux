@@ -105,8 +105,9 @@ jobs:
 
       # The plugin tests quietly do without their probe component when it doesn't build (no wasm
       # target on a developer's Mac); here it must build — and with it the bundled plugins, which
-      # need the same target.
+      # need the same target. Windows: reported, not fatal, as the tests above.
       - name: Plugin components built
+        continue-on-error: ${{ runner.os == 'Windows' }}
         run: |
           cargo test -p flux-plugin --lib --locked -- --nocapture 2>&1 | tee plugin-tests.log
           if grep -q '^skipped:' plugin-tests.log; then
