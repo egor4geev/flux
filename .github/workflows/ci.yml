@@ -101,6 +101,8 @@ jobs:
       # are reported, not fatal.
       - name: Tests
         continue-on-error: ${{ runner.os == 'Windows' }}
+        # A test that hangs ends the step, not the whole job's hour.
+        timeout-minutes: 25
         run: cargo test --workspace --locked --no-fail-fast
 
       # The plugin tests quietly do without their probe component when it doesn't build (no wasm
