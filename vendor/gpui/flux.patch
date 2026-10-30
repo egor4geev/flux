@@ -1,6 +1,6 @@
 diff -ruN a/src/app.rs b/src/app.rs
---- a/src/app.rs	2006-07-24 05:21:28
-+++ b/src/app.rs	2026-10-15 10:51:59
+--- a/src/app.rs	2026-10-30 13:10:46
++++ b/src/app.rs	2026-10-30 13:10:46
 @@ -750,6 +750,32 @@
          self.platform.quit();
      }
@@ -35,8 +35,8 @@ diff -ruN a/src/app.rs b/src/app.rs
      /// multiple times in an update cycle and still result in a single redraw.
      pub fn refresh_windows(&mut self) {
 diff -ruN a/src/elements/animation.rs b/src/elements/animation.rs
---- a/src/elements/animation.rs	2006-07-24 05:21:28
-+++ b/src/elements/animation.rs	2026-10-16 14:48:32
+--- a/src/elements/animation.rs	2026-10-30 13:10:46
++++ b/src/elements/animation.rs	2026-10-30 13:10:46
 @@ -1,12 +1,54 @@
  use std::{
 +    cell::RefCell,
@@ -108,8 +108,8 @@ diff -ruN a/src/elements/animation.rs b/src/elements/animation.rs
  
              ((element.request_layout(window, cx), element), state)
 diff -ruN a/src/elements/div.rs b/src/elements/div.rs
---- a/src/elements/div.rs	2006-07-24 05:21:28
-+++ b/src/elements/div.rs	2026-10-29 05:16:45
+--- a/src/elements/div.rs	2026-10-30 13:10:46
++++ b/src/elements/div.rs	2026-10-30 13:10:46
 @@ -16,7 +16,7 @@
  //! constructed by combining these two systems into an all-in-one element.
  
@@ -622,8 +622,8 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
                          window.refresh();
                      })
 diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
---- a/src/platform/mac/metal_renderer.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/metal_renderer.rs	2026-10-15 03:41:33
+--- a/src/platform/mac/metal_renderer.rs	2026-10-30 13:10:46
++++ b/src/platform/mac/metal_renderer.rs	2026-10-30 13:10:46
 @@ -370,8 +370,12 @@
          loop {
              let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
@@ -753,8 +753,8 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
      configure_color_attachment(color_attachment);
  
 diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
---- a/src/platform/mac/platform.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/platform.rs	2026-10-15 10:51:59
+--- a/src/platform/mac/platform.rs	2026-10-30 13:10:46
++++ b/src/platform/mac/platform.rs	2026-10-30 13:10:46
 @@ -98,7 +98,12 @@
                  sel!(applicationWillTerminate:),
                  will_terminate as extern "C" fn(&mut Object, Sel, id),
@@ -943,8 +943,8 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
  }
  
 diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
---- a/src/platform/mac/window.rs	2006-07-24 05:21:28
-+++ b/src/platform/mac/window.rs	2026-10-15 04:00:04
+--- a/src/platform/mac/window.rs	2026-10-30 13:10:46
++++ b/src/platform/mac/window.rs	2026-10-30 13:10:46
 @@ -455,6 +455,12 @@
                          - traffic_light_position.y
                          - px(close_button_frame.size.height as f32),
@@ -983,9 +983,325 @@ diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
      }
  
      fn titlebar_double_click(&self) {
+diff -ruN a/src/platform/windows/directx_renderer.rs b/src/platform/windows/directx_renderer.rs
+--- a/src/platform/windows/directx_renderer.rs	2026-10-30 13:10:46
++++ b/src/platform/windows/directx_renderer.rs	2026-10-30 13:10:46
+@@ -1391,7 +1391,9 @@
+ pub(crate) mod shader_resources {
+     use anyhow::Result;
+ 
+-    #[cfg(debug_assertions)]
++    // Flux patch (runtime shaders on Windows): with `runtime_shaders` the shaders are compiled
++    // from the sources embedded in the binary (`runtime` below), in every profile.
++    #[cfg(all(debug_assertions, not(feature = "runtime_shaders")))]
+     use windows::{
+         Win32::Graphics::Direct3D::{
+             Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
+@@ -1421,17 +1423,23 @@
+     pub(crate) struct RawShaderBytes<'t> {
+         inner: &'t [u8],
+ 
+-        #[cfg(debug_assertions)]
++        #[cfg(all(debug_assertions, not(feature = "runtime_shaders")))]
+         _blob: ID3DBlob,
+     }
+ 
+     impl<'t> RawShaderBytes<'t> {
+         pub(crate) fn new(module: ShaderModule, target: ShaderTarget) -> Result<Self> {
+-            #[cfg(not(debug_assertions))]
++            #[cfg(feature = "runtime_shaders")]
+             {
++                Ok(Self {
++                    inner: runtime::compiled(module, target)?,
++                })
++            }
++            #[cfg(all(not(debug_assertions), not(feature = "runtime_shaders")))]
++            {
+                 Ok(Self::from_bytes(module, target))
+             }
+-            #[cfg(debug_assertions)]
++            #[cfg(all(debug_assertions, not(feature = "runtime_shaders")))]
+             {
+                 let blob = build_shader_blob(module, target)?;
+                 let inner = unsafe {
+@@ -1448,7 +1456,7 @@
+             self.inner
+         }
+ 
+-        #[cfg(not(debug_assertions))]
++        #[cfg(all(not(debug_assertions), not(feature = "runtime_shaders")))]
+         fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
+             let bytes = match module {
+                 ShaderModule::Quad => match target {
+@@ -1488,7 +1496,7 @@
+         }
+     }
+ 
+-    #[cfg(debug_assertions)]
++    #[cfg(all(debug_assertions, not(feature = "runtime_shaders")))]
+     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
+         unsafe {
+             use windows::Win32::Graphics::{
+@@ -1554,10 +1562,124 @@
+         }
+     }
+ 
+-    #[cfg(not(debug_assertions))]
++    #[cfg(all(not(debug_assertions), not(feature = "runtime_shaders")))]
+     include!(concat!(env!("OUT_DIR"), "/shaders_bytes.rs"));
+ 
+-    #[cfg(debug_assertions)]
++    /// Flux patch (runtime shaders on Windows): the shaders compiled when a renderer needs them,
++    /// from the HLSL embedded in the binary, in every profile. A release build then needs no
++    /// `fxc.exe` (`build.rs` skips it), so gpui builds for Windows on any host — Flux's Windows
++    /// build cross-compiled on a Mac; and a debug build doesn't read the sources from the folder
++    /// it was built in. `D3DCompile` comes from d3dcompiler_47.dll, a part of Windows 10 and 11.
++    /// Each shader is compiled once per process: every window's renderer shares it.
++    #[cfg(feature = "runtime_shaders")]
++    mod runtime {
++        use std::sync::Mutex;
++
++        use anyhow::{Result, anyhow};
++        use windows::{
++            Win32::Graphics::Direct3D::{
++                Fxc::{
++                    D3DCOMPILE_DEBUG, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCOMPILE_SKIP_OPTIMIZATION,
++                    D3DCompile,
++                },
++                ID3DBlob, ID3DInclude,
++            },
++            core::PCSTR,
++        };
++
++        use super::{ShaderModule, ShaderTarget};
++
++        const SHADERS: &str = include_str!("shaders.hlsl");
++        const COLOR_TEXT_RASTER: &str = include_str!("color_text_raster.hlsl");
++        /// Both files include it; a source compiled from memory has no folder to include from, so
++        /// the file's text takes the directive's place.
++        const ALPHA_CORRECTION: &str = include_str!("alpha_correction.hlsl");
++        const ALPHA_CORRECTION_INCLUDE: &str = "#include \"alpha_correction.hlsl\"";
++
++        /// The compiled bytecode of a shader, compiled the first time it is asked for.
++        pub(super) fn compiled(
++            module: ShaderModule,
++            target: ShaderTarget,
++        ) -> Result<&'static [u8]> {
++            type Compiled = Vec<(ShaderModule, ShaderTarget, &'static [u8])>;
++            static COMPILED: Mutex<Compiled> = Mutex::new(Vec::new());
++            let mut compiled = COMPILED
++                .lock()
++                .unwrap_or_else(|poisoned| poisoned.into_inner());
++            if let Some(&(_, _, bytes)) = compiled
++                .iter()
++                .find(|(m, t, _)| *m == module && *t == target)
++            {
++                return Ok(bytes);
++            }
++            let blob = compile(module, target)?;
++            let bytes: &'static [u8] = Box::leak(blob_bytes(&blob).to_vec().into_boxed_slice());
++            compiled.push((module, target, bytes));
++            Ok(bytes)
++        }
++
++        fn compile(module: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
++            let (name, source) = match module {
++                ShaderModule::EmojiRasterization => ("color_text_raster.hlsl\0", COLOR_TEXT_RASTER),
++                _ => ("shaders.hlsl\0", SHADERS),
++            };
++            let source = source.replacen(ALPHA_CORRECTION_INCLUDE, ALPHA_CORRECTION, 1);
++            let entry = format!(
++                "{}_{}\0",
++                module.as_str(),
++                match target {
++                    ShaderTarget::Vertex => "vertex",
++                    ShaderTarget::Fragment => "fragment",
++                }
++            );
++            let profile = match target {
++                ShaderTarget::Vertex => "vs_4_1\0",
++                ShaderTarget::Fragment => "ps_4_1\0",
++            };
++            // As `build.rs` compiles them with fxc (`/O3`); a debug build keeps them debuggable.
++            let flags = if cfg!(debug_assertions) {
++                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
++            } else {
++                D3DCOMPILE_OPTIMIZATION_LEVEL3
++            };
++            let mut code = None;
++            let mut errors = None;
++            let result = unsafe {
++                D3DCompile(
++                    source.as_ptr().cast(),
++                    source.len(),
++                    PCSTR::from_raw(name.as_ptr()),
++                    None,
++                    None::<&ID3DInclude>,
++                    PCSTR::from_raw(entry.as_ptr()),
++                    PCSTR::from_raw(profile.as_ptr()),
++                    flags,
++                    0,
++                    &mut code,
++                    Some(&mut errors),
++                )
++            };
++            if let Err(error) = result {
++                let message = errors
++                    .map(|blob| String::from_utf8_lossy(blob_bytes(&blob)).into_owned())
++                    .unwrap_or_else(|| format!("{error:?}"));
++                log::error!("Shader compile error: {}", message);
++                return Err(anyhow!("Compile error: {}", message));
++            }
++            code.ok_or_else(|| anyhow!("no code compiled for {}", entry.trim_end_matches('\0')))
++        }
++
++        fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
++            unsafe {
++                std::slice::from_raw_parts(
++                    blob.GetBufferPointer() as *const u8,
++                    blob.GetBufferSize(),
++                )
++            }
++        }
++    }
++
++    #[cfg(any(debug_assertions, feature = "runtime_shaders"))]
+     impl ShaderModule {
+         pub fn as_str(&self) -> &str {
+             match self {
+diff -ruN a/src/platform/windows/events.rs b/src/platform/windows/events.rs
+--- a/src/platform/windows/events.rs	2026-10-30 13:10:46
++++ b/src/platform/windows/events.rs	2026-10-30 13:10:46
+@@ -26,6 +26,9 @@
+ pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
+ pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
+ pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
++/// Flux patch (part 10.9): a window tells the platform that the user's session ends
++/// ([`WindowsWindowInner::handle_end_session_msg`]).
++pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 8;
+ 
+ const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+ const AUTO_HIDE_TASKBAR_THICKNESS_PX: i32 = 1;
+@@ -54,6 +57,8 @@
+             WM_PAINT => self.handle_paint_msg(handle),
+             WM_CLOSE => self.handle_close_msg(),
+             WM_DESTROY => self.handle_destroy_msg(handle),
++            // Flux patch (part 10.9): signing out, restarting, shutting down.
++            WM_ENDSESSION => self.handle_end_session_msg(wparam),
+             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
+             WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
+             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
+@@ -280,6 +285,26 @@
+         Some(0)
+     }
+ 
++    /// Flux patch (part 10.9): the user's session ends (signing out, restarting, shutting down).
++    /// Windows ends the process once its windows have answered, with no `WM_CLOSE` and no end of
++    /// the run loop — the way the application quits otherwise. So the platform runs its quit
++    /// callback now (the application's `on_app_quit`: Flux saves the state of its windows), once
++    /// however many windows get the message. `wparam` is false when the session goes on after
++    /// all (another application refused to end it).
++    fn handle_end_session_msg(&self, wparam: WPARAM) -> Option<isize> {
++        if wparam.0 != 0 {
++            unsafe {
++                SendMessageW(
++                    self.platform_window_handle,
++                    WM_GPUI_END_SESSION,
++                    Some(WPARAM(self.validation_number)),
++                    None,
++                );
++            }
++        }
++        Some(0)
++    }
++
+     fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
+         self.start_tracking_mouse(handle, TME_LEAVE);
+ 
+@@ -864,18 +889,22 @@
+             return None;
+         }
+ 
++        // Flux patch (part 10.9): a drag area gives way to the window's resize edges below — the
++        // title bar reaches the window's top edge, which resizes the window too; the window
++        // buttons don't.
++        let mut drag_area = None;
+         let mut lock = self.state.borrow_mut();
+         if let Some(mut callback) = lock.callbacks.hit_test_window_control.take() {
+             drop(lock);
+             let area = callback();
+             self.state.borrow_mut().callbacks.hit_test_window_control = Some(callback);
+             if let Some(area) = area {
+-                return match area {
+-                    WindowControlArea::Drag => Some(HTCAPTION as _),
+-                    WindowControlArea::Close => Some(HTCLOSE as _),
+-                    WindowControlArea::Max => Some(HTMAXBUTTON as _),
+-                    WindowControlArea::Min => Some(HTMINBUTTON as _),
+-                };
++                match area {
++                    WindowControlArea::Drag => drag_area = Some(HTCAPTION as _),
++                    WindowControlArea::Close => return Some(HTCLOSE as _),
++                    WindowControlArea::Max => return Some(HTMAXBUTTON as _),
++                    WindowControlArea::Min => return Some(HTMINBUTTON as _),
++                }
+             }
+         } else {
+             drop(lock);
+@@ -883,7 +912,7 @@
+ 
+         if !self.hide_title_bar {
+             // If the OS draws the title bar, we don't need to handle hit test messages.
+-            return None;
++            return drag_area;
+         }
+ 
+         // default handler for resize areas
+@@ -919,7 +948,7 @@
+             return Some(HTTOP as _);
+         }
+ 
+-        Some(HTCLIENT as _)
++        drag_area.or(Some(HTCLIENT as _))
+     }
+ 
+     fn handle_nc_mouse_move_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+diff -ruN a/src/platform/windows/platform.rs b/src/platform/windows/platform.rs
+--- a/src/platform/windows/platform.rs	2026-10-30 13:10:46
++++ b/src/platform/windows/platform.rs	2026-10-30 13:10:46
+@@ -699,7 +699,8 @@
+             | WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD
+             | WM_GPUI_DOCK_MENU_ACTION
+             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
+-            | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
++            | WM_GPUI_GPU_DEVICE_LOST
++            | WM_GPUI_END_SESSION => self.handle_gpui_events(msg, wparam, lparam),
+             _ => None,
+         };
+         if let Some(result) = handled {
+@@ -725,8 +726,20 @@
+             WM_GPUI_DOCK_MENU_ACTION => self.handle_dock_action_event(lparam.0 as _),
+             WM_GPUI_KEYBOARD_LAYOUT_CHANGED => self.handle_keyboard_layout_change(),
+             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
++            WM_GPUI_END_SESSION => self.handle_end_session(),
+             _ => unreachable!(),
+         }
++    }
++
++    /// Flux patch (part 10.9): the user's session ends ([`WM_GPUI_END_SESSION`]): the quit
++    /// callback runs now, as at the end of the run loop, which Windows doesn't wait for. It is
++    /// taken, so it runs once — not again for the next window, nor if the run loop ends after all.
++    fn handle_end_session(&self) -> Option<isize> {
++        let callback = self.state.borrow_mut().callbacks.quit.take();
++        if let Some(mut callback) = callback {
++            callback();
++        }
++        Some(0)
+     }
+ 
+     fn close_one_window(&self, target_window: HWND) -> bool {
 diff -ruN a/src/platform.rs b/src/platform.rs
---- a/src/platform.rs	2006-07-24 05:21:28
-+++ b/src/platform.rs	2026-10-15 10:51:59
+--- a/src/platform.rs	2026-10-30 13:10:46
++++ b/src/platform.rs	2026-10-30 13:10:46
 @@ -230,6 +230,15 @@
  
      fn on_quit(&self, callback: Box<dyn FnMut()>);
@@ -1050,8 +1366,8 @@ diff -ruN a/src/platform.rs b/src/platform.rs
              .flatten()
      }
 diff -ruN a/src/style.rs b/src/style.rs
---- a/src/style.rs	2006-07-24 05:21:28
-+++ b/src/style.rs	2026-10-28 01:24:47
+--- a/src/style.rs	2026-10-30 13:10:46
++++ b/src/style.rs	2026-10-30 13:10:46
 @@ -260,6 +260,19 @@
      /// The opacity of this element
      pub opacity: Option<f32>,
@@ -1083,8 +1399,8 @@ diff -ruN a/src/style.rs b/src/style.rs
              grid_cols: None,
              grid_location: None,
 diff -ruN a/src/styled.rs b/src/styled.rs
---- a/src/styled.rs	2006-07-24 05:21:28
-+++ b/src/styled.rs	2026-10-28 01:24:47
+--- a/src/styled.rs	2026-10-30 13:10:46
++++ b/src/styled.rs	2026-10-30 13:10:46
 @@ -654,6 +654,27 @@
          self
      }
@@ -1114,8 +1430,8 @@ diff -ruN a/src/styled.rs b/src/styled.rs
      fn grid_cols(mut self, cols: u16) -> Self {
          self.style().grid_cols = Some(cols);
 diff -ruN a/src/taffy.rs b/src/taffy.rs
---- a/src/taffy.rs	2006-07-24 05:21:28
-+++ b/src/taffy.rs	2026-10-15 03:27:31
+--- a/src/taffy.rs	2026-10-30 13:10:46
++++ b/src/taffy.rs	2026-10-30 13:10:46
 @@ -309,7 +309,7 @@
              unit: &Option<u16>,
          ) -> Vec<taffy::GridTemplateComponent<T>> {
@@ -1126,8 +1442,8 @@ diff -ruN a/src/taffy.rs b/src/taffy.rs
          }
  
 diff -ruN a/src/window.rs b/src/window.rs
---- a/src/window.rs	2006-07-24 05:21:28
-+++ b/src/window.rs	2026-10-29 05:16:45
+--- a/src/window.rs	2026-10-30 13:10:46
++++ b/src/window.rs	2026-10-30 13:10:46
 @@ -7,17 +7,20 @@
      DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
      FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
@@ -2219,3 +2535,16 @@ diff -ruN a/src/window.rs b/src/window.rs
 +        size: scale_size(bounds.size, factor),
      }
  }
+--- a/build.rs	2026-10-30 13:10:46
++++ b/build.rs	2026-10-30 13:10:46
+@@ -256,7 +256,9 @@
+ 
+     pub(super) fn build() {
+         // Compile HLSL shaders
+-        #[cfg(not(debug_assertions))]
++        // Flux patch (runtime shaders on Windows): with `runtime_shaders` the renderer compiles
++        // them at runtime (`shader_resources::runtime` in `directx_renderer.rs`): no fxc.exe.
++        #[cfg(not(any(debug_assertions, feature = "runtime_shaders")))]
+         compile_shaders();
+ 
+         // Embed the Windows manifest and resource file

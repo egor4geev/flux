@@ -2007,6 +2007,7 @@ dependencies = [
  "block",
  "core-foundation 0.10.0",
  "core-foundation-sys",
+ "embed-resource",
  "flux-claude",
  "flux-core",
  "flux-fs",

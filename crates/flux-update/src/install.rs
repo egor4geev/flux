@@ -14,16 +14,20 @@
 //!
 //! The helper logs every step to `~/Library/Logs/Flux/update.log`. `FLUX_UPDATE_NO_RELAUNCH=1` in
 //! Flux's environment: the helper swaps the bundles but doesn't open the new one (tests).
+//!
+//! Windows (part 10.9) has the same steps for Flux's folder instead of a bundle: [`folder`].
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+pub mod folder;
+
 /// An update unpacked and checked, waiting for Flux to quit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepared {
-    /// The new `Flux.app`, unpacked into the cache.
+    /// The new `Flux.app`, unpacked into the cache (Windows: the folder of the new files).
     pub app: PathBuf,
-    /// The running `Flux.app` it replaces.
+    /// The running `Flux.app` it replaces (Windows: the running Flux's folder).
     pub target: PathBuf,
     pub version: crate::Version,
 }
@@ -39,9 +43,14 @@ pub enum CannotInstall {
     Translocated,
 }
 
-/// The `Flux.app` this process runs from.
+/// The `Flux.app` this process runs from (Windows: the folder of `Flux.exe`).
 pub fn current_bundle() -> Option<PathBuf> {
-    bundle_of(&std::env::current_exe().ok()?)
+    let exe = std::env::current_exe().ok()?;
+    if cfg!(windows) {
+        folder::folder_of(&exe)
+    } else {
+        bundle_of(&exe)
+    }
 }
 
 /// The `*.app` whose `Contents/MacOS` holds `exe`.
@@ -65,6 +74,14 @@ pub fn can_install() -> Result<PathBuf, CannotInstall> {
 /// Whether `bundle` can be swapped: not translocated, not on a read-only volume, its folder and
 /// itself writable (moving a folder elsewhere rewrites its `..`).
 pub fn check_installable(bundle: &Path) -> Result<(), CannotInstall> {
+    // Windows: the folder takes the new files in, it isn't moved itself.
+    if cfg!(windows) {
+        return if writable(bundle) {
+            Ok(())
+        } else {
+            Err(CannotInstall::ReadOnly(bundle.to_path_buf()))
+        };
+    }
     if bundle.to_string_lossy().contains("/AppTranslocation/") || read_only_volume(bundle) {
         return Err(CannotInstall::Translocated);
     }
@@ -86,8 +103,16 @@ fn writable(path: &Path) -> bool {
     c_path(path).is_some_and(|path| unsafe { libc::access(path.as_ptr(), libc::W_OK) } == 0)
 }
 
+/// Windows: a folder's read-only attribute means nothing (`Program Files` has none, and only an
+/// administrator writes there), so a folder is tried with a file.
 #[cfg(not(unix))]
 fn writable(path: &Path) -> bool {
+    if path.is_dir() {
+        let probe = path.join(format!(".flux-write-test-{}", std::process::id()));
+        let created = std::fs::File::create(&probe).is_ok();
+        let _ = std::fs::remove_file(&probe);
+        return created;
+    }
     std::fs::metadata(path).is_ok_and(|meta| !meta.permissions().readonly())
 }
 
@@ -110,6 +135,9 @@ fn read_only_volume(_path: &Path) -> bool {
 
 /// Unpacks and checks a downloaded archive (see the module). Blocks.
 pub fn prepare(archive: &Path, version: &crate::Version) -> Result<Prepared, String> {
+    if cfg!(windows) {
+        return folder::prepare(archive, version);
+    }
     let requirement = match current_bundle() {
         Some(bundle) => Some(designated_requirement(&bundle)?),
         None => None,
@@ -249,7 +277,7 @@ impl Helper {
             trash: home.join(".Trash"),
             relaunch: std::env::var("FLUX_UPDATE_NO_RELAUNCH").as_deref() != Ok("1"),
             env: std::env::vars()
-                .filter(|(name, _)| name.starts_with("FLUX_"))
+                .filter(|(name, _)| name.starts_with("FLUX_") && name != folder::WAIT_PID)
                 .collect(),
         }
     }
@@ -268,6 +296,10 @@ pub fn schedule_with(
     relaunch: &[String],
     helper: &Helper,
 ) -> Result<(), String> {
+    // Windows: no helper, the files are swapped right away (the running Flux.exe is renamed).
+    if cfg!(windows) {
+        return folder::install(prepared, pid, relaunch, helper);
+    }
     let script = helper_script(prepared, pid, relaunch, helper);
     let dir = prepared
         .app
@@ -452,6 +484,14 @@ mod tests {
         let app = dir.join("Flux.app");
         std::fs::create_dir_all(&app).unwrap();
         assert_eq!(check_installable(&app), Ok(()));
+        // Windows: only whether the folder can be written to.
+        if cfg!(windows) {
+            assert!(matches!(
+                check_installable(&dir.join("missing")),
+                Err(CannotInstall::ReadOnly(_))
+            ));
+            return;
+        }
         assert_eq!(
             check_installable(Path::new(
                 "/private/var/folders/x/AppTranslocation/ABC/d/Flux.app"

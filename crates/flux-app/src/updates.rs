@@ -665,10 +665,19 @@ fn explain_cannot_install(
     cx: &mut App,
 ) {
     let message = match &reason {
+        // Windows: Flux is a folder with Flux.exe, the installer's or an unpacked zip's.
+        CannotInstall::NotBundled if cfg!(windows) => tr(
+            "This Flux isn't a released Flux.exe (a build from the sources). Download the new version from its release page.",
+        )
+        .to_string(),
         CannotInstall::NotBundled => tr(
             "This Flux doesn't run from an app bundle (a build from the sources). Download the new version from its release page.",
         )
         .to_string(),
+        CannotInstall::ReadOnly(folder) if cfg!(windows) => trf(
+            "Flux can't write to {0}. Download the installer of the new version and run it: it installs Flux in your own folder.",
+            &[&crate::workspace::tilde(folder)],
+        ),
         CannotInstall::ReadOnly(folder) => trf(
             "Flux can't write to {0}. Download the new version and replace Flux yourself, or move Flux to a folder you can change, such as Applications.",
             &[&crate::workspace::tilde(folder)],

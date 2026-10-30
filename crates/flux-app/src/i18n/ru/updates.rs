@@ -60,6 +60,14 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Flux не может писать в {0}. Скачайте новую версию и замените Flux сами или перенесите Flux в папку, которую можно менять, например в «Программы».",
     ),
     (
+        "This Flux isn't a released Flux.exe (a build from the sources). Download the new version from its release page.",
+        "Этот Flux — не Flux.exe из релиза (сборка из исходников). Скачайте новую версию со страницы релиза.",
+    ),
+    (
+        "Flux can't write to {0}. Download the installer of the new version and run it: it installs Flux in your own folder.",
+        "Flux не может писать в {0}. Скачайте установщик новой версии и запустите его: он установит Flux в вашу собственную папку.",
+    ),
+    (
         "Flux runs from the disk image or another read-only place. Move Flux to the Applications folder, open it from there and update again.",
         "Flux запущен с образа диска или из другого места только для чтения. Перенесите Flux в папку «Программы», откройте его оттуда и обновите снова.",
     ),

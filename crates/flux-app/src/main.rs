@@ -150,8 +150,17 @@ use gpui::{App, Application};
 use theme::Theme;
 
 fn main() {
+    // Windows: a Flux started by its update waits for the one it replaces to quit, then deletes
+    // its files (flux-update's `install::folder`).
+    #[cfg(windows)]
+    // SAFETY: the first thing: no other thread reads the environment yet.
+    unsafe {
+        flux_update::install::folder::finish();
+    }
     // Flux's log and crash reports (part 10.6), before anything can print or panic.
     app_log::start();
+    #[cfg(windows)]
+    set_app_user_model_id();
     // A UI scenario doesn't touch the user's plugins, their data and logs (as it doesn't touch
     // the settings): unless given, they live in a fresh temporary folder.
     #[cfg(feature = "scenario")]
@@ -313,6 +322,21 @@ fn main() {
             cx.activate(true);
         }
     });
+}
+
+/// Windows: Flux's AppUserModelID, the one its Start menu shortcut carries (the installer,
+/// `scripts/windows/flux.iss`): the taskbar groups Flux's windows under the pinned shortcut, and
+/// notifications are shown as Flux's. Set before any window opens.
+#[cfg(windows)]
+fn set_app_user_model_id() {
+    let id: Vec<u16> = "Flux.Flux".encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated wide string that outlives the call (the system copies it).
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(id.as_ptr())
+    };
+    if result < 0 {
+        log::warn!("SetCurrentProcessExplicitAppUserModelID failed: {result:#x}");
+    }
 }
 
 /// Project root: the directory from the arguments; without one, the nearest ancestor of the current

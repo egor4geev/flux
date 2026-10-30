@@ -150,6 +150,24 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
     that must not do it sets `restrict_scroll_to_axis` (Flux's board row and plugin trees).
     Elements with their own wheel listeners (the editor, the terminal) get the events unchanged.
 
+- **Runtime shaders on Windows** (2026-10-30, part 10.9, `scripts/bundle-windows.sh`): gpui 0.2.2
+  compiles its HLSL with `fxc.exe` in `build.rs` for a release build — only when the build script
+  itself runs on Windows — and includes the bytecode from `OUT_DIR`; a debug build compiles the
+  source files at runtime from the folder gpui was built in. Flux.exe built on a Mac (mingw-w64)
+  had no shaders at all, and a CI runner without the Windows SDK's fxc (ARM64) couldn't build.
+  Flux enables `runtime_shaders` (for Metal on macOS); now on Windows it means the same.
+  - `src/platform/windows/directx_renderer.rs`, `shader_resources::runtime`: with `runtime_shaders`
+    a shader is compiled by `D3DCompile` (d3dcompiler_47.dll, a part of Windows 10 and 11) from the
+    HLSL embedded with `include_str!` — `shaders.hlsl` and `color_text_raster.hlsl` (the emoji
+    pipeline of `direct_write.rs`), with `alpha_correction.hlsl` put in place of their `#include`
+    (a source compiled from memory has no folder to include from) — in every profile, optimized
+    as fxc's `/O3` in a release build. Each shader is compiled once per process and kept: every
+    window's renderer and the text system share it. Without the feature nothing changes.
+  - `build.rs`: with `runtime_shaders` the Windows build doesn't run fxc. The `windows-manifest`
+    feature is untouched; Flux turns it off and embeds its own manifest
+    (`crates/flux-app/build.rs`).
+  - The first change outside `src/`: `flux.patch` now takes `build.rs` too (step 3 below).
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,
@@ -158,8 +176,9 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
 2. Apply `flux.patch` (`patch -p1 -d vendor/gpui < vendor/gpui/flux.patch`) and fix what doesn't
    apply by the descriptions above; grep the new `window.rs` for new `platform_window.` calls that
    take or give positions — they need the scale too.
-3. Regenerate the patch from the crate's directory:
-   `diff -ruN ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gpui-<version>/src src > flux.patch`
+3. Regenerate the patch from the crate's directory, `src/` and `build.rs`:
+   `diff -ruN ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gpui-<version>/src src > flux.patch`,
+   then `diff -uN ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gpui-<version>/build.rs build.rs >> flux.patch`
    (paths relative to `vendor/gpui`).
 4. Check by hand: the mouse, scrolling, file drops and the input method (Japanese, Pinyin) at 125 %,
    the traffic lights at 80 % and 125 %; Quit in the Dock with an unsaved document (the question,

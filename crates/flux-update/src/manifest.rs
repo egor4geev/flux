@@ -63,7 +63,8 @@ pub struct Platform {
     pub sha256: String,
     /// Base64 of the Ed25519 signature of the archive's bytes.
     pub signature: String,
-    /// The installer for a first install (`.dmg`), shown when Flux can't update itself.
+    /// The installer for a first install (`.dmg`, Windows' `-setup.exe`), shown when Flux can't update
+    /// itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installer: Option<String>,
 }
