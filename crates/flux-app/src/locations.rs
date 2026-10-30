@@ -132,7 +132,11 @@ pub(crate) fn rows(
             }
         };
         let lines = text.map(Lines::new);
-        let relative = display_path(&path, root);
+        // In the system's separators even for a path that couldn't be resolved (a file that isn't
+        // there keeps the `/` it was joined with).
+        let relative = flux_platform::PathStyle::NATIVE
+            .native(&display_path(&path, root))
+            .into_owned();
         let file_name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())

@@ -97,19 +97,15 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo clippy -p flux-app --all-targets --features scenario --locked -- -D warnings
 
-      # Windows: the tests are being ported with the build (part 10.9); until then their failures
-      # are reported, not fatal.
       - name: Tests
-        continue-on-error: ${{ runner.os == 'Windows' }}
         # A test that hangs ends the step, not the whole job's hour.
         timeout-minutes: 25
         run: cargo test --workspace --locked --no-fail-fast
 
       # The plugin tests quietly do without their probe component when it doesn't build (no wasm
       # target on a developer's Mac); here it must build — and with it the bundled plugins, which
-      # need the same target. Windows: reported, not fatal, as the tests above.
+      # need the same target.
       - name: Plugin components built
-        continue-on-error: ${{ runner.os == 'Windows' }}
         run: |
           cargo test -p flux-plugin --lib --locked -- --nocapture 2>&1 | tee plugin-tests.log
           if grep -q '^skipped:' plugin-tests.log; then
