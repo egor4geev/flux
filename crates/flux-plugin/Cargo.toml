@@ -54,8 +54,3 @@ wasmtime = { version = "48.0.5", default-features = false, features = [
 # WASI 0.2 for the plugins: the file system (the project, the plugin's folder), clocks, random,
 # stdout and stderr into the plugin's log.
 wasmtime-wasi = { version = "48.0.5", default-features = false, features = ["p2"] }
-
-# The plugins' secrets kept as generic passwords in the macOS keychain before (`secrets`): moved out
-# once, and removed with their plugin (the crate is in the tree already, through rustls).
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = { version = "3", default-features = false }
