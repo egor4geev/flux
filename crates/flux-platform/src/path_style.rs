@@ -216,10 +216,17 @@ pub fn join_slashed(base: &Path, relative: &str) -> PathBuf {
 
 /// A path as Flux keeps it: on Windows [`PathStyle::simplified`]; elsewhere unchanged.
 pub fn simplified(path: PathBuf) -> PathBuf {
-    match path.to_str().map(|text| PathStyle::NATIVE.simplified(text)) {
-        Some(Cow::Owned(text)) => PathBuf::from(text),
-        _ => path,
-    }
+    simplified_in(PathStyle::NATIVE, path)
+}
+
+/// [`simplified`] in `style`. A prefix cut off gives a borrowed tail of the same text: what tells
+/// "unchanged" is the length, not whether the result is borrowed.
+fn simplified_in(style: PathStyle, path: PathBuf) -> PathBuf {
+    let simple = path.to_str().and_then(|text| match style.simplified(text) {
+        Cow::Borrowed(same) if same.len() == text.len() => None,
+        changed => Some(changed.into_owned()),
+    });
+    simple.map_or(path, PathBuf::from)
 }
 
 /// `std::fs::canonicalize` without the `\\?\` prefix on Windows: paths Flux keeps are shown to the
@@ -231,6 +238,21 @@ pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::PathStyle::{Unix, Windows};
+
+    #[test]
+    fn canonical_paths_lose_the_verbatim_prefix() {
+        use super::simplified_in;
+        use std::path::PathBuf;
+        let simple = |path: &str| simplified_in(Windows, PathBuf::from(path));
+        assert_eq!(simple(r"\\?\C:\Users\me"), PathBuf::from(r"C:\Users\me"));
+        assert_eq!(simple(r"\\?\c:\Users"), PathBuf::from(r"C:\Users"));
+        assert_eq!(simple(r"\\?\UNC\srv\share"), PathBuf::from(r"\\srv\share"));
+        assert_eq!(simple(r"C:\Users"), PathBuf::from(r"C:\Users"));
+        assert_eq!(
+            simplified_in(Unix, PathBuf::from("/Users/me")),
+            PathBuf::from("/Users/me")
+        );
+    }
 
     #[test]
     fn absolute_paths() {

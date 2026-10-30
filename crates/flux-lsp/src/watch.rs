@@ -159,7 +159,8 @@ mod tests {
     #[test]
     fn rust_analyzer_relative_patterns_and_absolute_paths() {
         // As rust-analyzer 1.99 registers them for a loaded project.
-        let base = format!("file://{}", slashed(ROOT));
+        // `file:///work/proj`, `file:///C:/work/proj`: three slashes on every system.
+        let base = format!("file:///{}", slashed(ROOT).trim_start_matches('/'));
         let watchers = watchers(json!({ "watchers": [
             { "globPattern": { "baseUri": base, "pattern": "**/*.rs" } },
             { "globPattern": { "baseUri": base, "pattern": "**/Cargo.{lock,toml}" } },
