@@ -806,15 +806,15 @@ impl Workspace {
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
         // A theme that follows macOS changes with it (Settings → Appearance → Sync with OS).
-        crate::theme::system_appearance_changed(crate::theme::window_appearance(window), cx);
+        crate::theme::system_appearance_changed(cx);
         // Updates of the installed plugins, once the plugins are found (stage 8.3).
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, crate::plugin_updates::check_on_start).ok();
         });
         let subscriptions = vec![
-            cx.observe_window_appearance(window, |_, window, cx| {
-                crate::theme::system_appearance_changed(crate::theme::window_appearance(window), cx)
+            cx.observe_window_appearance(window, |_, _, cx| {
+                crate::theme::system_appearance_changed(cx)
             }),
             // Files may have changed while the window was inactive (git in a terminal, another
             // editor): the watcher reports them, and a refresh on return makes sure.

@@ -48,6 +48,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "{0} менялся после правки Claude: эти изменения тоже пропадут",
     ),
     ("to the Trash", "в Корзину"),
+    ("to the Recycle Bin", "в Корзину"),
     (
         "The files are as they were before Claude's edits",
         "Файлы уже в том виде, что до правок Claude",

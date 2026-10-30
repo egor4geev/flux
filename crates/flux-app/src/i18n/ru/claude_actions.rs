@@ -15,6 +15,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Forward", "Вперёд"),
     ("Open In", "Открыть в"),
     ("Finder", "Finder"),
+    ("Explorer", "Проводник"),
     ("Send Selection to Claude", "Отправить выделение в Claude"),
     ("Send File to Claude", "Отправить файл в Claude"),
     ("Send to Claude", "Отправить в Claude"),

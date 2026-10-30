@@ -2376,14 +2376,18 @@ impl SettingsView {
             .on_click(|_, _, cx| cx.open_url(&format!("https://{REPOSITORY}")))
             .child(REPOSITORY)
             .into_any_element();
-        let macos = machine
+        // The system's name labels its version: "macOS" — "26.1 (25B78)", "Windows" — "11 24H2
+        // (26100.4061)".
+        let version = machine
             .macos
-            .strip_prefix("macOS ")
+            .strip_prefix(feedback::SYSTEM_NAME)
+            .map(str::trim_start)
+            .filter(|version| !version.is_empty())
             .unwrap_or(&machine.macos)
             .to_string();
         let facts = [
             (tr("Version"), plain(machine.version.clone(), ui)),
-            ("macOS", plain(macos, ui)),
+            (feedback::SYSTEM_NAME, plain(version, ui)),
             (tr("Computer"), plain(feedback::computer(), ui)),
             (tr("License"), plain(env!("CARGO_PKG_LICENSE"), ui)),
             (tr("Developer"), plain(DEVELOPER, ui)),

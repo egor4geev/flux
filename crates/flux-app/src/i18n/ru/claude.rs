@@ -174,6 +174,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "A macOS notification while Flux isn't the active app.",
         "Уведомление macOS, пока Flux не активное приложение.",
     ),
+    (
+        "A Windows notification while Flux isn't the active app.",
+        "Уведомление Windows, пока Flux не активное приложение.",
+    ),
     ("Flux Tools for Claude", "Инструменты Flux для Claude"),
     (
         "Give Claude the tools of Flux",

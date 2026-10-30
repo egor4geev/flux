@@ -1870,28 +1870,7 @@ fn render_label(label: &Label, ui: UiColors) -> impl IntoElement {
 
 /// The local time zone's offset from UTC at a moment, in seconds.
 pub(crate) fn local_offset(time: i64) -> i64 {
-    #[cfg(target_os = "macos")]
-    {
-        use core_foundation_sys::date::CFAbsoluteTime;
-        use core_foundation_sys::timezone::{CFTimeZoneCopySystem, CFTimeZoneGetSecondsFromGMT};
-        // CFAbsoluteTime counts from 2001-01-01.
-        const CF_EPOCH: i64 = 978_307_200;
-        // SAFETY: the system time zone is a valid CF object, released after use.
-        unsafe {
-            let zone = CFTimeZoneCopySystem();
-            if zone.is_null() {
-                return 0;
-            }
-            let offset = CFTimeZoneGetSecondsFromGMT(zone, (time - CF_EPOCH) as CFAbsoluteTime);
-            core_foundation_sys::base::CFRelease(zone as _);
-            offset as i64
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = time;
-        0
-    }
+    i64::from(flux_platform::time::local_utc_offset(time))
 }
 
 /// Days since 1970-01-01 → (year, month, day) (Howard Hinnant's civil_from_days).

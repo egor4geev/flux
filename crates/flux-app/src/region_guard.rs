@@ -531,7 +531,7 @@ impl RegionGuard {
         for stop in self.stops.drain(..).filter_map(|stop| stop.upgrade()) {
             stop.store(true, Ordering::Relaxed);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         std::thread::Builder::new()
             .name("region-stop".into())
             .spawn(stop_claude_processes)
@@ -666,7 +666,39 @@ pub fn country_name(code: &str) -> Option<String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The country's name from Windows' geographical data, which speaks the display language of
+/// Windows: taken when the interface speaks it too; otherwise none, and the code stands alone.
+#[cfg(windows)]
+pub fn country_name(code: &str) -> Option<String> {
+    use windows_sys::Win32::Globalization::{GEO_FRIENDLYNAME, GetGeoInfoEx};
+
+    let code = region::normalize(code)?;
+    let interface = crate::i18n::lang_code();
+    let same_language = crate::i18n::system_languages()
+        .first()
+        .and_then(|tag| tag.split(['-', '_']).next())
+        .is_some_and(|primary| primary.eq_ignore_ascii_case(interface));
+    if !same_language {
+        return None;
+    }
+    let location: Vec<u16> = code.encode_utf16().chain(Some(0)).collect();
+    let mut name = [0u16; 128];
+    // SAFETY: a NUL-terminated code; the call writes at most the buffer's length.
+    let len = unsafe {
+        GetGeoInfoEx(
+            location.as_ptr(),
+            GEO_FRIENDLYNAME,
+            name.as_mut_ptr(),
+            name.len() as i32,
+        )
+    };
+    let len = usize::try_from(len).ok().filter(|&len| len > 0)?;
+    let name = String::from_utf16_lossy(&name[..len.min(name.len())]);
+    let name = name.trim_end_matches('\0').trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn country_name(_code: &str) -> Option<String> {
     None
 }
@@ -713,8 +745,88 @@ fn network_fingerprint() -> u64 {
     hasher.finish()
 }
 
-/// Other systems (the ports, 10.9–10.10): no watching yet — the periodic checks only.
-#[cfg(not(target_os = "macos"))]
+/// The network as a number that changes when it does: the adapters that are up (not loopback) and
+/// their addresses.
+#[cfg(windows)]
+fn network_fingerprint() -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::ffi::CStr;
+    use std::hash::{Hash, Hasher};
+
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows_sys::Win32::Networking::WinSock::AF_UNSPEC;
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size: u32 = 16 * 1024;
+    // Eight-byte words: the list's structs are aligned so.
+    let mut buffer: Vec<u64> = Vec::new();
+    // An adapter may come between asking the size and reading the list: asked again then.
+    for _ in 0..3 {
+        buffer = vec![0; (size as usize).div_ceil(8)];
+        // SAFETY: the buffer holds `size` bytes, as `size` says; the call writes the list into it.
+        let result = unsafe {
+            GetAdaptersAddresses(
+                u32::from(AF_UNSPEC),
+                flags,
+                std::ptr::null(),
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        match result {
+            0 => break,
+            ERROR_BUFFER_OVERFLOW => buffer.clear(),
+            _ => return 0,
+        }
+    }
+    if buffer.is_empty() {
+        return 0;
+    }
+    let mut found: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut adapter = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    // SAFETY: the list and its addresses live in the buffer, which outlives the walk; each pointer
+    // is the system's, null at a list's end.
+    unsafe {
+        while let Some(current) = adapter.as_ref() {
+            adapter = current.Next;
+            if current.OperStatus != IfOperStatusUp || current.IfType == IF_TYPE_SOFTWARE_LOOPBACK {
+                continue;
+            }
+            let name = if current.AdapterName.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(current.AdapterName.cast())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let mut address = current.FirstUnicastAddress;
+            while let Some(unicast) = address.as_ref() {
+                address = unicast.Next;
+                let socket = unicast.Address;
+                let Ok(len) = usize::try_from(socket.iSockaddrLength) else {
+                    continue;
+                };
+                if socket.lpSockaddr.is_null() || len == 0 {
+                    continue;
+                }
+                let bytes = std::slice::from_raw_parts(socket.lpSockaddr.cast::<u8>(), len);
+                found.push((name.clone(), bytes.to_vec()));
+            }
+        }
+    }
+    found.sort();
+    let mut hasher = DefaultHasher::new();
+    found.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Other systems (Linux, 10.10): no watching yet — the periodic checks only.
+#[cfg(not(any(target_os = "macos", windows)))]
 fn network_fingerprint() -> u64 {
     0
 }
@@ -741,6 +853,107 @@ fn stop_claude_processes() {
         if processes::is_claude(pid) && processes::descends(pid, me) {
             // SAFETY: as above; it is still that `claude`.
             unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Ends every `claude` this Flux started, directly or through its terminals and their shells. On
+/// Windows there is no SIGTERM to ask first: a console program gets Ctrl+C only from its own
+/// console, and Flux, a windowed app, shares none of its terminals' — each ends at once.
+#[cfg(windows)]
+fn stop_claude_processes() {
+    use flux_platform::process;
+
+    let me = std::process::id();
+    let list = process::list();
+    let found: Vec<u32> = process::descendants(&list, me, process::started)
+        .into_iter()
+        .filter(|&pid| processes::is_claude(pid))
+        .collect();
+    if found.is_empty() {
+        return;
+    }
+    log::warn!("country check: stopping {} claude processes", found.len());
+    for pid in found {
+        process::terminate(pid);
+    }
+}
+
+/// A `claude` program: the native installer's `claude.exe`, or Node running Claude Code's package
+/// (npm). `arguments` — the command line — is asked for Node only.
+#[cfg(any(windows, test))]
+fn is_claude_program(executable: &str, arguments: impl FnOnce() -> String) -> bool {
+    let name = executable.rsplit(['/', '\\']).next().unwrap_or_default();
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    if stem.eq_ignore_ascii_case("claude") {
+        return true;
+    }
+    stem.eq_ignore_ascii_case("node")
+        && arguments()
+            .replace('\\', "/")
+            .contains("@anthropic-ai/claude-code")
+}
+
+/// The processes of the system: their executables and command lines.
+#[cfg(windows)]
+mod processes {
+    pub fn is_claude(pid: u32) -> bool {
+        let Some(path) = flux_platform::process::executable(pid) else {
+            return false;
+        };
+        super::is_claude_program(&path.to_string_lossy(), || {
+            command_line(pid).unwrap_or_default()
+        })
+    }
+
+    /// Another process's command line: `NtQueryInformationProcess` writes it as a UNICODE_STRING
+    /// followed by its text.
+    fn command_line(pid: u32) -> Option<String> {
+        use windows_sys::Wdk::System::Threading::{
+            NtQueryInformationProcess, ProcessCommandLineInformation,
+        };
+        use windows_sys::Win32::Foundation::{CloseHandle, UNICODE_STRING};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: the handle is checked before use and closed after; the first call asks for the
+        // size, the second writes at most that many bytes into the buffer (aligned for the
+        // UNICODE_STRING), whose text the string points into.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return None;
+            }
+            let mut size = 0u32;
+            NtQueryInformationProcess(
+                process,
+                ProcessCommandLineInformation,
+                std::ptr::null_mut(),
+                0,
+                &mut size,
+            );
+            let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+            let status = if size == 0 {
+                -1
+            } else {
+                NtQueryInformationProcess(
+                    process,
+                    ProcessCommandLineInformation,
+                    buffer.as_mut_ptr().cast(),
+                    size,
+                    &mut size,
+                )
+            };
+            CloseHandle(process);
+            if status != 0 {
+                return None;
+            }
+            let text = &*buffer.as_ptr().cast::<UNICODE_STRING>();
+            if text.Buffer.is_null() {
+                return None;
+            }
+            let chars = std::slice::from_raw_parts(text.Buffer, usize::from(text.Length) / 2);
+            Some(String::from_utf16_lossy(chars))
         }
     }
 }
@@ -908,6 +1121,28 @@ mod tests {
     fn the_network_has_a_fingerprint() {
         // The same network twice in a row.
         assert_eq!(network_fingerprint(), network_fingerprint());
+    }
+
+    #[test]
+    fn claude_is_told_by_its_program() {
+        let no_arguments = || -> String { panic!("asked for the arguments of a program not Node") };
+        assert!(is_claude_program(
+            r"C:\Users\me\.local\bin\claude.exe",
+            no_arguments
+        ));
+        assert!(is_claude_program("/opt/homebrew/bin/claude", no_arguments));
+        assert!(!is_claude_program(
+            r"C:\Tools\claude-helper.exe",
+            no_arguments
+        ));
+        let npm = || {
+            r#""C:\Program Files\nodejs\node.exe" C:\Users\me\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js"#.to_string()
+        };
+        assert!(is_claude_program(r"C:\Program Files\nodejs\node.exe", npm));
+        assert!(!is_claude_program(
+            r"C:\Program Files\nodejs\node.exe",
+            || { "node server.js".to_string() }
+        ));
     }
 
     #[cfg(target_os = "macos")]

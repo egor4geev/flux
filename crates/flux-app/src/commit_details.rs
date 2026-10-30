@@ -605,7 +605,7 @@ fn file_name(path: &str) -> &str {
 
 /// "2026-10-09 14:32" in the local time zone.
 pub(crate) fn format_time(seconds: i64) -> String {
-    let local = seconds + utc_offset(seconds);
+    let local = seconds + crate::git_log::local_offset(seconds);
     let days = local.div_euclid(86_400);
     let secs = local.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -628,29 +628,6 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     (year, month, day)
-}
-
-#[cfg(target_os = "macos")]
-fn utc_offset(seconds: i64) -> i64 {
-    use core_foundation_sys::date::CFAbsoluteTime;
-    use core_foundation_sys::timezone::{CFTimeZoneCopySystem, CFTimeZoneGetSecondsFromGMT};
-    // CFAbsoluteTime counts from 2001-01-01.
-    let at = (seconds - 978_307_200) as CFAbsoluteTime;
-    // SAFETY: the system time zone is a valid CF object, released after use.
-    unsafe {
-        let zone = CFTimeZoneCopySystem();
-        if zone.is_null() {
-            return 0;
-        }
-        let offset = CFTimeZoneGetSecondsFromGMT(zone, at);
-        core_foundation_sys::base::CFRelease(zone as _);
-        offset as i64
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn utc_offset(_: i64) -> i64 {
-    0
 }
 
 impl Focusable for CommitDetailsView {

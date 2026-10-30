@@ -11,6 +11,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Reduce motion is on in macOS’s Accessibility settings: everything simply appears.",
         "В универсальном доступе macOS включено «Уменьшение движения»: всё просто появляется.",
     ),
+    (
+        "Animation effects are off in the Accessibility settings of Windows: everything simply appears.",
+        "В специальных возможностях Windows выключены «Эффекты анимации»: всё просто появляется.",
+    ),
 ];
 
 pub(super) const PLURALS: &[(&str, [&str; 3])] = &[];

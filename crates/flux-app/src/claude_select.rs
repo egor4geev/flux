@@ -738,7 +738,7 @@ mod tests {
     fn runs_split_around_the_selection() {
         let run = |len| TextRun {
             len,
-            font: gpui::font("Inter"),
+            font: gpui::font(crate::theme::UI_FONT),
             color: gpui::black(),
             background_color: None,
             underline: None,

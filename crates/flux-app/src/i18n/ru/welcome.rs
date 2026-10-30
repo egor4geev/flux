@@ -22,6 +22,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "A fast native code editor for macOS — with code understanding, version control and Claude Code built in.",
         "Быстрый нативный редактор кода для macOS — с пониманием кода, Git и Claude Code.",
     ),
+    (
+        "A fast native code editor for Windows — with code understanding, version control and Claude Code built in.",
+        "Быстрый нативный редактор кода для Windows — с пониманием кода, Git и Claude Code.",
+    ),
     ("Interface language", "Язык интерфейса"),
     // Help.
     ("Welcome Guide", "Гайд по Flux"),

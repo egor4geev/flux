@@ -4,6 +4,9 @@
 //! session. Through `UNUserNotificationCenter`, which wants an app bundle: unbundled (`cargo run`,
 //! UI scenarios) nothing is posted. The first notification asks macOS for the permission.
 //!
+//! On Windows (part 10.9) they are toasts under Flux's AppUserModelID, which its Start menu
+//! shortcut carries: without the installed shortcut (`cargo run`) Windows shows none.
+//!
 //! Each session has one notification at a time (its identifier): "done" replaces "waits", an
 //! answered question takes its notification back.
 
@@ -337,7 +340,149 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// A toast's XML: the generic template, the title and up to two lines.
+#[cfg(any(windows, test))]
+fn toast_xml(title: &str, subtitle: &str, body: &str) -> String {
+    let mut lines = String::new();
+    for line in [title, subtitle, body] {
+        if !line.is_empty() {
+            lines.push_str(&format!("<text>{}</text>", escape_xml(line)));
+        }
+    }
+    format!("<toast><visual><binding template=\"ToastGeneric\">{lines}</binding></visual></toast>")
+}
+
+/// Text for XML: its markup characters escaped, the control characters XML 1.0 has no place for
+/// dropped.
+#[cfg(any(windows, test))]
+fn escape_xml(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            '\n' | '\t' | '\r' => escaped.push(c),
+            c if c.is_control() => {}
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// Windows' toasts, through WinRT. A click while Flux runs brings it forward on the session; a
+/// toast clicked later in the notification center starts Flux through its shortcut, and the
+/// second launch hands over to the running one.
+#[cfg(windows)]
+mod platform {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    use futures::channel::mpsc::UnboundedSender;
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::Foundation::TypedEventHandler;
+    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+    use windows::core::{HSTRING, IInspectable};
+
+    /// The AppUserModelID Flux sets at start, the one its Start menu shortcut carries: Windows
+    /// shows the toasts of an app it knows by that id.
+    const APP_ID: &str = "Flux.Flux";
+    /// The sessions' toasts: one per session, by its tag in this group.
+    const GROUP: &str = "claude";
+
+    /// Where clicks go: the listener of `init`.
+    static CLICKS: OnceLock<Mutex<UnboundedSender<u64>>> = OnceLock::new();
+    /// The toasts shown, by tag: a click reaches a toast's handler only while the toast lives in
+    /// this process.
+    static SHOWN: Mutex<Vec<(String, ToastNotification)>> = Mutex::new(Vec::new());
+    /// A failure was logged: without the shortcut every toast fails the same way.
+    static FAILED: AtomicBool = AtomicBool::new(false);
+
+    pub fn install(clicks: UnboundedSender<u64>) {
+        CLICKS.set(Mutex::new(clicks)).ok();
+    }
+
+    /// One of Flux's windows is the foreground window.
+    pub fn app_is_active() -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId,
+        };
+        let mut pid = 0;
+        // SAFETY: reads the foreground window's process id into `pid`; a null window has none.
+        unsafe {
+            let window = GetForegroundWindow();
+            !window.is_null()
+                && GetWindowThreadProcessId(window, &mut pid) != 0
+                && pid == std::process::id()
+        }
+    }
+
+    /// A short tag: the session's number (older Windows 10 takes up to 16 characters).
+    fn tag(identifier: &str) -> HSTRING {
+        HSTRING::from(identifier.rsplit('.').next().unwrap_or(identifier))
+    }
+
+    pub fn post(identifier: &str, session: u64, title: &str, subtitle: &str, body: &str) {
+        if let Err(error) = show(identifier, session, title, subtitle, body)
+            && !FAILED.swap(true, Ordering::Relaxed)
+        {
+            log::warn!("system notification: {error}");
+        }
+    }
+
+    fn show(
+        identifier: &str,
+        session: u64,
+        title: &str,
+        subtitle: &str,
+        body: &str,
+    ) -> windows::core::Result<()> {
+        let document = XmlDocument::new()?;
+        document.LoadXml(&HSTRING::from(super::toast_xml(title, subtitle, body)))?;
+        let toast = ToastNotification::CreateToastNotification(&document)?;
+        toast.SetTag(&tag(identifier))?;
+        toast.SetGroup(&HSTRING::from(GROUP))?;
+        toast.Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
+            move |_, _| {
+                if let Some(Ok(clicks)) = CLICKS.get().map(|clicks| clicks.lock()) {
+                    clicks.unbounded_send(session).ok();
+                }
+                Ok(())
+            },
+        ))?;
+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?
+            .Show(&toast)?;
+        if let Ok(mut shown) = SHOWN.lock() {
+            shown.retain(|(shown, _)| shown != identifier);
+            shown.push((identifier.to_string(), toast));
+        }
+        Ok(())
+    }
+
+    pub fn withdraw(identifier: &str) {
+        let Ok(mut shown) = SHOWN.lock() else {
+            return;
+        };
+        let count = shown.len();
+        shown.retain(|(shown, _)| shown != identifier);
+        if shown.len() == count {
+            return;
+        }
+        ToastNotificationManager::History()
+            .and_then(|history| {
+                history.RemoveGroupedTagWithId(
+                    &tag(identifier),
+                    &HSTRING::from(GROUP),
+                    &HSTRING::from(APP_ID),
+                )
+            })
+            .ok();
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 mod platform {
     use futures::channel::mpsc::UnboundedSender;
 
@@ -365,6 +510,15 @@ mod tests {
                 streaming: false,
             },
         }
+    }
+
+    #[test]
+    fn toasts_carry_escaped_text() {
+        assert_eq!(
+            toast_xml("Claude · <fix>", "", "Tom & \"Jerry\"\u{7}"),
+            "<toast><visual><binding template=\"ToastGeneric\"><text>Claude · &lt;fix&gt;</text>\
+             <text>Tom &amp; &quot;Jerry&quot;</text></binding></visual></toast>"
+        );
     }
 
     #[test]

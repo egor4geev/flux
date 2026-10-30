@@ -33,6 +33,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Flux started from the Dock or the Finder opens the projects that were open when it quit.",
         "Flux, запущенный из Dock или Finder, открывает проекты, которые были открыты при выходе.",
     ),
+    (
+        "Flux started from the Start menu or the taskbar opens the projects that were open when it quit.",
+        "Flux, запущенный из меню «Пуск» или с панели задач, открывает проекты, которые были открыты при выходе.",
+    ),
     ("Open project in", "Где открывать проект"),
     ("New window", "В новом окне"),
     (

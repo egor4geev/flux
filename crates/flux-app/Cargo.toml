@@ -67,17 +67,32 @@ objc = "0.2.7"
 
 # Windows (part 10.9): a second launch hands its folders and files to the running Flux through a
 # named pipe (`second_launch.rs`); the process's AppUserModelID (`main.rs`) — the identity of its
-# windows, taskbar button and notifications, the Start menu shortcut's.
+# windows, taskbar button and notifications, the Start menu shortcut's; the system's facts: the
+# preferred languages, country names and "Animation effects" (`i18n`, `region_guard.rs`,
+# `motion.rs`), the version, processor and memory for bug reports (`feedback.rs`), the network's
+# adapters and the processes of the country check (`region_guard.rs`).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemServices",
+    "Wdk_System_Threading",
     "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# Toasts of Claude sessions (`system_notify.rs`): WinRT's notifications, the same `windows` crate
+# gpui uses.
+windows = { version = "0.61", features = ["Data_Xml_Dom", "Foundation", "UI_Notifications"] }
 
 [build-dependencies]
 # Flux.exe's manifest, icon and version (`build.rs`): rc.exe with MSVC, mingw-w64's windres in a

@@ -34,6 +34,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Коммит отменён: не удалось сохранить документ",
     ),
     ("Move {0} to Trash?", "Переместить {0} в Корзину?"),
+    ("Move {0} to the Recycle Bin?", "Переместить {0} в Корзину?"),
     // Rollback.
     ("Roll back changes in “{0}”?", "Откатить изменения в «{0}»?"),
     ("Roll back changes {0}?", "Откатить изменения {0}?"),

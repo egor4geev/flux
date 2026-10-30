@@ -897,7 +897,7 @@ fn report_text(crash: &Crash, machine: &SystemInfo, log_tail: &str) -> String {
     for (key, value) in [
         ("Time", &crash.time),
         ("Version", &crash.version),
-        ("macOS", &machine.macos),
+        (crate::feedback::SYSTEM_NAME, &machine.macos),
         ("Hardware", &machine.hardware),
         ("Thread", &crash.thread),
         ("Location", &crash.location),

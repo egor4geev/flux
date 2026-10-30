@@ -11,7 +11,9 @@
 //! - `trf("{0} of {1} files", &[&shown, &total])` — a template with numbered arguments;
 //! - `trn(count, "{n} result", "{n} results")` — a count with plural forms (Russian has three).
 //!
-//! Russian translations live in `i18n/ru/*.rs`, one table per area of the UI.
+//! Russian translations live in `i18n/ru/*.rs`, one table per area of the UI. The strings name
+//! macOS's places (the Finder, the Trash); on Windows [`tr`] takes Windows' words first
+//! ([`WINDOWS_WORDS`]) and translates those.
 
 mod ru;
 
@@ -20,6 +22,7 @@ use std::fmt::Display;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use crate::keymap::KeyOs;
 use crate::settings::LanguageChoice;
 
 /// A language of the interface.
@@ -130,7 +133,7 @@ fn parse(tag: &str) -> Option<Lang> {
 
 /// Preferred languages of the user, most preferred first (System Settings → Language & Region).
 #[cfg(target_os = "macos")]
-fn system_languages() -> Vec<String> {
+pub(crate) fn system_languages() -> Vec<String> {
     use core_foundation::array::CFArray;
     use core_foundation::base::TCFType;
     use core_foundation::string::CFString;
@@ -145,18 +148,173 @@ fn system_languages() -> Vec<String> {
         .collect()
 }
 
-#[cfg(not(target_os = "macos"))]
-fn system_languages() -> Vec<String> {
+/// The display languages of Windows, most preferred first (Settings → Time & language → Language
+/// & region): "ru-RU", "en-US".
+#[cfg(windows)]
+pub(crate) fn system_languages() -> Vec<String> {
+    use windows_sys::Win32::Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME};
+    let (mut count, mut len) = (0u32, 0u32);
+    // SAFETY: a null buffer asks for the length; the second call writes at most `len` characters
+    // into the buffer, which outlives it.
+    unsafe {
+        let asked = GetUserPreferredUILanguages(
+            MUI_LANGUAGE_NAME,
+            &mut count,
+            std::ptr::null_mut(),
+            &mut len,
+        );
+        if asked == 0 || len == 0 {
+            return Vec::new();
+        }
+        let mut buffer = vec![0u16; len as usize];
+        let read = GetUserPreferredUILanguages(
+            MUI_LANGUAGE_NAME,
+            &mut count,
+            buffer.as_mut_ptr(),
+            &mut len,
+        );
+        if read == 0 {
+            return Vec::new();
+        }
+        buffer.truncate(len as usize);
+        multi_string(&buffer)
+    }
+}
+
+/// The strings of a Windows multi-string: each ends with a NUL, an empty one ends the list.
+#[cfg(any(windows, test))]
+fn multi_string(buffer: &[u16]) -> Vec<String> {
+    buffer
+        .split(|&c| c == 0)
+        .take_while(|part| !part.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) fn system_languages() -> Vec<String> {
     ["LC_ALL", "LC_MESSAGES", "LANG"]
         .iter()
         .filter_map(|name| std::env::var(name).ok())
         .collect()
 }
 
-/// The translation of `text` into the interface language; `text` itself when there is none.
+/// The translation of `text` into the interface language; `text` itself when there is none. On
+/// Windows, Windows' words for the system's places come first ([`for_system`]).
 pub fn tr(text: &str) -> &str {
-    translate(lang(), text)
+    translate(lang(), for_system(KeyOs::current(), text))
 }
+
+/// `text` as the system words it: the strings are written for macOS; on Windows the ones that name
+/// macOS's places become [`WINDOWS_WORDS`]'.
+fn for_system(os: KeyOs, text: &str) -> &str {
+    match os {
+        KeyOs::Mac => text,
+        KeyOs::Windows => windows_words().get(text).copied().unwrap_or(text),
+    }
+}
+
+fn windows_words() -> &'static HashMap<&'static str, &'static str> {
+    static WORDS: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+    WORDS.get_or_init(|| WINDOWS_WORDS.iter().copied().collect())
+}
+
+/// The strings that name macOS's places, as Windows words them: Explorer for the Finder, the
+/// Recycle Bin for the Trash, "this computer" for "this Mac". Each has its Russian translation.
+const WINDOWS_WORDS: &[(&str, &str)] = &[
+    ("Finder", "Explorer"),
+    ("Reveal in Finder", "Reveal in Explorer"),
+    ("Reveal In Finder", "Reveal In Explorer"),
+    ("Show in Finder", "Show in Explorer"),
+    ("Show Log in Finder", "Show Log in Explorer"),
+    (
+        "Flux started from the Dock or the Finder opens the projects that were open when it quit.",
+        "Flux started from the Start menu or the taskbar opens the projects that were open when it quit.",
+    ),
+    ("Move to Trash", "Move to Recycle Bin"),
+    ("Move To Trash", "Move To Recycle Bin"),
+    ("Move “{0}” to Trash?", "Move “{0}” to the Recycle Bin?"),
+    ("Move {0} to Trash?", "Move {0} to the Recycle Bin?"),
+    (
+        "The folder and everything in it will be moved to the Trash.",
+        "The folder and everything in it will be moved to the Recycle Bin.",
+    ),
+    (
+        "You can restore it from the Trash.",
+        "You can restore it from the Recycle Bin.",
+    ),
+    ("Couldn't move to Trash", "Couldn't move to the Recycle Bin"),
+    (
+        "Files Claude created are moved to the Trash.",
+        "Files Claude created are moved to the Recycle Bin.",
+    ),
+    (
+        "Its transcript goes to the Trash.",
+        "Its transcript goes to the Recycle Bin.",
+    ),
+    (
+        "It closes, and its transcript goes to the Trash.",
+        "It closes, and its transcript goes to the Recycle Bin.",
+    ),
+    ("to the Trash", "to the Recycle Bin"),
+    ("While macOS is dark", "While Windows is in dark mode"),
+    ("While macOS is light", "While Windows is in light mode"),
+    (
+        "Switch between a light and a dark theme together with macOS.",
+        "Switch between a light and a dark theme together with Windows.",
+    ),
+    (
+        "macOS is dark now: Flux shows the dark theme.",
+        "Windows is in dark mode now: Flux shows the dark theme.",
+    ),
+    (
+        "macOS is light now: Flux shows the light theme.",
+        "Windows is in light mode now: Flux shows the light theme.",
+    ),
+    (
+        "Reduce motion is on in macOS’s Accessibility settings: everything simply appears.",
+        "Animation effects are off in the Accessibility settings of Windows: everything simply appears.",
+    ),
+    (
+        "A macOS notification while Flux isn't the active app.",
+        "A Windows notification while Flux isn't the active app.",
+    ),
+    (
+        "The version, macOS, the computer and the plugins — for a report",
+        "The version, Windows, the computer and the plugins — for a report",
+    ),
+    (
+        "A fast native code editor for macOS — with code understanding, version control and Claude Code built in.",
+        "A fast native code editor for Windows — with code understanding, version control and Claude Code built in.",
+    ),
+    (
+        "Asking a neutral service where the network sees this Mac",
+        "Asking a neutral service where the network sees this computer",
+    ),
+    (
+        "Flux finds out which country the network shows for this Mac and stops Claude while that country is on the list below or can't be found out.",
+        "Flux finds out which country the network shows for this computer and stops Claude while that country is on the list below or can't be found out.",
+    ),
+    (
+        "Accept connections from programs on this Mac",
+        "Accept connections from programs on this computer",
+    ),
+    ("uses the one on this Mac", "uses the one on this computer"),
+    (
+        "The languages found on this Mac are checked. Flux installs their plugins from the catalog; a language server comes by itself when you open the first file.",
+        "The languages found on this computer are checked. Flux installs their plugins from the catalog; a language server comes by itself when you open the first file.",
+    ),
+    ("Found on this Mac", "Found on this computer"),
+    (
+        "Flux starts the server for the language of an open file: errors, completion, go to definition. Servers installed on this Mac are used as they are; those Flux installed can be updated or deleted here.",
+        "Flux starts the server for the language of an open file: errors, completion, go to definition. Servers installed on this computer are used as they are; those Flux installed can be updated or deleted here.",
+    ),
+    (
+        "When a file needs a server that isn't on this Mac, Flux downloads it to:",
+        "When a file needs a server that isn't on this computer, Flux downloads it to:",
+    ),
+    ("On this Mac · {0}", "On this computer · {0}"),
+];
 
 fn translate(lang: Lang, text: &str) -> &str {
     match lang {
@@ -315,6 +473,46 @@ mod tests {
             "Applied stash@{1}: WIP"
         );
         assert_eq!(fill("{x} {9} {0}", &[&"a"]), "{x} {9} a");
+    }
+
+    /// Windows' words replace macOS's in both languages: every replaced string is one the sources
+    /// use (it has a Russian translation), and its Windows wording has one too, free of macOS's
+    /// names.
+    #[test]
+    fn windows_words_its_places_in_both_languages() {
+        for (mac, windows) in WINDOWS_WORDS {
+            assert!(
+                ru_strings().contains_key(mac),
+                "not a source string: {mac:?}"
+            );
+            let russian = ru_strings().get(windows).copied();
+            assert!(russian.is_some(), "no Russian for {windows:?}");
+            for name in ["Finder", "Trash", "macOS", "Mac", "Dock"] {
+                assert!(!windows.contains(name), "{windows:?}");
+                assert!(!russian.unwrap_or_default().contains(name), "{russian:?}");
+            }
+        }
+        assert_eq!(
+            for_system(KeyOs::Windows, "Reveal in Finder"),
+            "Reveal in Explorer"
+        );
+        assert_eq!(
+            translate(Lang::Ru, for_system(KeyOs::Windows, "Reveal in Finder")),
+            "Показать в Проводнике"
+        );
+        assert_eq!(
+            for_system(KeyOs::Mac, "Reveal in Finder"),
+            "Reveal in Finder"
+        );
+        assert_eq!(for_system(KeyOs::Windows, "Search files"), "Search files");
+    }
+
+    #[test]
+    fn windows_languages_come_as_a_multi_string() {
+        let buffer: Vec<u16> = "ru-RU\0en-US\0\0".encode_utf16().collect();
+        assert_eq!(multi_string(&buffer), ["ru-RU", "en-US"]);
+        assert!(multi_string(&[0, 0]).is_empty());
+        assert!(multi_string(&[]).is_empty());
     }
 
     #[test]

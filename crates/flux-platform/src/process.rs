@@ -160,9 +160,191 @@ pub fn redirect_stderr(file: &File) -> bool {
     }
 }
 
+/// A process in the system's list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessEntry {
+    pub pid: u32,
+    /// The process that started it. Windows reuses ids: once the parent has ended, its id may
+    /// belong to a newer process ([`descendants`] checks the start times).
+    pub parent: u32,
+    /// The executable's file name: `cargo.exe`.
+    pub name: String,
+}
+
+/// The processes running now, in the system's order (Windows: a Toolhelp32 snapshot). Unix systems
+/// ask about one process at a time instead (libproc, `/proc`).
+#[cfg(windows)]
+pub fn list() -> Vec<ProcessEntry> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    let mut list = Vec::new();
+    // SAFETY: the snapshot is checked before use and closed after; each entry is written by the
+    // calls, its size set first as they require.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+            return list;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            let name = &entry.szExeFile;
+            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            list.push(ProcessEntry {
+                pid: entry.th32ProcessID,
+                parent: entry.th32ParentProcessID,
+                name: String::from_utf16_lossy(&name[..len]),
+            });
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+    }
+    list
+}
+
+/// When a process started, in Windows' ticks (100 ns since 1601): a child starts after its parent,
+/// which tells a real parent from a newer process with a reused id.
+#[cfg(windows)]
+pub fn started(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: the handle is checked before use and closed after; the times are plain structs the
+    // call writes.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let (mut created, mut exited, mut kernel, mut user): (
+            FILETIME,
+            FILETIME,
+            FILETIME,
+            FILETIME,
+        ) = std::mem::zeroed();
+        let read = GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(process);
+        (read != 0)
+            .then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+}
+
+/// The full path of a process's executable.
+#[cfg(windows)]
+pub fn executable(pid: u32) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    // SAFETY: the handle is checked before use and closed after; the buffer outlives the call,
+    // which writes at most `len` characters and sets `len` to what it wrote.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut buffer = vec![0u16; 32_768];
+        let mut len = buffer.len() as u32;
+        let read =
+            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut len);
+        CloseHandle(process);
+        if read == 0 {
+            return None;
+        }
+        buffer.truncate(len as usize);
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
+    }
+}
+
+/// Ends a process at once. Windows has no signal asking a program to end: a console program gets
+/// Ctrl+C only from its own console, and a windowed Flux has none.
+#[cfg(windows)]
+pub fn terminate(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    // SAFETY: the handle is checked before use and closed after.
+    unsafe {
+        let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let ended = TerminateProcess(process, 1) != 0;
+        CloseHandle(process);
+        ended
+    }
+}
+
+/// The processes `ancestor` started, the ones they started, and so on. A link counts only when the
+/// child started after its parent (`started`; unknown — it doesn't): a process whose parent ended
+/// may name an id Windows has given to a newer process since.
+pub fn descendants(
+    list: &[ProcessEntry],
+    ancestor: u32,
+    started: impl Fn(u32) -> Option<u64>,
+) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut parents = vec![(ancestor, started(ancestor))];
+    while let Some((parent, parent_started)) = parents.pop() {
+        let Some(parent_started) = parent_started else {
+            continue;
+        };
+        for entry in list.iter().filter(|entry| entry.parent == parent) {
+            if entry.pid == ancestor || entry.pid == parent || found.contains(&entry.pid) {
+                continue;
+            }
+            let child_started = started(entry.pid);
+            if child_started.is_some_and(|at| at >= parent_started) {
+                found.push(entry.pid);
+                parents.push((entry.pid, child_started));
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(pid: u32, parent: u32, name: &str) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            parent,
+            name: name.to_string(),
+        }
+    }
+
+    /// Children and grandchildren are found; a process naming an ended parent's id that a newer
+    /// process got since is not.
+    #[test]
+    fn descendants_started_after_their_parents() {
+        let list = [
+            entry(10, 1, "flux.exe"),
+            entry(20, 10, "pwsh.exe"),
+            entry(30, 20, "node.exe"),
+            entry(40, 10, "claude.exe"),
+            // Started before Flux, by a process whose id Flux got later.
+            entry(50, 10, "old.exe"),
+            entry(60, 2, "other.exe"),
+        ];
+        let started = |pid: u32| match pid {
+            50 => Some(5),
+            60 => Some(1),
+            pid => Some(u64::from(pid) * 10),
+        };
+        let mut found = descendants(&list, 10, started);
+        found.sort();
+        assert_eq!(found, [20, 30, 40]);
+        // A parent whose start can't be read leads nowhere.
+        assert!(descendants(&list, 10, |_| None).is_empty());
+    }
 
     #[test]
     fn this_process_is_alive() {
