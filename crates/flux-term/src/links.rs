@@ -449,7 +449,7 @@ pub fn resolve(path: &str, cwd: Option<&Path>, root: Option<&Path>) -> Option<Pa
 fn expand_home(path: &str) -> Option<PathBuf> {
     match path.strip_prefix('~') {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            let home = std::env::var_os("HOME")?;
+            let home = flux_platform::paths::home().map(std::ffi::OsString::from)?;
             Some(PathBuf::from(home).join(rest.trim_start_matches('/')))
         }
         _ => Some(PathBuf::from(path)),
@@ -768,7 +768,7 @@ mod tests {
 
     #[test]
     fn home_is_expanded() {
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let home = flux_platform::paths::home().unwrap();
         assert_eq!(expand_home("~"), Some(home.clone()));
         assert_eq!(expand_home("~/x/y"), Some(home.join("x/y")));
         assert_eq!(expand_home("~user/x"), Some(PathBuf::from("~user/x")));

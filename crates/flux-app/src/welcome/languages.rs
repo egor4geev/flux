@@ -127,9 +127,7 @@ impl LanguagesStep {
         plugin_catalog::index(cx);
         plugin_catalog::ensure_fresh(cx);
         let find = cx.background_spawn(async move {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default();
+            let home = flux_platform::paths::home().unwrap_or_default();
             let path = flux_plugin::login_env()
                 .iter()
                 .find(|(name, _)| name == "PATH")

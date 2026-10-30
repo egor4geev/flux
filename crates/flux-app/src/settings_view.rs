@@ -2642,11 +2642,7 @@ fn dirs_label() -> String {
     std::env::var_os("FLUX_SERVERS_DIR")
         .filter(|dir| !dir.is_empty())
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| {
-                std::path::PathBuf::from(home).join("Library/Application Support/flux/servers")
-            })
-        })
+        .or_else(|| flux_platform::paths::support_dir().map(|dir| dir.join("servers")))
         .map(|dir| tilde(&dir))
         .unwrap_or_default()
 }

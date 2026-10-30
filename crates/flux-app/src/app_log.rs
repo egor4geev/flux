@@ -190,7 +190,7 @@ pub fn file() -> PathBuf {
 pub fn start() {
     let dir = start_dir();
     let _ = DIR.set(dir.clone());
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = flux_platform::paths::home().map(std::ffi::OsString::from) {
         let _ = HOME.set(home.to_string_lossy().trim_end_matches('/').to_string());
     }
     let machine = MACHINE.get_or_init(feedback::machine);

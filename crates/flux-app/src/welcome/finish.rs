@@ -340,8 +340,8 @@ fn recent_projects() -> Vec<Project> {
         .collect()
 }
 
-/// Where other IDEs keep their settings: `~/Library/Application Support`, or `FLUX_OTHER_IDES_DIR`;
-/// none in a scenario without it.
+/// Where other IDEs keep their settings: `~/Library/Application Support` (Windows: Roaming
+/// AppData, Linux: `~/.config`), or `FLUX_OTHER_IDES_DIR`; none in a scenario without it.
 fn other_ides_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("FLUX_OTHER_IDES_DIR").filter(|dir| !dir.is_empty()) {
         return Some(dir.into());
@@ -349,13 +349,19 @@ fn other_ides_dir() -> Option<PathBuf> {
     if std::env::var_os("FLUX_SCENARIO").is_some() {
         return None;
     }
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    Some(home.join("Library/Application Support"))
+    let home = flux_platform::paths::home()?;
+    Some(if cfg!(target_os = "macos") {
+        home.join("Library/Application Support")
+    } else if cfg!(windows) {
+        home.join("AppData").join("Roaming")
+    } else {
+        home.join(".config")
+    })
 }
 
 /// The recent projects the IDEs under `support` remember, newest first, no repeats.
 fn other_projects(support: &Path) -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = flux_platform::paths::home();
     let mut found: Vec<(u64, PathBuf)> = Vec::new();
     for file in xml_lists(support) {
         if let Ok(text) = fs::read_to_string(&file) {

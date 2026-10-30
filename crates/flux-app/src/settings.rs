@@ -480,7 +480,7 @@ pub fn init(cx: &mut App) {
     let path = store_path_for(
         std::env::var_os("FLUX_SETTINGS_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     )
     // Watched and opened in a tab: the same path wherever the current directory is.
     .map(|path| std::path::absolute(&path).unwrap_or(path));
@@ -871,7 +871,7 @@ fn store_path_for(
     if scenario {
         return None;
     }
-    Some(PathBuf::from(home?).join("Library/Application Support/flux/settings.json"))
+    Some(flux_platform::paths::support_dir_in(std::path::Path::new(&home?)).join("settings.json"))
 }
 
 /// Broken files fall back to the defaults.

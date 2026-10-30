@@ -6821,7 +6821,7 @@ fn canonical(path: &Path) -> PathBuf {
 
 /// Display path: the home directory is shown as `~`.
 pub(crate) fn tilde(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = flux_platform::paths::home();
     match home
         .as_deref()
         .and_then(|home| path.strip_prefix(home).ok())
@@ -8671,7 +8671,7 @@ mod tests {
 
     #[test]
     fn home_is_shown_as_tilde() {
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let home = flux_platform::paths::home().unwrap();
         assert_eq!(tilde(&home), "~");
         assert_eq!(tilde(&home.join("dev/flux")), "~/dev/flux");
         assert_eq!(tilde(Path::new("/opt/x")), "/opt/x");

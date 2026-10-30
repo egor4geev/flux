@@ -306,7 +306,7 @@ fn search_path() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = env::var_os("PATH")
         .map(|path| env::split_paths(&path).collect())
         .unwrap_or_default();
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = flux_platform::paths::home() {
         dirs.push(home.join(".local/bin"));
         dirs.push(home.join(".claude/local"));
         dirs.push(home.join(".npm-global/bin"));

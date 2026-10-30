@@ -266,7 +266,9 @@ impl system::Host for State {
     }
 
     fn home_dir(&mut self) -> String {
-        std::env::var("HOME").unwrap_or_default()
+        flux_platform::paths::home()
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     fn utc_offset(&mut self, at: i64) -> i32 {

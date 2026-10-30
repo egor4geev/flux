@@ -240,13 +240,11 @@ impl Helper {
     /// The user's: `~/Library/Logs/Flux/update.log` (`FLUX_LOG_DIR`, as Flux's log), `~/.Trash`; no relaunch with
     /// `FLUX_UPDATE_NO_RELAUNCH=1`; the new Flux gets this process's `FLUX_*` variables.
     pub fn user() -> Helper {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
+        let home = flux_platform::paths::home().unwrap_or_default();
         Helper {
             log: std::env::var_os("FLUX_LOG_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| home.join("Library/Logs/Flux"))
+                .unwrap_or_else(|| flux_platform::paths::logs_dir_in(&home))
                 .join("update.log"),
             trash: home.join(".Trash"),
             relaunch: std::env::var("FLUX_UPDATE_NO_RELAUNCH").as_deref() != Ok("1"),

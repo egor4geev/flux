@@ -2277,9 +2277,7 @@ impl Favorites {
         let path = match explicit {
             Some(file) => Some(PathBuf::from(file)),
             None if std::env::var_os("FLUX_SCENARIO").is_some() => None,
-            None => std::env::var_os("HOME").map(|home| {
-                PathBuf::from(home).join("Library/Application Support/flux/git-favorites.json")
-            }),
+            None => flux_platform::paths::support_dir().map(|dir| dir.join("git-favorites.json")),
         };
         let by_repo = path
             .as_deref()

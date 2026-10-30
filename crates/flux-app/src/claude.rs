@@ -771,7 +771,7 @@ impl ClaudeStore {
         let cwd = self
             .root
             .clone()
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(flux_platform::paths::home)
             .unwrap_or_else(|| PathBuf::from("/"));
         LaunchOptions {
             cwd,

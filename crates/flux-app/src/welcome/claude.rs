@@ -9,7 +9,6 @@
 //! after a sign-in or an install, every Flux window checks again too: its chat works without a
 //! restart.
 
-use std::path::PathBuf;
 use std::sync::Once;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -166,7 +165,7 @@ impl ClaudeStep {
         let (program, args) = cli.login_command();
         let spec = SpawnSpec {
             command: Some((program.to_string_lossy().into_owned(), args)),
-            cwd: std::env::var_os("HOME").map(PathBuf::from),
+            cwd: flux_platform::paths::home(),
             title: Some("claude auth login".into()),
             keep_on_exit: true,
             ..SpawnSpec::default()

@@ -167,7 +167,7 @@ impl HostState {
                 &format!("processes = [\"{name}\"]"),
             ));
         }
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = flux_platform::paths::home();
         let base = self
             .root
             .clone()

@@ -64,7 +64,7 @@ fn store_path() -> Option<PathBuf> {
     store_path_for(
         std::env::var_os("FLUX_RECENT_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     )
 }
 
@@ -81,7 +81,7 @@ fn store_path_for(
         return None;
     }
     let home = PathBuf::from(home?);
-    Some(home.join("Library/Application Support/flux/recent-projects"))
+    Some(flux_platform::paths::support_dir_in(&home).join("recent-projects"))
 }
 
 fn load_from(file: &Path) -> Vec<PathBuf> {

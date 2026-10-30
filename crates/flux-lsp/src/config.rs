@@ -71,7 +71,12 @@ pub fn with_user_settings(mut config: ServerConfig, user: &Value) -> Option<Serv
         .map(str::trim)
         .filter(|command| !command.is_empty())
     {
-        config.command = expand_home(command, env::var_os("HOME").as_deref());
+        config.command = expand_home(
+            command,
+            flux_platform::paths::home()
+                .map(std::ffi::OsString::from)
+                .as_deref(),
+        );
         config.install = None;
     }
     if let Some(args) = user.get("args").and_then(Value::as_array) {
@@ -371,7 +376,7 @@ pub fn search_path() -> Vec<PathBuf> {
     if let Some(path) = env::var_os("PATH") {
         dirs.extend(env::split_paths(&path));
     }
-    let home = env::var_os("HOME").map(PathBuf::from);
+    let home = flux_platform::paths::home();
     let in_home = |relative: &str| home.as_ref().map(|home| home.join(relative));
 
     if let Some(cargo_home) = env::var_os("CARGO_HOME") {

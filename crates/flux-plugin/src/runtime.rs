@@ -1007,9 +1007,7 @@ fn new_store(
     }
     // The folders outside the project, each at its real path; one that isn't there (yet) is left
     // out, not a reason to stop.
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = flux_platform::paths::home().unwrap_or_default();
     for folder in &config.entry.manifest.permissions.folders {
         let path = folder.resolve(&home);
         let perms = match folder.access {

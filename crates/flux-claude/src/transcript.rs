@@ -58,7 +58,7 @@ pub fn projects_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir).join("projects"));
     }
-    let home = std::env::var_os("HOME")?;
+    let home = flux_platform::paths::home().map(std::ffi::OsString::from)?;
     Some(PathBuf::from(home).join(".claude").join("projects"))
 }
 

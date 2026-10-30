@@ -55,9 +55,7 @@ pub(crate) fn propose(
             state.entry.manifest.permissions.folders.clone(),
         )
     };
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = flux_platform::paths::home().unwrap_or_default();
     allowed(&path, root.as_deref(), &folders, &home, proposal.apply)?;
     let original = match open_editor(workspace, &path, cx) {
         Some(editor) => Some(editor.read(cx).document.text().to_string()),

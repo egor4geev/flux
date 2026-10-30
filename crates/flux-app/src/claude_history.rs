@@ -588,7 +588,7 @@ fn store_path() -> Option<PathBuf> {
     store_path_for(
         std::env::var_os("FLUX_CLAUDE_SESSIONS_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     )
 }
 
@@ -597,7 +597,7 @@ fn console_path() -> Option<PathBuf> {
         "claude-console.json",
         std::env::var_os("FLUX_CLAUDE_CONSOLE_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     )
 }
 
@@ -626,7 +626,7 @@ fn file_path_for(
         return None;
     }
     let home = PathBuf::from(home?);
-    Some(home.join("Library/Application Support/flux").join(name))
+    Some(flux_platform::paths::support_dir_in(&home).join(name))
 }
 
 fn read(file: &Path) -> BTreeMap<String, OpenSessions> {

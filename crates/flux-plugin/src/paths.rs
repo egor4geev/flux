@@ -14,7 +14,8 @@ pub fn override_home(dir: PathBuf) {
     let _ = HOME.set(dir);
 }
 
-/// `~/Library/Application Support/flux`, or `FLUX_PLUGINS_HOME`.
+/// Flux's support folder (`~/Library/Application Support/flux`, `%LOCALAPPDATA%\Flux`), or
+/// `FLUX_PLUGINS_HOME`.
 fn home() -> PathBuf {
     if let Some(home) = HOME.get() {
         return home.clone();
@@ -22,13 +23,11 @@ fn home() -> PathBuf {
     if let Some(home) = std::env::var_os("FLUX_PLUGINS_HOME") {
         return PathBuf::from(home);
     }
-    user_home().join("Library/Application Support/flux")
+    flux_platform::paths::support_dir_in(&user_home())
 }
 
 fn user_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    flux_platform::paths::home().unwrap_or_else(std::env::temp_dir)
 }
 
 /// Everything is in a folder of `FLUX_PLUGINS_HOME` or of the process itself, not the user's.
@@ -60,7 +59,7 @@ pub fn cache_dir() -> PathBuf {
     if overridden() {
         return home().join("cache");
     }
-    user_home().join("Library/Caches/flux/plugins")
+    flux_platform::paths::caches_dir_in(&user_home()).join("plugins")
 }
 
 /// The plugins' logs: `~/Library/Logs/Flux/plugins/<id>.log`.
@@ -68,5 +67,5 @@ pub fn logs_dir() -> PathBuf {
     if overridden() {
         return home().join("logs");
     }
-    user_home().join("Library/Logs/Flux/plugins")
+    flux_platform::paths::logs_dir_in(&user_home()).join("plugins")
 }

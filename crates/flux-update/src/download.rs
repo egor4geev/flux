@@ -17,11 +17,12 @@ const MAX_ARCHIVE: u64 = 1024 * 1024 * 1024;
 
 /// The cache of updates.
 pub fn cache_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = flux_platform::paths::home().unwrap_or_default();
     if cfg!(target_os = "macos") {
         return home.join("Library/Caches/Flux/updates");
+    }
+    if cfg!(windows) {
+        return flux_platform::paths::caches_dir_in(&home).join("updates");
     }
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
