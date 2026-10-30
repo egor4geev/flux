@@ -685,13 +685,16 @@ fn open_in_new_window(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let root = fs::canonicalize(&path).unwrap_or(path);
+    let root = flux_platform::path_style::canonicalize(&path).unwrap_or(path);
     if !root.is_dir() {
         // A folder from the recent list may have disappeared since.
         let message = trf("Folder not found: {0}", &[&tilde(&root)]);
         return workspace.notify(Notification::warning(message), cx);
     }
-    if workspace.root() == Some(root.as_path()) {
+    if workspace
+        .root()
+        .is_some_and(|open| flux_platform::same_path(open, &root))
+    {
         return;
     }
     let this = window.window_handle().window_id();
@@ -701,9 +704,11 @@ fn open_in_new_window(
         .filter(|handle| handle.window_id() != this)
         .filter_map(|handle| handle.downcast::<Workspace>())
         .find(|handle| {
-            handle
-                .read(cx)
-                .is_ok_and(|other| other.root() == Some(root.as_path()))
+            handle.read(cx).is_ok_and(|other| {
+                other
+                    .root()
+                    .is_some_and(|open| flux_platform::same_path(open, &root))
+            })
         });
     if let Some(handle) = other {
         handle

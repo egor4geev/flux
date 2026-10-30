@@ -108,18 +108,11 @@ pub fn user_shell() -> String {
         .unwrap_or_else(|| "/bin/zsh".into())
 }
 
-/// Windows: the Git Bash the Claude CLI itself runs commands in (`CLAUDE_CODE_GIT_BASH_PATH`, else
-/// Git's own folder), so `!` commands read as in Claude's bash mode; without Git — PowerShell.
+/// Windows: the Git Bash the Claude CLI itself runs commands in ([`crate::cli::git_bash`]), so `!`
+/// commands read as in Claude's bash mode; without Git — PowerShell.
 #[cfg(windows)]
 pub fn user_shell() -> String {
-    let git_bash = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("ProgramFiles")
-                .map(|dir| Path::new(&dir).join("Git").join("bin").join("bash.exe"))
-        })
-        .filter(|bash| bash.is_file());
-    match git_bash {
+    match crate::cli::git_bash() {
         Some(bash) => bash.to_string_lossy().into_owned(),
         None => "powershell.exe".into(),
     }

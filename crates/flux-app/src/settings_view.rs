@@ -1784,6 +1784,7 @@ impl SettingsView {
                     .into(),
             ),
             CliState::Failed(error) => (error.clone().into(), "—".into()),
+            CliState::NoGitBash => (tr("Claude Code needs Git for Windows").into(), "—".into()),
         };
         let signed_out = matches!(state, CliState::SignedOut { .. });
         let account_value = div()

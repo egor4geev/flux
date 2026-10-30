@@ -294,7 +294,7 @@ fn show_log(
         return;
     }
     // The tab knows the file by its real path (`/private/var/…` for the temporary `/var/…`).
-    let path = fs::canonicalize(&path).unwrap_or(path);
+    let path = flux_platform::path_style::canonicalize(&path).unwrap_or(path);
     let opened = path.clone();
     workspace.open_and(path, true, window, cx, move |workspace, cx| {
         let Some(editor) = workspace.active_editor() else {
@@ -319,7 +319,14 @@ fn show_log(
 fn log_path(temp: &Path, key: &ServerKey) -> PathBuf {
     let clean = |text: &str| -> String {
         text.chars()
-            .map(|c| if c == '/' || c == ':' { '-' } else { c })
+            // On Windows `\` too: the project's path must not make folders of the name.
+            .map(|c| {
+                if flux_platform::PathStyle::NATIVE.is_separator(c) || c == ':' {
+                    '-'
+                } else {
+                    c
+                }
+            })
             .collect()
     };
     let project = key

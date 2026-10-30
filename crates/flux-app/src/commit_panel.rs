@@ -3498,7 +3498,8 @@ pub(crate) fn restore_originals(jobs: &[(PathBuf, Option<Arc<str>>)]) -> Vec<Str
 /// Writes a file through a temporary one and a rename, keeping its permissions (as a document's
 /// save): a failure leaves the old file whole.
 fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target =
+        flux_platform::path_style::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let permissions = std::fs::metadata(&target)
         .ok()
         .map(|meta| meta.permissions());

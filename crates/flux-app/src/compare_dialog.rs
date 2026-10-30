@@ -832,7 +832,10 @@ fn file_row(
     ui: UiColors,
 ) -> gpui::Stateful<Div> {
     let (dir, name) = match file.path.rsplit_once('/') {
-        Some((dir, name)) => (Some(dir.to_string()), name.to_string()),
+        Some((dir, name)) => (
+            Some(flux_platform::PathStyle::NATIVE.native(dir).into_owned()),
+            name.to_string(),
+        ),
         None => (None, file.path.clone()),
     };
     let detail: Option<SharedString> = match (file.status, &file.orig_path) {

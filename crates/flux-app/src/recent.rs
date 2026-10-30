@@ -94,14 +94,14 @@ fn record_in(file: &Path, root: &Path) -> Vec<PathBuf> {
         eprintln!("flux: {}: {error}", file.display());
     }
     list.into_iter()
-        .filter(|dir| dir == root || dir.is_dir())
+        .filter(|dir| flux_platform::same_path(dir, root) || dir.is_dir())
         .collect()
 }
 
 fn remove_in(file: &Path, root: &Path) -> Vec<PathBuf> {
     let mut list = read(file);
     let before = list.len();
-    list.retain(|known| known != root);
+    list.retain(|known| !flux_platform::same_path(known, root));
     if list.len() != before
         && let Err(error) = write(file, &list)
     {
@@ -127,7 +127,11 @@ fn parse(text: &str) -> Vec<PathBuf> {
     let mut list: Vec<PathBuf> = Vec::new();
     for line in text.lines() {
         let path = Path::new(line.trim_end_matches('\r'));
-        if path.is_absolute() && !list.iter().any(|known| known == path) {
+        if path.is_absolute()
+            && !list
+                .iter()
+                .any(|known| flux_platform::same_path(known, path))
+        {
             list.push(path.to_path_buf());
         }
     }
@@ -137,7 +141,7 @@ fn parse(text: &str) -> Vec<PathBuf> {
 
 /// `root` goes first; its previous place is freed; the length is at most [`MAX_RECENT`].
 fn push_front(mut list: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
-    list.retain(|known| known != root);
+    list.retain(|known| !flux_platform::same_path(known, root));
     list.insert(0, root.to_path_buf());
     list.truncate(MAX_RECENT);
     list

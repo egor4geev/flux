@@ -24,6 +24,15 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ),
     ("Native installer", "Официальный установщик"),
     ("Homebrew", "Homebrew"),
+    ("npm", "npm"),
+    (
+        "Claude Code needs Git for Windows",
+        "Для Claude Code нужен Git for Windows",
+    ),
+    (
+        "On Windows, Claude Code runs its commands in Git Bash, which comes with Git for Windows. Install it from git-scm.com, then check again.",
+        "В Windows Claude Code выполняет команды в Git Bash, который ставится вместе с Git for Windows. Установите его с git-scm.com и проверьте снова.",
+    ),
     ("Type in Terminal", "Вписать в терминал"),
     ("Check Again", "Проверить снова"),
     ("Set Path…", "Указать путь…"),

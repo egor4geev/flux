@@ -146,7 +146,8 @@ impl PickerDelegate for FileFinder {
         let Some(found) = self.matcher.get(index) else {
             return;
         };
-        let path = self.root.join(&*found.path);
+        // The finder's paths are `/`-separated: joined in the system's separators.
+        let path = flux_platform::join_slashed(&self.root, &found.path);
         cx.emit(DismissEvent);
         self.workspace
             .update(cx, |workspace, cx| {
@@ -241,7 +242,8 @@ impl PathRow {
                 .iter()
                 .filter_map(|&p| p.checked_sub(name_start))
                 .collect(),
-            dir: dir.to_string(),
+            // Shown in the system's separators (one character for one: the positions hold).
+            dir: flux_platform::PathStyle::NATIVE.native(dir).into_owned(),
             dir_positions: found
                 .positions
                 .iter()

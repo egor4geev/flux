@@ -363,5 +363,5 @@ fn project_root(dirs: Vec<PathBuf>) -> Option<PathBuf> {
             extra.display()
         );
     }
-    Some(std::fs::canonicalize(&root).unwrap_or(root))
+    Some(flux_platform::path_style::canonicalize(&root).unwrap_or(root))
 }

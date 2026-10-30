@@ -42,7 +42,7 @@ pub fn run(mut urls: UnboundedReceiver<Vec<String>>, cx: &mut App) {
 pub(crate) fn open(paths: Vec<PathBuf>, cx: &mut App) {
     let (dirs, files): (Vec<_>, Vec<_>) = paths.into_iter().partition(|path| path.is_dir());
     for dir in dirs {
-        let root = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let root = flux_platform::path_style::canonicalize(&dir).unwrap_or(dir);
         if let Some(handle) = workspace::project_window(&root, cx) {
             handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -125,6 +125,12 @@ fn file_path(url: &str) -> Option<PathBuf> {
         Some(trimmed) if !trimmed.is_empty() => trimmed.to_string(),
         _ => path,
     };
+    // Windows: `/C:/dir` is `C:\dir`.
+    if flux_platform::PathStyle::NATIVE == flux_platform::PathStyle::Windows {
+        return flux_platform::PathStyle::Windows
+            .file_url_path("", &path)
+            .map(PathBuf::from);
+    }
     Some(PathBuf::from(path))
 }
 

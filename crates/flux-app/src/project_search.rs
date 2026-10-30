@@ -751,7 +751,7 @@ impl ProjectSearch {
                 self.close(cx);
             }
             Some(Row::NamedFile(hit)) => {
-                let path = root.join(&*self.named.hits[hit].path);
+                let path = flux_platform::join_slashed(&root, &self.named.hits[hit].path);
                 cx.emit(ProjectSearchEvent::OpenFile(path));
                 self.close(cx);
             }
@@ -1773,10 +1773,11 @@ fn split_named(path: &str, positions: &[usize]) -> (String, Vec<usize>, String, 
         .copied()
         .filter(|&p| p < dir_chars)
         .collect();
+    // The folder in the system's separators (one character for one: the positions hold).
     (
         name.to_string(),
         name_positions,
-        dir.to_string(),
+        flux_platform::PathStyle::NATIVE.native(dir).into_owned(),
         dir_positions,
     )
 }

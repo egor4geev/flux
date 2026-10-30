@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use flux_platform::process::Background;
 use serde_json::{Value, json};
 
 use crate::install;
@@ -232,9 +233,10 @@ impl ServerConfig {
         if command.components().count() > 1 {
             return is_executable(command).then(|| command.to_path_buf());
         }
+        // On Windows a bare name is a `.exe` or a `.cmd`: `PATHEXT` says which.
         search_path()
             .into_iter()
-            .map(|dir| dir.join(command))
+            .flat_map(|dir| flux_platform::process::program_files(&dir, &self.command))
             .find(|path| is_executable(path))
             .filter(|path| !self.is_bare_rustup_proxy(path))
     }
@@ -245,13 +247,15 @@ impl ServerConfig {
         let Some(Install::Rustup { component, .. }) = &self.install else {
             return false;
         };
-        let Some(rustup) = path.parent().map(|dir| dir.join("rustup")) else {
+        let Some(rustup) = path.parent().and_then(|dir| {
+            flux_platform::process::program_files(dir, "rustup")
+                .into_iter()
+                .find(|rustup| is_executable(rustup))
+        }) else {
             return false;
         };
-        if !is_executable(&rustup) {
-            return false;
-        }
         let has_component = Command::new(rustup)
+            .background()
             .args(["which", component])
             .env("PATH", search_path_env())
             .stdin(Stdio::null())
@@ -399,6 +403,10 @@ pub fn search_path() -> Vec<PathBuf> {
     dirs.extend(in_home("go/bin"));
     dirs.extend(in_home(".local/bin"));
 
+    // npm's global packages on Windows (`npm install -g` puts `.cmd` files there).
+    if cfg!(windows) {
+        dirs.extend(env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("npm")));
+    }
     dirs.extend(in_home(".volta/bin"));
     dirs.extend(in_home(".npm-global/bin"));
     dirs.extend(in_home(".bun/bin"));
@@ -468,18 +476,7 @@ fn system_paths() -> Vec<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        metadata.is_file()
-    }
+    flux_platform::process::is_executable(path)
 }
 
 #[cfg(test)]

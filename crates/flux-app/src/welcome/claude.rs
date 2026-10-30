@@ -167,6 +167,8 @@ impl ClaudeStep {
             command: Some((program.to_string_lossy().into_owned(), args)),
             cwd: flux_platform::paths::home(),
             title: Some("claude auth login".into()),
+            // Windows: the Git Bash Flux found, should the CLI not find it by itself.
+            env: flux_claude::cli::terminal_env(),
             keep_on_exit: true,
             ..SpawnSpec::default()
         };
@@ -433,6 +435,20 @@ impl ClaudeStep {
                         ),
                 )
             }
+            CliState::NoGitBash => card
+                .child(head(
+                    IconName::Warning,
+                    ui.warning,
+                    tr("Claude Code needs Git for Windows").into(),
+                    claude::git_bash_note().into(),
+                    ui,
+                ))
+                .child(
+                    actions().child(
+                        ui::text_button("welcome-claude-check", tr("Check Again"), false, ui)
+                            .on_click(cx.listener(|this, _, _, cx| this.check(cx))),
+                    ),
+                ),
             CliState::Failed(error) => card
                 .child(head(
                     IconName::Warning,

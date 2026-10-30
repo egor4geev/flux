@@ -858,7 +858,10 @@ impl ConflictsDialog {
             Row::File(change) => {
                 let selected = self.selected.contains(&change.path);
                 let (dir, name) = match change.relative.rsplit_once('/') {
-                    Some((dir, name)) => (Some(dir.to_string()), name.to_string()),
+                    Some((dir, name)) => (
+                        Some(flux_platform::PathStyle::NATIVE.native(dir).into_owned()),
+                        name.to_string(),
+                    ),
                     None => (None, change.relative.clone()),
                 };
                 let (ours, theirs) = side_changes(change.conflict);

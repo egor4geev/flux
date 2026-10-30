@@ -2233,12 +2233,12 @@ fn set_scroll(editor: &Entity<Editor>, scroll: Point<f32>, cx: &mut App) {
 /// The path as the git hub knows it: canonical, or, for a missing file, its canonical directory and
 /// its name.
 fn canonical(path: &Path) -> PathBuf {
-    if let Ok(path) = std::fs::canonicalize(path) {
+    if let Ok(path) = flux_platform::path_style::canonicalize(path) {
         return path;
     }
     match (
         path.parent()
-            .and_then(|dir| std::fs::canonicalize(dir).ok()),
+            .and_then(|dir| flux_platform::path_style::canonicalize(dir).ok()),
         path.file_name(),
     ) {
         (Some(dir), Some(name)) => dir.join(name),

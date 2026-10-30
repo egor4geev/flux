@@ -1997,6 +1997,18 @@ impl ClaudeConsole {
                             Box::new(claude::OpenSettings),
                         )),
                 ),
+            CliState::NoGitBash => column
+                .child(tile(IconName::Warning, ui.warning))
+                .child(heading(tr("Claude Code needs Git for Windows").into()))
+                .child(note(claude::git_bash_note().into()))
+                .child(
+                    div().flex().gap_2().child(action_button(
+                        "claude-check-again",
+                        tr("Check Again"),
+                        true,
+                        Box::new(claude::CheckAgain),
+                    )),
+                ),
             // Ready: the list draws instead.
             CliState::Ready { .. } => column,
         };

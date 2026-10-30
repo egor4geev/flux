@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use flux_platform::process::Background;
 use serde_json::{Value, json};
 
 use crate::config::{Install, ServerConfig, search_path, search_path_env};
@@ -86,8 +87,9 @@ pub fn check(config: &ServerConfig) -> Result<(), String> {
 fn check_recipe(recipe: &Install) -> Result<(), String> {
     match recipe {
         Install::Npm { .. } => node_platform().map(|_| ()).ok_or(UNSUPPORTED.into()),
-        Install::GitHubRelease { .. } => {
-            let supported = cfg!(target_os = "macos") && github_arch().is_some();
+        Install::GitHubRelease { asset, .. } => {
+            let system = cfg!(target_os = "macos") || (WINDOWS && windows_asset(asset).is_some());
+            let supported = system && github_arch().is_some();
             supported.then_some(()).ok_or(UNSUPPORTED.into())
         }
         Install::GoInstall { .. } => find_tool("go").map(|_| ()).ok_or(NEEDS_GO.into()),
@@ -215,7 +217,7 @@ fn installed_in(dir: &Path, config: &ServerConfig) -> Option<PathBuf> {
 fn installed_home(dir: &Path, config: &ServerConfig) -> Option<(PathBuf, PathBuf)> {
     let recipe = config.install.as_ref()?;
     let node_ready = !matches!(recipe, Install::Npm { .. })
-        || is_executable(&dir.join("node").join("bin").join("node"));
+        || is_executable(&NodePaths::of(&dir.join("node"), WINDOWS).node);
     if !node_ready {
         return None;
     }
@@ -239,7 +241,7 @@ fn installed_home(dir: &Path, config: &ServerConfig) -> Option<(PathBuf, PathBuf
         .map(|entry| entry.path())
         .filter(|other| other.is_dir() && *other != home)
         .find_map(|other| {
-            let command = other.join("node_modules").join(".bin").join(bin);
+            let command = npm_command(&other, bin, WINDOWS);
             let shared = recipe_of(&other).is_some_and(|key| key.starts_with(&same_packages));
             (shared && is_executable(&command)).then_some((other, command))
         })
@@ -267,9 +269,9 @@ fn package_name(spec: &str) -> &str {
 fn command_path(dir: &Path, name: &str, recipe: &Install) -> PathBuf {
     let home = dir.join(name);
     match recipe {
-        Install::Npm { bin, .. } => home.join("node_modules").join(".bin").join(bin),
+        Install::Npm { bin, .. } => npm_command(&home, bin, WINDOWS),
         Install::GitHubRelease { bin, .. } | Install::GoInstall { bin, .. } => {
-            home.join("bin").join(bin)
+            home.join("bin").join(program_name(bin, WINDOWS))
         }
         Install::Rustup { fallback, .. } => command_path(dir, name, fallback),
     }
@@ -282,7 +284,7 @@ pub(crate) fn node_bin_for(config: &ServerConfig, program: &Path) -> Option<Path
     if !matches!(config.install, Some(Install::Npm { .. })) || !program.starts_with(&dir) {
         return None;
     }
-    Some(dir.join("node").join("bin"))
+    Some(NodePaths::of(&dir.join("node"), WINDOWS).bin)
 }
 
 /// `bin` directories of the tools Flux installed for servers.
@@ -381,14 +383,11 @@ impl Installer<'_> {
         let node = self.ensure_node()?;
         let staging = self.staging(name)?;
         self.report(format!("Installing {name}"), None);
-        let npm = node
-            .join("lib")
-            .join("node_modules")
-            .join("npm")
-            .join("bin");
-        let mut command = Command::new(node.join("bin").join("node"));
+        let paths = NodePaths::of(&node, WINDOWS);
+        let mut command = Command::new(&paths.node);
         command
-            .arg(npm.join("npm-cli.js"))
+            .background()
+            .arg(&paths.npm_cli)
             .args(["install", "--no-audit", "--no-fund", "--no-update-notifier"])
             .args(["--loglevel=error", "--prefix"])
             .arg(staging.path())
@@ -396,9 +395,9 @@ impl Installer<'_> {
             .arg(self.dir.join(".npm-cache"))
             .args(packages)
             .current_dir(staging.path())
-            .env("PATH", prepend_path(&node.join("bin")));
+            .env("PATH", prepend_path(&paths.bin));
         self.run(&mut command, "npm install")?;
-        let command = staging.path().join("node_modules").join(".bin").join(bin);
+        let command = npm_command(staging.path(), bin, WINDOWS);
         if !is_executable(&command) {
             return Err(format!("npm installed no {bin}"));
         }
@@ -435,6 +434,13 @@ impl Installer<'_> {
         key: &str,
     ) -> Result<(), String> {
         let arch = github_arch().ok_or(UNSUPPORTED)?;
+        let windows_asset = WINDOWS.then(|| windows_asset(asset)).flatten();
+        let asset = match &windows_asset {
+            Some(windows_asset) => windows_asset.as_str(),
+            None if WINDOWS => return Err(UNSUPPORTED.into()),
+            None => asset,
+        };
+        let bin = &program_name(bin, WINDOWS);
         self.report(format!("Looking up the latest {name}"), None);
         let release = self.fetch(&format!(
             "{}/repos/{repo}/releases/latest",
@@ -497,16 +503,18 @@ impl Installer<'_> {
         self.report(format!("Building {name} with Go"), None);
         let mut command = Command::new(&go);
         command
+            .background()
             .args(["install", &format!("{package}@latest")])
             .current_dir(staging.path())
             .env("GOBIN", &bin_dir)
             .env("PATH", search_path_env());
         self.run(&mut command, "go install")?;
-        let binary = bin_dir.join(bin);
+        let binary = bin_dir.join(program_name(bin, WINDOWS));
         if !is_executable(&binary) {
             return Err(format!("go install built no {bin}"));
         }
         let version = Command::new(&go)
+            .background()
             .args(["version", "-m"])
             .arg(&binary)
             .env("PATH", search_path_env())
@@ -524,12 +532,14 @@ impl Installer<'_> {
         };
         self.report(format!("Installing {component} with rustup"), None);
         let mut add = Command::new(&rustup);
-        add.args(["component", "add", component])
+        add.background()
+            .args(["component", "add", component])
             .env("PATH", search_path_env());
         if self.run(&mut add, "rustup").is_err() {
             return Ok(false);
         }
         let found = Command::new(&rustup)
+            .background()
             .args(["which", component])
             .env("PATH", search_path_env())
             .stdout(Stdio::null())
@@ -542,7 +552,12 @@ impl Installer<'_> {
     /// shellcheck for bash-language-server, unless the machine has one.
     fn install_shellcheck(&self) -> Result<(), String> {
         let name = "shellcheck";
-        if find_tool(name).is_some() || is_executable(&self.dir.join(name).join("bin").join(name)) {
+        let installed = self
+            .dir
+            .join(name)
+            .join("bin")
+            .join(program_name(name, WINDOWS));
+        if find_tool(name).is_some() || is_executable(&installed) {
             return Ok(());
         }
         let _lock = self.lock(name)?;
@@ -558,18 +573,18 @@ impl Installer<'_> {
     /// `SHASUMS256.txt` the first time an npm server is installed.
     fn ensure_node(&self) -> Result<PathBuf, String> {
         let home = self.dir.join("node");
-        if is_executable(&home.join("bin").join("node")) {
+        if is_executable(&NodePaths::of(&home, WINDOWS).node) {
             return Ok(home);
         }
         let _lock = self.lock("node")?;
-        if is_executable(&home.join("bin").join("node")) {
+        if is_executable(&NodePaths::of(&home, WINDOWS).node) {
             return Ok(home);
         }
         let (os, arch) = node_platform().ok_or(UNSUPPORTED)?;
         self.report("Looking up Node.js", None);
         let index = self.fetch(&format!("{}/index.json", self.sources.node_dist))?;
         let version = latest_lts(&index, os, arch).ok_or("No Node.js LTS for this system")?;
-        let file = format!("node-{version}-{os}-{arch}.tar.xz");
+        let file = node_archive(&version, os, arch);
         let shasums = self.fetch(&format!(
             "{}/{version}/SHASUMS256.txt",
             self.sources.node_dist
@@ -591,7 +606,7 @@ impl Installer<'_> {
         let unpacked = staging.path().join("unpacked");
         unpack(&archive, &unpacked)?;
         let root = unpacked.join(format!("node-{version}-{os}-{arch}"));
-        if !is_executable(&root.join("bin").join("node")) {
+        if !is_executable(&NodePaths::of(&root, WINDOWS).node) {
             return Err(format!("No node in {file}"));
         }
         write_manifest(&root, json!({ "source": "nodejs.org", "version": version }))?;
@@ -609,6 +624,7 @@ impl Installer<'_> {
         let size = size.or_else(|| self.content_length(url));
         let mut command = Command::new("curl");
         command
+            .background()
             .args([
                 "-fL",
                 "-sS",
@@ -634,6 +650,7 @@ impl Installer<'_> {
     /// The size of what `url` serves (after redirects), if the server says.
     fn content_length(&self, url: &str) -> Option<u64> {
         let output = Command::new("curl")
+            .background()
             .args(["-sIL", "--connect-timeout", "20", "-A", USER_AGENT, url])
             .stdin(Stdio::null())
             .output()
@@ -654,6 +671,7 @@ impl Installer<'_> {
     fn fetch(&self, url: &str) -> Result<String, String> {
         self.check_cancel()?;
         let output = Command::new("curl")
+            .background()
             .args(["-fL", "-sS", "--retry", "2", "--connect-timeout", "20"])
             .args(["--max-time", "60", "-A", USER_AGENT])
             .args(["-H", "Accept: application/vnd.github+json", url])
@@ -887,6 +905,9 @@ fn process_alive(pid: u32) -> bool {
     if pid == std::process::id() {
         return true;
     }
+    if WINDOWS {
+        return flux_platform::process::alive(pid);
+    }
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdin(Stdio::null())
@@ -911,6 +932,7 @@ fn node_platform() -> Option<(&'static str, &'static str)> {
     let os = match env::consts::OS {
         "macos" => "darwin",
         "linux" => "linux",
+        "windows" => "win",
         _ => return None,
     };
     let arch = match env::consts::ARCH {
@@ -938,9 +960,11 @@ fn find_asset(release: &Value, name: &str) -> Option<(String, Option<u64>)> {
 /// The newest LTS in Node.js's `index.json` with a tarball for `os`-`arch` (`darwin`, `arm64`).
 fn latest_lts(index: &str, os: &str, arch: &str) -> Option<String> {
     let releases: Vec<Value> = serde_json::from_str(index).ok()?;
-    // index.json names macOS tarballs "osx-arm64-tar", Linux ones "linux-arm64".
+    // index.json names macOS tarballs "osx-arm64-tar", Windows zips "win-arm64-zip", Linux
+    // tarballs "linux-arm64".
     let file = match os {
         "darwin" => format!("osx-{arch}-tar"),
+        "win" => format!("win-{arch}-zip"),
         os => format!("{os}-{arch}"),
     };
     releases.iter().find_map(|release| {
@@ -982,11 +1006,26 @@ fn verify_sha256(file: &Path, expected: &str) -> Result<(), String> {
     }
 }
 
-/// SHA-256 with `shasum` (macOS) or `sha256sum` (Linux).
+/// SHA-256 with `shasum` (macOS), `sha256sum` (Linux) or `certutil` (Windows).
 fn sha256(file: &Path) -> Result<String, String> {
+    if WINDOWS {
+        let output = Command::new("certutil")
+            .background()
+            .arg("-hashfile")
+            .arg(file)
+            .arg("SHA256")
+            .output()
+            .map_err(|err| format!("Can't compute a checksum: {err}"))?;
+        return certutil_hash(&String::from_utf8_lossy(&output.stdout))
+            .ok_or_else(|| "Can't compute a checksum".to_string());
+    }
     let attempts: [(&str, &[&str]); 2] = [("shasum", &["-a", "256"]), ("sha256sum", &[])];
     for (tool, args) in attempts {
-        if let Ok(output) = Command::new(tool).args(args).arg(file).output()
+        if let Ok(output) = Command::new(tool)
+            .background()
+            .args(args)
+            .arg(file)
+            .output()
             && output.status.success()
         {
             let text = String::from_utf8_lossy(&output.stdout);
@@ -1014,8 +1053,10 @@ fn unpack(archive: &Path, into: &Path) -> Result<(), String> {
     let tarball = [".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tar"]
         .iter()
         .any(|ext| name.ends_with(ext));
-    if tarball {
+    // Windows' own `tar` (10 and later) reads zips too; it has no `unzip` and no `gunzip`.
+    if tarball || (WINDOWS && name.ends_with(".zip")) {
         let output = Command::new("tar")
+            .background()
             .arg("-xf")
             .arg(archive)
             .arg("-C")
@@ -1029,6 +1070,7 @@ fn unpack(archive: &Path, into: &Path) -> Result<(), String> {
     }
     if name.ends_with(".zip") {
         let output = Command::new("unzip")
+            .background()
             .arg("-q")
             .arg(archive)
             .arg("-d")
@@ -1043,6 +1085,7 @@ fn unpack(archive: &Path, into: &Path) -> Result<(), String> {
     if let Some(stem) = name.strip_suffix(".gz") {
         let target = fs::File::create(into.join(stem)).map_err(|err| err.to_string())?;
         let output = Command::new("gunzip")
+            .background()
             .arg("-c")
             .arg(archive)
             .stdout(target)
@@ -1108,7 +1151,7 @@ fn make_executable(path: &Path) -> Result<(), String> {
 fn find_tool(name: &str) -> Option<PathBuf> {
     search_path()
         .into_iter()
-        .map(|dir| dir.join(name))
+        .flat_map(|dir| flux_platform::process::program_files(&dir, name))
         .find(|path| is_executable(path))
 }
 
@@ -1120,18 +1163,77 @@ fn prepend_path(dir: &Path) -> OsString {
 }
 
 fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    flux_platform::process::is_executable(path)
+}
+
+/// Flux runs on Windows: the programs are `.exe`, npm's are `.cmd`, Node.js is laid out otherwise.
+const WINDOWS: bool = cfg!(windows);
+
+/// Where a Node.js distribution keeps its programs.
+struct NodePaths {
+    node: PathBuf,
+    npm_cli: PathBuf,
+    /// The folder of `node` (and `npm`), first in an npm server's `PATH`.
+    bin: PathBuf,
+}
+
+impl NodePaths {
+    /// `bin/node` and `lib/node_modules/npm` on macOS and Linux; `node.exe` and `node_modules\npm`
+    /// at the top on Windows.
+    fn of(home: &Path, windows: bool) -> NodePaths {
+        let (bin, modules) = match windows {
+            true => (home.to_path_buf(), home.join("node_modules")),
+            false => (home.join("bin"), home.join("lib").join("node_modules")),
+        };
+        NodePaths {
+            node: bin.join(program_name("node", windows)),
+            npm_cli: modules.join("npm").join("bin").join("npm-cli.js"),
+            bin,
+        }
     }
-    #[cfg(not(unix))]
-    {
-        metadata.is_file()
+}
+
+/// The archive of a Node.js release: a `.tar.xz`, on Windows a `.zip`.
+fn node_archive(version: &str, os: &str, arch: &str) -> String {
+    let extension = if os == "win" { "zip" } else { "tar.xz" };
+    format!("node-{version}-{os}-{arch}.{extension}")
+}
+
+/// The command npm made for a package's `bin` under `home`: `node_modules/.bin/<bin>`, on Windows
+/// its `.cmd`.
+fn npm_command(home: &Path, bin: &str, windows: bool) -> PathBuf {
+    let bin_dir = home.join("node_modules").join(".bin");
+    match windows {
+        true => bin_dir.join(format!("{bin}.cmd")),
+        false => bin_dir.join(bin),
     }
+}
+
+/// A program's file name: on Windows with `.exe` unless it has an extension.
+fn program_name(bin: &str, windows: bool) -> String {
+    match windows && Path::new(bin).extension().is_none() {
+        true => format!("{bin}.exe"),
+        false => bin.to_string(),
+    }
+}
+
+/// The Windows asset of a release whose macOS one is named for the Rust target
+/// (`ruff-{arch}-apple-darwin.tar.gz`, `rust-analyzer-{arch}-apple-darwin.gz`): the same name for
+/// `pc-windows-msvc`, as a `.zip` — how these projects publish for Windows. Other names are
+/// unknown: Flux can't install such a server on Windows.
+fn windows_asset(asset: &str) -> Option<String> {
+    let (stem, _) = asset.split_once("-apple-darwin")?;
+    Some(format!("{stem}-pc-windows-msvc.zip"))
+}
+
+/// The hash in `certutil -hashfile <file> SHA256` output: the line of hex digits (older Windows
+/// put spaces between the bytes).
+fn certutil_hash(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let hex: String = line.split_whitespace().collect();
+        (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| hex.to_ascii_lowercase())
+    })
 }
 
 fn last_line(text: &str) -> String {
@@ -1149,6 +1251,77 @@ mod tests {
 
     fn quiet() -> impl Fn(Progress) + Sync {
         |_| {}
+    }
+
+    #[test]
+    fn windows_names_of_programs_and_downloads() {
+        assert_eq!(
+            windows_asset("rust-analyzer-{arch}-apple-darwin.gz").as_deref(),
+            Some("rust-analyzer-{arch}-pc-windows-msvc.zip")
+        );
+        assert_eq!(
+            windows_asset("ruff-{arch}-apple-darwin.tar.gz").as_deref(),
+            Some("ruff-{arch}-pc-windows-msvc.zip")
+        );
+        assert_eq!(windows_asset("taplo-darwin-{arch}.gz"), None);
+        assert_eq!(windows_asset("shellcheck-{tag}.darwin.{arch}.tar.xz"), None);
+
+        assert_eq!(program_name("gopls", true), "gopls.exe");
+        assert_eq!(program_name("gopls", false), "gopls");
+        assert_eq!(program_name("tool.cmd", true), "tool.cmd");
+        let home = Path::new("servers").join("ts");
+        assert_eq!(
+            npm_command(&home, "typescript-language-server", true),
+            home.join("node_modules")
+                .join(".bin")
+                .join("typescript-language-server.cmd")
+        );
+        assert_eq!(
+            npm_command(&home, "pyright", false),
+            home.join("node_modules").join(".bin").join("pyright")
+        );
+
+        let node = Path::new("node");
+        let windows = NodePaths::of(node, true);
+        assert_eq!(windows.node, node.join("node.exe"));
+        assert_eq!(windows.bin, node);
+        assert_eq!(
+            windows.npm_cli,
+            node.join("node_modules")
+                .join("npm")
+                .join("bin")
+                .join("npm-cli.js")
+        );
+        let mac = NodePaths::of(node, false);
+        assert_eq!(mac.node, node.join("bin").join("node"));
+        assert_eq!(
+            mac.npm_cli,
+            node.join("lib")
+                .join("node_modules")
+                .join("npm")
+                .join("bin")
+                .join("npm-cli.js")
+        );
+        assert_eq!(
+            node_archive("v24.1.0", "win", "arm64"),
+            "node-v24.1.0-win-arm64.zip"
+        );
+        assert_eq!(
+            node_archive("v24.1.0", "darwin", "arm64"),
+            "node-v24.1.0-darwin-arm64.tar.xz"
+        );
+        let index = r#"[{ "version": "v24.1.0", "lts": "Krypton", "files": ["win-x64-zip", "osx-x64-tar"] }]"#;
+        assert_eq!(latest_lts(index, "win", "x64").as_deref(), Some("v24.1.0"));
+        assert_eq!(latest_lts(index, "win", "arm64"), None);
+
+        let hash = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let output = format!(
+            "SHA256 hash of C:\\x.zip:\r\n{hash}\r\nCertUtil: -hashfile command completed successfully.\r\n"
+        );
+        assert_eq!(certutil_hash(&output).as_deref(), Some(hash));
+        let spaced = "9f 86 d0 81 88 4c 7d 65 9a 2f ea a0 c5 5a d0 15 a3 bf 4f 1b 2b 0b 82 2c d1 5d 6c 15 b0 f0 0a 08";
+        assert_eq!(certutil_hash(spaced).as_deref(), Some(hash));
+        assert_eq!(certutil_hash("CertUtil: error"), None);
     }
 
     #[test]

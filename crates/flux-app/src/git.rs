@@ -1396,7 +1396,11 @@ impl GitStore {
     /// An error notification: `title` ("Checkout failed"), git's first line, and git's whole output
     /// behind "Details" when there is more to it.
     pub fn notify_error(&mut self, title: &str, error: &GitError, cx: &mut Context<Self>) {
-        let notification = error_notification(title, &error.to_string(), error.details());
+        let text = match error {
+            GitError::NotInstalled => git_missing(cfg!(windows)),
+            _ => error.to_string(),
+        };
+        let notification = error_notification(title, &text, error.details());
         self.notify(notification, cx);
     }
 
@@ -2566,6 +2570,18 @@ fn branch_from_head(head: &str) -> Option<SharedString> {
         }
         None if head.len() >= 7 => Some(head[..7].to_string().into()),
         None => None,
+    }
+}
+
+/// What Flux says when git isn't installed: on Windows where to get it (Git for Windows has no
+/// stand-in on the system); on macOS as it always did.
+fn git_missing(windows: bool) -> String {
+    match windows {
+        true => {
+            tr("Git isn't installed. Install Git for Windows from git-scm.com, then restart Flux.")
+                .to_string()
+        }
+        false => GitError::NotInstalled.to_string(),
     }
 }
 

@@ -13,6 +13,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::{Flags, Hyperlink};
+use flux_platform::PathStyle;
 
 use crate::content::GridPoint;
 
@@ -233,10 +234,15 @@ fn is_url_char(c: char) -> bool {
     }
 }
 
-/// The path of a `file://` URL: the host is dropped, `%XX` escapes are decoded.
+/// The path of a `file://` URL: the host is dropped, `%XX` escapes are decoded. On Windows the
+/// URL's `/C:/…` is `C:\…` and a host is a share's ([`PathStyle::file_url_path`]).
 pub(crate) fn file_url_path(url: &str) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
-    let path = percent_decode(&rest[rest.find('/')?..]);
+    let slash = rest.find('/')?;
+    let path = percent_decode(&rest[slash..]);
+    if PathStyle::NATIVE == PathStyle::Windows {
+        return PathStyle::Windows.file_url_path(&rest[..slash], &path);
+    }
     (path.len() > 1).then_some(path)
 }
 
@@ -332,7 +338,8 @@ fn path_at(chars: &[char], column: usize) -> Option<(Range<usize>, LinkTarget)> 
         },
     };
     let path: String = chars[start..path_end].iter().collect();
-    if !(start..span_end).contains(&column) || !looks_like_path(&path, line.is_some()) {
+    let path_like = looks_like_path(&path, line.is_some(), PathStyle::NATIVE);
+    if !(start..span_end).contains(&column) || !path_like {
         return None;
     }
     let target = LinkTarget::Path {
@@ -396,13 +403,13 @@ fn is_delimiter(c: char) -> bool {
         || ('\u{2500}'..='\u{259f}').contains(&c)
 }
 
-/// Whether a word is worth checking on disk: it has a letter and a slash, an extension, a leading
-/// `~/`, a dotfile name, or a line number after it.
-fn looks_like_path(path: &str, has_line: bool) -> bool {
+/// Whether a word is worth checking on disk: it has a letter and a slash (on Windows a backslash
+/// too), an extension, a leading `~/`, a dotfile name, or a line number after it.
+fn looks_like_path(path: &str, has_line: bool, style: PathStyle) -> bool {
     if path.is_empty() || path.contains("://") || !path.chars().any(char::is_alphabetic) {
         return false;
     }
-    if has_line || path.contains('/') {
+    if has_line || path.contains(|c| style.is_separator(c)) {
         return true;
     }
     // `README.md`, `Cargo.toml`, `.gitignore`.
@@ -445,12 +452,13 @@ pub fn resolve(path: &str, cwd: Option<&Path>, root: Option<&Path>) -> Option<Pa
     })
 }
 
-/// `~` and `~/…` in the home directory.
+/// `~` and `~/…` (on Windows `~\…` too) in the home directory.
 fn expand_home(path: &str) -> Option<PathBuf> {
+    let separator = |c| PathStyle::NATIVE.is_separator(c);
     match path.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+        Some(rest) if rest.is_empty() || rest.starts_with(separator) => {
             let home = flux_platform::paths::home().map(std::ffi::OsString::from)?;
-            Some(PathBuf::from(home).join(rest.trim_start_matches('/')))
+            Some(PathBuf::from(home).join(rest.trim_start_matches(separator)))
         }
         _ => Some(PathBuf::from(path)),
     }
@@ -764,6 +772,27 @@ mod tests {
             (GridPoint::new(0, 5), GridPoint::new(0, 12))
         );
         assert_eq!(link.target, path("/tmp/My a.rs", None, None));
+    }
+
+    #[test]
+    fn windows_locations() {
+        assert_eq!(
+            link(r"error at C:\dir\main.rs:12:5: oops", "main"),
+            Some((
+                r"C:\dir\main.rs:12:5".to_string(),
+                path(r"C:\dir\main.rs", Some(12), Some(5))
+            ))
+        );
+        assert_eq!(
+            link(r"  --> src\main.rs:12", "main"),
+            Some((
+                r"src\main.rs:12".to_string(),
+                path(r"src\main.rs", Some(12), None)
+            ))
+        );
+        assert!(looks_like_path(r"src\lib", false, PathStyle::Windows));
+        assert!(!looks_like_path(r"src\lib", false, PathStyle::Unix));
+        assert!(looks_like_path("src/lib", false, PathStyle::Unix));
     }
 
     #[test]

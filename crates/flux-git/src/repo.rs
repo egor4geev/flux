@@ -82,9 +82,9 @@ impl Repo {
         Some(parts.join("/"))
     }
 
-    /// A path as git prints it (relative, `/`) → absolute.
+    /// A path as git prints it (relative, `/`) → absolute, in the system's separators.
     pub fn absolute(&self, relative: &str) -> PathBuf {
-        self.work_dir.join(relative)
+        flux_platform::join_slashed(&self.work_dir, relative)
     }
 
     /// Whether `path` is inside this repository's working tree.

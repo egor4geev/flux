@@ -541,14 +541,16 @@ mod tests {
             .iter()
             .map(|row| (row.place.as_str(), row.text.as_str()))
             .collect();
+        // Places are shown in the system's separators.
+        let native = |place: &'static str| flux_platform::PathStyle::NATIVE.native(place);
         assert_eq!(
             summary,
             vec![
                 // The file the cursor is in goes first, by line.
-                ("src/lib.rs:1", "pub fn sum() {}"),
-                ("src/lib.rs:3", "fn x() { sum(); }"),
-                ("src/main.rs:1", "fn main() { sum(); }"),
-                ("src/missing.rs:5", ""),
+                (&*native("src/lib.rs:1"), "pub fn sum() {}"),
+                (&*native("src/lib.rs:3"), "fn x() { sum(); }"),
+                (&*native("src/main.rs:1"), "fn main() { sum(); }"),
+                (&*native("src/missing.rs:5"), ""),
             ]
         );
         assert_eq!(&rows[0].text[rows[0].symbol.clone()], "sum");

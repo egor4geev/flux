@@ -968,7 +968,7 @@ impl Workspace {
 
     /// A new project root (cmd-o with a directory).
     fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let root = fs::canonicalize(&root).unwrap_or(root);
+        let root = flux_platform::path_style::canonicalize(&root).unwrap_or(root);
         self.claude
             .update(cx, |store, cx| store.set_root(Some(root.clone()), cx));
         self.project_search
@@ -1026,7 +1026,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let root = fs::canonicalize(&root).unwrap_or(root);
+        let root = flux_platform::path_style::canonicalize(&root).unwrap_or(root);
         if !root.is_dir() {
             // A folder from the recent list may have disappeared since.
             let message = trf("Folder not found: {0}", &[&tilde(&root)]);
@@ -6775,9 +6775,13 @@ pub(crate) fn project_window(root: &Path, cx: &App) -> Option<WindowHandle<Works
         .into_iter()
         .filter_map(|handle| handle.downcast::<Workspace>())
         .find(|handle| {
-            handle
-                .read(cx)
-                .is_ok_and(|workspace| workspace.root.as_deref() == Some(root))
+            handle.read(cx).is_ok_and(|workspace| {
+                // On Windows `C:\Proj` and `c:\proj` are one project: one window.
+                workspace
+                    .root
+                    .as_deref()
+                    .is_some_and(|open| flux_platform::same_path(open, root))
+            })
         })
 }
 
@@ -6878,11 +6882,12 @@ fn read_document(path: PathBuf) -> Result<Document, OpenError> {
 /// Path for the "is this the same file" comparison: canonical, or, for a file that does not exist
 /// yet, the canonical directory plus the name.
 fn canonical(path: &Path) -> PathBuf {
-    if let Ok(path) = fs::canonicalize(path) {
+    if let Ok(path) = flux_platform::path_style::canonicalize(path) {
         return path;
     }
     match (
-        path.parent().and_then(|dir| fs::canonicalize(dir).ok()),
+        path.parent()
+            .and_then(|dir| flux_platform::path_style::canonicalize(dir).ok()),
         path.file_name(),
     ) {
         (Some(dir), Some(name)) => dir.join(name),
@@ -6890,9 +6895,16 @@ fn canonical(path: &Path) -> PathBuf {
     }
 }
 
-/// Display path: the home directory is shown as `~`.
+/// Display path: the home directory is shown as `~` (on Windows `~\dev\app`).
 pub(crate) fn tilde(path: &Path) -> String {
     let home = flux_platform::paths::home();
+    if flux_platform::PathStyle::NATIVE == flux_platform::PathStyle::Windows {
+        return match home {
+            Some(home) => flux_platform::PathStyle::Windows
+                .tilde(&path.to_string_lossy(), &home.to_string_lossy()),
+            None => path.display().to_string(),
+        };
+    }
     match home
         .as_deref()
         .and_then(|home| path.strip_prefix(home).ok())
@@ -8429,10 +8441,7 @@ impl Workspace {
         let Some(cli) = self.claude.read(cx).cli().cli().cloned() else {
             return self.claude.update(cx, |store, cx| store.check(cx));
         };
-        let command = format!(
-            "{} auth login",
-            claude::shell_quote(&cli.path.to_string_lossy())
-        );
+        let command = claude::terminal_command(&cli.path.to_string_lossy(), &["auth", "login"]);
         let this = cx.weak_entity();
         let handle = window.window_handle();
         // Part «Флаг страны»: signing in talks to Anthropic too.
@@ -8737,7 +8746,10 @@ mod tests {
     fn same_parent_name_goes_deeper() {
         assert_eq!(
             details(&["/x/core/src/lib.rs", "/x/app/src/lib.rs"]),
-            vec![Some("core/src".into()), Some("app/src".into())]
+            // Shown in the system's separators.
+            ["core/src", "app/src"]
+                .map(|dir| Some(flux_platform::PathStyle::NATIVE.native(dir).into_owned()))
+                .to_vec()
         );
     }
 
@@ -8752,7 +8764,10 @@ mod tests {
     fn home_is_shown_as_tilde() {
         let home = flux_platform::paths::home().unwrap();
         assert_eq!(tilde(&home), "~");
-        assert_eq!(tilde(&home.join("dev/flux")), "~/dev/flux");
+        assert_eq!(
+            tilde(&home.join("dev").join("flux")),
+            flux_platform::PathStyle::NATIVE.native("~/dev/flux")
+        );
         assert_eq!(tilde(Path::new("/opt/x")), "/opt/x");
     }
 

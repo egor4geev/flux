@@ -331,7 +331,11 @@ fn recent_projects() -> Vec<Project> {
     own.into_iter()
         .chain(others)
         .filter(|path| path.is_dir())
-        .filter(|path| seen.insert(fs::canonicalize(path).unwrap_or_else(|_| path.clone())))
+        .filter(|path| {
+            seen.insert(
+                flux_platform::path_style::canonicalize(path).unwrap_or_else(|_| path.clone()),
+            )
+        })
         .take(MAX_SHOWN)
         .map(|path| Project {
             branch: head_branch(&path),
@@ -483,7 +487,9 @@ fn expand(path: &str, home: Option<&Path>) -> Option<PathBuf> {
         }
         None => path.to_string(),
     };
-    (path.starts_with('/') && !path.contains('$')).then(|| PathBuf::from(path))
+    // Windows lists keep `C:/Users/me/…`: in Windows' separators for Flux.
+    let style = flux_platform::PathStyle::NATIVE;
+    (style.is_absolute(&path) && !path.contains('$')).then(|| PathBuf::from(&*style.native(&path)))
 }
 
 /// XML's escapes in an attribute.

@@ -5,7 +5,6 @@
 //! Keys follow the JetBrains macOS keymap: cmd-b on a definition itself shows its usages, as
 //! there.
 
-use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -698,7 +697,7 @@ fn rename_symbol(
 
 /// Path for comparing files: canonical, or as is if it can't be resolved.
 pub(crate) fn canonical(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    flux_platform::path_style::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]

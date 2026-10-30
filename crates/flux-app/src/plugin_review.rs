@@ -210,9 +210,9 @@ fn open_editor(workspace: &Workspace, path: &Path, cx: &App) -> Option<Entity<Ed
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
-    a == b
+    flux_platform::same_path(a, b)
         || matches!(
-            (fs::canonicalize(a), fs::canonicalize(b)),
+            (flux_platform::path_style::canonicalize(a), flux_platform::path_style::canonicalize(b)),
             (Ok(a), Ok(b)) if a == b
         )
 }
@@ -279,7 +279,7 @@ fn real_path(path: &Path) -> PathBuf {
     let mut existing = path;
     let mut rest = Vec::new();
     loop {
-        if let Ok(real) = fs::canonicalize(existing) {
+        if let Ok(real) = flux_platform::path_style::canonicalize(existing) {
             return rest.iter().rev().fold(real, |path, part| path.join(part));
         }
         match (existing.parent(), existing.file_name()) {
@@ -360,7 +360,8 @@ fn minimal_edit(old: &str, new: &str) -> Option<(Range<usize>, String)> {
 /// if the write fails). A new file gets its folders; an existing one keeps its line endings, its
 /// permissions, and its symlink.
 fn write_file(path: &Path, text: &str) -> io::Result<()> {
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target =
+        flux_platform::path_style::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let existing = fs::read(&target).ok();
     let text = match &existing {
         Some(bytes) if bytes.windows(2).any(|pair| pair == b"\r\n") => {

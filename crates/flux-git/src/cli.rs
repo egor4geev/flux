@@ -105,6 +105,9 @@ pub fn git_binary() -> Option<&'static Path> {
     static BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
     BINARY
         .get_or_init(|| {
+            if cfg!(windows) {
+                return windows_git();
+            }
             let from_path = std::env::var_os("PATH")
                 .into_iter()
                 .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
@@ -119,6 +122,19 @@ pub fn git_binary() -> Option<&'static Path> {
             from_path.chain(known).find(|path| path.is_file())
         })
         .as_deref()
+}
+
+/// Windows: `git.exe` on the `PATH` (by `PATHEXT`), otherwise in Git for Windows' own folder
+/// (`Git\cmd\git.exe` under Program Files or `%LOCALAPPDATA%\Programs`): its installer may leave
+/// the `PATH` alone.
+fn windows_git() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    flux_platform::process::find_in_path("git", &path).or_else(|| {
+        flux_platform::process::program_dirs()
+            .into_iter()
+            .map(|dir| dir.join("Git").join("cmd").join("git.exe"))
+            .find(|git| git.is_file())
+    })
 }
 
 /// One git command: `git -C <dir> <global options> <args>`.

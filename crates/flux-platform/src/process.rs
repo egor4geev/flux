@@ -3,8 +3,9 @@
 
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 
 /// A program Flux starts for its own work, out of sight.
 pub trait Background {
@@ -63,6 +64,27 @@ pub fn find_in_path(program: &str, path: &OsStr) -> Option<PathBuf> {
         .find(|file| is_executable(file))
 }
 
+/// Where Windows installers put programs: `%ProgramFiles%` (and its 64- and 32-bit variants), then
+/// the per-user `%LOCALAPPDATA%\Programs` (Git for Windows installed for one user goes there).
+/// Empty elsewhere.
+pub fn program_dirs() -> Vec<PathBuf> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let found = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .chain(std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Programs")));
+    for dir in found {
+        if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
 /// Windows' program extensions, `.exe` first: `PATHEXT`, lowercased.
 fn path_extensions() -> impl Iterator<Item = String> {
     let extensions = std::env::var("PATHEXT").unwrap_or_default();
@@ -77,6 +99,25 @@ fn path_extensions() -> impl Iterator<Item = String> {
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>()
         .into_iter()
+}
+
+/// Ends a program Flux started, and on Windows what it started in turn: a `.cmd` (npm's
+/// `claude.cmd`, an npm language server's) runs its program as a child of `cmd.exe`, which
+/// `Child::kill` alone leaves running; the Claude CLI's own commands, too. Elsewhere `Child::kill`
+/// as always.
+pub fn kill_tree(child: &mut Child) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::process::Stdio;
+        let _ = Command::new("taskkill")
+            .background()
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    child.kill()
 }
 
 /// The process is there (someone else's counts too).
