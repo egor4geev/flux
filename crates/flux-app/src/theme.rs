@@ -23,13 +23,18 @@ use crate::settings;
 
 /// The UI font is the system font (SF Pro on macOS).
 pub const UI_FONT: &str = ".SystemUIFont";
-/// The code font is the first installed one from the list ([`init_fonts`]).
-const CODE_FONTS: [&str; 4] = [
+/// The code font is the first installed one from the list ([`init_fonts`]); Windows has the last
+/// two (Cascadia Mono since Windows 11, Consolas everywhere).
+const CODE_FONTS: [&str; 6] = [
     "JetBrains Mono",
     "JetBrainsMono Nerd Font Mono",
     "SF Mono",
     "Menlo",
+    "Cascadia Mono",
+    "Consolas",
 ];
+/// The code font when none of the list is found.
+const FALLBACK_CODE_FONT: &str = if cfg!(windows) { "Consolas" } else { "Menlo" };
 pub const FONT_SIZE: f32 = 14.;
 pub const LINE_HEIGHT: f32 = 21.;
 pub const TAB_WIDTH: usize = 4;
@@ -60,13 +65,13 @@ pub fn init_fonts(cx: &App) {
     let family = CODE_FONTS
         .into_iter()
         .find(|family| installed.iter().any(|name| name == family))
-        .unwrap_or("Menlo");
+        .unwrap_or(FALLBACK_CODE_FONT);
     CODE_FONT.set(family).ok();
 }
 
 /// The code font: editor, search fields, result rows.
 pub fn code_font() -> &'static str {
-    CODE_FONT.get().copied().unwrap_or("Menlo")
+    CODE_FONT.get().copied().unwrap_or(FALLBACK_CODE_FONT)
 }
 
 /// The UI color tokens, each by its name in a theme file: [`UiColors`] and the table of tokens
