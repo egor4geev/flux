@@ -6,6 +6,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Window", "Окно"),
     ("Minimize", "Свернуть"),
     ("Zoom", "Изменить масштаб"),
+    // Zoom on Windows (part 10.9).
+    ("Maximize", "Развернуть"),
     ("Next Window", "Следующее окно"),
     ("Previous Window", "Предыдущее окно"),
     (

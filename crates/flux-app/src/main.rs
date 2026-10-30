@@ -113,6 +113,7 @@ mod rename;
 #[cfg(feature = "scenario")]
 mod scenario;
 mod scrollbar;
+mod second_launch;
 mod settings;
 mod settings_file;
 mod settings_view;
@@ -129,6 +130,7 @@ mod terminal_panel;
 mod terminal_search;
 mod terminal_view;
 mod theme;
+mod title_bar;
 mod ui;
 mod ui_scale;
 mod update_notes;
@@ -181,6 +183,12 @@ fn main() {
         .map(|path| absolute(&path).unwrap_or(path))
         .collect();
     let (dirs, paths): (Vec<_>, Vec<_>) = args.into_iter().partition(|path| path.is_dir());
+    // Windows (part 10.9): with Flux already running, this launch hands it the folders and files
+    // and ends, as macOS sends them to the running app.
+    #[cfg(windows)]
+    if second_launch::hand_over(&dirs.iter().chain(&paths).cloned().collect::<Vec<_>>()) {
+        return;
+    }
     let root = project_root(dirs);
     i18n::init();
     // Compiled WebAssembly grammars of plugins: next to the compiled plugins' components.

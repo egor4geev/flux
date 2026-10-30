@@ -12,7 +12,9 @@
 
 use gpui::{AnyWindowHandle, App, KeyBinding, Menu, MenuItem, SystemMenuType, actions};
 
+use crate::context_menu::ContextMenu;
 use crate::i18n::tr;
+use crate::keymap::KeyOs;
 use crate::workspace::Workspace;
 use crate::{app_log, feedback, settings_view, updates, welcome, workspace};
 
@@ -54,9 +56,13 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("cmd-~", PreviousWindow, None),
         ],
     );
-    cx.on_action(|_: &Hide, cx| cx.hide());
-    cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
-    cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    // Hiding is the Mac's: gpui's Windows backend has none (it panics on hiding the other apps),
+    // so the actions aren't there — nor in the palette.
+    if KeyOs::current() == KeyOs::Mac {
+        cx.on_action(|_: &Hide, cx| cx.hide());
+        cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    }
     cx.on_action(|_: &Minimize, cx| {
         with_active_window(cx, |window: &mut gpui::Window| window.minimize_window())
     });
@@ -74,35 +80,69 @@ pub fn init(cx: &mut App) {
 
 /// Sets the menu bar in the current interface language.
 pub fn rebuild(cx: &mut App) {
-    cx.set_menus(vec![
+    cx.set_menus(menus(KeyOs::current()));
+    // gpui makes a menu the windows menu only when it is named "Window" exactly: in Russian it
+    // is «Окно», so it is set here. The same for the help menu («Справка»): macOS puts its search
+    // field into it.
+    #[cfg(target_os = "macos")]
+    {
+        appkit::set_windows_menu(WINDOW_MENU);
+        appkit::set_help_menu(HELP_MENU);
+    }
+}
+
+/// The menus of the menu bar in the current interface language: on macOS the menu bar itself; on
+/// Windows, which has no menu bar for them, the popup of the title bar's menu button ([`popup`],
+/// part 10.9) — one source, so the two never drift apart. Windows has no place for Services,
+/// hiding the app and bringing all its windows to front; quitting is Exit there, maximizing is
+/// Maximize, and the log is shown in Explorer.
+pub fn menus(os: KeyOs) -> Vec<Menu> {
+    let mac = os == KeyOs::Mac;
+    let mut flux = vec![
+        MenuItem::action(tr("About Flux"), settings_view::About),
+        MenuItem::action(tr("Check for Updates…"), updates::CheckForUpdates),
+        MenuItem::separator(),
+        MenuItem::action(tr("Settings…"), settings_view::Toggle),
+        MenuItem::separator(),
+    ];
+    if mac {
+        flux.extend([
+            MenuItem::os_submenu(tr("Services"), SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action(tr("Hide Flux"), Hide),
+            MenuItem::action(tr("Hide Others"), HideOthers),
+            MenuItem::action(tr("Show All"), ShowAll),
+            MenuItem::separator(),
+            MenuItem::action(tr("Quit Flux"), workspace::Quit),
+        ]);
+    } else {
+        flux.push(MenuItem::action(tr("Exit"), workspace::Quit));
+    }
+    let mut window = vec![
+        MenuItem::action(tr("Minimize"), Minimize),
+        if mac {
+            MenuItem::action(tr("Zoom"), Zoom)
+        } else {
+            MenuItem::action(tr("Maximize"), Zoom)
+        },
+        MenuItem::separator(),
+        MenuItem::action(tr("Next Window"), NextWindow),
+        MenuItem::action(tr("Previous Window"), PreviousWindow),
+    ];
+    if mac {
+        window.extend([
+            MenuItem::separator(),
+            MenuItem::action(tr("Bring All to Front"), BringAllToFront),
+        ]);
+    }
+    vec![
         Menu {
             name: "Flux".into(),
-            items: vec![
-                MenuItem::action(tr("About Flux"), settings_view::About),
-                MenuItem::action(tr("Check for Updates…"), updates::CheckForUpdates),
-                MenuItem::separator(),
-                MenuItem::action(tr("Settings…"), settings_view::Toggle),
-                MenuItem::separator(),
-                MenuItem::os_submenu(tr("Services"), SystemMenuType::Services),
-                MenuItem::separator(),
-                MenuItem::action(tr("Hide Flux"), Hide),
-                MenuItem::action(tr("Hide Others"), HideOthers),
-                MenuItem::action(tr("Show All"), ShowAll),
-                MenuItem::separator(),
-                MenuItem::action(tr("Quit Flux"), workspace::Quit),
-            ],
+            items: flux,
         },
         Menu {
             name: tr("Window").into(),
-            items: vec![
-                MenuItem::action(tr("Minimize"), Minimize),
-                MenuItem::action(tr("Zoom"), Zoom),
-                MenuItem::separator(),
-                MenuItem::action(tr("Next Window"), NextWindow),
-                MenuItem::action(tr("Previous Window"), PreviousWindow),
-                MenuItem::separator(),
-                MenuItem::action(tr("Bring All to Front"), BringAllToFront),
-            ],
+            items: window,
         },
         Menu {
             name: tr("Help").into(),
@@ -115,18 +155,33 @@ pub fn rebuild(cx: &mut App) {
                 MenuItem::action(tr("Suggest a Feature…"), feedback::SuggestFeature),
                 MenuItem::action(tr("Ask a Question…"), feedback::AskQuestion),
                 MenuItem::separator(),
-                MenuItem::action(tr("Show Log in Finder"), app_log::ShowLog),
+                if mac {
+                    MenuItem::action(tr("Show Log in Finder"), app_log::ShowLog)
+                } else {
+                    MenuItem::action(tr("Show Log in Explorer"), app_log::ShowLog)
+                },
             ],
         },
-    ]);
-    // gpui makes a menu the windows menu only when it is named "Window" exactly: in Russian it
-    // is «Окно», so it is set here. The same for the help menu («Справка»): macOS puts its search
-    // field into it.
-    #[cfg(target_os = "macos")]
-    {
-        appkit::set_windows_menu(WINDOW_MENU);
-        appkit::set_help_menu(HELP_MENU);
-    }
+    ]
+}
+
+/// The title bar's menu on Windows (part 10.9): every menu of [`menus`] as a submenu of Flux's own
+/// popup — as the main menu button of a Windows IDE shows its menu bar. The shortcuts come from the
+/// keymap, in Windows keys; what only the system draws (a system submenu) is left out.
+pub fn popup(menu: ContextMenu, os: KeyOs) -> ContextMenu {
+    menus(os)
+        .into_iter()
+        .fold(menu, |menu, Menu { name, items }| {
+            menu.submenu(name, |submenu| {
+                items.into_iter().fold(submenu, |submenu, item| match item {
+                    MenuItem::Action { name, action, .. } => {
+                        submenu.boxed_entry_if(true, name, action)
+                    }
+                    MenuItem::Separator => submenu.separator(),
+                    MenuItem::Submenu(_) | MenuItem::SystemMenu(_) => submenu,
+                })
+            })
+        })
 }
 
 /// The windows of Flux in the order they opened: ⌘` goes along it, as macOS cycles a document
@@ -228,5 +283,98 @@ mod appkit {
             let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![app, arrangeInFront: std::ptr::null_mut::<Object>()];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every menu's items: an action's name and its label, `-` for a separator, the name of a
+    /// system submenu.
+    fn items(menus: &[Menu]) -> Vec<(String, Vec<(String, String)>)> {
+        menus
+            .iter()
+            .map(|menu| {
+                let items = menu
+                    .items
+                    .iter()
+                    .map(|item| match item {
+                        MenuItem::Action { name, action, .. } => {
+                            (action.name().to_string(), name.to_string())
+                        }
+                        MenuItem::Separator => ("-".into(), String::new()),
+                        MenuItem::Submenu(menu) => ("submenu".into(), menu.name.to_string()),
+                        MenuItem::SystemMenu(menu) => ("system".into(), menu.name.to_string()),
+                    })
+                    .collect();
+                (menu.name.to_string(), items)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn windows_menus_are_the_mac_ones_without_what_windows_has_no_place_for() {
+        let mac = items(&menus(KeyOs::Mac));
+        let windows = items(&menus(KeyOs::Windows));
+        let mac_only = [
+            "system",
+            "flux::Hide",
+            "flux::HideOthers",
+            "flux::ShowAll",
+            "window::BringAllToFront",
+        ];
+        assert_eq!(mac.len(), windows.len());
+        for ((mac_name, mac_items), (name, items)) in mac.iter().zip(&windows) {
+            assert_eq!(mac_name, name);
+            let actions = |items: &[(String, String)]| -> Vec<String> {
+                let mut actions: Vec<String> = Vec::new();
+                for (action, _) in items {
+                    if mac_only.contains(&action.as_str())
+                        || (action == "-" && actions.last().is_none_or(|last| last == "-"))
+                    {
+                        continue;
+                    }
+                    actions.push(action.clone());
+                }
+                while actions.last().is_some_and(|last| last == "-") {
+                    actions.pop();
+                }
+                actions
+            };
+            assert_eq!(actions(mac_items), actions(items), "the {name} menu");
+            assert!(
+                !items
+                    .iter()
+                    .any(|(action, _)| mac_only.contains(&action.as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn windows_names_quit_maximize_and_the_log_its_own_way() {
+        let label = |os: KeyOs, wanted: &str| {
+            items(&menus(os))
+                .into_iter()
+                .flat_map(|(_, items)| items)
+                .find(|(action, _)| action == wanted)
+                .map(|(_, label)| label)
+        };
+        assert_eq!(
+            label(KeyOs::Mac, "workspace::Quit").as_deref(),
+            Some(tr("Quit Flux"))
+        );
+        assert_eq!(
+            label(KeyOs::Windows, "workspace::Quit").as_deref(),
+            Some(tr("Exit"))
+        );
+        assert_eq!(
+            label(KeyOs::Windows, "window::Zoom").as_deref(),
+            Some(tr("Maximize"))
+        );
+        assert_eq!(
+            label(KeyOs::Windows, "help::ShowLog").as_deref(),
+            Some(tr("Show Log in Explorer"))
+        );
     }
 }

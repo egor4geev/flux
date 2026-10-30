@@ -39,6 +39,7 @@ use crate::icons::{IconName, icon};
 use crate::motion::{self, TransitionExt as _};
 use crate::notifications::Notification;
 use crate::theme::{self, Theme, UiColors};
+use crate::title_bar;
 use crate::ui;
 use crate::workspace::{self, Workspace};
 
@@ -991,6 +992,11 @@ impl Render for WelcomeGuide {
             .children(left)
             .child(page);
         let title = self.title();
+        let os = title_bar::os();
+        let window_buttons = title_bar::render_window_buttons(
+            title_bar::window_buttons(os, window.is_fullscreen(), false, false),
+            ui,
+        );
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -1021,17 +1027,26 @@ impl Render for WelcomeGuide {
             .text_color(ui.foreground)
             .when(!flat, |root| root.child(ui::frame_glow(ui)))
             .child(
-                div()
-                    .h(px(ui::TITLE_BAR_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .text_size(px(theme::TEXT_SM + 0.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(ui.text_muted)
-                    .child(icon(IconName::Logo, ui.accent_text).size(px(13.)))
-                    .child(title),
+                // On Windows (part 10.9) the title bar is the guide's caption, with minimize and
+                // close at its right end: the guide can't be resized.
+                title_bar::caption(
+                    os,
+                    div()
+                        .h(px(ui::TITLE_BAR_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .text_size(px(theme::TEXT_SM + 0.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ui.text_muted)
+                        .child(icon(IconName::Logo, ui.accent_text).size(px(13.)))
+                        .child(title),
+                )
+                .when_some(window_buttons, |bar, buttons| {
+                    bar.relative()
+                        .child(div().absolute().top_0().right_0().h_full().child(buttons))
+                }),
             )
             .child(
                 ui::island(ui, style)

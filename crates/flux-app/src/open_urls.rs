@@ -19,8 +19,11 @@ pub fn listen(app: &Application) -> UnboundedReceiver<Vec<String>> {
     receiver
 }
 
-/// Opens what arrives, for as long as Flux runs.
+/// Opens what arrives, for as long as Flux runs — and on Windows what later launches of Flux hand
+/// over (`second_launch.rs`, part 10.9).
 pub fn run(mut urls: UnboundedReceiver<Vec<String>>, cx: &mut App) {
+    #[cfg(windows)]
+    crate::second_launch::run(crate::second_launch::listen(), cx);
     cx.spawn(async move |cx| {
         while let Some(urls) = urls.next().await {
             let paths: Vec<PathBuf> = urls.iter().filter_map(|url| file_path(url)).collect();
@@ -34,8 +37,9 @@ pub fn run(mut urls: UnboundedReceiver<Vec<String>>, cx: &mut App) {
 
 /// A folder becomes a project: its window comes forward, a window without a project (the start
 /// screen) takes it, otherwise it opens in a new window. A file opens in the window of the project
-/// that holds it, or the window in front.
-fn open(paths: Vec<PathBuf>, cx: &mut App) {
+/// that holds it, or the window in front. Also what a second launch on Windows hands over
+/// (`second_launch.rs`).
+pub(crate) fn open(paths: Vec<PathBuf>, cx: &mut App) {
     let (dirs, files): (Vec<_>, Vec<_>) = paths.into_iter().partition(|path| path.is_dir());
     for dir in dirs {
         let root = std::fs::canonicalize(&dir).unwrap_or(dir);
@@ -101,7 +105,7 @@ fn holding_window(file: &std::path::Path, cx: &App) -> Option<gpui::WindowHandle
         .map(|(_, handle)| handle)
 }
 
-fn front_window(cx: &App) -> Option<gpui::WindowHandle<Workspace>> {
+pub(crate) fn front_window(cx: &App) -> Option<gpui::WindowHandle<Workspace>> {
     cx.active_window()
         .and_then(|window| window.downcast::<Workspace>())
         .or_else(|| workspaces(cx).into_iter().next())

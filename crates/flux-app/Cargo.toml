@@ -57,6 +57,18 @@ libc = "0.2"
 core-foundation-sys = "0.8.7"
 objc = "0.2.7"
 
+# A second launch hands its folders and files to the running Flux through a named pipe
+# (`second_launch.rs`, part 10.9).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 # The tests' languages (`flux_syntax::standard`: native grammars of the catalog's languages): Flux
 # itself gets them from plugins.
