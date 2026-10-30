@@ -12,8 +12,9 @@
 //! be read (another key, damaged) is never written over: it is put aside as
 //! `secrets.bin.unreadable-<unix time>`, and the secrets start empty — the plugins look signed out.
 //!
-//! Flux kept them in the macOS keychain before: the first use of the secrets in Flux.app moves them
-//! here, once ([`Store::move_from_keychain`]).
+//! Flux kept them in the macOS keychain before 0.3.0, which moved them here once. Since 0.3.1 Flux
+//! never touches the keychain: macOS asked for the keychain's password to let Flux read and remove
+//! its old items. A secret left there stays there; its plugin signs in again.
 //!
 //! `FLUX_PLUGIN_SECRETS_FILE=<file>` keeps them in a plain JSON file instead (tests, scenarios).
 
@@ -21,13 +22,11 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use ring::rand::{SecureRandom as _, SystemRandom};
-
-use crate::keychain::{self, Keychain};
 
 /// The secrets of every plugin by service, then account.
 type Secrets = BTreeMap<String, BTreeMap<String, String>>;
@@ -52,15 +51,14 @@ pub fn delete(service: &str, account: &str) -> Result<(), String> {
     Place::current().delete(service, account)
 }
 
-/// Deletes every secret of the service, with its items left in the keychain.
+/// Deletes every secret of the service.
 pub fn delete_all(service: &str) -> Result<(), String> {
     Place::current().delete_all(service)
 }
 
-/// The store's own entry, which no plugin's service can be: when the keychain's secrets were moved
-/// ([`MOVED`]). Never read, written or removed as a secret.
+/// The store's own entry, which no plugin's service can be (Flux 0.3.0 marked there when it moved
+/// the keychain's secrets). Never read, written or removed as a secret.
 const META: &str = "flux";
-const MOVED: &str = "moved-from-keychain";
 
 /// Where the secrets are kept.
 enum Place<'a> {
@@ -124,18 +122,9 @@ impl Place<'_> {
         if service == META {
             return Ok(());
         }
-        let removed = self.change(|secrets| {
+        self.change(|secrets| {
             secrets.remove(service);
-        });
-        // Items the user didn't let Flux move from the keychain.
-        let left = match self {
-            Place::Store(Store {
-                keychain: Some(keychain),
-                ..
-            }) => keychain.delete_all(service),
-            _ => Ok(()),
-        };
-        removed.and(left)
+        })
     }
 }
 
@@ -174,8 +163,6 @@ type Key = [u8; KEY_LEN];
 /// The encrypted secrets in a folder.
 struct Store {
     dir: PathBuf,
-    /// Where the secrets were before, to move them from: none in tests and scenarios.
-    keychain: Option<Arc<dyn Keychain>>,
     /// The plugins' threads take turns (other processes — by the lock file).
     state: Mutex<State>,
 }
@@ -184,8 +171,6 @@ struct Store {
 struct State {
     /// The secrets as last read or written.
     cache: Option<Cached>,
-    /// The keychain was looked at: once a process, so a denied read isn't asked again.
-    keychain_checked: bool,
 }
 
 #[derive(Default)]
@@ -226,10 +211,9 @@ enum Unreadable {
 }
 
 impl Store {
-    fn new(dir: PathBuf, keychain: Option<Arc<dyn Keychain>>) -> Self {
+    fn new(dir: PathBuf) -> Self {
         Self {
             dir,
-            keychain,
             state: Mutex::default(),
         }
     }
@@ -237,26 +221,17 @@ impl Store {
     /// The user's secrets (or those of `FLUX_PLUGINS_HOME`).
     fn user() -> &'static Store {
         static STORE: OnceLock<Store> = OnceLock::new();
-        STORE.get_or_init(|| Store::new(crate::paths::secrets_dir(), keychain::user()))
+        STORE.get_or_init(|| Store::new(crate::paths::secrets_dir()))
     }
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
 
-    /// Reads and changes the secrets, writing them if they changed. The first time, moves the
-    /// keychain's secrets here.
+    /// Reads and changes the secrets, writing them if they changed.
     fn change<T>(&self, change: impl FnOnce(&mut Secrets) -> T) -> Result<T, String> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let _lock = self.lock()?;
-        if !state.keychain_checked {
-            state.keychain_checked = true;
-            if let Some(keychain) = &self.keychain
-                && let Err(err) = self.move_from_keychain(&mut state, keychain.as_ref())
-            {
-                log::warn!("The plugins' secrets weren't moved from the keychain: {err}");
-            }
-        }
         let cached = self.refresh(&mut state)?;
         let before = cached.secrets.clone();
         let result = change(&mut cached.secrets);
@@ -458,66 +433,6 @@ impl Store {
             .map_err(|err| format!("{name} can't be read nor put aside: {err}"))?;
         Ok(aside)
     }
-
-    /// Moves the secrets the keychain kept before here, once: the secrets remember it ([`MOVED`]).
-    /// An item is deleted from the keychain only once written here; one whose read fails (the user
-    /// denied it) stays there and isn't asked for again — its plugin looks signed out.
-    fn move_from_keychain(&self, state: &mut State, keychain: &dyn Keychain) -> Result<(), String> {
-        let cached = self.refresh(state)?;
-        let moved_before = cached
-            .secrets
-            .get(META)
-            .is_some_and(|meta| meta.contains_key(MOVED));
-        if moved_before {
-            return Ok(());
-        }
-        // A failed list isn't remembered: the next start tries again.
-        let items = keychain.list()?;
-        let mut secrets = cached.secrets.clone();
-        let mut moved = Vec::new();
-        for (service, account) in items {
-            match keychain.read(&service, &account) {
-                Ok(Some(secret)) => {
-                    // One saved here already is newer.
-                    secrets
-                        .entry(service.clone())
-                        .or_default()
-                        .entry(account.clone())
-                        .or_insert(secret);
-                    moved.push((service, account));
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    log::warn!("The secret \"{account}\" of {service} stays in the keychain: {err}")
-                }
-            }
-        }
-        secrets
-            .entry(META.to_string())
-            .or_default()
-            .insert(MOVED.to_string(), unix_time().to_string());
-        match self.save(&secrets) {
-            Ok(stamp) => {
-                state.cache = Some(Cached {
-                    stamp: Some(stamp),
-                    secrets,
-                })
-            }
-            Err(err) => {
-                state.cache = None;
-                return Err(err);
-            }
-        }
-        for (service, account) in &moved {
-            if let Err(err) = keychain.delete(service, account) {
-                log::warn!("The secret \"{account}\" of {service} is left in the keychain: {err}");
-            }
-        }
-        if !moved.is_empty() {
-            log::info!("Moved {} plugins' secrets from the keychain", moved.len());
-        }
-        Ok(())
-    }
 }
 
 fn unix_time() -> u64 {
@@ -578,71 +493,8 @@ mod tests {
     use super::*;
     use crate::tests::temp_dir;
 
-    /// A keychain of the test's own: the user's is never touched.
-    #[derive(Default)]
-    struct FakeKeychain {
-        items: Mutex<BTreeMap<(String, String), String>>,
-        /// Items whose read the user denies.
-        denied: BTreeSet<(String, String)>,
-        lists: Mutex<usize>,
-    }
-
-    impl FakeKeychain {
-        fn with(items: &[(&str, &str, &str)], denied: &[(&str, &str)]) -> Arc<Self> {
-            let pair = |service: &str, account: &str| (service.to_string(), account.to_string());
-            Arc::new(Self {
-                items: Mutex::new(
-                    items
-                        .iter()
-                        .map(|(service, account, secret)| {
-                            (pair(service, account), secret.to_string())
-                        })
-                        .collect(),
-                ),
-                denied: denied
-                    .iter()
-                    .map(|(service, account)| pair(service, account))
-                    .collect(),
-                lists: Mutex::new(0),
-            })
-        }
-
-        fn left(&self) -> Vec<(String, String)> {
-            self.items.lock().unwrap().keys().cloned().collect()
-        }
-    }
-
-    impl Keychain for FakeKeychain {
-        fn list(&self) -> Result<Vec<(String, String)>, String> {
-            *self.lists.lock().unwrap() += 1;
-            Ok(self.left())
-        }
-
-        fn read(&self, service: &str, account: &str) -> Result<Option<String>, String> {
-            let item = (service.to_string(), account.to_string());
-            if self.denied.contains(&item) {
-                return Err("denied".into());
-            }
-            Ok(self.items.lock().unwrap().get(&item).cloned())
-        }
-
-        fn delete(&self, service: &str, account: &str) -> Result<(), String> {
-            let item = (service.to_string(), account.to_string());
-            self.items.lock().unwrap().remove(&item);
-            Ok(())
-        }
-
-        fn delete_all(&self, service: &str) -> Result<(), String> {
-            self.items
-                .lock()
-                .unwrap()
-                .retain(|(item_service, _), _| item_service != service);
-            Ok(())
-        }
-    }
-
     fn store(dir: &Path) -> Store {
-        Store::new(dir.to_path_buf(), None)
+        Store::new(dir.to_path_buf())
     }
 
     fn mode(path: &Path) -> u32 {
@@ -865,100 +717,17 @@ mod tests {
     }
 
     #[test]
-    fn the_keychain_is_moved_once() {
-        let dir = temp_dir("secrets-move");
-        let keychain = FakeKeychain::with(
-            &[
-                ("Flux plugin a", "token", "a1"),
-                ("Flux plugin a", "refresh", "a2"),
-                ("Flux plugin b", "token", "b1"),
-                ("Flux plugin c", "token", "c1"),
-                ("Flux plugin d", "token", "old"),
-            ],
-            &[("Flux plugin c", "token")],
-        );
-        // A secret saved here already (by a Flux that didn't move them) is newer.
-        Place::Store(&store(&dir))
-            .set("Flux plugin d", "token", "new")
-            .unwrap();
-        let mover = Store::new(dir.clone(), Some(keychain.clone()));
-        let place = Place::Store(&mover);
+    fn the_stores_own_entry_is_no_plugins_secret() {
+        let dir = temp_dir("secrets-meta");
+        let place = Place::Store(&store(&dir));
+        place.set("Flux plugin a", "token", "x").unwrap();
+        assert!(place.set(META, "moved-from-keychain", "1").is_err());
+        assert_eq!(place.get(META, "moved-from-keychain").unwrap(), None);
+        place.delete_all(META).unwrap();
         assert_eq!(
             place.get("Flux plugin a", "token").unwrap().as_deref(),
-            Some("a1")
+            Some("x")
         );
-        assert_eq!(
-            place.get("Flux plugin a", "refresh").unwrap().as_deref(),
-            Some("a2")
-        );
-        assert_eq!(
-            place.get("Flux plugin b", "token").unwrap().as_deref(),
-            Some("b1")
-        );
-        assert_eq!(
-            place.get("Flux plugin d", "token").unwrap().as_deref(),
-            Some("new")
-        );
-        // The denied one stays in the keychain, the plugin signed out.
-        assert_eq!(place.get("Flux plugin c", "token").unwrap(), None);
-        assert_eq!(
-            keychain.left(),
-            [("Flux plugin c".to_string(), "token".to_string())]
-        );
-        // The mark is no plugin's secret.
-        assert_eq!(place.get(META, MOVED).unwrap(), None);
-        assert!(place.set(META, MOVED, "x").is_err());
-        place.delete_all(META).unwrap();
-        // Once: neither this process nor the next one asks again.
-        assert_eq!(*keychain.lists.lock().unwrap(), 1);
-        let next = Store::new(dir.clone(), Some(keychain.clone()));
-        assert_eq!(
-            Place::Store(&next)
-                .get("Flux plugin b", "token")
-                .unwrap()
-                .as_deref(),
-            Some("b1")
-        );
-        assert_eq!(*keychain.lists.lock().unwrap(), 1);
-        // Uninstalling a plugin removes what the keychain still has of it too.
-        Place::Store(&next).delete_all("Flux plugin c").unwrap();
-        assert!(keychain.left().is_empty());
-        Place::Store(&next).delete_all("Flux plugin a").unwrap();
-        assert_eq!(place.get("Flux plugin a", "refresh").unwrap(), None);
-    }
-
-    #[test]
-    fn a_keychain_that_cant_be_listed_is_tried_again_next_time() {
-        struct Locked;
-        impl Keychain for Locked {
-            fn list(&self) -> Result<Vec<(String, String)>, String> {
-                Err("locked".into())
-            }
-            fn read(&self, _: &str, _: &str) -> Result<Option<String>, String> {
-                unreachable!()
-            }
-            fn delete(&self, _: &str, _: &str) -> Result<(), String> {
-                unreachable!()
-            }
-            fn delete_all(&self, _: &str) -> Result<(), String> {
-                Ok(())
-            }
-        }
-        let dir = temp_dir("secrets-locked");
-        let locked = Store::new(dir.clone(), Some(Arc::new(Locked)));
-        Place::Store(&locked)
-            .set("Flux plugin a", "token", "x")
-            .unwrap();
-        let keychain = FakeKeychain::with(&[("Flux plugin b", "token", "b1")], &[]);
-        let next = Store::new(dir, Some(keychain.clone()));
-        assert_eq!(
-            Place::Store(&next)
-                .get("Flux plugin b", "token")
-                .unwrap()
-                .as_deref(),
-            Some("b1")
-        );
-        assert!(keychain.left().is_empty());
     }
 
     #[test]

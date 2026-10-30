@@ -25,7 +25,6 @@ pub(crate) mod compat;
 pub mod dev;
 mod host;
 pub mod install;
-pub(crate) mod keychain;
 pub mod locales;
 pub mod log;
 pub mod manifest;
