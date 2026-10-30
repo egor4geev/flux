@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+flux-platform.workspace = true
 # Pictures in the user's messages go to the CLI as base64.
 base64 = "0.22"
 # Channels from the CLI's reader thread to the window's UI tasks: futures, no async runtime (as

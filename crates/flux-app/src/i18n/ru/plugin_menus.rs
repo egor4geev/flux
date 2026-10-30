@@ -13,6 +13,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Принимать подключения от программ на этом Mac",
     ),
     (
+        "Accept connections from programs on this computer",
+        "Принимать подключения от программ на этом компьютере",
+    ),
+    (
         "Run any program with your rights",
         "Запускать любые программы с вашими правами",
     ),

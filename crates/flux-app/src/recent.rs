@@ -64,7 +64,7 @@ fn store_path() -> Option<PathBuf> {
     store_path_for(
         std::env::var_os("FLUX_RECENT_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     )
 }
 
@@ -81,7 +81,7 @@ fn store_path_for(
         return None;
     }
     let home = PathBuf::from(home?);
-    Some(home.join("Library/Application Support/flux/recent-projects"))
+    Some(flux_platform::paths::support_dir_in(&home).join("recent-projects"))
 }
 
 fn load_from(file: &Path) -> Vec<PathBuf> {
@@ -94,14 +94,14 @@ fn record_in(file: &Path, root: &Path) -> Vec<PathBuf> {
         eprintln!("flux: {}: {error}", file.display());
     }
     list.into_iter()
-        .filter(|dir| dir == root || dir.is_dir())
+        .filter(|dir| flux_platform::same_path(dir, root) || dir.is_dir())
         .collect()
 }
 
 fn remove_in(file: &Path, root: &Path) -> Vec<PathBuf> {
     let mut list = read(file);
     let before = list.len();
-    list.retain(|known| known != root);
+    list.retain(|known| !flux_platform::same_path(known, root));
     if list.len() != before
         && let Err(error) = write(file, &list)
     {
@@ -127,7 +127,11 @@ fn parse(text: &str) -> Vec<PathBuf> {
     let mut list: Vec<PathBuf> = Vec::new();
     for line in text.lines() {
         let path = Path::new(line.trim_end_matches('\r'));
-        if path.is_absolute() && !list.iter().any(|known| known == path) {
+        if path.is_absolute()
+            && !list
+                .iter()
+                .any(|known| flux_platform::same_path(known, path))
+        {
             list.push(path.to_path_buf());
         }
     }
@@ -137,7 +141,7 @@ fn parse(text: &str) -> Vec<PathBuf> {
 
 /// `root` goes first; its previous place is freed; the length is at most [`MAX_RECENT`].
 fn push_front(mut list: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
-    list.retain(|known| known != root);
+    list.retain(|known| !flux_platform::same_path(known, root));
     list.insert(0, root.to_path_buf());
     list.truncate(MAX_RECENT);
     list
@@ -186,11 +190,23 @@ mod tests {
         dir
     }
 
+    /// A full path of the system: `/a/one`, on Windows `C:\a\one`.
+    fn full(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", path.replace('/', "\\"))
+        } else {
+            path.to_string()
+        }
+    }
+
     #[test]
     fn parse_skips_blanks_relative_paths_and_repeats() {
-        let text = "/a/one\n\nrelative/two\n/a/one\r\n/b/three\n";
-        assert_eq!(parse(text), paths(&["/a/one", "/b/three"]));
-        let many: String = (0..MAX_RECENT + 5).map(|n| format!("/p/{n}\n")).collect();
+        let (one, three) = (full("/a/one"), full("/b/three"));
+        let text = format!("{one}\n\nrelative/two\n{one}\r\n{three}\n");
+        assert_eq!(parse(&text), paths(&[&one, &three]));
+        let many: String = (0..MAX_RECENT + 5)
+            .map(|n| full(&format!("/p/{n}")) + "\n")
+            .collect();
         assert_eq!(parse(&many).len(), MAX_RECENT);
     }
 
@@ -226,8 +242,9 @@ mod tests {
         let home = Some(OsString::from("/Users/me"));
         assert_eq!(
             store_path_for(None, false, home.clone()),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/recent-projects"
+            Some(crate::settings::support_file(
+                "/Users/me",
+                "recent-projects"
             ))
         );
         assert_eq!(store_path_for(None, true, home.clone()), None);
@@ -237,8 +254,9 @@ mod tests {
         );
         assert_eq!(
             store_path_for(Some(OsString::new()), false, home),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/recent-projects"
+            Some(crate::settings::support_file(
+                "/Users/me",
+                "recent-projects"
             ))
         );
         assert_eq!(store_path_for(None, false, None), None);

@@ -115,12 +115,12 @@ pub fn component_mtime(entry: &PluginEntry) -> Option<SystemTime> {
     std::fs::metadata(dir.join(wasm)).ok()?.modified().ok()
 }
 
-/// cargo: on the PATH, or where rustup and Homebrew put it.
+/// cargo: on the PATH, or where rustup and Homebrew put it (`cargo.exe` on Windows).
 fn find_cargo() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = flux_platform::paths::home();
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
-        .chain(home.map(|home| home.join(".cargo/bin")))
+        .chain(home.map(|home| home.join(".cargo").join("bin")))
         .chain(
             [
                 "/opt/homebrew/opt/rustup/bin",
@@ -129,7 +129,7 @@ fn find_cargo() -> Option<PathBuf> {
             ]
             .map(PathBuf::from),
         )
-        .map(|dir| dir.join("cargo"))
+        .flat_map(|dir| flux_platform::process::program_files(&dir, "cargo"))
         .find(|cargo| cargo.is_file())
 }
 

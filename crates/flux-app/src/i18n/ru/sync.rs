@@ -130,8 +130,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     // Settings → Version Control.
     ("Version Control", "Контроль версий"),
     (
-        "Git: how Update Project (⌘T) brings the commits of the upstream into the current branch. Local changes are stashed for the update and come back after it.",
-        "Git: как «Обновить проект» (⌘T) приносит коммиты upstream в текущую ветку. Локальные изменения на время обновления уходят в stash и возвращаются после.",
+        "Git: how Update Project ({0}) brings the commits of the upstream into the current branch. Local changes are stashed for the update and come back after it.",
+        "Git: как «Обновить проект» ({0}) приносит коммиты upstream в текущую ветку. Локальные изменения на время обновления уходят в stash и возвращаются после.",
     ),
     (
         "Incoming commits are merged into the current branch",

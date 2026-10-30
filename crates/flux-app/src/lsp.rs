@@ -137,7 +137,7 @@ const PROBLEM_SETTLE: Duration = Duration::from_millis(1200);
 pub fn init(_cx: &mut App) {
     if let Some(dir) = servers_dir_for(
         std::env::var_os("FLUX_SERVERS_DIR"),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     ) {
         install::set_dir(dir);
     }
@@ -149,7 +149,7 @@ fn servers_dir_for(explicit: Option<OsString>, home: Option<OsString>) -> Option
     if let Some(dir) = explicit.filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir));
     }
-    Some(PathBuf::from(home?).join("Library/Application Support/flux/servers"))
+    Some(flux_platform::paths::support_dir_in(std::path::Path::new(&home?)).join("servers"))
 }
 
 pub struct LspStore {
@@ -2358,9 +2358,7 @@ mod tests {
         let home = Some(OsString::from("/Users/me"));
         assert_eq!(
             servers_dir_for(None, home.clone()),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/servers"
-            ))
+            Some(crate::settings::support_file("/Users/me", "servers"))
         );
         assert_eq!(
             servers_dir_for(Some("/tmp/servers".into()), home.clone()),
@@ -2368,9 +2366,7 @@ mod tests {
         );
         assert_eq!(
             servers_dir_for(Some("".into()), home),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/servers"
-            ))
+            Some(crate::settings::support_file("/Users/me", "servers"))
         );
         assert_eq!(servers_dir_for(None, None), None);
     }

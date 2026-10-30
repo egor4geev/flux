@@ -67,10 +67,13 @@ const LOG_LINE_HEIGHT: f32 = 18.;
 pub fn init(cx: &mut App) {
     // ↑ / ↓ go through the list from its search field.
     let context = Some("PluginManager");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+        ],
+    );
 }
 
 /// Opens Settings on Plugins: the palette's «Plugins…», a notification about a plugin.
@@ -2344,9 +2347,11 @@ fn contribution_row(
 }
 
 /// A shortcut of a manifest in gpui's notation ("alt-cmd-shift-t", "cmd-k cmd-s") as the
-/// palette shows it ("⌥⇧⌘T", "⌘K ⌘S"); none when it doesn't parse.
+/// palette shows it ("⌥⇧⌘T", "⌘K ⌘S"; in the system's keys, `keymap::system_keys`); none when it
+/// doesn't parse.
 fn keys_label(keys: &str) -> Option<String> {
-    keys.split_whitespace()
+    crate::keymap::system_keys(keys)
+        .split_whitespace()
         .map(|part| {
             Keystroke::parse(part)
                 .ok()
@@ -2465,6 +2470,12 @@ authors = ["Someone", "Another"]
 
     #[test]
     fn permissions_read_in_plain_words() {
+        // Worded for the system: Windows says "this computer".
+        let server = if cfg!(windows) {
+            "Accept connections from programs on this computer"
+        } else {
+            "Accept connections from programs on this Mac"
+        };
         assert_eq!(
             lines(
                 "project = \"write\"\nnetwork = [\"api.tracker.yandex.net\", \"*.yandex.ru\"]\n\
@@ -2480,7 +2491,7 @@ authors = ["Someone", "Another"]
                     "Connect to api.tracker.yandex.net, *.yandex.ru".into(),
                     false
                 ),
-                ("Accept connections from programs on this Mac".into(), false),
+                (server.into(), false),
                 ("Run programs: git, gh".into(), false),
                 ("Read the folder ~/.config/gh".into(), false),
                 ("Read and change the folder /tmp/x".into(), false),
@@ -2523,8 +2534,19 @@ authors = ["Someone", "Another"]
 
     #[test]
     fn shortcuts_read_as_the_palette_shows_them() {
-        assert_eq!(keys_label("alt-cmd-shift-t").as_deref(), Some("⌥⇧⌘T"));
-        assert_eq!(keys_label("cmd-k cmd-s").as_deref(), Some("⌘K ⌘S"));
+        // The system's keys: a manifest names macOS keys.
+        let on = |mac, windows| match crate::keymap::KeyOs::current() {
+            crate::keymap::KeyOs::Mac => Some(mac),
+            crate::keymap::KeyOs::Windows => Some(windows),
+        };
+        assert_eq!(
+            keys_label("alt-cmd-shift-t").as_deref(),
+            on("⌥⇧⌘T", "Ctrl+Alt+Shift+T")
+        );
+        assert_eq!(
+            keys_label("cmd-k cmd-s").as_deref(),
+            on("⌘K ⌘S", "Ctrl+K Ctrl+S")
+        );
         assert_eq!(keys_label(""), None);
     }
 

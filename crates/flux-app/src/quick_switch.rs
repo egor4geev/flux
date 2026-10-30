@@ -49,20 +49,23 @@ const MAX_VISIBLE_ROWS: usize = 12;
 
 pub fn init(cx: &mut App) {
     let popup = Some("QuickSwitch");
-    cx.bind_keys([
-        KeyBinding::new("ctrl-`", Toggle, Some("Workspace")),
-        // In a terminal ⌃` stays the program's (it sends NUL), as ⌃V does.
-        KeyBinding::new("ctrl-`", NoAction, Some("Terminal")),
-        KeyBinding::new("down", SelectNext, popup),
-        KeyBinding::new("up", SelectPrevious, popup),
-        KeyBinding::new("ctrl-n", SelectNext, popup),
-        KeyBinding::new("ctrl-p", SelectPrevious, popup),
-        KeyBinding::new("enter", Confirm, popup),
-        KeyBinding::new("right", Open, popup),
-        KeyBinding::new("left", Back, popup),
-        KeyBinding::new("backspace", Back, popup),
-        KeyBinding::new("escape", Dismiss, popup),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("ctrl-`", Toggle, Some("Workspace")),
+            // In a terminal ⌃` stays the program's (it sends NUL), as ⌃V does.
+            KeyBinding::new("ctrl-`", NoAction, Some("Terminal")),
+            KeyBinding::new("down", SelectNext, popup),
+            KeyBinding::new("up", SelectPrevious, popup),
+            KeyBinding::new("ctrl-n", SelectNext, popup),
+            KeyBinding::new("ctrl-p", SelectPrevious, popup),
+            KeyBinding::new("enter", Confirm, popup),
+            KeyBinding::new("right", Open, popup),
+            KeyBinding::new("left", Back, popup),
+            KeyBinding::new("backspace", Back, popup),
+            KeyBinding::new("escape", Dismiss, popup),
+        ],
+    );
 }
 
 /// The window's handlers of Quick Switch.

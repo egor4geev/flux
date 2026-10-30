@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn paths_are_appended_once_and_anchored() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let repo = init_repo(&root);
         fs::write(root.join(".gitignore"), "*.log").unwrap();
         add_to_gitignore(&repo, "target", true).unwrap();

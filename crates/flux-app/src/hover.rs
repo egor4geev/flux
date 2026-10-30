@@ -58,10 +58,13 @@ actions!(editor, [ShowHover, OpenLinkAtCaret]);
 actions!(hover, [HideHover]);
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("f1", ShowHover, Some("Editor")),
-        KeyBinding::new("escape", HideHover, Some("Editor && showing_hover")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("f1", ShowHover, Some("Editor")),
+            KeyBinding::new("escape", HideHover, Some("Editor && showing_hover")),
+        ],
+    );
 }
 
 /// Hover state of an editor (`Editor::hover`).
@@ -585,7 +588,7 @@ fn word_at(editor: &Editor, pos: usize) -> Option<Range<usize>> {
 /// ⌘ alone (as for ⌘-click) over a plugin's link, or over a word of a document with a language
 /// server: that is the link.
 fn update_link(editor: &mut Editor, modifiers: Modifiers, cx: &mut Context<Editor>) {
-    let command = modifiers.platform && !modifiers.shift && !modifiers.alt && !modifiers.control;
+    let command = crate::keymap::secondary_alone(crate::keymap::KeyOs::current(), &modifiers);
     let mut plugin_link = None;
     let link = editor.hover.mouse_over.filter(|_| command).and_then(|pos| {
         match plugin_link_at(editor, pos) {
@@ -607,7 +610,7 @@ fn update_link(editor: &mut Editor, modifiers: Modifiers, cx: &mut Context<Edito
 /// take the mouse: the click goes to the editor (⌘-click).
 fn render_link(editor: &Editor, window: &Window, cx: &App) -> Option<AnyElement> {
     let link = editor.hover.link.as_ref()?;
-    if !window.modifiers().platform {
+    if !window.modifiers().secondary() {
         return None;
     }
     let start = popup::anchor(editor, link.start)?;

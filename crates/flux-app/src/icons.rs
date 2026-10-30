@@ -103,6 +103,7 @@ icons! {
     LayoutPreview => "layout-preview",
     LayoutSplit => "layout-split",
     Logo => "logo",
+    Menu => "menu",
     Merge => "merge",
     Minus => "minus",
     Moon => "moon",
@@ -141,6 +142,12 @@ icons! {
     Update => "update",
     Warning => "warning",
     WholeWord => "whole-word",
+    // The window buttons of the title bar on Windows (part 10.9): Windows' 10 × 10 glyphs, 1 px
+    // lines, in the middle of the grid.
+    WindowClose => "window-close",
+    WindowMaximize => "window-maximize",
+    WindowMinimize => "window-minimize",
+    WindowRestore => "window-restore",
 }
 
 /// Default icon size, to fit a list row and 13 px text.

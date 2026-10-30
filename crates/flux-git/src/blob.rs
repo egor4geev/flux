@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn files_are_read_at_head() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let repo = init_repo(&root);
         let reader = BlobReader::new(&repo);
         // No commits yet: nothing at HEAD.

@@ -153,6 +153,7 @@ mod tests {
     use super::*;
     use crate::status::{ConflictKind, FileStatus, status};
     use crate::testing::{Sandbox, commit_all, git, read, write};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     /// Main and `theirs` change `both.txt`; main deletes `deleted-here.txt` that theirs changes, and
@@ -164,6 +165,7 @@ mod tests {
         write(&repo, "deleted-here.txt", "x\n");
         write(&repo, "deleted-there.txt", "y\n");
         write(&repo, "run.sh", "echo base\n");
+        #[cfg(unix)]
         std::fs::set_permissions(repo.absolute("run.sh"), fs::Permissions::from_mode(0o755))
             .unwrap();
         commit_all(&repo, "Base");
@@ -242,11 +244,14 @@ mod tests {
         // The merge tool's result, written with the file's mode kept.
         mark_resolved(&repo, "run.sh", Some(b"echo both\n")).unwrap();
         assert_eq!(read(&repo, "run.sh"), "echo both\n");
-        let mode = fs::metadata(repo.absolute("run.sh"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o755);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(repo.absolute("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
         assert!(!crate::ops::has_unmerged(&repo));
         // A resolved file is left alone by another accept.
         accept_side(&repo, &["both.txt".into()], ConflictSide::Ours).unwrap();

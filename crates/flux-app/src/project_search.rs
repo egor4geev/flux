@@ -44,6 +44,7 @@ use crate::editor::Editor;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, file_icon, icon};
 use crate::input::{InputEvent, TextInput};
+use crate::keymap;
 use crate::motion;
 use crate::picker::highlighted_text;
 use crate::theme::{self, Theme, UiColors};
@@ -92,22 +93,28 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-shift-f", Toggle, Some("Workspace"))]);
+    crate::keymap::bind_keys(
+        cx,
+        [KeyBinding::new("cmd-shift-f", Toggle, Some("Workspace"))],
+    );
     // The window context encloses the query field, so the arrow keys and Enter work right while
     // typing.
     let context = Some("ProjectSearch");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNextMatch, context),
-        KeyBinding::new("up", SelectPreviousMatch, context),
-        KeyBinding::new("pagedown", SelectNextPage, context),
-        KeyBinding::new("pageup", SelectPreviousPage, context),
-        KeyBinding::new("enter", OpenMatch, context),
-        KeyBinding::new("cmd-enter", OpenMatch, context),
-        KeyBinding::new("escape", Close, context),
-        KeyBinding::new("alt-cmd-c", ToggleCaseSensitive, context),
-        KeyBinding::new("alt-cmd-w", ToggleWholeWord, context),
-        KeyBinding::new("alt-cmd-r", ToggleRegex, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNextMatch, context),
+            KeyBinding::new("up", SelectPreviousMatch, context),
+            KeyBinding::new("pagedown", SelectNextPage, context),
+            KeyBinding::new("pageup", SelectPreviousPage, context),
+            KeyBinding::new("enter", OpenMatch, context),
+            KeyBinding::new("cmd-enter", OpenMatch, context),
+            KeyBinding::new("escape", Close, context),
+            KeyBinding::new("alt-cmd-c", ToggleCaseSensitive, context),
+            KeyBinding::new("alt-cmd-w", ToggleWholeWord, context),
+            KeyBinding::new("alt-cmd-r", ToggleRegex, context),
+        ],
+    );
 }
 
 /// What the window asks of the Workspace.
@@ -744,7 +751,7 @@ impl ProjectSearch {
                 self.close(cx);
             }
             Some(Row::NamedFile(hit)) => {
-                let path = root.join(&*self.named.hits[hit].path);
+                let path = flux_platform::join_slashed(&root, &self.named.hits[hit].path);
                 cx.emit(ProjectSearchEvent::OpenFile(path));
                 self.close(cx);
             }
@@ -1062,7 +1069,10 @@ impl ProjectSearch {
             Status::NoRoot => (
                 IconName::Folder,
                 tr("No project folder").into(),
-                tr("Open a folder with ⌘O to search across its files.").into(),
+                trf(
+                    "Open a folder with {0} to search across its files.",
+                    &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+                ),
                 ui.folder,
             ),
             Status::Idle => (
@@ -1071,8 +1081,14 @@ impl ProjectSearch {
                 format!(
                     "{} {}",
                     tr("Type text to find it in every file, or a file’s name to open the file."),
-                    tr(
-                        "Match Case ⌥⌘C, Words ⌥⌘W and Regex ⌥⌘R narrow the search; ↑↓ pick a result, ↵ opens it."
+                    trf(
+                        "Match Case {0}, Words {1} and Regex {2} narrow the search; ↑↓ pick a result, {3} opens it.",
+                        &[
+                            &keymap::shortcut("project_search::ToggleCaseSensitive", "alt-cmd-c"),
+                            &keymap::shortcut("project_search::ToggleWholeWord", "alt-cmd-w"),
+                            &keymap::shortcut("project_search::ToggleRegex", "alt-cmd-r"),
+                            &keymap::label(keymap::KeyOs::current(), "↵"),
+                        ]
                     )
                 ),
                 ui.accent_text,
@@ -1757,10 +1773,11 @@ fn split_named(path: &str, positions: &[usize]) -> (String, Vec<usize>, String, 
         .copied()
         .filter(|&p| p < dir_chars)
         .collect();
+    // The folder in the system's separators (one character for one: the positions hold).
     (
         name.to_string(),
         name_positions,
-        dir.to_string(),
+        flux_platform::PathStyle::NATIVE.native(dir).into_owned(),
         dir_positions,
     )
 }
@@ -1836,7 +1853,10 @@ fn char_ranges_to_bytes(
 fn status_text(status: &Status, found: (usize, usize)) -> (SharedString, bool) {
     let text = match status {
         Status::Idle => String::new(),
-        Status::NoRoot => tr("No project folder — open one with ⌘O").into(),
+        Status::NoRoot => trf(
+            "No project folder — open one with {0}",
+            &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+        ),
         Status::Searching if found.0 == 0 => tr("Searching…").into(),
         Status::Searching => trf("Searching… {0}", &[&results_label(found.0, found.1)]),
         Status::Done(summary) if summary.matches == 0 => tr("No results").into(),

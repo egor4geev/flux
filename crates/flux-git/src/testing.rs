@@ -17,7 +17,7 @@ pub(crate) struct Sandbox {
 impl Sandbox {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         Self { _dir: dir, root }
     }
 
@@ -38,7 +38,7 @@ impl Sandbox {
 
     /// A clone of `remote` at `name` (a teammate).
     pub fn clone(&self, remote: &Path, name: &str) -> Repo {
-        run(&self.root, &["clone", "-q", remote.to_str().unwrap(), name]);
+        run(&self.root, &["clone", "-q", &url(remote), name]);
         let path = self.root.join(name);
         configure(&path);
         Repo::discover(&path).unwrap()
@@ -49,15 +49,19 @@ impl Sandbox {
     pub fn with_remote(&self) -> (Repo, PathBuf) {
         let remote = self.bare("remote.git");
         let repo = self.repo("work");
-        git(
-            &repo,
-            &["remote", "add", "origin", remote.to_str().unwrap()],
-        );
+        git(&repo, &["remote", "add", "origin", &url(&remote)]);
         write(&repo, "a.txt", "one\ntwo\nthree\n");
         commit_all(&repo, "First");
         git(&repo, &["push", "-q", "-u", "origin", "main"]);
         (repo, remote)
     }
+}
+
+/// A local repository's path as a remote's URL. A canonical Windows path (`\\?\C:\…`) has a `:`
+/// and no `/` before it: git would take it for an ssh host; the plain `C:\…` is a path.
+pub(crate) fn url(path: &Path) -> String {
+    let path = path.to_str().unwrap();
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
 }
 
 fn configure(path: &Path) {
@@ -69,6 +73,8 @@ fn configure(path: &Path) {
         ("rerere.enabled", "false"),
         ("pull.rebase", "false"),
         ("merge.conflictStyle", "merge"),
+        // Git for Windows checks files out with `\r\n` by default.
+        ("core.autocrlf", "false"),
     ] {
         run(path, &["config", key, value]);
     }

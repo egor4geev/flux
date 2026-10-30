@@ -115,7 +115,7 @@ pub fn init(cx: &mut App) {
     let path = store_path_for(
         std::env::var_os("FLUX_COMMAND_USAGE_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     );
     let commands = path.as_deref().map(load).unwrap_or_default();
     cx.set_global(CommandUsage { commands, path });
@@ -211,7 +211,7 @@ fn store_path_for(
         return None;
     }
     let home = PathBuf::from(home?);
-    Some(home.join("Library/Application Support/flux/command-usage.json"))
+    Some(flux_platform::paths::support_dir_in(&home).join("command-usage.json"))
 }
 
 fn load(path: &Path) -> HashMap<String, Usage> {
@@ -468,8 +468,9 @@ mod tests {
         let home = Some(OsString::from("/Users/me"));
         assert_eq!(
             store_path_for(None, false, home.clone()),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/command-usage.json"
+            Some(crate::settings::support_file(
+                "/Users/me",
+                "command-usage.json"
             ))
         );
         assert_eq!(store_path_for(None, true, home.clone()), None);

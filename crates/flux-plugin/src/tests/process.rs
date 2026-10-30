@@ -77,11 +77,42 @@ impl Probe {
 }
 
 /// Whether a program with this command line runs (`pgrep -f`).
+#[cfg(unix)]
 fn running(pattern: &str) -> bool {
     Command::new("pgrep")
         .args(["-f", pattern])
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+/// Whether a program with this command line runs: Windows has no `pgrep`, PowerShell asks WMI.
+#[cfg(windows)]
+fn running(pattern: &str) -> bool {
+    // The program may be started by its full path: `"C:\…\sleep.exe" 31.517`.
+    let pattern = pattern.replace(' ', "*");
+    let script = format!(
+        "if (Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and \
+         $_.CommandLine -like '*{pattern}*' }}) {{ exit 0 }} else {{ exit 1 }}"
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// The exit code of a killed program: none, a signal ended it; Windows has no signals, the
+/// program ends with code 1.
+const KILLED: &str = if cfg!(windows) { "Some(1)" } else { "None" };
+
+/// What `pwd` prints in `dir`. Git's `pwd`, which Windows runners have, prints its own paths
+/// (`/tmp/…` for the temporary folder): the folder's last names are the same.
+fn printed_pwd_is(printed: &str, dir: &Path) -> bool {
+    if cfg!(windows) {
+        let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+        printed.ends_with(&format!("/{}/{}", name(dir.parent().unwrap()), name(dir)))
+    } else {
+        printed == dir.display().to_string()
+    }
 }
 
 #[test]
@@ -108,7 +139,11 @@ fn runs_programs_to_their_end() {
     assert!(started.elapsed() < Duration::from_secs(3));
     let cwd = probe.run("proc:run-cwd");
     let root = std::fs::canonicalize(&root).unwrap();
-    assert_eq!(cwd, format!("cwd: {}", root.display()));
+    assert!(
+        cwd.strip_prefix("cwd: ")
+            .is_some_and(|printed| printed_pwd_is(printed, &root)),
+        "{cwd}"
+    );
     let env = probe.run("proc:run-env");
     assert!(env.starts_with("env: 42 "), "{env}");
     assert!(env.contains("/usr/bin"), "{env}");
@@ -131,7 +166,10 @@ fn started_programs_report_their_output_and_their_end() {
         "both: out=out err=err code=Some(5)"
     );
     let started = Instant::now();
-    assert_eq!(probe.run("proc:spawn-kill"), "killed: out= err= code=None");
+    assert_eq!(
+        probe.run("proc:spawn-kill"),
+        format!("killed: out= err= code={KILLED}")
+    );
     assert!(started.elapsed() < Duration::from_secs(2));
     let denied = probe.run("proc:spawn-denied");
     assert!(denied.contains("may not run ls"), "{denied}");
@@ -192,8 +230,8 @@ fn folders_outside_the_project_follow_their_permissions() {
     std::fs::write(other.join("note.txt"), "secret").unwrap();
     let missing = Path::new("/nonexistent/flux-folder");
     let permissions = format!(
-        "folders = [{{ path = \"{}\" }}, {{ path = \"{}\", access = \"write\" }}, \
-         {{ path = \"{}\" }}]",
+        // Literal strings: a Windows path's `\` is no escape there.
+        "folders = [{{ path = '{}' }}, {{ path = '{}', access = \"write\" }}, {{ path = '{}' }}]",
         readable.display(),
         writable.display(),
         missing.display()

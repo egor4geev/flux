@@ -37,7 +37,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Model", "Модель"),
     ("Effort", "Усилие"),
     ("Permission Mode", "Режим разрешений"),
-    ("Permission mode (⇧⇥)", "Режим разрешений (⇧⇥)"),
+    ("Permission mode ({0})", "Режим разрешений ({0})"),
     ("{0} goes with the message", "{0} уйдёт вместе с сообщением"),
     ("Remove", "Удалить"),
     (

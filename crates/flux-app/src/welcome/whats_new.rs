@@ -204,7 +204,7 @@ pub fn after_update(cx: &mut App) -> bool {
     let Some(path) = last_version_path(
         std::env::var_os("FLUX_LAST_VERSION_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     ) else {
         return false;
     };
@@ -250,7 +250,7 @@ fn last_version_path(
     if scenario {
         return None;
     }
-    Some(PathBuf::from(home?).join("Library/Application Support/flux/last-version"))
+    Some(flux_platform::paths::support_dir_in(std::path::Path::new(&home?)).join("last-version"))
 }
 
 /// Through a temporary file and a `rename`: a Flux quitting halfway leaves the old record whole.
@@ -578,8 +578,9 @@ mod tests {
         let home = Some("/Users/someone".into());
         assert_eq!(
             last_version_path(None, false, home.clone()),
-            Some(PathBuf::from(
-                "/Users/someone/Library/Application Support/flux/last-version"
+            Some(crate::settings::support_file(
+                "/Users/someone",
+                "last-version"
             ))
         );
         assert_eq!(

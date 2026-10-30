@@ -779,7 +779,7 @@ impl Element for ScrollbarElement {
         }
         let now = Instant::now();
         let ui = Theme::ui(cx);
-        let always = !overlay_scrollers();
+        let always = !overlay_scrollers(cx);
         // The editor's element laid out the text before this one: its scroll is this frame's.
         let line_marks = self.editor.update(cx, |editor, _| {
             let scroll = editor.scroll;
@@ -2006,13 +2006,15 @@ fn widget(
 
 /// macOS shows overlay scroll bars (General → Show scroll bars: automatically, with a trackpad, or
 /// when scrolling): the thumbs show only while the editor scrolls or the mouse is over them. With
-/// legacy ones (a mouse, or "Always") they always show — IntelliJ follows the same setting.
-fn overlay_scrollers() -> bool {
+/// legacy ones (a mouse, or "Always") they always show — IntelliJ follows the same setting. Windows
+/// hides them the same way unless Settings → Accessibility → Visual effects → "Always show
+/// scrollbars" is on.
+fn overlay_scrollers(cx: &App) -> bool {
     #[cfg(feature = "scenario")]
     if scenario_always() {
         return false;
     }
-    system::overlay_scrollers()
+    system::overlay_scrollers(cx)
 }
 
 /// "Click in the scroll bar to: Jump to the spot that's clicked" (otherwise a click pages).
@@ -2028,7 +2030,7 @@ mod system {
     use objc::runtime::{NO, Object};
     use objc::{class, msg_send, sel, sel_impl};
 
-    pub fn overlay_scrollers() -> bool {
+    pub fn overlay_scrollers(_: &gpui::App) -> bool {
         // SAFETY: a class method of AppKit's NSScroller without arguments, returning NSInteger.
         let style: isize = unsafe { msg_send![class!(NSScroller), preferredScrollerStyle] };
         // NSScrollerStyleOverlay.
@@ -2050,10 +2052,31 @@ mod system {
 
 #[cfg(not(target_os = "macos"))]
 mod system {
-    pub fn overlay_scrollers() -> bool {
-        true
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    /// How long an answer of the system's setting stands: gpui asks WinRT anew at each call, and
+    /// every editor's scroll bar asks at every frame.
+    const RECHECK: Duration = Duration::from_secs(2);
+
+    thread_local! {
+        static ASKED: Cell<Option<(Instant, bool)>> = const { Cell::new(None) };
     }
 
+    /// Windows' "Always show scrollbars" is off (gpui reads it).
+    pub fn overlay_scrollers(cx: &gpui::App) -> bool {
+        let now = Instant::now();
+        if let Some((asked, hide)) = ASKED.get()
+            && now.duration_since(asked) < RECHECK
+        {
+            return hide;
+        }
+        let hide = cx.should_auto_hide_scrollbars();
+        ASKED.set(Some((now, hide)));
+        hide
+    }
+
+    /// A click in the track pages, as Windows' own scroll bars do.
     pub fn click_jumps() -> bool {
         false
     }

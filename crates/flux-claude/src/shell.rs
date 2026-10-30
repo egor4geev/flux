@@ -8,6 +8,7 @@
 //! process group (what the command started in the background too).
 
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -22,6 +23,7 @@ use futures::channel::mpsc;
 /// background may keep the pipes open.
 const DRAIN: Duration = Duration::from_secs(2);
 /// After SIGTERM, how long a stopped command has before SIGKILL.
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(2);
 /// What Claude gets of each stream at most (the CLI's own limit for a command's output); a longer
 /// one keeps its beginning and its end around a marker.
@@ -50,6 +52,7 @@ pub struct ShellCommand {
 impl ShellCommand {
     /// Ends the command and everything it started: SIGTERM to its group, SIGKILL if it's still
     /// there after a grace period.
+    #[cfg(unix)]
     pub fn stop(&self) {
         if self.ended.load(Ordering::SeqCst) || self.group <= 0 {
             return;
@@ -66,11 +69,28 @@ impl ShellCommand {
             });
     }
 
+    /// Windows has no signals to ask with: the command's whole process tree ends at once.
+    #[cfg(windows)]
+    pub fn stop(&self) {
+        use flux_platform::process::Background;
+        if self.ended.load(Ordering::SeqCst) || self.group <= 0 {
+            return;
+        }
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &self.group.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .background()
+            .status();
+    }
+
     pub fn pid(&self) -> u32 {
         self.group as u32
     }
 }
 
+#[cfg(unix)]
 fn signal(group: i32, signal: libc::c_int) {
     // SAFETY: `kill` only sends a signal; a negative pid is the process group of a command this
     // runner started (a group of its own) and hasn't reaped yet.
@@ -80,11 +100,46 @@ fn signal(group: i32, signal: libc::c_int) {
 }
 
 /// The user's shell: `$SHELL` when it's a path, otherwise zsh (the macOS default).
+#[cfg(unix)]
 pub fn user_shell() -> String {
     std::env::var("SHELL")
         .ok()
         .filter(|shell| shell.starts_with('/'))
         .unwrap_or_else(|| "/bin/zsh".into())
+}
+
+/// Windows: the Git Bash the Claude CLI itself runs commands in ([`crate::cli::git_bash`]), so `!`
+/// commands read as in Claude's bash mode; without Git — PowerShell.
+#[cfg(windows)]
+pub fn user_shell() -> String {
+    match crate::cli::git_bash() {
+        Some(bash) => bash.to_string_lossy().into_owned(),
+        None => "powershell.exe".into(),
+    }
+}
+
+/// How a shell takes a command line: `-c` for the POSIX shells (and Git Bash), `-Command` for
+/// PowerShell, `/C` for `cmd`.
+fn command_args(shell: &str, command: &str, login: bool) -> Vec<String> {
+    let name = Path::new(shell)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "pwsh" | "powershell" => [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ]
+        .map(String::from)
+        .to_vec(),
+        "cmd" => ["/D", "/S", "/C", command].map(String::from).to_vec(),
+        _ if login => ["-l", "-c", command].map(String::from).to_vec(),
+        _ => ["-c", command].map(String::from).to_vec(),
+    }
 }
 
 /// Runs `command` with `shell -c` in `cwd`. `env` — the whole environment (the login shell's, so
@@ -97,17 +152,16 @@ pub fn spawn(
     env: Option<&[(String, String)]>,
 ) -> io::Result<(ShellCommand, mpsc::UnboundedReceiver<ShellEvent>)> {
     let mut process = Command::new(shell);
-    if env.is_none() {
-        process.arg("-l");
-    }
     process
-        .arg("-c")
-        .arg(command)
+        .args(command_args(shell, command, env.is_none()))
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    process.process_group(0);
+    #[cfg(windows)]
+    flux_platform::process::Background::background(&mut process);
     if let Some(env) = env {
         process
             .env_clear()
@@ -422,9 +476,22 @@ mod tests {
     use futures::StreamExt;
     use futures::executor::block_on;
 
+    /// A POSIX shell to run the commands in: Git Bash on Windows.
+    fn sh() -> String {
+        if cfg!(windows) {
+            user_shell()
+        } else {
+            "/bin/sh".into()
+        }
+    }
+
+    /// How a command ended when Stop ended it: by a signal (no code), or on Windows, which has no
+    /// signals, by `taskkill` (code 1).
+    const STOPPED: Option<i32> = if cfg!(windows) { Some(1) } else { None };
+
     fn run(command: &str) -> (String, String, Option<i32>) {
         let cwd = std::env::temp_dir();
-        let (_, events) = spawn(command, &cwd, "/bin/sh", None).unwrap();
+        let (_, events) = spawn(command, &cwd, &sh(), None).unwrap();
         let events: Vec<ShellEvent> = block_on(events.collect());
         let (mut stdout, mut stderr, mut code) = (String::new(), String::new(), None);
         for event in events {
@@ -456,10 +523,12 @@ mod tests {
     fn the_command_runs_in_its_folder_with_the_given_environment() {
         let dir = tempfile::tempdir().unwrap();
         let env = [("FLUX_SHELL_PROBE".to_string(), "42".to_string())];
+        // Git Bash prints its own `/c/…` paths unless asked for the Windows one.
+        let pwd = if cfg!(windows) { "pwd -W" } else { "pwd" };
         let (_, events) = spawn(
-            "pwd; echo $FLUX_SHELL_PROBE",
+            &format!("{pwd}; echo $FLUX_SHELL_PROBE"),
             dir.path(),
-            "/bin/sh",
+            &sh(),
             Some(&env),
         )
         .unwrap();
@@ -471,7 +540,14 @@ mod tests {
             })
             .collect();
         let real = dir.path().canonicalize().unwrap();
-        assert_eq!(stdout, format!("{}\n42\n", real.display()));
+        if cfg!(windows) {
+            // `C:/Users/RUNNER~1/…`: the same folder, spelled another way.
+            let (folder, rest) = stdout.split_once('\n').unwrap();
+            assert_eq!(Path::new(folder).canonicalize().unwrap(), real);
+            assert_eq!(rest, "42\n");
+        } else {
+            assert_eq!(stdout, format!("{}\n42\n", real.display()));
+        }
     }
 
     #[test]
@@ -479,7 +555,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let started = Instant::now();
         let (command, mut events) =
-            spawn("sleep 30 & sleep 30; echo never", &cwd, "/bin/sh", None).unwrap();
+            spawn("sleep 30 & sleep 30; echo never", &cwd, &sh(), None).unwrap();
         thread::sleep(Duration::from_millis(200));
         command.stop();
         let exited = block_on(async {
@@ -490,7 +566,7 @@ mod tests {
             }
             None
         });
-        assert_eq!(exited, Some(None), "ended by the signal");
+        assert_eq!(exited, Some(STOPPED), "ended by Stop");
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 

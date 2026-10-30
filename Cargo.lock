@@ -2007,11 +2007,13 @@ dependencies = [
  "block",
  "core-foundation 0.10.0",
  "core-foundation-sys",
+ "embed-resource",
  "flux-claude",
  "flux-core",
  "flux-fs",
  "flux-git",
  "flux-lsp",
+ "flux-platform",
  "flux-plugin",
  "flux-search",
  "flux-syntax",
@@ -2027,6 +2029,8 @@ dependencies = [
  "resvg",
  "serde_json",
  "toml 1.1.6+spec-1.1.0",
+ "windows 0.61.3",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2034,6 +2038,7 @@ name = "flux-claude"
 version = "0.3.1"
 dependencies = [
  "base64 0.22.1",
+ "flux-platform",
  "futures",
  "libc",
  "serde_json",
@@ -2053,6 +2058,7 @@ dependencies = [
 name = "flux-fs"
 version = "0.3.1"
 dependencies = [
+ "flux-platform",
  "ignore",
  "libc",
  "notify",
@@ -2064,6 +2070,7 @@ dependencies = [
 name = "flux-git"
 version = "0.3.1"
 dependencies = [
+ "flux-platform",
  "imara-diff",
  "libc",
  "notify",
@@ -2075,6 +2082,7 @@ name = "flux-lsp"
 version = "0.3.1"
 dependencies = [
  "flux-core",
+ "flux-platform",
  "futures",
  "globset",
  "lsp-types",
@@ -2086,10 +2094,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-platform"
+version = "0.3.1"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "flux-plugin"
 version = "0.3.1"
 dependencies = [
  "bytes",
+ "flux-platform",
  "flux-search",
  "futures",
  "httparse",
@@ -2105,6 +2122,7 @@ dependencies = [
  "url",
  "wasmtime",
  "wasmtime-wasi",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2156,6 +2174,7 @@ name = "flux-term"
 version = "0.3.1"
 dependencies = [
  "alacritty_terminal",
+ "flux-platform",
  "futures",
  "libc",
  "tempfile",
@@ -2166,6 +2185,7 @@ name = "flux-update"
 version = "0.3.1"
 dependencies = [
  "base64 0.22.1",
+ "flux-platform",
  "libc",
  "ring",
  "semver",

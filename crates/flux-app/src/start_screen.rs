@@ -556,13 +556,22 @@ fn looks_like_error(message: &str) -> bool {
 /// "/private/…/scratchpad/wt-start". If the last component is longer than the limit, "…" and its
 /// tail.
 pub(crate) fn shorten_path(path: &str, max_chars: usize) -> String {
+    shorten_path_with(
+        path,
+        max_chars,
+        flux_platform::PathStyle::NATIVE.separator(),
+    )
+}
+
+/// [`shorten_path`] for paths with `separator` between names (`\` on Windows: `C:\…\wt-start`).
+fn shorten_path_with(path: &str, max_chars: usize, separator: char) -> String {
     let len = |text: &str| text.chars().count();
     if len(path) <= max_chars {
         return path.to_string();
     }
-    let parts: Vec<&str> = path.split('/').collect();
+    let parts: Vec<&str> = path.split(separator).collect();
     let (head, rest) = match parts.as_slice() {
-        ["", first, rest @ ..] => (format!("/{first}"), rest),
+        ["", first, rest @ ..] => (format!("{separator}{first}"), rest),
         [first, rest @ ..] => (first.to_string(), rest),
         [] => return path.to_string(),
     };
@@ -584,7 +593,8 @@ pub(crate) fn shorten_path(path: &str, max_chars: usize) -> String {
         return format!("…{}", last.chars().skip(skip).collect::<String>());
     }
     tail.reverse();
-    format!("{head}/…/{}", tail.join("/"))
+    let separator = separator.to_string();
+    format!("{head}{separator}…{separator}{}", tail.join(&separator))
 }
 
 /// The directory name; for a disk root, the whole path.
@@ -598,6 +608,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_paths_are_shortened_on_backslashes() {
+        assert_eq!(
+            shorten_path_with(r"C:\Users\me\scratchpad\deep\wt-start", 24, '\\'),
+            r"C:\…\deep\wt-start"
+        );
+        assert_eq!(
+            shorten_path_with("/private/var/scratchpad/wt-start", 24, '/'),
+            "/private/…/wt-start"
+        );
+    }
+
+    #[test]
     fn errors_are_told_from_information() {
         assert!(looks_like_error("Cannot open a.rs: Permission denied"));
         assert!(looks_like_error("Save failed"));
@@ -609,6 +631,8 @@ mod tests {
 
     #[test]
     fn long_paths_are_shortened_in_the_middle() {
+        // macOS paths, split on `/` whatever the system (Windows ones: the test above).
+        let shorten_path = |path, max_chars| shorten_path_with(path, max_chars, '/');
         assert_eq!(shorten_path("~/dev/flux", 44), "~/dev/flux");
         let scratch = "/private/tmp/claude-501/-Users-me-dev/fc0c1149-64b3/scratchpad/wt-start";
         let short = shorten_path(scratch, 32);

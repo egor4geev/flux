@@ -146,15 +146,37 @@ mod tests {
         watchers.matches(Path::new(path), change, Path::new(ROOT))
     }
 
+    /// A full path as a server writes it in a glob or a URI: `/work/proj`, on Windows
+    /// `C:/work/proj`.
+    fn slashed(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
     #[test]
     fn rust_analyzer_relative_patterns_and_absolute_paths() {
         // As rust-analyzer 1.99 registers them for a loaded project.
+        // `file:///work/proj`, `file:///C:/work/proj`: three slashes on every system.
+        let base = format!("file:///{}", slashed(ROOT).trim_start_matches('/'));
         let watchers = watchers(json!({ "watchers": [
-            { "globPattern": { "baseUri": "file:///work/proj", "pattern": "**/*.rs" } },
-            { "globPattern": { "baseUri": "file:///work/proj", "pattern": "**/Cargo.{lock,toml}" } },
-            { "globPattern": "/Users/me/Library/Application Support/rust-analyzer" },
-            { "globPattern": "/work/proj/Cargo.toml" },
+            { "globPattern": { "baseUri": base, "pattern": "**/*.rs" } },
+            { "globPattern": { "baseUri": base, "pattern": "**/Cargo.{lock,toml}" } },
+            { "globPattern": slashed("/Users/me/Library/Application Support/rust-analyzer") },
+            { "globPattern": slashed("/work/proj/Cargo.toml") },
         ]}));
+        // The paths as the system writes them: on Windows `C:\work\proj\…`.
+        let matches = |watchers: &Watchers, path: &str, change| {
+            let style = flux_platform::PathStyle::NATIVE;
+            let (path, root) = (slashed(path), slashed(ROOT));
+            watchers.matches(
+                Path::new(style.native(&path).as_ref()),
+                change,
+                Path::new(style.native(&root).as_ref()),
+            )
+        };
         let changed = FileChangeType::CHANGED;
         assert!(matches(&watchers, "/work/proj/src/main.rs", changed));
         assert!(matches(&watchers, "/work/proj/main.rs", changed));

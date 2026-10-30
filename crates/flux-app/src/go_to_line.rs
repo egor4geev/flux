@@ -24,11 +24,14 @@ const HEADER_HEIGHT: f32 = 50.;
 const FOOTER_HEIGHT: f32 = 36.;
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-l", Toggle, Some("Workspace")),
-        KeyBinding::new("enter", Confirm, Some("GoToLine")),
-        KeyBinding::new("escape", Dismiss, Some("GoToLine")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-l", Toggle, Some("Workspace")),
+            KeyBinding::new("enter", Confirm, Some("GoToLine")),
+            KeyBinding::new("escape", Dismiss, Some("GoToLine")),
+        ],
+    );
 }
 
 pub fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {

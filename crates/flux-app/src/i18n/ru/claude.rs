@@ -24,6 +24,15 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ),
     ("Native installer", "Официальный установщик"),
     ("Homebrew", "Homebrew"),
+    ("npm", "npm"),
+    (
+        "Claude Code needs Git for Windows",
+        "Для Claude Code нужен Git for Windows",
+    ),
+    (
+        "On Windows, Claude Code runs its commands in Git Bash, which comes with Git for Windows. Install it from git-scm.com, then check again.",
+        "В Windows Claude Code выполняет команды в Git Bash, который ставится вместе с Git for Windows. Установите его с git-scm.com и проверьте снова.",
+    ),
     ("Type in Terminal", "Вписать в терминал"),
     ("Check Again", "Проверить снова"),
     ("Set Path…", "Указать путь…"),
@@ -90,13 +99,13 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("in {0} days", "через {0} дн."),
     // Settings → Claude Code.
     (
-        "Claude Code in Flux: chats in editor tabs, the console on the left (⌘Esc). Flux runs your claude command line tool, signed in with your Claude subscription.",
-        "Claude Code во Flux: чаты во вкладках редактора, пульт слева (⌘Esc). Flux запускает вашу утилиту claude со входом по подписке Claude.",
+        "Claude Code in Flux: chats in editor tabs, the console on the left ({0}). Flux runs your claude command line tool, signed in with your Claude subscription.",
+        "Claude Code во Flux: чаты во вкладках редактора, пульт слева ({0}). Flux запускает вашу утилиту claude со входом по подписке Claude.",
     ),
     ("Enable Claude Code", "Включить Claude Code"),
     (
-        "The Claude console in the launchpad, ⌘Esc and ⌥⌘K.",
-        "Пульт Claude в лаунчпаде, ⌘Esc и ⌥⌘K.",
+        "The Claude console in the launchpad, {0} and {1}.",
+        "Пульт Claude в лаунчпаде, {0} и {1}.",
     ),
     ("Command Line Tool", "Консольная утилита"),
     ("Executable", "Исполняемый файл"),
@@ -163,8 +172,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Claude отвечает на вывод команд !",
     ),
     (
-        "A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message. ⌘↵ runs a command the other way.",
-        "Команда после ! выполняется в корне проекта, её вывод получает Claude. Включено — Claude сразу отвечает на него; выключено — увидит вывод вместе с вашим следующим сообщением. ⌘↵ запускает команду наоборот.",
+        "A command typed after ! runs in the project's root; its output goes to Claude. On — Claude answers it at once; off — it sees the output with your next message. {0} runs a command the other way.",
+        "Команда после ! выполняется в корне проекта, её вывод получает Claude. Включено — Claude сразу отвечает на него; выключено — увидит вывод вместе с вашим следующим сообщением. {0} запускает команду наоборот.",
     ),
     (
         "Notify when a session finishes or waits",
@@ -173,6 +182,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     (
         "A macOS notification while Flux isn't the active app.",
         "Уведомление macOS, пока Flux не активное приложение.",
+    ),
+    (
+        "A Windows notification while Flux isn't the active app.",
+        "Уведомление Windows, пока Flux не активное приложение.",
     ),
     ("Flux Tools for Claude", "Инструменты Flux для Claude"),
     (

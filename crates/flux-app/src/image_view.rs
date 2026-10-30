@@ -68,12 +68,15 @@ pub mod scenario {
 }
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-=", ZoomIn, Some(CONTEXT)),
-        KeyBinding::new("cmd-+", ZoomIn, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-=", ZoomIn, Some(CONTEXT)),
-        KeyBinding::new("cmd--", ZoomOut, Some(CONTEXT)),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-=", ZoomIn, Some(CONTEXT)),
+            KeyBinding::new("cmd-+", ZoomIn, Some(CONTEXT)),
+            KeyBinding::new("cmd-shift-=", ZoomIn, Some(CONTEXT)),
+            KeyBinding::new("cmd--", ZoomOut, Some(CONTEXT)),
+        ],
+    );
 }
 
 /// What an image tab shows.
@@ -518,7 +521,7 @@ impl ImageView {
     /// ⌘ with the wheel or the trackpad zooms; otherwise the wheel scrolls. Either is the hand:
     /// a zoom glide stops where it is (⌘ — zooming on from there) or ends at its step.
     fn on_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !event.modifiers.platform {
+        if !event.modifiers.secondary() {
             self.settle_zoom();
             return;
         }

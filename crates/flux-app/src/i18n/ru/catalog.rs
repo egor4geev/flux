@@ -14,6 +14,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("grammar built into Flux", "грамматика встроена во Flux"),
     ("WebAssembly grammar", "грамматика WebAssembly"),
     ("uses the one on this Mac", "берётся с этого Mac"),
+    (
+        "uses the one on this computer",
+        "берётся с этого компьютера",
+    ),
     ("installs with npm: {0}", "ставится через npm: {0}"),
     ("installs from GitHub: {0}", "ставится с GitHub: {0}"),
     (

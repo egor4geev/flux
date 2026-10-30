@@ -207,11 +207,34 @@ fn committed(repo: &Repo, request: &CommitRequest) -> Result<CommitResult, GitEr
 }
 
 /// The mode of a file for the index: executable bits survive a partial commit.
+#[cfg(unix)]
 fn file_mode(repo: &Repo, path: &str) -> &'static str {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::symlink_metadata(repo.absolute(path)) {
         Ok(meta) if meta.file_type().is_symlink() => "120000",
         Ok(meta) if meta.permissions().mode() & 0o111 != 0 => "100755",
+        _ => "100644",
+    }
+}
+
+/// Windows files have no executable bit (git keeps `core.fileMode` off there): the mode the index
+/// already has for the file survives, a new file is a plain one.
+#[cfg(not(unix))]
+fn file_mode(repo: &Repo, path: &str) -> &'static str {
+    if std::fs::symlink_metadata(repo.absolute(path))
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return "120000";
+    }
+    let staged = repo
+        .git()
+        .read_only()
+        .args(["ls-files", "--stage", "--", path])
+        .output_string()
+        .unwrap_or_default();
+    match staged.split_whitespace().next() {
+        Some("100755") => "100755",
+        Some("120000") => "120000",
         _ => "100644",
     }
 }
@@ -297,7 +320,7 @@ mod tests {
     #[test]
     fn only_checked_files_are_committed() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let repo = init_repo(&root);
         fs::write(root.join("a.txt"), "a\n").unwrap();
         fs::write(root.join("b.txt"), "b\n").unwrap();
@@ -389,7 +412,7 @@ mod tests {
     #[test]
     fn partial_content_is_committed_and_the_rest_stays_changed() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let repo = init_repo(&root);
         fs::write(root.join("a.txt"), "1\n2\n3\n").unwrap();
         commit(&repo, &request(vec![whole("a.txt")]), &Cancel::new()).unwrap();

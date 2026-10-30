@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use flux_platform::process::Background;
 use serde_json::Value;
 
 use crate::types::{Effort, PermissionMode};
@@ -36,7 +37,8 @@ pub struct AuthStatus {
 impl Cli {
     /// The executable to run: `FLUX_CLAUDE_PATH` (tests and scenarios — the fake CLI), the path the
     /// user chose, then `claude` on the `PATH` and where installers put it. Flux started from the
-    /// Finder has a short `PATH`, hence the list.
+    /// Finder has a short `PATH`, hence the list. On Windows the `PATH` is searched by `PATHEXT`
+    /// (`claude.exe`, npm's `claude.cmd`), then the installers' folders ([`windows_install_paths`]).
     pub fn locate(preferred: Option<&Path>) -> Option<Cli> {
         if let Some(path) = env::var_os("FLUX_CLAUDE_PATH").filter(|path| !path.is_empty()) {
             return Some(Cli {
@@ -47,6 +49,20 @@ impl Cli {
             return Some(Cli {
                 path: path.to_path_buf(),
             });
+        }
+        if cfg!(windows) {
+            let path = env::var_os("PATH").unwrap_or_default();
+            return flux_platform::process::find_in_path("claude", &path)
+                .or_else(|| {
+                    let app_data = env::var_os("APPDATA").map(PathBuf::from);
+                    windows_install_paths(
+                        flux_platform::paths::home().as_deref(),
+                        app_data.as_deref(),
+                    )
+                    .into_iter()
+                    .find(|path| path.is_file())
+                })
+                .map(|path| Cli { path });
         }
         search_path()
             .into_iter()
@@ -135,12 +151,12 @@ impl Cli {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if stop.load(Ordering::Relaxed) => {
-                    child.kill().ok();
+                    flux_platform::process::kill_tree(&mut child).ok();
                     child.wait().ok();
                     return Err(ASK_STOPPED.to_string());
                 }
                 Ok(None) if started.elapsed() > ASK_TIMEOUT => {
-                    child.kill().ok();
+                    flux_platform::process::kill_tree(&mut child).ok();
                     child.wait().ok();
                     return Err(format!(
                         "Claude didn't answer in {} s.",
@@ -158,6 +174,7 @@ impl Cli {
     }
 
     /// A command for this executable with the environment a session needs.
+    /// Started out of sight: on Windows a console program would open a console window.
     pub fn command(&self) -> Command {
         let mut command = Command::new(&self.path);
         command
@@ -166,7 +183,15 @@ impl Cli {
             // The SDK drops these from the child's environment: a debugger flag of Node would
             // break the CLI's own runtime.
             .env_remove("NODE_OPTIONS")
-            .env_remove("DEBUG");
+            .env_remove("DEBUG")
+            .background();
+        // The CLI on Windows looks for Git Bash only by the variable and the `git` on the `PATH`;
+        // Flux also knows Git's usual folders and tells it where Git Bash is.
+        if cfg!(windows)
+            && let Some(bash) = git_bash()
+        {
+            command.env(GIT_BASH_VARIABLE, bash);
+        }
         command
     }
 }
@@ -300,13 +325,103 @@ impl LaunchOptions {
     }
 }
 
+/// Where the Windows installers put `claude`, besides the `PATH`: the native installer's
+/// `%USERPROFILE%\.local\bin\claude.exe`, npm's `%APPDATA%\npm\claude.cmd`, Bun's
+/// `%USERPROFILE%\.bun\bin\claude.exe`.
+pub fn windows_install_paths(home: Option<&Path>, app_data: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        paths.push(home.join(".local").join("bin").join("claude.exe"));
+    }
+    if let Some(app_data) = app_data {
+        paths.push(app_data.join("npm").join("claude.cmd"));
+    }
+    if let Some(home) = home {
+        paths.push(home.join(".bun").join("bin").join("claude.exe"));
+    }
+    paths
+}
+
+/// The variable that tells the Claude CLI on Windows where Git Bash is.
+pub const GIT_BASH_VARIABLE: &str = "CLAUDE_CODE_GIT_BASH_PATH";
+
+/// The Git Bash the Claude CLI runs its commands in on Windows (it doesn't start without one):
+/// see [`git_bash_in`]. `None` elsewhere and when Git for Windows isn't installed.
+pub fn git_bash() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let configured = env::var_os(GIT_BASH_VARIABLE).map(PathBuf::from);
+    let path = env::var_os("PATH").unwrap_or_default();
+    let git = flux_platform::process::find_in_path("git", &path);
+    let program_dirs = flux_platform::process::program_dirs();
+    git_bash_in(
+        configured.as_deref(),
+        git.as_deref(),
+        &program_dirs,
+        |file| file.is_file(),
+    )
+}
+
+/// What a terminal that runs `claude` adds to its environment: on Windows where Git Bash is (as
+/// [`Cli::command`] tells the CLI), elsewhere nothing.
+pub fn terminal_env() -> Vec<(String, String)> {
+    git_bash()
+        .map(|bash| {
+            (
+                GIT_BASH_VARIABLE.to_string(),
+                bash.to_string_lossy().into_owned(),
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+/// Where Git Bash is: `configured` (`CLAUDE_CODE_GIT_BASH_PATH`) when the file is there; else
+/// `bin\bash.exe` two folders above `git` (`…\Git\cmd\git.exe` → `…\Git\bin\bash.exe`, as the
+/// CLI looks); else `Git\bin\bash.exe` in one of `program_dirs` (Program Files, the per-user
+/// `%LOCALAPPDATA%\Programs`). `exists` says which files are there.
+pub fn git_bash_in(
+    configured: Option<&Path>,
+    git: Option<&Path>,
+    program_dirs: &[PathBuf],
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let next_to_git = git
+        .and_then(|git| git.parent()?.parent())
+        .map(|dir| dir.join("bin").join("bash.exe"));
+    let installed = program_dirs
+        .iter()
+        .map(|dir| dir.join("Git").join("bin").join("bash.exe"));
+    configured
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(next_to_git)
+        .chain(installed)
+        .find(|bash| exists(bash))
+}
+
 /// Where to look for `claude`: the `PATH`, then where the native installer, Homebrew, npm and nvm
-/// put it.
+/// put it. On Windows the `PATH` and the installers' folders of [`windows_install_paths`].
 fn search_path() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = env::var_os("PATH")
         .map(|path| env::split_paths(&path).collect())
         .unwrap_or_default();
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+    if cfg!(windows) {
+        let app_data = env::var_os("APPDATA").map(PathBuf::from);
+        let installers =
+            windows_install_paths(flux_platform::paths::home().as_deref(), app_data.as_deref());
+        for dir in installers.iter().filter_map(|path| path.parent()) {
+            if !dirs
+                .iter()
+                .any(|known| flux_platform::same_path(known, dir))
+            {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+        return dirs;
+    }
+    if let Some(home) = flux_platform::paths::home() {
         dirs.push(home.join(".local/bin"));
         dirs.push(home.join(".claude/local"));
         dirs.push(home.join(".npm-global/bin"));
@@ -448,6 +563,60 @@ mod tests {
             ask_answer("", "", Some(2)),
             Err("claude exited with code 2.".to_string())
         );
+    }
+
+    #[test]
+    fn windows_installs_and_git_bash() {
+        let home = Path::new(r"C:\Users\me");
+        let app_data = Path::new(r"C:\Users\me\AppData\Roaming");
+        let paths = windows_install_paths(Some(home), Some(app_data));
+        let shown: Vec<String> = paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        let separator = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            shown[0],
+            format!(r"C:\Users\me{separator}.local{separator}bin{separator}claude.exe")
+        );
+        assert_eq!(
+            shown[1],
+            format!(r"C:\Users\me\AppData\Roaming{separator}npm{separator}claude.cmd")
+        );
+        assert!(windows_install_paths(None, None).is_empty());
+
+        let program_files = PathBuf::from(r"C:\Program Files");
+        let bash = program_files.join("Git").join("bin").join("bash.exe");
+        let only = |file: PathBuf| move |path: &Path| path == file;
+        // Git's own folder, found without git on the PATH.
+        assert_eq!(
+            git_bash_in(
+                None,
+                None,
+                std::slice::from_ref(&program_files),
+                only(bash.clone())
+            ),
+            Some(bash.clone())
+        );
+        // Next to the git on the PATH, as the CLI looks.
+        let scoop = Path::new("D:").join("scoop").join("git");
+        let git = scoop.join("cmd").join("git.exe");
+        let scoop_bash = scoop.join("bin").join("bash.exe");
+        assert_eq!(
+            git_bash_in(None, Some(&git), &[], only(scoop_bash.clone())),
+            Some(scoop_bash)
+        );
+        // The user's variable first; a missing file is passed over.
+        let custom = Path::new("E:").join("bash.exe");
+        assert_eq!(
+            git_bash_in(Some(&custom), None, &[], only(custom.clone())),
+            Some(custom.clone())
+        );
+        assert_eq!(
+            git_bash_in(Some(&custom), None, &[program_files], only(bash.clone())),
+            Some(bash)
+        );
+        assert_eq!(git_bash_in(None, None, &[], |_| true), None);
     }
 
     #[test]

@@ -79,12 +79,24 @@ pub struct ShowExitDetails {
 }
 
 /// The official installer and Homebrew, as the Claude Code documentation gives them.
+#[cfg(not(windows))]
 pub const INSTALL_COMMANDS: [(&str, &str); 2] = [
     (
         "Native installer",
         "curl -fsSL https://claude.ai/install.sh | bash",
     ),
     ("Homebrew", "brew install --cask claude-code"),
+];
+
+/// Windows: the official installer (a PowerShell command: the terminal's shell there) and npm, as
+/// the Claude Code documentation gives them.
+#[cfg(windows)]
+pub const INSTALL_COMMANDS: [(&str, &str); 2] = [
+    (
+        "Native installer",
+        "irm https://claude.ai/install.ps1 | iex",
+    ),
+    ("npm", "npm install -g @anthropic-ai/claude-code"),
 ];
 
 /// How often the sessions' badges redraw while one works (their clocks, part 10.2).
@@ -96,10 +108,13 @@ const SIGN_IN_WAIT: Duration = Duration::from_secs(300);
 
 pub fn init(cx: &mut App) {
     crate::system_notify::init(cx);
-    cx.bind_keys([
-        KeyBinding::new("cmd-escape", ToggleClaude, Some("Workspace")),
-        KeyBinding::new("alt-cmd-k", AddSelectionToClaude, Some("Editor")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-escape", ToggleClaude, Some("Workspace")),
+            KeyBinding::new("alt-cmd-k", AddSelectionToClaude, Some("Editor")),
+        ],
+    );
 }
 
 /// Whether Claude Code is on (Settings → Claude Code): off hides the launchpad icon and keys.
@@ -124,6 +139,9 @@ pub enum CliState {
     },
     /// It is there but doesn't answer as expected.
     Failed(String),
+    /// Windows: installed, but Git for Windows isn't — the CLI runs its commands in Git Bash and
+    /// doesn't start without it.
+    NoGitBash,
 }
 
 impl CliState {
@@ -768,7 +786,7 @@ impl ClaudeStore {
         let cwd = self
             .root
             .clone()
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(flux_platform::paths::home)
             .unwrap_or_else(|| PathBuf::from("/"));
         LaunchOptions {
             cwd,
@@ -1091,6 +1109,13 @@ fn last_turn_failed(session: &Entity<ClaudeSession>, cx: &App) -> bool {
         .unwrap_or(false)
 }
 
+/// What the Claude window and the guide say when Git Bash is missing (Windows).
+pub fn git_bash_note() -> &'static str {
+    tr(
+        "On Windows, Claude Code runs its commands in Git Bash, which comes with Git for Windows. Install it from git-scm.com, then check again.",
+    )
+}
+
 /// Finds `claude`, asks its version and the sign-in (on a background thread: each is a process).
 pub(crate) fn check_cli(preferred: Option<&Path>) -> CliState {
     // Scenarios can't uninstall `claude`: `FLUX_SCENARIO_CLAUDE_MISSING` shows the window without
@@ -1102,6 +1127,13 @@ pub(crate) fn check_cli(preferred: Option<&Path>) -> CliState {
     let Some(cli) = Cli::locate(preferred) else {
         return CliState::Missing;
     };
+    // The fake CLI of the tests needs no Git Bash.
+    if cfg!(windows)
+        && std::env::var_os("FLUX_CLAUDE_PATH").is_none()
+        && flux_claude::cli::git_bash().is_none()
+    {
+        return CliState::NoGitBash;
+    }
     let version = match cli.version() {
         Ok(version) => version,
         Err(err) => return CliState::Failed(err),
@@ -1213,10 +1245,48 @@ pub fn shell_quote(text: &str) -> String {
 /// The command that continues a session in the terminal: `claude --resume <id>` (or a new
 /// session when it has no id yet).
 pub fn resume_command(cli: &Cli, session_id: Option<&str>) -> String {
-    let program = shell_quote(&cli.path.to_string_lossy());
+    let program = cli.path.to_string_lossy();
     match session_id {
-        Some(id) => format!("{program} --resume {}", shell_quote(id)),
-        None => program,
+        Some(id) => terminal_command(&program, &["--resume", id]),
+        None => terminal_command(&program, &[]),
+    }
+}
+
+/// A command line for the terminal's shell that runs `program` with `args`: POSIX quoting for the
+/// shells of macOS; on Windows PowerShell's, the terminal's shell there.
+pub fn terminal_command(program: &str, args: &[&str]) -> String {
+    terminal_command_for(program, args, cfg!(windows))
+}
+
+/// [`terminal_command`] for PowerShell (`powershell`) or a POSIX shell. PowerShell runs a quoted
+/// path only after its call operator: `& 'C:\My Tools\claude.exe' auth login`.
+fn terminal_command_for(program: &str, args: &[&str], powershell: bool) -> String {
+    let quote = |text: &str| match powershell {
+        true => powershell_quote(text),
+        false => shell_quote(text),
+    };
+    let mut line = match powershell {
+        true => format!("& {}", quote(program)),
+        false => quote(program),
+    };
+    for arg in args {
+        line.push(' ');
+        line.push_str(&quote(arg));
+    }
+    line
+}
+
+/// A word for PowerShell: as it is when it has nothing special, else in single quotes (a quote
+/// inside doubled).
+fn powershell_quote(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/\\._-:".contains(c));
+    if plain {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "''"))
     }
 }
 
@@ -1266,6 +1336,28 @@ mod tests {
     }
 
     #[test]
+    fn powershell_command_lines() {
+        assert_eq!(
+            terminal_command_for(
+                r"C:\Users\me\.local\bin\claude.exe",
+                &["auth", "login"],
+                true
+            ),
+            r"& C:\Users\me\.local\bin\claude.exe auth login"
+        );
+        assert_eq!(
+            terminal_command_for(r"C:\My Tools\claude.cmd", &["--resume", "a1"], true),
+            r"& 'C:\My Tools\claude.cmd' --resume a1"
+        );
+        assert_eq!(powershell_quote("it's"), "'it''s'");
+        // macOS keeps its POSIX quoting.
+        assert_eq!(
+            terminal_command_for("/Users/me/My Tools/claude", &["auth", "login"], false),
+            "'/Users/me/My Tools/claude' auth login"
+        );
+    }
+
+    #[test]
     fn shell_quoting() {
         assert_eq!(
             shell_quote("/opt/homebrew/bin/claude"),
@@ -1279,10 +1371,15 @@ mod tests {
         let cli = Cli {
             path: PathBuf::from("/opt/homebrew/bin/claude"),
         };
+        // The terminal's shell: on Windows PowerShell, which runs a program after `&`.
+        let call = if cfg!(windows) { "& " } else { "" };
         assert_eq!(
             resume_command(&cli, Some("3615c7de-b3bc")),
-            "/opt/homebrew/bin/claude --resume 3615c7de-b3bc"
+            format!("{call}/opt/homebrew/bin/claude --resume 3615c7de-b3bc")
         );
-        assert_eq!(resume_command(&cli, None), "/opt/homebrew/bin/claude");
+        assert_eq!(
+            resume_command(&cli, None),
+            format!("{call}/opt/homebrew/bin/claude")
+        );
     }
 }

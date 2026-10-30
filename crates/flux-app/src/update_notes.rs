@@ -28,10 +28,13 @@ const TILE: f32 = 44.;
 
 pub fn init(cx: &mut App) {
     let context = Some("ReleaseNotes");
-    cx.bind_keys([
-        KeyBinding::new("enter", Confirm, context),
-        KeyBinding::new("escape", Dismiss, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, context),
+            KeyBinding::new("escape", Dismiss, context),
+        ],
+    );
 }
 
 /// Opens the notes of `manifest` over the window (they stay if already open).

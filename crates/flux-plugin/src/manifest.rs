@@ -216,11 +216,17 @@ pub struct FolderPermission {
 }
 
 impl FolderPermission {
-    /// The folder's absolute path: "~" is the home folder.
+    /// The folder's absolute path: "~" is the home folder. On Windows in its separators:
+    /// "~/.config/gh" is `C:\Users\me\.config\gh`.
     pub fn resolve(&self, home: &Path) -> PathBuf {
+        self.resolve_in(home, flux_platform::PathStyle::NATIVE)
+    }
+
+    fn resolve_in(&self, home: &Path, style: flux_platform::PathStyle) -> PathBuf {
+        let separator = |c| style.is_separator(c);
         match self.path.strip_prefix('~') {
-            Some(rest) => home.join(rest.trim_start_matches('/')),
-            None => PathBuf::from(&self.path),
+            Some(rest) => home.join(style.native(rest.trim_start_matches(separator)).as_ref()),
+            None => PathBuf::from(style.native(&self.path).as_ref()),
         }
     }
 }
@@ -962,9 +968,11 @@ impl RawPermissions {
             }
         }
         for folder in &self.folders {
+            // A full path of the system counts too: `C:\Users\me\notes` on Windows.
             if !(folder.path.starts_with("~/")
                 || folder.path == "~"
-                || folder.path.starts_with('/'))
+                || folder.path.starts_with('/')
+                || flux_platform::PathStyle::NATIVE.is_absolute(&folder.path))
             {
                 return error(format!(
                     "permissions.folders: \"{}\" — an absolute path or one in the home folder \
@@ -1441,6 +1449,32 @@ fn toml_to_json(value: toml::Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folders_resolve_in_the_home_folder_with_the_systems_separators() {
+        use flux_platform::PathStyle;
+        let folder = FolderPermission {
+            path: "~/.config/gh".into(),
+            access: FolderAccess::Read,
+        };
+        assert_eq!(
+            folder.resolve_in(Path::new("/Users/me"), PathStyle::Unix),
+            PathBuf::from("/Users/me/.config/gh")
+        );
+        let home = Path::new(r"C:\Users\me");
+        assert_eq!(
+            folder.resolve_in(home, PathStyle::Windows),
+            home.join(r".config\gh")
+        );
+        let windows_style = FolderPermission {
+            path: r"~\.config\gh".into(),
+            access: FolderAccess::Read,
+        };
+        assert_eq!(
+            windows_style.resolve_in(home, PathStyle::Windows),
+            home.join(r".config\gh")
+        );
+    }
 
     const TODO: &str = r#"
 id = "flux.todo"

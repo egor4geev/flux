@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -32,18 +32,25 @@ const MAX_OUTPUT: usize = 64 << 20;
 /// The largest piece of output in one `process-output` event.
 const CHUNK: usize = 64 * 1024;
 /// After SIGTERM a program has this long before SIGKILL.
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(2);
 /// How long the end of a program waits for its output to drain: a program it left running may keep
 /// the pipes open.
 const DRAIN: Duration = Duration::from_secs(2);
 /// How long the login shell may take to tell its environment.
+#[cfg(unix)]
 const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a waiting `run` looks whether the plugin is stopping.
 const POLL: Duration = Duration::from_millis(50);
 /// The `PATH` when the login shell can't tell its own.
+#[cfg(unix)]
 const DEFAULT_PATH: &str = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:\
                             /usr/sbin:/sbin";
+/// Windows gives a windowed app the user's whole environment: no `PATH` there is an empty one.
+#[cfg(windows)]
+const DEFAULT_PATH: &str = "";
 /// Marks the login shell's environment in its output (a profile may print its own lines).
+#[cfg(unix)]
 const MARK: &str = "__FLUX_LOGIN_ENV__";
 
 /// The plugin's started programs, by id: ended when the plugin stops (the store goes) or the
@@ -160,7 +167,7 @@ impl HostState {
                 &format!("processes = [\"{name}\"]"),
             ));
         }
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = flux_platform::paths::home();
         let base = self
             .root
             .clone()
@@ -174,9 +181,12 @@ impl HostState {
             return Err(format!("The folder {} isn't there", cwd.display()));
         }
         let env = login_env();
+        // Windows names variables in any case ("Path").
         let path = env
             .iter()
-            .find(|(name, _)| name == "PATH")
+            .find(|(name, _)| {
+                name == "PATH" || (cfg!(windows) && name.eq_ignore_ascii_case("PATH"))
+            })
             .map_or(DEFAULT_PATH, |(_, value)| value.as_str());
         let program = find_program(&command.program, path, &cwd)?;
         let mut process = Command::new(&program);
@@ -187,8 +197,11 @@ impl HostState {
             .envs(command.env.iter().map(|(name, value)| (name, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        process.process_group(0);
+        #[cfg(windows)]
+        flux_platform::process::Background::background(&mut process);
         self.log.write(
             Level::Info,
             &format!("Runs {} in {}", shown(command), cwd.display()),
@@ -424,6 +437,7 @@ impl Capture {
 
 /// Ends a program and what it started (its process group): SIGTERM now, SIGKILL if it still runs
 /// after [`KILL_GRACE`] — on a thread of its own: nobody waits for it.
+#[cfg(unix)]
 fn terminate(group: i32, ended: Arc<AtomicBool>) {
     if ended.load(Ordering::SeqCst) || group <= 0 {
         return;
@@ -439,6 +453,28 @@ fn terminate(group: i32, ended: Arc<AtomicBool>) {
         });
 }
 
+/// Windows: the program's whole process tree ends at once (`taskkill /T /F`), on a thread of its
+/// own.
+#[cfg(windows)]
+fn terminate(group: i32, ended: Arc<AtomicBool>) {
+    use flux_platform::process::Background;
+    if ended.load(Ordering::SeqCst) || group <= 0 {
+        return;
+    }
+    let _ = thread::Builder::new()
+        .name("plugin program kill".into())
+        .spawn(move || {
+            let _ = Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &group.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .background()
+                .status();
+        });
+}
+
+#[cfg(unix)]
 fn signal(group: i32, signal: libc::c_int) {
     // SAFETY: `kill` only sends a signal; a negative pid is the process group of a program this
     // plugin started (a group of its own), not reaped yet.
@@ -476,7 +512,7 @@ fn seconds(duration: Duration) -> String {
 /// The program to run: a path (with a slash) as it is, relative to `cwd`; a name looked up in
 /// `path`.
 fn find_program(program: &str, path: &str, cwd: &Path) -> Result<PathBuf, String> {
-    if program.contains('/') {
+    if program.contains('/') || (cfg!(windows) && program.contains('\\')) {
         let file = cwd.join(program);
         return if is_executable(&file) {
             Ok(file)
@@ -484,22 +520,29 @@ fn find_program(program: &str, path: &str, cwd: &Path) -> Result<PathBuf, String
             Err(format!("{program} isn't a program"))
         };
     }
-    path.split(':')
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| Path::new(dir).join(program))
+    std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .flat_map(|dir| flux_platform::process::program_files(&dir, program))
         .find(|file| is_executable(file))
         .ok_or_else(|| format!("{program} isn't found (PATH: {path})"))
 }
 
 fn is_executable(file: &Path) -> bool {
-    std::fs::metadata(file)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    flux_platform::process::is_executable(file)
 }
 
 /// The environment of the user's login shell, as a terminal of theirs gets it: read once per Flux
 /// process — an interactive login shell first (a `.zshrc` sets `PATH` too), a non-interactive
 /// one if that fails; Flux's own environment with a usual `PATH` if both do. Also what Claude's
 /// `!` commands run with (part 10.2).
+#[cfg(windows)]
+pub fn login_env() -> &'static [(String, String)] {
+    static ENV: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    ENV.get_or_init(|| std::env::vars().collect())
+}
+
+/// The same on macOS and Linux.
+#[cfg(unix)]
 pub fn login_env() -> &'static [(String, String)] {
     static ENV: OnceLock<Vec<(String, String)>> = OnceLock::new();
     ENV.get_or_init(|| {
@@ -520,6 +563,7 @@ pub fn login_env() -> &'static [(String, String)] {
 }
 
 /// The environment `shell` with `flags` prints, if it does within [`SHELL_TIMEOUT`].
+#[cfg(unix)]
 fn shell_env(shell: &str, flags: &[&str]) -> Option<Vec<(String, String)>> {
     let script = format!("printf '%s' '{MARK}'; /usr/bin/env -0; printf '%s' '{MARK}'");
     let mut child = Command::new(shell)
@@ -552,6 +596,7 @@ fn shell_env(shell: &str, flags: &[&str]) -> Option<Vec<(String, String)>> {
 
 /// The variables between the marks of [`shell_env`]'s output; the shell's own bookkeeping
 /// (`PWD`, `SHLVL`, `_`…) is left out.
+#[cfg(unix)]
 fn parse_env(output: &[u8]) -> Option<Vec<(String, String)>> {
     let text = String::from_utf8_lossy(output);
     let start = text.find(MARK)? + MARK.len();
@@ -570,7 +615,10 @@ fn parse_env(output: &[u8]) -> Option<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
     fn programs_are_found_in_the_path() {
         let dir = crate::tests::temp_dir("find-program");
@@ -599,6 +647,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_login_environment_is_parsed_between_the_marks() {
         let output = format!(
@@ -620,7 +669,16 @@ mod tests {
     #[test]
     fn the_login_environment_has_a_path() {
         let env = login_env();
-        let path = env.iter().find(|(name, _)| name == "PATH").unwrap();
-        assert!(path.1.contains("/usr/bin"), "{}", path.1);
+        let path = env
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .unwrap();
+        // The system's own programs are always there.
+        let system = if cfg!(windows) {
+            path.1.to_ascii_lowercase().contains(r"\windows\system32")
+        } else {
+            path.1.contains("/usr/bin")
+        };
+        assert!(system, "{}", path.1);
     }
 }

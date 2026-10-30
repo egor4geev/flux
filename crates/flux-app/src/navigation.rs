@@ -5,7 +5,6 @@
 //! Keys follow the JetBrains macOS keymap: cmd-b on a definition itself shows its usages, as
 //! there.
 
-use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -58,16 +57,19 @@ const METHOD_NOT_FOUND: i64 = -32601;
 pub fn init(cx: &mut App) {
     let editor = Some("Editor");
     let workspace = Some("Workspace");
-    cx.bind_keys([
-        KeyBinding::new("cmd-b", GoToDefinition, editor),
-        KeyBinding::new("alt-f7", FindUsages, editor),
-        KeyBinding::new("cmd-alt-l", ReformatCode, editor),
-        KeyBinding::new("shift-f6", RenameSymbol, editor),
-        KeyBinding::new("cmd-[", NavigateBack, workspace),
-        KeyBinding::new("cmd-]", NavigateForward, workspace),
-        KeyBinding::new("cmd-alt-left", NavigateBack, workspace),
-        KeyBinding::new("cmd-alt-right", NavigateForward, workspace),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-b", GoToDefinition, editor),
+            KeyBinding::new("alt-f7", FindUsages, editor),
+            KeyBinding::new("cmd-alt-l", ReformatCode, editor),
+            KeyBinding::new("shift-f6", RenameSymbol, editor),
+            KeyBinding::new("cmd-[", NavigateBack, workspace),
+            KeyBinding::new("cmd-]", NavigateForward, workspace),
+            KeyBinding::new("cmd-alt-left", NavigateBack, workspace),
+            KeyBinding::new("cmd-alt-right", NavigateForward, workspace),
+        ],
+    );
     rename::init(cx);
 }
 
@@ -100,10 +102,7 @@ pub fn cmd_click(
     cx: &mut Context<Editor>,
 ) -> bool {
     let modifiers = event.modifiers;
-    if !modifiers.platform
-        || modifiers.shift
-        || modifiers.alt
-        || modifiers.control
+    if !crate::keymap::secondary_alone(crate::keymap::KeyOs::current(), &modifiers)
         || event.click_count != 1
     {
         return false;
@@ -698,7 +697,7 @@ fn rename_symbol(
 
 /// Path for comparing files: canonical, or as is if it can't be resolved.
 pub(crate) fn canonical(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    flux_platform::path_style::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]

@@ -9,7 +9,6 @@
 //! after a sign-in or an install, every Flux window checks again too: its chat works without a
 //! restart.
 
-use std::path::PathBuf;
 use std::sync::Once;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -166,8 +165,10 @@ impl ClaudeStep {
         let (program, args) = cli.login_command();
         let spec = SpawnSpec {
             command: Some((program.to_string_lossy().into_owned(), args)),
-            cwd: std::env::var_os("HOME").map(PathBuf::from),
+            cwd: flux_platform::paths::home(),
             title: Some("claude auth login".into()),
+            // Windows: the Git Bash Flux found, should the CLI not find it by itself.
+            env: flux_claude::cli::terminal_env(),
             keep_on_exit: true,
             ..SpawnSpec::default()
         };
@@ -434,6 +435,20 @@ impl ClaudeStep {
                         ),
                 )
             }
+            CliState::NoGitBash => card
+                .child(head(
+                    IconName::Warning,
+                    ui.warning,
+                    tr("Claude Code needs Git for Windows").into(),
+                    claude::git_bash_note().into(),
+                    ui,
+                ))
+                .child(
+                    actions().child(
+                        ui::text_button("welcome-claude-check", tr("Check Again"), false, ui)
+                            .on_click(cx.listener(|this, _, _, cx| this.check(cx))),
+                    ),
+                ),
             CliState::Failed(error) => card
                 .child(head(
                     IconName::Warning,
@@ -570,7 +585,16 @@ impl Render for ClaudeStep {
                         div()
                             .text_size(px(theme::TEXT_SM))
                             .text_color(ui.dim)
-                            .child(tr("The Claude console in the launchpad, ⌘Esc and ⌥⌘K.")),
+                            .child(trf(
+                                "The Claude console in the launchpad, {0} and {1}.",
+                                &[
+                                    &crate::keymap::shortcut("claude::ToggleClaude", "cmd-escape"),
+                                    &crate::keymap::shortcut(
+                                        "claude::AddSelectionToClaude",
+                                        "alt-cmd-k",
+                                    ),
+                                ],
+                            )),
                     ),
             )
             .child(
@@ -613,7 +637,8 @@ fn bind_keys(cx: &mut App) {
     static BOUND: Once = Once::new();
     BOUND.call_once(|| {
         let terminal = format!("{CONTEXT} > Terminal");
-        cx.bind_keys(
+        crate::keymap::bind_keys(
+            cx,
             ["enter", "left", "right", "escape"]
                 .map(|key| KeyBinding::new(key, NoAction, Some(terminal.as_str()))),
         );

@@ -43,6 +43,10 @@
 //! - `FLUX_SCENARIO_FINDER=1` — without a folder in the arguments, Flux starts as from the Dock or
 //!   the Finder (no project from the current directory): it reopens the projects open when it quit
 //!   (`FLUX_PROJECTS_FILE`).
+//! - `FLUX_SCENARIO_TITLE_BAR=windows` — the title bars are Windows' (part 10.9): the menu button
+//!   (`action:workspace::ShowMainMenu` opens Windows' menu), the window buttons, and closing the
+//!   last window quits ([`windows_title_bar`]); a headless shot then has no traffic lights painted
+//!   in. macOS still has its own buttons where the menu button is: a `click:` there closes.
 //! - `FLUX_SCENARIO_HEADLESS=1` (the harness sets it when the screen is locked) — Flux draws the
 //!   frames itself on a timer and saves each `shot:` as `<FLUX_SCENARIO_OUT>/<name>-<window id>.png`,
 //!   rendered offscreen ([`headless`]): a locked screen stops gpui's display link and the window
@@ -100,6 +104,13 @@ pub fn window_opened(window: AnyWindowHandle) {
 pub fn launched_from_finder() -> bool {
     std::env::var_os("FLUX_SCENARIO").is_some()
         && std::env::var_os("FLUX_SCENARIO_FINDER").is_some_and(|value| !value.is_empty())
+}
+
+/// The title bars are Windows' (`FLUX_SCENARIO_TITLE_BAR=windows`): what the author sees in a
+/// Windows VM, shot on a Mac ([`crate::title_bar::os`]).
+pub fn windows_title_bar() -> bool {
+    std::env::var_os("FLUX_SCENARIO").is_some()
+        && std::env::var("FLUX_SCENARIO_TITLE_BAR").is_ok_and(|value| value == "windows")
 }
 
 /// With `FLUX_SCENARIO` the window is a pop-up panel above all other windows: the app the author is
@@ -389,7 +400,9 @@ fn capture_later(name: String, cx: &AsyncApp) {
                     window.render_to_image(cx).map(|image| {
                         let device = image.width() as f32 / width.max(1.);
                         let mut image = over_backdrop(image, dark);
-                        paint_traffic_lights(&mut image, device, ui_scale);
+                        if !windows_title_bar() {
+                            paint_traffic_lights(&mut image, device, ui_scale);
+                        }
                         image
                     })
                 })

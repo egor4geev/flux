@@ -62,16 +62,19 @@ actions!(
 
 pub fn init(cx: &mut App) {
     let context = Some("Picker");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-        KeyBinding::new("ctrl-n", SelectNext, context),
-        KeyBinding::new("ctrl-p", SelectPrevious, context),
-        KeyBinding::new("pagedown", SelectNextPage, context),
-        KeyBinding::new("pageup", SelectPreviousPage, context),
-        KeyBinding::new("enter", Confirm, context),
-        KeyBinding::new("escape", Dismiss, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+            KeyBinding::new("ctrl-n", SelectNext, context),
+            KeyBinding::new("ctrl-p", SelectPrevious, context),
+            KeyBinding::new("pagedown", SelectNextPage, context),
+            KeyBinding::new("pageup", SelectPreviousPage, context),
+            KeyBinding::new("enter", Confirm, context),
+            KeyBinding::new("escape", Dismiss, context),
+        ],
+    );
 }
 
 /// What the selection list displays. The delegate knows nothing about keys, selection, or
@@ -485,6 +488,7 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .then(|| self.delegate.render_footer(window, cx))
             .flatten();
         let delete_label = self.delegate.delete_label();
+        let delete_keys = crate::keymap::shortcut("picker::DeleteSelected", "cmd-backspace");
         let header = searchable.then(|| {
             div()
                 .flex_none()
@@ -512,7 +516,7 @@ impl<D: PickerDelegate> Render for Picker<D> {
                 .child(ui::hint_bar(
                     &[("↑↓", tr("navigate")), ("↵", self.delegate.confirm_label())]
                         .into_iter()
-                        .chain(delete_label.map(|label| ("⌘⌫", label)))
+                        .chain(delete_label.map(|label| (delete_keys.as_str(), label)))
                         .chain([("esc", tr("close"))])
                         .collect::<Vec<_>>(),
                     ui,

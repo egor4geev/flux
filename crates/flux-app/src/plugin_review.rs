@@ -55,9 +55,7 @@ pub(crate) fn propose(
             state.entry.manifest.permissions.folders.clone(),
         )
     };
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = flux_platform::paths::home().unwrap_or_default();
     allowed(&path, root.as_deref(), &folders, &home, proposal.apply)?;
     let original = match open_editor(workspace, &path, cx) {
         Some(editor) => Some(editor.read(cx).document.text().to_string()),
@@ -212,9 +210,9 @@ fn open_editor(workspace: &Workspace, path: &Path, cx: &App) -> Option<Entity<Ed
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
-    a == b
+    flux_platform::same_path(a, b)
         || matches!(
-            (fs::canonicalize(a), fs::canonicalize(b)),
+            (flux_platform::path_style::canonicalize(a), flux_platform::path_style::canonicalize(b)),
             (Ok(a), Ok(b)) if a == b
         )
 }
@@ -281,7 +279,7 @@ fn real_path(path: &Path) -> PathBuf {
     let mut existing = path;
     let mut rest = Vec::new();
     loop {
-        if let Ok(real) = fs::canonicalize(existing) {
+        if let Ok(real) = flux_platform::path_style::canonicalize(existing) {
             return rest.iter().rev().fold(real, |path, part| path.join(part));
         }
         match (existing.parent(), existing.file_name()) {
@@ -362,7 +360,8 @@ fn minimal_edit(old: &str, new: &str) -> Option<(Range<usize>, String)> {
 /// if the write fails). A new file gets its folders; an existing one keeps its line endings, its
 /// permissions, and its symlink.
 fn write_file(path: &Path, text: &str) -> io::Result<()> {
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target =
+        flux_platform::path_style::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let existing = fs::read(&target).ok();
     let text = match &existing {
         Some(bytes) if bytes.windows(2).any(|pair| pair == b"\r\n") => {
@@ -419,7 +418,9 @@ mod tests {
         );
         assert!(resolve(Some(root), "  ").is_err());
         assert!(resolve(None, "src/main.rs").is_err());
-        assert_eq!(resolve(None, "/tmp/x"), Ok(PathBuf::from("/tmp/x")));
+        // Without a project only a full path of the system does.
+        let absolute = if cfg!(windows) { r"C:\tmp\x" } else { "/tmp/x" };
+        assert_eq!(resolve(None, absolute), Ok(PathBuf::from(absolute)));
     }
 
     #[test]

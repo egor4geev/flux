@@ -144,6 +144,9 @@ pub fn build_version() -> String {
     }
 }
 
+/// The system Flux runs on, as its facts are labeled.
+pub const SYSTEM_NAME: &str = if cfg!(windows) { "Windows" } else { "macOS" };
+
 /// The facts about this Flux and this Mac that don't need the app: the version, macOS and the
 /// processor (the log's header and a crash report, written from a panic hook, take them). Read once.
 pub fn machine() -> SystemInfo {
@@ -182,9 +185,9 @@ struct MacFacts {
 fn mac_facts() -> &'static MacFacts {
     static FACTS: OnceLock<MacFacts> = OnceLock::new();
     FACTS.get_or_init(|| MacFacts {
-        system: mac::system(),
-        processor: mac::processor(),
-        memory_gb: mac::memory_gb(),
+        system: os::system(),
+        processor: os::processor(),
+        memory_gb: os::memory_gb(),
     })
 }
 
@@ -532,6 +535,13 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &AskQuestion, cx| open_url(&question_url(&machine()), cx));
 }
 
+#[cfg(target_os = "macos")]
+use mac as os;
+#[cfg(not(any(target_os = "macos", windows)))]
+use other as os;
+#[cfg(windows)]
+use win as os;
+
 /// The Mac's facts, from `sysctl`.
 #[cfg(target_os = "macos")]
 mod mac {
@@ -628,9 +638,194 @@ mod mac {
     }
 }
 
+/// Windows' facts: its version from the kernel and the registry, the processor's name from the
+/// registry, the memory installed.
+#[cfg(windows)]
+mod win {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
+    };
+
+    const CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+
+    /// "Windows 11 24H2 (26100.4061)"; "Windows" when the system doesn't say.
+    pub fn system() -> String {
+        use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+        use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+        // SAFETY: the struct is plain data with its size set, as the call requires; it writes
+        // into it only. Unlike `GetVersionEx`, it tells the real version to any program.
+        let version = unsafe {
+            let mut info: OSVERSIONINFOW = std::mem::zeroed();
+            info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+            (RtlGetVersion(&mut info) == 0).then_some(info)
+        };
+        let Some(version) = version else {
+            return "Windows".to_string();
+        };
+        super::windows_name(
+            version.dwMajorVersion,
+            version.dwMinorVersion,
+            version.dwBuildNumber,
+            registry_text(CURRENT_VERSION, "DisplayVersion").as_deref(),
+            registry_number(CURRENT_VERSION, "UBR"),
+        )
+    }
+
+    /// "Snapdragon X Elite – X1E78100 – Qualcomm Oryon CPU, arm64"; a Flux for x64 on an ARM
+    /// computer — "…, x64 (emulated)".
+    pub fn processor() -> String {
+        let mut parts = Vec::new();
+        parts.extend(
+            registry_text(
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                "ProcessorNameString",
+            )
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
+        );
+        let arch = super::windows_arch(std::env::consts::ARCH);
+        let native = native_arch();
+        parts.push(match native {
+            Some(native) if native != arch => format!("{arch} (emulated)"),
+            _ => arch.to_string(),
+        });
+        parts.join(", ")
+    }
+
+    /// The memory installed, in whole gigabytes; what Windows may use when the firmware doesn't
+    /// say (a virtual machine).
+    pub fn memory_gb() -> Option<u64> {
+        use windows_sys::Win32::System::SystemInformation::{
+            GetPhysicallyInstalledSystemMemory, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+        };
+        let mut kilobytes = 0u64;
+        // SAFETY: the calls write into the locals only; the status has its size set first.
+        let bytes = unsafe {
+            if GetPhysicallyInstalledSystemMemory(&mut kilobytes) != 0 && kilobytes > 0 {
+                kilobytes * 1024
+            } else {
+                let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+                status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+                if GlobalMemoryStatusEx(&mut status) == 0 {
+                    return None;
+                }
+                status.ullTotalPhys
+            }
+        };
+        (bytes > 0).then(|| bytes.div_ceil(1 << 30))
+    }
+
+    /// The computer's own architecture, as Windows names it: a Flux for x64 runs on ARM too.
+    fn native_arch() -> Option<&'static str> {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
+        let (mut process, mut native) = (0u16, 0u16);
+        // SAFETY: the pseudo handle of this process needs no closing; the call writes the two
+        // machine types.
+        let read = unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, &mut native) };
+        if read == 0 {
+            return None;
+        }
+        // IMAGE_FILE_MACHINE_*.
+        match native {
+            0xAA64 => Some("arm64"),
+            0x8664 => Some("x64"),
+            0x014C => Some("x86"),
+            _ => None,
+        }
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    /// A string value of HKEY_LOCAL_MACHINE.
+    fn registry_text(key: &str, value: &str) -> Option<String> {
+        let (key, value) = (wide(key), wide(value));
+        let mut buffer = vec![0u16; 256];
+        let mut bytes = (buffer.len() * 2) as u32;
+        // SAFETY: NUL-terminated names; the call writes at most `bytes` bytes into the buffer,
+        // which outlives it, and says how many it wrote.
+        let read = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        if read != 0 {
+            return None;
+        }
+        buffer.truncate(bytes as usize / 2);
+        let text = String::from_utf16_lossy(&buffer);
+        let text = text.trim_end_matches('\0').trim();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
+    /// A number (DWORD) value of HKEY_LOCAL_MACHINE.
+    fn registry_number(key: &str, value: &str) -> Option<u32> {
+        let (key, value) = (wide(key), wide(value));
+        let mut number = 0u32;
+        let mut bytes = 4u32;
+        // SAFETY: NUL-terminated names; the call writes one DWORD into `number`.
+        let read = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&raw mut number).cast(),
+                &mut bytes,
+            )
+        };
+        (read == 0).then_some(number)
+    }
+}
+
+/// "Windows 11 24H2 (26100.4061)": the name, the feature update, the build and its revision.
+/// Windows 11's kernel still says 10.0: its builds start at 22000.
+#[cfg(any(windows, test))]
+fn windows_name(
+    major: u32,
+    minor: u32,
+    build: u32,
+    display_version: Option<&str>,
+    revision: Option<u32>,
+) -> String {
+    let name = match (major, minor) {
+        (10, 0) if build >= 22_000 => "11".to_string(),
+        (10, 0) => "10".to_string(),
+        (major, minor) => format!("{major}.{minor}"),
+    };
+    let mut text = format!("Windows {name}");
+    if let Some(version) = display_version.filter(|version| !version.is_empty()) {
+        text.push(' ');
+        text.push_str(version);
+    }
+    match revision {
+        Some(revision) => text.push_str(&format!(" ({build}.{revision})")),
+        None => text.push_str(&format!(" ({build})")),
+    }
+    text
+}
+
+/// An architecture as Windows names it: `x64`, `arm64` (Rust's `x86_64`, `aarch64`).
+#[cfg(any(windows, test))]
+fn windows_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
 /// Other systems: what Rust knows about them.
-#[cfg(not(target_os = "macos"))]
-mod mac {
+#[cfg(not(any(target_os = "macos", windows)))]
+mod other {
     pub fn system() -> String {
         std::env::consts::OS.to_string()
     }
@@ -914,6 +1109,24 @@ mod tests {
             "https://github.com/egor4geev/flux/discussions/new?category=q-a\
              &version=0.1.0%20%28ca086c2%29&macos=macOS%2026.1%20%2825B78%29"
         );
+    }
+
+    #[test]
+    fn windows_is_named_by_its_build() {
+        assert_eq!(
+            windows_name(10, 0, 26_100, Some("24H2"), Some(4061)),
+            "Windows 11 24H2 (26100.4061)"
+        );
+        assert_eq!(
+            windows_name(10, 0, 19_045, Some("22H2"), None),
+            "Windows 10 22H2 (19045)"
+        );
+        assert_eq!(
+            windows_name(6, 3, 9600, Some(""), None),
+            "Windows 6.3 (9600)"
+        );
+        assert_eq!(windows_arch("x86_64"), "x64");
+        assert_eq!(windows_arch("aarch64"), "arm64");
     }
 
     #[test]

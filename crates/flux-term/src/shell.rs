@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 /// The user's shell as a login shell: `$SHELL`, otherwise the account's shell from the user
 /// database, otherwise `/bin/zsh` (the macOS default). A login shell reads the profile, so `PATH`
 /// is complete even when Flux was started from Finder with a minimal environment.
+#[cfg(unix)]
 pub fn login_shell() -> (String, Vec<String>) {
     let shell = env::var("SHELL")
         .ok()
@@ -17,7 +18,27 @@ pub fn login_shell() -> (String, Vec<String>) {
     (shell, vec!["-l".to_string()])
 }
 
+/// Windows: PowerShell 7 (`pwsh`) when it's installed, otherwise the Windows PowerShell every
+/// Windows has. A windowed app gets the user's whole environment there, so no login shell is needed.
+#[cfg(windows)]
+pub fn login_shell() -> (String, Vec<String>) {
+    let shell = if on_path("pwsh.exe") {
+        "pwsh.exe"
+    } else {
+        "powershell.exe"
+    };
+    (shell.to_string(), vec!["-NoLogo".to_string()])
+}
+
+/// A program of that name is in one of the `PATH` folders.
+#[cfg(windows)]
+fn on_path(program: &str) -> bool {
+    env::var_os("PATH")
+        .is_some_and(|path| env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+}
+
 /// The login shell from the user database (`getpwuid_r`).
+#[cfg(unix)]
 fn account_shell() -> Option<String> {
     let mut buffer = vec![0 as libc::c_char; 4096];
     let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
@@ -152,10 +173,22 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_login_shell_is_an_absolute_path() {
         let (shell, args) = login_shell();
         assert!(shell.starts_with('/'), "{shell}");
         assert_eq!(args, ["-l"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_shell_is_powershell() {
+        let (shell, args) = login_shell();
+        assert!(
+            ["pwsh.exe", "powershell.exe"].contains(&shell.as_str()),
+            "{shell}"
+        );
+        assert_eq!(args, ["-NoLogo"]);
     }
 }

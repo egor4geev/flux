@@ -58,18 +58,29 @@ pub fn projects_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir).join("projects"));
     }
-    let home = std::env::var_os("HOME")?;
+    let home = flux_platform::paths::home().map(std::ffi::OsString::from)?;
     Some(PathBuf::from(home).join(".claude").join("projects"))
 }
 
 /// The folder of a project's transcripts under `projects`.
 pub fn project_dir(projects: &Path, root: &Path) -> PathBuf {
-    let slug: String = root
-        .to_string_lossy()
+    projects.join(project_slug(
+        &root.to_string_lossy(),
+        flux_platform::PathStyle::NATIVE,
+    ))
+}
+
+/// The CLI's name for a project's folder: its path with every character other than an ASCII
+/// letter or digit replaced by `-` (`/Users/me/my_app` → `-Users-me-my-app`, `C:\Users\me\proj` →
+/// `C--Users-me-proj`). On Windows the path is first written as the CLI sees its working folder:
+/// without the `\\?\` prefix, the drive letter upper-case (NTFS ignores the case of the folder's
+/// name anyway).
+pub fn project_slug(root: &str, style: flux_platform::PathStyle) -> String {
+    style
+        .simplified(root)
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    projects.join(slug)
+        .collect()
 }
 
 /// A session's transcript: `<projects>/<project slug>/<id>.jsonl` (part 10.2).
@@ -799,6 +810,24 @@ mod tests {
             ),
             PathBuf::from("/h/.claude/projects/-Users-me-dev-my-app")
         );
+        use flux_platform::PathStyle::{Unix, Windows};
+        assert_eq!(
+            project_slug("/Users/me/dev/my_app", Unix),
+            "-Users-me-dev-my-app"
+        );
+        assert_eq!(
+            project_slug(r"C:\Users\me\proj", Windows),
+            "C--Users-me-proj"
+        );
+        assert_eq!(
+            project_slug(r"\\?\C:\Users\me\proj", Windows),
+            "C--Users-me-proj"
+        );
+        assert_eq!(
+            project_slug(r"c:\Users\me\my app", Windows),
+            "C--Users-me-my-app"
+        );
+        assert_eq!(project_slug(r"\\srv\share\p", Windows), "--srv-share-p");
     }
 
     #[test]

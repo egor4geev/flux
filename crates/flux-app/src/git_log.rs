@@ -154,21 +154,24 @@ const ARRIVAL_CAP: usize = 12;
 
 pub fn init(cx: &mut App) {
     let context = Some("GitLog");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-        KeyBinding::new("shift-down", ExtendNext, context),
-        KeyBinding::new("shift-up", ExtendPrevious, context),
-        KeyBinding::new("pagedown", PageDown, context),
-        KeyBinding::new("pageup", PageUp, context),
-        KeyBinding::new("home", SelectFirst, context),
-        KeyBinding::new("end", SelectLast, context),
-        KeyBinding::new("cmd-a", SelectAll, context),
-        KeyBinding::new("cmd-c", CopyHash, context),
-        KeyBinding::new("enter", OpenDiff, context),
-        KeyBinding::new("cmd-d", OpenDiff, context),
-        KeyBinding::new("cmd-f", FocusSearch, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+            KeyBinding::new("shift-down", ExtendNext, context),
+            KeyBinding::new("shift-up", ExtendPrevious, context),
+            KeyBinding::new("pagedown", PageDown, context),
+            KeyBinding::new("pageup", PageUp, context),
+            KeyBinding::new("home", SelectFirst, context),
+            KeyBinding::new("end", SelectLast, context),
+            KeyBinding::new("cmd-a", SelectAll, context),
+            KeyBinding::new("cmd-c", CopyHash, context),
+            KeyBinding::new("enter", OpenDiff, context),
+            KeyBinding::new("cmd-d", OpenDiff, context),
+            KeyBinding::new("cmd-f", FocusSearch, context),
+        ],
+    );
 }
 
 /// What a log shows.
@@ -1011,7 +1014,7 @@ impl GitLogView {
             let anchor = self.anchor.unwrap_or(index);
             self.selected = (anchor.min(index)..=anchor.max(index)).collect();
             self.cursor = Some(index);
-        } else if modifiers.platform {
+        } else if modifiers.secondary() {
             if !self.selected.remove(&index) {
                 self.selected.insert(index);
             }
@@ -1867,28 +1870,7 @@ fn render_label(label: &Label, ui: UiColors) -> impl IntoElement {
 
 /// The local time zone's offset from UTC at a moment, in seconds.
 pub(crate) fn local_offset(time: i64) -> i64 {
-    #[cfg(target_os = "macos")]
-    {
-        use core_foundation_sys::date::CFAbsoluteTime;
-        use core_foundation_sys::timezone::{CFTimeZoneCopySystem, CFTimeZoneGetSecondsFromGMT};
-        // CFAbsoluteTime counts from 2001-01-01.
-        const CF_EPOCH: i64 = 978_307_200;
-        // SAFETY: the system time zone is a valid CF object, released after use.
-        unsafe {
-            let zone = CFTimeZoneCopySystem();
-            if zone.is_null() {
-                return 0;
-            }
-            let offset = CFTimeZoneGetSecondsFromGMT(zone, (time - CF_EPOCH) as CFAbsoluteTime);
-            core_foundation_sys::base::CFRelease(zone as _);
-            offset as i64
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = time;
-        0
-    }
+    i64::from(flux_platform::time::local_utc_offset(time))
 }
 
 /// Days since 1970-01-01 → (year, month, day) (Howard Hinnant's civil_from_days).
