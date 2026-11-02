@@ -1,0 +1,35 @@
+# What's New in Flux 0.4: Windows, frontend frameworks, languages inside languages, .env checks (format: 0.1.0.toml).
+version = "0.4.0"
+date = "2026-11-02"
+
+[[items]]
+icon = "window-maximize"
+color = "blue"
+title = "Flux on Windows"
+text = "Flux runs on Windows 10 and 11, x64 and ARM64: an installer that needs no admin rights, updates over the air, the shortcuts Windows users expect, its own title bar and menu, PowerShell or Git Bash in the terminal."
+ru.title = "Flux на Windows"
+ru.text = "Flux работает на Windows 10 и 11, x64 и ARM64: установщик без прав администратора, обновления по воздуху, привычные для Windows сочетания, своя шапка и меню, PowerShell или Git Bash в терминале."
+
+[[items]]
+icon = "puzzle"
+color = "violet"
+title = "Vue, Svelte, Astro and Angular"
+text = "Plugins in the catalog highlight every part of a component — template, script, styles — and bring each framework's language server. Tailwind CSS completes classes next to them, ESLint shows its problems with quick fixes."
+ru.title = "Vue, Svelte, Astro и Angular"
+ru.text = "Плагины каталога подсвечивают все части компонента — шаблон, скрипт, стили — и приносят языковой сервер фреймворка. Рядом с ними Tailwind CSS дополняет классы, а ESLint показывает проблемы с быстрыми исправлениями."
+
+[[items]]
+icon = "layout-split"
+color = "teal"
+title = "Languages inside languages"
+text = "The scripts and styles of HTML, the code blocks and front matter of Markdown are highlighted in their own languages."
+ru.title = "Языки внутри языков"
+ru.text = "Скрипты и стили в HTML, блоки кода и front matter в Markdown подсвечиваются в своих языках."
+
+[[items]]
+icon = "check-circle"
+color = "orange"
+title = "Checked .env files"
+text = "The Dotenv plugin highlights .env files and warns about a key set twice, a file with values Git doesn't ignore, and keys missing against .env.example."
+ru.title = "Проверка .env"
+ru.text = "Плагин Dotenv подсвечивает файлы .env и предупреждает о ключе, заданном дважды, о файле со значениями, который Git не игнорирует, и о ключах, которых нет относительно .env.example."

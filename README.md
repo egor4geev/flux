@@ -4,10 +4,10 @@
 
 # Flux
 
-**A fast, native code editor for macOS — a complete Git workflow and Claude Code, built in.**
+**A fast, native code editor for macOS and Windows — a complete Git workflow and Claude Code, built in.**
 
 ![status](https://img.shields.io/badge/status-early%20development-8590ff)
-![platform](https://img.shields.io/badge/platform-macOS-a3abc3)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-a3abc3)
 ![license](https://img.shields.io/badge/license-MIT-4fd18b)
 
 </div>
@@ -20,7 +20,7 @@
 
 ### Fast and native
 
-A Mac app written in Rust and drawn by the GPU: Flux opens instantly, and typing, scrolling and
+An app for macOS and Windows written in Rust and drawn by the GPU: Flux opens instantly, and typing, scrolling and
 searching never wait, even in files with tens of thousands of lines. Popovers grow out of where you
 called them, panels glide and buttons spring back — and nothing ever waits for an animation. Find a
 file by a few letters of its name, search the whole project with a live preview, run any command
@@ -30,7 +30,9 @@ from the palette — the keyboard comes first and every action shows its keys, i
 
 Errors as you type, completion, go to definition, find usages and rename — from language servers Flux
 installs by itself. <kbd>⌥</kbd><kbd>↵</kbd> on an error offers the quick fixes, and the scrollbar maps
-the file's errors, warnings and changes.
+the file's errors, warnings and changes. Languages inside languages are highlighted too: the script and
+styles of an HTML page, Markdown's code blocks, every part of a Vue, Svelte, Astro or Angular
+component — with Tailwind CSS and ESLint working next to the framework's own server.
 
 ### Git, all of it
 
@@ -53,7 +55,7 @@ Claude at once and sends nothing until that changes.
 
 Plugins run as WebAssembly: they can't crash Flux and reach only what you allowed when you installed
 them. The Marketplace brings languages, color themes and file icons in one click — and integrations
-such as [Yandex Tracker & Calendar](https://github.com/egor4geev/flux-plugins/tree/main/plugins/flux.yandex).
+such as [Yandex Tracker](https://github.com/egor4geev/flux-plugins/tree/main/plugins/flux.yandex).
 Write your own in Rust: [Writing plugins](docs/plugins.md).
 
 ### A terminal built in
