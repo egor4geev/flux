@@ -474,6 +474,16 @@ fn a_stopped_instance_says_nothing_more() {
     let mut probe = start(entry, None, Map::new());
     probe.instance.run_command("hello", palette());
     assert_eq!(probe.notification(), "hello");
+    // The plugin's thread waits for the window's answer to an editor call: what is queued next runs
+    // only once the instance is let go — otherwise a quick thread says "hello" before the drop.
+    probe.instance.run_command("echo", palette());
+    let pending = match probe.next() {
+        MessageKind::Call(HostCall::Editor {
+            call: EditorCall::Active,
+            reply,
+        }) => reply,
+        other => panic!("expected an editor call, got {other:?}"),
+    };
     let Probe {
         instance,
         mut messages,
@@ -482,6 +492,7 @@ fn a_stopped_instance_says_nothing_more() {
     instance.run_command("hello", palette());
     instance.run_command("panic", palette());
     drop(instance);
+    drop(pending);
     // The queued calls run (the panic too), and `deactivate` doesn't: the plugin trapped.
     std::thread::sleep(Duration::from_millis(300));
     while let Ok(message) = messages.try_recv() {
