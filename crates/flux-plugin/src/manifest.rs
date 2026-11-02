@@ -47,7 +47,9 @@
 //! Declarative contributions (stage 8.3) need no code: a language with its tree-sitter grammar and
 //! highlighting query, a language server and how Flux installs it, a color theme, a set of file
 //! icons. API 0.4 adds a language's `injections` (the languages embedded in its files: a
-//! tree-sitter injections query) and `file-patterns` (globs over file names: `.env.*`).
+//! tree-sitter injections query) and `file-patterns` (globs over file names: `.env.*`), and a
+//! language server's `secondary` (a helper that is never a file's main server) and `activation`
+//! (the files or npm dependencies a project needs for the server to start).
 //!
 //! ```toml
 //! [[languages]]
@@ -450,6 +452,23 @@ pub struct LanguageServerSpec {
     /// Answers to `workspace/configuration`, by section.
     pub settings: Option<Value>,
     pub install: Option<InstallSpec>,
+    /// API 0.4: a helper next to a language's own server (a linter, a framework's classes) — never
+    /// a file's main server, whatever the plugins' order.
+    pub secondary: bool,
+    /// API 0.4: the server starts for a project only if this finds it there; `None` — always.
+    pub activation: Option<ActivationSpec>,
+}
+
+/// When a language server is wanted in a project (API 0.4 `activation`): one of `files` is in the
+/// project's root or in the folder of the nearest `package.json` above the file, or one of
+/// `dependencies` is among that `package.json`'s `dependencies`, `devDependencies` or
+/// `peerDependencies`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ActivationSpec {
+    /// Patterns of file names, as `file-patterns` (`eslint.config.*`, `.eslintrc*`); no braces.
+    pub files: Vec<String>,
+    /// npm package names; `*`, `?`, `[…]` match within a part (`@tailwindcss/*`).
+    pub dependencies: Vec<String>,
 }
 
 /// How Flux installs a language server that isn't on the machine.
@@ -873,6 +892,19 @@ struct RawLanguageServer {
     initialization_options: Option<toml::Value>,
     settings: Option<toml::Value>,
     install: Option<RawInstall>,
+    /// API 0.4.
+    secondary: Option<bool>,
+    /// API 0.4.
+    activation: Option<RawActivation>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawActivation {
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
 }
 
 /// `{ npm = […], bin = … }`, `{ github = …, asset = …, bin = … }`, `{ go = …, bin = … }`,
@@ -1352,6 +1384,21 @@ fn check_languages(
                 raw.id
             ));
         }
+        for (key, used) in [
+            ("secondary", raw.secondary.is_some()),
+            ("activation", raw.activation.is_some()),
+        ] {
+            if used && !api_at_least(api, 0, 4) {
+                return error(format!(
+                    "language server \"{}\": unknown field `{key}` (it needs api = \"0.4\")",
+                    raw.id
+                ));
+            }
+        }
+        let activation = match raw.activation {
+            Some(activation) => Some(check_activation(&raw.id, activation)?),
+            None => None,
+        };
         servers.push(LanguageServerSpec {
             id: raw.id,
             command: raw.command,
@@ -1366,9 +1413,51 @@ fn check_languages(
             initialization_options: raw.initialization_options.map(toml_to_json),
             settings: raw.settings.map(toml_to_json),
             install: raw.install.map(RawInstall::check),
+            secondary: raw.secondary.unwrap_or(false),
+            activation,
         });
     }
     Ok((languages, grammars, servers))
+}
+
+/// A server's `activation`: something to look for, patterns of file names without folders or
+/// braces (`{a,b}` isn't a pattern: the variants are listed), package names.
+fn check_activation(server: &str, raw: RawActivation) -> Result<ActivationSpec, ManifestError> {
+    let error = |why: String| {
+        Err(ManifestError(format!(
+            "language server \"{server}\": activation — {why}"
+        )))
+    };
+    if raw.files.is_empty() && raw.dependencies.is_empty() {
+        return error("`files` or `dependencies`".into());
+    }
+    for pattern in &raw.files {
+        if pattern.contains(['{', '}']) {
+            return error(format!(
+                "\"{pattern}\": no braces, list the variants (\"a.js\", \"a.ts\") or use `*`"
+            ));
+        }
+        if let Err(why) = flux_platform::glob::check_glob(pattern) {
+            return error(why);
+        }
+    }
+    for name in &raw.dependencies {
+        let parts: Vec<&str> = name.split('/').collect();
+        let fine = !name.trim().is_empty()
+            && parts.len() <= 2
+            && parts
+                .iter()
+                .all(|part| flux_platform::glob::check_glob(part).is_ok());
+        if !fine {
+            return error(format!(
+                "\"{name}\" isn't a package name (\"eslint\", \"@tailwindcss/*\")"
+            ));
+        }
+    }
+    Ok(ActivationSpec {
+        files: raw.files,
+        dependencies: raw.dependencies,
+    })
 }
 
 fn unique<'a>(what: &str, ids: impl Iterator<Item = &'a str>) -> Result<(), ManifestError> {
@@ -1850,6 +1939,69 @@ injections = ["languages/a.scm", "languages/b.scm"]
 id = "vue"
 wasm = "grammars/vue.wasm"
 "#;
+
+    /// API 0.4: a helper server and when it starts.
+    const ESLINT: &str = r#"
+id = "test.eslint"
+name = "ESLint"
+version = "0.1.0"
+api = "0.4"
+
+[[language-servers]]
+id = "eslint"
+command = "vscode-eslint-language-server"
+languages = ["javascript", "vue"]
+secondary = true
+activation = { files = ["eslint.config.*", ".eslintrc*"], dependencies = ["eslint", "@eslint/*"] }
+
+[[language-servers]]
+id = "plain"
+command = "plain"
+extensions = ["zz"]
+"#;
+
+    #[test]
+    fn api_04_reads_secondary_servers_and_their_activation() {
+        let manifest = Manifest::parse(ESLINT).unwrap();
+        let eslint = &manifest.language_servers[0];
+        assert!(eslint.secondary);
+        assert_eq!(
+            eslint.activation,
+            Some(ActivationSpec {
+                files: vec!["eslint.config.*".into(), ".eslintrc*".into()],
+                dependencies: vec!["eslint".into(), "@eslint/*".into()],
+            })
+        );
+        let plain = &manifest.language_servers[1];
+        assert!(!plain.secondary);
+        assert_eq!(plain.activation, None);
+        // Older APIs don't know the keys.
+        for key in ["secondary = true\n", "activation = { files = [\"a\"] }\n"] {
+            let text = ESLINT
+                .replace("api = \"0.4\"", "api = \"0.3\"")
+                .replace("secondary = true\n", "")
+                .replace(
+                    "activation = { files = [\"eslint.config.*\", \".eslintrc*\"], dependencies = [\"eslint\", \"@eslint/*\"] }\n",
+                    key,
+                );
+            let err = Manifest::parse(&text).unwrap_err().0;
+            assert!(err.contains("needs api = \"0.4\""), "{key}: {err}");
+        }
+        for wrong in [
+            "activation = {}",
+            "activation = { files = [\"tailwind.config.{js,ts}\"] }",
+            "activation = { files = [\"config/eslint.js\"] }",
+            "activation = { dependencies = [\"a/b/c\"] }",
+            "activation = { dependencies = [\"\"] }",
+            "activation = { files = [\"a\"], other = [\"b\"] }",
+        ] {
+            let text = ESLINT.replace(
+                "activation = { files = [\"eslint.config.*\", \".eslintrc*\"], dependencies = [\"eslint\", \"@eslint/*\"] }",
+                wrong,
+            );
+            assert!(Manifest::parse(&text).is_err(), "{wrong}");
+        }
+    }
 
     #[test]
     fn api_04_reads_injections_and_file_patterns() {

@@ -154,6 +154,8 @@ pub fn server(
         settings: None,
         install: None,
         env: Default::default(),
+        secondary: false,
+        activation: None,
     }
 }
 

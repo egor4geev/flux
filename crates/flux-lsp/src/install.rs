@@ -1513,6 +1513,8 @@ mod tests {
             settings: None,
             install: Some(install),
             env: Default::default(),
+            secondary: false,
+            activation: None,
         }
     }
 

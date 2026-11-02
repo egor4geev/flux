@@ -1070,7 +1070,14 @@ Yandex Tracker and Calendar — is built of these pieces:
   Flux.
 - `{server-dir}` in a language server's `args`, `initialization-options` and `settings` is the
   folder Flux installed it in ([Language plugins](languages.md)); such a server always runs as Flux
-  installed it.
+  installed it. `{root}` and `{root-uri}` there are the project's root folder, as a path and as a
+  `file://` URI.
+- A language server's `secondary = true` makes it a helper: never a file's main server while the
+  file has another, its completion and hover joining the main server's; `activation = { files,
+  dependencies }` starts it only in projects with one of those config files or npm dependencies.
+  Like the language keys, they need `api = "0.4"`.
+- Flux asks servers with `diagnosticProvider` for their problems (LSP 3.17 pull diagnostics), and
+  the catalog suggests a plugin for a file its language's `file-patterns` match (`.env.local`).
 - The interfaces haven't changed: a plugin with code built for 0.3 keeps working and may say
   `api = "0.4"` as it is — its component imports the 0.3 interfaces (`flux:plugin@0.3.0`).
 

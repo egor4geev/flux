@@ -1532,6 +1532,7 @@ mod tests {
                 name: "Rust".into(),
                 extensions: vec!["rs".into()],
                 file_names: Vec::new(),
+                file_patterns: Vec::new(),
             }],
             themes: Vec::new(),
             icon_themes: Vec::new(),

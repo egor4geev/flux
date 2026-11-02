@@ -306,6 +306,8 @@ mod tests {
             settings: None,
             install: None,
             env: Default::default(),
+            secondary: false,
+            activation: None,
         };
         assert_eq!(
             config::with_user_settings(config.clone(), &stub("rust-analyzer")),

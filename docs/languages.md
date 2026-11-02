@@ -224,12 +224,16 @@ for some files:
 | `initialization-options` | | `initializationOptions` of `initialize`, as a TOML table. |
 | `settings` | | Answers to `workspace/configuration`, by section: `settings = { python = { analysis = { typeCheckingMode = "basic" } } }`. |
 | `install` | | How Flux installs the server when it isn't on the Mac. |
+| `secondary` | | API 0.4. `true`: a helper next to a language's own server — a linter, a framework's classes. It is never a file's main server while the file has another; its completion and hover join the main server's. `false` by default. |
+| `activation` | | API 0.4. When the server starts in a project: `{ files = […], dependencies = […] }`. See [Starting only where needed](#starting-only-where-needed). Without it, whenever a file it serves opens. |
 
 `{server-dir}` in `args` and in any string of `initialization-options` and `settings` (API 0.4) is
 the folder Flux installed the server in — for what the server needs by path from its own install:
 `typescript = { tsdk = "{server-dir}/node_modules/typescript/lib" }`. A server that names it always
 runs as Flux installed it (its `install` is required then): a copy elsewhere on the machine may be
-another major version.
+another major version. `{root}` and `{root-uri}` (API 0.4) are the project's root folder — the
+server's workspace folder — as a path and as a `file://` URI:
+`workspaceFolder = { uri = "{root-uri}", name = "{root}" }`.
 
 ```toml
 [[language-servers]]
@@ -243,10 +247,49 @@ install = { npm = ["vscode-langservers-extracted"], bin = "vscode-json-language-
 ```
 
 A file may have several servers: it is open on all of them, the first one is the main one
-(completion, hover, navigation), the problems of each are kept apart, and formatting goes to the first
-one that can. The order is the plugins' order (bundled first, then by name) and, within a plugin,
-the manifest's — Python's pyright comes before ruff, its formatter and linter. A server with the `id`
-of another plugin's server replaces it.
+(completion, hover, navigation, rename, signature help), the problems of each are kept apart, code
+actions come from all of them, and formatting goes to the first one that can. The order is the
+plugins' order (bundled first, then by name) and, within a plugin, the manifest's — Python's
+pyright comes before ruff, its formatter and linter — with the `secondary` servers after the
+others: a helper of the catalog ("ESLint", "Tailwind CSS") never takes a Vue file from Vue's own
+server, though its name comes first. If all of a file's servers are secondary, the first one is the
+main one. Completion and hover ask the main server and the secondary ones together: their items
+join the main server's (after them among equally good matches, without the duplicates; each item is
+resolved and applied by its own server), their hovers follow the main server's under a rule. What
+has come within a third of a second shows; a slower answer joins it when it comes. A server with
+the `id` of another plugin's server replaces it.
+
+A server's problems come as it publishes them, or — when its capabilities have `diagnosticProvider`
+(LSP 3.17 pull diagnostics: ESLint's server) — Flux asks for them after the file opens and a quarter
+of a second after typing stops, with the `resultId` of the last report (the server may answer
+"unchanged"), takes the reports of related files that come with it, asks again when the server
+cancels with `retriggerRequest`, and asks for every open file again on
+`workspace/diagnostic/refresh`.
+
+### Starting only where needed
+
+A server for projects of one kind — a framework, a linter with its config — names what such a
+project has (API 0.4):
+
+```toml
+[[language-servers]]
+id = "vscode-eslint-language-server"
+command = "vscode-eslint-language-server"
+args = ["--stdio"]
+languages = ["javascript", "typescript", "vue"]
+secondary = true
+activation = { files = ["eslint.config.*", ".eslintrc*"], dependencies = ["eslint"] }
+```
+
+The server starts for a file only if one of `files` is in the project's root, or in the folder of
+the nearest `package.json` above the file (not above the root), or one of `dependencies` is among
+that `package.json`'s `dependencies`, `devDependencies` or `peerDependencies`. `files` are patterns
+of file names as in `file-patterns` — `*`, `?`, `[…]`, no folders. Braces aren't patterns: list the
+variants (`["tailwind.config.js", "tailwind.config.ts"]`) or use `*` (`"tailwind.config.*"`).
+`dependencies` are package names; a pattern matches within a part: `"@tailwindcss/*"`. Flux looks
+once per project and `package.json`, and again when a `package.json` or a file `files` names
+changes in the project (a config added, a dependency installed): the server starts for the open
+files, or stops.
 
 ### Installing a server
 

@@ -334,6 +334,14 @@ fn server_config(server: &LanguageServerSpec, languages: &[&LanguageSpec]) -> Se
         install: server.install.as_ref().map(install),
         // The user's own (`lsp.<server>.env`, part 10.5) come with [`crate::lsp_settings`].
         env: Default::default(),
+        secondary: server.secondary,
+        activation: server
+            .activation
+            .as_ref()
+            .map(|activation| flux_lsp::Activation {
+                files: activation.files.clone(),
+                dependencies: activation.dependencies.clone(),
+            }),
     }
 }
 

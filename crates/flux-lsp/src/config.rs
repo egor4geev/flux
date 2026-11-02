@@ -14,11 +14,17 @@ use flux_platform::process::Background;
 use serde_json::{Value, json};
 
 use crate::install;
+use crate::position::uri_from_path;
 
 /// In a server's arguments, settings and options: the folder Flux installed the server in, e.g.
 /// `{server-dir}/node_modules/typescript/lib` for the TypeScript it bundles. A server that names it
 /// runs only as Flux installed it: a copy elsewhere on the machine may be another major version.
 pub const SERVER_DIR: &str = "{server-dir}";
+/// In a server's arguments, settings and options (plugin API 0.4): the project's root folder, the
+/// server's workspace folder — ESLint's `workspaceFolder`.
+pub const ROOT: &str = "{root}";
+/// The same as a `file://` URI.
+pub const ROOT_URI: &str = "{root-uri}";
 
 /// How to start a language server and which files it serves.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +50,102 @@ pub struct ServerConfig {
     /// More environment variables for the server's process (the user's settings, part 10.5:
     /// `CARGO_TARGET_DIR`, `NODE_OPTIONS`); they win over Flux's own `PATH`.
     pub env: BTreeMap<String, String>,
+    /// A helper next to a language's own server (plugin API 0.4: a linter, a framework's classes):
+    /// never a file's main server while it has another ([`servers_for_path`]); its completion and
+    /// hover join the main server's.
+    pub secondary: bool,
+    /// What a project needs for the server to start in it (plugin API 0.4); `None` — nothing.
+    pub activation: Option<Activation>,
+}
+
+/// When a server is wanted in a project (plugin API 0.4 `activation`): one of `files` is in the
+/// project's root or in the folder of the nearest `package.json` above the file, or one of
+/// `dependencies` is among that `package.json`'s `dependencies`, `devDependencies` or
+/// `peerDependencies`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Activation {
+    /// Patterns of file names ([`flux_platform::glob`]): `eslint.config.*`, `.eslintrc*`.
+    pub files: Vec<String>,
+    /// npm package names; a pattern matches within a part: `@tailwindcss/*`.
+    pub dependencies: Vec<String>,
+}
+
+impl Activation {
+    /// Whether the project at `root` wants the server for a file whose nearest `package.json` is
+    /// in `package_dir` ([`package_dir`]). Reads the folders and the `package.json`: cache it.
+    pub fn applies(&self, root: &Path, package_dir: Option<&Path>) -> bool {
+        if self.has_file(root) {
+            return true;
+        }
+        package_dir
+            .is_some_and(|dir| (dir != root && self.has_file(dir)) || self.has_dependency(dir))
+    }
+
+    /// One of [`Self::files`] is in `dir`.
+    fn has_file(&self, dir: &Path) -> bool {
+        if self.files.is_empty() {
+            return false;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            self.files
+                .iter()
+                .any(|pattern| flux_platform::glob::glob_matches(pattern, &name))
+        })
+    }
+
+    /// One of [`Self::dependencies`] is in `dir/package.json`.
+    fn has_dependency(&self, dir: &Path) -> bool {
+        if self.dependencies.is_empty() {
+            return false;
+        }
+        let Some(package) = fs::read(dir.join("package.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        else {
+            return false;
+        };
+        ["dependencies", "devDependencies", "peerDependencies"]
+            .iter()
+            .filter_map(|section| package.get(section)?.as_object())
+            .flat_map(|names| names.keys())
+            .any(|name| {
+                self.dependencies
+                    .iter()
+                    .any(|pattern| dependency_matches(pattern, name))
+            })
+    }
+}
+
+/// Whether the npm package `name` matches `pattern`: part by part (`@scope/name`), each a glob.
+fn dependency_matches(pattern: &str, name: &str) -> bool {
+    let (pattern, name): (Vec<&str>, Vec<&str>) =
+        (pattern.split('/').collect(), name.split('/').collect());
+    pattern.len() == name.len()
+        && pattern
+            .iter()
+            .zip(&name)
+            .all(|(pattern, part)| flux_platform::glob::glob_matches(pattern, part))
+}
+
+/// The folder of the nearest `package.json` above `file` — for a file in the project, not above
+/// its `root`.
+pub fn package_dir(root: &Path, file: &Path) -> Option<PathBuf> {
+    let mut dir = file.parent();
+    while let Some(current) = dir {
+        if current.join("package.json").is_file() {
+            return Some(current.to_path_buf());
+        }
+        if current == root {
+            return None;
+        }
+        dir = current.parent();
+    }
+    None
 }
 
 /// The plugin's `config` with the user's settings of the server over it (part 10.5: `lsp.<server>`
@@ -195,9 +297,17 @@ pub enum Install {
 }
 
 /// Every config that serves `path`, the main server first (Python: pyright, then ruff for formatting
-/// and linting): those that name the file exactly if any, otherwise those for its extension (any
-/// case), in the order of `configs`.
+/// and linting): those that name the file exactly if any, otherwise those whose patterns match its
+/// name, otherwise those for its extension (any case) — in the order of `configs`, the
+/// [secondary](ServerConfig::secondary) ones after the others.
 pub fn servers_for_path<'a>(configs: &'a [ServerConfig], path: &Path) -> Vec<&'a ServerConfig> {
+    let mut servers = matching_servers(configs, path);
+    // Stable: the order of `configs` within each kind.
+    servers.sort_by_key(|config| config.secondary);
+    servers
+}
+
+fn matching_servers<'a>(configs: &'a [ServerConfig], path: &Path) -> Vec<&'a ServerConfig> {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return Vec::new();
     };
@@ -268,6 +378,14 @@ impl ServerConfig {
             .filter(|path| !self.is_bare_rustup_proxy(path))
     }
 
+    /// Whether the server is wanted in the project at `root` for a file whose nearest
+    /// `package.json` is in `package_dir`: always, unless it has an [`Activation`].
+    pub fn activated(&self, root: &Path, package_dir: Option<&Path>) -> bool {
+        self.activation
+            .as_ref()
+            .is_none_or(|activation| activation.applies(root, package_dir))
+    }
+
     /// The config names [`SERVER_DIR`] in its arguments, options or settings.
     pub fn uses_server_dir(&self) -> bool {
         let names = |value: &Option<Value>| {
@@ -318,6 +436,7 @@ pub(crate) struct Launch {
 }
 
 /// [`Launch`] for `config` started as `program` in `root`:
+/// - [`SERVER_DIR`], [`ROOT`] and [`ROOT_URI`] are filled in its arguments, options and settings;
 /// - pyright gets the project's virtual environment as `python.pythonPath` — otherwise it resolves
 ///   imports against whatever `python3` is first in `PATH`, and installed packages are "missing";
 /// - typescript-language-server gets the TypeScript installed next to it as the fallback, used when
@@ -325,19 +444,15 @@ pub(crate) struct Launch {
 /// - an npm server installed by Flux runs with Flux's Node.js first in `PATH`, and the tools Flux
 ///   installed for servers (shellcheck) are at the end of it.
 pub(crate) fn launch(config: &ServerConfig, root: &Path, program: &Path) -> Launch {
-    let mut settings = workspace_settings(config, root);
+    let settings = workspace_settings(config, root);
     let mut initialization_options = config.initialization_options.clone();
     let mut args = config.args.clone();
-    if config.uses_server_dir()
-        && let Some(dir) = install::installed_dir(config)
-    {
-        let dir = dir.to_string_lossy();
-        fill_server_dir(&mut settings, &dir);
+    for (placeholder, value) in placeholders(config, root) {
         if let Some(options) = initialization_options.as_mut() {
-            fill_server_dir(options, &dir);
+            fill_placeholder(options, placeholder, &value);
         }
         for arg in &mut args {
-            *arg = arg.replace(SERVER_DIR, &dir);
+            *arg = arg.replace(placeholder, &value);
         }
     }
     if config.name == "typescript-language-server"
@@ -370,25 +485,50 @@ pub(crate) fn launch(config: &ServerConfig, root: &Path, program: &Path) -> Laun
     }
 }
 
-/// [`SERVER_DIR`] in every string of `value` replaced by `dir`.
-fn fill_server_dir(value: &mut Value, dir: &str) {
+/// What the placeholders of `config` started in `root` stand for: [`ROOT`] and [`ROOT_URI`], and
+/// [`SERVER_DIR`] once Flux installed the server.
+fn placeholders(config: &ServerConfig, root: &Path) -> Vec<(&'static str, String)> {
+    let mut values = vec![
+        (ROOT, root.to_string_lossy().into_owned()),
+        (ROOT_URI, uri_from_path(root).as_str().to_string()),
+    ];
+    if config.uses_server_dir()
+        && let Some(dir) = install::installed_dir(config)
+    {
+        values.push((SERVER_DIR, dir.to_string_lossy().into_owned()));
+    }
+    values
+}
+
+/// `placeholder` in every string of `value` replaced by `with`.
+fn fill_placeholder(value: &mut Value, placeholder: &str, with: &str) {
     match value {
-        Value::String(text) if text.contains(SERVER_DIR) => *text = text.replace(SERVER_DIR, dir),
-        Value::Array(items) => items.iter_mut().for_each(|item| fill_server_dir(item, dir)),
-        Value::Object(map) => map.values_mut().for_each(|item| fill_server_dir(item, dir)),
+        Value::String(text) if text.contains(placeholder) => {
+            *text = text.replace(placeholder, with)
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| fill_placeholder(item, placeholder, with)),
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|item| fill_placeholder(item, placeholder, with)),
         _ => {}
     }
 }
 
 /// The answers to `workspace/configuration` of `config` started in `root` (an object; sections
-/// are looked up in it): its settings, and pyright gets the project's virtual environment as
-/// `python.pythonPath` when the settings don't name an interpreter. Also what a running server
-/// takes when the user changes its settings.
+/// are looked up in it): its settings with the placeholders filled ([`ROOT`], [`ROOT_URI`],
+/// [`SERVER_DIR`]), and pyright gets the project's virtual environment as `python.pythonPath` when
+/// the settings don't name an interpreter. Also what a running server takes when the user changes
+/// its settings.
 pub fn workspace_settings(config: &ServerConfig, root: &Path) -> Value {
     let mut settings = match &config.settings {
         Some(Value::Object(map)) => Value::Object(map.clone()),
         _ => json!({}),
     };
+    for (placeholder, value) in placeholders(config, root) {
+        fill_placeholder(&mut settings, placeholder, &value);
+    }
     if config.name == "pyright"
         && matches!(settings.get("python"), None | Some(Value::Object(_)))
         && settings["python"]["pythonPath"].is_null()
@@ -920,12 +1060,14 @@ mod tests {
             settings: None,
             install: None,
             env: BTreeMap::new(),
+            secondary: false,
+            activation: None,
         };
         assert!(config.uses_server_dir());
         // A copy on the machine never stands in for Flux's own.
         assert_eq!(config.resolve_system_command(), None);
         let mut options = config.initialization_options.clone().unwrap();
-        fill_server_dir(&mut options, "/servers/vue");
+        fill_placeholder(&mut options, SERVER_DIR, "/servers/vue");
         assert_eq!(
             options["typescript"]["tsdk"],
             json!("/servers/vue/node_modules/typescript/lib")
@@ -951,6 +1093,8 @@ mod tests {
             settings: None,
             install: None,
             env: BTreeMap::new(),
+            secondary: false,
+            activation: None,
         };
         let configs = [
             server("html", &["html"], &[]),
@@ -964,5 +1108,123 @@ mod tests {
         };
         assert_eq!(names("src/app/app.component.html"), ["angular"]);
         assert_eq!(names("src/index.html"), ["html"]);
+    }
+
+    #[test]
+    fn the_root_fills_in_as_a_path_and_as_a_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("my project");
+        fs::create_dir_all(&root).unwrap();
+        let mut config = server("eslint", "eslint-ls", &["--root={root}"], &["js"], &[]);
+        config.settings = Some(json!({
+            "workspaceFolder": { "uri": "{root-uri}", "name": "{root}" },
+            "nodePath": "{root}/node_modules",
+            "list": ["{root-uri}/a"],
+            "other": 1,
+        }));
+        config.initialization_options = Some(json!({ "root": "{root}" }));
+        let path = root.to_string_lossy().into_owned();
+        let uri = uri_from_path(&root).as_str().to_string();
+        assert!(
+            uri.starts_with("file:///") && uri.ends_with("/my%20project"),
+            "{uri}"
+        );
+        let settings = workspace_settings(&config, &root);
+        assert_eq!(
+            settings["workspaceFolder"],
+            json!({ "uri": uri, "name": path })
+        );
+        assert_eq!(settings["nodePath"], json!(format!("{path}/node_modules")));
+        assert_eq!(settings["list"], json!([format!("{uri}/a")]));
+        assert_eq!(settings["other"], json!(1));
+        let launch = launch(&config, &root, Path::new("/bin/eslint-ls"));
+        assert_eq!(launch.args, [format!("--root={path}")]);
+        assert_eq!(launch.initialization_options, Some(json!({ "root": path })));
+        assert_eq!(launch.settings, settings);
+        // `{root}` isn't a server of Flux's own: a copy on the machine runs.
+        assert!(!config.uses_server_dir());
+    }
+
+    #[test]
+    fn a_secondary_server_is_never_the_main_one_while_there_is_another() {
+        let mut eslint = server("eslint", "eslint", &[], &["vue", "ts"], &[]);
+        eslint.secondary = true;
+        let mut tailwind = server("tailwind", "tailwind", &[], &["vue"], &[]);
+        tailwind.secondary = true;
+        let vue = server("vue", "vue", &[], &["vue"], &[]);
+        let configs = vec![eslint, tailwind, vue];
+        let names = |path: &str| -> Vec<String> {
+            servers_for_path(&configs, Path::new(path))
+                .iter()
+                .map(|config| config.name.clone())
+                .collect()
+        };
+        assert_eq!(names("App.vue"), ["vue", "eslint", "tailwind"]);
+        // Only secondary ones: the first is the main one.
+        assert_eq!(names("main.ts"), ["eslint"]);
+        assert_eq!(
+            server_for_path(&configs, Path::new("App.vue")).map(|c| c.name.as_str()),
+            Some("vue")
+        );
+    }
+
+    #[test]
+    fn activation_by_config_files_and_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let app = root.join("packages/app");
+        let lib = root.join("packages/lib");
+        fs::create_dir_all(app.join("src")).unwrap();
+        fs::create_dir_all(lib.join("src")).unwrap();
+        fs::write(
+            app.join("package.json"),
+            r#"{ "devDependencies": { "@tailwindcss/vite": "4.1.0" }, "dependencies": { "vue": "3" } }"#,
+        )
+        .unwrap();
+        fs::write(
+            lib.join("package.json"),
+            r#"{ "dependencies": { "lodash": "4" } }"#,
+        )
+        .unwrap();
+        let tailwind = Activation {
+            files: vec!["tailwind.config.*".into()],
+            dependencies: vec!["tailwindcss".into(), "@tailwindcss/*".into()],
+        };
+        let eslint = Activation {
+            files: vec!["eslint.config.*".into(), ".eslintrc*".into()],
+            dependencies: vec!["eslint".into()],
+        };
+        let app_file = app.join("src/App.vue");
+        let lib_file = lib.join("src/index.ts");
+        assert_eq!(package_dir(root, &app_file), Some(app.clone()));
+        assert_eq!(package_dir(root, &lib_file), Some(lib.clone()));
+        assert_eq!(package_dir(root, &root.join("x.ts")), None);
+        // A dependency of the nearest package.json.
+        assert!(tailwind.applies(root, Some(&app)));
+        assert!(!tailwind.applies(root, Some(&lib)));
+        assert!(!eslint.applies(root, Some(&app)));
+        // A config file in the package's folder, in any case of the pattern's letters.
+        fs::write(lib.join("Tailwind.config.ts"), "").unwrap();
+        assert!(tailwind.applies(root, Some(&lib)));
+        // A config file in the root serves every package.
+        fs::write(root.join(".eslintrc.json"), "{}").unwrap();
+        assert!(eslint.applies(root, Some(&lib)));
+        assert!(eslint.applies(root, None));
+        // A broken package.json is no dependency.
+        fs::write(lib.join("package.json"), "{ not json").unwrap();
+        let only_deps = Activation {
+            files: Vec::new(),
+            dependencies: vec!["lodash".into()],
+        };
+        assert!(!only_deps.applies(root, Some(&lib)));
+        let mut config = server("tailwind", "tailwind", &[], &["vue"], &[]);
+        assert!(config.activated(root, None), "without activation: always");
+        config.activation = Some(tailwind);
+        assert!(config.activated(root, Some(&app)));
+        assert!(!config.activated(root, None));
+        assert!(dependency_matches("@scope/*", "@scope/name"));
+        assert!(!dependency_matches("@scope/*", "@other/name"));
+        assert!(!dependency_matches("eslint", "eslint-plugin-vue"));
+        assert!(!dependency_matches("*", "@scope/name"));
     }
 }
