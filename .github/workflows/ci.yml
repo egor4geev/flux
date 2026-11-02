@@ -4,7 +4,8 @@
 # merges only green.
 #
 # The jobs' names are the checks' names: renaming one means changing the ruleset too. The matrix
-# gets Linux (10.9) and Windows (10.10) as they come — each a new required check.
+# gets Windows (10.9) and Linux (10.10) as they come — each a new required check once its build
+# ships.
 name: CI
 
 on:
@@ -62,7 +63,14 @@ jobs:
         include:
           - name: macOS
             os: macos-15
+          - name: Windows
+            os: windows-2025
     steps:
+      # The files as the repository has them (LF): Windows' git would turn them into CRLF.
+      - name: Line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v7
 
       # wasm32-wasip2: the bundled plugins (crates/flux-app/build.rs) and the plugin tests' probe
@@ -74,21 +82,25 @@ jobs:
           rustup default stable
           rustc --version
 
-      # Pull requests read the cache of their base branch; only pushes write it (a cache per
-      # pull request would push the useful ones out of the 10 GB).
+      # Pull requests read the cache of their base branch; pushes and manual runs write it (a cache
+      # per pull request would push the useful ones out of the 10 GB).
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          save-if: ${{ github.event_name == 'push' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # The UI check scenarios for agents (scripts/ui-scenario.sh) live behind a feature.
+      # The UI check scenarios for agents (scripts/ui-scenario.sh) live behind a feature; they drive
+      # macOS only so far.
       - name: Clippy (scenario feature)
+        if: runner.os == 'macOS'
         run: cargo clippy -p flux-app --all-targets --features scenario --locked -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace --locked
+        # A test that hangs ends the step, not the whole job's hour.
+        timeout-minutes: 25
+        run: cargo test --workspace --locked --no-fail-fast
 
       # The plugin tests quietly do without their probe component when it doesn't build (no wasm
       # target on a developer's Mac); here it must build — and with it the bundled plugins, which

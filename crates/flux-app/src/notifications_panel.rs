@@ -75,15 +75,18 @@ const RESIZE_HANDLE_WIDTH: f32 = GAP;
 
 pub fn init(cx: &mut App) {
     let context = Some(CONTEXT);
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-        KeyBinding::new("enter", RunAction, context),
-        KeyBinding::new("backspace", Remove, context),
-        KeyBinding::new("delete", Remove, context),
-        KeyBinding::new("escape", FocusEditor, context),
-        KeyBinding::new("shift-escape", Hide, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+            KeyBinding::new("enter", RunAction, context),
+            KeyBinding::new("backspace", Remove, context),
+            KeyBinding::new("delete", Remove, context),
+            KeyBinding::new("escape", FocusEditor, context),
+            KeyBinding::new("shift-escape", Hide, context),
+        ],
+    );
 }
 
 /// The filter menu and its subscriptions.

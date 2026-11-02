@@ -5,7 +5,7 @@ members = ["crates/*"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 
@@ -15,6 +15,7 @@ flux-core = { path = "crates/flux-core" }
 flux-fs = { path = "crates/flux-fs" }
 flux-git = { path = "crates/flux-git" }
 flux-lsp = { path = "crates/flux-lsp" }
+flux-platform = { path = "crates/flux-platform" }
 flux-plugin = { path = "crates/flux-plugin" }
 flux-syntax = { path = "crates/flux-syntax" }
 flux-search = { path = "crates/flux-search" }

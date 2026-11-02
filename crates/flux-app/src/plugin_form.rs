@@ -90,22 +90,31 @@ fn bind_keys(cx: &mut App) {
     }
     cx.set_global(FormKeys);
     let form = Some("PluginForm");
-    cx.bind_keys([
-        KeyBinding::new("enter", Confirm, form),
-        KeyBinding::new("cmd-enter", Confirm, form),
-        KeyBinding::new("escape", Dismiss, form),
-        KeyBinding::new("tab", FocusNext, form),
-        KeyBinding::new("shift-tab", FocusPrevious, form),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, form),
+            KeyBinding::new("cmd-enter", Confirm, form),
+            KeyBinding::new("escape", Dismiss, form),
+            KeyBinding::new("tab", FocusNext, form),
+            KeyBinding::new("shift-tab", FocusPrevious, form),
+        ],
+    );
     let toggle = Some("PluginFormToggle");
-    cx.bind_keys([KeyBinding::new("space", ToggleFocused, toggle)]);
+    crate::keymap::bind_keys(cx, [KeyBinding::new("space", ToggleFocused, toggle)]);
     let choice = Some("PluginFormChoice");
-    cx.bind_keys([
-        KeyBinding::new("space", OpenChoice, choice),
-        KeyBinding::new("down", OpenChoice, choice),
-        KeyBinding::new("up", OpenChoice, choice),
-    ]);
-    cx.bind_keys([KeyBinding::new("enter", NewLine, Some("PluginFormLines"))]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("space", OpenChoice, choice),
+            KeyBinding::new("down", OpenChoice, choice),
+            KeyBinding::new("up", OpenChoice, choice),
+        ],
+    );
+    crate::keymap::bind_keys(
+        cx,
+        [KeyBinding::new("enter", NewLine, Some("PluginFormLines"))],
+    );
 }
 
 /// How long an answered form stays for its plugin to ask again (a wrong value) before it closes:

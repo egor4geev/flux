@@ -85,7 +85,7 @@ pub fn init(cx: &mut App) {
     for n in 1..=9 {
         bindings.push(KeyBinding::new(&n.to_string(), PickRow(n - 1), rows));
     }
-    cx.bind_keys(bindings);
+    crate::keymap::bind_keys(cx, bindings);
 }
 
 /// The cards' state in their chat: which card has the keyboard, the highlighted rows, the open
@@ -475,8 +475,9 @@ fn short_path(path: &str, cwd: &Path) -> String {
             relative.into_owned()
         };
     }
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+    let home = flux_platform::paths::home().map(|home| home.to_string_lossy().into_owned());
+    match home {
+        Some(home) if !home.is_empty() && path.starts_with(&home) => {
             format!("~{}", &path[home.len()..])
         }
         _ => path.to_string(),

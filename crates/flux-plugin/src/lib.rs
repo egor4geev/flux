@@ -1,6 +1,6 @@
 //! Plugins without UI (stage 8, ADR-029): WebAssembly components of the `flux:plugin` world
-//! (`wit/v0.3/flux-plugin.wit`; plugins built for 0.2 — `wit/v0.2`, [`compat`]) run by wasmtime,
-//! each on its own thread.
+//! (`wit/v0.3/flux-plugin.wit`, which API 0.4 keeps; plugins built for 0.2 — `wit/v0.2`,
+//! [`compat`]) run by wasmtime, each on its own thread.
 //!
 //! - [`manifest`] — `flux-plugin.toml`: who the plugin is, its permissions and what it adds
 //!   (commands, tool windows, status bar items, settings; with 8.3 — languages, grammars, language
@@ -13,8 +13,7 @@
 //!   ([`runtime::PluginMessage`]); limits on time and memory; the sandbox. `host` answers the
 //!   API's functions on the plugin's side of the thread: what needs the window becomes a message,
 //!   the rest (the network, the server, programs, timers, secrets) is done right there.
-//! - [`secrets`] — the plugins' secrets, kept by Flux encrypted ([`keychain`] — where they were
-//!   before).
+//! - [`secrets`] — the plugins' secrets, kept by Flux encrypted.
 //! - [`api`] — the types of the WIT interfaces, shared with the window.
 //! - [`log`], [`locales`], [`dev`], [`paths`] — the plugin's log, its translations, building a
 //!   plugin under development, where everything lives on disk.
@@ -38,23 +37,33 @@ pub(crate) mod tests;
 /// The user's login shell environment (a terminal's `PATH`), read once per process.
 pub use host::login_env;
 
-/// The version of the plugin API (`flux:plugin@0.3.0`) a manifest names in `api`: what plugins are
-/// built for now (the SDK, the template, the bundled plugins).
-pub const API_VERSION: &str = "0.3";
+/// The version of the plugin API a manifest names in `api`: what plugins are built for now (the
+/// SDK, the template). API 0.4 added keys of the manifest only — a language's `injections` and
+/// `file-patterns` — so its components are built with the 0.3 interfaces (`flux:plugin@0.3.0`,
+/// [`wit_version`]).
+pub const API_VERSION: &str = "0.4";
 
 /// The versions this Flux runs, oldest first: a plugin built for an older one keeps working (its
 /// calls are answered through `wit/v0.2`), and a plugin without code (a language, a theme) names
 /// any of them.
-pub const SUPPORTED_API_VERSIONS: &[&str] = &["0.2", API_VERSION];
+pub const SUPPORTED_API_VERSIONS: &[&str] = &["0.2", "0.3", API_VERSION];
 
 /// This Flux runs plugins built for `api`.
 pub fn supports_api(api: &str) -> bool {
     SUPPORTED_API_VERSIONS.contains(&api)
 }
 
+/// The version of the interfaces (`wit/v…`) the component of a plugin built for `api` imports:
+/// API 0.4 changed only the manifest, its components are built with the 0.3 interfaces.
+pub fn wit_version(api: &str) -> &str {
+    match api {
+        "0.4" => "0.3",
+        other => other,
+    }
+}
+
 /// A plugin's secret, as its `secrets.get` reads it: Settings keeps a plugin's `secret` settings
-/// there (API 0.3). It may wait for another Flux writing them, and the first time for the secrets
-/// to move from the keychain (macOS may ask the user) — call it off the UI thread.
+/// there (API 0.3). It may wait for another Flux writing them — call it off the UI thread.
 pub fn plugin_secret(plugin: &str, key: &str) -> Result<Option<String>, String> {
     secrets::get(&secrets::service(plugin), key)
 }

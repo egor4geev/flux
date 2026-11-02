@@ -39,17 +39,20 @@ const MAX_SUMMARY_LINES: usize = 6;
 pub fn init(cx: &mut App) {
     let update = Some("UpdateDialog");
     let pull = Some("PullDialog");
-    cx.bind_keys([
-        KeyBinding::new("enter", Confirm, update),
-        KeyBinding::new("escape", Dismiss, update),
-        KeyBinding::new("down", SelectNext, update),
-        KeyBinding::new("up", SelectPrevious, update),
-        KeyBinding::new("enter", Confirm, pull),
-        KeyBinding::new("cmd-enter", Confirm, pull),
-        KeyBinding::new("escape", Dismiss, pull),
-        KeyBinding::new("down", SelectNext, pull),
-        KeyBinding::new("up", SelectPrevious, pull),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, update),
+            KeyBinding::new("escape", Dismiss, update),
+            KeyBinding::new("down", SelectNext, update),
+            KeyBinding::new("up", SelectPrevious, update),
+            KeyBinding::new("enter", Confirm, pull),
+            KeyBinding::new("cmd-enter", Confirm, pull),
+            KeyBinding::new("escape", Dismiss, pull),
+            KeyBinding::new("down", SelectNext, pull),
+            KeyBinding::new("up", SelectPrevious, pull),
+        ],
+    );
 }
 
 // --- Update Project ---

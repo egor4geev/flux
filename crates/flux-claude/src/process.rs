@@ -160,7 +160,7 @@ impl Process {
                     }
                     thread::sleep(Duration::from_millis(50));
                 }
-                let _ = lock(&child).kill();
+                let _ = flux_platform::process::kill_tree(&mut lock(&child));
             })
             .ok();
     }
@@ -168,7 +168,7 @@ impl Process {
     /// Kills the process at once.
     pub fn kill(&self) {
         lock(&self.stdin).take();
-        let _ = lock(&self.child).kill();
+        let _ = flux_platform::process::kill_tree(&mut lock(&self.child));
     }
 
     fn write(&self, frame: &Value) {
@@ -284,7 +284,7 @@ fn spawn_reader(
                     }
                     _ => {
                         let mut child = lock(&child);
-                        let _ = child.kill();
+                        let _ = flux_platform::process::kill_tree(&mut child);
                         break child.wait().ok().and_then(|status| status.code());
                     }
                 }

@@ -12,8 +12,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Regex", "Regex"),
     ("No project folder", "Нет папки проекта"),
     (
-        "Open a folder with ⌘O to search across its files.",
-        "Откройте папку через ⌘O, чтобы искать по её файлам.",
+        "Open a folder with {0} to search across its files.",
+        "Откройте папку через {0}, чтобы искать по её файлам.",
     ),
     ("Search across the project", "Поиск по всему проекту"),
     (
@@ -21,8 +21,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Введите текст, чтобы найти его во всех файлах.",
     ),
     (
-        "Match Case ⌥⌘C, Words ⌥⌘W and Regex ⌥⌘R narrow the search; ↑↓ pick a result, ↵ opens it.",
-        "Регистр ⌥⌘C, слова ⌥⌘W и regex ⌥⌘R сужают поиск; ↑↓ — выбор результата, ↵ — открыть.",
+        "Match Case {0}, Words {1} and Regex {2} narrow the search; ↑↓ pick a result, {3} opens it.",
+        "Регистр {0}, слова {1} и regex {2} сужают поиск; ↑↓ — выбор результата, {3} — открыть.",
     ),
     (
         "Looking for “{0}” in the project files.",

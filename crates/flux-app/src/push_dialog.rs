@@ -46,15 +46,18 @@ const TARGET_DELAY: Duration = Duration::from_millis(300);
 
 pub fn init(cx: &mut App) {
     let dialog = Some("PushDialog");
-    cx.bind_keys([
-        KeyBinding::new("enter", Confirm, dialog),
-        KeyBinding::new("cmd-enter", Confirm, dialog),
-        KeyBinding::new("escape", Dismiss, dialog),
-        KeyBinding::new("down", SelectNext, dialog),
-        KeyBinding::new("up", SelectPrevious, dialog),
-        // In the target branch field, ↵ only confirms the name.
-        KeyBinding::new("enter", ConfirmTarget, Some("PushTarget")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, dialog),
+            KeyBinding::new("cmd-enter", Confirm, dialog),
+            KeyBinding::new("escape", Dismiss, dialog),
+            KeyBinding::new("down", SelectNext, dialog),
+            KeyBinding::new("up", SelectPrevious, dialog),
+            // In the target branch field, ↵ only confirms the name.
+            KeyBinding::new("enter", ConfirmTarget, Some("PushTarget")),
+        ],
+    );
 }
 
 /// Opens the dialog for the repositories of the window (or closes it, when open).

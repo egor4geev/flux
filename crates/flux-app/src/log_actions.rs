@@ -48,12 +48,15 @@ const RESET_WIDTH: f32 = 480.;
 
 pub fn init(cx: &mut App) {
     let context = Some("ResetDialog");
-    cx.bind_keys([
-        KeyBinding::new("enter", Confirm, context),
-        KeyBinding::new("escape", Dismiss, context),
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, context),
+            KeyBinding::new("escape", Dismiss, context),
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+        ],
+    );
 }
 
 /// What applies to the selected commits right now.

@@ -205,7 +205,11 @@ fn settings_path() -> Option<PathBuf> {
     let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".claude")))?;
+        .or_else(|| {
+            flux_platform::paths::home()
+                .map(std::ffi::OsString::from)
+                .map(|home| Path::new(&home).join(".claude"))
+        })?;
     Some(dir.join("settings.json"))
 }
 

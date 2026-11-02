@@ -188,9 +188,9 @@ pub fn configure(
 /// Whether two paths name the same file (one may come through a symbolic link, `/tmp`).
 fn same_file(a: &Path, b: &Path) -> bool {
     a == b
-        || std::fs::canonicalize(a)
+        || flux_platform::path_style::canonicalize(a)
             .ok()
-            .zip(std::fs::canonicalize(b).ok())
+            .zip(flux_platform::path_style::canonicalize(b).ok())
             .is_some_and(|(a, b)| a == b)
 }
 
@@ -301,10 +301,13 @@ mod tests {
             args: vec![],
             extensions: vec!["rs".into()],
             file_names: vec![],
+            file_patterns: Vec::new(),
             initialization_options: None,
             settings: None,
             install: None,
             env: Default::default(),
+            secondary: false,
+            activation: None,
         };
         assert_eq!(
             config::with_user_settings(config.clone(), &stub("rust-analyzer")),

@@ -14,16 +14,17 @@ A plugin without code can add languages, their grammars and language servers: [L
 color themes: [Themes](themes.md); sets of file icons: [File icon sets](icon-themes.md).
 
 > [!NOTE]
-> The plugin API is version **0.3**. A manifest names the version it is built for; Flux keeps
-> running plugins built for **0.2**, the version the [catalog](catalog.md) opened with
-> ([From 0.2 to 0.3](#from-02-to-03)).
+> The plugin API is version **0.4**. A manifest names the version it is built for; Flux keeps
+> running plugins built for **0.3** and **0.2**, the version the [catalog](catalog.md) opened with
+> ([From 0.3 to 0.4](#from-03-to-04), [From 0.2 to 0.3](#from-02-to-03)).
 
 ## How plugins run
 
 A plugin is a **WebAssembly component** of the `flux:plugin` world, run by
 [wasmtime](https://wasmtime.dev) inside Flux. The API is described in WIT —
 [`crates/flux-plugin/wit/v0.3/flux-plugin.wit`](../crates/flux-plugin/wit/v0.3/flux-plugin.wit) is
-the reference (`wit/v0.2` — the previous version, which Flux still runs); this guide summarizes it.
+the reference — API 0.4 keeps its interfaces and adds keys of the manifest only (`wit/v0.2` — the
+previous interfaces, which Flux still runs); this guide summarizes it.
 Plugins are written in Rust with the SDK ([`crates/flux-plugin-api`](../crates/flux-plugin-api)) and
 built for the `wasm32-wasip2` target.
 
@@ -240,7 +241,7 @@ default = "Hello!"
 | `id` | required | Lowercase letters and digits, words joined by `.` or `-`: `someone.hello-world`. The plugin's key everywhere: its folder, settings, notification group, secrets. |
 | `name` | required | Shown in the manager, the palette's chips, Settings. |
 | `version` | required | The plugin's version. |
-| `api` | required | The plugin API it is built for: `"0.3"`. Flux runs 0.3 and 0.2 ([From 0.2 to 0.3](#from-02-to-03)); a plugin with code names the version of the SDK it was built with — Flux checks it against the component. |
+| `api` | required | The plugin API it is built for: `"0.4"`. Flux runs 0.4, 0.3 and 0.2 ([From 0.3 to 0.4](#from-03-to-04), [From 0.2 to 0.3](#from-02-to-03)); a plugin with code names the version of the SDK it was built with — Flux checks it against the component (a 0.4 plugin's component imports the 0.3 interfaces). |
 | `authors` | `[]` | |
 | `description` | `""` | Shown in the manager. |
 | `repository` | — | A link for the manager. |
@@ -276,7 +277,7 @@ notification actions.
 | `id` | required | What `run_command` gets. |
 | `title` | required | Also the label of its menu items. |
 | `category` | the plugin's name | The palette's chip. |
-| `keys` | — | A default shortcut in gpui's notation: `cmd-shift-h`, `alt-f7`. A key Flux already uses is not taken (the plugin's log says so). |
+| `keys` | — | A default shortcut in gpui's notation, in macOS keys: `cmd-shift-h`, `alt-f7`. On Windows ⌘ becomes Ctrl and ⌥ Alt (`ctrl-shift-h`). A key Flux already uses is not taken (the plugin's log says so). |
 | `palette` | `true` | `false` — not in the palette: a command only a notification's action, a settings button or a status bar item runs. |
 
 **`[[menus]]`** — an item of a context menu that runs one of the plugin's commands on what the menu
@@ -1058,6 +1059,27 @@ Yandex Tracker and Calendar — is built of these pieces:
    prompt and a mode.
 7. **News** — polling with `timers::every`; notifications whose actions carry the task's key
    (`Notice::action_with`, `context.argument()`).
+
+## From 0.3 to 0.4
+
+- API 0.4 adds two keys of a language ([Language plugins](languages.md)): `injections` — the
+  languages embedded in its files (the `<script>` of HTML, a Markdown code block, a Vue file's
+  `<script lang="ts">`), a tree-sitter injections query — and `file-patterns` — patterns of file
+  names (`.env.*`, `*.component.html`). A manifest that uses them says `api = "0.4"`; with an older
+  `api` they are unknown keys, an error. A Flux without 0.4 shows such a plugin as needing a newer
+  Flux.
+- `{server-dir}` in a language server's `args`, `initialization-options` and `settings` is the
+  folder Flux installed it in ([Language plugins](languages.md)); such a server always runs as Flux
+  installed it. `{root}` and `{root-uri}` there are the project's root folder, as a path and as a
+  `file://` URI.
+- A language server's `secondary = true` makes it a helper: never a file's main server while the
+  file has another, its completion and hover joining the main server's; `activation = { files,
+  dependencies }` starts it only in projects with one of those config files or npm dependencies.
+  Like the language keys, they need `api = "0.4"`.
+- Flux asks servers with `diagnosticProvider` for their problems (LSP 3.17 pull diagnostics), and
+  the catalog suggests a plugin for a file its language's `file-patterns` match (`.env.local`).
+- The interfaces haven't changed: a plugin with code built for 0.3 keeps working and may say
+  `api = "0.4"` as it is — its component imports the 0.3 interfaces (`flux:plugin@0.3.0`).
 
 ## From 0.2 to 0.3
 

@@ -150,12 +150,14 @@ fn a_broken_module_says_why_and_is_not_parsed_again() {
         display_name: "Broken".into(),
         extensions: vec!["zz-broken-wasm".into()],
         file_names: Vec::new(),
+        file_patterns: Vec::new(),
         aliases: Vec::new(),
         grammar: GrammarSource::Wasm {
             name: "json".into(),
             bytes: Arc::from(&b"\0asm not really"[..]),
         },
         highlights: "(string) @string".into(),
+        injections: String::new(),
         precedence: Precedence::LastPattern,
     };
     register("test.wasm-broken", vec![config]);

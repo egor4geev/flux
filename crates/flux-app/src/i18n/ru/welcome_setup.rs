@@ -26,10 +26,15 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "The languages found on this Mac are checked. Flux installs their plugins from the catalog; a language server comes by itself when you open the first file.",
         "Отмечены языки, которые нашлись на этом Mac. Flux поставит их плагины из каталога, а языковой сервер скачает сам, когда вы откроете первый файл.",
     ),
+    (
+        "The languages found on this computer are checked. Flux installs their plugins from the catalog; a language server comes by itself when you open the first file.",
+        "Отмечены языки, которые нашлись на этом компьютере. Flux поставит их плагины из каталога, а языковой сервер скачает сам, когда вы откроете первый файл.",
+    ),
     ("Already installed", "Уже установлен"),
     ("Ready to use", "Готов к работе"),
     ("Couldn't install", "Не установился"),
     ("Found on this Mac", "Найден на этом Mac"),
+    ("Found on this computer", "Найден на этом компьютере"),
     ("In every project", "Есть в каждом проекте"),
     (
         "Highlighting, errors, completion",

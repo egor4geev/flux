@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+flux-platform.workspace = true
 # Terminal emulation: the VT parser, the grid with scrollback, selection, regex search, and the PTY
 # with its I/O thread. Without the serde feature: nothing is serialized.
 alacritty_terminal = { version = "0.26.0", default-features = false }

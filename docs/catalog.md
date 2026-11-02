@@ -88,10 +88,11 @@ Releases, a release per plugin version (`<plugin id>-v<version>`).
 
 A plugin is offered as an update when its version is newer than the installed one by SemVer
 (`1.10.0` after `1.9.2`; a pre-release before its release). Its `api` must be a plugin API this Flux
-runs — **0.2 or 0.3** now: the Marketplace shows a plugin for another API as **Needs a newer Flux**
-and doesn't install it. Flux keeps running the older versions of the API since the catalog opened:
-a plugin built for 0.2 works on a Flux with 0.3 as it is, through the 0.2 interfaces
-([From 0.2 to 0.3](plugins.md#from-02-to-03)). The catalog takes plugins of every version Flux
+runs — **0.2, 0.3 or 0.4** now: the Marketplace shows a plugin for another API as **Needs a newer
+Flux** and doesn't install it. Flux keeps running the older versions of the API since the catalog
+opened: a plugin built for 0.2 works on a Flux with 0.3 as it is, through the 0.2 interfaces
+([From 0.2 to 0.3](plugins.md#from-02-to-03)); a language that embeds others or names files by
+patterns says `api = "0.4"` ([From 0.3 to 0.4](plugins.md#from-03-to-04)). The catalog takes plugins of every version Flux
 runs (`scripts/build.py`); a plugin with code names the version its SDK was built for, and takes
 the SDK from the Flux repository pinned to a commit of that version:
 

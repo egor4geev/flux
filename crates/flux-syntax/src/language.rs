@@ -1,7 +1,8 @@
 //! Language registry (stage 8.3): languages come from plugins. A plugin's `[[languages]]` entry,
-//! resolved by the application into a [`LanguageConfig`] (the query read from the plugin's files,
+//! resolved by the application into a [`LanguageConfig`] (the queries read from the plugin's files,
 //! the grammar's bytes), is registered under the plugin's id ([`register`]); detection by file path
-//! ([`language_for_path`]) and by name ([`language_by_name`]) look through what is registered.
+//! ([`language_for_path`]), by name ([`language_by_name`]) and by the name an injection gives
+//! ([`injected_language`]) look through what is registered.
 //!
 //! A grammar is either compiled into Flux ([`GrammarSource::Builtin`], [`builtin_grammar`]) or a
 //! tree-sitter grammar compiled to WebAssembly that a plugin ships ([`GrammarSource::Wasm`]).
@@ -19,6 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use tree_sitter::Query;
+
+use crate::injection::InjectionQuery;
+use flux_platform::glob::glob_matches;
 
 /// Which pattern wins when the same span is captured by several patterns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,11 +71,16 @@ pub struct LanguageConfig {
     pub extensions: Vec<String>,
     /// Exact file names: `Cargo.lock`, `.bashrc`.
     pub file_names: Vec<String>,
+    /// Patterns of file names (plugin API 0.4): `.env.*`, `*.component.html` ([`crate::glob_matches`]).
+    pub file_patterns: Vec<String>,
     /// More names for code fences and lookups by name: "rs", "py", "sh".
     pub aliases: Vec<String>,
     pub grammar: GrammarSource,
     /// The highlighting query (the plugin's query files, concatenated).
     pub highlights: String,
+    /// The injections query (plugin API 0.4): which nodes hold text of another language — a
+    /// `<script>`, a Markdown code block. Empty: the language embeds none.
+    pub injections: String,
     pub precedence: Precedence,
 }
 
@@ -81,6 +90,7 @@ pub struct Language {
     owner: String,
     grammar: OnceLock<Result<tree_sitter::Language, String>>,
     query: OnceLock<Option<Query>>,
+    injections: OnceLock<Option<InjectionQuery>>,
     /// A parse of its WebAssembly grammar outlived [`crate::wasm::PARSE_LIMIT`]: the grammar is
     /// not parsed any more.
     hung: AtomicBool,
@@ -222,7 +232,8 @@ pub fn language_by_name(name: &str) -> Option<Arc<Language>> {
     found.last().map(|language| (*language).clone())
 }
 
-/// The language by file name (`Cargo.lock`, `.zshrc`), otherwise by extension (in any case). A
+/// The language of a file: by its exact name (`Cargo.lock`, `.zshrc`), otherwise by a pattern of
+/// names (`.env.*`; the longest matching pattern wins), otherwise by its extension (in any case). A
 /// later registration wins: a plugin installed over a bundled one takes its files.
 pub fn language_for_path(path: &Path) -> Option<Arc<Language>> {
     let file_name = path.file_name()?.to_str()?;
@@ -239,6 +250,21 @@ pub fn language_for_path(path: &Path) -> Option<Arc<Language>> {
     {
         return Some((*language).clone());
     }
+    // The longest pattern is the most specific: `*.component.html` over `*.html`-like ones. On a
+    // tie, the later registration (the first one met going back).
+    let mut best: Option<(usize, &Arc<Language>)> = None;
+    for language in all.iter().rev() {
+        for pattern in &language.config.file_patterns {
+            let length = pattern.chars().count();
+            if best.is_none_or(|(longest, _)| length > longest) && glob_matches(pattern, file_name)
+            {
+                best = Some((length, language));
+            }
+        }
+    }
+    if let Some((_, language)) = best {
+        return Some(language.clone());
+    }
     let extension = path.extension()?.to_str()?;
     all.iter()
         .rev()
@@ -252,6 +278,34 @@ pub fn language_for_path(path: &Path) -> Option<Arc<Language>> {
         .map(|language| (*language).clone())
 }
 
+/// The language an injection names (`#set! injection.language "ts"`, a Markdown fence's `py`), in
+/// any case: by id first, then by alias, then by extension. A later registration wins within each.
+pub fn injected_language(name: &str) -> Option<Arc<Language>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let registry = REGISTRY.read().unwrap();
+    let all: Vec<&Arc<Language>> = registry
+        .owners
+        .iter()
+        .flat_map(|(_, languages)| languages)
+        .collect();
+    let by = |names: fn(&LanguageConfig) -> &[String]| {
+        all.iter()
+            .rev()
+            .find(|language| {
+                names(&language.config)
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(name))
+            })
+            .map(|language| (*language).clone())
+    };
+    by(|config| std::slice::from_ref(&config.name))
+        .or_else(|| by(|config| &config.aliases))
+        .or_else(|| by(|config| &config.extensions))
+}
+
 impl Language {
     pub(crate) fn new(owner: &str, config: LanguageConfig) -> Self {
         Self {
@@ -259,6 +313,7 @@ impl Language {
             owner: owner.to_string(),
             grammar: OnceLock::new(),
             query: OnceLock::new(),
+            injections: OnceLock::new(),
             hung: AtomicBool::new(false),
         }
     }
@@ -347,6 +402,30 @@ impl Language {
         self.query.get().and_then(Option::as_ref)
     }
 
+    /// Whether the language embeds others: it has an injections query.
+    pub fn has_injections(&self) -> bool {
+        !self.config.injections.trim().is_empty()
+    }
+
+    /// The injections query, compiled on first access (not on the UI thread, like
+    /// [`Language::query`]). `None` if the language has none, or it doesn't compile.
+    pub(crate) fn injections(&self) -> Option<&InjectionQuery> {
+        if !self.has_injections() {
+            return None;
+        }
+        self.injections
+            .get_or_init(|| InjectionQuery::new(self.grammar()?, &self.config.injections))
+            .as_ref()
+    }
+
+    /// Whether everything a parse of this language needs on the UI thread is ready: the grammar
+    /// is loaded and the queries are compiled (the background parse does it).
+    pub(crate) fn is_ready(&self) -> bool {
+        self.loaded_grammar().is_some()
+            && self.compiled_query().is_some()
+            && (!self.has_injections() || self.injections.get().is_some())
+    }
+
     /// The capture names of the highlighting query; an index in this list is the capture index.
     pub fn capture_names(&self) -> &[&str] {
         self.query().map_or(&[], Query::capture_names)
@@ -381,8 +460,8 @@ fn load_grammar(source: &GrammarSource) -> Result<tree_sitter::Language, String>
 /// their `not-`/`any-` variants. It skips the others, and so do we:
 /// - `#is-not? local` (and any `#is-not?`): we don't track local variables, so no node is "local":
 ///   the condition is satisfied and the pattern applies;
-/// - `#set!`: pattern properties are needed by injections and locals, neither of which we have
-///   here;
+/// - `#set!`: pattern properties are needed by injections ([`crate::injection`]) and locals, not by
+///   highlighting;
 /// - unknown general predicates (`#lua-match?`…): like tree-sitter-highlight, we don't filter the
 ///   match.
 ///
@@ -506,9 +585,11 @@ mod tests {
             display_name: name.to_uppercase(),
             extensions: vec![extension.into()],
             file_names: Vec::new(),
+            file_patterns: Vec::new(),
             aliases: Vec::new(),
             grammar: GrammarSource::Builtin("json".into()),
             highlights: "(string) @string".into(),
+            injections: String::new(),
             precedence: Precedence::LastPattern,
         }
     }
@@ -547,6 +628,69 @@ mod tests {
             "zzfirst"
         );
         unregister("test.first");
+    }
+
+    #[test]
+    fn file_names_win_over_patterns_and_the_longest_pattern_wins() {
+        let mut env = config("zzenv", "zzenv");
+        env.file_patterns = vec![".zzenv.*".into(), "*.zzenv".into()];
+        let mut html = config("zzhtml", "zzhtml");
+        html.file_names = vec!["exact.component.zzhtml".into()];
+        let mut angular = config("zzangular", "zzangular");
+        angular.file_patterns = vec!["*.component.zzhtml".into(), "*.zzhtml".into()];
+        register("test.patterns", vec![env, html, angular]);
+        let name = |path: &str| language_for_path(Path::new(path)).map(|l| l.name().to_string());
+        assert_eq!(name("/p/.zzenv.local").as_deref(), Some("zzenv"));
+        assert_eq!(name("/p/prod.ZZENV").as_deref(), Some("zzenv"));
+        assert_eq!(
+            name("/p/app.component.zzhtml").as_deref(),
+            Some("zzangular")
+        );
+        // A pattern wins over the extension of another language.
+        assert_eq!(name("/p/page.zzhtml").as_deref(), Some("zzangular"));
+        assert_eq!(name("/p/exact.component.zzhtml").as_deref(), Some("zzhtml"));
+        // Another plugin's longer pattern wins over a shorter one registered later.
+        let mut short = config("zzshort", "zzshort");
+        short.file_patterns = vec!["*.zzhtml".into()];
+        register("test.patterns-later", vec![short]);
+        assert_eq!(
+            name("/p/app.component.zzhtml").as_deref(),
+            Some("zzangular")
+        );
+        assert_eq!(
+            name("/p/page.zzhtml").as_deref(),
+            Some("zzshort"),
+            "a tie: the later one"
+        );
+        unregister("test.patterns-later");
+        unregister("test.patterns");
+    }
+
+    #[test]
+    fn an_injected_language_goes_by_id_then_alias_then_extension() {
+        let mut first = config("zzinj-a", "zzinj-ext");
+        first.aliases = vec!["zzinj-b".into()];
+        let second = config("zzinj-b", "zzinj-other");
+        register("test.injected", vec![first, second]);
+        let name = |n: &str| injected_language(n).map(|l| l.name().to_string());
+        assert_eq!(name("ZZINJ-A").as_deref(), Some("zzinj-a"));
+        assert_eq!(
+            name("zzinj-b").as_deref(),
+            Some("zzinj-b"),
+            "an id before an alias"
+        );
+        assert_eq!(
+            name(" zzinj-ext ").as_deref(),
+            Some("zzinj-a"),
+            "an extension"
+        );
+        assert_eq!(name("zzinj-none"), None);
+        assert_eq!(name(""), None);
+        unregister("test.injected");
+        standard::register();
+        assert_eq!(injected_language("py").unwrap().name(), "python");
+        assert_eq!(injected_language("JS").unwrap().name(), "javascript");
+        assert_eq!(injected_language("mts").unwrap().name(), "typescript");
     }
 
     #[test]

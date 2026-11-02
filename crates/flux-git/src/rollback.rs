@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn modified_deleted_and_added_files_are_rolled_back() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let repo = init_repo(&root);
         fs::write(root.join("a.txt"), "a\n").unwrap();
         fs::write(root.join("b.txt"), "b\n").unwrap();

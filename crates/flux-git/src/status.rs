@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn untracked_and_ignored_directories() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let repo = init_repo(&root);
         fs::write(root.join(".gitignore"), "target/\n*.log\n").unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn status_of_a_real_repository() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = flux_platform::path_style::canonicalize(dir.path()).unwrap();
         let repo = init_repo(&root);
         fs::write(root.join("a.txt"), "one\n").unwrap();
         repo.git().args(["add", "a.txt"]).output().unwrap();

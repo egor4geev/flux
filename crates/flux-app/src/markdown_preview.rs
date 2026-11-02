@@ -87,19 +87,22 @@ const LIST_INDENT: f32 = 22.;
 
 pub fn init(cx: &mut App) {
     let context = Some(CONTEXT);
-    cx.bind_keys([
-        KeyBinding::new("up", ScrollUp, context),
-        KeyBinding::new("down", ScrollDown, context),
-        KeyBinding::new("pageup", ScrollPageUp, context),
-        KeyBinding::new("pagedown", ScrollPageDown, context),
-        KeyBinding::new("shift-space", ScrollPageUp, context),
-        KeyBinding::new("space", ScrollPageDown, context),
-        KeyBinding::new("cmd-up", ScrollToTop, context),
-        KeyBinding::new("home", ScrollToTop, context),
-        KeyBinding::new("cmd-down", ScrollToBottom, context),
-        KeyBinding::new("end", ScrollToBottom, context),
-        KeyBinding::new("cmd-s", crate::editor::Save, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("up", ScrollUp, context),
+            KeyBinding::new("down", ScrollDown, context),
+            KeyBinding::new("pageup", ScrollPageUp, context),
+            KeyBinding::new("pagedown", ScrollPageDown, context),
+            KeyBinding::new("shift-space", ScrollPageUp, context),
+            KeyBinding::new("space", ScrollPageDown, context),
+            KeyBinding::new("cmd-up", ScrollToTop, context),
+            KeyBinding::new("home", ScrollToTop, context),
+            KeyBinding::new("cmd-down", ScrollToBottom, context),
+            KeyBinding::new("end", ScrollToBottom, context),
+            KeyBinding::new("cmd-s", crate::editor::Save, context),
+        ],
+    );
 }
 
 /// A Markdown file, by its extension.

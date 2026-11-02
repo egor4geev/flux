@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 flux-core.workspace = true
+flux-platform.workspace = true
 tree-sitter.workspace = true
 # The grammars compiled into Flux: JavaScript and TypeScript come with it (the bundled plugin
 # `flux.javascript`); every other language is a plugin with a WebAssembly grammar.

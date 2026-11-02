@@ -117,7 +117,8 @@ fn the_manifest_must_name_the_api_the_component_is_built_for() {
         error,
         "The component is built for plugin API 0.2, but flux-plugin.toml says api = \"0.3\""
     );
-    // A 0.3 component that says it is 0.2.
+    // A 0.3 component that says it is 0.2 (the probe's manifest says the current API, 0.4, whose
+    // components are 0.3 ones — every other probe test runs that way).
     let Some(entry) = probe_manifest("test.v03-says-02", "project = \"none\"", &[], "") else {
         return;
     };
@@ -125,7 +126,10 @@ fn the_manifest_must_name_the_api_the_component_is_built_for() {
     let manifest = std::fs::read_to_string(dir.join("flux-plugin.toml")).unwrap();
     std::fs::write(
         dir.join("flux-plugin.toml"),
-        manifest.replace("api = \"0.3\"", "api = \"0.2\""),
+        manifest.replace(
+            &format!("api = \"{}\"", crate::API_VERSION),
+            "api = \"0.2\"",
+        ),
     )
     .unwrap();
     let entry = load_dir(&dir, PluginSource::Installed).unwrap();
@@ -158,7 +162,7 @@ fn start_stopped(entry: PluginEntry) -> Probe {
 
 #[test]
 fn plugins_without_code_load_for_either_api_and_not_for_others() {
-    for (api, works) in [("0.2", true), ("0.3", true), ("9.9", false)] {
+    for (api, works) in [("0.2", true), ("0.3", true), ("0.4", true), ("9.9", false)] {
         let dir = temp_dir("declarative-api");
         std::fs::write(
             dir.join("flux-plugin.toml"),
@@ -173,7 +177,7 @@ fn plugins_without_code_load_for_either_api_and_not_for_others() {
         } else {
             assert_eq!(
                 entry.problem.as_deref(),
-                Some("Built for plugin API 9.9; this Flux runs 0.2, 0.3")
+                Some("Built for plugin API 9.9; this Flux runs 0.2, 0.3, 0.4")
             );
         }
     }

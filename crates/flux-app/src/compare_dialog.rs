@@ -46,15 +46,18 @@ const ROW_HEIGHT: f32 = 28.;
 
 pub fn init(cx: &mut App) {
     let context = Some("CompareDialog");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-        KeyBinding::new("right", FocusFiles, context),
-        KeyBinding::new("left", FocusCommits, context),
-        KeyBinding::new("tab", SwitchTab, context),
-        KeyBinding::new("enter", OpenDiff, context),
-        KeyBinding::new("escape", Dismiss, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+            KeyBinding::new("right", FocusFiles, context),
+            KeyBinding::new("left", FocusCommits, context),
+            KeyBinding::new("tab", SwitchTab, context),
+            KeyBinding::new("enter", OpenDiff, context),
+            KeyBinding::new("escape", Dismiss, context),
+        ],
+    );
 }
 
 /// The dialog's window-level actions: `CompareWithCurrent`, `DiffWithWorkingTree`.
@@ -829,7 +832,10 @@ fn file_row(
     ui: UiColors,
 ) -> gpui::Stateful<Div> {
     let (dir, name) = match file.path.rsplit_once('/') {
-        Some((dir, name)) => (Some(dir.to_string()), name.to_string()),
+        Some((dir, name)) => (
+            Some(flux_platform::PathStyle::NATIVE.native(dir).into_owned()),
+            name.to_string(),
+        ),
         None => (None, file.path.clone()),
     };
     let detail: Option<SharedString> = match (file.status, &file.orig_path) {

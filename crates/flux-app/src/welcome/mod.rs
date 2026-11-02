@@ -39,6 +39,7 @@ use crate::icons::{IconName, icon};
 use crate::motion::{self, TransitionExt as _};
 use crate::notifications::Notification;
 use crate::theme::{self, Theme, UiColors};
+use crate::title_bar;
 use crate::ui;
 use crate::workspace::{self, Workspace};
 
@@ -243,15 +244,18 @@ pub enum Start {
 }
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("right", Next, Some(CONTEXT)),
-        KeyBinding::new("enter", Next, Some(CONTEXT)),
-        KeyBinding::new("left", Previous, Some(CONTEXT)),
-        KeyBinding::new("escape", Close, Some(CONTEXT)),
-        KeyBinding::new("cmd-w", CloseWindow, Some(CONTEXT)),
-        // On the first launch the guide may be Flux's only window: ⌘Q works in it too.
-        KeyBinding::new("cmd-q", workspace::Quit, Some(CONTEXT)),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("right", Next, Some(CONTEXT)),
+            KeyBinding::new("enter", Next, Some(CONTEXT)),
+            KeyBinding::new("left", Previous, Some(CONTEXT)),
+            KeyBinding::new("escape", Close, Some(CONTEXT)),
+            KeyBinding::new("cmd-w", CloseWindow, Some(CONTEXT)),
+            // On the first launch the guide may be Flux's only window: ⌘Q works in it too.
+            KeyBinding::new("cmd-q", workspace::Quit, Some(CONTEXT)),
+        ],
+    );
     tour::bind_keys(cx);
     // Global: from the menu bar and the palette of any window, and with no window at all. After
     // the action's own update, when the window it came from can be read (its screen).
@@ -988,6 +992,11 @@ impl Render for WelcomeGuide {
             .children(left)
             .child(page);
         let title = self.title();
+        let os = title_bar::os();
+        let window_buttons = title_bar::render_window_buttons(
+            title_bar::window_buttons(os, window.is_fullscreen(), false, false),
+            ui,
+        );
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -1018,17 +1027,26 @@ impl Render for WelcomeGuide {
             .text_color(ui.foreground)
             .when(!flat, |root| root.child(ui::frame_glow(ui)))
             .child(
-                div()
-                    .h(px(ui::TITLE_BAR_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .text_size(px(theme::TEXT_SM + 0.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(ui.text_muted)
-                    .child(icon(IconName::Logo, ui.accent_text).size(px(13.)))
-                    .child(title),
+                // On Windows (part 10.9) the title bar is the guide's caption, with minimize and
+                // close at its right end: the guide can't be resized.
+                title_bar::caption(
+                    os,
+                    div()
+                        .h(px(ui::TITLE_BAR_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .text_size(px(theme::TEXT_SM + 0.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ui.text_muted)
+                        .child(icon(IconName::Logo, ui.accent_text).size(px(13.)))
+                        .child(title),
+                )
+                .when_some(window_buttons, |bar, buttons| {
+                    bar.relative()
+                        .child(div().absolute().top_0().right_0().h_full().child(buttons))
+                }),
             )
             .child(
                 ui::island(ui, style)

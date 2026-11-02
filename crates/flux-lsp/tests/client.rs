@@ -2,7 +2,6 @@
 //! cancellation, notifications both ways, server requests, crashes.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,10 +45,13 @@ impl Fake {
             args,
             extensions: vec!["rs".into()],
             file_names: vec![],
+            file_patterns: Vec::new(),
             initialization_options: None,
             settings: None,
             install: None,
             env: Default::default(),
+            secondary: false,
+            activation: None,
         }
     }
 
@@ -146,11 +148,7 @@ fn hover_params(uri: Uri, line: u32) -> HoverParams {
 }
 
 fn process_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    flux_platform::process::alive(pid)
 }
 
 fn wait_dead(pid: u32) {
@@ -558,4 +556,197 @@ enum FluxAskConfiguration {}
 impl Notification for FluxAskConfiguration {
     type Params = ();
     const METHOD: &'static str = "flux/askConfiguration";
+}
+
+/// The fake server's next pull answers `ServerCancelled`.
+enum FluxCancelNextPull {}
+
+impl Notification for FluxCancelNextPull {
+    type Params = ();
+    const METHOD: &'static str = "flux/cancelNextPull";
+}
+
+/// The fake server sends `workspace/diagnostic/refresh`.
+enum FluxRefreshDiagnostics {}
+
+impl Notification for FluxRefreshDiagnostics {
+    type Params = ();
+    const METHOD: &'static str = "flux/refreshDiagnostics";
+}
+
+#[test]
+fn pulled_diagnostics_with_result_ids_cancellation_and_refresh() {
+    use flux_lsp::lsp_types::notification::DidChangeTextDocument;
+    use flux_lsp::lsp_types::{
+        DidChangeTextDocumentParams, TextDocumentContentChangeEvent,
+        VersionedTextDocumentIdentifier,
+    };
+    use flux_lsp::pull::PulledReport;
+
+    let fake = Fake::new();
+    let (server, mut events) = fake.start(&["--pull"]);
+    assert!(matches!(next_event(&mut events), ServerEvent::Initialized));
+    // The client says it can pull, with related documents, and be told to pull again.
+    let capabilities = &fake.received()[1]["params"]["capabilities"];
+    assert_eq!(
+        capabilities["textDocument"]["diagnostic"],
+        json!({ "dynamicRegistration": false, "relatedDocumentSupport": true })
+    );
+    assert_eq!(
+        capabilities["workspace"]["diagnostics"],
+        json!({ "refreshSupport": true })
+    );
+    assert!(server.pulls_diagnostics());
+    server.notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+        text_document: TextDocumentItem::new(uri(&fake), "rust".into(), 0, "fn main() {}".into()),
+    });
+
+    let pulled = block_on(server.pull_diagnostics(uri(&fake), None)).unwrap();
+    let Some(PulledReport::Full { result_id, items }) = pulled.report else {
+        panic!("a full report first");
+    };
+    assert_eq!(result_id.as_deref(), Some("r0"));
+    assert_eq!(items[0].message, "pulled 0");
+    // The server's identifier went with the request.
+    assert_eq!(items[0].source.as_deref(), Some("fake"));
+    assert_eq!(pulled.related.len(), 1);
+    assert!(pulled.related[0].0.as_str().ends_with("/related.rs"));
+
+    // Nothing changed: "unchanged" for the result id named.
+    let pulled = block_on(server.pull_diagnostics(uri(&fake), Some("r0".into()))).unwrap();
+    assert_eq!(
+        pulled.report,
+        Some(PulledReport::Unchanged {
+            result_id: "r0".into()
+        })
+    );
+    let request = fake.wait_received(|m| {
+        m["method"] == "textDocument/diagnostic" && m["params"]["previousResultId"] == "r0"
+    });
+    assert_eq!(request["params"]["identifier"], "fake");
+
+    // An edit: a new report.
+    server.notify::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier::new(uri(&fake), 1),
+        content_changes: vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: "fn main() { x }".into(),
+        }],
+    });
+    let pulled = block_on(server.pull_diagnostics(uri(&fake), Some("r0".into()))).unwrap();
+    assert!(matches!(
+        pulled.report,
+        Some(PulledReport::Full { ref result_id, ref items })
+            if result_id.as_deref() == Some("r1") && items[0].message == "pulled 1"
+    ));
+
+    // The server cancels a pull and asks for it again.
+    server.notify::<FluxCancelNextPull>(());
+    let error = block_on(server.pull_diagnostics(uri(&fake), Some("r1".into()))).unwrap_err();
+    assert!(error.retrigger(), "{error:?}");
+
+    // The server's configuration changed: it asks the client to pull again.
+    server.notify::<FluxRefreshDiagnostics>(());
+    wait_event(&mut events, |e| {
+        matches!(e, ServerEvent::DiagnosticsRefresh)
+    });
+    let answer = fake.wait_received(|m| m["id"] == "refresh" && m.get("method").is_none());
+    assert_eq!(answer["result"], Value::Null);
+}
+
+#[test]
+fn completion_and_hover_of_a_main_and_a_secondary_server_merge() {
+    use flux_lsp::lsp_types::{CompletionResponse, CompletionTextEdit, TextEdit};
+
+    let main_fake = Fake::new();
+    let secondary_fake = Fake::new();
+    let (main, mut main_events) = main_fake.start(&["--items=flex,grid", "--hover=**main**"]);
+    let (secondary, mut secondary_events) =
+        secondary_fake.start(&["--items=flex,flex-col", "--hover=`.flex`"]);
+    assert!(matches!(
+        next_event(&mut main_events),
+        ServerEvent::Initialized
+    ));
+    assert!(matches!(
+        next_event(&mut secondary_events),
+        ServerEvent::Initialized
+    ));
+    let completion = |server: &LanguageServer, fake: &Fake| {
+        block_on(server.request::<Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri(fake) },
+                position: Position::new(0, 0),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        }))
+        .unwrap()
+        .unwrap()
+    };
+    let answers = vec![
+        (0, completion(&main, &main_fake)),
+        (1, completion(&secondary, &secondary_fake)),
+    ];
+    let (items, incomplete) = flux_lsp::merge::completions(answers);
+    let labels: Vec<(usize, &str)> = items
+        .iter()
+        .map(|(source, item)| (*source, item.label.as_str()))
+        .collect();
+    // The main server's first; the secondary's `flex` is the same item.
+    assert_eq!(labels, [(0, "flex"), (0, "grid"), (1, "flex-col")]);
+    assert!(!incomplete);
+    // An item that inserts other text is kept.
+    let edited = CompletionResponse::Array(vec![flux_lsp::lsp_types::CompletionItem {
+        label: "flex".into(),
+        text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+            Default::default(),
+            "flex ".into(),
+        ))),
+        ..Default::default()
+    }]);
+    let (items, _) =
+        flux_lsp::merge::completions(vec![(0, completion(&main, &main_fake)), (1, edited)]);
+    assert_eq!(items.len(), 3);
+
+    let hover = |server: &LanguageServer, fake: &Fake| {
+        block_on(server.request::<HoverRequest>(hover_params(uri(fake), 0))).unwrap()
+    };
+    let merged = flux_lsp::merge::hovers(
+        [hover(&main, &main_fake), hover(&secondary, &secondary_fake)]
+            .into_iter()
+            .flatten()
+            .collect(),
+    )
+    .unwrap();
+    assert_eq!(
+        merged.contents,
+        HoverContents::Markup(MarkupContent {
+            kind: flux_lsp::lsp_types::MarkupKind::Markdown,
+            value: "**main**\n\n---\n\n`.flex`".into(),
+        })
+    );
+    // A server without a hover there adds nothing.
+    let quiet_fake = Fake::new();
+    let (quiet, mut quiet_events) = quiet_fake.start(&["--hover="]);
+    assert!(matches!(
+        next_event(&mut quiet_events),
+        ServerEvent::Initialized
+    ));
+    assert_eq!(hover(&quiet, &quiet_fake), None);
+    let merged = flux_lsp::merge::hovers(
+        [hover(&main, &main_fake), hover(&quiet, &quiet_fake)]
+            .into_iter()
+            .flatten()
+            .collect(),
+    )
+    .unwrap();
+    assert_eq!(
+        merged.contents,
+        HoverContents::Markup(MarkupContent {
+            kind: flux_lsp::lsp_types::MarkupKind::Markdown,
+            value: "**main**".into(),
+        })
+    );
 }

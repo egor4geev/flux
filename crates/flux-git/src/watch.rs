@@ -91,7 +91,7 @@ impl Classifier {
             .into_iter()
             .chain(&git_dirs)
             .filter_map(|dir| {
-                let real = std::fs::canonicalize(dir).ok()?;
+                let real = flux_platform::path_style::canonicalize(dir).ok()?;
                 (real != *dir).then(|| (real, dir.clone()))
             })
             .collect();

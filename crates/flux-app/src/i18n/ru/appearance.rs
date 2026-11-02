@@ -9,18 +9,38 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Dark themes", "Тёмные темы"),
     ("Light themes", "Светлые темы"),
     ("While macOS is dark", "Пока в macOS тёмный режим"),
+    (
+        "While Windows is in dark mode",
+        "Пока в Windows тёмный режим",
+    ),
     ("While macOS is light", "Пока в macOS светлый режим"),
+    (
+        "While Windows is in light mode",
+        "Пока в Windows светлый режим",
+    ),
     (
         "Switch between a light and a dark theme together with macOS.",
         "Переключать светлую и тёмную тему вместе с macOS.",
+    ),
+    (
+        "Switch between a light and a dark theme together with Windows.",
+        "Переключать светлую и тёмную тему вместе с Windows.",
     ),
     (
         "macOS is dark now: Flux shows the dark theme.",
         "Сейчас в macOS тёмный режим — Flux показывает тёмную тему.",
     ),
     (
+        "Windows is in dark mode now: Flux shows the dark theme.",
+        "Сейчас в Windows тёмный режим — Flux показывает тёмную тему.",
+    ),
+    (
         "macOS is light now: Flux shows the light theme.",
         "Сейчас в macOS светлый режим — Flux показывает светлую тему.",
+    ),
+    (
+        "Windows is in light mode now: Flux shows the light theme.",
+        "Сейчас в Windows светлый режим — Flux показывает светлую тему.",
     ),
     ("Built into Flux", "Встроена во Flux"),
     (

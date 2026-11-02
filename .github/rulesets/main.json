@@ -31,7 +31,8 @@
         "required_status_checks": [
           { "context": "PR source", "integration_id": 15368 },
           { "context": "Format", "integration_id": 15368 },
-          { "context": "Clippy and tests (macOS)", "integration_id": 15368 }
+          { "context": "Clippy and tests (macOS)", "integration_id": 15368 },
+          { "context": "Clippy and tests (Windows)", "integration_id": 15368 }
         ]
       }
     }

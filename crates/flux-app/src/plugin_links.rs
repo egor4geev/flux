@@ -574,7 +574,7 @@ mod tests {
     fn run(len: usize) -> TextRun {
         TextRun {
             len,
-            font: gpui::font("Menlo"),
+            font: gpui::font(theme::code_font()),
             color: gpui::black(),
             background_color: None,
             underline: None,

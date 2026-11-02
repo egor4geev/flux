@@ -201,9 +201,11 @@ mod tests {
                 display_name: name.into(),
                 extensions: Vec::new(),
                 file_names: Vec::new(),
+                file_patterns: Vec::new(),
                 aliases: Vec::new(),
                 grammar: GrammarSource::Builtin("javascript".into()),
                 highlights: String::new(),
+                injections: String::new(),
                 precedence: Precedence::LastPattern,
             },
         ))

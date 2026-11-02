@@ -52,6 +52,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Asking a neutral service where the network sees this Mac",
         "Спрашиваем нейтральный сервис, где сеть видит этот Mac",
     ),
+    (
+        "Asking a neutral service where the network sees this computer",
+        "Спрашиваем нейтральный сервис, где сеть видит этот компьютер",
+    ),
     ("Country Check", "Проверка страны"),
     ("Off in Settings", "Выключена в настройках"),
     ("Checking now…", "Проверяем…"),
@@ -83,6 +87,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     (
         "Flux finds out which country the network shows for this Mac and stops Claude while that country is on the list below or can't be found out.",
         "Flux определяет, из какой страны сеть видит этот Mac, и останавливает Claude, пока эта страна в списке ниже или её не удаётся определить.",
+    ),
+    (
+        "Flux finds out which country the network shows for this computer and stops Claude while that country is on the list below or can't be found out.",
+        "Flux определяет, из какой страны сеть видит этот компьютер, и останавливает Claude, пока эта страна в списке ниже или её не удаётся определить.",
     ),
     (
         "The stop is at once: running sessions end, and nothing is sent to Claude until the country changes. Flux checks as it starts, every minute (every 10 s while Claude works), when the network changes and before a new request. It asks a neutral service, never Claude's servers.",

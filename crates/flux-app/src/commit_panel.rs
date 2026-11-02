@@ -181,31 +181,37 @@ pub struct UseMessage(pub usize);
 
 pub fn init(cx: &mut App) {
     let list = Some("CommitChanges");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, list),
-        KeyBinding::new("up", SelectPrevious, list),
-        KeyBinding::new("home", SelectFirst, list),
-        KeyBinding::new("end", SelectLast, list),
-        KeyBinding::new("right", Expand, list),
-        KeyBinding::new("left", Collapse, list),
-        KeyBinding::new("space", ToggleChecked, list),
-        // As in the Commit tool window of JetBrains IDEs.
-        KeyBinding::new("enter", ShowDiff, list),
-        KeyBinding::new("cmd-d", ShowDiff, list),
-        KeyBinding::new("f4", JumpToSource, list),
-        KeyBinding::new("cmd-down", JumpToSource, list),
-        KeyBinding::new("alt-cmd-z", Rollback, list),
-        KeyBinding::new("cmd-backspace", Delete, list),
-        KeyBinding::new("alt-cmd-c", CopyPath, list),
-        KeyBinding::new("shift-f10", ShowContextMenu, list),
-        KeyBinding::new("tab", FocusMessage, list),
-        KeyBinding::new("escape", Cancel, list),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, list),
+            KeyBinding::new("up", SelectPrevious, list),
+            KeyBinding::new("home", SelectFirst, list),
+            KeyBinding::new("end", SelectLast, list),
+            KeyBinding::new("right", Expand, list),
+            KeyBinding::new("left", Collapse, list),
+            KeyBinding::new("space", ToggleChecked, list),
+            // As in the Commit tool window of JetBrains IDEs.
+            KeyBinding::new("enter", ShowDiff, list),
+            KeyBinding::new("cmd-d", ShowDiff, list),
+            KeyBinding::new("f4", JumpToSource, list),
+            KeyBinding::new("cmd-down", JumpToSource, list),
+            KeyBinding::new("alt-cmd-z", Rollback, list),
+            KeyBinding::new("cmd-backspace", Delete, list),
+            KeyBinding::new("alt-cmd-c", CopyPath, list),
+            KeyBinding::new("shift-f10", ShowContextMenu, list),
+            KeyBinding::new("tab", FocusMessage, list),
+            KeyBinding::new("escape", Cancel, list),
+        ],
+    );
     let panel = Some("CommitPanel");
-    cx.bind_keys([
-        KeyBinding::new("cmd-enter", CommitChanges, panel),
-        KeyBinding::new("alt-shift-cmd-k", CommitAndPush, panel),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-enter", CommitChanges, panel),
+            KeyBinding::new("alt-shift-cmd-k", CommitAndPush, panel),
+        ],
+    );
 }
 
 /// What the commit window asks the workspace to do.
@@ -2934,14 +2940,17 @@ impl CommitPanel {
                 1,
                 IconName::Branch,
                 tr("No Git repository"),
-                Some(tr("Open a folder with a repository: ⌘O")),
+                Some(SharedString::from(trf(
+                    "Open a folder with a repository: {0}",
+                    &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+                ))),
             )
         } else {
             (
                 2,
                 IconName::Check,
                 tr("No changes"),
-                Some(tr("Edits to the project's files show up here")),
+                Some(tr("Edits to the project's files show up here").into()),
             )
         };
         let empty = div()
@@ -3489,7 +3498,8 @@ pub(crate) fn restore_originals(jobs: &[(PathBuf, Option<Arc<str>>)]) -> Vec<Str
 /// Writes a file through a temporary one and a rename, keeping its permissions (as a document's
 /// save): a failure leaves the old file whole.
 fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target =
+        flux_platform::path_style::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let permissions = std::fs::metadata(&target)
         .ok()
         .map(|meta| meta.permissions());

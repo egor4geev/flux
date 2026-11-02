@@ -8,6 +8,9 @@
 # Flux downloads itself) and a .dmg (the first install); latest.json describes the release for
 # Flux's updater, each archive signed with Ed25519 (secret FLUX_UPDATE_PRIVATE_KEY; the public key
 # is built into Flux — crates/flux-update). Notarization: none (no Apple Developer ID, Roadmap 10.8).
+# Flux.exe (part 10.9) is built for x64 and ARM64 with MSVC and packed as a .zip (the update, and
+# Flux to run without installing) and an installer (-setup.exe, scripts/windows/flux.iss). Not
+# signed: Windows SmartScreen asks once (More info → Run anyway).
 #
 # A pull request into main (a release or a hotfix) and Run workflow make a dry run: everything but
 # the release — the downloads and latest.json stay as the run's artifacts, to try before tagging.
@@ -194,9 +197,106 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+  build-windows:
+    name: Build (Windows ${{ matrix.arch }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            inno: x64
+          # Built where it runs: the ARM64 runner.
+          - arch: aarch64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            inno: arm64
+    env:
+      FLUX_BUILD_VERSION: ${{ needs.verify.outputs.version }}
+      # The C runtime linked in (the C code built with /MT too): a fresh Windows has no
+      # vcruntime140.dll, and Flux.exe must start without the Visual C++ Redistributable.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      # The files as the repository has them (LF): Windows' git would turn them into CRLF.
+      - name: Line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+
+      # A clean build, without caches, as on macOS. The ARM64 runner may lack rustup, cmake
+      # (wasmtime's C API) and clang (ring's ARM64 code): installed when missing.
+      - name: Rust
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -sSfL -o "$RUNNER_TEMP/rustup-init.exe" \
+              "https://static.rust-lang.org/rustup/dist/${{ matrix.target }}/rustup-init.exe"
+            "$RUNNER_TEMP/rustup-init.exe" -y --profile minimal --default-toolchain none --no-modify-path
+            export PATH="$HOME/.cargo/bin:$PATH"
+            echo "$USERPROFILE\.cargo\bin" >>"$GITHUB_PATH"
+          fi
+          rustup toolchain install stable --profile minimal --target wasm32-wasip2 \
+            --target ${{ matrix.target }} --no-self-update
+          rustup default stable
+          rustc --version
+          if ! command -v cmake >/dev/null; then
+            choco install cmake --no-progress -y
+            echo 'C:\Program Files\CMake\bin' >>"$GITHUB_PATH"
+          fi
+          if [ "${{ matrix.arch }}" = aarch64 ] && ! command -v clang >/dev/null; then
+            choco install llvm --no-progress -y
+            echo 'C:\Program Files\LLVM\bin' >>"$GITHUB_PATH"
+          fi
+          echo "FLUX_COMMIT=$(git rev-parse --short=7 HEAD)" >>"$GITHUB_ENV"
+
+      - name: Flux.exe
+        run: |
+          cargo build --release -p flux-app --target ${{ matrix.target }}
+          mkdir -p dist/app
+          cp target/${{ matrix.target }}/release/flux.exe dist/app/Flux.exe
+          cp LICENSE dist/app/LICENSE.txt
+          # Only Windows' own DLLs: no Visual C++ runtime to install first.
+          if grep -aiqE '(vcruntime140(_1)?|msvcp140)\.dll' dist/app/Flux.exe; then
+            echo "::error title=C runtime::Flux.exe needs the Visual C++ runtime DLLs (crt-static is off)."
+            exit 1
+          fi
+          /bin/ls -l dist/app
+
+      # The zip holds the files at its root (Explorer's Extract All makes the folder), as the
+      # Mac's script makes it (scripts/bundle-windows.sh); the updater unpacks it into Flux's folder.
+      - name: Zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/app/* -CompressionLevel Optimal `
+            -DestinationPath "dist/Flux-$env:FLUX_BUILD_VERSION-windows-${{ matrix.arch }}.zip"
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          & $iscc "/DVersion=$env:FLUX_BUILD_VERSION" "/DArch=${{ matrix.inno }}" `
+            "/DAppDir=$PWD\dist\app" "/DOutputDir=$PWD\dist" scripts\windows\flux.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flux-windows-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
   manifest:
     name: latest.json
-    needs: [verify, build]
+    needs: [verify, build, build-windows]
     # flux-release is built and checked where Flux runs.
     runs-on: macos-15
     timeout-minutes: 20
@@ -217,7 +317,8 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          pattern: flux-macos-*
+          # flux-macos-* and flux-windows-*.
+          pattern: flux-*
           path: dist
           merge-multiple: true
 
@@ -236,14 +337,19 @@ jobs:
           for arch in aarch64 x86_64; do
             name=Flux-$VERSION-macos-$arch
             args+=(--platform "macos-$arch=dist/$name.zip,dist/$name.dmg")
+            # The keys are Flux's own (flux_update::platform_key): the system and the processor.
+            name=Flux-$VERSION-windows-$arch
+            args+=(--platform "windows-$arch=dist/$name.zip,dist/$name-setup.exe")
           done
           target/release/flux-release manifest --version "$VERSION" --date "$(date -u +%F)" \
             --notes "$notes" \
             --base-url "https://github.com/${{ github.repository }}/releases/download/v$VERSION" \
             "${args[@]}" >dist/latest.json
-          for arch in aarch64 x86_64; do
-            signature=$(jq -er --arg key "macos-$arch" '.platforms[$key].signature' dist/latest.json)
-            target/release/flux-release verify "dist/Flux-$VERSION-macos-$arch.zip" "$signature"
+          for platform in macos windows; do
+            for arch in aarch64 x86_64; do
+              signature=$(jq -er --arg key "$platform-$arch" '.platforms[$key].signature' dist/latest.json)
+              target/release/flux-release verify "dist/Flux-$VERSION-$platform-$arch.zip" "$signature"
+            done
           done
           jq . dist/latest.json
           { echo '```json'; cat dist/latest.json; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
@@ -290,5 +396,5 @@ jobs:
           /bin/ls -l dist
           gh release create "v$VERSION" --verify-tag --title "$title" \
             --notes-file "docs/release-notes/$VERSION.md" "${flags[@]}" \
-            dist/*.zip dist/*.dmg dist/latest.json
+            dist/*.zip dist/*.dmg dist/*-setup.exe dist/latest.json
           echo "Released: https://github.com/$GH_REPO/releases/tag/v$VERSION" >>"$GITHUB_STEP_SUMMARY"

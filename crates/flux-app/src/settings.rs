@@ -480,7 +480,7 @@ pub fn init(cx: &mut App) {
     let path = store_path_for(
         std::env::var_os("FLUX_SETTINGS_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     )
     // Watched and opened in a tab: the same path wherever the current directory is.
     .map(|path| std::path::absolute(&path).unwrap_or(path));
@@ -871,7 +871,20 @@ fn store_path_for(
     if scenario {
         return None;
     }
-    Some(PathBuf::from(home?).join("Library/Application Support/flux/settings.json"))
+    Some(flux_platform::paths::support_dir_in(std::path::Path::new(&home?)).join("settings.json"))
+}
+
+/// A file of the support folder of a user whose home is `home`, as each system writes it: what the
+/// tests of the files kept there expect.
+#[cfg(test)]
+pub(crate) fn support_file(home: &str, name: &str) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from(format!("{home}/Library/Application Support/flux/{name}"))
+    } else if cfg!(windows) {
+        PathBuf::from(format!(r"{home}\AppData\Local\Flux\{name}"))
+    } else {
+        PathBuf::from(format!("{home}/.local/share/flux/{name}"))
+    }
 }
 
 /// Broken files fall back to the defaults.
@@ -1375,9 +1388,7 @@ mod tests {
         let home = Some(OsString::from("/Users/me"));
         assert_eq!(
             store_path_for(None, false, home.clone()),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/settings.json"
-            ))
+            Some(crate::settings::support_file("/Users/me", "settings.json"))
         );
         assert_eq!(store_path_for(None, true, home.clone()), None);
         assert_eq!(

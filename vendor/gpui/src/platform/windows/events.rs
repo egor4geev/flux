@@ -26,6 +26,9 @@ pub(crate) const WM_GPUI_DOCK_MENU_ACTION: u32 = WM_USER + 4;
 pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
 pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
+/// Flux patch (part 10.9): a window tells the platform that the user's session ends
+/// ([`WindowsWindowInner::handle_end_session_msg`]).
+pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 8;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 const AUTO_HIDE_TASKBAR_THICKNESS_PX: i32 = 1;
@@ -54,6 +57,8 @@ impl WindowsWindowInner {
             WM_PAINT => self.handle_paint_msg(handle),
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
+            // Flux patch (part 10.9): signing out, restarting, shutting down.
+            WM_ENDSESSION => self.handle_end_session_msg(wparam),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
             WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
@@ -276,6 +281,26 @@ impl WindowsWindowInner {
                 LPARAM(handle.0 as isize),
             )
             .log_err();
+        }
+        Some(0)
+    }
+
+    /// Flux patch (part 10.9): the user's session ends (signing out, restarting, shutting down).
+    /// Windows ends the process once its windows have answered, with no `WM_CLOSE` and no end of
+    /// the run loop — the way the application quits otherwise. So the platform runs its quit
+    /// callback now (the application's `on_app_quit`: Flux saves the state of its windows), once
+    /// however many windows get the message. `wparam` is false when the session goes on after
+    /// all (another application refused to end it).
+    fn handle_end_session_msg(&self, wparam: WPARAM) -> Option<isize> {
+        if wparam.0 != 0 {
+            unsafe {
+                SendMessageW(
+                    self.platform_window_handle,
+                    WM_GPUI_END_SESSION,
+                    Some(WPARAM(self.validation_number)),
+                    None,
+                );
+            }
         }
         Some(0)
     }
@@ -864,18 +889,22 @@ impl WindowsWindowInner {
             return None;
         }
 
+        // Flux patch (part 10.9): a drag area gives way to the window's resize edges below — the
+        // title bar reaches the window's top edge, which resizes the window too; the window
+        // buttons don't.
+        let mut drag_area = None;
         let mut lock = self.state.borrow_mut();
         if let Some(mut callback) = lock.callbacks.hit_test_window_control.take() {
             drop(lock);
             let area = callback();
             self.state.borrow_mut().callbacks.hit_test_window_control = Some(callback);
             if let Some(area) = area {
-                return match area {
-                    WindowControlArea::Drag => Some(HTCAPTION as _),
-                    WindowControlArea::Close => Some(HTCLOSE as _),
-                    WindowControlArea::Max => Some(HTMAXBUTTON as _),
-                    WindowControlArea::Min => Some(HTMINBUTTON as _),
-                };
+                match area {
+                    WindowControlArea::Drag => drag_area = Some(HTCAPTION as _),
+                    WindowControlArea::Close => return Some(HTCLOSE as _),
+                    WindowControlArea::Max => return Some(HTMAXBUTTON as _),
+                    WindowControlArea::Min => return Some(HTMINBUTTON as _),
+                }
             }
         } else {
             drop(lock);
@@ -883,7 +912,7 @@ impl WindowsWindowInner {
 
         if !self.hide_title_bar {
             // If the OS draws the title bar, we don't need to handle hit test messages.
-            return None;
+            return drag_area;
         }
 
         // default handler for resize areas
@@ -919,7 +948,7 @@ impl WindowsWindowInner {
             return Some(HTTOP as _);
         }
 
-        Some(HTCLIENT as _)
+        drag_area.or(Some(HTCLIENT as _))
     }
 
     fn handle_nc_mouse_move_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {

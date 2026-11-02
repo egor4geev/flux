@@ -9,6 +9,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ),
     // Files: the tree, open documents, the disk.
     ("Couldn't move to Trash", "Не удалось переместить в Корзину"),
+    (
+        "Couldn't move to the Recycle Bin",
+        "Не удалось переместить в Корзину",
+    ),
     ("Couldn't rename", "Не удалось переименовать"),
     ("Couldn't create", "Не удалось создать"),
     ("Couldn't move", "Не удалось переместить"),

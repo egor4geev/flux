@@ -36,9 +36,11 @@ pub fn configs() -> Vec<LanguageConfig> {
         display_name: display_name.into(),
         extensions: extensions.iter().map(|s| s.to_string()).collect(),
         file_names: file_names.iter().map(|s| s.to_string()).collect(),
+        file_patterns: Vec::new(),
         aliases: aliases.iter().map(|s| s.to_string()).collect(),
         grammar: GrammarSource::Builtin(name.into()),
         highlights: queries.join("\n"),
+        injections: String::new(),
         precedence,
     };
     vec![

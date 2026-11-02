@@ -43,10 +43,13 @@ const TEXT_INSET: f32 = 1. + 8. + 1. + 10.;
 const OFFSET_Y: f32 = 4.;
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("enter", Confirm, Some("RenameField")),
-        KeyBinding::new("escape", Dismiss, Some("RenameField")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, Some("RenameField")),
+            KeyBinding::new("escape", Dismiss, Some("RenameField")),
+        ],
+    );
 }
 
 /// Opens the rename field for the symbol at the cursor. `range` and `placeholder` come from

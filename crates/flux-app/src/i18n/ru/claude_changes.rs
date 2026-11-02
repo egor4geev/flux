@@ -30,6 +30,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Файлы, созданные Claude, отправятся в Корзину.",
     ),
     (
+        "Files Claude created are moved to the Recycle Bin.",
+        "Файлы, созданные Claude, отправятся в Корзину.",
+    ),
+    (
         "Rolled back Claude's changes: {0}",
         "Изменения Claude откачены: {0}",
     ),

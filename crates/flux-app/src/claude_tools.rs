@@ -1150,7 +1150,7 @@ pub fn after_edit(
             }
         }
         None => {
-            let refreshed = lsp.update(cx, |lsp, _| lsp.refresh_background(&path));
+            let refreshed = lsp.update(cx, |lsp, cx| lsp.refresh_background(&path, cx));
             if !refreshed && !lsp.update(cx, |lsp, cx| lsp.open_background(&path, cx)) {
                 return Task::ready(None);
             }

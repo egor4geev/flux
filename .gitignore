@@ -1,4 +1,6 @@
 /target
+# Downloads made by scripts/bundle-windows.sh (and bundle-macos.sh --out dist/…).
+/dist
 .DS_Store
 # Plugins built in their own folders, as plugins under development (the bundled ones are built
 # into target/plugins).

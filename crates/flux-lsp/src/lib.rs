@@ -10,8 +10,10 @@
 pub mod config;
 pub mod edit;
 pub mod install;
+pub mod merge;
 pub mod output;
 pub mod position;
+pub mod pull;
 pub mod snippet;
 pub mod sync;
 
@@ -20,7 +22,7 @@ mod transport;
 mod watch;
 
 pub use client::{ApplyEdit, Health, LanguageServer, RequestError, ServerEvent, ServerStatus};
-pub use config::{Install, ServerConfig, server_for_path, servers_for_path};
+pub use config::{Activation, Install, ServerConfig, server_for_path, servers_for_path};
 pub use lsp_types;
 pub use output::{LogSource, ServerLog};
 pub use position::Lines;

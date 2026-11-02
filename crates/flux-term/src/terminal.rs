@@ -9,6 +9,7 @@
 
 use std::borrow::Cow;
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -187,6 +188,7 @@ pub struct Terminal {
     sender: EventLoopSender,
     shared: Arc<Shared>,
     /// A duplicate of the controlling side of the PTY: asks for its foreground process group.
+    #[cfg(unix)]
     pty: OwnedFd,
     shell_pid: u32,
 }
@@ -222,10 +224,17 @@ impl Terminal {
             working_directory: options.cwd.clone(),
             drain_on_exit: false,
             env: shell::environment(&options.env),
+            // ConPTY takes one command line: arguments with spaces are quoted.
+            #[cfg(windows)]
+            escape_args: true,
         };
         let pty = tty::new(&pty_options, options.size.window_size(), 0)?;
+        #[cfg(unix)]
         let shell_pid = pty.child().id();
+        #[cfg(unix)]
         let pty_fd = OwnedFd::from(pty.file().try_clone()?);
+        #[cfg(windows)]
+        let shell_pid = pty.child_watcher().pid().map_or(0, |pid| pid.get());
 
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
         let sender = event_loop.channel();
@@ -237,6 +246,7 @@ impl Terminal {
             term,
             sender,
             shared,
+            #[cfg(unix)]
             pty: pty_fd,
             shell_pid,
         };
@@ -520,7 +530,10 @@ impl Terminal {
 
     /// The process in the foreground: the shell itself while it waits for a command.
     pub fn foreground_process(&self) -> Option<ProcessInfo> {
+        #[cfg(unix)]
         let pid = process::foreground_pid(self.pty.as_raw_fd())?;
+        #[cfg(windows)]
+        let pid = process::foreground_pid(self.shell_pid)?;
         let name = process::name(pid)?;
         Some(ProcessInfo { pid, name })
     }

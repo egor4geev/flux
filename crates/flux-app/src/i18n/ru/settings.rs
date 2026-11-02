@@ -8,6 +8,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Flux запускает сервер языка открытого файла: ошибки, подсказки, переход к определению. Серверы, установленные на этом Mac, используются как есть; поставленные Flux здесь можно обновить или удалить.",
     ),
     (
+        "Flux starts the server for the language of an open file: errors, completion, go to definition. Servers installed on this computer are used as they are; those Flux installed can be updated or deleted here.",
+        "Flux запускает сервер языка открытого файла: ошибки, подсказки, переход к определению. Серверы, установленные на этом компьютере, используются как есть; поставленные Flux здесь можно обновить или удалить.",
+    ),
+    (
         "Install missing servers automatically",
         "Ставить недостающие серверы автоматически",
     ),
@@ -15,12 +19,17 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "When a file needs a server that isn't on this Mac, Flux downloads it to:",
         "Когда файлу нужен сервер, которого нет на этом Mac, Flux скачивает его в каталог:",
     ),
+    (
+        "When a file needs a server that isn't on this computer, Flux downloads it to:",
+        "Когда файлу нужен сервер, которого нет на этом компьютере, Flux скачивает его в каталог:",
+    ),
     ("Installing…", "Установка…"),
     ("Updating…", "Обновление…"),
     ("Deleting…", "Удаление…"),
     ("Failed: {0}", "Не удалось: {0}"),
     ("Checking…", "Проверка…"),
     ("On this Mac · {0}", "На этом Mac · {0}"),
+    ("On this computer · {0}", "На этом компьютере · {0}"),
     ("Installed by Flux · {0}", "Поставлен Flux · {0}"),
     ("Installed by Flux", "Поставлен Flux"),
     ("Not installed", "Не установлен"),
