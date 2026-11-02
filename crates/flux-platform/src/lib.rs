@@ -4,6 +4,7 @@
 //! next, Linux will follow. Code for one system only stays where it is used, behind
 //! `cfg(target_os = …)`; what several crates need is here.
 
+pub mod glob;
 pub mod path_style;
 pub mod paths;
 pub mod process;

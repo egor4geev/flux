@@ -301,6 +301,7 @@ mod tests {
             args: vec![],
             extensions: vec!["rs".into()],
             file_names: vec![],
+            file_patterns: Vec::new(),
             initialization_options: None,
             settings: None,
             install: None,

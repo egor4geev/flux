@@ -17,6 +17,7 @@ version = "0.1.0"
 api = "0.2"
 authors = ["Someone"]
 description = "Rust: highlighting and rust-analyzer."
+# A language with `injections` or `file-patterns` says api = "0.4".
 
 [[languages]]
 id = "rust"
@@ -59,10 +60,12 @@ Each `[[languages]]` table is a file type.
 | `id` | required | The key Flux knows the language by: `rust`, `typescript`, `tsx`. Lowercase letters, digits, `-`, `_`, `+`, `#` (`c++`, `c#`). It is also a name of Markdown code fences (```` ```rust ````). |
 | `name` | required | The name people read: the status bar, the manager. Translated by `locales/` like any string of the manifest. |
 | `extensions` | | Extensions without the dot, in lowercase: `["rs"]`. A file matches in any case. |
-| `file-names` | | Exact file names: `["Cargo.lock", ".bashrc"]`. A file name wins over an extension. |
+| `file-names` | | Exact file names: `["Cargo.lock", ".bashrc"]`. A file name wins over a pattern and an extension. |
+| `file-patterns` | | API 0.4. Patterns of file names, not paths: `[".env.*", "*.env", "*.component.html"]` — `*` any run of characters, `?` one character, `[…]` one of a set (`[a-z]`, `[!0-9]`); letters match in any case. A pattern wins over an extension; of several matching patterns the longest wins. |
 | `aliases` | | More names of code fences: `["rs"]`, `["py", "python3"]`. |
 | `grammar` | required | The `id` of one of the plugin's `[[grammars]]`. Several languages may share a grammar (JavaScript and JSX do). |
 | `highlights` | required | The highlighting query: a file, or a list of files joined in this order. |
+| `injections` | | API 0.4. The injections query — which text of the file is another language: a file, or a list of files joined in this order. See [Injections](#injections). |
 | `precedence` | | `"last-pattern"` (the default) or `"first-pattern"` — see [Highlighting queries](#highlighting-queries). |
 | `lsp-id` | | The language id language servers know it by (`textDocument/didOpen`); the `id` by default. |
 | `icon` | | A monochrome 16×16 SVG of the plugin: the icon of the language's files when the chosen set of file icons has none for them. |
@@ -162,8 +165,49 @@ JavaScript, though the grammar's `tree-sitter.json` lists them the other way rou
 
 **Predicates.** `#eq?`, `#match?`, `#any-of?` and their `not-` and `any-` forms filter matches.
 `#is-not? local` passes (Flux doesn't track local variables), a pattern with `#is?` is turned off,
-`#set!` and unknown predicates are ignored. There are no injections (code inside Markdown fences,
-strings) and no locals.
+`#set!` and unknown predicates are ignored. There are no locals; code of other languages inside a
+file comes with [injections](#injections).
+
+## Injections
+
+API 0.4: a language's `injections` query marks the text of its files that is another language — the
+`<script>` and `<style>` of HTML, a Markdown code block, a Vue file's `<script lang="ts">`, the
+`{{ }}` of a template. It is a tree-sitter injections query, as grammars' repositories ship them
+(`queries/injections.scm`):
+
+```scheme
+; ```rust … ```: the language the info string names.
+(fenced_code_block
+  (info_string (language) @injection.language)
+  (code_fence_content) @injection.content)
+
+; <style>: CSS, unless a `lang` names another language.
+((style_element
+  (start_tag) @_start
+  (raw_text) @injection.content)
+  (#not-match? @_start "\\slang\\s*=")
+  (#set! injection.language "css"))
+```
+
+- `@injection.content` is the node whose text is the embedded document. Its **named** children are
+  cut out of it (the `>` of a code block in a quote); `#set! injection.include-children` keeps them.
+- The language: `#set! injection.language "css"`, or the text of the node captured as
+  `@injection.language` (quotes around it are dropped). Flux looks the name up in any case among
+  the installed languages: by `id`, then by `aliases`, then by `extensions` — so `ts`, `js`,
+  `scss`, a fence's `py` all work. A language that isn't installed leaves its text to the host;
+  when its plugin is installed, open files pick it up.
+- `#set! injection.combined`: all the matches of the pattern are one document (the expressions of a
+  template, parsed together).
+- `#eq?`, `#match?`, `#any-of?` and their `not-` forms filter matches, as in highlighting; captures
+  whose names start with `_` are helpers.
+- Embedded documents nest — a Vue file's `<script lang="ts">`, a code block of HTML inside Markdown
+  — down to four levels.
+- Highlighting: the embedded language's colors paint over the host's on its text. The host's
+  captures of the embedded text itself (of the content node and the nodes inside it) are dropped; a
+  capture around it stays underneath (Markdown's `@text.literal` of a whole code block shows where
+  the embedded language has no color).
+- Typing stays fast: Flux looks for injections again only where the file changed, keeps the trees of
+  the embedded documents the edit doesn't touch and reparses the touched ones from their old trees.
 
 ## Language servers
 
@@ -175,11 +219,17 @@ for some files:
 | `id` | required | The server's name and key: the status bar, Settings → Language Servers, its folder among the servers Flux installed. |
 | `command` | required | The program: a name looked up on the `PATH` (and the usual places a GUI app's `PATH` lacks — Homebrew, `~/.cargo/bin`, `~/go/bin`, nvm, Volta…), then among the servers Flux installed; or an absolute path. |
 | `args` | | Its arguments: `["--stdio"]`. |
-| `languages` | | The languages whose files it serves, by `id` — of this plugin or any other. |
+| `languages` | | The languages whose files it serves, by `id` — of this plugin or any other; their `file-patterns` (API 0.4) too: an Angular template matched by `*.component.html` goes to its language's server, not to plain HTML's. |
 | `extensions`, `file-names` | | Instead of the languages' files: these. For a server that serves only some of a language's files (bash-language-server: `.sh` and `.bash`, not `.zsh`). One of `languages`, `extensions`, `file-names` is required. |
 | `initialization-options` | | `initializationOptions` of `initialize`, as a TOML table. |
 | `settings` | | Answers to `workspace/configuration`, by section: `settings = { python = { analysis = { typeCheckingMode = "basic" } } }`. |
 | `install` | | How Flux installs the server when it isn't on the Mac. |
+
+`{server-dir}` in `args` and in any string of `initialization-options` and `settings` (API 0.4) is
+the folder Flux installed the server in — for what the server needs by path from its own install:
+`typescript = { tsdk = "{server-dir}/node_modules/typescript/lib" }`. A server that names it always
+runs as Flux installed it (its `install` is required then): a copy elsewhere on the machine may be
+another major version.
 
 ```toml
 [[language-servers]]

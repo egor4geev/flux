@@ -261,7 +261,7 @@ impl LanguageServer {
         let launch = config::launch(config, root, &program);
         let mut child = Command::new(program)
             .background()
-            .args(&config.args)
+            .args(&launch.args)
             .current_dir(root)
             .env("PATH", &launch.path)
             .envs(&config.env)
@@ -280,7 +280,7 @@ impl LanguageServer {
         let output = Arc::new(ServerLog::new());
         let command = [config.command.as_str()]
             .into_iter()
-            .chain(config.args.iter().map(String::as_str))
+            .chain(launch.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ");
         output.push(

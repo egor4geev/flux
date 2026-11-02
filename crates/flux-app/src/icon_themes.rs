@@ -52,6 +52,8 @@ pub struct LanguageIcon {
     pub plugin: SharedString,
     pub extensions: Vec<String>,
     pub file_names: Vec<String>,
+    /// Patterns of file names (`*.component.html`, plugin API 0.4).
+    pub file_patterns: Vec<String>,
     /// The SVG in the plugin's folder.
     pub icon: String,
     /// A shade of the theme's palette ("orange", "text-muted") or "#rrggbb"; none — the default
@@ -71,6 +73,9 @@ struct Defaults {
 #[derive(Debug, Clone, Default)]
 struct Rules {
     file_names: HashMap<String, Entry>,
+    /// Language plugins' file name patterns, in the plugins' order: the longest that matches wins,
+    /// between equal ones the later plugin's (as languages pick theirs).
+    patterns: Vec<(String, Entry)>,
     /// Longest first: the first that matches wins.
     prefixes: Vec<(String, Entry)>,
     extensions: HashMap<String, Entry>,
@@ -129,6 +134,14 @@ impl Rules {
             return Some(entry);
         }
         if let Some((_, entry)) = self
+            .patterns
+            .iter()
+            .filter(|(pattern, _)| flux_platform::glob::glob_matches(pattern, lower))
+            .max_by_key(|(pattern, _)| pattern.chars().count())
+        {
+            return Some(entry);
+        }
+        if let Some((_, entry)) = self
             .prefixes
             .iter()
             .find(|(prefix, _)| lower.starts_with(prefix.as_str()))
@@ -163,7 +176,10 @@ impl Rules {
     }
 
     fn is_empty(&self) -> bool {
-        self.file_names.is_empty() && self.prefixes.is_empty() && self.extensions.is_empty()
+        self.file_names.is_empty()
+            && self.patterns.is_empty()
+            && self.prefixes.is_empty()
+            && self.extensions.is_empty()
     }
 }
 
@@ -256,6 +272,7 @@ pub fn load_plugin_icons(plugins: &[Arc<PluginEntry>], cx: &mut App) -> Vec<(Str
                     plugin: plugin.clone(),
                     extensions: language.extensions.clone(),
                     file_names: language.file_names.clone(),
+                    file_patterns: language.file_patterns.clone(),
                     icon: icon.clone(),
                     color: language.icon_color.clone(),
                 },
@@ -283,6 +300,11 @@ fn add_language_icon(rules: &mut Rules, language: &LanguageIcon, entry: Entry) {
         let extension = extension.to_ascii_lowercase();
         rules.extension_dots = rules.extension_dots.max(extension.matches('.').count());
         rules.extensions.insert(extension, entry.clone());
+    }
+    for pattern in &language.file_patterns {
+        let pattern = pattern.to_ascii_lowercase();
+        rules.patterns.retain(|(known, _)| *known != pattern);
+        rules.patterns.push((pattern, entry.clone()));
     }
 }
 
@@ -1008,6 +1030,7 @@ file = { icon = "icons/file.svg", color = "dim" }
                     plugin: "test.lang".into(),
                     extensions: vec![extension.into()],
                     file_names: vec!["Kotlinfile".into()],
+                    file_patterns: Vec::new(),
                     icon: icon.into(),
                     color: Some("violet".into()),
                 },
@@ -1194,5 +1217,43 @@ file = { icon = "icons/gone.svg", color = "dim" }
         eprintln!("resolve_with: {per_call:?} per name");
         // Debug builds are slow; this only catches something going quadratic.
         assert!(per_call.as_micros() < 50, "{per_call:?}");
+    }
+
+    #[test]
+    fn a_name_pattern_wins_over_the_extension_and_the_longest_wins() {
+        let entry = |icon: &str| Entry {
+            source: IconSource::Asset(icon.to_string().into()),
+            color: None,
+            tint: None,
+        };
+        let language = |patterns: &[&str], extensions: &[&str]| LanguageIcon {
+            plugin: "test.lang".into(),
+            extensions: extensions.iter().map(|e| e.to_string()).collect(),
+            file_names: Vec::new(),
+            file_patterns: patterns.iter().map(|p| p.to_string()).collect(),
+            icon: String::new(),
+            color: None,
+        };
+        let mut rules = Rules::default();
+        add_language_icon(&mut rules, &language(&[], &["html"]), entry("html"));
+        add_language_icon(
+            &mut rules,
+            &language(&["*.component.html"], &[]),
+            entry("angular"),
+        );
+        add_language_icon(
+            &mut rules,
+            &language(&[".env.*", "*.env"], &[]),
+            entry("env"),
+        );
+        let icon = |name: &str| match &rules.lookup(name)?.source {
+            IconSource::Asset(path) => Some(path.to_string()),
+            IconSource::Builtin(_) => None,
+        };
+        assert_eq!(icon("app.component.html").as_deref(), Some("angular"));
+        assert_eq!(icon("index.html").as_deref(), Some("html"));
+        assert_eq!(icon(".env.local").as_deref(), Some("env"));
+        assert_eq!(icon("prod.env").as_deref(), Some("env"));
+        assert_eq!(icon("readme.md"), None);
     }
 }

@@ -15,6 +15,11 @@ use serde_json::{Value, json};
 
 use crate::install;
 
+/// In a server's arguments, settings and options: the folder Flux installed the server in, e.g.
+/// `{server-dir}/node_modules/typescript/lib` for the TypeScript it bundles. A server that names it
+/// runs only as Flux installed it: a copy elsewhere on the machine may be another major version.
+pub const SERVER_DIR: &str = "{server-dir}";
+
 /// How to start a language server and which files it serves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerConfig {
@@ -25,6 +30,9 @@ pub struct ServerConfig {
     /// File extensions (without the dot) and exact file names this server serves.
     pub extensions: Vec<String>,
     pub file_names: Vec<String>,
+    /// Patterns of file names it serves (`*.component.html`, plugin API 0.4 —
+    /// [`flux_platform::glob`]).
+    pub file_patterns: Vec<String>,
     /// `initializationOptions` for `initialize`.
     pub initialization_options: Option<serde_json::Value>,
     /// Answers to `workspace/configuration`, by section (`{"python": {"analysis": …}}`); the client
@@ -200,6 +208,20 @@ pub fn servers_for_path<'a>(configs: &'a [ServerConfig], path: &Path) -> Vec<&'a
     if !by_name.is_empty() {
         return by_name;
     }
+    // Then patterns, as languages pick a file's language: `app.component.html` is a template's,
+    // not plain HTML's.
+    let by_pattern: Vec<&ServerConfig> = configs
+        .iter()
+        .filter(|config| {
+            config
+                .file_patterns
+                .iter()
+                .any(|pattern| flux_platform::glob::glob_matches(pattern, file_name))
+        })
+        .collect();
+    if !by_pattern.is_empty() {
+        return by_pattern;
+    }
     let Some(extension) = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -229,8 +251,11 @@ impl ServerConfig {
     }
 
     /// The executable installed on the machine itself (`PATH` and the usual install locations),
-    /// not by Flux.
+    /// not by Flux; never for a server that names [`SERVER_DIR`].
     pub fn resolve_system_command(&self) -> Option<PathBuf> {
+        if self.uses_server_dir() {
+            return None;
+        }
         let command = Path::new(&self.command);
         if command.components().count() > 1 {
             return is_executable(command).then(|| command.to_path_buf());
@@ -241,6 +266,18 @@ impl ServerConfig {
             .flat_map(|dir| flux_platform::process::program_files(&dir, &self.command))
             .find(|path| is_executable(path))
             .filter(|path| !self.is_bare_rustup_proxy(path))
+    }
+
+    /// The config names [`SERVER_DIR`] in its arguments, options or settings.
+    pub fn uses_server_dir(&self) -> bool {
+        let names = |value: &Option<Value>| {
+            value
+                .as_ref()
+                .is_some_and(|value| value.to_string().contains(SERVER_DIR))
+        };
+        self.args.iter().any(|arg| arg.contains(SERVER_DIR))
+            || names(&self.initialization_options)
+            || names(&self.settings)
     }
 
     /// rustup puts a proxy for `rust-analyzer` next to itself whether or not the toolchain has the
@@ -273,6 +310,8 @@ impl ServerConfig {
 /// on the project and on what Flux installed.
 pub(crate) struct Launch {
     pub path: OsString,
+    /// The config's arguments, [`SERVER_DIR`] filled in.
+    pub args: Vec<String>,
     /// Answers to `workspace/configuration` (an object; sections are looked up in it).
     pub settings: Value,
     pub initialization_options: Option<Value>,
@@ -286,8 +325,21 @@ pub(crate) struct Launch {
 /// - an npm server installed by Flux runs with Flux's Node.js first in `PATH`, and the tools Flux
 ///   installed for servers (shellcheck) are at the end of it.
 pub(crate) fn launch(config: &ServerConfig, root: &Path, program: &Path) -> Launch {
-    let settings = workspace_settings(config, root);
+    let mut settings = workspace_settings(config, root);
     let mut initialization_options = config.initialization_options.clone();
+    let mut args = config.args.clone();
+    if config.uses_server_dir()
+        && let Some(dir) = install::installed_dir(config)
+    {
+        let dir = dir.to_string_lossy();
+        fill_server_dir(&mut settings, &dir);
+        if let Some(options) = initialization_options.as_mut() {
+            fill_server_dir(options, &dir);
+        }
+        for arg in &mut args {
+            *arg = arg.replace(SERVER_DIR, &dir);
+        }
+    }
     if config.name == "typescript-language-server"
         && let Some(lib) = typescript_beside(program)
     {
@@ -312,8 +364,19 @@ pub(crate) fn launch(config: &ServerConfig, root: &Path, program: &Path) -> Laun
         .chain(install::tool_dirs());
     Launch {
         path: env::join_paths(dirs).unwrap_or_default(),
+        args,
         settings,
         initialization_options,
+    }
+}
+
+/// [`SERVER_DIR`] in every string of `value` replaced by `dir`.
+fn fill_server_dir(value: &mut Value, dir: &str) {
+    match value {
+        Value::String(text) if text.contains(SERVER_DIR) => *text = text.replace(SERVER_DIR, dir),
+        Value::Array(items) => items.iter_mut().for_each(|item| fill_server_dir(item, dir)),
+        Value::Object(map) => map.values_mut().for_each(|item| fill_server_dir(item, dir)),
+        _ => {}
     }
 }
 
@@ -839,5 +902,67 @@ mod tests {
             })
             .collect();
         assert_eq!(bins, ["v20.11.1", "v20.2.0", "v18.19.0", "v9.0.0"]);
+    }
+
+    #[test]
+    fn the_server_dir_fills_in_everywhere_and_keeps_the_server_flux_installed() {
+        let mut config = ServerConfig {
+            name: "vue-language-server".into(),
+            command: "vue-language-server".into(),
+            args: vec!["--stdio".into()],
+            extensions: vec!["vue".into()],
+            file_names: Vec::new(),
+            file_patterns: Vec::new(),
+            initialization_options: Some(json!({
+                "typescript": { "tsdk": "{server-dir}/node_modules/typescript/lib" },
+                "vue": { "hybridMode": false },
+            })),
+            settings: None,
+            install: None,
+            env: BTreeMap::new(),
+        };
+        assert!(config.uses_server_dir());
+        // A copy on the machine never stands in for Flux's own.
+        assert_eq!(config.resolve_system_command(), None);
+        let mut options = config.initialization_options.clone().unwrap();
+        fill_server_dir(&mut options, "/servers/vue");
+        assert_eq!(
+            options["typescript"]["tsdk"],
+            json!("/servers/vue/node_modules/typescript/lib")
+        );
+        assert_eq!(options["vue"]["hybridMode"], json!(false));
+        config.initialization_options = None;
+        config.args = vec!["--probe".into(), ".,{server-dir}".into()];
+        assert!(config.uses_server_dir());
+        config.args = vec!["--stdio".into()];
+        assert!(!config.uses_server_dir());
+    }
+
+    #[test]
+    fn a_file_name_pattern_picks_its_server_before_the_extension() {
+        let server = |name: &str, extensions: &[&str], patterns: &[&str]| ServerConfig {
+            name: name.into(),
+            command: name.into(),
+            args: Vec::new(),
+            extensions: extensions.iter().map(|e| e.to_string()).collect(),
+            file_names: Vec::new(),
+            file_patterns: patterns.iter().map(|p| p.to_string()).collect(),
+            initialization_options: None,
+            settings: None,
+            install: None,
+            env: BTreeMap::new(),
+        };
+        let configs = [
+            server("html", &["html"], &[]),
+            server("angular", &[], &["*.component.html"]),
+        ];
+        let names = |path: &str| {
+            servers_for_path(&configs, Path::new(path))
+                .iter()
+                .map(|config| config.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("src/app/app.component.html"), ["angular"]);
+        assert_eq!(names("src/index.html"), ["html"]);
     }
 }
