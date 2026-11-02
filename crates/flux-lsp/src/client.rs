@@ -26,11 +26,12 @@ use flux_platform::process::Background;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
 use lsp_types::notification::{DidChangeWatchedFiles, Notification};
-use lsp_types::request::Request;
+use lsp_types::request::{DocumentDiagnosticRequest, Request};
 use lsp_types::{
-    ApplyWorkspaceEditParams, DidChangeWatchedFilesParams, FileChangeType, FileEvent,
-    InitializeResult, LogMessageParams, NumberOrString, ProgressParams, ProgressParamsValue,
-    PublishDiagnosticsParams, ServerCapabilities, ShowMessageParams, WorkDoneProgress,
+    ApplyWorkspaceEditParams, DidChangeWatchedFilesParams, DocumentDiagnosticParams,
+    FileChangeType, FileEvent, InitializeResult, LogMessageParams, NumberOrString, ProgressParams,
+    ProgressParamsValue, PublishDiagnosticsParams, ServerCapabilities, ShowMessageParams,
+    WorkDoneProgress,
 };
 use serde_json::{Value, json};
 
@@ -80,6 +81,9 @@ pub enum ServerEvent {
     /// The server registered or dropped watchers of files: [`LanguageServer::watches_files`] may
     /// have changed.
     WatchersChanged,
+    /// `workspace/diagnostic/refresh`: the pulled diagnostics of the open documents are stale
+    /// (the project's configuration changed) — pull them again.
+    DiagnosticsRefresh,
 }
 
 /// rust-analyzer's `experimental/serverStatus` (part 10.5).
@@ -184,9 +188,13 @@ impl Drop for Reply {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestError {
-    /// The server answered with an error (`code`, `message`); `ContentModified` and
+    /// The server answered with an error (`code`, `message`, its `data`); `ContentModified` and
     /// `RequestCancelled` included.
-    Server { code: i64, message: String },
+    Server {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
     /// The server is gone.
     Exited,
     /// The response didn't fit the request's result type.
@@ -206,6 +214,22 @@ impl RequestError {
                 ..
             }
         )
+    }
+
+    /// The request is worth sending again: `ServerCancelled` (-32802) that asks for it
+    /// (`retriggerRequest`, pulled diagnostics), or `ContentModified` (-32801).
+    pub fn retrigger(&self) -> bool {
+        match self {
+            Self::Server {
+                code: -32802, data, ..
+            } => data
+                .as_ref()
+                .and_then(|data| data.get("retriggerRequest"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            Self::Server { code: -32801, .. } => true,
+            _ => false,
+        }
     }
 }
 
@@ -261,7 +285,7 @@ impl LanguageServer {
         let launch = config::launch(config, root, &program);
         let mut child = Command::new(program)
             .background()
-            .args(&config.args)
+            .args(&launch.args)
             .current_dir(root)
             .env("PATH", &launch.path)
             .envs(&config.env)
@@ -280,7 +304,7 @@ impl LanguageServer {
         let output = Arc::new(ServerLog::new());
         let command = [config.command.as_str()]
             .into_iter()
-            .chain(config.args.iter().map(String::as_str))
+            .chain(launch.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ");
         output.push(
@@ -416,6 +440,34 @@ impl LanguageServer {
             drop(cancel);
             serde_json::from_value(result?).map_err(|err| RequestError::Decode(err.to_string()))
         }
+    }
+
+    /// `textDocument/diagnostic` (LSP 3.17) of the document `uri`, with the `resultId` of its last
+    /// report: the server's problems in it ([`crate::pull`]). Ask only a server that has
+    /// `diagnosticProvider`.
+    pub fn pull_diagnostics(
+        &self,
+        uri: lsp_types::Uri,
+        previous_result_id: Option<String>,
+    ) -> impl Future<Output = Result<crate::pull::Pulled, RequestError>> + Send + use<> {
+        let identifier = self
+            .capabilities()
+            .and_then(|capabilities| crate::pull::provider(&capabilities))
+            .flatten();
+        let response = self.request::<DocumentDiagnosticRequest>(DocumentDiagnosticParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri },
+            identifier,
+            previous_result_id,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        });
+        async move { response.await.map(crate::pull::Pulled::from) }
+    }
+
+    /// The server has pulled diagnostics (`diagnosticProvider`).
+    pub fn pulls_diagnostics(&self) -> bool {
+        self.capabilities()
+            .is_some_and(|capabilities| crate::pull::provider(&capabilities).is_some())
     }
 
     /// The user changed the server's settings (part 10.5): `workspace/configuration` is answered
@@ -683,6 +735,7 @@ impl Shared {
                             .and_then(Value::as_str)
                             .unwrap_or("error")
                             .to_owned(),
+                        data: error.get_mut("data").map(Value::take),
                     }),
                     None => Ok(message.get_mut("result").map_or(Value::Null, Value::take)),
                 };
@@ -844,6 +897,11 @@ impl Shared {
                 Ok(Value::Null)
             }
             "window/showDocument" => Ok(json!({ "success": false })),
+            // The pulled problems are stale: the window pulls them again.
+            "workspace/diagnostic/refresh" => {
+                self.emit(ServerEvent::DiagnosticsRefresh);
+                Ok(Value::Null)
+            }
             // "Refresh your semantic tokens, inlay hints, …": we have none.
             method if method.starts_with("workspace/") && method.ends_with("/refresh") => {
                 Ok(Value::Null)
@@ -1061,6 +1119,8 @@ fn client_capabilities() -> Value {
             "applyEdit": true,
             "configuration": true,
             "workspaceFolders": true,
+            // Pulled diagnostics are pulled again on `workspace/diagnostic/refresh`.
+            "diagnostics": { "refreshSupport": true },
             "workspaceEdit": {
                 "documentChanges": true,
                 "resourceOperations": ["create", "rename", "delete"],
@@ -1091,6 +1151,12 @@ fn client_capabilities() -> Value {
                 "codeDescriptionSupport": true,
                 // Fixes ride in `data` (ruff): it goes back in a code action's context.
                 "dataSupport": true,
+            },
+            // LSP 3.17: problems pulled after opening and editing (ESLint's server), with the
+            // reports of related files.
+            "diagnostic": {
+                "dynamicRegistration": false,
+                "relatedDocumentSupport": true,
             },
             "completion": {
                 "dynamicRegistration": false,
@@ -1218,11 +1284,24 @@ mod tests {
         let error = |code| RequestError::Server {
             code,
             message: String::new(),
+            data: None,
         };
         assert!(error(-32801).is_outdated());
         assert!(error(-32800).is_outdated());
         assert!(!error(-32603).is_outdated());
         assert!(!RequestError::Exited.is_outdated());
+        // Pulled diagnostics: sent again when the server asks for it.
+        let cancelled = |data| RequestError::Server {
+            code: -32802,
+            message: "server cancelled".into(),
+            data,
+        };
+        assert!(cancelled(Some(json!({ "retriggerRequest": true }))).retrigger());
+        assert!(!cancelled(Some(json!({ "retriggerRequest": false }))).retrigger());
+        assert!(cancelled(None).retrigger());
+        assert!(error(-32801).retrigger());
+        assert!(!error(-32800).retrigger());
+        assert!(!RequestError::Exited.retrigger());
     }
 
     #[test]

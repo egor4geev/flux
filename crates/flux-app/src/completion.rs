@@ -14,6 +14,12 @@
 //! item's additional edits (imports) go into the same undo step; if the item still has to be
 //! resolved for them (`completionItem/resolve`), they follow as soon as it is.
 //!
+//! A document with helper servers (plugin API 0.4 `secondary`: Tailwind's classes, a linter) asks
+//! them too: their items join the main server's (after them among equally good matches, without
+//! the duplicates), each resolved and applied by its own server. What has come within
+//! [`crate::lsp::MERGE_DEADLINE`] shows; a later answer joins the list when it comes. A trigger
+//! character asks the servers that have it.
+//!
 //! Motion: the menu pops out of its word once a session (typing narrows it in place, on the side
 //! it took when it appeared); a menu that closes without an accepted item fades out where it was,
 //! taking no input. An accepted item's text takes the menu's place at once.
@@ -117,11 +123,18 @@ pub struct CompletionMenu {
     next_pending: u64,
 }
 
-struct Session {
+/// A server the session asks: the main one first, then the helpers.
+struct Source {
     server: LanguageServer,
     uri: Uri,
     /// The server fills documentation and edits in on `completionItem/resolve`.
     resolve_provider: bool,
+    /// Its trigger characters (`.`, `:`).
+    triggers: Vec<String>,
+}
+
+struct Session {
+    sources: Vec<Source>,
     /// Where the completed word starts, in current coordinates.
     word_start: usize,
     /// The character before `word_start` at the start: if an edit changes it (the trigger `.` is
@@ -213,11 +226,17 @@ impl Origin {
 
 struct Request {
     origin: Origin,
+    /// Which request this is (the session's count): answers of a replaced one are dropped.
+    round: u64,
+    /// The answers so far, by source; one that failed has none.
+    answers: Vec<(usize, CompletionResponse)>,
     _task: Task<()>,
 }
 
 struct Item {
     lsp: CompletionItem,
+    /// The [`Source`] it came from: resolved and applied by that server.
+    source: usize,
     /// Resolved, or nothing to resolve: documentation and edits are final.
     resolved: bool,
     /// Start of the item's edit in the request's text: the item is filtered by the text from there
@@ -228,7 +247,7 @@ struct Item {
 }
 
 impl Item {
-    fn new(lsp: CompletionItem, lines: &Lines, resolved: bool) -> Self {
+    fn new(lsp: CompletionItem, source: usize, lines: &Lines, resolved: bool) -> Self {
         let edit_start = lsp.text_edit.as_ref().map(|edit| {
             let range = match edit {
                 CompletionTextEdit::Edit(edit) => edit.range,
@@ -238,6 +257,7 @@ impl Item {
         });
         Self {
             lsp,
+            source,
             resolved,
             edit_start,
             docs: None,
@@ -336,24 +356,15 @@ pub fn typed(editor: &mut Editor, text: &str, window: &mut Window, cx: &mut Cont
     let Some(last) = text.chars().last() else {
         return;
     };
-    let Some((server, _)) = crate::lsp::document_server(editor) else {
+    let sources = sources(editor);
+    if sources.is_empty() {
         return;
-    };
-    let Some(capabilities) = server.capabilities() else {
-        return;
-    };
-    let Some(options) = &capabilities.completion_provider else {
-        return;
-    };
+    }
     let primary = editor.document.selection().primary();
     if !primary.is_empty() {
         return;
     }
-    let trigger = options
-        .trigger_characters
-        .iter()
-        .flatten()
-        .any(|trigger| trigger.chars().eq([last]));
+    let trigger = sources.iter().any(|source| source.triggers(last));
     if trigger {
         let context = CompletionContext {
             trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
@@ -414,6 +425,30 @@ pub fn actions(root: Div, editor: &Editor, cx: &mut Context<Editor>) -> Div {
 
 // --- Session ---
 
+/// The servers a session asks: those of [`crate::lsp::merged_servers`] that complete.
+fn sources(editor: &Editor) -> Vec<Source> {
+    crate::lsp::merged_servers(editor, |capabilities| {
+        capabilities.completion_provider.is_some()
+    })
+    .into_iter()
+    .filter_map(|(server, uri)| {
+        let options = server.capabilities()?.completion_provider.clone()?;
+        Some(Source {
+            server,
+            uri,
+            resolve_provider: options.resolve_provider == Some(true),
+            triggers: options.trigger_characters.unwrap_or_default(),
+        })
+    })
+    .collect()
+}
+
+impl Source {
+    fn triggers(&self, c: char) -> bool {
+        self.triggers.iter().any(|trigger| trigger.chars().eq([c]))
+    }
+}
+
 fn invoked() -> CompletionContext {
     CompletionContext {
         trigger_kind: CompletionTriggerKind::INVOKED,
@@ -443,15 +478,10 @@ fn start(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
-    let Some((server, uri)) = crate::lsp::document_server(editor) else {
+    let sources = sources(editor);
+    if sources.is_empty() {
         return;
-    };
-    let Some(capabilities) = server.capabilities() else {
-        return;
-    };
-    let Some(options) = &capabilities.completion_provider else {
-        return;
-    };
+    }
     let selection = editor.document.selection().clone();
     let primary = selection.primary();
     if !primary.is_empty() {
@@ -461,9 +491,7 @@ fn start(
     let cursor = primary.head;
     let word_start = word_start(text, cursor);
     let session = Session {
-        server,
-        uri,
-        resolve_provider: options.resolve_provider == Some(true),
+        sources,
         word_start,
         before_start: word_start.checked_sub(1).map(|i| text.char(i)),
         query: text.slice(word_start..cursor).to_string(),
@@ -499,65 +527,135 @@ fn start(
     request(editor, context, cx);
 }
 
-/// Requests the items at the cursor; the answer replaces the list when it comes.
+/// One server's answer.
+type Answer = (usize, Result<Option<CompletionResponse>, RequestError>);
+
+/// Requests the items at the cursor from the session's servers (a trigger character: from those
+/// that have it); the answers replace the list as they come ([`receive`]).
 fn request(editor: &mut Editor, context: CompletionContext, cx: &mut Context<Editor>) {
     let text = editor.document.text().clone();
     let cursor = editor.document.selection().primary().head;
     let Some(session) = session_mut(editor) else {
         return;
     };
-    let params = CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: session.uri.clone(),
-            },
-            position: flux_lsp::position::to_lsp(&text, cursor),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-        context: Some(context),
-    };
-    let response = session.server.request::<Completion>(params);
+    let trigger = context
+        .trigger_character
+        .as_deref()
+        .and_then(|trigger| trigger.chars().next())
+        .filter(|_| context.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER);
+    let position = flux_lsp::position::to_lsp(&text, cursor);
+    let responses: Vec<_> = session
+        .sources
+        .iter()
+        .enumerate()
+        .filter(|(_, source)| trigger.is_none_or(|c| source.triggers(c)))
+        .map(|(index, source)| {
+            let params = CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: source.uri.clone(),
+                    },
+                    position,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: Some(context.clone()),
+            };
+            let response = source.server.request::<Completion>(params);
+            async move { (index, response.await) }
+        })
+        .collect();
+    let round = session.next_list_id;
+    session.next_list_id += 1;
     let task = cx.spawn(async move |this, cx| {
-        let response = response.await;
-        this.update(cx, |editor, cx| receive(editor, response, cx))
+        use futures::{FutureExt, StreamExt};
+        let mut pending: futures::stream::FuturesUnordered<_> = responses.into_iter().collect();
+        let mut deadline = cx
+            .background_executor()
+            .timer(crate::lsp::MERGE_DEADLINE)
+            .fuse();
+        // Until the deadline the answers wait for each other; after it each goes at once.
+        let mut waiting = true;
+        let mut batch: Vec<Answer> = Vec::new();
+        loop {
+            futures::select_biased! {
+                answer = pending.next() => match answer {
+                    Some(answer) => batch.push(answer),
+                    None => break,
+                },
+                _ = deadline => waiting = false,
+            }
+            if !waiting && !batch.is_empty() && !pending.is_empty() {
+                let answers = std::mem::take(&mut batch);
+                let delivered =
+                    this.update(cx, |editor, cx| receive(editor, round, answers, false, cx));
+                if delivered.is_err() {
+                    return;
+                }
+            }
+        }
+        this.update(cx, |editor, cx| receive(editor, round, batch, true, cx))
             .ok();
     });
     session.request = Some(Request {
         origin: Origin::new(text),
+        round,
+        answers: Vec::new(),
         _task: task,
     });
 }
 
+/// Answers of the request `round`: with those before them they make the list (the main server's
+/// items first). `last` — no more will come. Answers that failed (the document changed under the
+/// request, the server failed) add nothing: with none at all the previous list stays, if there is
+/// one; a failure is not worth a message while typing.
 fn receive(
     editor: &mut Editor,
-    response: Result<Option<CompletionResponse>, RequestError>,
+    round: u64,
+    answers: Vec<Answer>,
+    last: bool,
     cx: &mut Context<Editor>,
 ) {
     let Some(session) = session_mut(editor) else {
         return;
     };
-    let Some(request) = session.request.take() else {
+    let Some(request) = session
+        .request
+        .as_mut()
+        .filter(|request| request.round == round)
+    else {
         return;
     };
-    let (items, incomplete) = match response {
-        Ok(Some(CompletionResponse::Array(items))) => (items, false),
-        Ok(Some(CompletionResponse::List(list))) => (list.items, list.is_incomplete),
-        Ok(None) => (Vec::new(), false),
-        // The document changed under the request, or the server failed: keep the previous list,
-        // if there is one; a failure is not worth a message while typing.
-        Err(_) => {
-            if session.list.is_none() {
-                close(editor, cx);
-            }
-            return;
+    for (source, answer) in answers {
+        match answer {
+            Ok(Some(response)) => request.answers.push((source, response)),
+            Ok(None) => request
+                .answers
+                .push((source, CompletionResponse::Array(Vec::new()))),
+            Err(_) => {}
         }
-    };
-    let lines = Lines::new(&request.origin.text);
-    let resolved = !session.resolve_provider;
+    }
+    let answered = !request.answers.is_empty();
+    let mut answers = request.answers.clone();
+    let origin = request.origin.clone();
+    if last {
+        session.request = None;
+    }
+    if !answered {
+        if last && session.list.is_none() {
+            close(editor, cx);
+        }
+        return;
+    }
+    answers.sort_by_key(|(source, _)| *source);
+    let (items, incomplete) = flux_lsp::merge::completions(answers);
+    let lines = Lines::new(&origin.text);
     let items = items
         .into_iter()
-        .map(|item| Item::new(item, &lines, resolved))
+        .map(|(source, item)| {
+            let resolved = !session.sources[source].resolve_provider;
+            Item::new(item, source, &lines, resolved)
+        })
         .collect();
     let id = session.next_list_id;
     session.next_list_id += 1;
@@ -565,7 +663,7 @@ fn receive(
         id,
         items,
         incomplete,
-        origin: request.origin,
+        origin,
     });
     refilter(editor, cx);
     cx.notify();
@@ -754,7 +852,7 @@ fn load_details(editor: &mut Editor, cx: &mut Context<Editor>) {
         return;
     }
     let resolve = (!item.resolved).then(|| {
-        session
+        session.sources[item.source]
             .server
             .request::<ResolveCompletionItem>(item.lsp.clone())
     });
@@ -830,7 +928,7 @@ fn confirm(editor: &mut Editor, mode: Mode, window: &mut Window, cx: &mut Contex
         .map(|command| command.command.clone());
     // Edits may only arrive with the resolved item: they follow it.
     if !item.resolved && item.lsp.additional_text_edits.is_none() {
-        let resolve = session
+        let resolve = session.sources[item.source]
             .server
             .request::<ResolveCompletionItem>(item.lsp.clone());
         let id = menu.next_pending;
@@ -1023,7 +1121,7 @@ fn query_groups(
 }
 
 /// Fuzzy matches of the items against their group's query, best first: prefix matches, then by
-/// score, then in the server's order.
+/// score, then the main server's before the helpers', then in the server's order.
 fn rank(items: &[Item], groups: &[(String, Vec<usize>)]) -> Vec<Match> {
     let mut matches = Vec::new();
     for (query, members) in groups {
@@ -1064,6 +1162,8 @@ fn rank(items: &[Item], groups: &[(String, Vec<usize>)]) -> Vec<Match> {
         b.prefix
             .cmp(&a.prefix)
             .then(b.score.cmp(&a.score))
+            // The main server's before the helpers': their `sortText`s don't compare.
+            .then(items[a.item].source.cmp(&items[b.item].source))
             .then_with(|| items[a.item].sort_text().cmp(items[b.item].sort_text()))
             .then_with(|| items[a.item].lsp.label.cmp(&items[b.item].lsp.label))
     });
@@ -1819,6 +1919,7 @@ mod tests {
                 label: label.to_string(),
                 ..Default::default()
             },
+            source: 0,
             resolved: true,
             edit_start: None,
             docs: None,

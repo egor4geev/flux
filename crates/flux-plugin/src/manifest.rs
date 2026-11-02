@@ -46,7 +46,10 @@
 //!
 //! Declarative contributions (stage 8.3) need no code: a language with its tree-sitter grammar and
 //! highlighting query, a language server and how Flux installs it, a color theme, a set of file
-//! icons.
+//! icons. API 0.4 adds a language's `injections` (the languages embedded in its files: a
+//! tree-sitter injections query) and `file-patterns` (globs over file names: `.env.*`), and a
+//! language server's `secondary` (a helper that is never a file's main server) and `activation`
+//! (the files or npm dependencies a project needs for the server to start).
 //!
 //! ```toml
 //! [[languages]]
@@ -369,12 +372,18 @@ pub struct LanguageSpec {
     pub extensions: Vec<String>,
     /// Exact file names ("Cargo.lock", ".bashrc").
     pub file_names: Vec<String>,
+    /// Patterns of file names (API 0.4): `*` any run of characters, `?` one, `[…]` one of a set;
+    /// ".env.*", "*.component.html". Exact names win over them, they win over extensions.
+    pub file_patterns: Vec<String>,
     /// More names of code fences: "rs", "py".
     pub aliases: Vec<String>,
     /// The id of one of the plugin's `[[grammars]]`.
     pub grammar: String,
     /// Highlighting query files in the plugin's folder, concatenated in this order.
     pub highlights: Vec<String>,
+    /// Injections query files (API 0.4), concatenated in this order: which nodes hold text of
+    /// another language.
+    pub injections: Vec<String>,
     pub precedence: QueryPrecedence,
     /// The language id language servers know it by (`textDocument/didOpen`): "typescriptreact";
     /// the id by default.
@@ -443,6 +452,23 @@ pub struct LanguageServerSpec {
     /// Answers to `workspace/configuration`, by section.
     pub settings: Option<Value>,
     pub install: Option<InstallSpec>,
+    /// API 0.4: a helper next to a language's own server (a linter, a framework's classes) — never
+    /// a file's main server, whatever the plugins' order.
+    pub secondary: bool,
+    /// API 0.4: the server starts for a project only if this finds it there; `None` — always.
+    pub activation: Option<ActivationSpec>,
+}
+
+/// When a language server is wanted in a project (API 0.4 `activation`): one of `files` is in the
+/// project's root or in the folder of the nearest `package.json` above the file, or one of
+/// `dependencies` is among that `package.json`'s `dependencies`, `devDependencies` or
+/// `peerDependencies`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ActivationSpec {
+    /// Patterns of file names, as `file-patterns` (`eslint.config.*`, `.eslintrc*`); no braces.
+    pub files: Vec<String>,
+    /// npm package names; `*`, `?`, `[…]` match within a part (`@tailwindcss/*`).
+    pub dependencies: Vec<String>,
 }
 
 /// How Flux installs a language server that isn't on the machine.
@@ -727,6 +753,7 @@ impl Manifest {
         let mut files: Vec<&str> = Vec::new();
         for language in &self.languages {
             files.extend(language.highlights.iter().map(String::as_str));
+            files.extend(language.injections.iter().map(String::as_str));
             files.extend(language.icon.as_deref());
         }
         for grammar in &self.grammars {
@@ -808,10 +835,14 @@ struct RawLanguage {
     extensions: Vec<String>,
     #[serde(default)]
     file_names: Vec<String>,
+    /// API 0.4.
+    file_patterns: Option<Vec<String>>,
     #[serde(default)]
     aliases: Vec<String>,
     grammar: String,
     highlights: OneOrMany,
+    /// API 0.4.
+    injections: Option<OneOrMany>,
     #[serde(default)]
     precedence: QueryPrecedence,
     lsp_id: Option<String>,
@@ -861,6 +892,19 @@ struct RawLanguageServer {
     initialization_options: Option<toml::Value>,
     settings: Option<toml::Value>,
     install: Option<RawInstall>,
+    /// API 0.4.
+    secondary: Option<bool>,
+    /// API 0.4.
+    activation: Option<RawActivation>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawActivation {
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
 }
 
 /// `{ npm = […], bin = … }`, `{ github = …, asset = …, bin = … }`, `{ go = …, bin = … }`,
@@ -1135,8 +1179,12 @@ impl RawManifest {
                 ));
             }
         }
-        let (languages, grammars, language_servers) =
-            check_languages(self.languages, self.grammars, self.language_servers)?;
+        let (languages, grammars, language_servers) = check_languages(
+            &self.api,
+            self.languages,
+            self.grammars,
+            self.language_servers,
+        )?;
         for theme in &self.themes {
             check_relative("themes", &theme.file)?;
         }
@@ -1172,8 +1220,55 @@ impl RawManifest {
 /// The languages, grammars and language servers of a manifest.
 type LanguageParts = (Vec<LanguageSpec>, Vec<GrammarSpec>, Vec<LanguageServerSpec>);
 
+/// Whether `api` ("0.4") is `major.minor` or later. A version that isn't one (`"next"`) is not.
+fn api_at_least(api: &str, major: u32, minor: u32) -> bool {
+    let mut parts = api.trim().split('.').map(str::parse::<u32>);
+    match (parts.next(), parts.next()) {
+        (Some(Ok(have_major)), Some(Ok(have_minor))) => (have_major, have_minor) >= (major, minor),
+        _ => false,
+    }
+}
+
+/// A pattern of file names (`file-patterns`): not empty, no folders, every `[` closed. Flux
+/// matches it with `flux_syntax::glob_matches`, which takes the same patterns.
+fn check_file_pattern(language: &str, pattern: &str) -> Result<(), ManifestError> {
+    let error = |why: &str| {
+        Err(ManifestError(format!(
+            "language \"{language}\": file pattern \"{pattern}\" — {why}"
+        )))
+    };
+    if pattern.is_empty() {
+        return error("it is empty");
+    }
+    if pattern.contains(['/', '\\']) {
+        return error("a pattern of a file name, without folders");
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '[' {
+            i += 1;
+            continue;
+        }
+        // A `]` right after `[` or `[!` is a member of the set, not its end.
+        let mut end = i + 1;
+        if matches!(chars.get(end), Some('!' | '^')) {
+            end += 1;
+        }
+        if chars.get(end) == Some(&']') {
+            end += 1;
+        }
+        match chars[end.min(chars.len())..].iter().position(|&c| c == ']') {
+            Some(offset) => i = end + offset + 1,
+            None => return error("a `[` without its `]`"),
+        }
+    }
+    Ok(())
+}
+
 /// Checks the languages, grammars and servers of a manifest: ids, references between them, paths.
 fn check_languages(
+    api: &str,
     raw_languages: Vec<RawLanguage>,
     raw_grammars: Vec<RawGrammar>,
     raw_servers: Vec<RawLanguageServer>,
@@ -1226,6 +1321,27 @@ fn check_languages(
         if let Some(icon) = &raw.icon {
             check_relative(&format!("language \"{}\"", raw.id), icon)?;
         }
+        // The keys of API 0.4: to an older Flux they are unknown, so an older manifest can't have
+        // them.
+        for (key, used) in [
+            ("injections", raw.injections.is_some()),
+            ("file-patterns", raw.file_patterns.is_some()),
+        ] {
+            if used && !api_at_least(api, 0, 4) {
+                return error(format!(
+                    "language \"{}\": unknown field `{key}` (it needs api = \"0.4\")",
+                    raw.id
+                ));
+            }
+        }
+        let injections = raw.injections.map(OneOrMany::into_vec).unwrap_or_default();
+        for file in &injections {
+            check_relative(&format!("language \"{}\"", raw.id), file)?;
+        }
+        let file_patterns = raw.file_patterns.unwrap_or_default();
+        for pattern in &file_patterns {
+            check_file_pattern(&raw.id, pattern)?;
+        }
         if raw
             .extensions
             .iter()
@@ -1245,9 +1361,11 @@ fn check_languages(
                 .map(|extension| extension.to_ascii_lowercase())
                 .collect(),
             file_names: raw.file_names,
+            file_patterns,
             aliases: raw.aliases,
             grammar: raw.grammar,
             highlights,
+            injections,
             precedence: raw.precedence,
             lsp_id: raw.lsp_id,
             icon: raw.icon,
@@ -1266,6 +1384,21 @@ fn check_languages(
                 raw.id
             ));
         }
+        for (key, used) in [
+            ("secondary", raw.secondary.is_some()),
+            ("activation", raw.activation.is_some()),
+        ] {
+            if used && !api_at_least(api, 0, 4) {
+                return error(format!(
+                    "language server \"{}\": unknown field `{key}` (it needs api = \"0.4\")",
+                    raw.id
+                ));
+            }
+        }
+        let activation = match raw.activation {
+            Some(activation) => Some(check_activation(&raw.id, activation)?),
+            None => None,
+        };
         servers.push(LanguageServerSpec {
             id: raw.id,
             command: raw.command,
@@ -1280,9 +1413,51 @@ fn check_languages(
             initialization_options: raw.initialization_options.map(toml_to_json),
             settings: raw.settings.map(toml_to_json),
             install: raw.install.map(RawInstall::check),
+            secondary: raw.secondary.unwrap_or(false),
+            activation,
         });
     }
     Ok((languages, grammars, servers))
+}
+
+/// A server's `activation`: something to look for, patterns of file names without folders or
+/// braces (`{a,b}` isn't a pattern: the variants are listed), package names.
+fn check_activation(server: &str, raw: RawActivation) -> Result<ActivationSpec, ManifestError> {
+    let error = |why: String| {
+        Err(ManifestError(format!(
+            "language server \"{server}\": activation — {why}"
+        )))
+    };
+    if raw.files.is_empty() && raw.dependencies.is_empty() {
+        return error("`files` or `dependencies`".into());
+    }
+    for pattern in &raw.files {
+        if pattern.contains(['{', '}']) {
+            return error(format!(
+                "\"{pattern}\": no braces, list the variants (\"a.js\", \"a.ts\") or use `*`"
+            ));
+        }
+        if let Err(why) = flux_platform::glob::check_glob(pattern) {
+            return error(why);
+        }
+    }
+    for name in &raw.dependencies {
+        let parts: Vec<&str> = name.split('/').collect();
+        let fine = !name.trim().is_empty()
+            && parts.len() <= 2
+            && parts
+                .iter()
+                .all(|part| flux_platform::glob::check_glob(part).is_ok());
+        if !fine {
+            return error(format!(
+                "\"{name}\" isn't a package name (\"eslint\", \"@tailwindcss/*\")"
+            ));
+        }
+    }
+    Ok(ActivationSpec {
+        files: raw.files,
+        dependencies: raw.dependencies,
+    })
 }
 
 fn unique<'a>(what: &str, ids: impl Iterator<Item = &'a str>) -> Result<(), ManifestError> {
@@ -1734,6 +1909,158 @@ file = "icon-themes/flux.toml"
             assert!(files.contains(&file), "{file}");
         }
         assert!(!Manifest::parse(TODO).unwrap().has_contributions());
+    }
+
+    /// API 0.4: a language's injections and patterns of file names.
+    const VUE: &str = r#"
+id = "test.vue"
+name = "Vue"
+version = "0.1.0"
+api = "0.4"
+
+[[languages]]
+id = "vue"
+name = "Vue"
+extensions = ["vue"]
+grammar = "vue"
+highlights = "languages/vue/highlights.scm"
+injections = "languages/vue/injections.scm"
+
+[[languages]]
+id = "dotenv"
+name = ".env"
+file-names = [".env"]
+file-patterns = [".env.*", "*.env", "[Dd]ocker.env[!~]"]
+grammar = "vue"
+highlights = "languages/dotenv/highlights.scm"
+injections = ["languages/a.scm", "languages/b.scm"]
+
+[[grammars]]
+id = "vue"
+wasm = "grammars/vue.wasm"
+"#;
+
+    /// API 0.4: a helper server and when it starts.
+    const ESLINT: &str = r#"
+id = "test.eslint"
+name = "ESLint"
+version = "0.1.0"
+api = "0.4"
+
+[[language-servers]]
+id = "eslint"
+command = "vscode-eslint-language-server"
+languages = ["javascript", "vue"]
+secondary = true
+activation = { files = ["eslint.config.*", ".eslintrc*"], dependencies = ["eslint", "@eslint/*"] }
+
+[[language-servers]]
+id = "plain"
+command = "plain"
+extensions = ["zz"]
+"#;
+
+    #[test]
+    fn api_04_reads_secondary_servers_and_their_activation() {
+        let manifest = Manifest::parse(ESLINT).unwrap();
+        let eslint = &manifest.language_servers[0];
+        assert!(eslint.secondary);
+        assert_eq!(
+            eslint.activation,
+            Some(ActivationSpec {
+                files: vec!["eslint.config.*".into(), ".eslintrc*".into()],
+                dependencies: vec!["eslint".into(), "@eslint/*".into()],
+            })
+        );
+        let plain = &manifest.language_servers[1];
+        assert!(!plain.secondary);
+        assert_eq!(plain.activation, None);
+        // Older APIs don't know the keys.
+        for key in ["secondary = true\n", "activation = { files = [\"a\"] }\n"] {
+            let text = ESLINT
+                .replace("api = \"0.4\"", "api = \"0.3\"")
+                .replace("secondary = true\n", "")
+                .replace(
+                    "activation = { files = [\"eslint.config.*\", \".eslintrc*\"], dependencies = [\"eslint\", \"@eslint/*\"] }\n",
+                    key,
+                );
+            let err = Manifest::parse(&text).unwrap_err().0;
+            assert!(err.contains("needs api = \"0.4\""), "{key}: {err}");
+        }
+        for wrong in [
+            "activation = {}",
+            "activation = { files = [\"tailwind.config.{js,ts}\"] }",
+            "activation = { files = [\"config/eslint.js\"] }",
+            "activation = { dependencies = [\"a/b/c\"] }",
+            "activation = { dependencies = [\"\"] }",
+            "activation = { files = [\"a\"], other = [\"b\"] }",
+        ] {
+            let text = ESLINT.replace(
+                "activation = { files = [\"eslint.config.*\", \".eslintrc*\"], dependencies = [\"eslint\", \"@eslint/*\"] }",
+                wrong,
+            );
+            assert!(Manifest::parse(&text).is_err(), "{wrong}");
+        }
+    }
+
+    #[test]
+    fn api_04_reads_injections_and_file_patterns() {
+        let manifest = Manifest::parse(VUE).unwrap();
+        let vue = manifest.language("vue").unwrap();
+        assert_eq!(vue.injections, ["languages/vue/injections.scm"]);
+        assert!(vue.file_patterns.is_empty());
+        let dotenv = manifest.language("dotenv").unwrap();
+        assert_eq!(
+            dotenv.file_patterns,
+            [".env.*", "*.env", "[Dd]ocker.env[!~]"]
+        );
+        assert_eq!(dotenv.injections, ["languages/a.scm", "languages/b.scm"]);
+        let files = manifest.named_files();
+        assert!(files.contains(&"languages/vue/injections.scm"));
+        assert!(files.contains(&"languages/b.scm"));
+        // A later API has them too.
+        assert!(Manifest::parse(&VUE.replace("api = \"0.4\"", "api = \"0.5\"")).is_ok());
+    }
+
+    #[test]
+    fn api_04_keys_need_api_04() {
+        for api in ["0.3", "0.2", "next"] {
+            let older = VUE.replace("api = \"0.4\"", &format!("api = \"{api}\""));
+            let err = Manifest::parse(&older).unwrap_err().0;
+            assert!(err.contains("unknown field `injections`"), "{api}: {err}");
+            assert!(err.contains("api = \"0.4\""), "{err}");
+            let patterns_only =
+                older.replace("injections = \"languages/vue/injections.scm\"\n", "");
+            let patterns_only = patterns_only.replace(
+                "injections = [\"languages/a.scm\", \"languages/b.scm\"]\n",
+                "",
+            );
+            let err = Manifest::parse(&patterns_only).unwrap_err().0;
+            assert!(
+                err.contains("unknown field `file-patterns`"),
+                "{api}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_04_checks_patterns_and_paths() {
+        for (right, wrong, says) in [
+            ("\".env.*\"", "\"config/.env.*\"", "without folders"),
+            ("\".env.*\"", "\"\"", "empty"),
+            ("\"*.env\"", "\"*.[env\"", "`[` without its `]`"),
+            (
+                "injections = \"languages/vue/injections.scm\"",
+                "injections = \"../vue/injections.scm\"",
+                "a path in the plugin's folder",
+            ),
+        ] {
+            let err = Manifest::parse(&VUE.replacen(right, wrong, 1))
+                .unwrap_err()
+                .0;
+            assert!(err.contains(says), "{wrong}: {err}");
+        }
+        assert!(Manifest::parse(&VUE.replace("\"*.env\"", "\"[]x]\"")).is_ok());
     }
 
     #[test]

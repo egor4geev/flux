@@ -149,10 +149,13 @@ pub fn server(
         args: strings(args),
         extensions: strings(extensions),
         file_names: strings(file_names),
+        file_patterns: Vec::new(),
         initialization_options: None,
         settings: None,
         install: None,
         env: Default::default(),
+        secondary: false,
+        activation: None,
     }
 }
 

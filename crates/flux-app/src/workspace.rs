@@ -3273,7 +3273,12 @@ impl Workspace {
                     .group(NotificationGroup::Files);
                 self.notify(notification, cx)
             }
-            FileTreeEvent::DiskChanged(paths) => self.sync_documents(paths.clone(), cx),
+            FileTreeEvent::DiskChanged(paths) => {
+                // A config file or a `package.json` may start or stop language servers.
+                self.lsp
+                    .update(cx, |store, cx| store.disk_changed(paths.as_deref(), cx));
+                self.sync_documents(paths.clone(), cx)
+            }
         }
     }
 

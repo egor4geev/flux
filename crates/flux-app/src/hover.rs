@@ -333,69 +333,133 @@ fn show(
     cx.notify();
 }
 
-/// `textDocument/hover` at `position`, if the document's server provides it; the answer is
-/// prepared (Markdown parsed, code highlighted) in the background.
+/// `textDocument/hover` at `position` of the document's servers that provide it — the main one and
+/// the helpers (plugin API 0.4 `secondary`), whose contents follow the main server's under a rule;
+/// what has come within [`crate::lsp::MERGE_DEADLINE`] shows, a later answer joins it. The answer
+/// is prepared (Markdown parsed, code highlighted) in the background.
 fn request(
     editor: &Editor,
     position: usize,
     id: usize,
     cx: &mut Context<Editor>,
 ) -> Option<Task<()>> {
-    let (server, uri) = crate::lsp::document_server(editor)?;
-    let capabilities = server.capabilities()?;
-    let supported = match &capabilities.hover_provider {
-        Some(HoverProviderCapability::Simple(supported)) => *supported,
-        Some(HoverProviderCapability::Options(_)) => true,
-        None => false,
-    };
-    if !supported {
+    let servers =
+        crate::lsp::merged_servers(editor, |capabilities| match &capabilities.hover_provider {
+            Some(HoverProviderCapability::Simple(supported)) => *supported,
+            Some(HoverProviderCapability::Options(_)) => true,
+            None => false,
+        });
+    if servers.is_empty() {
         return None;
     }
     let text = editor.document.text().clone();
-    let params = HoverParams {
-        text_document_position_params: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier { uri },
-            position: flux_lsp::position::to_lsp(&text, position),
-        },
-        work_done_progress_params: Default::default(),
-    };
-    let response = server.request::<HoverRequest>(params);
+    let at = flux_lsp::position::to_lsp(&text, position);
+    let responses: Vec<_> = servers
+        .into_iter()
+        .enumerate()
+        .map(|(index, (server, uri))| {
+            let params = HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: at,
+                },
+                work_done_progress_params: Default::default(),
+            };
+            let response = server.request::<HoverRequest>(params);
+            async move { (index, response.await.ok().flatten()) }
+        })
+        .collect();
     let language = editor.document.path().and_then(language_for_path);
     let scopes = markdown::scopes(cx);
     Some(cx.spawn(async move |this, cx| {
-        let hover = response.await.ok().flatten();
-        let range = hover
-            .as_ref()
-            .and_then(|hover| hover.range)
-            .map(|range| flux_lsp::position::range_from_lsp(&text, range));
-        let blocks = match hover {
-            Some(hover) => {
-                cx.background_executor()
-                    .spawn(async move {
-                        let mut blocks = hover_blocks(hover.contents);
-                        markdown::highlight(&mut blocks, language, &scopes);
-                        blocks
-                    })
-                    .await
+        use futures::{FutureExt, StreamExt};
+        let mut pending: futures::stream::FuturesUnordered<_> = responses.into_iter().collect();
+        let mut deadline = cx
+            .background_executor()
+            .timer(crate::lsp::MERGE_DEADLINE)
+            .fuse();
+        let mut answers = Vec::new();
+        // Until the deadline the answers wait for each other; after it each shows at once.
+        let mut waiting = true;
+        let mut fresh = false;
+        loop {
+            futures::select_biased! {
+                answer = pending.next() => match answer {
+                    Some(answer) => {
+                        answers.push(answer);
+                        fresh = true;
+                    }
+                    None => break,
+                },
+                _ = deadline => waiting = false,
             }
-            None => Vec::new(),
-        };
-        this.update(cx, |editor, cx| received(editor, id, blocks, range, cx))
-            .ok();
+            if !waiting && fresh && !pending.is_empty() {
+                fresh = false;
+                let (blocks, range) =
+                    prepare(&answers, &text, language.clone(), scopes.clone(), cx).await;
+                let shown = this.update(cx, |editor, cx| {
+                    received(editor, id, blocks, range, false, cx)
+                });
+                if shown.is_err() {
+                    return;
+                }
+            }
+        }
+        let (blocks, range) = prepare(&answers, &text, language, scopes, cx).await;
+        this.update(cx, |editor, cx| {
+            received(editor, id, blocks, range, true, cx)
+        })
+        .ok();
     }))
 }
 
+/// The servers' hovers so far, joined in their order ([`flux_lsp::merge::hovers`]): blocks and the
+/// range of the symbol.
+async fn prepare(
+    answers: &[(usize, Option<flux_lsp::lsp_types::Hover>)],
+    text: &flux_core::Rope,
+    language: Option<std::sync::Arc<flux_syntax::Language>>,
+    scopes: Vec<String>,
+    cx: &mut gpui::AsyncApp,
+) -> (Vec<Block>, Option<Range<usize>>) {
+    let mut ordered: Vec<_> = answers.to_vec();
+    ordered.sort_by_key(|(index, _)| *index);
+    let hover =
+        flux_lsp::merge::hovers(ordered.into_iter().filter_map(|(_, hover)| hover).collect());
+    let range = hover
+        .as_ref()
+        .and_then(|hover| hover.range)
+        .map(|range| flux_lsp::position::range_from_lsp(text, range));
+    let blocks = match hover {
+        Some(hover) => {
+            cx.background_executor()
+                .spawn(async move {
+                    let mut blocks = hover_blocks(hover.contents);
+                    markdown::highlight(&mut blocks, language, &scopes);
+                    blocks
+                })
+                .await
+        }
+        None => Vec::new(),
+    };
+    (blocks, range)
+}
+
+/// The servers' hover for the popup `id` (`last` — all of it, nothing more will come).
 fn received(
     editor: &mut Editor,
     id: usize,
     blocks: Vec<Block>,
     range: Option<Range<usize>>,
+    last: bool,
     cx: &mut Context<Editor>,
 ) {
     let Some(popup) = editor.hover.popup.as_mut().filter(|popup| popup.id == id) else {
         return;
     };
-    popup.request = None;
+    if last {
+        popup.request = None;
+    }
     if !blocks.is_empty() && popup.has_content() && motion::enabled() {
         popup.blocks_since = Some(Instant::now());
     }
@@ -410,7 +474,8 @@ fn received(
     }) {
         popup.range = range;
     }
-    if popup.blocks.is_empty()
+    if last
+        && popup.blocks.is_empty()
         && popup.diagnostics.is_empty()
         && popup.link_blocks.is_empty()
         && !popup.link_waiting

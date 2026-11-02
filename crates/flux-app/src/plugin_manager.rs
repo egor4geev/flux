@@ -2183,6 +2183,7 @@ pub(crate) fn contribution_sections(
                 .map(|extension| format!(".{extension}"))
                 .collect();
             files.extend(language.file_names.iter().cloned());
+            files.extend(language.file_patterns.iter().cloned());
             let grammar = match manifest
                 .grammar(&language.grammar)
                 .map(|grammar| &grammar.source)

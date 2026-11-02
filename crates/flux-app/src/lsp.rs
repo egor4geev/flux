@@ -16,7 +16,12 @@
 //!
 //! A document may have several servers (Python: pyright for the language, ruff for formatting and
 //! linting): it is open on all of them, the first is the main one (completion, hover, navigation),
-//! diagnostics are kept per server.
+//! diagnostics are kept per server. Plugin API 0.4: a `secondary` server (ESLint, Tailwind CSS) is
+//! never the main one while there is another, its completion and hover join the main server's
+//! ([`merged_servers`]); one with an `activation` starts only in projects with its config files or
+//! npm dependencies ([`LspStore::disk_changed`] looks again). A server with `diagnosticProvider` is
+//! asked for its problems (pull diagnostics, LSP 3.17) after a document opens and after edits;
+//! they land where published ones do.
 //!
 //! Stage 8.3: the servers come from the language plugins (`[[language-servers]]`,
 //! [`crate::contributions::servers`]). When the turned-on plugins change, so do the servers: one
@@ -41,6 +46,7 @@
 //! server can also be stopped (it stays stopped until started there). Files the servers watch get
 //! the changes on disk ([`crate::lsp_watch`]).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
@@ -60,9 +66,10 @@ use flux_lsp::lsp_types::{
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncKind,
     Uri, VersionedTextDocumentIdentifier,
 };
+use flux_lsp::pull::{Pulled, PulledReport};
 use flux_lsp::{
-    ApplyEdit, Health, LanguageServer, ServerEvent, ServerLog, ServerStatus, install, position,
-    sync,
+    ApplyEdit, Health, LanguageServer, RequestError, ServerEvent, ServerLog, ServerStatus, install,
+    position, sync,
 };
 use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedReceiver};
@@ -124,6 +131,12 @@ const BACKGROUND_MAX_BYTES: u64 = 4 << 20;
 
 impl EventEmitter<LspEvent> for LspStore {}
 
+/// Pulled diagnostics (LSP 3.17) are asked for this long after the last edit: typing doesn't ask
+/// at every key.
+const PULL_DELAY: Duration = Duration::from_millis(250);
+/// A pull the server cancelled (`ServerCancelled` with `retriggerRequest`) goes again after this.
+const PULL_RETRY: Duration = Duration::from_millis(500);
+
 /// How long an error or warning from a server (`window/showMessage`) stays in the status bar.
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longer status texts are shortened with "…": the status bar shares its width with the position,
@@ -177,10 +190,16 @@ pub struct LspStore {
     background_clock: u64,
     /// Watchers of the files the servers registered (part 10.5).
     watch: crate::lsp_watch::WatchState,
+    /// Whether a server with an `activation` (plugin API 0.4) is wanted, by server, root and the
+    /// folder of the file's nearest `package.json`; cleared when such files change on disk.
+    activation: RefCell<HashMap<ActivationKey, bool>>,
     /// Where the status item was drawn and whether the servers' popup is open (part 10.5).
     pub(crate) status_ui: crate::lsp_status::StatusUi,
     _subscriptions: Vec<Subscription>,
 }
+
+/// A server's name, a workspace root, the folder of a file's nearest `package.json`.
+type ActivationKey = (String, PathBuf, Option<PathBuf>);
 
 /// A file open on a server without an editor (Flux's tools for Claude).
 struct BackgroundDocument {
@@ -219,6 +238,9 @@ struct Server {
     published: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
     /// Files open on this server without an editor.
     background: Vec<BackgroundDocument>,
+    /// Pulled diagnostics (LSP 3.17), by file: the last `resultId` and the pull waiting or in
+    /// flight.
+    pulls: HashMap<PathBuf, Pull>,
     /// Work in progress (`$/progress`), in order of start.
     progress: Vec<Progress>,
     /// The last error or warning the server showed (`window/showMessage`), for a few seconds.
@@ -283,6 +305,16 @@ impl Status {
     }
 }
 
+/// A file's pulled diagnostics on a server.
+#[derive(Default)]
+struct Pull {
+    /// Of the last report the file's current text had: sent with the next pull, so the server may
+    /// answer "unchanged".
+    result_id: Option<String>,
+    /// The next pull (its delay, then the request); dropping it cancels.
+    task: Option<Task<()>>,
+}
+
 #[derive(Debug, Clone)]
 struct Progress {
     token: String,
@@ -302,6 +334,9 @@ pub struct LspDocument {
     pub(crate) version: i32,
     /// Place of the server among the document's servers (`servers_for_path`): 0 — the main one.
     pub(crate) rank: usize,
+    /// A helper server (plugin API 0.4 `secondary`): its completion and hover join the main
+    /// server's.
+    pub(crate) secondary: bool,
     /// How the server wants `didChange` (from its capabilities).
     pub(crate) sync: TextDocumentSyncKind,
     /// `didSave`: `None` — not wanted; `Some(true)` — with the text.
@@ -351,6 +386,7 @@ impl LspStore {
             waiters: Vec::new(),
             background_clock: 0,
             watch: Default::default(),
+            activation: Default::default(),
             status_ui: Default::default(),
             _subscriptions: subscriptions,
         }
@@ -389,24 +425,105 @@ impl LspStore {
         };
         // Open in an editor now: a background copy of it would be a second didOpen.
         self.close_background(&path);
-        let configs: Vec<ServerConfig> = config::servers_for_path(&self.configs, &path)
-            .into_iter()
-            .cloned()
-            .collect();
+        let configs: Vec<ServerConfig> = self.servers_for(&path).into_iter().cloned().collect();
         let root = self.server_root(&path);
         for (rank, config) in configs.into_iter().enumerate() {
             let key = ServerKey {
                 name: config.name.clone(),
                 root: root.clone(),
             };
+            let secondary = config.secondary;
             let index = self.ensure_server(config, key, cx);
             let server = &mut self.servers[index];
             server.editors.push(editor.downgrade());
             if server.status == Status::Running {
-                open_document(server, editor, rank, cx);
+                open_document(server, editor, rank, secondary, cx);
+                let id = server.id;
+                self.pull(id, &path, Duration::ZERO, cx);
             }
         }
         cx.notify();
+    }
+
+    /// The servers of `path` ([`config::servers_for_path`], the main one first) that its project
+    /// wants: one with an `activation` (plugin API 0.4) only where it finds its config files or
+    /// dependencies — looked up once per project and `package.json`.
+    fn servers_for(&self, path: &Path) -> Vec<&ServerConfig> {
+        let configs = config::servers_for_path(&self.configs, path);
+        if configs.iter().all(|config| config.activation.is_none()) {
+            return configs;
+        }
+        let root = self.server_root(path);
+        let package = config::package_dir(&root, path);
+        let mut cache = self.activation.borrow_mut();
+        configs
+            .into_iter()
+            .filter(|config| {
+                config.activation.is_none()
+                    || *cache
+                        .entry((config.name.clone(), root.clone(), package.clone()))
+                        .or_insert_with(|| config.activated(&root, package.as_deref()))
+            })
+            .collect()
+    }
+
+    /// Files changed on disk (the project's watcher; `None` — anything may have): a
+    /// `package.json` or a file a server's `activation` looks for may start or stop servers.
+    pub fn disk_changed(&mut self, paths: Option<&[PathBuf]>, cx: &mut Context<Self>) {
+        let patterns: Vec<&str> = self
+            .configs
+            .iter()
+            .filter_map(|config| config.activation.as_ref())
+            .flat_map(|activation| activation.files.iter().map(String::as_str))
+            .collect();
+        if patterns.is_empty() {
+            return;
+        }
+        let relevant = paths.is_none_or(|paths| {
+            paths.iter().any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name == "package.json"
+                            || patterns
+                                .iter()
+                                .any(|pattern| flux_platform::glob::glob_matches(pattern, name))
+                    })
+            })
+        });
+        if !relevant {
+            return;
+        }
+        self.activation.borrow_mut().clear();
+        self.resync_editors(cx);
+        cx.notify();
+    }
+
+    /// Each editor's document goes to the servers that serve it now, if they aren't those that do.
+    fn resync_editors(&mut self, cx: &mut Context<Self>) {
+        self.editors.retain(|editor| editor.upgrade().is_some());
+        for editor in self.editors.clone().iter().filter_map(WeakEntity::upgrade) {
+            let Some(path) = editor.read(cx).document.path().map(Path::to_path_buf) else {
+                continue;
+            };
+            let mut wanted: Vec<String> = self
+                .servers_for(&path)
+                .iter()
+                .map(|config| config.name.clone())
+                .collect();
+            let id = editor.entity_id();
+            let mut serving: Vec<String> = self
+                .servers
+                .iter()
+                .filter(|server| server.editors.iter().any(|e| e.entity_id() == id))
+                .map(|server| server.key.name.clone())
+                .collect();
+            wanted.sort();
+            serving.sort();
+            if wanted != serving {
+                self.register(&editor, cx);
+            }
+        }
     }
 
     /// The language plugins bring other servers: those whose config is gone stop, those whose
@@ -461,28 +578,9 @@ impl LspStore {
                 Some(_) => {}
             }
         }
-        self.editors.retain(|editor| editor.upgrade().is_some());
-        for editor in self.editors.clone().iter().filter_map(WeakEntity::upgrade) {
-            let Some(path) = editor.read(cx).document.path().map(Path::to_path_buf) else {
-                continue;
-            };
-            let mut wanted: Vec<String> = config::servers_for_path(&self.configs, &path)
-                .iter()
-                .map(|config| config.name.clone())
-                .collect();
-            let id = editor.entity_id();
-            let mut serving: Vec<String> = self
-                .servers
-                .iter()
-                .filter(|server| server.editors.iter().any(|e| e.entity_id() == id))
-                .map(|server| server.key.name.clone())
-                .collect();
-            wanted.sort();
-            serving.sort();
-            if wanted != serving {
-                self.register(&editor, cx);
-            }
-        }
+        // Another activation may hold for the new configs.
+        self.activation.borrow_mut().clear();
+        self.resync_editors(cx);
         cx.notify();
     }
 
@@ -570,7 +668,8 @@ impl LspStore {
         let Some(path) = editor.read(cx).document.path().map(Path::to_path_buf) else {
             return;
         };
-        let names: Vec<String> = config::servers_for_path(&self.configs, &path)
+        let names: Vec<String> = self
+            .servers_for(&path)
             .iter()
             .map(|config| config.name.clone())
             .collect();
@@ -792,6 +891,7 @@ impl LspStore {
             unopened: HashMap::new(),
             published: HashMap::new(),
             background: Vec::new(),
+            pulls: HashMap::new(),
             progress: Vec::new(),
             message: None,
             message_timer: None,
@@ -853,30 +953,37 @@ impl LspStore {
     fn server_event(&mut self, id: u64, event: ServerEvent, cx: &mut Context<Self>) {
         match event {
             ServerEvent::Initialized => {
-                let configs = &self.configs;
-                let Some(server) = self.servers.iter_mut().find(|server| server.id == id) else {
+                let Some(server) = self.servers.iter().find(|server| server.id == id) else {
                     return;
                 };
+                let name = server.key.name.clone();
+                let editors: Vec<(Entity<Editor>, usize, bool)> = server
+                    .editors
+                    .iter()
+                    .filter_map(WeakEntity::upgrade)
+                    .map(|editor| {
+                        let place = editor
+                            .read(cx)
+                            .document
+                            .path()
+                            .map(|path| self.place_of(path, &name))
+                            .unwrap_or((0, false));
+                        (editor, place.0, place.1)
+                    })
+                    .collect();
+                let server = self.server_mut(id).expect("found above");
                 server.status = Status::Running;
                 if let Some(handle) = &server.handle {
                     server.log = Some(handle.log());
                 }
-                let editors: Vec<_> = server
-                    .editors
-                    .iter()
-                    .filter_map(WeakEntity::upgrade)
-                    .collect();
-                for editor in &editors {
-                    let rank = editor
-                        .read(cx)
-                        .document
-                        .path()
-                        .map_or(0, |path| rank_of(configs, path, &server.key.name));
-                    open_document(server, editor, rank, cx);
+                for (editor, rank, secondary) in &editors {
+                    open_document(server, editor, *rank, *secondary, cx);
                 }
                 open_background_documents(server, cx);
+                self.pull_all(id, Duration::ZERO, cx);
                 cx.notify();
             }
+            ServerEvent::DiagnosticsRefresh => self.pull_all(id, Duration::ZERO, cx),
             ServerEvent::ApplyEdit(request) => {
                 let Some(server) = self.server_mut(id).and_then(|server| server.handle.clone())
                 else {
@@ -1063,6 +1170,7 @@ impl LspStore {
         server.unopened.clear();
         server.published.clear();
         server.background.clear();
+        server.pulls.clear();
         let editors: Vec<_> = server
             .editors
             .iter()
@@ -1155,9 +1263,194 @@ impl LspStore {
         }
         cx.emit(DiagnosticsChanged(vec![path.clone()]));
         // Those waiting for this file learn that its diagnostics are fresh.
+        self.wake_waiters(&path);
+    }
+
+    // --- Pulled diagnostics (LSP 3.17) ---
+
+    /// Place of server `name` among the servers of `path` (0 — the main one) and whether it is a
+    /// helper ([`ServerConfig::secondary`]).
+    fn place_of(&self, path: &Path, name: &str) -> (usize, bool) {
+        let configs = self.servers_for(path);
+        configs
+            .iter()
+            .position(|config| config.name == name)
+            .map_or((usize::MAX, false), |rank| (rank, configs[rank].secondary))
+    }
+
+    /// Every document open on the server pulls its diagnostics again (after `delay`): it has just
+    /// started, or asked for it (`workspace/diagnostic/refresh`).
+    fn pull_all(&mut self, id: u64, delay: Duration, cx: &mut Context<Self>) {
+        let Some(server) = self.servers.iter().find(|server| server.id == id) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = server
+            .editors
+            .iter()
+            .filter_map(WeakEntity::upgrade)
+            .filter_map(|editor| editor.read(cx).document.path().map(Path::to_path_buf))
+            .collect();
+        paths.extend(server.background.iter().map(|doc| doc.path.clone()));
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            self.pull(id, &path, delay, cx);
+        }
+    }
+
+    /// Edits of `path` on the servers `ids`: their diagnostics are pulled again once typing
+    /// pauses ([`schedule_pull`]).
+    pub(crate) fn edited(&mut self, ids: &[u64], path: &Path, cx: &mut Context<Self>) {
+        for &id in ids {
+            self.pull(id, path, PULL_DELAY, cx);
+        }
+    }
+
+    /// The text of `path` the server `id` has (an editor's or a background copy's): its URI and
+    /// version.
+    fn open_text(&self, id: u64, path: &Path, cx: &App) -> Option<(LanguageServer, Uri, i32)> {
+        let server = self.servers.iter().find(|server| server.id == id)?;
+        let handle = server.handle.clone()?;
+        for editor in server.editors.iter().filter_map(WeakEntity::upgrade) {
+            let editor = editor.read(cx);
+            if editor.document.path() != Some(path) {
+                continue;
+            }
+            if let Some(doc) = editor.lsp.iter().find(|doc| doc.server_id == id) {
+                return Some((handle, doc.uri.clone(), doc.version));
+            }
+        }
+        let doc = server
+            .background
+            .iter()
+            .find(|doc| doc.path == path && doc.opened)?;
+        Some((handle, doc.uri.clone(), doc.version))
+    }
+
+    /// Asks the server `id` for the problems of `path` after `delay` (`textDocument/diagnostic`),
+    /// if it pulls them and has the file open; a pull waiting or in flight for it gives way.
+    fn pull(&mut self, id: u64, path: &Path, delay: Duration, cx: &mut Context<Self>) {
+        let Some((handle, uri, version)) = self.open_text(id, path, cx) else {
+            return;
+        };
+        if !handle.pulls_diagnostics() {
+            return;
+        }
+        let Some(server) = self.server_mut(id) else {
+            return;
+        };
+        let pull = server.pulls.entry(path.to_path_buf()).or_default();
+        let previous = pull.result_id.clone();
+        let path = path.to_path_buf();
+        pull.task = Some(cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let result = handle.pull_diagnostics(uri.clone(), previous).await;
+            this.update(cx, |this, cx| {
+                this.pulled(id, path, uri, version, result, cx)
+            })
+            .ok();
+        }));
+    }
+
+    /// The answer to a pull of `path` at `version`: problems land where published ones do; the
+    /// result ids are kept while they are of the current text; a cancelled pull goes again.
+    fn pulled(
+        &mut self,
+        id: u64,
+        path: PathBuf,
+        uri: Uri,
+        version: i32,
+        result: Result<Pulled, RequestError>,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .open_text(id, &path, cx)
+            .is_some_and(|(_, _, now)| now == version);
+        let pulled = match result {
+            Ok(pulled) => pulled,
+            Err(error) => {
+                if error.retrigger() {
+                    self.pull(id, &path, PULL_RETRY, cx);
+                } else if !error.is_outdated()
+                    && let Some(server) = self.server_mut(id)
+                    && let Some(log) = server.handle.as_ref().map(LanguageServer::log)
+                {
+                    log.push(
+                        flux_lsp::LogSource::Flux,
+                        &format!("textDocument/diagnostic failed: {error}"),
+                    );
+                }
+                return;
+            }
+        };
+        if let Some(pull) = self
+            .server_mut(id)
+            .and_then(|server| server.pulls.get_mut(&path))
+        {
+            pull.task = None;
+        }
+        match pulled.report {
+            Some(PulledReport::Full { result_id, items }) => {
+                if current {
+                    self.keep_result_id(id, &path, result_id);
+                }
+                let params = PublishDiagnosticsParams {
+                    uri,
+                    diagnostics: items,
+                    version: Some(version),
+                };
+                self.publish_diagnostics(id, params, cx);
+            }
+            Some(PulledReport::Unchanged { result_id }) => {
+                if current {
+                    self.keep_result_id(id, &path, Some(result_id));
+                }
+                // The problems shown are fresh: those waiting for them learn it.
+                self.wake_waiters(&path);
+            }
+            None => {}
+        }
+        for (related, report) in pulled.related {
+            let Some(related_path) = position::path_from_uri(&related) else {
+                continue;
+            };
+            if related_path == path {
+                continue;
+            }
+            match report {
+                PulledReport::Full { result_id, items } => {
+                    self.keep_result_id(id, &related_path, result_id);
+                    let params = PublishDiagnosticsParams {
+                        uri: related,
+                        diagnostics: items,
+                        version: None,
+                    };
+                    self.publish_diagnostics(id, params, cx);
+                }
+                PulledReport::Unchanged { result_id } => {
+                    self.keep_result_id(id, &related_path, Some(result_id))
+                }
+            }
+        }
+    }
+
+    fn keep_result_id(&mut self, id: u64, path: &Path, result_id: Option<String>) {
+        if let Some(server) = self.server_mut(id) {
+            server
+                .pulls
+                .entry(path.to_path_buf())
+                .or_default()
+                .result_id = result_id;
+        }
+    }
+
+    /// Those waiting for the diagnostics of `path` learn that they are fresh.
+    fn wake_waiters(&mut self, path: &Path) {
         let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
             .into_iter()
-            .partition(|(waited, _)| *waited == path);
+            .partition(|(waited, _)| waited == path);
         self.waiters = waiting;
         for (_, waiter) in ready {
             let _ = waiter.send(());
@@ -1171,10 +1464,7 @@ impl LspStore {
     /// nobody opened. `false` — no server serves the file, or it is too big; `true` too when an
     /// editor has it open (it is on its servers already).
     pub fn open_background(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
-        let configs: Vec<ServerConfig> = config::servers_for_path(&self.configs, path)
-            .into_iter()
-            .cloned()
-            .collect();
+        let configs: Vec<ServerConfig> = self.servers_for(path).into_iter().cloned().collect();
         if configs.is_empty() {
             return false;
         }
@@ -1207,6 +1497,8 @@ impl LspStore {
             });
             if server.status == Status::Running {
                 open_background_documents(server, cx);
+                let id = server.id;
+                self.pull(id, path, Duration::ZERO, cx);
             }
         }
         self.trim_background();
@@ -1216,8 +1508,9 @@ impl LspStore {
 
     /// The file of a background document changed on disk (an edit of Claude): the servers get the
     /// new text. `false` — it isn't open in the background.
-    pub fn refresh_background(&mut self, path: &Path) -> bool {
+    pub fn refresh_background(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
         let mut found = false;
+        let mut pulled = Vec::new();
         let mut text = None;
         for server in &mut self.servers {
             let Some(handle) = server.handle.clone() else {
@@ -1246,6 +1539,10 @@ impl LspStore {
                     text: text.clone(),
                 }],
             });
+            pulled.push(server.id);
+        }
+        for id in pulled {
+            self.pull(id, path, PULL_DELAY, cx);
         }
         found
     }
@@ -1286,10 +1583,7 @@ impl LspStore {
         if let Some(editor) = self.editor_for_path(path, cx) {
             return document_server(editor.read(cx));
         }
-        let main = config::servers_for_path(&self.configs, path)
-            .first()?
-            .name
-            .clone();
+        let main = self.servers_for(path).first()?.name.clone();
         let root = self.server_root(path);
         let server = self
             .servers
@@ -1315,7 +1609,7 @@ impl LspStore {
     /// Why `path` has no server to ask yet (starting, installing, not installed), as
     /// [`Self::waiting`] says it for an editor; `None` — running, or no server serves it.
     pub fn file_waiting(&self, path: &Path) -> Option<FileServers> {
-        let configs = config::servers_for_path(&self.configs, path);
+        let configs = self.servers_for(path);
         let main = configs.first()?;
         let root = self.server_root(path);
         let Some(server) = self
@@ -1341,7 +1635,7 @@ impl LspStore {
 
     /// Whether any server serves files like `path`.
     pub fn serves(&self, path: &Path) -> bool {
-        !config::servers_for_path(&self.configs, path).is_empty()
+        !self.servers_for(path).is_empty()
     }
 
     /// The editor that has `path` open on its servers.
@@ -1524,6 +1818,7 @@ impl LspStore {
         let mut changed: Vec<PathBuf> = server.unopened.drain().map(|(path, _)| path).collect();
         changed.extend(server.published.drain().map(|(path, _)| path));
         server.background.clear();
+        server.pulls.clear();
         let editors: Vec<_> = server
             .editors
             .iter()
@@ -1873,20 +2168,13 @@ async fn install_server(
     }
 }
 
-/// Place of server `name` among the servers of `path`: 0 — the main one.
-fn rank_of(configs: &[ServerConfig], path: &Path, name: &str) -> usize {
-    config::servers_for_path(configs, path)
-        .iter()
-        .position(|config| config.name == name)
-        .unwrap_or(usize::MAX)
-}
-
 /// Sends `didOpen` for the editor's document and attaches it to the server (in rank order among
 /// the document's servers), with the diagnostics published before it was opened.
 fn open_document(
     server: &mut Server,
     editor: &Entity<Editor>,
     rank: usize,
+    secondary: bool,
     cx: &mut Context<LspStore>,
 ) {
     let Some(handle) = server.handle.clone() else {
@@ -1922,6 +2210,7 @@ fn open_document(
                 uri,
                 version: 0,
                 rank,
+                secondary,
                 sync,
                 save,
             },
@@ -1986,6 +2275,31 @@ pub fn document_server(editor: &Editor) -> Option<(LanguageServer, Uri)> {
     Some((doc.server.clone(), doc.uri.clone()))
 }
 
+/// How long the answers of a document's servers to one request (completion, hover) are waited for
+/// together: what has come by then shows, what comes later joins it (plugin API 0.4).
+pub const MERGE_DEADLINE: Duration = Duration::from_millis(300);
+
+/// The servers whose answers make one for the editor's document (completion, hover): the main one
+/// (if the document is open on it) and the helpers ([`LspDocument::secondary`]) — whose
+/// capabilities fit — in rank order. Navigation, rename and signature help stay with the main
+/// server ([`document_server`]).
+pub fn merged_servers(
+    editor: &Editor,
+    fits: impl Fn(&ServerCapabilities) -> bool,
+) -> Vec<(LanguageServer, Uri)> {
+    editor
+        .lsp
+        .iter()
+        .filter(|doc| doc.rank == 0 || doc.secondary)
+        .filter(|doc| {
+            doc.server
+                .capabilities()
+                .is_some_and(|capabilities| fits(&capabilities))
+        })
+        .map(|doc| (doc.server.clone(), doc.uri.clone()))
+        .collect()
+}
+
 /// The first of the document's servers whose capabilities fit (formatting: ruff for Python).
 pub fn document_server_with(
     editor: &Editor,
@@ -2037,6 +2351,29 @@ pub fn text_changed(editor: &mut Editor, changes: &[TextChange]) {
                 content_changes,
             });
     }
+}
+
+/// From `Editor::text_changed`, after [`text_changed`]: the servers that pull diagnostics (LSP
+/// 3.17) are asked again once typing pauses — through the store, after the editor's update.
+pub fn schedule_pull(editor: &Editor, cx: &mut Context<Editor>) {
+    let ids: Vec<u64> = editor
+        .lsp
+        .iter()
+        .filter(|doc| doc.server.pulls_diagnostics())
+        .map(|doc| doc.server_id)
+        .collect();
+    let (Some(store), Some(path)) = (editor.lsp_store.clone(), editor.document.path()) else {
+        return;
+    };
+    if ids.is_empty() {
+        return;
+    }
+    let path = path.to_path_buf();
+    cx.defer(move |cx| {
+        store
+            .update(cx, |store, cx| store.edited(&ids, &path, cx))
+            .ok();
+    });
 }
 
 /// From `Editor::save_now` after a successful write.

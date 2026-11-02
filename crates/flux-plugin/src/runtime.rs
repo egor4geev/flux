@@ -856,7 +856,7 @@ impl Runner {
             ));
         }
         if let Some(built) = crate::compat::built_for(component, &shared.engine)
-            && built != api
+            && built != crate::wit_version(api)
         {
             return Err(Stop::new(
                 format!(

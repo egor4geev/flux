@@ -12,6 +12,11 @@
 //!
 //! At most one job runs at a time: edits made during a parse accumulate and go into the next parse,
 //! so a long parse doesn't build up a queue.
+//!
+//! A language with an injections query (plugin API 0.4) embeds others: after the document's tree,
+//! the job finds and parses the embedded documents ([`crate::injection`]) — within the same budget
+//! on the UI thread, and whatever doesn't fit (or is a WebAssembly grammar) goes on in the
+//! background like the document's own parse.
 
 use std::ops::{ControlFlow, Range};
 use std::sync::{Arc, Weak};
@@ -21,15 +26,37 @@ use flux_core::{ChangeSet, Rope};
 use tree_sitter::{InputEdit, ParseOptions, ParseState, Parser, Point, Tree};
 
 use crate::edit::input_edits;
-use crate::highlight::{self, HighlightMap, HighlightSpan};
+use crate::highlight::{self, HighlightMaps, HighlightSpan};
+use crate::injection::{Injector, Layer, edit_bytes, edit_layers, merge_ranges};
 use crate::language::Language;
 use crate::text::{chunk_from, count_newlines};
+
+/// More edited ranges than this are remembered as one, from the first to the last.
+const MAX_EDITED: usize = 32;
+
+/// An embedded document ([`Syntax::injections`]): its language and the text it is made of.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Injection {
+    pub language: Arc<Language>,
+    /// 1 for one in the document, 2 for one inside it…
+    pub depth: usize,
+    /// Byte ranges of the document's text.
+    pub ranges: Vec<Range<usize>>,
+}
 
 pub struct Syntax {
     language: Arc<Language>,
     /// The latest tree, edited to match the current text. It may be stale (edits made after the
     /// parse), but its node offsets have already been shifted.
     tree: Option<Tree>,
+    /// The embedded documents of the latest parse, edited like the tree; parents before children.
+    layers: Vec<Layer>,
+    /// The bytes of the current text edited since the last job's snapshot: where the next job
+    /// looks for injections again (with the places where the tree changed).
+    edited: Vec<Range<usize>>,
+    /// The next job looks for injections everywhere: the first parse, the languages changed, a
+    /// job was lost with its edits.
+    reinject: bool,
     /// The number of `\n` in the current text, if known. Always known when there is a tree: edits
     /// use it to tell whether ropey lines match tree-sitter lines.
     newlines: Option<usize>,
@@ -40,6 +67,8 @@ pub struct Syntax {
     job: Option<InFlight>,
     /// The parser kept between jobs, so memory isn't reallocated for each one.
     parser: Option<Parser>,
+    /// The same for the embedded documents.
+    layer_parser: Option<Parser>,
 }
 
 /// The job handed out to the application.
@@ -66,12 +95,60 @@ impl Syntax {
         Self {
             language,
             tree: None,
+            layers: Vec::new(),
+            edited: Vec::new(),
+            reinject: true,
             newlines: None,
             dirty: true,
             version: 0,
             job: None,
             parser: None,
+            layer_parser: None,
         }
+    }
+
+    /// The embedded documents of the latest parse, edited to match the current text, in order:
+    /// a document's before the ones inside it.
+    pub fn injections(&self) -> Vec<Injection> {
+        self.layers
+            .iter()
+            .filter(|layer| layer.tree.is_some())
+            .map(|layer| Injection {
+                language: layer.language.clone(),
+                depth: layer.depth,
+                ranges: layer
+                    .ranges()
+                    .map(|range| range.start_byte..range.end_byte)
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The document's language and the languages embedded in it now, each once: the highlight
+    /// maps a highlighting needs ([`HighlightMaps`]).
+    pub fn languages(&self) -> Vec<Arc<Language>> {
+        let mut languages = vec![self.language.clone()];
+        for layer in &self.layers {
+            if !languages
+                .iter()
+                .any(|known| Arc::ptr_eq(known, &layer.language))
+            {
+                languages.push(layer.language.clone());
+            }
+        }
+        languages
+    }
+
+    /// The registered languages changed (a plugin installed, removed, turned on or off): the
+    /// injections are looked up again — a language may have come or gone. Needs a parse.
+    pub fn languages_changed(&mut self) {
+        if !self.language.has_injections() && self.layers.is_empty() {
+            return;
+        }
+        self.reinject = true;
+        self.dirty = true;
+        // Its store keeps every WebAssembly grammar it parsed, the removed ones too.
+        self.layer_parser = None;
     }
 
     pub fn language(&self) -> &Arc<Language> {
@@ -133,6 +210,8 @@ impl Syntax {
                 if let Some(tree) = &mut self.tree {
                     apply_edits(tree, &batch.edits);
                 }
+                edit_layers(&mut self.layers, &batch.edits);
+                self.record_edits(&batch.edits);
                 self.newlines = Some(batch.newlines);
                 if let Some(job) = &mut self.job {
                     job.pending.push(PendingEdit::Ready(batch.edits));
@@ -142,6 +221,7 @@ impl Syntax {
                 // The line count is unknown, so there is no tree and the first parse is in
                 // progress.
                 debug_assert!(self.tree.is_none());
+                self.reinject = true;
                 if let Some(job) = &mut self.job {
                     job.pending.push(PendingEdit::Deferred {
                         old_text: old_text.clone(),
@@ -172,6 +252,8 @@ impl Syntax {
             pending: Vec::new(),
         });
         self.dirty = false;
+        let edited = std::mem::take(&mut self.edited);
+        let edited = (!std::mem::take(&mut self.reinject)).then_some(edited);
         Some(ParseJob {
             language: self.language.clone(),
             text: text.clone(),
@@ -180,6 +262,12 @@ impl Syntax {
             newlines: self.newlines,
             token,
             version: self.version,
+            tree: None,
+            injector: Box::new(Injector::new(
+                self.layers.clone(),
+                edited,
+                self.layer_parser.take(),
+            )),
         })
     }
 
@@ -189,7 +277,9 @@ impl Syntax {
     pub fn finish(&mut self, result: ParseResult) -> bool {
         let ParseResult {
             tree,
+            layers,
             parser,
+            layer_parser,
             newlines,
             token,
             version,
@@ -205,22 +295,33 @@ impl Syntax {
         if let Some(parser) = parser {
             self.parser.get_or_insert(parser);
         }
+        if let Some(parser) = layer_parser {
+            self.layer_parser.get_or_insert(parser);
+        }
         let Some(mut tree) = tree else {
-            // The parse failed: the previous (edited) tree stays.
+            // The parse failed: the previous (edited) tree and layers stay, and the edits it took
+            // are looked at again.
+            self.reinject = true;
             return true;
         };
+        let mut layers = layers;
         let mut newlines = newlines;
         for pending in job.pending {
             match pending {
-                PendingEdit::Ready(edits) => apply_edits(&mut tree, &edits),
+                PendingEdit::Ready(edits) => {
+                    apply_edits(&mut tree, &edits);
+                    edit_layers(&mut layers, &edits);
+                }
                 PendingEdit::Deferred { old_text, changes } => {
                     let batch = input_edits(&old_text, &changes, newlines);
                     apply_edits(&mut tree, &batch.edits);
+                    edit_layers(&mut layers, &batch.edits);
                     newlines = batch.newlines;
                 }
             }
         }
         self.tree = Some(tree);
+        self.layers = layers;
         self.newlines.get_or_insert(newlines);
         true
     }
@@ -230,6 +331,9 @@ impl Syntax {
     /// disk). The result of an already issued job will be discarded.
     pub fn reset(&mut self) {
         self.tree = None;
+        self.layers.clear();
+        self.edited.clear();
+        self.reinject = true;
         self.newlines = None;
         self.job = None;
         self.dirty = true;
@@ -238,28 +342,57 @@ impl Syntax {
 
     /// Highlighting for the lines `lines` (ropey lines): a vector of spans for each existing line
     /// in the range. Columns are in characters within the line, excluding the newline. Before the
-    /// first parse, the vectors are empty.
+    /// first parse, the vectors are empty. `maps` has the document language's map — a
+    /// [`HighlightMap`](crate::HighlightMap) — and those of the embedded languages; an embedded
+    /// document without one keeps the host's highlighting.
     pub fn highlight_lines(
         &self,
         text: &Rope,
         lines: Range<usize>,
-        map: &HighlightMap,
+        maps: &(impl HighlightMaps + ?Sized),
     ) -> Vec<Vec<HighlightSpan>> {
-        let tree = self
-            .tree
-            .as_ref()
-            .filter(|_| Arc::ptr_eq(map.language(), &self.language));
-        debug_assert!(
-            Arc::ptr_eq(map.language(), &self.language),
-            "highlight map is for another language"
-        );
-        highlight::highlight_lines(tree, text, lines, map)
+        highlight::highlight_lines(
+            self.tree.as_ref(),
+            &self.language,
+            &self.layers,
+            text,
+            lines,
+            maps,
+        )
+    }
+
+    /// Remembers where the edits of one change put new text, in the current text's coordinates:
+    /// the next job looks for injections there.
+    fn record_edits(&mut self, edits: &[InputEdit]) {
+        if !self.language.has_injections() {
+            return;
+        }
+        for edit in edits.iter().rev() {
+            for range in &mut self.edited {
+                *range = edit_bytes(range, edit);
+            }
+        }
+        // The edits are in the old text's coordinates: each moves by those before it.
+        let mut shift = 0isize;
+        for edit in edits {
+            let start = edit.start_byte.saturating_add_signed(shift);
+            let end = edit.new_end_byte.saturating_add_signed(shift);
+            self.edited.push(start..end);
+            shift += edit.new_end_byte as isize - edit.old_end_byte as isize;
+        }
+        let mut edited = merge_ranges(std::mem::take(&mut self.edited));
+        if edited.len() > MAX_EDITED {
+            edited = std::iter::once(edited[0].start..edited[edited.len() - 1].end).collect();
+        }
+        self.edited = edited;
     }
 
     /// The job was abandoned before reaching `finish`: its snapshot was never parsed.
     fn forget_abandoned_job(&mut self) {
         if self.job.take_if(|job| !job.is_alive()).is_some() {
             self.dirty = true;
+            // The edits it took are gone with it.
+            self.reinject = true;
         }
     }
 }
@@ -287,13 +420,19 @@ pub struct ParseJob {
     newlines: Option<usize>,
     token: Arc<()>,
     version: u64,
+    /// The document's new tree, once parsed: then the embedded documents are.
+    tree: Option<Tree>,
+    /// Boxed: the job comes back in `Err` from a parse within a budget.
+    injector: Box<Injector>,
 }
 
 /// The job's result; pass it to [`Syntax::finish`].
 pub struct ParseResult {
     tree: Option<Tree>,
+    layers: Vec<Layer>,
     /// None when no parser could be made (the grammar didn't load).
     parser: Option<Parser>,
+    layer_parser: Option<Parser>,
     /// The number of `\n` in the snapshot text.
     newlines: usize,
     token: Arc<()>,
@@ -306,23 +445,35 @@ impl ParseJob {
         &self.language
     }
 
-    /// Parses to completion. Also loads the grammar and compiles the language's highlighting
-    /// query, so the first highlighting on the UI thread doesn't pay milliseconds for them. A
-    /// WebAssembly grammar is parsed under the watchdog ([`crate::wasm::PARSE_LIMIT`]).
+    /// Whether the job may parse a WebAssembly grammar — the document's, or an embedded one's (a
+    /// language with injections may embed any): run it on a thread of its own
+    /// ([`ParseJob::spawn`]), its scanner is a plugin's code.
+    pub fn needs_own_thread(&self) -> bool {
+        self.language.is_wasm() || self.language.has_injections() || self.injector.has_wasm()
+    }
+
+    /// Parses to completion. Also loads the grammar and compiles the language's queries, so the
+    /// first highlighting on the UI thread doesn't pay milliseconds for them. A WebAssembly grammar
+    /// is parsed under the watchdog ([`crate::wasm::PARSE_LIMIT`]), the embedded ones too.
     pub fn run(mut self) -> ParseResult {
-        let _watch = self
-            .language
-            .is_wasm()
-            .then(|| crate::wasm::Watch::start(&self.language));
-        self.language.query();
-        let tree = self.parse(None);
-        self.into_result(tree)
+        if self.tree.is_none() {
+            let _watch = self
+                .language
+                .is_wasm()
+                .then(|| crate::wasm::Watch::start(&self.language));
+            self.language.query();
+            self.language.injections();
+            self.tree = self.parse(None);
+        }
+        // Without a deadline it always finishes.
+        let _ = self.inject(None);
+        self.into_result()
     }
 
     /// Runs the job ([`ParseJob::run`]) on a thread of its own and hands the result to `done`
-    /// there. For a WebAssembly grammar ([`Language::is_wasm`]): its scanner is a plugin's code
-    /// that may never return, and then only this thread is stuck, not a thread of a pool. If the
-    /// thread can't be made, the job is dropped and `done` is never called.
+    /// there. For a WebAssembly grammar ([`ParseJob::needs_own_thread`]): its scanner is a plugin's
+    /// code that may never return, and then only this thread is stuck, not a thread of a pool. If
+    /// the thread can't be made, the job is dropped and `done` is never called.
     pub fn spawn(self, done: impl FnOnce(ParseResult) + Send + 'static) {
         let thread = std::thread::Builder::new().name("flux-parse".into());
         if let Err(err) = thread.spawn(move || done(self.run())) {
@@ -335,16 +486,42 @@ impl ParseJob {
     /// place. The budget is checked once every hundred parser steps, so a small text finishes even
     /// with a zero budget. A grammar that isn't loaded yet is not loaded here (it may take a while),
     /// and a WebAssembly grammar is never parsed here — this is for the UI thread, and its scanner
-    /// may never return ([`crate::wasm`]): the job comes back for [`ParseJob::run`].
+    /// may never return ([`crate::wasm`]): the job comes back for [`ParseJob::run`]. The same goes
+    /// for the embedded documents: the job comes back at the first one it can't parse here.
     pub fn run_with_budget(mut self, budget: Duration) -> Result<ParseResult, ParseJob> {
         let not_loaded = self.parser.is_none() && self.language.loaded_grammar().is_none();
-        if self.language.is_wasm() || not_loaded {
+        let injections_not_ready = self.language.has_injections() && !self.language.is_ready();
+        if self.language.is_wasm() || not_loaded || injections_not_ready {
             return Err(self);
         }
         // A budget that doesn't fit in an Instant is the same as no budget.
-        match self.parse(Instant::now().checked_add(budget)) {
-            Some(tree) => Ok(self.into_result(Some(tree))),
-            None => Err(self),
+        let deadline = Instant::now().checked_add(budget);
+        if self.tree.is_none() {
+            match self.parse(deadline) {
+                Some(tree) => self.tree = Some(tree),
+                None => return Err(self),
+            }
+        }
+        match self.inject(deadline) {
+            ControlFlow::Continue(()) => Ok(self.into_result()),
+            ControlFlow::Break(()) => Err(self),
+        }
+    }
+
+    /// Finds and parses the embedded documents, once the document's tree is there.
+    fn inject(&mut self, deadline: Option<Instant>) -> ControlFlow<()> {
+        let Some(tree) = &self.tree else {
+            return ControlFlow::Continue(());
+        };
+        match self.injector.run(
+            &self.text,
+            &self.language,
+            tree,
+            self.old_tree.as_ref(),
+            deadline,
+        ) {
+            ControlFlow::Continue(()) => ControlFlow::Continue(()),
+            ControlFlow::Break(_) => ControlFlow::Break(()),
         }
     }
 
@@ -376,11 +553,14 @@ impl ParseJob {
         parser.parse_with_options(&mut read, old_tree.as_ref(), Some(options))
     }
 
-    fn into_result(self, tree: Option<Tree>) -> ParseResult {
+    fn into_result(self) -> ParseResult {
         let newlines = self.newlines.unwrap_or_else(|| count_newlines(&self.text));
+        let (layers, layer_parser) = self.injector.into_parts();
         ParseResult {
-            tree,
+            tree: self.tree,
+            layers,
             parser: self.parser,
+            layer_parser,
             newlines,
             token: self.token,
             version: self.version,

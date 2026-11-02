@@ -16,7 +16,10 @@
 //! that thread is stuck.
 //!
 //! The highlight query is compiled in the background (`ParseJob::run`), so [`HighlightMap`] is
-//! built only after a background parse, via `try_new`.
+//! built only after a background parse, via `try_new` — one for the document's language and one
+//! for each language embedded in it (injections, plugin API 0.4). A language that embeds others
+//! is parsed off the UI thread on a thread of its own, like a WebAssembly grammar: the embedded
+//! languages are plugins' grammars.
 
 use std::future::Future;
 use std::ops::Range;
@@ -59,8 +62,9 @@ pub struct Highlighter {
     /// languages, the document looks its language up again ([`Highlighter::languages_changed`]).
     generation: u64,
     syntax: Option<Syntax>,
-    /// capture → scope of the current theme; appears after the first background parse.
-    map: Option<HighlightMap>,
+    /// capture → scope of the current theme, for the document's language and the embedded ones;
+    /// they appear after the background parse that compiles their queries.
+    maps: Vec<HighlightMap>,
     /// The background parse. Dropping it cancels it: the tab was closed or the language changed.
     parse_task: Option<Task<()>>,
 }
@@ -79,7 +83,7 @@ impl Highlighter {
             language,
             generation,
             syntax,
-            map: None,
+            maps: Vec::new(),
             parse_task: None,
         }
     }
@@ -123,7 +127,14 @@ impl Highlighter {
         }
         self.generation = generation;
         if path.and_then(language_for_path) == self.language {
-            return false;
+            // The same language, but one it embeds may have come or gone.
+            let Some(syntax) = &mut self.syntax else {
+                return false;
+            };
+            syntax.languages_changed();
+            self.maps
+                .retain(|map| flux_syntax::languages().contains(map.language()));
+            return syntax.needs_parse();
         }
         *self = Self::new(path, text);
         self.syntax.is_some()
@@ -131,24 +142,40 @@ impl Highlighter {
 
     /// Spans of the visible lines; empty until there is a tree or a mapping to the theme.
     pub fn highlight_lines(&self, text: &Rope, lines: Range<usize>) -> Vec<Vec<HighlightSpan>> {
-        match (&self.syntax, &self.map) {
-            (Some(syntax), Some(map)) => syntax.highlight_lines(text, lines, map),
+        match &self.syntax {
+            Some(syntax) if !self.maps.is_empty() => {
+                syntax.highlight_lines(text, lines, &self.maps)
+            }
             _ => Vec::new(),
         }
     }
 
-    /// Rebuilds the mapping of captures to theme scopes (the theme changed). Until the language
-    /// query is compiled in the background, there is no mapping.
+    /// Rebuilds the mapping of captures to theme scopes (the theme changed). Until a language's
+    /// query is compiled in the background, it has no mapping.
     pub fn refresh_map(&mut self, theme: &Theme) {
-        self.map = self
-            .syntax
-            .as_ref()
-            .and_then(|syntax| HighlightMap::try_new(syntax.language(), &theme.syntax_scopes()));
+        self.maps.clear();
+        self.ensure_map(theme);
     }
 
+    /// Adds the mappings of the languages that have none yet: the document's and the embedded
+    /// ones whose queries are compiled.
     fn ensure_map(&mut self, theme: &Theme) {
-        if self.map.is_none() {
-            self.refresh_map(theme);
+        let Some(syntax) = &self.syntax else {
+            return;
+        };
+        let missing: Vec<Arc<Language>> = syntax
+            .languages()
+            .into_iter()
+            .filter(|language| !self.maps.iter().any(|map| map.language() == language))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let scopes = theme.syntax_scopes();
+        for language in missing {
+            if let Some(map) = HighlightMap::try_new(&language, &scopes) {
+                self.maps.push(map);
+            }
         }
     }
 }
@@ -196,14 +223,14 @@ pub fn parse(editor: &mut Editor, mode: ParseMode, cx: &mut Context<Editor>) {
     }));
 }
 
-/// Runs a parse off the UI thread: a native grammar on the background executor, a WebAssembly one on
-/// a thread of its own ([`ParseJob::spawn`]). `None` if the parse never finished (the thread
-/// couldn't start).
+/// Runs a parse off the UI thread: a native grammar on the background executor, a WebAssembly one —
+/// or a language that embeds others — on a thread of its own ([`ParseJob::spawn`]). `None` if the
+/// parse never finished (the thread couldn't start).
 fn run_in_background(
     job: ParseJob,
     cx: &mut Context<Editor>,
 ) -> Pin<Box<dyn Future<Output = Option<ParseResult>>>> {
-    if job.language().is_wasm() {
+    if job.needs_own_thread() {
         let (sender, receiver) = oneshot::channel();
         job.spawn(move |result| {
             sender.send(result).ok();

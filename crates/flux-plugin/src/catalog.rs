@@ -133,6 +133,64 @@ pub struct IndexLanguage {
     pub extensions: Vec<String>,
     #[serde(default)]
     pub file_names: Vec<String>,
+    /// Patterns of file names (API 0.4 `file-patterns`: `.env.*`).
+    #[serde(default)]
+    pub file_patterns: Vec<String>,
+}
+
+impl IndexLanguage {
+    /// The longest of the language's patterns that matches `file_name`.
+    fn pattern_for(&self, file_name: &str) -> Option<&str> {
+        self.file_patterns
+            .iter()
+            .filter(|pattern| flux_platform::glob::glob_matches(pattern, file_name))
+            .max_by_key(|pattern| pattern.chars().count())
+            .map(String::as_str)
+    }
+}
+
+/// How a published language claims a file, as Flux picks a file's language: by its exact name,
+/// then by a pattern of names (the longest wins), then by its extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Claim<'a> {
+    Extension,
+    Pattern(usize, &'a str),
+    FileName,
+}
+
+/// The strongest claim of `language` on the file, if any.
+fn claim<'a>(
+    language: &'a IndexLanguage,
+    file_name: &str,
+    extension: Option<&str>,
+) -> Option<Claim<'a>> {
+    if language.file_names.iter().any(|name| name == file_name) {
+        return Some(Claim::FileName);
+    }
+    if let Some(pattern) = language.pattern_for(file_name) {
+        return Some(Claim::Pattern(pattern.chars().count(), pattern));
+    }
+    let extension = extension?;
+    language
+        .extensions
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(extension))
+        .then_some(Claim::Extension)
+}
+
+/// The best claim of the plugin's languages on the file, with the language.
+fn best_claim<'a>(entry: &'a IndexEntry, path: &Path) -> Option<(Claim<'a>, &'a IndexLanguage)> {
+    let file_name = path.file_name()?.to_str()?;
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    let mut best: Option<(Claim<'a>, &'a IndexLanguage)> = None;
+    for language in &entry.languages {
+        if let Some(found) = claim(language, file_name, extension)
+            && best.is_none_or(|(claim, _)| found > claim)
+        {
+            best = Some((found, language));
+        }
+    }
+    best
 }
 
 /// A color theme a published plugin adds.
@@ -163,24 +221,10 @@ impl IndexEntry {
             .map_or(text, String::as_str)
     }
 
-    /// The language this plugin adds for `path`, if any: by the exact file name first, then by the
-    /// extension (in any case).
+    /// The language this plugin adds for `path`, if any: by the exact file name first, then by a
+    /// pattern of names (the longest wins), then by the extension (in any case).
     pub fn language_for(&self, path: &Path) -> Option<&IndexLanguage> {
-        let file_name = path.file_name()?.to_str()?;
-        if let Some(language) = self
-            .languages
-            .iter()
-            .find(|language| language.file_names.iter().any(|name| name == file_name))
-        {
-            return Some(language);
-        }
-        let extension = path.extension()?.to_str()?;
-        self.languages.iter().find(|language| {
-            language
-                .extensions
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(extension))
-        })
+        best_claim(self, path).map(|(_, language)| language)
     }
 }
 
@@ -505,43 +549,33 @@ pub fn updates<'a>(index: &'a Index, installed: &[(String, String)]) -> Vec<&'a 
         .collect()
 }
 
-/// A compatible published plugin that adds a language for `path` (by file name, then by
-/// extension): for a file Flux has no language for.
+/// A compatible published plugin that adds a language for `path` — by file name, then by a
+/// pattern of names (the longest wins), then by extension, as Flux picks a file's language; of
+/// equal claims, the first plugin of the index: for a file Flux has no language for.
 pub fn suggest<'a>(index: &'a Index, path: &Path) -> Option<&'a IndexEntry> {
-    let file_name = path.file_name()?.to_str()?;
-    let compatible = || index.plugins.iter().filter(|entry| entry.compatible());
-    if let Some(entry) = compatible().find(|entry| {
-        entry
-            .languages
-            .iter()
-            .any(|language| language.file_names.iter().any(|name| name == file_name))
-    }) {
-        return Some(entry);
+    let mut best: Option<(Claim<'a>, &'a IndexEntry)> = None;
+    for entry in index.plugins.iter().filter(|entry| entry.compatible()) {
+        if let Some((found, _)) = best_claim(entry, path)
+            && best.is_none_or(|(claim, _)| found > claim)
+        {
+            best = Some((found, entry));
+        }
     }
-    let extension = path.extension()?.to_str()?;
-    compatible().find(|entry| {
-        entry.languages.iter().any(|language| {
-            language
-                .extensions
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(extension))
-        })
-    })
+    best.map(|(_, entry)| entry)
 }
 
-/// The kind of file a suggestion is about, as the user ignores it: "*.rs" for an extension a
-/// language claims, the file name ("Dockerfile") for a file name.
+/// The kind of file a suggestion is about, as the user ignores it: the file name ("Dockerfile")
+/// for a file name, the pattern (".env.*") for a pattern, "*.rs" for an extension a language
+/// claims.
 pub fn suggestion_kind(entry: &IndexEntry, path: &Path) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
-    let by_name = entry
-        .languages
-        .iter()
-        .any(|language| language.file_names.iter().any(|name| name == file_name));
-    if by_name {
-        return Some(file_name.to_string());
+    match best_claim(entry, path)?.0 {
+        Claim::FileName => Some(path.file_name()?.to_str()?.to_string()),
+        Claim::Pattern(_, pattern) => Some(pattern.to_string()),
+        Claim::Extension => Some(format!(
+            "*.{}",
+            path.extension()?.to_str()?.to_ascii_lowercase()
+        )),
     }
-    let extension = path.extension()?.to_str()?;
-    Some(format!("*.{}", extension.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
@@ -586,6 +620,7 @@ mod tests {
             name: id.into(),
             extensions: extensions.iter().map(|s| s.to_string()).collect(),
             file_names: file_names.iter().map(|s| s.to_string()).collect(),
+            file_patterns: Vec::new(),
         }
     }
 
@@ -672,6 +707,61 @@ mod tests {
                 .map(|l| l.id.as_str()),
             Some("dockerfile")
         );
+    }
+
+    #[test]
+    fn suggestions_by_pattern_between_file_name_and_extension() {
+        let mut dotenv = entry("flux.dotenv", "0.1.0");
+        dotenv.languages = vec![IndexLanguage {
+            file_patterns: vec![".env.*".into(), "*.env".into()],
+            ..language("dotenv", &[], &[".env"])
+        }];
+        let mut local = entry("flux.local", "0.1.0");
+        local.languages = vec![language("local", &["local"], &[])];
+        let mut angular = entry("flux.angular", "0.1.0");
+        angular.languages = vec![IndexLanguage {
+            file_patterns: vec!["*.component.html".into()],
+            ..language("angular", &[], &[])
+        }];
+        let mut html = entry("flux.html", "0.1.0");
+        html.languages = vec![IndexLanguage {
+            file_patterns: vec!["*.html".into()],
+            ..language("html", &["html"], &[])
+        }];
+        let index = Index {
+            format: INDEX_FORMAT,
+            generated: None,
+            plugins: vec![local, dotenv, html, angular],
+        };
+        let id = |path: &str| suggest(&index, Path::new(path)).map(|entry| entry.id.clone());
+        // A pattern wins over an extension, a file name over a pattern.
+        assert_eq!(id(".env.local").as_deref(), Some("flux.dotenv"));
+        assert_eq!(id("prod.env").as_deref(), Some("flux.dotenv"));
+        assert_eq!(id(".env").as_deref(), Some("flux.dotenv"));
+        assert_eq!(id("notes.local").as_deref(), Some("flux.local"));
+        // Of two patterns, the longer one.
+        assert_eq!(id("app.component.html").as_deref(), Some("flux.angular"));
+        assert_eq!(id("index.html").as_deref(), Some("flux.html"));
+        let dotenv = index.plugin("flux.dotenv").unwrap();
+        assert_eq!(
+            suggestion_kind(dotenv, Path::new("app/.env.local")).as_deref(),
+            Some(".env.*")
+        );
+        assert_eq!(
+            suggestion_kind(dotenv, Path::new(".env")).as_deref(),
+            Some(".env")
+        );
+        assert_eq!(
+            dotenv
+                .language_for(Path::new("x.env"))
+                .map(|l| l.id.as_str()),
+            Some("dotenv")
+        );
+        // An index without patterns reads as before.
+        let old: IndexLanguage =
+            serde_json::from_str(r#"{"id": "rust", "name": "Rust", "extensions": ["rs"]}"#)
+                .unwrap();
+        assert!(old.file_patterns.is_empty());
     }
 
     #[test]

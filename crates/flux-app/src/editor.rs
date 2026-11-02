@@ -556,6 +556,7 @@ impl Editor {
             self.diagnostics.map(&change.changes);
         }
         crate::lsp::text_changed(self, changes);
+        crate::lsp::schedule_pull(self, cx);
         crate::completion::text_changed(self, changes);
         crate::hover::text_changed(self);
         crate::git_gutter::text_changed(self, changes, cx);

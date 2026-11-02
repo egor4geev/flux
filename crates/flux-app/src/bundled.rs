@@ -128,6 +128,7 @@ mod tests {
                 aliases: Vec::new(),
                 extensions: Vec::new(),
                 file_names: Vec::new(),
+                file_patterns: Vec::new(),
                 ..config.clone()
             })
             .collect();

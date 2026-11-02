@@ -1,5 +1,5 @@
-//! What the turned-on plugins add without code (stage 8.3, ADR-032): languages — their grammars
-//! and highlighting queries go to flux-syntax's registry; language servers — the window's language
+//! What the turned-on plugins add without code (stage 8.3, ADR-032): languages — their grammars,
+//! highlighting and injections queries and file patterns go to flux-syntax's registry; language servers — the window's language
 //! servers ([`servers`]); color themes — [`crate::theme`]; sets of file icons and the languages'
 //! own file icons — [`crate::icon_themes`].
 //!
@@ -231,18 +231,30 @@ pub fn problems(plugin: &str, cx: &App) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A plugin's language, resolved: the query files read and joined, the grammar's bytes read.
-fn language_config(entry: &PluginEntry, language: &LanguageSpec) -> Result<LanguageConfig, String> {
-    let mut highlights = Vec::new();
-    for file in &language.highlights {
+/// Query files of a plugin's language, read and joined in order.
+fn read_queries(
+    entry: &PluginEntry,
+    language: &LanguageSpec,
+    files: &[String],
+) -> Result<String, String> {
+    let mut queries = Vec::new();
+    for file in files {
         let bytes = entry
             .files
             .read(file)
             .ok_or_else(|| format!("{}: {file} is missing", language.id))?;
         let text = String::from_utf8(bytes.into_owned())
             .map_err(|_| format!("{}: {file} is not UTF-8", language.id))?;
-        highlights.push(text);
+        queries.push(text);
     }
+    Ok(queries.join("\n"))
+}
+
+/// A plugin's language, resolved: the query files read and joined (highlights; with API 0.4 the
+/// injections too), the grammar's bytes read.
+fn language_config(entry: &PluginEntry, language: &LanguageSpec) -> Result<LanguageConfig, String> {
+    let highlights = read_queries(entry, language, &language.highlights)?;
+    let injections = read_queries(entry, language, &language.injections)?;
     let grammar = entry
         .manifest
         .grammar(&language.grammar)
@@ -272,9 +284,11 @@ fn language_config(entry: &PluginEntry, language: &LanguageSpec) -> Result<Langu
             .to_string(),
         extensions: language.extensions.clone(),
         file_names: language.file_names.clone(),
+        file_patterns: language.file_patterns.clone(),
         aliases: language.aliases.clone(),
         grammar,
-        highlights: highlights.join("\n"),
+        highlights,
+        injections,
         precedence: match language.precedence {
             QueryPrecedence::LastPattern => Precedence::LastPattern,
             QueryPrecedence::FirstPattern => Precedence::FirstPattern,
@@ -285,31 +299,49 @@ fn language_config(entry: &PluginEntry, language: &LanguageSpec) -> Result<Langu
 /// A plugin's language server as the window's language servers take it: the files it serves are
 /// its own `extensions` and `file-names`, otherwise those of its languages.
 fn server_config(server: &LanguageServerSpec, languages: &[&LanguageSpec]) -> ServerConfig {
-    let (extensions, file_names) = if server.extensions.is_empty() && server.file_names.is_empty() {
-        let served = languages
-            .iter()
-            .filter(|language| server.languages.contains(&language.id));
-        let mut extensions = Vec::new();
-        let mut file_names = Vec::new();
-        for language in served {
-            extensions.extend(language.extensions.iter().cloned());
-            file_names.extend(language.file_names.iter().cloned());
-        }
-        (extensions, file_names)
-    } else {
-        (server.extensions.clone(), server.file_names.clone())
-    };
+    let (extensions, file_names, file_patterns) =
+        if server.extensions.is_empty() && server.file_names.is_empty() {
+            let served = languages
+                .iter()
+                .filter(|language| server.languages.contains(&language.id));
+            let mut extensions = Vec::new();
+            let mut file_names = Vec::new();
+            let mut file_patterns = Vec::new();
+            for language in served {
+                extensions.extend(language.extensions.iter().cloned());
+                file_names.extend(language.file_names.iter().cloned());
+                // A language matched by its file name's pattern alone (`*.component.html`) is served
+                // too (API 0.4).
+                file_patterns.extend(language.file_patterns.iter().cloned());
+            }
+            (extensions, file_names, file_patterns)
+        } else {
+            (
+                server.extensions.clone(),
+                server.file_names.clone(),
+                Vec::new(),
+            )
+        };
     ServerConfig {
         name: server.id.clone(),
         command: server.command.clone(),
         args: server.args.clone(),
         extensions,
         file_names,
+        file_patterns,
         initialization_options: server.initialization_options.clone(),
         settings: server.settings.clone(),
         install: server.install.as_ref().map(install),
         // The user's own (`lsp.<server>.env`, part 10.5) come with [`crate::lsp_settings`].
         env: Default::default(),
+        secondary: server.secondary,
+        activation: server
+            .activation
+            .as_ref()
+            .map(|activation| flux_lsp::Activation {
+                files: activation.files.clone(),
+                dependencies: activation.dependencies.clone(),
+            }),
     }
 }
 
@@ -400,6 +432,28 @@ install = { npm = ["zz-ls"], bin = "zz-ls" }
                 .unwrap_err()
                 .contains("queries/missing.scm")
         );
+    }
+
+    #[test]
+    fn an_api_04_language_reads_its_injections_and_patterns() {
+        let manifest = MANIFEST.replace("api = \"0.2\"", "api = \"0.4\"").replace(
+            "lsp-id = \"zz\"",
+            "lsp-id = \"zz\"\ninjections = \"queries/b.scm\"\nfile-patterns = [\".zz.*\"]",
+        );
+        let entry = PluginEntry {
+            manifest: Manifest::parse(&manifest).unwrap(),
+            files: PluginFiles::Embedded(FILES),
+            source: PluginSource::Bundled,
+            locales: Default::default(),
+            problem: None,
+        };
+        let config = language_config(&entry, &entry.manifest.languages[0]).unwrap();
+        assert_eq!(config.injections, "(number) @number");
+        assert_eq!(config.file_patterns, [".zz.*"]);
+        // Without injections, none.
+        let entry = self::entry();
+        let config = language_config(&entry, &entry.manifest.languages[0]).unwrap();
+        assert!(config.injections.is_empty());
     }
 
     #[test]

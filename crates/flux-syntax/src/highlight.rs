@@ -8,6 +8,11 @@
 //! (by start, then by pattern number) paints its span over the earlier ones. A nested capture
 //! overrides the outer one on its own span; for an identical range the later pattern wins (for some
 //! languages, the earlier one; see `Precedence`).
+//!
+//! Embedded documents (injections) are painted over their host, inner ones last. The host's
+//! captures of the embedded text — of its content node and of the nodes inside it — are dropped;
+//! a capture around it (Markdown's `@text.literal` of a whole code block) stays underneath, and
+//! the embedded language's spans paint over it.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -17,6 +22,7 @@ use flux_core::Rope;
 use flux_core::text::line_ending_len;
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 
+use crate::injection::Layer;
 use crate::language::{Language, Precedence};
 use crate::text::{CharCounter, byte_chunks};
 
@@ -90,6 +96,32 @@ impl HighlightMap {
     }
 }
 
+/// The capture → scope maps a highlighting needs: the document language's, and those of the
+/// languages embedded in it ([`Syntax::languages`](crate::Syntax::languages)). A single
+/// [`HighlightMap`] is the maps of a document without injections.
+pub trait HighlightMaps {
+    /// The map of `language`, if there is one.
+    fn map_for(&self, language: &Arc<Language>) -> Option<&HighlightMap>;
+}
+
+impl HighlightMaps for HighlightMap {
+    fn map_for(&self, language: &Arc<Language>) -> Option<&HighlightMap> {
+        Arc::ptr_eq(&self.language, language).then_some(self)
+    }
+}
+
+impl HighlightMaps for [HighlightMap] {
+    fn map_for(&self, language: &Arc<Language>) -> Option<&HighlightMap> {
+        self.iter().find(|map| Arc::ptr_eq(&map.language, language))
+    }
+}
+
+impl HighlightMaps for Vec<HighlightMap> {
+    fn map_for(&self, language: &Arc<Language>) -> Option<&HighlightMap> {
+        self.as_slice().map_for(language)
+    }
+}
+
 fn resolve(capture: &str, scopes: &HashMap<&str, Highlight>) -> Option<Highlight> {
     if capture.starts_with('_') {
         return None;
@@ -110,9 +142,11 @@ fn resolve(capture: &str, scopes: &HashMap<&str, Highlight>) -> Option<Highlight
 /// text length and to character boundaries.
 pub(crate) fn highlight_lines(
     tree: Option<&Tree>,
+    language: &Arc<Language>,
+    layers: &[Layer],
     text: &Rope,
     lines: Range<usize>,
-    map: &HighlightMap,
+    maps: &(impl HighlightMaps + ?Sized),
 ) -> Vec<Vec<HighlightSpan>> {
     let last = lines.end.min(text.len_lines());
     let first = lines.start.min(last);
@@ -122,7 +156,9 @@ pub(crate) fn highlight_lines(
     let Some(tree) = tree else {
         return result;
     };
-    let language = &map.language;
+    let Some(map) = maps.map_for(language) else {
+        return result;
+    };
     let Some(query) = language.query() else {
         return result;
     };
@@ -130,9 +166,115 @@ pub(crate) fn highlight_lines(
     if range.is_empty() {
         return result;
     }
-    let spans = flat_spans(tree, query, language.precedence(), text, range, map);
+    // The content spans of the layers embedded in a host (`None` — the document) near the lines.
+    let contents = |host: Option<usize>| -> Vec<Range<usize>> {
+        layers
+            .iter()
+            .filter(|layer| layer.parent() == host && layer.tree.is_some())
+            .flat_map(Layer::contents)
+            .filter(|content| content.start < range.end && content.end > range.start)
+            .cloned()
+            .collect()
+    };
+    let precedence = language.precedence();
+    let mut spans = flat_spans(
+        tree,
+        query,
+        precedence,
+        text,
+        range.clone(),
+        map,
+        &contents(None),
+    );
+    // Parents come before children: an inner document paints over the one it is in.
+    for (index, layer) in layers.iter().enumerate() {
+        let Some(layer_tree) = &layer.tree else {
+            continue;
+        };
+        let span = layer.span();
+        if span.end <= range.start || span.start >= range.end {
+            continue;
+        }
+        let (Some(map), Some(query)) = (
+            maps.map_for(&layer.language),
+            layer.language.compiled_query(),
+        ) else {
+            continue;
+        };
+        let holes: Vec<Range<usize>> = layer
+            .ranges()
+            .map(|r| r.start_byte.max(range.start)..r.end_byte.min(range.end))
+            .filter(|hole| hole.start < hole.end)
+            .collect();
+        if holes.is_empty() {
+            continue;
+        }
+        let precedence = layer.language.precedence();
+        let inner = flat_spans(
+            layer_tree,
+            query,
+            precedence,
+            text,
+            range.clone(),
+            map,
+            &contents(Some(index)),
+        );
+        let inner = clip(inner, &holes);
+        let painted: Vec<Range<usize>> = inner.iter().map(|(span, _)| span.clone()).collect();
+        spans = overlay(spans, &painted, inner);
+    }
     split_into_lines(text, first..last, &spans, &mut result);
     result
+}
+
+/// `spans` within `holes` (sorted, without overlaps).
+fn clip(spans: Vec<FlatSpan>, holes: &[Range<usize>]) -> Vec<FlatSpan> {
+    let mut clipped = Vec::with_capacity(spans.len());
+    let mut first = 0;
+    for (span, highlight) in spans {
+        while first < holes.len() && holes[first].end <= span.start {
+            first += 1;
+        }
+        for hole in holes[first..]
+            .iter()
+            .take_while(|hole| hole.start < span.end)
+        {
+            let start = span.start.max(hole.start);
+            let end = span.end.min(hole.end);
+            if start < end {
+                clipped.push((start..end, highlight));
+            }
+        }
+    }
+    clipped
+}
+
+/// `base` with `holes` cut out of it and `top` (within the holes) put in: sorted spans without
+/// overlaps.
+fn overlay(base: Vec<FlatSpan>, holes: &[Range<usize>], top: Vec<FlatSpan>) -> Vec<FlatSpan> {
+    let mut spans = Vec::with_capacity(base.len() + top.len());
+    let mut first = 0;
+    for (span, highlight) in base {
+        while first < holes.len() && holes[first].end <= span.start {
+            first += 1;
+        }
+        let mut start = span.start;
+        for hole in holes[first..]
+            .iter()
+            .take_while(|hole| hole.start < span.end)
+        {
+            if start < hole.start {
+                spans.push((start..hole.start, highlight));
+            }
+            start = start.max(hole.end);
+        }
+        if start < span.end {
+            spans.push((start..span.end, highlight));
+        }
+    }
+    spans.extend(top);
+    spans.sort_by_key(|(span, _)| span.start);
+    spans
 }
 
 /// A capture with an already resolved scope, in bytes.
@@ -148,7 +290,8 @@ struct Capture {
 /// A span without overlaps, in bytes.
 type FlatSpan = (Range<usize>, Highlight);
 
-/// Non-overlapping sorted spans within `range`.
+/// Non-overlapping sorted spans within `range`. The captures of nodes within one of `embedded`
+/// (the content of an embedded document) are left out: that text is the embedded language's.
 fn flat_spans(
     tree: &Tree,
     query: &Query,
@@ -156,6 +299,7 @@ fn flat_spans(
     text: &Rope,
     range: Range<usize>,
     map: &HighlightMap,
+    embedded: &[Range<usize>],
 ) -> Vec<FlatSpan> {
     let len = text.len_bytes();
     let mut cursor = QueryCursor::new();
@@ -170,6 +314,12 @@ fn flat_spans(
             continue;
         };
         let node = capture.node.byte_range();
+        if embedded
+            .iter()
+            .any(|content| content.start <= node.start && node.end <= content.end)
+        {
+            continue;
+        }
         let end = node.end.min(len);
         let start = node.start.min(end);
         if start < end && start < range.end && end > range.start {
@@ -464,6 +614,34 @@ mod tests {
         assert_eq!(
             spans,
             vec![(0..2, KEYWORD), (2..4, STRING), (4..12, COMMENT)]
+        );
+    }
+
+    #[test]
+    fn an_embedded_document_paints_over_its_host() {
+        // The host: a string over 3..20 around the embedded text 5..10 and 12..15 (10..12 is a
+        // child of the content node, the host's).
+        let base = vec![(0..3, KEYWORD), (3..20, STRING)];
+        let holes = [5..10, 12..15];
+        let inner = clip(vec![(4..7, COMMENT), (8..14, KEYWORD)], &holes);
+        assert_eq!(
+            inner,
+            vec![(5..7, COMMENT), (8..10, KEYWORD), (12..14, KEYWORD)]
+        );
+        let painted: Vec<Range<usize>> = inner.iter().map(|(span, _)| span.clone()).collect();
+        // Where the embedded language has nothing to say, the host's string shows through.
+        assert_eq!(
+            overlay(base, &painted, inner),
+            vec![
+                (0..3, KEYWORD),
+                (3..5, STRING),
+                (5..7, COMMENT),
+                (7..8, STRING),
+                (8..10, KEYWORD),
+                (10..12, STRING),
+                (12..14, KEYWORD),
+                (14..20, STRING),
+            ]
         );
     }
 

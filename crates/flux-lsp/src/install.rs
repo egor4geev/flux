@@ -205,6 +205,12 @@ pub(crate) fn installed_command(config: &ServerConfig) -> Option<PathBuf> {
     installed_in(&dir()?, config)
 }
 
+/// The folder Flux installed the server in (`servers/<name>`, or the folder of another server
+/// installed from the same packages), if it is installed: what [`crate::config::SERVER_DIR`] means.
+pub(crate) fn installed_dir(config: &ServerConfig) -> Option<PathBuf> {
+    installed_home(&dir()?, config).map(|(home, _)| home)
+}
+
 /// The command, if `<dir>/<name>` has the server installed by the same recipe: when a new Flux
 /// changes the recipe (another package version, another source), the old install is replaced.
 fn installed_in(dir: &Path, config: &ServerConfig) -> Option<PathBuf> {
@@ -1502,10 +1508,13 @@ mod tests {
             args: vec![],
             extensions: vec![],
             file_names: vec![],
+            file_patterns: Vec::new(),
             initialization_options: None,
             settings: None,
             install: Some(install),
             env: Default::default(),
+            secondary: false,
+            activation: None,
         }
     }
 

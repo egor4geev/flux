@@ -1,6 +1,7 @@
 //! Watching project files: on macOS this uses FSEvents (via `notify`), recursively over the whole
 //! root with a single event stream and no separate watcher per directory.
 
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -68,7 +69,11 @@ struct RootPaths {
 
 impl RootPaths {
     fn new(root: &Path) -> Self {
-        let canonical = fs::canonicalize(root).ok().filter(|real| real != root);
+        // Without Windows' `\\?\` prefix: events come as `C:\…`, and the real path catches a
+        // root opened in another letter case.
+        let canonical = flux_platform::path_style::canonicalize(root)
+            .ok()
+            .filter(|real| real != root);
         Self {
             root: root.to_path_buf(),
             canonical,

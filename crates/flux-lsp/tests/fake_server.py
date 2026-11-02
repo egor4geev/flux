@@ -6,6 +6,12 @@ didOpen; asks for its settings again on `flux/askConfiguration`; crashes on `flu
 `flux/status`, `flux/register`, `flux/unregister` sends rust-analyzer's `experimental/serverStatus`
 and (un)registers watched files with the params given. Every message it receives is appended to the
 log file given as the first argument, one JSON per line ({"pid": ..., "env": $FLUX_FAKE_ENV} first).
+
+`--pull`: problems only by pull diagnostics (`diagnosticProvider`, identifier "fake"): a full report
+with a new `resultId` after each change, "unchanged" otherwise, a related file's report too;
+`flux/cancelNextPull` makes the next pull `ServerCancelled` (retrigger), `flux/refreshDiagnostics`
+sends `workspace/diagnostic/refresh`. `--items=a,b`: completion answers these labels (otherwise
+"content modified"); `--hover=text`: the hover's Markdown (`""` — no hover).
 """
 
 import json
@@ -14,6 +20,14 @@ import sys
 
 log_path = sys.argv[1]
 fail_init = "--fail-init" in sys.argv
+pull = "--pull" in sys.argv
+options = dict(arg[2:].split("=", 1) for arg in sys.argv[2:] if arg.startswith("--") and "=" in arg)
+items = options.get("items")
+hover = options.get("hover", "**doc**")
+# Pull diagnostics: the text's version (+1 per didChange), the result id of the last full report.
+changes = 0
+reported = None
+cancel_next_pull = False
 stdin = sys.stdin.buffer
 stdout = sys.stdout.buffer
 
@@ -61,14 +75,16 @@ while True:
         if fail_init:
             send({"id": id, "error": {"code": -32603, "message": "no workspace"}})
             continue
-        send({"id": id, "result": {
-            "capabilities": {
-                "textDocumentSync": 2,
-                "hoverProvider": True,
-                "completionProvider": {"triggerCharacters": ["."]},
-            },
-            "serverInfo": {"name": "fake"},
-        }})
+        capabilities = {
+            "textDocumentSync": 2,
+            "hoverProvider": True,
+            "completionProvider": {"triggerCharacters": ["."]},
+        }
+        if pull:
+            capabilities["diagnosticProvider"] = {
+                "identifier": "fake", "interFileDependencies": True, "workspaceDiagnostics": False,
+            }
+        send({"id": id, "result": {"capabilities": capabilities, "serverInfo": {"name": "fake"}}})
     elif method == "initialized":
         send({"id": "conf-1", "method": "workspace/configuration",
               "params": {"items": [{"section": "a"}, {"section": "b"}]}})
@@ -80,6 +96,39 @@ while True:
         send({"method": "$/progress", "params": {"token": "t", "value": {"kind": "end"}}})
         send({"method": "window/showMessage", "params": {"type": 1, "message": "hello"}})
         send({"method": "window/logMessage", "params": {"type": 4, "message": "ignored"}})
+    elif method == "textDocument/didChange":
+        changes += 1
+    elif method == "textDocument/diagnostic":
+        params = message["params"]
+        if cancel_next_pull:
+            cancel_next_pull = False
+            send({"id": id, "error": {"code": -32802, "message": "server cancelled",
+                                      "data": {"retriggerRequest": True}}})
+            continue
+        result_id = "r%d" % changes
+        if params.get("previousResultId") == result_id and reported == result_id:
+            send({"id": id, "result": {"kind": "unchanged", "resultId": result_id}})
+            continue
+        reported = result_id
+        uri = params["textDocument"]["uri"]
+        related = uri.rsplit("/", 1)[0] + "/related.rs"
+        send({"id": id, "result": {
+            "kind": "full",
+            "resultId": result_id,
+            "items": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "severity": 2,
+                "message": "pulled %d" % changes,
+                "source": params.get("identifier"),
+            }],
+            "relatedDocuments": {related: {"kind": "full", "items": []}},
+        }})
+    elif method == "flux/cancelNextPull":
+        cancel_next_pull = True
+    elif method == "flux/refreshDiagnostics":
+        send({"id": "refresh", "method": "workspace/diagnostic/refresh"})
+    elif method == "textDocument/didOpen" and pull:
+        pass
     elif method == "textDocument/didOpen":
         uri = message["params"]["textDocument"]["uri"]
         send({"method": "textDocument/publishDiagnostics", "params": {
@@ -94,9 +143,17 @@ while True:
     elif method == "textDocument/hover":
         if message["params"]["position"]["line"] == 99:
             continue  # Answered only by a cancel.
-        send({"id": id, "result": {"contents": {"kind": "markdown", "value": "**doc**"}}})
+        if not hover:
+            send({"id": id, "result": None})
+            continue
+        send({"id": id, "result": {"contents": {"kind": "markdown", "value": hover}}})
     elif method == "textDocument/completion":
-        send({"id": id, "error": {"code": -32801, "message": "content modified"}})
+        if items is None:
+            send({"id": id, "error": {"code": -32801, "message": "content modified"}})
+            continue
+        send({"id": id, "result": {"isIncomplete": False, "items": [
+            {"label": label} for label in items.split(",") if label
+        ]}})
     elif method == "$/cancelRequest":
         send({"id": message["params"]["id"], "error": {"code": -32800, "message": "cancelled"}})
     elif method == "flux/status":
