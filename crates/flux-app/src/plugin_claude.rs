@@ -87,6 +87,7 @@ fn not_ready(cli: &CliState) -> &'static str {
         CliState::Missing => "Claude Code isn't installed",
         CliState::SignedOut { .. } => "Claude Code isn't signed in",
         CliState::Failed(_) => "Claude Code doesn't answer",
+        CliState::NoGitBash => "Claude Code needs Git for Windows",
         CliState::Checking | CliState::Ready { .. } => "Claude Code isn't ready yet",
     }
 }

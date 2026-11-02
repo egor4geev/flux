@@ -1,0 +1,441 @@
+//! Starting and finding other programs: git, language servers, the Claude CLI, the plugins'
+//! programs, `!` commands.
+
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+
+/// A program Flux starts for its own work, out of sight.
+pub trait Background {
+    /// On Windows a console program started by a windowed app opens a console window of its own:
+    /// every git call would flash one. `CREATE_NO_WINDOW` gives it a console nobody sees. Elsewhere
+    /// nothing changes.
+    fn background(&mut self) -> &mut Self;
+}
+
+impl Background for Command {
+    fn background(&mut self) -> &mut Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            self.creation_flags(CREATE_NO_WINDOW);
+        }
+        self
+    }
+}
+
+/// A file the system runs as a program: one with an executable bit (a link to one counts:
+/// Homebrew's programs are links); on Windows — one with an extension `PATHEXT` lists.
+pub fn is_executable(file: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(file)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(windows)]
+    {
+        let extension = file.extension().map(|ext| ext.to_string_lossy());
+        file.is_file()
+            && extension.is_some_and(|ext| {
+                path_extensions().any(|known| known[1..].eq_ignore_ascii_case(&ext))
+            })
+    }
+}
+
+/// The files a program name may be in one folder: the name itself, and on Windows a bare name with
+/// each extension of `PATHEXT` (`cargo` → `cargo.exe`, `npx` → `npx.cmd`).
+pub fn program_files(dir: &Path, program: &str) -> Vec<PathBuf> {
+    let mut files = vec![dir.join(program)];
+    if cfg!(windows) && Path::new(program).extension().is_none() {
+        files.extend(path_extensions().map(|ext| dir.join(format!("{program}{ext}"))));
+    }
+    files
+}
+
+/// The program a name stands for in the folders of `path` (a `PATH` value), first found first.
+pub fn find_in_path(program: &str, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .flat_map(|dir| program_files(&dir, program))
+        .find(|file| is_executable(file))
+}
+
+/// Where Windows installers put programs: `%ProgramFiles%` (and its 64- and 32-bit variants), then
+/// the per-user `%LOCALAPPDATA%\Programs` (Git for Windows installed for one user goes there).
+/// Empty elsewhere.
+pub fn program_dirs() -> Vec<PathBuf> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let found = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .chain(std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Programs")));
+    for dir in found {
+        if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Windows' program extensions, `.exe` first: `PATHEXT`, lowercased.
+fn path_extensions() -> impl Iterator<Item = String> {
+    let extensions = std::env::var("PATHEXT").unwrap_or_default();
+    let extensions = if extensions.is_empty() {
+        ".COM;.EXE;.BAT;.CMD".to_string()
+    } else {
+        extensions
+    };
+    extensions
+        .split(';')
+        .filter(|ext| ext.len() > 1 && ext.starts_with('.'))
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+/// Ends a program Flux started, and on Windows what it started in turn: a `.cmd` (npm's
+/// `claude.cmd`, an npm language server's) runs its program as a child of `cmd.exe`, which
+/// `Child::kill` alone leaves running; the Claude CLI's own commands, too. Elsewhere `Child::kill`
+/// as always.
+pub fn kill_tree(child: &mut Child) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::process::Stdio;
+        let _ = Command::new("taskkill")
+            .background()
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    child.kill()
+}
+
+/// The process is there (someone else's counts too).
+pub fn alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        // EPERM: it does, someone else's.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        /// `GetExitCodeProcess` of a process still running.
+        const STILL_ACTIVE: u32 = 259;
+        // SAFETY: the handle is checked before use and closed after.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                // Denied: it does, someone else's.
+                return GetLastError() == ERROR_ACCESS_DENIED;
+            }
+            let mut code = 0;
+            let running = GetExitCodeProcess(process, &mut code) != 0 && code == STILL_ACTIVE;
+            CloseHandle(process);
+            running
+        }
+    }
+}
+
+/// Nobody reads this process's stderr: it is closed or `/dev/null` (Finder, the Dock and `open`
+/// start apps so); on Windows a windowed app has none at all.
+pub fn stderr_unread() -> bool {
+    #[cfg(unix)]
+    // SAFETY: fstat and stat write only into the zeroed structs, which outlive the calls.
+    unsafe {
+        let mut stderr: libc::stat = std::mem::zeroed();
+        if libc::fstat(libc::STDERR_FILENO, &mut stderr) != 0 {
+            return true;
+        }
+        let mut null: libc::stat = std::mem::zeroed();
+        if libc::stat(c"/dev/null".as_ptr(), &mut null) != 0 {
+            return false;
+        }
+        (stderr.st_mode & libc::S_IFMT) == libc::S_IFCHR && stderr.st_rdev == null.st_rdev
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        // SAFETY: only reads the process's standard handle.
+        let handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        handle.is_null() || handle == INVALID_HANDLE_VALUE
+    }
+}
+
+/// Sends this process's stderr (what Rust's `eprintln!` and panics write) into `file`.
+pub fn redirect_stderr(file: &File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: both descriptors are open; dup2 replaces fd 2 atomically.
+        unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) >= 0 }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+        // SAFETY: the handle stays open while the log keeps the file; Rust's stderr asks for the
+        // standard handle at every write.
+        unsafe { SetStdHandle(STD_ERROR_HANDLE, file.as_raw_handle()) != 0 }
+    }
+}
+
+/// A process in the system's list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessEntry {
+    pub pid: u32,
+    /// The process that started it. Windows reuses ids: once the parent has ended, its id may
+    /// belong to a newer process ([`descendants`] checks the start times).
+    pub parent: u32,
+    /// The executable's file name: `cargo.exe`.
+    pub name: String,
+}
+
+/// The processes running now, in the system's order (Windows: a Toolhelp32 snapshot). Unix systems
+/// ask about one process at a time instead (libproc, `/proc`).
+#[cfg(windows)]
+pub fn list() -> Vec<ProcessEntry> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    let mut list = Vec::new();
+    // SAFETY: the snapshot is checked before use and closed after; each entry is written by the
+    // calls, its size set first as they require.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+            return list;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            let name = &entry.szExeFile;
+            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            list.push(ProcessEntry {
+                pid: entry.th32ProcessID,
+                parent: entry.th32ParentProcessID,
+                name: String::from_utf16_lossy(&name[..len]),
+            });
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+    }
+    list
+}
+
+/// When a process started, in Windows' ticks (100 ns since 1601): a child starts after its parent,
+/// which tells a real parent from a newer process with a reused id.
+#[cfg(windows)]
+pub fn started(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: the handle is checked before use and closed after; the times are plain structs the
+    // call writes.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let (mut created, mut exited, mut kernel, mut user): (
+            FILETIME,
+            FILETIME,
+            FILETIME,
+            FILETIME,
+        ) = std::mem::zeroed();
+        let read = GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(process);
+        (read != 0)
+            .then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+}
+
+/// The full path of a process's executable.
+#[cfg(windows)]
+pub fn executable(pid: u32) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    // SAFETY: the handle is checked before use and closed after; the buffer outlives the call,
+    // which writes at most `len` characters and sets `len` to what it wrote.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        // The name comes back through a counted string of at most 65 535 bytes: a buffer of 32 768
+        // characters (65 536 bytes) is more than it holds. A usual size first, then the most.
+        let mut path = None;
+        for size in [1024, 32_767] {
+            let mut buffer = vec![0u16; size];
+            let mut len = size as u32;
+            let read = QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                buffer.as_mut_ptr(),
+                &mut len,
+            );
+            if read != 0 {
+                buffer.truncate(len as usize);
+                path = Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer)));
+                break;
+            }
+        }
+        CloseHandle(process);
+        path
+    }
+}
+
+/// Ends a process at once. Windows has no signal asking a program to end: a console program gets
+/// Ctrl+C only from its own console, and a windowed Flux has none.
+#[cfg(windows)]
+pub fn terminate(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    // SAFETY: the handle is checked before use and closed after.
+    unsafe {
+        let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let ended = TerminateProcess(process, 1) != 0;
+        CloseHandle(process);
+        ended
+    }
+}
+
+/// The processes `ancestor` started, the ones they started, and so on. A link counts only when the
+/// child started after its parent (`started`; unknown — it doesn't): a process whose parent ended
+/// may name an id Windows has given to a newer process since.
+pub fn descendants(
+    list: &[ProcessEntry],
+    ancestor: u32,
+    started: impl Fn(u32) -> Option<u64>,
+) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut parents = vec![(ancestor, started(ancestor))];
+    while let Some((parent, parent_started)) = parents.pop() {
+        let Some(parent_started) = parent_started else {
+            continue;
+        };
+        for entry in list.iter().filter(|entry| entry.parent == parent) {
+            if entry.pid == ancestor || entry.pid == parent || found.contains(&entry.pid) {
+                continue;
+            }
+            let child_started = started(entry.pid);
+            if child_started.is_some_and(|at| at >= parent_started) {
+                found.push(entry.pid);
+                parents.push((entry.pid, child_started));
+            }
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(pid: u32, parent: u32, name: &str) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            parent,
+            name: name.to_string(),
+        }
+    }
+
+    /// Children and grandchildren are found; a process naming an ended parent's id that a newer
+    /// process got since is not.
+    #[test]
+    fn descendants_started_after_their_parents() {
+        let list = [
+            entry(10, 1, "flux.exe"),
+            entry(20, 10, "pwsh.exe"),
+            entry(30, 20, "node.exe"),
+            entry(40, 10, "claude.exe"),
+            // Started before Flux, by a process whose id Flux got later.
+            entry(50, 10, "old.exe"),
+            entry(60, 2, "other.exe"),
+        ];
+        let started = |pid: u32| match pid {
+            50 => Some(5),
+            60 => Some(1),
+            pid => Some(u64::from(pid) * 10),
+        };
+        let mut found = descendants(&list, 10, started);
+        found.sort();
+        assert_eq!(found, [20, 30, 40]);
+        // A parent whose start can't be read leads nowhere.
+        assert!(descendants(&list, 10, |_| None).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn this_process_has_its_executable() {
+        let path = executable(std::process::id()).expect("the test's executable");
+        assert_eq!(
+            path.file_name(),
+            std::env::current_exe().unwrap().file_name()
+        );
+    }
+
+    #[test]
+    fn this_process_is_alive() {
+        assert!(alive(std::process::id()));
+        assert!(!alive(u32::MAX - 1));
+    }
+
+    #[test]
+    fn programs_are_found_in_the_path() {
+        let dir = std::env::temp_dir().join(format!("flux-platform-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        let program = {
+            use std::os::unix::fs::PermissionsExt;
+            let program = dir.join("tool");
+            std::fs::write(&program, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            program
+        };
+        #[cfg(windows)]
+        let program = {
+            let program = dir.join("tool.cmd");
+            std::fs::write(&program, "@echo off\r\n").unwrap();
+            program
+        };
+        std::fs::write(dir.join("text"), "").unwrap();
+        let path = std::env::join_paths([Path::new("/nowhere"), &dir]).unwrap();
+        assert_eq!(find_in_path("tool", &path), Some(program));
+        assert_eq!(find_in_path("text", &path), None);
+        assert_eq!(find_in_path("missing", &path), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

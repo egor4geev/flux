@@ -1,8 +1,7 @@
 //! `secrets`: the plugin's secrets, which Flux keeps encrypted ([`crate::secrets`]) under the
 //! plugin's service ([`store::service`]), apart from its files. [`crate::install::uninstall`]
-//! removes them with the plugin. Waiting for them — another Flux writing them; the first time,
-//! moving them from the keychain, where macOS may ask the user — doesn't count toward the plugin's
-//! time limit.
+//! removes them with the plugin. Waiting for them (another Flux writing them) doesn't count toward
+//! the plugin's time limit.
 
 use std::time::Instant;
 

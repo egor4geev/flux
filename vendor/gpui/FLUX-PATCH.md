@@ -74,6 +74,25 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
     `terminate:` only after `Platform::quit`. Flux's scenario step `app-terminate` sends it from a run
     loop timer for the same reason.
 
+- **Windows: the title bar and the end of the session** (part 10.9,
+  `crates/flux-app/src/title_bar.rs`, `crates/flux-app/src/workspace.rs`).
+  - The title bar's top edge: Flux's title bar is the window's caption (`WindowControlArea::Drag`)
+    and reaches the window's top edge, where gpui itself answers `WM_NCHITTEST` with `HTTOP` (the
+    custom frame has no top border). gpui 0.2.2 answered with the control area first, so the window
+    couldn't be resized from its top edge. `src/platform/windows/events.rs` (`handle_hit_test_msg`):
+    a drag area now gives way to the resize edges and is the answer only where none of them is; the
+    window buttons (`Min`, `Max`, `Close`) still answer first.
+  - The end of the session: signing out, restarting and shutting down, Windows ends a process once
+    its windows have answered `WM_QUERYENDSESSION` and `WM_ENDSESSION` — with no `WM_CLOSE`, no
+    `WM_DESTROY` and no end of gpui's run loop, after which the quit callback runs (`on_app_quit`):
+    the state of Flux's windows wasn't saved. `src/platform/windows/events.rs`: `WM_ENDSESSION` with
+    `wParam` true (the session does end) sends `WM_GPUI_END_SESSION` to the platform's window;
+    `src/platform/windows/platform.rs` (`handle_end_session`) takes the quit callback and runs it —
+    once for all the windows, and not again if the run loop ends after all. `WM_QUERYENDSESSION`
+    keeps Windows' answer, yes: unlike macOS, the end of the session doesn't ask about unsaved
+    documents (Windows waits for an answer only a few seconds, then offers to end the session
+    anyway).
+
 - **Motion** (2026-10-28, `crates/flux-app/src/motion.rs`): the author asked for lively, Liquid
   Glass-like animations; gpui 0.2.2 can animate a style (`with_animation`) but can't scale or move
   what an element paints, and its hover and press styles switch at once.
@@ -131,6 +150,24 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
     that must not do it sets `restrict_scroll_to_axis` (Flux's board row and plugin trees).
     Elements with their own wheel listeners (the editor, the terminal) get the events unchanged.
 
+- **Runtime shaders on Windows** (2026-10-30, part 10.9, `scripts/bundle-windows.sh`): gpui 0.2.2
+  compiles its HLSL with `fxc.exe` in `build.rs` for a release build — only when the build script
+  itself runs on Windows — and includes the bytecode from `OUT_DIR`; a debug build compiles the
+  source files at runtime from the folder gpui was built in. Flux.exe built on a Mac (mingw-w64)
+  had no shaders at all, and a CI runner without the Windows SDK's fxc (ARM64) couldn't build.
+  Flux enables `runtime_shaders` (for Metal on macOS); now on Windows it means the same.
+  - `src/platform/windows/directx_renderer.rs`, `shader_resources::runtime`: with `runtime_shaders`
+    a shader is compiled by `D3DCompile` (d3dcompiler_47.dll, a part of Windows 10 and 11) from the
+    HLSL embedded with `include_str!` — `shaders.hlsl` and `color_text_raster.hlsl` (the emoji
+    pipeline of `direct_write.rs`), with `alpha_correction.hlsl` put in place of their `#include`
+    (a source compiled from memory has no folder to include from) — in every profile, optimized
+    as fxc's `/O3` in a release build. Each shader is compiled once per process and kept: every
+    window's renderer and the text system share it. Without the feature nothing changes.
+  - `build.rs`: with `runtime_shaders` the Windows build doesn't run fxc. The `windows-manifest`
+    feature is untouched; Flux turns it off and embeds its own manifest
+    (`crates/flux-app/build.rs`).
+  - The first change outside `src/`: `flux.patch` now takes `build.rs` too (step 3 below).
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,
@@ -139,11 +176,14 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
 2. Apply `flux.patch` (`patch -p1 -d vendor/gpui < vendor/gpui/flux.patch`) and fix what doesn't
    apply by the descriptions above; grep the new `window.rs` for new `platform_window.` calls that
    take or give positions — they need the scale too.
-3. Regenerate the patch from the crate's directory:
-   `diff -ruN ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gpui-<version>/src src > flux.patch`
+3. Regenerate the patch from the crate's directory, `src/` and `build.rs`:
+   `diff -ruN ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gpui-<version>/src src > flux.patch`,
+   then `diff -uN ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gpui-<version>/build.rs build.rs >> flux.patch`
    (paths relative to `vendor/gpui`).
 4. Check by hand: the mouse, scrolling, file drops and the input method (Japanese, Pinyin) at 125 %,
    the traffic lights at 80 % and 125 %; Quit in the Dock with an unsaved document (the question,
    Cancel keeps Flux, Don't Save quits); a swipe down over a plugin board in a narrow tab scrolls a
    lane and doesn't slide the board, a sideways swipe slides it; along a toolbar the next button's
    tooltip shows at once, a tooltip fades out when the mouse leaves, and after a click it waits.
+   On Windows: signing out with a project open, then starting Flux, brings the project back with its
+   tabs; the window resizes from its top edge and moves by its title bar.

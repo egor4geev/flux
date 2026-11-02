@@ -90,18 +90,21 @@ actions!(
 const MENU_CONTEXT: &str = "Editor && showing_completions";
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("ctrl-space", ShowCompletions, Some("Editor")),
-        KeyBinding::new("down", SelectNext, Some(MENU_CONTEXT)),
-        KeyBinding::new("up", SelectPrevious, Some(MENU_CONTEXT)),
-        KeyBinding::new("ctrl-n", SelectNext, Some(MENU_CONTEXT)),
-        KeyBinding::new("ctrl-p", SelectPrevious, Some(MENU_CONTEXT)),
-        KeyBinding::new("pagedown", SelectNextPage, Some(MENU_CONTEXT)),
-        KeyBinding::new("pageup", SelectPreviousPage, Some(MENU_CONTEXT)),
-        KeyBinding::new("enter", ConfirmInsert, Some(MENU_CONTEXT)),
-        KeyBinding::new("tab", ConfirmReplace, Some(MENU_CONTEXT)),
-        KeyBinding::new("escape", Dismiss, Some(MENU_CONTEXT)),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("ctrl-space", ShowCompletions, Some("Editor")),
+            KeyBinding::new("down", SelectNext, Some(MENU_CONTEXT)),
+            KeyBinding::new("up", SelectPrevious, Some(MENU_CONTEXT)),
+            KeyBinding::new("ctrl-n", SelectNext, Some(MENU_CONTEXT)),
+            KeyBinding::new("ctrl-p", SelectPrevious, Some(MENU_CONTEXT)),
+            KeyBinding::new("pagedown", SelectNextPage, Some(MENU_CONTEXT)),
+            KeyBinding::new("pageup", SelectPreviousPage, Some(MENU_CONTEXT)),
+            KeyBinding::new("enter", ConfirmInsert, Some(MENU_CONTEXT)),
+            KeyBinding::new("tab", ConfirmReplace, Some(MENU_CONTEXT)),
+            KeyBinding::new("escape", Dismiss, Some(MENU_CONTEXT)),
+        ],
+    );
 }
 
 /// Completion state of an editor (`Editor::completion`): the open session, and accepted items

@@ -276,7 +276,7 @@ notification actions.
 | `id` | required | What `run_command` gets. |
 | `title` | required | Also the label of its menu items. |
 | `category` | the plugin's name | The palette's chip. |
-| `keys` | — | A default shortcut in gpui's notation: `cmd-shift-h`, `alt-f7`. A key Flux already uses is not taken (the plugin's log says so). |
+| `keys` | — | A default shortcut in gpui's notation, in macOS keys: `cmd-shift-h`, `alt-f7`. On Windows ⌘ becomes Ctrl and ⌥ Alt (`ctrl-shift-h`). A key Flux already uses is not taken (the plugin's log says so). |
 | `palette` | `true` | `false` — not in the palette: a command only a notification's action, a settings button or a status bar item runs. |
 
 **`[[menus]]`** — an item of a context menu that runs one of the plugin's commands on what the menu

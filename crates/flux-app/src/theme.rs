@@ -21,15 +21,21 @@ use gpui::{App, Global, Hsla, SharedString, rgb, rgba};
 
 use crate::settings;
 
-/// The UI font is the system font (SF Pro on macOS).
+/// The UI font is the system font (SF Pro on macOS; gpui gives Segoe UI on Windows).
 pub const UI_FONT: &str = ".SystemUIFont";
-/// The code font is the first installed one from the list ([`init_fonts`]).
-const CODE_FONTS: [&str; 4] = [
+/// The code font is the first installed one from the list ([`init_fonts`]): the fonts developers
+/// install, then the systems' own — Cascadia Mono comes with Windows 11, Consolas with every
+/// Windows.
+const CODE_FONTS: [&str; 6] = [
     "JetBrains Mono",
     "JetBrainsMono Nerd Font Mono",
     "SF Mono",
     "Menlo",
+    "Cascadia Mono",
+    "Consolas",
 ];
+/// The code font when none of the list is found: a monospaced font every copy of the system has.
+const FALLBACK_CODE_FONT: &str = if cfg!(windows) { "Consolas" } else { "Menlo" };
 pub const FONT_SIZE: f32 = 14.;
 pub const LINE_HEIGHT: f32 = 21.;
 pub const TAB_WIDTH: usize = 4;
@@ -60,13 +66,13 @@ pub fn init_fonts(cx: &App) {
     let family = CODE_FONTS
         .into_iter()
         .find(|family| installed.iter().any(|name| name == family))
-        .unwrap_or("Menlo");
+        .unwrap_or(FALLBACK_CODE_FONT);
     CODE_FONT.set(family).ok();
 }
 
 /// The code font: editor, search fields, result rows.
 pub fn code_font() -> &'static str {
-    CODE_FONT.get().copied().unwrap_or("Menlo")
+    CODE_FONT.get().copied().unwrap_or(FALLBACK_CODE_FONT)
 }
 
 /// The UI color tokens, each by its name in a theme file: [`UiColors`] and the table of tokens
@@ -580,8 +586,6 @@ struct Themes {
     themes: Vec<(SharedString, Arc<Theme>)>,
     /// A theme shown for a moment instead of the chosen one (Quick Switch, the theme page).
     preview: Option<SharedString>,
-    /// The appearance of macOS, for a theme that follows it.
-    system: Appearance,
 }
 
 impl Global for Themes {}
@@ -808,22 +812,15 @@ pub fn preview(name: Option<&str>, cx: &mut App) {
     apply(cx);
 }
 
-/// The appearance of macOS as a window sees it.
-pub fn window_appearance(window: &gpui::Window) -> Appearance {
-    match window.appearance() {
-        gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => Appearance::Light,
-        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => Appearance::Dark,
-    }
-}
-
-/// macOS switched between light and dark: a theme that follows it changes.
-pub fn system_appearance_changed(appearance: Appearance, cx: &mut App) {
-    cx.default_global::<Themes>().system = appearance;
+/// The system switched between light and dark (a window's appearance observer): a theme that
+/// follows it changes.
+pub fn system_appearance_changed(cx: &mut App) {
     apply(cx);
 }
 
-/// The appearance of macOS now. On macOS it is read from the system's setting, not from a window:
-/// a window takes the appearance of the theme shown in it.
+/// The appearance of the system now, read from its setting rather than from a window: on macOS a
+/// window takes the appearance of the theme shown in it. On Windows gpui reads the system's mode
+/// (Settings → Personalization → Colors), the one its windows' frames follow too.
 pub fn system_appearance(cx: &App) -> Appearance {
     #[cfg(feature = "scenario")]
     if let Some(appearance) = scenario_appearance() {
@@ -839,8 +836,10 @@ pub fn system_appearance(cx: &App) -> Appearance {
         }
     }
     #[cfg(not(target_os = "macos"))]
-    cx.try_global::<Themes>()
-        .map_or(Appearance::Dark, |themes| themes.system)
+    match cx.window_appearance() {
+        gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => Appearance::Light,
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => Appearance::Dark,
+    }
 }
 
 /// `FLUX_SCENARIO_APPEARANCE=light|dark`: a scenario's macOS appearance, so a scenario checks a

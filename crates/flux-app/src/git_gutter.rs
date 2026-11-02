@@ -73,13 +73,16 @@ const POPUP_TOOLBAR_HEIGHT: f32 = 34.;
 
 pub fn init(cx: &mut App) {
     let editor = Some("Editor");
-    cx.bind_keys([
-        // As in JetBrains IDEs (macOS keymap): Rollback, Next / Previous Change.
-        KeyBinding::new("alt-cmd-z", RollbackLines, editor),
-        KeyBinding::new("ctrl-alt-shift-down", NextChange, editor),
-        KeyBinding::new("ctrl-alt-shift-up", PreviousChange, editor),
-        KeyBinding::new("escape", HideChange, Some("Editor && showing_change")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            // As in JetBrains IDEs (macOS keymap): Rollback, Next / Previous Change.
+            KeyBinding::new("alt-cmd-z", RollbackLines, editor),
+            KeyBinding::new("ctrl-alt-shift-down", NextChange, editor),
+            KeyBinding::new("ctrl-alt-shift-up", PreviousChange, editor),
+            KeyBinding::new("escape", HideChange, Some("Editor && showing_change")),
+        ],
+    );
 }
 
 /// The editor's git state.

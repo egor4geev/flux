@@ -10,7 +10,7 @@
 //!     checks a signature (by default with the key built into Flux)
 //! flux-release manifest --version <X.Y.Z[-beta.N]> --date <YYYY-MM-DD> --notes <file.md>
 //!         --base-url <https://github.com/…/releases/download/vX.Y.Z>
-//!         --platform <key>=<archive.zip>[,<installer.dmg>] [--platform …]
+//!         --platform <key>=<archive.zip>[,<installer>] [--platform …]
 //!     prints `latest.json` (the channel follows the version; archives are signed with
 //!     FLUX_UPDATE_PRIVATE_KEY, their size and SHA-256 computed)
 //! ```
@@ -28,7 +28,7 @@ const USAGE: &str = "usage:
   flux-release sign <file>                       (FLUX_UPDATE_PRIVATE_KEY: base64 seed)
   flux-release verify <file> <signature> [--public-key <base64>]
   flux-release manifest --version <X.Y.Z[-beta.N]> --date <YYYY-MM-DD> --notes <file.md>
-      --base-url <url> --platform <key>=<archive.zip>[,<installer.dmg>] [--platform …]";
+      --base-url <url> --platform <key>=<archive.zip>[,<installer>] [--platform …]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

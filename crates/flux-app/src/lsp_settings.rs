@@ -188,9 +188,9 @@ pub fn configure(
 /// Whether two paths name the same file (one may come through a symbolic link, `/tmp`).
 fn same_file(a: &Path, b: &Path) -> bool {
     a == b
-        || std::fs::canonicalize(a)
+        || flux_platform::path_style::canonicalize(a)
             .ok()
-            .zip(std::fs::canonicalize(b).ok())
+            .zip(flux_platform::path_style::canonicalize(b).ok())
             .is_some_and(|(a, b)| a == b)
 }
 

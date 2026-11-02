@@ -114,28 +114,34 @@ pub struct UnstashToBranch {
 
 pub fn init(cx: &mut App) {
     let list = Some("StashList");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, list),
-        KeyBinding::new("up", SelectPrevious, list),
-        KeyBinding::new("home", SelectFirst, list),
-        KeyBinding::new("end", SelectLast, list),
-        KeyBinding::new("right", Expand, list),
-        KeyBinding::new("left", Collapse, list),
-        KeyBinding::new("enter", Open, list),
-        // As Delete in the Stash tab of JetBrains IDEs.
-        KeyBinding::new("backspace", Drop, list),
-        KeyBinding::new("delete", Drop, list),
-        KeyBinding::new("cmd-backspace", Drop, list),
-        KeyBinding::new("shift-f10", ShowContextMenu, list),
-        KeyBinding::new("escape", Cancel, list),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, list),
+            KeyBinding::new("up", SelectPrevious, list),
+            KeyBinding::new("home", SelectFirst, list),
+            KeyBinding::new("end", SelectLast, list),
+            KeyBinding::new("right", Expand, list),
+            KeyBinding::new("left", Collapse, list),
+            KeyBinding::new("enter", Open, list),
+            // As Delete in the Stash tab of JetBrains IDEs.
+            KeyBinding::new("backspace", Drop, list),
+            KeyBinding::new("delete", Drop, list),
+            KeyBinding::new("cmd-backspace", Drop, list),
+            KeyBinding::new("shift-f10", ShowContextMenu, list),
+            KeyBinding::new("escape", Cancel, list),
+        ],
+    );
     let dialog = Some("StashDialog");
-    cx.bind_keys([
-        KeyBinding::new("enter", Confirm, dialog),
-        KeyBinding::new("escape", Dismiss, dialog),
-        KeyBinding::new("down", NextRepo, dialog),
-        KeyBinding::new("up", PreviousRepo, dialog),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, dialog),
+            KeyBinding::new("escape", Dismiss, dialog),
+            KeyBinding::new("down", NextRepo, dialog),
+            KeyBinding::new("up", PreviousRepo, dialog),
+        ],
+    );
 }
 
 /// What the Stash tab asks the commit window (and the workspace) to do.
@@ -1197,7 +1203,10 @@ impl StashPanel {
                     1,
                     IconName::Branch,
                     tr("No Git repository"),
-                    Some(tr("Open a folder with a repository: ⌘O")),
+                    Some(SharedString::from(trf(
+                        "Open a folder with a repository: {0}",
+                        &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+                    ))),
                     false,
                 )
             } else {
@@ -1205,7 +1214,7 @@ impl StashPanel {
                     2,
                     IconName::Stash,
                     tr("No stashes"),
-                    Some(tr("Put local changes aside to come back to them later")),
+                    Some(tr("Put local changes aside to come back to them later").into()),
                     true,
                 )
             };

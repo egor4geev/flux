@@ -24,10 +24,13 @@ const WIDTH: f32 = 440.;
 
 pub fn init(cx: &mut App) {
     let context = Some("InputDialog");
-    cx.bind_keys([
-        KeyBinding::new("enter", Confirm, context),
-        KeyBinding::new("escape", Dismiss, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, context),
+            KeyBinding::new("escape", Dismiss, context),
+        ],
+    );
 }
 
 type Validate = Box<dyn Fn(&str, &[bool], &App) -> Result<(), SharedString>>;

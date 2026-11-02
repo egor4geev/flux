@@ -141,7 +141,7 @@ pub fn interactive_rebase(
         // The plan replaces what git proposes; the comments git would add don't matter.
         .env(
             "GIT_SEQUENCE_EDITOR",
-            format!("cp {}", shell_quote(&todo_path.to_string_lossy())),
+            format!("cp {}", shell_path(&todo_path)),
         )
         .args(["-c", "rebase.missingCommitsCheck=ignore"])
         .args(["-c", "rebase.updateRefs=false"])
@@ -236,8 +236,8 @@ fn todo(plan: &[RebaseEntry], work: &Path) -> Result<String, GitError> {
             fs::write(&file, message)?;
             lines.push(format!(
                 "exec {} commit --amend --only --allow-empty --no-verify --cleanup=strip -q -F {}",
-                shell_quote(&git.to_string_lossy()),
-                shell_quote(&file.to_string_lossy())
+                shell_path(git),
+                shell_path(&file)
             ));
         }
         i += 1 + run.len();
@@ -280,6 +280,15 @@ pub fn reword(repo: &Repo, oid: &str, message: &str) -> Result<Outcome, GitError
 /// `'…'` for sh: the editor command and `exec` lines run through a shell.
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// A path for those commands, quoted. Git for Windows runs them through its own `sh`, which takes
+/// `C:/…` both for its programs (`cp`) and for the Windows ones it starts (git itself), but
+/// rewrites `\\?\C:\…` into a path nobody finds: no prefix, `/` between names.
+fn shell_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    let style = flux_platform::PathStyle::NATIVE;
+    shell_quote(&style.slashed(&style.simplified(&path)))
 }
 
 #[cfg(test)]

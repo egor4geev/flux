@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use flux_platform::process::Background;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
 use lsp_types::notification::{DidChangeWatchedFiles, Notification};
@@ -259,6 +260,7 @@ impl LanguageServer {
         // for an npm server Flux installed.
         let launch = config::launch(config, root, &program);
         let mut child = Command::new(program)
+            .background()
             .args(&config.args)
             .current_dir(root)
             .env("PATH", &launch.path)
@@ -889,7 +891,7 @@ impl Shared {
                 Ok(None) if Instant::now() < deadline => {}
                 // Closed stdout but still running: of no use any more.
                 _ => {
-                    let _ = process.kill();
+                    let _ = flux_platform::process::kill_tree(process);
                     break process.wait().ok();
                 }
             }
@@ -951,7 +953,7 @@ impl Shared {
                 Ok(None) if Instant::now() < deadline => {}
                 Ok(Some(_)) => return,
                 _ => {
-                    let _ = process.kill();
+                    let _ = flux_platform::process::kill_tree(process);
                     let _ = process.wait();
                     return;
                 }
@@ -971,7 +973,7 @@ impl Shared {
         }
         let child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(mut child) = child {
-            let _ = child.kill();
+            let _ = flux_platform::process::kill_tree(&mut child);
             let _ = thread::Builder::new()
                 .name(format!("lsp-{}-reaper", self.name))
                 .spawn(move || {

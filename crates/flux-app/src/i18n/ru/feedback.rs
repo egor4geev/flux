@@ -13,6 +13,10 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "The version, macOS, the computer and the plugins — for a report",
         "Версия, macOS, компьютер и плагины — для сообщения о проблеме",
     ),
+    (
+        "The version, Windows, the computer and the plugins — for a report",
+        "Версия, Windows, компьютер и плагины — для сообщения о проблеме",
+    ),
 ];
 
 pub(super) const PLURALS: &[(&str, [&str; 3])] = &[];

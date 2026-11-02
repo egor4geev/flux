@@ -74,20 +74,26 @@ const PADDING: f32 = 5.;
 const DIVIDER_HEIGHT: f32 = 9.;
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "alt-enter",
-        ShowContextActions,
-        Some("Editor"),
-    )]);
+    crate::keymap::bind_keys(
+        cx,
+        [KeyBinding::new(
+            "alt-enter",
+            ShowContextActions,
+            Some("Editor"),
+        )],
+    );
     let popup = Some("ContextActions");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, popup),
-        KeyBinding::new("up", SelectPrevious, popup),
-        KeyBinding::new("ctrl-n", SelectNext, popup),
-        KeyBinding::new("ctrl-p", SelectPrevious, popup),
-        KeyBinding::new("enter", Confirm, popup),
-        KeyBinding::new("escape", Dismiss, popup),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, popup),
+            KeyBinding::new("up", SelectPrevious, popup),
+            KeyBinding::new("ctrl-n", SelectNext, popup),
+            KeyBinding::new("ctrl-p", SelectPrevious, popup),
+            KeyBinding::new("enter", Confirm, popup),
+            KeyBinding::new("escape", Dismiss, popup),
+        ],
+    );
 }
 
 /// The editor's handlers: none — ⌥↵ goes up to the window ([`workspace_actions`]), where the popup

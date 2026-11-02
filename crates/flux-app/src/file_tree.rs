@@ -128,51 +128,60 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        // As the Project tool window in JetBrains IDEs; cmd-b goes to a definition.
-        KeyBinding::new("cmd-1", ToggleOpen, Some("Workspace")),
-        KeyBinding::new("cmd-shift-e", ToggleFocus, Some("Workspace")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            // As the Project tool window in JetBrains IDEs; cmd-b goes to a definition.
+            KeyBinding::new("cmd-1", ToggleOpen, Some("Workspace")),
+            KeyBinding::new("cmd-shift-e", ToggleFocus, Some("Workspace")),
+        ],
+    );
     // While a name is being edited, the tree's keys are inactive: arrow keys, Space, ⌫ and ⌘C/⌘V
     // belong to the field.
     let tree = Some("FileTree && !editing");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, tree),
-        KeyBinding::new("up", SelectPrevious, tree),
-        KeyBinding::new("home", SelectFirst, tree),
-        KeyBinding::new("end", SelectLast, tree),
-        KeyBinding::new("pagedown", SelectNextPage, tree),
-        KeyBinding::new("pageup", SelectPreviousPage, tree),
-        KeyBinding::new("right", Expand, tree),
-        KeyBinding::new("left", Collapse, tree),
-        KeyBinding::new("enter", Open, tree),
-        KeyBinding::new("cmd-down", Open, tree),
-        KeyBinding::new("space", OpenKeepFocus, tree),
-        KeyBinding::new("cmd-n", NewFile, tree),
-        KeyBinding::new("alt-cmd-n", NewFolder, tree),
-        KeyBinding::new("f2", Rename, tree),
-        // Rename as in JetBrains IDEs.
-        KeyBinding::new("shift-f6", Rename, tree),
-        KeyBinding::new("cmd-d", Duplicate, tree),
-        // The primary binding goes first: the context menu and the palette show it.
-        KeyBinding::new("cmd-backspace", MoveToTrash, tree),
-        KeyBinding::new("backspace", MoveToTrash, tree),
-        KeyBinding::new("delete", MoveToTrash, tree),
-        KeyBinding::new("cmd-x", Cut, tree),
-        KeyBinding::new("cmd-c", Copy, tree),
-        KeyBinding::new("cmd-v", Paste, tree),
-        KeyBinding::new("alt-cmd-c", CopyPath, tree),
-        KeyBinding::new("alt-shift-cmd-c", CopyRelativePath, tree),
-        KeyBinding::new("alt-cmd-r", RevealInFinder, tree),
-        KeyBinding::new("shift-f10", ShowContextMenu, tree),
-        KeyBinding::new("escape", Cancel, tree),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, tree),
+            KeyBinding::new("up", SelectPrevious, tree),
+            KeyBinding::new("home", SelectFirst, tree),
+            KeyBinding::new("end", SelectLast, tree),
+            KeyBinding::new("pagedown", SelectNextPage, tree),
+            KeyBinding::new("pageup", SelectPreviousPage, tree),
+            KeyBinding::new("right", Expand, tree),
+            KeyBinding::new("left", Collapse, tree),
+            KeyBinding::new("enter", Open, tree),
+            KeyBinding::new("cmd-down", Open, tree),
+            KeyBinding::new("space", OpenKeepFocus, tree),
+            KeyBinding::new("cmd-n", NewFile, tree),
+            KeyBinding::new("alt-cmd-n", NewFolder, tree),
+            KeyBinding::new("f2", Rename, tree),
+            // Rename as in JetBrains IDEs.
+            KeyBinding::new("shift-f6", Rename, tree),
+            KeyBinding::new("cmd-d", Duplicate, tree),
+            // The primary binding goes first: the context menu and the palette show it.
+            KeyBinding::new("cmd-backspace", MoveToTrash, tree),
+            KeyBinding::new("backspace", MoveToTrash, tree),
+            KeyBinding::new("delete", MoveToTrash, tree),
+            KeyBinding::new("cmd-x", Cut, tree),
+            KeyBinding::new("cmd-c", Copy, tree),
+            KeyBinding::new("cmd-v", Paste, tree),
+            KeyBinding::new("alt-cmd-c", CopyPath, tree),
+            KeyBinding::new("alt-shift-cmd-c", CopyRelativePath, tree),
+            KeyBinding::new("alt-cmd-r", RevealInFinder, tree),
+            KeyBinding::new("shift-f10", ShowContextMenu, tree),
+            KeyBinding::new("escape", Cancel, tree),
+        ],
+    );
     // The name edit field hands Enter and Esc over to the row.
     let edit = Some("FileTreeEdit");
-    cx.bind_keys([
-        KeyBinding::new("enter", ConfirmEdit, edit),
-        KeyBinding::new("escape", CancelEdit, edit),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", ConfirmEdit, edit),
+            KeyBinding::new("escape", CancelEdit, edit),
+        ],
+    );
 }
 
 /// What the panel asks Workspace to do.

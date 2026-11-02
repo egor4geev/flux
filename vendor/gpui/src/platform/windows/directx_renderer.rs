@@ -1391,7 +1391,9 @@ const BUFFER_COUNT: usize = 3;
 pub(crate) mod shader_resources {
     use anyhow::Result;
 
-    #[cfg(debug_assertions)]
+    // Flux patch (runtime shaders on Windows): with `runtime_shaders` the shaders are compiled
+    // from the sources embedded in the binary (`runtime` below), in every profile.
+    #[cfg(all(debug_assertions, not(feature = "runtime_shaders")))]
     use windows::{
         Win32::Graphics::Direct3D::{
             Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
@@ -1421,17 +1423,23 @@ pub(crate) mod shader_resources {
     pub(crate) struct RawShaderBytes<'t> {
         inner: &'t [u8],
 
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "runtime_shaders")))]
         _blob: ID3DBlob,
     }
 
     impl<'t> RawShaderBytes<'t> {
         pub(crate) fn new(module: ShaderModule, target: ShaderTarget) -> Result<Self> {
-            #[cfg(not(debug_assertions))]
+            #[cfg(feature = "runtime_shaders")]
+            {
+                Ok(Self {
+                    inner: runtime::compiled(module, target)?,
+                })
+            }
+            #[cfg(all(not(debug_assertions), not(feature = "runtime_shaders")))]
             {
                 Ok(Self::from_bytes(module, target))
             }
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, not(feature = "runtime_shaders")))]
             {
                 let blob = build_shader_blob(module, target)?;
                 let inner = unsafe {
@@ -1448,7 +1456,7 @@ pub(crate) mod shader_resources {
             self.inner
         }
 
-        #[cfg(not(debug_assertions))]
+        #[cfg(all(not(debug_assertions), not(feature = "runtime_shaders")))]
         fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
             let bytes = match module {
                 ShaderModule::Quad => match target {
@@ -1488,7 +1496,7 @@ pub(crate) mod shader_resources {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(feature = "runtime_shaders")))]
     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
         unsafe {
             use windows::Win32::Graphics::{
@@ -1554,10 +1562,124 @@ pub(crate) mod shader_resources {
         }
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(all(not(debug_assertions), not(feature = "runtime_shaders")))]
     include!(concat!(env!("OUT_DIR"), "/shaders_bytes.rs"));
 
-    #[cfg(debug_assertions)]
+    /// Flux patch (runtime shaders on Windows): the shaders compiled when a renderer needs them,
+    /// from the HLSL embedded in the binary, in every profile. A release build then needs no
+    /// `fxc.exe` (`build.rs` skips it), so gpui builds for Windows on any host — Flux's Windows
+    /// build cross-compiled on a Mac; and a debug build doesn't read the sources from the folder
+    /// it was built in. `D3DCompile` comes from d3dcompiler_47.dll, a part of Windows 10 and 11.
+    /// Each shader is compiled once per process: every window's renderer shares it.
+    #[cfg(feature = "runtime_shaders")]
+    mod runtime {
+        use std::sync::Mutex;
+
+        use anyhow::{Result, anyhow};
+        use windows::{
+            Win32::Graphics::Direct3D::{
+                Fxc::{
+                    D3DCOMPILE_DEBUG, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCOMPILE_SKIP_OPTIMIZATION,
+                    D3DCompile,
+                },
+                ID3DBlob, ID3DInclude,
+            },
+            core::PCSTR,
+        };
+
+        use super::{ShaderModule, ShaderTarget};
+
+        const SHADERS: &str = include_str!("shaders.hlsl");
+        const COLOR_TEXT_RASTER: &str = include_str!("color_text_raster.hlsl");
+        /// Both files include it; a source compiled from memory has no folder to include from, so
+        /// the file's text takes the directive's place.
+        const ALPHA_CORRECTION: &str = include_str!("alpha_correction.hlsl");
+        const ALPHA_CORRECTION_INCLUDE: &str = "#include \"alpha_correction.hlsl\"";
+
+        /// The compiled bytecode of a shader, compiled the first time it is asked for.
+        pub(super) fn compiled(
+            module: ShaderModule,
+            target: ShaderTarget,
+        ) -> Result<&'static [u8]> {
+            type Compiled = Vec<(ShaderModule, ShaderTarget, &'static [u8])>;
+            static COMPILED: Mutex<Compiled> = Mutex::new(Vec::new());
+            let mut compiled = COMPILED
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(&(_, _, bytes)) = compiled
+                .iter()
+                .find(|(m, t, _)| *m == module && *t == target)
+            {
+                return Ok(bytes);
+            }
+            let blob = compile(module, target)?;
+            let bytes: &'static [u8] = Box::leak(blob_bytes(&blob).to_vec().into_boxed_slice());
+            compiled.push((module, target, bytes));
+            Ok(bytes)
+        }
+
+        fn compile(module: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
+            let (name, source) = match module {
+                ShaderModule::EmojiRasterization => ("color_text_raster.hlsl\0", COLOR_TEXT_RASTER),
+                _ => ("shaders.hlsl\0", SHADERS),
+            };
+            let source = source.replacen(ALPHA_CORRECTION_INCLUDE, ALPHA_CORRECTION, 1);
+            let entry = format!(
+                "{}_{}\0",
+                module.as_str(),
+                match target {
+                    ShaderTarget::Vertex => "vertex",
+                    ShaderTarget::Fragment => "fragment",
+                }
+            );
+            let profile = match target {
+                ShaderTarget::Vertex => "vs_4_1\0",
+                ShaderTarget::Fragment => "ps_4_1\0",
+            };
+            // As `build.rs` compiles them with fxc (`/O3`); a debug build keeps them debuggable.
+            let flags = if cfg!(debug_assertions) {
+                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
+            } else {
+                D3DCOMPILE_OPTIMIZATION_LEVEL3
+            };
+            let mut code = None;
+            let mut errors = None;
+            let result = unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    PCSTR::from_raw(name.as_ptr()),
+                    None,
+                    None::<&ID3DInclude>,
+                    PCSTR::from_raw(entry.as_ptr()),
+                    PCSTR::from_raw(profile.as_ptr()),
+                    flags,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                )
+            };
+            if let Err(error) = result {
+                let message = errors
+                    .map(|blob| String::from_utf8_lossy(blob_bytes(&blob)).into_owned())
+                    .unwrap_or_else(|| format!("{error:?}"));
+                log::error!("Shader compile error: {}", message);
+                return Err(anyhow!("Compile error: {}", message));
+            }
+            code.ok_or_else(|| anyhow!("no code compiled for {}", entry.trim_end_matches('\0')))
+        }
+
+        fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
+            unsafe {
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer() as *const u8,
+                    blob.GetBufferSize(),
+                )
+            }
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "runtime_shaders"))]
     impl ShaderModule {
         pub fn as_str(&self) -> &str {
             match self {

@@ -17,6 +17,7 @@ use std::str::FromStr;
 
 use flux_core::Rope;
 use flux_core::text::line_end;
+use flux_platform::PathStyle;
 use lsp_types::{Position, Uri};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str};
 
@@ -170,49 +171,79 @@ const PATH: &AsciiSet = &CONTROLS
 /// `file://` URI for a path; a relative path is made absolute against the current directory.
 pub fn uri_from_path(path: &Path) -> Uri {
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut uri = String::from("file://");
-    for part in encode_path(&path) {
-        uri.push_str(part);
-    }
-    // Everything outside `pchar` and `/` is escaped above, so the URI always parses.
+    #[cfg(unix)]
+    let uri = {
+        use std::os::unix::ffi::OsStrExt;
+        let mut uri = String::from("file://");
+        uri.extend(percent_encoding::percent_encode(
+            path.as_os_str().as_bytes(),
+            PATH,
+        ));
+        uri
+    };
+    // Non-UTF-8 paths are not representable here; they don't occur on Windows (names are UTF-16).
+    #[cfg(not(unix))]
+    let uri = uri_text(&path.to_string_lossy(), PathStyle::NATIVE);
+    // Everything outside `pchar` and `/` is escaped, so the URI always parses.
     Uri::from_str(&uri).unwrap_or_else(|_| Uri::from_str("file:///").expect("a valid URI"))
 }
 
-#[cfg(unix)]
-fn encode_path(path: &Path) -> percent_encoding::PercentEncode<'_> {
-    use std::os::unix::ffi::OsStrExt;
-    percent_encoding::percent_encode(path.as_os_str().as_bytes(), PATH)
+/// The `file://` URI of an absolute path written in `style`. Windows: `C:\a b\x.rs` →
+/// `file:///C:/a%20b/x.rs` (the drive letter upper-case, as the servers' own URIs of files on
+/// disk have it; the `\\?\` prefix dropped), a share `\\server\share\x.rs` →
+/// `file://server/share/x.rs`.
+pub fn uri_text(path: &str, style: PathStyle) -> String {
+    let mut uri = String::from("file://");
+    if style == PathStyle::Unix {
+        uri.extend(percent_encoding::utf8_percent_encode(path, PATH));
+        return uri;
+    }
+    let path = style.simplified(path).replace('\\', "/");
+    if let Some(share) = path.strip_prefix("//") {
+        let (host, rest) = share.split_once('/').unwrap_or((share, ""));
+        uri.extend(percent_encoding::utf8_percent_encode(host, PATH));
+        uri.push('/');
+        uri.extend(percent_encoding::utf8_percent_encode(rest, PATH));
+    } else {
+        if !path.starts_with('/') {
+            uri.push('/');
+        }
+        uri.extend(percent_encoding::utf8_percent_encode(&path, PATH));
+    }
+    uri
 }
 
-#[cfg(not(unix))]
-fn encode_path(path: &Path) -> percent_encoding::PercentEncode<'_> {
-    // Non-UTF-8 paths are not representable here; they don't occur on the platforms we target.
-    percent_encoding::utf8_percent_encode(path.to_str().unwrap_or_default(), PATH)
-}
-
-/// The path of a `file://` URI (`file:///…` or `file://localhost/…`); `None` for other schemes
-/// and hosts. Compare documents by path, not by URI string: servers encode URIs differently.
+/// The path of a `file://` URI (`file:///…` or `file://localhost/…`; on Windows also a share,
+/// `file://server/share/…`); `None` for other schemes and hosts. Compare documents by path, not by
+/// URI string: servers encode URIs differently.
 pub fn path_from_uri(uri: &Uri) -> Option<PathBuf> {
     if !uri.scheme()?.as_str().eq_ignore_ascii_case("file") {
         return None;
     }
     let host = uri.authority().map_or("", |authority| authority.as_str());
-    if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
-        return None;
-    }
     let bytes: Vec<u8> = percent_decode_str(uri.path().as_str()).collect();
-    if bytes.first() != Some(&b'/') {
-        return None;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
+        let local = host.is_empty() || host.eq_ignore_ascii_case("localhost");
+        if !local || bytes.first() != Some(&b'/') {
+            return None;
+        }
         Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
     }
     #[cfg(not(unix))]
     {
-        String::from_utf8(bytes).ok().map(PathBuf::from)
+        let path = path_text(host, &String::from_utf8(bytes).ok()?, PathStyle::NATIVE)?;
+        // `file:///tmp/x` names a folder of the current drive.
+        let path = PathBuf::from(path);
+        Some(std::path::absolute(&path).unwrap_or(path))
     }
+}
+
+/// The path a `file://` URI names, from its host and its percent-decoded path, written in `style`
+/// ([`PathStyle::file_url_path`]).
+pub fn path_text(host: &str, path: &str, style: PathStyle) -> Option<String> {
+    style.file_url_path(host, path)
 }
 
 #[cfg(test)]
@@ -412,6 +443,7 @@ pub(crate) mod tests {
         assert_eq!(extra_breaks(&text), expected);
     }
 
+    #[cfg(unix)]
     #[test]
     fn uris_round_trip_with_escapes() {
         let path = Path::new("/Users/me/my project/100% [draft] #1/Ёлка ?.rs");
@@ -421,8 +453,68 @@ pub(crate) mod tests {
             "file:///Users/me/my%20project/100%25%20%5Bdraft%5D%20%231/%D0%81%D0%BB%D0%BA%D0%B0%20%3F.rs"
         );
         assert_eq!(path_from_uri(&uri).as_deref(), Some(path));
+        assert_eq!(
+            uri_text(&path.to_string_lossy(), PathStyle::Unix),
+            uri.as_str()
+        );
     }
 
+    #[test]
+    fn windows_paths_and_uris() {
+        let windows = PathStyle::Windows;
+        let uri = uri_text(r"C:\Users\me\my project\100% [1]\Ёлка.rs", windows);
+        assert_eq!(
+            uri,
+            "file:///C:/Users/me/my%20project/100%25%20%5B1%5D/%D0%81%D0%BB%D0%BA%D0%B0.rs"
+        );
+        // What Flux sends parses, and comes back as the same path.
+        let parsed = Uri::from_str(&uri).unwrap();
+        let decoded: String = percent_decode_str(parsed.path().as_str())
+            .decode_utf8()
+            .unwrap()
+            .into_owned();
+        assert_eq!(
+            path_text("", &decoded, windows).as_deref(),
+            Some(r"C:\Users\me\my project\100% [1]\Ёлка.rs")
+        );
+        // Canonical and lower-case drives are written as Flux keeps them.
+        assert_eq!(uri_text(r"\\?\c:\a\b.rs", windows), "file:///C:/a/b.rs");
+        assert_eq!(
+            uri_text(r"\\server\share\a b.rs", windows),
+            "file://server/share/a%20b.rs"
+        );
+        assert!(Uri::from_str("file://server/share/a%20b.rs").is_ok());
+        // The servers' spellings of one file.
+        for path in ["/C:/a/b.rs", "/c:/a/b.rs", "/c|/a/b.rs"] {
+            assert_eq!(
+                path_text("", path, windows).as_deref(),
+                Some(r"C:\a\b.rs"),
+                "{path}"
+            );
+        }
+        assert_eq!(path_text("", "/C:", windows).as_deref(), Some(r"C:\"));
+        assert_eq!(
+            path_text("server", "/share/a.rs", windows).as_deref(),
+            Some(r"\\server\share\a.rs")
+        );
+        assert_eq!(
+            path_text("", "//server/share/a.rs", windows).as_deref(),
+            Some(r"\\server\share\a.rs")
+        );
+        assert_eq!(
+            path_text("localhost", "/D:/x", windows).as_deref(),
+            Some(r"D:\x")
+        );
+        assert_eq!(path_text("", "relative", windows), None);
+        // Elsewhere a host is someone else's machine.
+        assert_eq!(path_text("server", "/share/a.rs", PathStyle::Unix), None);
+        assert_eq!(
+            path_text("", "/tmp/a b.rs", PathStyle::Unix).as_deref(),
+            Some("/tmp/a b.rs")
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn foreign_uris_have_no_path() {
         let uri = |s: &str| Uri::from_str(s).unwrap();

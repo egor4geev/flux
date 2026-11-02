@@ -80,6 +80,13 @@ Since macOS 15, Control-click → Open no longer gets past this. From then on Fl
 tells you when a new version is out, and **Update and Restart** installs it without asking again.
 Want the versions still being tried? **Settings → Updates → Channel: Beta**.
 
+On Windows 10 (version 1903 or later) or 11, download `Flux-<version>-windows-x86_64-setup.exe`
+(`windows-aarch64` for ARM processors) from the same page and run it: Flux installs for you alone,
+without administrator rights, and adds itself to the Start menu — and, if you like, "Open with Flux"
+to folders. The `.zip` next to it is Flux to run without installing. Flux isn't signed, so Windows
+SmartScreen stops its first launch: click **More info → Run anyway** once. Updates install by
+themselves, as on the Mac.
+
 On its first launch Flux opens a short guide: the interface language, the theme and the look of the
 window, the plugins of the languages you write in, Claude Code, and a few slides on working in Flux —
 each with a live task. It is always at hand in **Help → Welcome Guide**.
@@ -96,6 +103,10 @@ cd flux
 scripts/bundle-macos.sh
 open target/release/Flux.app
 ```
+
+Flux for Windows can be built on a Mac too (`rustup target add x86_64-pc-windows-gnu`,
+`brew install mingw-w64`): `scripts/bundle-windows.sh` makes
+`dist/windows/Flux-<version>-windows-x86_64.zip`.
 
 `main` follows the releases; development happens on `pre-release`. Open a folder with
 <kbd>⌘</kbd><kbd>O</kbd> or pick a recent project on the start screen. For Claude, install

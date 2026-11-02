@@ -386,22 +386,25 @@ const MAX_BASE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn init(cx: &mut App) {
     let workspace = Some("Workspace");
-    cx.bind_keys([
-        // As in JetBrains IDEs (macOS keymap).
-        KeyBinding::new("cmd-k", Commit, workspace),
-        KeyBinding::new("cmd-shift-k", Push, workspace),
-        KeyBinding::new("cmd-0", ToggleCommitWindow, workspace),
-        KeyBinding::new("ctrl-v", VcsOperations, workspace),
-        // The author's own key: JetBrains has none for the branches popup on macOS.
-        KeyBinding::new("cmd-shift-b", Branches, workspace),
-        // In a terminal, ⌘T is a new terminal (`terminal_panel`), as in JetBrains IDEs.
-        KeyBinding::new("cmd-t", UpdateProject, workspace),
-        KeyBinding::new("cmd-9", ToggleGitWindow, workspace),
-        // The author's own key: JetBrains has none for Annotate on macOS.
-        KeyBinding::new("alt-cmd-a", Annotate, workspace),
-        // Programs in a terminal need ⌃V (vim's visual block, a literal next character).
-        KeyBinding::new("ctrl-v", NoAction, Some("Terminal")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            // As in JetBrains IDEs (macOS keymap).
+            KeyBinding::new("cmd-k", Commit, workspace),
+            KeyBinding::new("cmd-shift-k", Push, workspace),
+            KeyBinding::new("cmd-0", ToggleCommitWindow, workspace),
+            KeyBinding::new("ctrl-v", VcsOperations, workspace),
+            // The author's own key: JetBrains has none for the branches popup on macOS.
+            KeyBinding::new("cmd-shift-b", Branches, workspace),
+            // In a terminal, ⌘T is a new terminal (`terminal_panel`), as in JetBrains IDEs.
+            KeyBinding::new("cmd-t", UpdateProject, workspace),
+            KeyBinding::new("cmd-9", ToggleGitWindow, workspace),
+            // The author's own key: JetBrains has none for Annotate on macOS.
+            KeyBinding::new("alt-cmd-a", Annotate, workspace),
+            // Programs in a terminal need ⌃V (vim's visual block, a literal next character).
+            KeyBinding::new("ctrl-v", NoAction, Some("Terminal")),
+        ],
+    );
 }
 
 /// What changed, for those who watch the store.
@@ -1393,7 +1396,11 @@ impl GitStore {
     /// An error notification: `title` ("Checkout failed"), git's first line, and git's whole output
     /// behind "Details" when there is more to it.
     pub fn notify_error(&mut self, title: &str, error: &GitError, cx: &mut Context<Self>) {
-        let notification = error_notification(title, &error.to_string(), error.details());
+        let text = match error {
+            GitError::NotInstalled => git_missing(cfg!(windows)),
+            _ => error.to_string(),
+        };
+        let notification = error_notification(title, &text, error.details());
         self.notify(notification, cx);
     }
 
@@ -2274,9 +2281,7 @@ impl Favorites {
         let path = match explicit {
             Some(file) => Some(PathBuf::from(file)),
             None if std::env::var_os("FLUX_SCENARIO").is_some() => None,
-            None => std::env::var_os("HOME").map(|home| {
-                PathBuf::from(home).join("Library/Application Support/flux/git-favorites.json")
-            }),
+            None => flux_platform::paths::support_dir().map(|dir| dir.join("git-favorites.json")),
         };
         let by_repo = path
             .as_deref()
@@ -2565,6 +2570,18 @@ fn branch_from_head(head: &str) -> Option<SharedString> {
         }
         None if head.len() >= 7 => Some(head[..7].to_string().into()),
         None => None,
+    }
+}
+
+/// What Flux says when git isn't installed: on Windows where to get it (Git for Windows has no
+/// stand-in on the system); on macOS as it always did.
+fn git_missing(windows: bool) -> String {
+    match windows {
+        true => {
+            tr("Git isn't installed. Install Git for Windows from git-scm.com, then restart Flux.")
+                .to_string()
+        }
+        false => GitError::NotInstalled.to_string(),
     }
 }
 

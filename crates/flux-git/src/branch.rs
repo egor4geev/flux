@@ -1051,7 +1051,7 @@ mod tests {
         )
         .unwrap();
         let listed = crate::cli::GitCommand::new(&sandbox.root)
-            .args(["ls-remote", "--heads", remote.to_str().unwrap()])
+            .args(["ls-remote", "--heads", &crate::testing::url(&remote)])
             .output_string()
             .unwrap();
         assert!(!listed.contains("refs/heads/gone"), "{listed}");

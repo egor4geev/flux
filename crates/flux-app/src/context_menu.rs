@@ -68,14 +68,17 @@ actions!(
 
 pub fn init(cx: &mut App) {
     let context = Some("ContextMenu");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-        KeyBinding::new("enter", Confirm, context),
-        KeyBinding::new("escape", Cancel, context),
-        KeyBinding::new("right", SelectChild, context),
-        KeyBinding::new("left", SelectParent, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+            KeyBinding::new("enter", Confirm, context),
+            KeyBinding::new("escape", Cancel, context),
+            KeyBinding::new("right", SelectChild, context),
+            KeyBinding::new("left", SelectParent, context),
+        ],
+    );
 }
 
 enum Item {
@@ -522,8 +525,8 @@ impl ContextMenu {
         window.dispatch_action(action, cx);
     }
 
-    /// The action's shortcut as macOS symbols, in the key context of whoever opened the menu
-    /// (without one, the window's own keys — [`ui::action_binding`]).
+    /// The action's shortcut in the system's notation, in the key context of whoever opened the
+    /// menu (without one, the window's own keys — [`ui::action_binding`]).
     fn keys_for(&self, action: &dyn Action, window: &Window, cx: &App) -> Option<SharedString> {
         let binding = match &self.previous_focus {
             Some(focus) => window

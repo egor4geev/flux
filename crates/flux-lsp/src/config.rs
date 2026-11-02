@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use flux_platform::process::Background;
 use serde_json::{Value, json};
 
 use crate::install;
@@ -71,7 +72,12 @@ pub fn with_user_settings(mut config: ServerConfig, user: &Value) -> Option<Serv
         .map(str::trim)
         .filter(|command| !command.is_empty())
     {
-        config.command = expand_home(command, env::var_os("HOME").as_deref());
+        config.command = expand_home(
+            command,
+            flux_platform::paths::home()
+                .map(std::ffi::OsString::from)
+                .as_deref(),
+        );
         config.install = None;
     }
     if let Some(args) = user.get("args").and_then(Value::as_array) {
@@ -150,7 +156,9 @@ fn pruned(value: &Value) -> Option<Value> {
 /// `~/bin/x` → `<home>/bin/x`; other commands as they are.
 fn expand_home(command: &str, home: Option<&std::ffi::OsStr>) -> String {
     match (command.strip_prefix("~/"), home) {
-        (Some(rest), Some(home)) => Path::new(home).join(rest).to_string_lossy().into_owned(),
+        (Some(rest), Some(home)) => flux_platform::join_slashed(Path::new(home), rest)
+            .to_string_lossy()
+            .into_owned(),
         _ => command.to_string(),
     }
 }
@@ -227,9 +235,10 @@ impl ServerConfig {
         if command.components().count() > 1 {
             return is_executable(command).then(|| command.to_path_buf());
         }
+        // On Windows a bare name is a `.exe` or a `.cmd`: `PATHEXT` says which.
         search_path()
             .into_iter()
-            .map(|dir| dir.join(command))
+            .flat_map(|dir| flux_platform::process::program_files(&dir, &self.command))
             .find(|path| is_executable(path))
             .filter(|path| !self.is_bare_rustup_proxy(path))
     }
@@ -240,13 +249,15 @@ impl ServerConfig {
         let Some(Install::Rustup { component, .. }) = &self.install else {
             return false;
         };
-        let Some(rustup) = path.parent().map(|dir| dir.join("rustup")) else {
+        let Some(rustup) = path.parent().and_then(|dir| {
+            flux_platform::process::program_files(dir, "rustup")
+                .into_iter()
+                .find(|rustup| is_executable(rustup))
+        }) else {
             return false;
         };
-        if !is_executable(&rustup) {
-            return false;
-        }
         let has_component = Command::new(rustup)
+            .background()
             .args(["which", component])
             .env("PATH", search_path_env())
             .stdin(Stdio::null())
@@ -329,7 +340,7 @@ pub fn workspace_settings(config: &ServerConfig, root: &Path) -> Value {
 /// root (a directory with `pyvenv.cfg`), otherwise the activated one (`VIRTUAL_ENV`).
 fn python_interpreter(root: &Path, activated: Option<&std::ffi::OsStr>) -> Option<String> {
     let interpreter = |venv: &Path| {
-        let python = venv.join("bin").join("python");
+        let python = venv_python(venv);
         (venv.join("pyvenv.cfg").is_file() && python.exists())
             .then(|| python.to_string_lossy().into_owned())
     };
@@ -337,6 +348,15 @@ fn python_interpreter(root: &Path, activated: Option<&std::ffi::OsStr>) -> Optio
         .iter()
         .find_map(|name| interpreter(&root.join(name)))
         .or_else(|| activated.and_then(|venv| interpreter(Path::new(venv))))
+}
+
+/// The interpreter of a virtual environment: `bin/python`, on Windows `Scripts\python.exe`.
+fn venv_python(venv: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    }
 }
 
 /// `node_modules/typescript/lib` next to the typescript-language-server that runs as `program`
@@ -371,7 +391,7 @@ pub fn search_path() -> Vec<PathBuf> {
     if let Some(path) = env::var_os("PATH") {
         dirs.extend(env::split_paths(&path));
     }
-    let home = env::var_os("HOME").map(PathBuf::from);
+    let home = flux_platform::paths::home();
     let in_home = |relative: &str| home.as_ref().map(|home| home.join(relative));
 
     if let Some(cargo_home) = env::var_os("CARGO_HOME") {
@@ -394,6 +414,10 @@ pub fn search_path() -> Vec<PathBuf> {
     dirs.extend(in_home("go/bin"));
     dirs.extend(in_home(".local/bin"));
 
+    // npm's global packages on Windows (`npm install -g` puts `.cmd` files there).
+    if cfg!(windows) {
+        dirs.extend(env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("npm")));
+    }
     dirs.extend(in_home(".volta/bin"));
     dirs.extend(in_home(".npm-global/bin"));
     dirs.extend(in_home(".bun/bin"));
@@ -463,18 +487,7 @@ fn system_paths() -> Vec<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        metadata.is_file()
-    }
+    flux_platform::process::is_executable(path)
 }
 
 #[cfg(test)]
@@ -544,30 +557,35 @@ mod tests {
         assert_eq!(settings_section(&settings, Some("")), settings);
     }
 
+    /// An empty interpreter where a virtual environment in `dir` has it.
+    fn python_file(dir: &Path) {
+        let python = venv_python(dir);
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(python, "").unwrap();
+    }
+
     #[test]
     fn python_virtual_environment_of_the_project() {
         let root = tempfile::tempdir().unwrap();
         let venv = |dir: &Path| {
-            fs::create_dir_all(dir.join("bin")).unwrap();
-            fs::write(dir.join("bin/python"), "").unwrap();
+            python_file(dir);
             fs::write(dir.join("pyvenv.cfg"), "home = /usr/bin").unwrap();
         };
         assert_eq!(python_interpreter(root.path(), None), None);
         // A directory named `env` without pyvenv.cfg is not an environment.
-        fs::create_dir_all(root.path().join("env/bin")).unwrap();
-        fs::write(root.path().join("env/bin/python"), "").unwrap();
+        python_file(&root.path().join("env"));
         assert_eq!(python_interpreter(root.path(), None), None);
 
         let activated = tempfile::tempdir().unwrap();
         venv(activated.path());
-        let expected = activated.path().join("bin/python");
+        let expected = venv_python(activated.path());
         assert_eq!(
             python_interpreter(root.path(), Some(activated.path().as_os_str())),
             Some(expected.to_string_lossy().into_owned())
         );
         // The project's own environment wins over the activated one.
         venv(&root.path().join(".venv"));
-        let expected = root.path().join(".venv/bin/python");
+        let expected = venv_python(&root.path().join(".venv"));
         assert_eq!(
             python_interpreter(root.path(), Some(activated.path().as_os_str())),
             Some(expected.to_string_lossy().into_owned())
@@ -588,7 +606,7 @@ mod tests {
     #[test]
     fn typescript_next_to_the_server_is_its_fallback() {
         let prefix = tempfile::tempdir().unwrap();
-        let bin = prefix.path().join("node_modules/.bin");
+        let bin = prefix.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin).unwrap();
         let program = bin.join("typescript-language-server");
         fs::write(&program, "").unwrap();
@@ -602,7 +620,11 @@ mod tests {
             launch(config, prefix.path(), &program).initialization_options,
             None
         );
-        let lib = prefix.path().join("node_modules/typescript/lib");
+        let lib = prefix
+            .path()
+            .join("node_modules")
+            .join("typescript")
+            .join("lib");
         fs::create_dir_all(&lib).unwrap();
         fs::write(lib.join("tsserver.js"), "").unwrap();
         let options = launch(config, prefix.path(), &program).initialization_options;
@@ -689,14 +711,14 @@ mod tests {
         assert_eq!(custom.command, "/opt/gopls");
         // Flux doesn't install the plugin's server in place of the user's own.
         assert_eq!(custom.install, None);
-        assert_eq!(
-            expand_home("~/bin/gopls", Some(std::ffi::OsStr::new("/Users/me"))),
-            "/Users/me/bin/gopls"
-        );
-        assert_eq!(
-            expand_home("gopls", Some(std::ffi::OsStr::new("/Users/me"))),
-            "gopls"
-        );
+        let (home, expanded) = if cfg!(windows) {
+            (r"C:\Users\me", r"C:\Users\me\bin\gopls")
+        } else {
+            ("/Users/me", "/Users/me/bin/gopls")
+        };
+        let home = Some(std::ffi::OsStr::new(home));
+        assert_eq!(expand_home("~/bin/gopls", home), expanded);
+        assert_eq!(expand_home("gopls", home), "gopls");
     }
 
     #[test]
@@ -740,16 +762,20 @@ mod tests {
     fn the_users_python_interpreter_wins_over_the_projects() {
         let root = tempfile::tempdir().unwrap();
         let venv = root.path().join(".venv");
-        fs::create_dir_all(venv.join("bin")).unwrap();
-        fs::write(venv.join("bin/python"), "").unwrap();
+        python_file(&venv);
         fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin").unwrap();
         let pyright = server("pyright", "pyright-langserver", &[], &["py"], &[]);
         let found = workspace_settings(&pyright, root.path());
+        let python = if cfg!(windows) {
+            r".venv\Scripts\python.exe"
+        } else {
+            ".venv/bin/python"
+        };
         assert!(
             found["python"]["pythonPath"]
                 .as_str()
                 .unwrap()
-                .ends_with(".venv/bin/python")
+                .ends_with(python)
         );
         let own = with_user_settings(
             pyright.clone(),
@@ -771,11 +797,14 @@ mod tests {
             command: command.to_string(),
             ..server("x", "x", &[], &[], &[])
         };
-        assert_eq!(
-            config("/bin/sh").resolve_command(),
-            Some(PathBuf::from("/bin/sh"))
-        );
-        assert!(config("sh").resolve_command().is_some());
+        // A program of the system, by its full path and by its name.
+        let (full, name) = if cfg!(windows) {
+            (r"C:\Windows\System32\cmd.exe", "cmd")
+        } else {
+            ("/bin/sh", "sh")
+        };
+        assert_eq!(config(full).resolve_command(), Some(PathBuf::from(full)));
+        assert!(config(name).resolve_command().is_some());
         assert_eq!(config("/bin/no-such-server").resolve_command(), None);
         assert_eq!(config("no-such-server-flux").resolve_command(), None);
         // A directory is not an executable.

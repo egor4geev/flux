@@ -192,6 +192,11 @@ mod tests {
         Uri::from_str(s).unwrap()
     }
 
+    /// The path `file://` + `path` names: on Windows `/a.rs` is a file of the current drive.
+    fn local(path: &str) -> PathBuf {
+        std::path::absolute(path).unwrap()
+    }
+
     #[test]
     fn edits_are_sorted_with_inserts_in_server_order() {
         let text = Rope::from("let x = 1;\nlet y = 2;\n");
@@ -247,7 +252,7 @@ mod tests {
         changes.insert(uri("file:///a%20x.rs"), vec![edit((0, 0), (0, 0), "a")]);
         let files = workspace_files(&WorkspaceEdit::new(changes)).unwrap();
         let paths: Vec<_> = files.iter().map(|(p, _)| p.clone()).collect();
-        assert_eq!(paths, [PathBuf::from("/a x.rs"), PathBuf::from("/b.rs")]);
+        assert_eq!(paths, [local("/a x.rs"), local("/b.rs")]);
     }
 
     #[test]
@@ -279,13 +284,10 @@ mod tests {
         };
         let files = workspace_files(&edit).unwrap();
         assert_eq!(files.len(), 2);
-        assert_eq!(files[0].0, PathBuf::from("/z.rs"));
+        assert_eq!(files[0].0, local("/z.rs"));
         assert_eq!(
             files[1],
-            (
-                PathBuf::from("/a.rs"),
-                vec![self::edit((0, 0), (0, 1), "a")]
-            )
+            (local("/a.rs"), vec![self::edit((0, 0), (0, 1), "a")])
         );
     }
 
@@ -340,16 +342,16 @@ mod tests {
             workspace_changes(&edit).unwrap(),
             vec![
                 FileChange::Create {
-                    path: PathBuf::from("/src/new.rs"),
+                    path: local("/src/new.rs"),
                     overwrite: false,
                     ignore_if_exists: true,
                 },
                 FileChange::Edit {
-                    path: PathBuf::from("/src/new.rs"),
+                    path: local("/src/new.rs"),
                     edits: vec![self::edit((0, 0), (0, 0), "fn moved() {}\n")],
                 },
                 FileChange::Delete {
-                    path: PathBuf::from("/src/old.rs"),
+                    path: local("/src/old.rs"),
                     recursive: false,
                     ignore_if_not_exists: false,
                 },
@@ -363,7 +365,7 @@ mod tests {
         assert_eq!(
             workspace_changes(&plain).unwrap(),
             vec![FileChange::Edit {
-                path: PathBuf::from("/b.rs"),
+                path: local("/b.rs"),
                 edits: vec![self::edit((0, 0), (0, 0), "x")],
             }]
         );

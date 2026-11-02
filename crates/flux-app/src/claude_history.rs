@@ -46,18 +46,21 @@ const MAX_OPEN: usize = 20;
 const CONTEXT: &str = "Picker ClaudeHistory";
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new(
-            "cmd-backspace",
-            picker::DeleteSelected,
-            Some("ClaudeHistory > TextInput"),
-        ),
-        KeyBinding::new(
-            "cmd-backspace",
-            picker::DeleteSelected,
-            Some("ClaudeHistory"),
-        ),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new(
+                "cmd-backspace",
+                picker::DeleteSelected,
+                Some("ClaudeHistory > TextInput"),
+            ),
+            KeyBinding::new(
+                "cmd-backspace",
+                picker::DeleteSelected,
+                Some("ClaudeHistory"),
+            ),
+        ],
+    );
 }
 
 thread_local! {
@@ -228,7 +231,10 @@ impl PickerDelegate for HistoryDelegate {
         // fades in (the button's id keeps the fade), moved to with the arrows it is there at once.
         let delete = crate::ui::icon_button(("history-delete", index), IconName::Trash, ui)
             .flex_none()
-            .tooltip(crate::ui::tooltip(tr("Delete Session"), Some("⌘⌫".into())))
+            .tooltip(crate::ui::tooltip(
+                tr("Delete Session"),
+                Some(crate::keymap::shortcut("picker::DeleteSelected", "cmd-backspace").into()),
+            ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(
                 cx.listener(move |picker, _, window, cx| picker.delegate.delete(index, window, cx)),
@@ -582,7 +588,7 @@ fn store_path() -> Option<PathBuf> {
     store_path_for(
         std::env::var_os("FLUX_CLAUDE_SESSIONS_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     )
 }
 
@@ -591,7 +597,7 @@ fn console_path() -> Option<PathBuf> {
         "claude-console.json",
         std::env::var_os("FLUX_CLAUDE_CONSOLE_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     )
 }
 
@@ -620,7 +626,7 @@ fn file_path_for(
         return None;
     }
     let home = PathBuf::from(home?);
-    Some(home.join("Library/Application Support/flux").join(name))
+    Some(flux_platform::paths::support_dir_in(&home).join(name))
 }
 
 fn read(file: &Path) -> BTreeMap<String, OpenSessions> {
@@ -891,8 +897,9 @@ mod tests {
         );
         assert_eq!(
             file_path_for("claude-console.json", None, false, Some("/Users/me".into())),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/claude-console.json"
+            Some(crate::settings::support_file(
+                "/Users/me",
+                "claude-console.json"
             ))
         );
         fs::remove_dir_all(dir).ok();
@@ -908,8 +915,9 @@ mod tests {
         assert_eq!(store_path_for(None, true, home.clone()), None);
         assert_eq!(
             store_path_for(None, false, home),
-            Some(PathBuf::from(
-                "/Users/me/Library/Application Support/flux/claude-sessions.json"
+            Some(crate::settings::support_file(
+                "/Users/me",
+                "claude-sessions.json"
             ))
         );
     }

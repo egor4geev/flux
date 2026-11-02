@@ -48,16 +48,19 @@ const MAX_CONTEXTS: usize = 50;
 const CONTEXT: &str = "Picker Contexts";
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        // Clear Context, as in JetBrains.
-        KeyBinding::new("alt-shift-x", ClearContext, Some("Workspace")),
-        KeyBinding::new(
-            "cmd-backspace",
-            picker::DeleteSelected,
-            Some("Contexts > TextInput"),
-        ),
-        KeyBinding::new("cmd-backspace", picker::DeleteSelected, Some("Contexts")),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            // Clear Context, as in JetBrains.
+            KeyBinding::new("alt-shift-x", ClearContext, Some("Workspace")),
+            KeyBinding::new(
+                "cmd-backspace",
+                picker::DeleteSelected,
+                Some("Contexts > TextInput"),
+            ),
+            KeyBinding::new("cmd-backspace", picker::DeleteSelected, Some("Contexts")),
+        ],
+    );
 }
 
 /// The window's commands of contexts.
@@ -386,7 +389,10 @@ impl PickerDelegate for ContextList {
         // with the row's hover (the button's id keeps the fade).
         let delete = crate::ui::icon_button(("context-delete", index), IconName::Trash, ui)
             .flex_none()
-            .tooltip(crate::ui::tooltip(tr("Delete Context"), Some("⌘⌫".into())))
+            .tooltip(crate::ui::tooltip(
+                tr("Delete Context"),
+                Some(crate::keymap::shortcut("picker::DeleteSelected", "cmd-backspace").into()),
+            ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(
                 cx.listener(move |picker, _, window, cx| picker.delegate.delete(index, window, cx)),
@@ -538,7 +544,7 @@ fn store_path() -> Option<PathBuf> {
     store_path_for(
         std::env::var_os("FLUX_CONTEXTS_FILE"),
         std::env::var_os("FLUX_SCENARIO").is_some(),
-        std::env::var_os("HOME"),
+        flux_platform::paths::home().map(std::ffi::OsString::from),
     )
 }
 
@@ -556,7 +562,7 @@ fn store_path_for(
         return None;
     }
     let home = PathBuf::from(home?);
-    Some(home.join("Library/Application Support/flux/contexts.json"))
+    Some(flux_platform::paths::support_dir_in(&home).join("contexts.json"))
 }
 
 /// The file as JSON; missing or broken — an empty object.
@@ -760,9 +766,7 @@ mod tests {
         assert_eq!(store_path_for(None, true, home.clone()), None);
         assert_eq!(
             store_path_for(None, false, home),
-            Some(PathBuf::from(
-                "/Users/u/Library/Application Support/flux/contexts.json"
-            ))
+            Some(crate::settings::support_file("/Users/u", "contexts.json"))
         );
     }
 

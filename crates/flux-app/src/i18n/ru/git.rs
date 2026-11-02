@@ -1,6 +1,10 @@
 //! Version control: the commit window, the diff viewer, the gutter, push, the operations menu.
 
 pub(super) const STRINGS: &[(&str, &str)] = &[
+    (
+        "Git isn't installed. Install Git for Windows from git-scm.com, then restart Flux.",
+        "Git не установлен. Установите Git for Windows с git-scm.com и перезапустите Flux.",
+    ),
     ("Commit", "Коммит"),
     ("Commit Message", "Сообщение коммита"),
     ("Commit and Push…", "Коммит и пуш…"),

@@ -32,11 +32,14 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "ctrl-alt-w",
-        ToggleSoftWrap,
-        Some("Editor"),
-    )]);
+    crate::keymap::bind_keys(
+        cx,
+        [KeyBinding::new(
+            "ctrl-alt-w",
+            ToggleSoftWrap,
+            Some("Editor"),
+        )],
+    );
 }
 
 /// A row never gets narrower than this many spaces, however narrow the editor: a tiny width would

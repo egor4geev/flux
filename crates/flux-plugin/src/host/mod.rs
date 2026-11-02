@@ -385,7 +385,13 @@ impl State {
         let files = files
             .into_iter()
             .map(|file| project::FileMatches {
-                path: file.path.to_string_lossy().into_owned(),
+                // With `/` on every system: the same plugin runs on all of them.
+                path: file
+                    .path
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
                 lines: file
                     .lines
                     .into_iter()

@@ -39,11 +39,17 @@ pub(crate) fn open(
             if program.trim().is_empty() {
                 return Err("The command's program is empty".into());
             }
-            let (shell, _) = flux_term::login_shell();
             let name = Path::new(program)
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned());
-            (Some(through_login_shell(&shell, program, args)), name)
+            #[cfg(unix)]
+            let command = {
+                let (shell, _) = flux_term::login_shell();
+                through_login_shell(&shell, program, args)
+            };
+            #[cfg(windows)]
+            let command = direct_command(program, args);
+            (Some(command), name)
         }
     };
     let title = options
@@ -209,6 +215,7 @@ fn working_dir(root: Option<&Path>, given: Option<&str>) -> Result<Option<PathBu
 /// The command line that runs `program` with `args` through the user's login shell: its profile
 /// gives the `PATH` an app started from the Dock lacks, and `exec` keeps the program's exit code.
 /// A shell that doesn't speak `sh` (other than fish) is replaced by zsh, the macOS default.
+#[cfg(unix)]
 fn through_login_shell(shell: &str, program: &str, args: &[String]) -> (String, Vec<String>) {
     let name = Path::new(shell)
         .file_name()
@@ -229,10 +236,38 @@ fn through_login_shell(shell: &str, program: &str, args: &[String]) -> (String, 
     (shell.to_string(), argv)
 }
 
+/// Windows: the program itself — a windowed app has the user's whole environment there, so no
+/// login shell is needed. A name is looked up in `PATH` by `PATHEXT`; a batch file (npm's
+/// `npm.cmd`) runs through `cmd.exe`, as Windows runs batch files.
+#[cfg(windows)]
+fn direct_command(program: &str, args: &[String]) -> (String, Vec<String>) {
+    let found = if program.contains(['\\', '/']) {
+        Some(PathBuf::from(program))
+    } else {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        flux_platform::process::find_in_path(program, &path)
+    };
+    let program = found.map_or_else(
+        || program.to_string(),
+        |path| path.to_string_lossy().into_owned(),
+    );
+    let batch = Path::new(&program)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+    if batch {
+        let mut argv = vec!["/d".to_string(), "/c".to_string(), program];
+        argv.extend(args.iter().cloned());
+        ("cmd.exe".to_string(), argv)
+    } else {
+        (program, args.to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn commands_run_through_the_login_shell() {
         let args = ["test".to_string(), "--all".to_string()];
@@ -250,6 +285,8 @@ mod tests {
         assert_eq!(shell, "/bin/zsh");
     }
 
+    // `sh` and a login shell: Unix's way to a full `PATH`.
+    #[cfg(unix)]
     #[test]
     fn the_exit_code_survives_the_login_shell() {
         let (shell, argv) = through_login_shell("/bin/sh", "sh", &["-c".into(), "exit 3".into()]);

@@ -2,7 +2,6 @@
 //! cancellation, notifications both ways, server requests, crashes.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -146,11 +145,7 @@ fn hover_params(uri: Uri, line: u32) -> HoverParams {
 }
 
 fn process_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    flux_platform::process::alive(pid)
 }
 
 fn wait_dead(pid: u32) {

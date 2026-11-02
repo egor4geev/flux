@@ -33,9 +33,17 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Its transcript goes to the Trash.",
         "Запись уйдёт в Корзину.",
     ),
+    (
+        "Its transcript goes to the Recycle Bin.",
+        "Запись уйдёт в Корзину.",
+    ),
     ("The session “{0}” is open", "Сессия «{0}» открыта"),
     (
         "It closes, and its transcript goes to the Trash.",
+        "Она закроется, а её запись уйдёт в Корзину.",
+    ),
+    (
+        "It closes, and its transcript goes to the Recycle Bin.",
         "Она закроется, а её запись уйдёт в Корзину.",
     ),
     ("Close and Delete", "Закрыть и удалить"),

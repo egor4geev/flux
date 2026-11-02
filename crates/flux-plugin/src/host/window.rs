@@ -266,7 +266,9 @@ impl system::Host for State {
     }
 
     fn home_dir(&mut self) -> String {
-        std::env::var("HOME").unwrap_or_default()
+        flux_platform::paths::home()
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     fn utc_offset(&mut self, at: i64) -> i32 {
@@ -284,13 +286,7 @@ impl system::Host for State {
 
 /// How far local time is ahead of UTC at `at` (seconds since 1970), by the system's rules.
 pub(crate) fn local_utc_offset(at: i64) -> i32 {
-    let time = at as libc::time_t;
-    // SAFETY: `localtime_r` writes only into `tm`, which outlives the call.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
-        return 0;
-    }
-    tm.tm_gmtoff as i32
+    flux_platform::time::local_utc_offset(at)
 }
 
 /// The IANA name of the local time zone: `TZ`, else the target of `/etc/localtime`

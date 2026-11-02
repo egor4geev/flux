@@ -56,17 +56,20 @@ const BUTTONS_WIDTH: f32 = 168.;
 
 pub fn init(cx: &mut App) {
     let context = Some("ConflictsDialog");
-    cx.bind_keys([
-        KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new("up", SelectPrevious, context),
-        KeyBinding::new("shift-down", ExtendNext, context),
-        KeyBinding::new("shift-up", ExtendPrevious, context),
-        KeyBinding::new("enter", MergeSelected, context),
-        // The first letters of Accept Yours / Accept Theirs (the left and right columns).
-        KeyBinding::new("alt-y", AcceptLeftColumn, context),
-        KeyBinding::new("alt-t", AcceptRightColumn, context),
-        KeyBinding::new("escape", Dismiss, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("down", SelectNext, context),
+            KeyBinding::new("up", SelectPrevious, context),
+            KeyBinding::new("shift-down", ExtendNext, context),
+            KeyBinding::new("shift-up", ExtendPrevious, context),
+            KeyBinding::new("enter", MergeSelected, context),
+            // The first letters of Accept Yours / Accept Theirs (the left and right columns).
+            KeyBinding::new("alt-y", AcceptLeftColumn, context),
+            KeyBinding::new("alt-t", AcceptRightColumn, context),
+            KeyBinding::new("escape", Dismiss, context),
+        ],
+    );
 }
 
 /// Opens the Conflicts dialog (or closes it, when open).
@@ -705,7 +708,7 @@ impl ConflictsDialog {
             self.cursor = Some(path);
             return self.merge(window, cx);
         }
-        if modifiers.platform {
+        if modifiers.secondary() {
             if let Some(at) = self.selected.iter().position(|selected| *selected == path) {
                 self.selected.remove(at);
             } else {
@@ -855,7 +858,10 @@ impl ConflictsDialog {
             Row::File(change) => {
                 let selected = self.selected.contains(&change.path);
                 let (dir, name) = match change.relative.rsplit_once('/') {
-                    Some((dir, name)) => (Some(dir.to_string()), name.to_string()),
+                    Some((dir, name)) => (
+                        Some(flux_platform::PathStyle::NATIVE.native(dir).into_owned()),
+                        name.to_string(),
+                    ),
                     None => (None, change.relative.clone()),
                 };
                 let (ours, theirs) = side_changes(change.conflict);

@@ -102,7 +102,21 @@ fn system_reduce_motion() -> bool {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows' "Animation effects" (Settings → Accessibility → Visual effects) is off.
+#[cfg(windows)]
+fn system_reduce_motion() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW,
+    };
+    let mut animate: windows_sys::core::BOOL = 1;
+    // SAFETY: the call writes one BOOL into `animate`, which outlives it.
+    let read = unsafe {
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut animate).cast(), 0)
+    };
+    read != 0 && animate == 0
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn system_reduce_motion() -> bool {
     false
 }

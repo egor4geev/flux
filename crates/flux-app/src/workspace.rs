@@ -24,6 +24,7 @@ use crate::claude_chat::{ClaudeChat, ClaudeChatEvent, DraggedClaudeChat};
 use crate::claude_composer::EditorContext;
 use crate::claude_console::{ClaudeConsole, ClaudeConsoleEvent, SessionRef};
 use crate::commit_panel::{CommitPanel, CommitPanelEvent};
+use crate::context_menu::ContextMenu;
 use crate::dialog::Dialog;
 use crate::diff_view::{DiffSide, DiffView, DiffViewEvent};
 use crate::editor::{self, Editor, EditorEvent};
@@ -35,6 +36,7 @@ use crate::git_window::{self, DraggedLogTab, GitWindow, GitWindowEvent};
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{FileIcon, IconName, file_icon, icon};
 use crate::image_view::{self, ImageSource, ImageView, ImageViewEvent};
+use crate::keymap::KeyOs;
 use crate::launchpad::{self, Tool};
 use crate::lsp::LspStore;
 use crate::merge_view::{MergeView, MergeViewEvent};
@@ -55,6 +57,7 @@ use crate::terminal_group::{DraggedTerminal, TerminalGroup, TerminalGroupEvent};
 use crate::terminal_panel::{self, TerminalPanel, TerminalPanelEvent};
 use crate::terminal_view::TerminalLink;
 use crate::theme::{self, Theme, UiColors};
+use crate::title_bar;
 use crate::ui::{self, GAP, RADIUS_MD, RADIUS_SM, STATUS_BAR_HEIGHT, TITLE_BAR_HEIGHT};
 use crate::{command_palette, file_finder, go_to_line, recent};
 
@@ -113,6 +116,8 @@ actions!(
         NextTab,
         PrevTab,
         LastTab,
+        /// Windows: the title bar's menu (`Alt+\`), the menu bar's menus (part 10.9).
+        ShowMainMenu,
     ]
 );
 
@@ -143,26 +148,35 @@ pub fn init(cx: &mut App) {
 
 fn bind_keys(cx: &mut App) {
     let context = Some("Workspace");
-    cx.bind_keys([
-        KeyBinding::new("cmd-o", Open, context),
-        KeyBinding::new("cmd-n", NewFile, context),
-        KeyBinding::new("cmd-w", CloseTab, context),
-        KeyBinding::new("cmd-shift-w", CloseWindow, context),
-        KeyBinding::new("cmd-q", Quit, context),
-        // macOS sends cmd-shift-] as cmd-}: shift is already accounted for in the character.
-        KeyBinding::new("cmd-}", NextTab, context),
-        KeyBinding::new("cmd-{", PrevTab, context),
-        KeyBinding::new("cmd-shift-]", NextTab, context),
-        KeyBinding::new("cmd-shift-[", PrevTab, context),
-        KeyBinding::new("ctrl-tab", NextTab, context),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, context),
-        KeyBinding::new("ctrl-9", LastTab, context),
-        // When focus is outside the editor (file tree, search fields), the active document is
-        // saved.
-        KeyBinding::new("cmd-s", editor::Save, context),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("cmd-o", Open, context),
+            KeyBinding::new("cmd-n", NewFile, context),
+            KeyBinding::new("cmd-w", CloseTab, context),
+            KeyBinding::new("cmd-shift-w", CloseWindow, context),
+            KeyBinding::new("cmd-q", Quit, context),
+            // macOS sends cmd-shift-] as cmd-}: shift is already accounted for in the character.
+            KeyBinding::new("cmd-}", NextTab, context),
+            KeyBinding::new("cmd-{", PrevTab, context),
+            KeyBinding::new("cmd-shift-]", NextTab, context),
+            KeyBinding::new("cmd-shift-[", PrevTab, context),
+            KeyBinding::new("ctrl-tab", NextTab, context),
+            KeyBinding::new("ctrl-shift-tab", PrevTab, context),
+            KeyBinding::new("ctrl-9", LastTab, context),
+            // When focus is outside the editor (file tree, search fields), the active document is
+            // saved.
+            KeyBinding::new("cmd-s", editor::Save, context),
+        ],
+    );
+    // The title bar's menu on Windows (part 10.9): Alt+\, as the main menu of a Windows IDE.
+    // These keys are Windows' already; macOS has its menu bar (and Option-\ types «).
+    if KeyOs::current() == KeyOs::Windows {
+        cx.bind_keys([KeyBinding::new("alt-\\", ShowMainMenu, context)]);
+    }
     // cmd-1 belongs to the file tree (as in JetBrains IDEs), so tabs by number are on ctrl.
-    cx.bind_keys(
+    crate::keymap::bind_keys(
+        cx,
         (1..=8).map(|n| KeyBinding::new(&format!("ctrl-{n}"), ActivateTab(n - 1), context)),
     );
 }
@@ -792,15 +806,15 @@ impl Workspace {
         // The panels open and close on their own (Esc, ×); when they do, the window layout changes
         // too.
         // A theme that follows macOS changes with it (Settings → Appearance → Sync with OS).
-        crate::theme::system_appearance_changed(crate::theme::window_appearance(window), cx);
+        crate::theme::system_appearance_changed(cx);
         // Updates of the installed plugins, once the plugins are found (stage 8.3).
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, crate::plugin_updates::check_on_start).ok();
         });
         let subscriptions = vec![
-            cx.observe_window_appearance(window, |_, window, cx| {
-                crate::theme::system_appearance_changed(crate::theme::window_appearance(window), cx)
+            cx.observe_window_appearance(window, |_, _, cx| {
+                crate::theme::system_appearance_changed(cx)
             }),
             // Files may have changed while the window was inactive (git in a terminal, another
             // editor): the watcher reports them, and a refresh on return makes sure.
@@ -954,7 +968,7 @@ impl Workspace {
 
     /// A new project root (cmd-o with a directory).
     fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let root = fs::canonicalize(&root).unwrap_or(root);
+        let root = flux_platform::path_style::canonicalize(&root).unwrap_or(root);
         self.claude
             .update(cx, |store, cx| store.set_root(Some(root.clone()), cx));
         self.project_search
@@ -1012,7 +1026,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let root = fs::canonicalize(&root).unwrap_or(root);
+        let root = flux_platform::path_style::canonicalize(&root).unwrap_or(root);
         if !root.is_dir() {
             // A folder from the recent list may have disappeared since.
             let message = trf("Folder not found: {0}", &[&tilde(&root)]);
@@ -1525,10 +1539,7 @@ impl Workspace {
     fn window_closing(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.save_state(cx);
         let closing = window.window_handle().window_id();
-        let others = cx.windows().iter().any(|handle| {
-            handle.window_id() != closing && handle.downcast::<Workspace>().is_some()
-        });
-        if others {
+        if other_project_windows(window, cx) {
             cx.defer(move |cx| remember_open_projects(Some(closing), cx));
         } else {
             project_state::set_open_projects(&OpenProjects {
@@ -3050,6 +3061,12 @@ impl Workspace {
         if self.closing {
             return false;
         }
+        // Windows (part 10.9): an app ends with its last window — closing it (×, Alt+F4) quits
+        // Flux the way Exit does: the same questions, the state saved for the next launch.
+        if last_window_quits(title_bar::os()) && !other_project_windows(window, cx) {
+            start_quit(cx);
+            return false;
+        }
         if self.running_processes(cx).is_empty()
             && self.claude.read(cx).working_sessions(cx).is_empty()
             && !self.tabs.iter().any(|tab| tab.item.is_modified(cx))
@@ -3572,7 +3589,14 @@ impl Workspace {
     /// cmd-1: show or hide the file tree.
     fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.tree_panel() else {
-            return self.show_message(tr("No project folder — open one with ⌘O").into(), cx);
+            return self.show_message(
+                trf(
+                    "No project folder — open one with {0}",
+                    &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+                )
+                .into(),
+                cx,
+            );
         };
         let focused = panel.focus_handle(cx).contains_focused(window, cx);
         // The commit window gives its place back to the tree, and its focus with it: a hidden panel
@@ -3607,7 +3631,14 @@ impl Workspace {
     /// editor.
     fn toggle_tree_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.tree_panel() else {
-            return self.show_message(tr("No project folder — open one with ⌘O").into(), cx);
+            return self.show_message(
+                trf(
+                    "No project folder — open one with {0}",
+                    &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+                )
+                .into(),
+                cx,
+            );
         };
         let handle = panel.focus_handle(cx);
         if self.tree_open && handle.contains_focused(window, cx) {
@@ -4788,17 +4819,17 @@ impl Workspace {
 
     /// The title bar on the window frame: space for the traffic lights, the project and branch, the
     /// file search bar in the middle, buttons on the right. A double-click acts like one on a macOS
-    /// window title bar.
+    /// window title bar. On Windows (part 10.9, `crate::title_bar`) it is the window's caption: the
+    /// menu button at the left, the window buttons at the right end.
     fn render_title_bar(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement + use<> {
         let ui = Theme::ui(cx);
-        let leading = if window.is_fullscreen() {
-            GAP + 4.
-        } else {
-            TRAFFIC_LIGHTS_WIDTH
-        };
+        let os = title_bar::os();
+        let fullscreen = window.is_fullscreen();
+        let leading = title_bar::leading(os, fullscreen);
         // The project and ▾: a click shows the recent projects (part 10.4).
-        let project = crate::project_popup::project_chip(self, cx);
-        let branch = crate::branches_popup::branch_chip(self, cx);
+        let project = title_bar::clickable_any(os, crate::project_popup::project_chip(self, cx));
+        let branch = crate::branches_popup::branch_chip(self, cx)
+            .map(|branch| title_bar::clickable_any(os, branch));
         let search =
             (f32::from(window.viewport_size().width) >= TITLE_SEARCH_MIN_WINDOW).then(|| {
                 div()
@@ -4807,7 +4838,8 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
+                    .child(title_bar::clickable(
+                        os,
                         div()
                             .id("title-search")
                             .w(px(340.))
@@ -4837,31 +4869,53 @@ impl Workspace {
                                 ui::shortcut_for(&file_finder::Toggle, cx)
                                     .map(|keys| ui::keys(&keys, ui)),
                             ),
-                    )
+                    ))
             });
         let button =
             |id: &'static str, name: IconName, label: &'static str, action: Box<dyn Action>| {
                 let keys = ui::shortcut_for(action.as_ref(), cx);
-                ui::icon_button(id, name, ui)
-                    .tooltip(ui::tooltip(label, keys))
-                    .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+                title_bar::clickable(
+                    os,
+                    ui::icon_button(id, name, ui)
+                        .tooltip(ui::tooltip(label, keys))
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(action.boxed_clone(), cx)
+                        }),
+                )
             };
-        div()
+        // Windows: the menu bar's menus behind a button where the traffic lights are on macOS.
+        let menu = (os == KeyOs::Windows).then(|| {
+            title_bar::clickable(
+                os,
+                ui::icon_button("title-menu", IconName::Menu, ui)
+                    .tooltip(ui::tooltip(tr("Main Menu"), None))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_main_menu(window, cx))),
+            )
+        });
+        let window_buttons = title_bar::render_window_buttons(
+            title_bar::window_buttons(os, fullscreen, true, window.is_maximized()),
+            ui,
+        );
+        let bar = div()
             .id("title-bar")
             .relative()
             .flex_none()
             .h(px(TITLE_BAR_HEIGHT))
             .pl(px(leading))
-            .pr(px(GAP + 2.))
+            .pr(px(title_bar::trailing(os, fullscreen)))
             .flex()
             .items_center()
             .gap_2()
-            .on_click(|event, window, _| {
-                if event.click_count() == 2 {
-                    window.titlebar_double_click();
-                }
-            })
+            .when(title_bar::handles_double_click(os), |bar| {
+                bar.on_click(|event, window, _| {
+                    if event.click_count() == 2 {
+                        window.titlebar_double_click();
+                    }
+                })
+            });
+        title_bar::caption(os, bar)
             .children(search)
+            .children(menu)
             .child(project)
             .children(branch)
             .child(div().flex_1())
@@ -4877,6 +4931,19 @@ impl Workspace {
                 tr("Command Palette"),
                 command_palette::Toggle.boxed_clone(),
             ))
+            .children(window_buttons)
+    }
+
+    /// The title bar's menu button on Windows (part 10.9): the menu bar's menus in Flux's own
+    /// popup (`app_menu::popup`), right under the button.
+    fn open_main_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let os = title_bar::os();
+        let menu = cx.new(|cx| crate::app_menu::popup(ContextMenu::new(window, cx), os));
+        let position = point(
+            px(title_bar::leading(os, window.is_fullscreen())),
+            px(TITLE_BAR_HEIGHT - 4.),
+        );
+        self.show_menu(menu, position, window, cx);
     }
 
     /// Status bar on the window frame: message on the left; position, cursors, language, and line
@@ -5024,7 +5091,10 @@ impl Workspace {
             None => {
                 let text = match &self.root {
                     Some(root) => tilde(root),
-                    None => tr("No project — open a folder with ⌘O").into(),
+                    None => trf(
+                        "No project — open a folder with {0}",
+                        &[&crate::keymap::shortcut("workspace::Open", "cmd-o")],
+                    ),
                 };
                 return bar
                     .child(status_text(
@@ -5764,179 +5834,186 @@ impl Render for Workspace {
         let ui = Theme::ui(cx);
         // The session actions of Claude are offered while a chat is current.
         let claude_chat = self.current_claude_chat(window, cx).is_some();
-        let root = div()
-            .key_context("Workspace")
-            .relative()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(ui.frame)
-            .text_color(ui.foreground)
-            .font_family(theme::UI_FONT)
-            .text_size(px(theme::TEXT_MD))
-            .on_action(cx.listener(Self::open))
-            // Language server navigation and refactoring.
-            .map(|root| crate::navigation::actions(root, cx))
-            .on_action(
-                cx.listener(|this, _: &crate::settings_view::Toggle, window, cx| {
-                    crate::settings_view::toggle(this, window, cx)
-                }),
-            )
-            .map(|root| crate::lsp::workspace_actions(root, cx))
-            .map(|root| crate::code_actions::workspace_actions(root, cx))
-            .map(|root| crate::git::workspace_actions(root, cx))
-            .map(|root| crate::vcs_menu::workspace_actions(root, cx))
-            .map(|root| crate::branches_popup::workspace_actions(root, cx))
-            .map(|root| crate::project_popup::workspace_actions(root, cx))
-            .map(|root| crate::branch_dialogs::workspace_actions(root, cx))
-            .map(|root| crate::git_sync::workspace_actions(root, cx))
-            .map(|root| crate::compare_dialog::workspace_actions(root, cx))
-            .map(|root| crate::stash_panel::workspace_actions(root, cx))
-            .map(|root| crate::conflicts_dialog::workspace_actions(root, cx))
-            .map(|root| crate::log_actions::workspace_actions(root, cx))
-            .map(|root| crate::rebase_dialog::workspace_actions(root, cx))
-            .map(|root| crate::blame::workspace_actions(root, cx))
-            .map(|root| crate::plugins::workspace_actions(root, cx))
-            .map(|root| crate::quick_switch::workspace_actions(root, cx))
-            .map(|root| crate::editor_menu::workspace_actions(root, cx))
-            .map(|root| crate::task_contexts::workspace_actions(root, cx))
-            .map(|root| Self::claude_actions(root, claude_chat, cx))
-            .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
-                this.open_project(action.0.clone(), Vec::new(), window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &NewFile, window, cx| {
-                this.add_document(Document::from_text(""), window, cx)
-            }))
-            // Esc in the editor: an open find bar is closed before the editor clears its selection;
-            // when there is nothing to clear (the editor passes Esc on), project search is closed.
-            .capture_action(cx.listener(|this, _: &editor::Cancel, window, cx| {
-                if this.find_bar.read(cx).is_open() {
-                    this.find_bar.update(cx, |bar, cx| bar.close(window, cx));
-                    cx.stop_propagation();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &editor::Cancel, _, cx| {
-                if this.project_search.read(cx).is_open() {
+        let root =
+            div()
+                .key_context("Workspace")
+                .relative()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(ui.frame)
+                .text_color(ui.foreground)
+                .font_family(theme::UI_FONT)
+                .text_size(px(theme::TEXT_MD))
+                .on_action(cx.listener(Self::open))
+                // Windows' title bar has the menu; on macOS the menu bar is the system's.
+                .when(title_bar::os() == KeyOs::Windows, |root| {
+                    root.on_action(cx.listener(|this, _: &ShowMainMenu, window, cx| {
+                        this.open_main_menu(window, cx)
+                    }))
+                })
+                // Language server navigation and refactoring.
+                .map(|root| crate::navigation::actions(root, cx))
+                .on_action(
+                    cx.listener(|this, _: &crate::settings_view::Toggle, window, cx| {
+                        crate::settings_view::toggle(this, window, cx)
+                    }),
+                )
+                .map(|root| crate::lsp::workspace_actions(root, cx))
+                .map(|root| crate::code_actions::workspace_actions(root, cx))
+                .map(|root| crate::git::workspace_actions(root, cx))
+                .map(|root| crate::vcs_menu::workspace_actions(root, cx))
+                .map(|root| crate::branches_popup::workspace_actions(root, cx))
+                .map(|root| crate::project_popup::workspace_actions(root, cx))
+                .map(|root| crate::branch_dialogs::workspace_actions(root, cx))
+                .map(|root| crate::git_sync::workspace_actions(root, cx))
+                .map(|root| crate::compare_dialog::workspace_actions(root, cx))
+                .map(|root| crate::stash_panel::workspace_actions(root, cx))
+                .map(|root| crate::conflicts_dialog::workspace_actions(root, cx))
+                .map(|root| crate::log_actions::workspace_actions(root, cx))
+                .map(|root| crate::rebase_dialog::workspace_actions(root, cx))
+                .map(|root| crate::blame::workspace_actions(root, cx))
+                .map(|root| crate::plugins::workspace_actions(root, cx))
+                .map(|root| crate::quick_switch::workspace_actions(root, cx))
+                .map(|root| crate::editor_menu::workspace_actions(root, cx))
+                .map(|root| crate::task_contexts::workspace_actions(root, cx))
+                .map(|root| Self::claude_actions(root, claude_chat, cx))
+                .on_action(cx.listener(|this, action: &OpenProject, window, cx| {
+                    this.open_project(action.0.clone(), Vec::new(), window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &NewFile, window, cx| {
+                    this.add_document(Document::from_text(""), window, cx)
+                }))
+                // Esc in the editor: an open find bar is closed before the editor clears its selection;
+                // when there is nothing to clear (the editor passes Esc on), project search is closed.
+                .capture_action(cx.listener(|this, _: &editor::Cancel, window, cx| {
+                    if this.find_bar.read(cx).is_open() {
+                        this.find_bar.update(cx, |bar, cx| bar.close(window, cx));
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &editor::Cancel, _, cx| {
+                    if this.project_search.read(cx).is_open() {
+                        this.project_search
+                            .update(cx, |search, cx| search.close(cx));
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &editor::Save, _, cx| {
+                    if let Some(editor) = this.active_editor() {
+                        editor.update(cx, |editor, cx| editor.save(cx).detach());
+                    }
+                }))
+                .on_action(cx.listener(Self::close_active_tab))
+                .on_action(cx.listener(Self::close_window))
+                .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle(1, window, cx)))
+                .on_action(cx.listener(|this, _: &PrevTab, window, cx| this.cycle(-1, window, cx)))
+                .on_action(cx.listener(|this, action: &ActivateTab, window, cx| {
+                    this.activate(action.0, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &LastTab, window, cx| {
+                    this.activate(this.tabs.len().saturating_sub(1), window, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &command_palette::Toggle, window, cx| {
+                        command_palette::toggle(this, window, cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &file_finder::Toggle, window, cx| {
+                    file_finder::toggle(this, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &go_to_line::Toggle, window, cx| {
+                    go_to_line::toggle(this, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &find_bar::Deploy, window, cx| {
+                    this.deploy_find(false, window, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &find_bar::DeployReplace, window, cx| {
+                        this.deploy_find(true, window, cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &find_bar::FindNext, window, cx| {
+                    this.find_bar
+                        .update(cx, |bar, cx| bar.select_next(false, window, cx))
+                }))
+                .on_action(cx.listener(|this, _: &find_bar::FindPrevious, window, cx| {
+                    this.find_bar
+                        .update(cx, |bar, cx| bar.select_next(true, window, cx))
+                }))
+                .on_action(cx.listener(|this, _: &file_tree::ToggleOpen, window, cx| {
+                    this.toggle_tree(window, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &crate::git::ToggleGitWindow, window, cx| {
+                        this.toggle_git_window(window, cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, action: &crate::git::ShowCommitInLog, window, cx| {
+                        this.show_commit_in_log(action.repo, &action.oid, window, cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, action: &crate::git::ShowHistory, window, cx| {
+                        this.show_history(&action.path, action.lines, window, cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &git_window::HideWindow, window, cx| {
+                    this.hide_git_window(window, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &terminal_panel::TogglePanel, window, cx| {
+                        this.toggle_terminal(window, cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &terminal_panel::NewTerminal, window, cx| {
+                        this.new_terminal(window, cx)
+                    }),
+                )
+                // ⇧Esc hides the panel only from one of its terminals.
+                .on_action(
+                    cx.listener(|this, _: &terminal_panel::HidePanel, window, cx| {
+                        if this.terminal_panel.read(cx).contains_focus(window, cx) {
+                            this.hide_terminal(window, cx)
+                        }
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &notifications_panel::Toggle, window, cx| {
+                        this.toggle_notifications(window, cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, action: &plugins::ToggleToolWindow, window, cx| {
+                        let key = this
+                            .plugins
+                            .read(cx)
+                            .tool_windows()
+                            .iter()
+                            .find(|tool| tool.plugin == action.plugin && tool.id == action.window)
+                            .map(|tool| tool.key);
+                        if let Some(key) = key {
+                            this.toggle_plugin_tool(key, window, cx)
+                        }
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &file_tree::ToggleFocus, window, cx| {
+                    this.toggle_tree_focus(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &project_search::Toggle, window, cx| {
+                    // Project search and other overlay windows are never open at the same time; behind
+                    // a dialog, it doesn't open.
+                    if this.dialog_open() {
+                        return;
+                    }
+                    this.dismiss_modal(window, cx);
+                    let seed = this
+                        .active_editor()
+                        .and_then(|editor| editor.read(cx).search_seed());
                     this.project_search
-                        .update(cx, |search, cx| search.close(cx));
-                }
-            }))
-            .on_action(cx.listener(|this, _: &editor::Save, _, cx| {
-                if let Some(editor) = this.active_editor() {
-                    editor.update(cx, |editor, cx| editor.save(cx).detach());
-                }
-            }))
-            .on_action(cx.listener(Self::close_active_tab))
-            .on_action(cx.listener(Self::close_window))
-            .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle(1, window, cx)))
-            .on_action(cx.listener(|this, _: &PrevTab, window, cx| this.cycle(-1, window, cx)))
-            .on_action(cx.listener(|this, action: &ActivateTab, window, cx| {
-                this.activate(action.0, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &LastTab, window, cx| {
-                this.activate(this.tabs.len().saturating_sub(1), window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &command_palette::Toggle, window, cx| {
-                    command_palette::toggle(this, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &file_finder::Toggle, window, cx| {
-                file_finder::toggle(this, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &go_to_line::Toggle, window, cx| {
-                go_to_line::toggle(this, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &find_bar::Deploy, window, cx| {
-                this.deploy_find(false, window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &find_bar::DeployReplace, window, cx| {
-                    this.deploy_find(true, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &find_bar::FindNext, window, cx| {
-                this.find_bar
-                    .update(cx, |bar, cx| bar.select_next(false, window, cx))
-            }))
-            .on_action(cx.listener(|this, _: &find_bar::FindPrevious, window, cx| {
-                this.find_bar
-                    .update(cx, |bar, cx| bar.select_next(true, window, cx))
-            }))
-            .on_action(cx.listener(|this, _: &file_tree::ToggleOpen, window, cx| {
-                this.toggle_tree(window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &crate::git::ToggleGitWindow, window, cx| {
-                    this.toggle_git_window(window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, action: &crate::git::ShowCommitInLog, window, cx| {
-                    this.show_commit_in_log(action.repo, &action.oid, window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, action: &crate::git::ShowHistory, window, cx| {
-                    this.show_history(&action.path, action.lines, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &git_window::HideWindow, window, cx| {
-                this.hide_git_window(window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &terminal_panel::TogglePanel, window, cx| {
-                    this.toggle_terminal(window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &terminal_panel::NewTerminal, window, cx| {
-                    this.new_terminal(window, cx)
-                }),
-            )
-            // ⇧Esc hides the panel only from one of its terminals.
-            .on_action(
-                cx.listener(|this, _: &terminal_panel::HidePanel, window, cx| {
-                    if this.terminal_panel.read(cx).contains_focus(window, cx) {
-                        this.hide_terminal(window, cx)
-                    }
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &notifications_panel::Toggle, window, cx| {
-                    this.toggle_notifications(window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, action: &plugins::ToggleToolWindow, window, cx| {
-                    let key = this
-                        .plugins
-                        .read(cx)
-                        .tool_windows()
-                        .iter()
-                        .find(|tool| tool.plugin == action.plugin && tool.id == action.window)
-                        .map(|tool| tool.key);
-                    if let Some(key) = key {
-                        this.toggle_plugin_tool(key, window, cx)
-                    }
-                }),
-            )
-            .on_action(cx.listener(|this, _: &file_tree::ToggleFocus, window, cx| {
-                this.toggle_tree_focus(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &project_search::Toggle, window, cx| {
-                // Project search and other overlay windows are never open at the same time; behind
-                // a dialog, it doesn't open.
-                if this.dialog_open() {
-                    return;
-                }
-                this.dismiss_modal(window, cx);
-                let seed = this
-                    .active_editor()
-                    .and_then(|editor| editor.read(cx).search_seed());
-                this.project_search
-                    .update(cx, |search, cx| search.toggle(seed, window, cx))
-            }));
+                        .update(cx, |search, cx| search.toggle(seed, window, cx))
+                }));
         // An SVG's text in front: its picture is a command away (Text | Preview's Preview).
         let svg_text = self
             .active_editor()
@@ -6327,9 +6404,24 @@ struct Quitting(bool);
 
 impl Global for Quitting {}
 
-/// Quit (⌘Q, the app menu).
+/// Quit (⌘Q, the app menu; Exit on Windows).
 fn quit(_: &Quit, cx: &mut App) {
     start_quit(cx);
+}
+
+/// Whether closing the last project window quits Flux through [`start_quit`]: on Windows, where an
+/// app ends with its last window (part 10.9). On macOS the window closes as any other does — with
+/// no window left Flux quits after it (`main.rs`).
+fn last_window_quits(os: KeyOs) -> bool {
+    os == KeyOs::Windows
+}
+
+/// Whether a project window other than `window` is open.
+fn other_project_windows(window: &Window, cx: &App) -> bool {
+    let this = window.window_handle().window_id();
+    cx.windows()
+        .iter()
+        .any(|handle| handle.window_id() != this && handle.downcast::<Workspace>().is_some())
 }
 
 /// A quit macOS asks for (part 10.5): Quit in the Dock or its menu, the end of the session. With
@@ -6683,9 +6775,13 @@ pub(crate) fn project_window(root: &Path, cx: &App) -> Option<WindowHandle<Works
         .into_iter()
         .filter_map(|handle| handle.downcast::<Workspace>())
         .find(|handle| {
-            handle
-                .read(cx)
-                .is_ok_and(|workspace| workspace.root.as_deref() == Some(root))
+            handle.read(cx).is_ok_and(|workspace| {
+                // On Windows `C:\Proj` and `c:\proj` are one project: one window.
+                workspace
+                    .root
+                    .as_deref()
+                    .is_some_and(|open| flux_platform::same_path(open, root))
+            })
         })
 }
 
@@ -6786,11 +6882,12 @@ fn read_document(path: PathBuf) -> Result<Document, OpenError> {
 /// Path for the "is this the same file" comparison: canonical, or, for a file that does not exist
 /// yet, the canonical directory plus the name.
 fn canonical(path: &Path) -> PathBuf {
-    if let Ok(path) = fs::canonicalize(path) {
+    if let Ok(path) = flux_platform::path_style::canonicalize(path) {
         return path;
     }
     match (
-        path.parent().and_then(|dir| fs::canonicalize(dir).ok()),
+        path.parent()
+            .and_then(|dir| flux_platform::path_style::canonicalize(dir).ok()),
         path.file_name(),
     ) {
         (Some(dir), Some(name)) => dir.join(name),
@@ -6798,9 +6895,16 @@ fn canonical(path: &Path) -> PathBuf {
     }
 }
 
-/// Display path: the home directory is shown as `~`.
+/// Display path: the home directory is shown as `~` (on Windows `~\dev\app`).
 pub(crate) fn tilde(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = flux_platform::paths::home();
+    if flux_platform::PathStyle::NATIVE == flux_platform::PathStyle::Windows {
+        return match home {
+            Some(home) => flux_platform::PathStyle::Windows
+                .tilde(&path.to_string_lossy(), &home.to_string_lossy()),
+            None => path.display().to_string(),
+        };
+    }
     match home
         .as_deref()
         .and_then(|home| path.strip_prefix(home).ok())
@@ -8337,10 +8441,7 @@ impl Workspace {
         let Some(cli) = self.claude.read(cx).cli().cli().cloned() else {
             return self.claude.update(cx, |store, cx| store.check(cx));
         };
-        let command = format!(
-            "{} auth login",
-            claude::shell_quote(&cli.path.to_string_lossy())
-        );
+        let command = claude::terminal_command(&cli.path.to_string_lossy(), &["auth", "login"]);
         let this = cx.weak_entity();
         let handle = window.window_handle();
         // Part «Флаг страны»: signing in talks to Anthropic too.
@@ -8621,6 +8722,14 @@ mod tests {
     }
 
     #[test]
+    fn the_last_window_quits_on_windows_only() {
+        // Windows: an app ends with its last window, through Exit's questions (part 10.9); macOS
+        // closes it as any other window.
+        assert!(last_window_quits(KeyOs::Windows));
+        assert!(!last_window_quits(KeyOs::Mac));
+    }
+
+    #[test]
     fn unique_names_have_no_detail() {
         assert_eq!(details(&["/a/main.rs", "/a/lib.rs"]), vec![None, None]);
     }
@@ -8637,7 +8746,10 @@ mod tests {
     fn same_parent_name_goes_deeper() {
         assert_eq!(
             details(&["/x/core/src/lib.rs", "/x/app/src/lib.rs"]),
-            vec![Some("core/src".into()), Some("app/src".into())]
+            // Shown in the system's separators.
+            ["core/src", "app/src"]
+                .map(|dir| Some(flux_platform::PathStyle::NATIVE.native(dir).into_owned()))
+                .to_vec()
         );
     }
 
@@ -8650,9 +8762,12 @@ mod tests {
 
     #[test]
     fn home_is_shown_as_tilde() {
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let home = flux_platform::paths::home().unwrap();
         assert_eq!(tilde(&home), "~");
-        assert_eq!(tilde(&home.join("dev/flux")), "~/dev/flux");
+        assert_eq!(
+            tilde(&home.join("dev").join("flux")),
+            flux_platform::PathStyle::NATIVE.native("~/dev/flux")
+        );
         assert_eq!(tilde(Path::new("/opt/x")), "/opt/x");
     }
 

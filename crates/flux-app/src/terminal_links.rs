@@ -49,7 +49,7 @@ pub fn mouse_moved(
     _: &mut Window,
     cx: &mut Context<TerminalView>,
 ) {
-    let pointing = event.modifiers.platform && event.pressed_button.is_none();
+    let pointing = event.modifiers.secondary() && event.pressed_button.is_none();
     hover(view, pointing.then_some(event.position), cx);
 }
 
@@ -61,7 +61,7 @@ pub fn modifiers_changed(
     window: &mut Window,
     cx: &mut Context<TerminalView>,
 ) {
-    let position = event.modifiers.platform.then(|| window.mouse_position());
+    let position = event.modifiers.secondary().then(|| window.mouse_position());
     hover(view, position, cx);
 }
 
@@ -72,7 +72,7 @@ pub fn cmd_click(
     _: &mut Window,
     cx: &mut Context<TerminalView>,
 ) -> bool {
-    if !event.modifiers.platform || event.button != MouseButton::Left {
+    if !event.modifiers.secondary() || event.button != MouseButton::Left {
         return false;
     }
     let Some(found) = point_at(view, event.position).and_then(|point| find(view, point)) else {
@@ -230,11 +230,26 @@ mod tests {
     /// The way of a ⌘-click without the mouse: a location a program printed, found in the real grid
     /// by the terminal, resolved against the shell's directory.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "ConPTY may put a program's first line below the top row (it clears the screen first)"
+    )]
     fn a_location_printed_by_a_program_opens_its_file() {
         let sandbox = Sandbox::new("pty");
         let script = "printf 'error: src/main.rs:12:5: oops'; sleep 2";
+        // A POSIX shell: on Windows Git's, found on `PATH` as git is.
+        let sh = if cfg!(windows) {
+            std::env::var_os("PATH")
+                .and_then(|path| flux_platform::process::find_in_path("sh", &path))
+                .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Git\bin\sh.exe"))
+        } else {
+            PathBuf::from("/bin/sh")
+        };
         let options = flux_term::TerminalOptions {
-            command: Some(("/bin/sh".into(), vec!["-c".into(), script.into()])),
+            command: Some((
+                sh.to_string_lossy().into_owned(),
+                vec!["-c".into(), script.into()],
+            )),
             cwd: Some(sandbox.0.clone()),
             ..Default::default()
         };

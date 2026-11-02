@@ -14,6 +14,7 @@ path = "src/main.rs"
 scenario = []
 
 [dependencies]
+flux-platform.workspace = true
 anyhow = "1.0.104"
 flux-claude.workspace = true
 flux-core.workspace = true
@@ -28,7 +29,15 @@ flux-term.workspace = true
 flux-update.workspace = true
 # Channels between the background search threads and gpui UI tasks.
 futures = "0.3.34"
-gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+# `runtime_shaders`: the shaders are compiled when Flux starts (Metal; on Windows HLSL, Flux's
+# patch), so a build needs neither Xcode's Metal compiler nor fxc.exe. gpui's defaults without
+# `windows-manifest`: Flux.exe embeds its own manifest (`build.rs`), and a binary takes only one.
+gpui = { version = "0.2.2", default-features = false, features = [
+    "font-kit",
+    "runtime_shaders",
+    "wayland",
+    "x11",
+] }
 # Pictures in a tab (`image_view.rs`, part 10.2): decoding and SVG drawn at the shown size — both
 # already in the tree through gpui, with the same features.
 image = "0.25"
@@ -55,6 +64,40 @@ core-foundation = "0.10.0"
 libc = "0.2"
 core-foundation-sys = "0.8.7"
 objc = "0.2.7"
+
+# Windows (part 10.9): a second launch hands its folders and files to the running Flux through a
+# named pipe (`second_launch.rs`); the process's AppUserModelID (`main.rs`) — the identity of its
+# windows, taskbar button and notifications, the Start menu shortcut's; the system's facts: the
+# preferred languages, country names and "Animation effects" (`i18n`, `region_guard.rs`,
+# `motion.rs`), the version, processor and memory for bug reports (`feedback.rs`), the network's
+# adapters and the processes of the country check (`region_guard.rs`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemServices",
+    "Wdk_System_Threading",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Toasts of Claude sessions (`system_notify.rs`): WinRT's notifications, the same `windows` crate
+# gpui uses.
+windows = { version = "0.61", features = ["Data_Xml_Dom", "Foundation", "UI_Notifications"] }
+
+[build-dependencies]
+# Flux.exe's manifest, icon and version (`build.rs`): rc.exe with MSVC, mingw-w64's windres in a
+# build from a Mac. The version gpui's build uses on Windows.
+embed-resource = "3.0"
 
 [dev-dependencies]
 # The tests' languages (`flux_syntax::standard`: native grammars of the catalog's languages): Flux

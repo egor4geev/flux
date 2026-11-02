@@ -107,8 +107,8 @@ fn install_unpacked(entry: &PluginEntry, unpacked: &Path) -> Result<PluginEntry,
     load_dir(&target, PluginSource::Installed)
 }
 
-/// Removes an installed plugin's folder and its secrets (with any of its items left in the
-/// keychain; best effort: the plugin is gone either way); its data (`paths::data_dir`) stays, as
+/// Removes an installed plugin's folder and its secrets (best effort: the plugin is gone either
+/// way); its data (`paths::data_dir`) stays, as
 /// JetBrains IDEs keep a removed plugin's settings. A plugin under development is only unlinked by
 /// the caller; a bundled one can't be removed.
 pub fn uninstall(entry: &PluginEntry) -> Result<(), String> {
@@ -137,6 +137,36 @@ fn unpack_dir() -> PathBuf {
     crate::paths::cache_dir().join("unpacked")
 }
 
+/// `unzip` for a zip, `tar` for a gzipped tar; the folder to unpack into is the last argument.
+#[cfg(not(windows))]
+fn unpack_command(archive: &Path, zip: bool) -> Command {
+    if zip {
+        let mut command = Command::new("unzip");
+        command.args(["-q", "-o"]).arg(archive).arg("-d");
+        command
+    } else {
+        let mut command = Command::new("tar");
+        command.arg("-xzf").arg(archive).arg("-C");
+        command
+    }
+}
+
+/// Windows has no `unzip`: the system's bsdtar unpacks both kinds.
+#[cfg(windows)]
+fn unpack_command(archive: &Path, _zip: bool) -> Command {
+    let mut command = Command::new(system_tar());
+    command.arg("-xf").arg(archive).arg("-C");
+    flux_platform::process::Background::background(&mut command);
+    command
+}
+
+/// Windows' own bsdtar. A GNU tar earlier on `PATH` (Git's) takes `C:\…` for a remote host.
+#[cfg(windows)]
+fn system_tar() -> PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    Path::new(&root).join("System32").join("tar.exe")
+}
+
 /// Unpacks an archive into a new temporary folder with the system `unzip` or `tar`.
 fn unpack(archive: &Path) -> Result<PathBuf, String> {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -145,13 +175,9 @@ fn unpack(archive: &Path) -> Result<PathBuf, String> {
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     let mut command = if name.ends_with(".zip") {
-        let mut command = Command::new("unzip");
-        command.args(["-q", "-o"]).arg(archive).arg("-d");
-        command
+        unpack_command(archive, true)
     } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-        let mut command = Command::new("tar");
-        command.arg("-xzf").arg(archive).arg("-C");
-        command
+        unpack_command(archive, false)
     } else {
         return Err(
             "Not a plugin: pick a folder with flux-plugin.toml, or a .zip or .tar.gz archive"
@@ -268,22 +294,35 @@ mod tests {
         } else {
             (folder, ".".into())
         };
-        let status = if archive.extension().is_some_and(|ext| ext == "zip") {
-            Command::new("zip")
-                .arg("-qr")
-                .arg(archive)
-                .arg(&item)
-                .current_dir(parent)
-                .status()
-        } else {
-            Command::new("tar")
-                .arg("-czf")
-                .arg(archive)
-                .arg(&item)
-                .current_dir(parent)
-                .status()
-        };
+        let status = pack_command(archive)
+            .arg(&item)
+            .current_dir(parent)
+            .status();
         assert!(status.unwrap().success());
+    }
+
+    /// `zip` or `tar`, with the archive to make.
+    #[cfg(not(windows))]
+    fn pack_command(archive: &Path) -> Command {
+        let mut command = if archive.extension().is_some_and(|ext| ext == "zip") {
+            let mut command = Command::new("zip");
+            command.arg("-qr");
+            command
+        } else {
+            let mut command = Command::new("tar");
+            command.arg("-czf");
+            command
+        };
+        command.arg(archive);
+        command
+    }
+
+    /// The system's bsdtar packs zips too (`-a`: the format the name says).
+    #[cfg(windows)]
+    fn pack_command(archive: &Path) -> Command {
+        let mut command = Command::new(system_tar());
+        command.arg("-a").arg("-cf").arg(archive);
+        command
     }
 
     #[test]

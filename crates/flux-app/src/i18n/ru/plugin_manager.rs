@@ -70,6 +70,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Plugin API", "API плагинов"),
     ("Folder", "Папка"),
     ("Show in Finder", "Показать в Finder"),
+    ("Show in Explorer", "Показать в Проводнике"),
     (
         "Read and search the files of the project",
         "Читать файлы проекта и искать по ним",

@@ -403,10 +403,11 @@ impl Store {
             .fill(&mut key)
             .map_err(|_| "No random numbers for the secrets' key")?;
         let path = self.path(KEY);
+        let sealed = key_file::encode(&key).ok_or("The system can't protect the secrets' key")?;
         let created = private().write(true).create_new(true).open(&path);
         match created {
             Ok(mut file) => {
-                file.write_all(&key_file::encode(&key))
+                file.write_all(&sealed)
                     .and_then(|()| file.sync_all())
                     .map_err(|err| format!("{}: {err}", path.display()))?;
                 Ok(key)
@@ -448,6 +449,7 @@ fn cipher(key: &Key) -> LessSafeKey {
 
 /// Options of a file only the user can read and write (0600).
 fn private() -> OpenOptions {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
@@ -459,8 +461,8 @@ fn private() -> OpenOptions {
 mod key_file {
     use super::Key;
 
-    pub fn encode(key: &Key) -> Vec<u8> {
-        key.to_vec()
+    pub fn encode(key: &Key) -> Option<Vec<u8>> {
+        Some(key.to_vec())
     }
 
     pub fn decode(bytes: Vec<u8>) -> Option<Key> {
@@ -468,25 +470,84 @@ mod key_file {
     }
 }
 
-/// Windows: as it is too, for now.
-// TODO(10.9): protect the key with DPAPI (`CryptProtectData`: the user's own, without prompts)
-// when the Windows port lands — a file's permissions there aren't the owner-only mode set here.
+/// Windows: sealed by DPAPI with the user's own protection (`CryptProtectData`) — only this user
+/// on this computer opens it, without a prompt. A file's permissions there aren't the owner-only
+/// mode set elsewhere: a plain key would be open to more than the user.
 #[cfg(windows)]
 mod key_file {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    };
+
     use super::Key;
 
-    pub fn encode(key: &Key) -> Vec<u8> {
-        key.to_vec()
+    /// Mixed into the seal: a blob some other program sealed for the user doesn't open as the key.
+    const ENTROPY: &[u8] = b"Flux plugin secrets key";
+
+    pub fn encode(key: &Key) -> Option<Vec<u8>> {
+        let mut sealed = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: the input blobs point into live slices DPAPI only reads; it allocates `sealed`.
+        let done = unsafe {
+            CryptProtectData(
+                &blob(key),
+                std::ptr::null(),
+                &blob(ENTROPY),
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut sealed,
+            )
+        };
+        (done != 0).then(|| take(sealed))
     }
 
     pub fn decode(bytes: Vec<u8>) -> Option<Key> {
-        bytes.try_into().ok()
+        let mut plain = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: as in `encode`.
+        let done = unsafe {
+            CryptUnprotectData(
+                &blob(&bytes),
+                std::ptr::null_mut(),
+                &blob(ENTROPY),
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut plain,
+            )
+        };
+        if done == 0 {
+            return None;
+        }
+        let mut plain = take(plain);
+        let key = plain.as_slice().try_into().ok();
+        plain.fill(0);
+        key
+    }
+
+    fn blob(bytes: &[u8]) -> CRYPT_INTEGER_BLOB {
+        CRYPT_INTEGER_BLOB {
+            cbData: bytes.len() as u32,
+            pbData: bytes.as_ptr().cast_mut(),
+        }
+    }
+
+    /// The bytes DPAPI returned; its buffer is freed.
+    fn take(blob: CRYPT_INTEGER_BLOB) -> Vec<u8> {
+        // SAFETY: on success DPAPI hands over `cbData` bytes at `pbData`, allocated with
+        // `LocalAlloc`, which are ours to free.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(blob.pbData, blob.cbData as usize).to_vec();
+            LocalFree(blob.pbData.cast());
+            bytes
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Stdio};
 
@@ -497,6 +558,7 @@ mod tests {
         Store::new(dir.to_path_buf())
     }
 
+    #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
@@ -545,6 +607,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_files_are_the_users_alone() {
         let dir = temp_dir("secrets-modes").join("flux");
@@ -556,6 +619,19 @@ mod tests {
             assert_eq!(mode(&dir.join(name)), 0o600, "{name}");
         }
         assert_eq!(fs::read(dir.join(KEY)).unwrap().len(), KEY_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_key_is_sealed_for_the_user() {
+        let dir = temp_dir("secrets-sealed").join("flux");
+        Place::Store(&store(&dir))
+            .set("Flux plugin a", "token", "x")
+            .unwrap();
+        let sealed = fs::read(dir.join(KEY)).unwrap();
+        assert_ne!(sealed.len(), KEY_LEN);
+        assert!(key_file::decode(sealed).is_some());
+        assert!(key_file::decode(vec![0; KEY_LEN]).is_none());
     }
 
     #[test]
@@ -631,7 +707,8 @@ mod tests {
                 .iter()
                 .any(|name| name.starts_with("secrets.key.unreadable-"))
         );
-        assert_eq!(fs::read(dir.join(KEY)).unwrap().len(), KEY_LEN);
+        // A whole key (sealed on Windows).
+        assert!(key_file::decode(fs::read(dir.join(KEY)).unwrap()).is_some());
     }
 
     #[test]

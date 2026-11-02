@@ -1,3 +1,7 @@
+// Windows: a windowed app — no console window comes up with it. Debug builds keep theirs: the log
+// echoes there.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app_log;
 mod app_menu;
 mod appearance_settings;
@@ -59,6 +63,7 @@ mod icons;
 mod image_view;
 mod input;
 mod input_dialog;
+mod keymap;
 mod launchpad;
 mod leftovers;
 mod locations;
@@ -108,6 +113,7 @@ mod rename;
 #[cfg(feature = "scenario")]
 mod scenario;
 mod scrollbar;
+mod second_launch;
 mod settings;
 mod settings_file;
 mod settings_view;
@@ -124,6 +130,7 @@ mod terminal_panel;
 mod terminal_search;
 mod terminal_view;
 mod theme;
+mod title_bar;
 mod ui;
 mod ui_scale;
 mod update_notes;
@@ -143,8 +150,17 @@ use gpui::{App, Application};
 use theme::Theme;
 
 fn main() {
+    // Windows: a Flux started by its update waits for the one it replaces to quit, then deletes
+    // its files (flux-update's `install::folder`).
+    #[cfg(windows)]
+    // SAFETY: the first thing: no other thread reads the environment yet.
+    unsafe {
+        flux_update::install::folder::finish();
+    }
     // Flux's log and crash reports (part 10.6), before anything can print or panic.
     app_log::start();
+    #[cfg(windows)]
+    set_app_user_model_id();
     // A UI scenario doesn't touch the user's plugins, their data and logs (as it doesn't touch
     // the settings): unless given, they live in a fresh temporary folder.
     #[cfg(feature = "scenario")]
@@ -157,7 +173,7 @@ fn main() {
         unsafe { std::env::set_var("FLUX_PLUGINS_HOME", home) };
     }
     // Nor the user's secrets: plugins' secrets go to a plain JSON file in the plugins' folder,
-    // which a scenario can read and fill (and nothing is moved from the keychain).
+    // which a scenario can read and fill.
     #[cfg(feature = "scenario")]
     if std::env::var_os("FLUX_SCENARIO").is_some()
         && std::env::var_os("FLUX_PLUGIN_SECRETS_FILE").is_none()
@@ -176,6 +192,12 @@ fn main() {
         .map(|path| absolute(&path).unwrap_or(path))
         .collect();
     let (dirs, paths): (Vec<_>, Vec<_>) = args.into_iter().partition(|path| path.is_dir());
+    // Windows (part 10.9): with Flux already running, this launch hands it the folders and files
+    // and ends, as macOS sends them to the running app.
+    #[cfg(windows)]
+    if second_launch::hand_over(&dirs.iter().chain(&paths).cloned().collect::<Vec<_>>()) {
+        return;
+    }
     let root = project_root(dirs);
     i18n::init();
     // Compiled WebAssembly grammars of plugins: next to the compiled plugins' components.
@@ -302,6 +324,21 @@ fn main() {
     });
 }
 
+/// Windows: Flux's AppUserModelID, the one its Start menu shortcut carries (the installer,
+/// `scripts/windows/flux.iss`): the taskbar groups Flux's windows under the pinned shortcut, and
+/// notifications are shown as Flux's. Set before any window opens.
+#[cfg(windows)]
+fn set_app_user_model_id() {
+    let id: Vec<u16> = "Flux.Flux".encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated wide string that outlives the call (the system copies it).
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(id.as_ptr())
+    };
+    if result < 0 {
+        log::warn!("SetCurrentProcessExplicitAppUserModelID failed: {result:#x}");
+    }
+}
+
 /// Project root: the directory from the arguments; without one, the nearest ancestor of the current
 /// directory that contains a repository (`.git`, etc.), otherwise the current directory itself. If
 /// not launched from a terminal (the current directory is `/`), there is no project: the projects
@@ -326,5 +363,5 @@ fn project_root(dirs: Vec<PathBuf>) -> Option<PathBuf> {
             extra.display()
         );
     }
-    Some(std::fs::canonicalize(&root).unwrap_or(root))
+    Some(flux_platform::path_style::canonicalize(&root).unwrap_or(root))
 }

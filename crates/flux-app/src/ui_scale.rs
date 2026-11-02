@@ -41,11 +41,14 @@ const TRAFFIC_LIGHTS_LEFT: f32 = 16.;
 pub fn init(cx: &mut App) {
     // No context: the keys work wherever focus is — the editor, a terminal (bindings come before
     // the keys the terminal sends to its program), a dialog.
-    cx.bind_keys([
-        KeyBinding::new("ctrl-alt-=", ZoomIn, None),
-        KeyBinding::new("ctrl-alt--", ZoomOut, None),
-        KeyBinding::new("ctrl-alt-0", ResetZoom, None),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("ctrl-alt-=", ZoomIn, None),
+            KeyBinding::new("ctrl-alt--", ZoomOut, None),
+            KeyBinding::new("ctrl-alt-0", ResetZoom, None),
+        ],
+    );
     // Global actions: they are also in the command palette, whatever has focus.
     cx.on_action(|_: &ZoomIn, cx| zoom(next_step(settings::ui_scale(cx)), cx));
     cx.on_action(|_: &ZoomOut, cx| zoom(previous_step(settings::ui_scale(cx)), cx));

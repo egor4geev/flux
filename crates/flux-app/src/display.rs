@@ -140,7 +140,7 @@ mod tests {
     fn base() -> TextRun {
         TextRun {
             len: 0,
-            font: font("Menlo"),
+            font: font(theme::code_font()),
             color: color(0xffffff),
             background_color: None,
             underline: None,

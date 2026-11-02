@@ -79,13 +79,16 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("tab", NextField, Some(PAGE_CONTEXT)),
-        KeyBinding::new("shift-tab", PreviousField, Some(PAGE_CONTEXT)),
-        KeyBinding::new("enter", NewLine, Some(LINES_CONTEXT)),
-        KeyBinding::new("alt-shift-up", MoveRecordUp, Some(RECORD_CONTEXT)),
-        KeyBinding::new("alt-shift-down", MoveRecordDown, Some(RECORD_CONTEXT)),
-    ]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("tab", NextField, Some(PAGE_CONTEXT)),
+            KeyBinding::new("shift-tab", PreviousField, Some(PAGE_CONTEXT)),
+            KeyBinding::new("enter", NewLine, Some(LINES_CONTEXT)),
+            KeyBinding::new("alt-shift-up", MoveRecordUp, Some(RECORD_CONTEXT)),
+            KeyBinding::new("alt-shift-down", MoveRecordDown, Some(RECORD_CONTEXT)),
+        ],
+    );
     // Without the keyboard in the page, the record actions still reach the open one.
     cx.on_action(|_: &AddRecord, cx| {
         with_open_page(cx, |page, window, cx| page.add_record_action(window, cx))
@@ -530,8 +533,8 @@ impl PluginSettingsPage {
 
     // --- Secrets, buttons, status lines (API 0.3) ---
 
-    /// Whether the secrets of the page are saved: read in the background (the first read may wait
-    /// for them to move from the keychain, which may ask the user).
+    /// Whether the secrets of the page are saved: read in the background (a read may wait for
+    /// another Flux writing them).
     fn read_secrets(&mut self, cx: &mut Context<Self>) {
         for index in 0..self.fields.len() {
             if !matches!(self.fields[index].state, FieldState::Secret(_)) {

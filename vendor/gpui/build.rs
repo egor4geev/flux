@@ -256,7 +256,9 @@ mod windows {
 
     pub(super) fn build() {
         // Compile HLSL shaders
-        #[cfg(not(debug_assertions))]
+        // Flux patch (runtime shaders on Windows): with `runtime_shaders` the renderer compiles
+        // them at runtime (`shader_resources::runtime` in `directx_renderer.rs`): no fxc.exe.
+        #[cfg(not(any(debug_assertions, feature = "runtime_shaders")))]
         compile_shaders();
 
         // Embed the Windows manifest and resource file
