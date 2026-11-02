@@ -127,12 +127,6 @@ impl Entry {
 }
 
 impl Rules {
-    /// The entry for a lowercased file name: its exact name, a prefix, then its extensions,
-    /// longest first.
-    fn lookup(&self, lower: &str) -> Option<&Entry> {
-        self.by_name(lower).or_else(|| self.extension(lower))
-    }
-
     /// The entry by the name itself: exact, a pattern, a prefix — not by an extension.
     fn by_name(&self, lower: &str) -> Option<&Entry> {
         if let Some(entry) = self.file_names.get(lower) {
@@ -1252,7 +1246,11 @@ file = { icon = "icons/gone.svg", color = "dim" }
             &language(&[".env.*", "*.env"], &[]),
             entry("env"),
         );
-        let icon = |name: &str| match &rules.lookup(name)?.source {
+        let icon = |name: &str| match &rules
+            .by_name(name)
+            .or_else(|| rules.extension(name))?
+            .source
+        {
             IconSource::Asset(path) => Some(path.to_string()),
             IconSource::Builtin(_) => None,
         };
