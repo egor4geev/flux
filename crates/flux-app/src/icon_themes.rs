@@ -130,6 +130,11 @@ impl Rules {
     /// The entry for a lowercased file name: its exact name, a prefix, then its extensions,
     /// longest first.
     fn lookup(&self, lower: &str) -> Option<&Entry> {
+        self.by_name(lower).or_else(|| self.extension(lower))
+    }
+
+    /// The entry by the name itself: exact, a pattern, a prefix — not by an extension.
+    fn by_name(&self, lower: &str) -> Option<&Entry> {
         if let Some(entry) = self.file_names.get(lower) {
             return Some(entry);
         }
@@ -141,14 +146,10 @@ impl Rules {
         {
             return Some(entry);
         }
-        if let Some((_, entry)) = self
-            .prefixes
+        self.prefixes
             .iter()
             .find(|(prefix, _)| lower.starts_with(prefix.as_str()))
-        {
-            return Some(entry);
-        }
-        self.extension(lower)
+            .map(|(_, entry)| entry)
     }
 
     /// The longest extension of the name the rules have: `types.d.ts` → `d.ts`, then `ts`.
@@ -611,10 +612,15 @@ fn resolve_with(
     lower: &str,
     ui: &UiColors,
 ) -> Option<FileIcon> {
-    if let Some(entry) = theme.and_then(|theme| theme.rules.lookup(lower)) {
-        return Some(entry.icon(ui));
-    }
-    if let Some(entry) = languages.lookup(lower) {
+    // Names and patterns before extensions, the set's before the languages' at each step: an Angular
+    // template (`*.component.html`) gets its language's icon though the set knows `.html`.
+    let by_name = theme
+        .and_then(|theme| theme.rules.by_name(lower))
+        .or_else(|| languages.by_name(lower));
+    let entry = by_name
+        .or_else(|| theme.and_then(|theme| theme.rules.extension(lower)))
+        .or_else(|| languages.extension(lower));
+    if let Some(entry) = entry {
         return Some(entry.icon(ui));
     }
     theme
