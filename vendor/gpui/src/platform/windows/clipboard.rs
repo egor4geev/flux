@@ -1,4 +1,9 @@
-use std::sync::LazyLock;
+use std::{
+    ffi::OsString,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::PathBuf,
+    sync::LazyLock,
+};
 
 use anyhow::Result;
 use collections::{FxHashMap, FxHashSet};
@@ -12,13 +17,15 @@ use windows::Win32::{
             RegisterClipboardFormatW, SetClipboardData,
         },
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
-        Ole::{CF_HDROP, CF_UNICODETEXT},
+        Ole::{CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_MOVE},
     },
-    UI::Shell::{DragQueryFileW, HDROP},
+    UI::Shell::{DROPFILES, DragQueryFileW, HDROP},
 };
 use windows_core::PCWSTR;
 
-use crate::{ClipboardEntry, ClipboardItem, ClipboardString, Image, ImageFormat, hash};
+use crate::{
+    ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat, hash,
+};
 
 // https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-dragqueryfilew
 const DRAGDROP_GET_FILES_COUNT: u32 = 0xFFFFFFFF;
@@ -36,6 +43,9 @@ static CLIPBOARD_PNG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("PNG")));
 static CLIPBOARD_JPG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("JFIF")));
+/// Flux patch: whether files on the clipboard were cut or copied (Explorer's Cut: move).
+static CLIPBOARD_DROP_EFFECT_FORMAT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("Preferred DropEffect")));
 
 // Helper maps and sets
 static FORMATS_MAP: LazyLock<FxHashMap<u32, ClipboardFormatType>> = LazyLock::new(|| {
@@ -80,11 +90,24 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
 
 pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
     with_clipboard(|| {
-        with_best_match_format(|item_format| match format_to_type(item_format) {
+        // Flux patch: files and folders (Explorer's Copy and Cut) become the item's paths, ahead of
+        // what is read as before; their text is the paths, one per line.
+        let paths = read_paths_from_clipboard();
+        let item = with_best_match_format(|item_format| match format_to_type(item_format) {
             ClipboardFormatType::Text => read_string_from_clipboard(),
             ClipboardFormatType::Image => read_image_from_clipboard(item_format),
-            ClipboardFormatType::Files => read_files_from_clipboard(),
-        })
+            ClipboardFormatType::Files => read_files_from_clipboard(paths.as_ref()),
+        });
+        let Some((paths, cut)) = paths else {
+            return item;
+        };
+        let mut item = item.unwrap_or(ClipboardItem {
+            entries: Vec::new(),
+            cut: false,
+        });
+        item.entries.insert(0, ClipboardEntry::ExternalPaths(paths));
+        item.cut = cut;
+        Some(item)
     })
     .flatten()
 }
@@ -151,6 +174,10 @@ fn write_to_clipboard_inner(item: ClipboardItem) -> Result<()> {
     unsafe {
         EmptyClipboard()?;
     }
+    // Flux patch: files and folders go as Explorer's Copy and Cut put them.
+    if let Some(paths) = item.paths() {
+        return write_paths_to_clipboard(paths, item.text(), item.is_cut());
+    }
     match item.entries().first() {
         Some(entry) => match entry {
             ClipboardEntry::String(string) => {
@@ -159,6 +186,8 @@ fn write_to_clipboard_inner(item: ClipboardItem) -> Result<()> {
             ClipboardEntry::Image(image) => {
                 write_image_to_clipboard(image)?;
             }
+            // Flux patch: written above.
+            ClipboardEntry::ExternalPaths(_) => {}
         },
         None => {
             // Writing an empty list of entries just clears the clipboard.
@@ -184,6 +213,77 @@ fn write_string_to_clipboard(item: &ClipboardString) -> Result<()> {
         set_data_to_clipboard(&metadata_wide, *CLIPBOARD_METADATA_FORMAT)?;
     }
     Ok(())
+}
+
+/// Flux patch: files and folders as Explorer puts them — CF_HDROP, "Preferred DropEffect" (move
+/// for a cut, else copy) — and `text` (the paths, one per line) for whoever pastes text.
+fn write_paths_to_clipboard(paths: &[PathBuf], text: Option<String>, cut: bool) -> Result<()> {
+    set_data_to_clipboard(&encode_dropfiles(paths), CF_HDROP.0 as u32)?;
+    let effect = if cut {
+        DROPEFFECT_MOVE
+    } else {
+        DROPEFFECT_COPY
+    };
+    set_data_to_clipboard(&[effect.0], *CLIPBOARD_DROP_EFFECT_FORMAT)?;
+    if let Some(text) = text {
+        write_string_to_clipboard(&ClipboardString::new(text))?;
+    }
+    Ok(())
+}
+
+/// Flux patch: CF_HDROP's data for `paths` — `DROPFILES`, then each path in UTF-16 ending in NUL,
+/// then one more NUL. Public for Flux's tests (gpui's own need the dev-dependencies left out).
+pub fn encode_dropfiles(paths: &[PathBuf]) -> Vec<u8> {
+    let header = DROPFILES {
+        pFiles: std::mem::size_of::<DROPFILES>() as u32,
+        fWide: true.into(),
+        ..Default::default()
+    };
+    // SAFETY: `DROPFILES` is plain data (`repr(C, packed(1))`), read as its bytes.
+    let mut bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&header as *const DROPFILES).cast::<u8>(),
+            std::mem::size_of::<DROPFILES>(),
+        )
+    }
+    .to_vec();
+    let mut wide = Vec::new();
+    for path in paths {
+        wide.extend(path.as_os_str().encode_wide());
+        wide.push(0);
+    }
+    // The list ends in an empty name: two NULs, even with no paths.
+    wide.push(0);
+    if paths.is_empty() {
+        wide.push(0);
+    }
+    bytes.extend(wide.into_iter().flat_map(u16::to_ne_bytes));
+    bytes
+}
+
+/// Flux patch: the paths in CF_HDROP's data (`DROPFILES` and the list after it); `None` unless the
+/// names are UTF-16 — the shell reads the rest ([`with_file_names`]). Public for Flux's tests.
+pub fn decode_dropfiles(bytes: &[u8]) -> Option<Vec<PathBuf>> {
+    if bytes.len() < std::mem::size_of::<DROPFILES>() {
+        return None;
+    }
+    // SAFETY: the bytes hold a whole `DROPFILES`, plain data read unaligned.
+    let header = unsafe { bytes.as_ptr().cast::<DROPFILES>().read_unaligned() };
+    if !header.fWide.as_bool() {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .get(header.pFiles as usize..)?
+        .chunks_exact(2)
+        .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
+        .collect();
+    // Names up to the empty one; past it, only the allocation's slack.
+    let paths = units
+        .split(|unit| *unit == 0)
+        .take_while(|name| !name.is_empty())
+        .map(|name| PathBuf::from(OsString::from_wide(name)))
+        .collect();
+    Some(paths)
 }
 
 fn set_data_to_clipboard<T>(data: &[T], format: u32) -> Result<()> {
@@ -259,6 +359,8 @@ where
         if let Some(entry) = f(*item_format) {
             return Some(ClipboardItem {
                 entries: vec![entry],
+                // Flux patch
+                cut: false,
             });
         }
     }
@@ -345,19 +447,65 @@ fn read_image_for_type(format_number: u32, format: ImageFormat) -> Option<Clipbo
     Some(ClipboardEntry::Image(Image { format, bytes, id }))
 }
 
-fn read_files_from_clipboard() -> Option<ClipboardEntry> {
-    let text = with_clipboard_data(CF_HDROP.0 as u32, |data_ptr, _size| {
-        let hdrop = HDROP(data_ptr);
-        let mut filenames = String::new();
-        with_file_names(hdrop, |file_name| {
-            filenames.push_str(&file_name);
-        });
-        filenames
-    })?;
+/// Flux patch: the text of the files on the clipboard ([`read_paths_from_clipboard`]): their paths,
+/// one per line (gpui 0.2.2 ran them together).
+fn read_files_from_clipboard(paths: Option<&(ExternalPaths, bool)>) -> Option<ClipboardEntry> {
+    let (paths, _) = paths?;
+    let text = paths
+        .paths()
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .join("\n");
     Some(ClipboardEntry::String(ClipboardString {
         text,
         metadata: None,
     }))
+}
+
+/// Flux patch: the files and folders on the clipboard (CF_HDROP), and whether they were cut —
+/// "Preferred DropEffect" is move, as Explorer's Cut sets it.
+fn read_paths_from_clipboard() -> Option<(ExternalPaths, bool)> {
+    unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32).ok()? };
+    let decoded = with_clipboard_data(CF_HDROP.0 as u32, |data_ptr, size| {
+        if data_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: the locked clipboard data, `size` bytes.
+        decode_dropfiles(unsafe { std::slice::from_raw_parts(data_ptr.cast::<u8>(), size) })
+    })
+    .flatten();
+    let paths = match decoded {
+        Some(paths) => paths,
+        // Names that aren't UTF-16: the shell converts them.
+        None => {
+            let handle = unsafe { GetClipboardData(CF_HDROP.0 as u32) }.ok()?;
+            let mut paths = Vec::new();
+            with_file_names(HDROP(handle.0), |name| paths.push(PathBuf::from(name)));
+            paths
+        }
+    };
+    if paths.is_empty() {
+        return None;
+    }
+    let cut = read_drop_effect().is_some_and(drop_effect_is_move);
+    Some((ExternalPaths(paths.into()), cut))
+}
+
+/// Flux patch: "Preferred DropEffect" of the files on the clipboard.
+fn read_drop_effect() -> Option<u32> {
+    unsafe { IsClipboardFormatAvailable(*CLIPBOARD_DROP_EFFECT_FORMAT).ok()? };
+    with_clipboard_data(*CLIPBOARD_DROP_EFFECT_FORMAT, |data_ptr, size| {
+        (!data_ptr.is_null() && size >= std::mem::size_of::<u32>())
+            // SAFETY: the locked clipboard data, at least a DWORD.
+            .then(|| unsafe { data_ptr.cast::<u32>().read_unaligned() })
+    })
+    .flatten()
+}
+
+/// Flux patch: the files were cut — "Preferred DropEffect" says move and not copy (Explorer's Cut
+/// says move; its Copy, copy and link). Both, or neither: a copy, which loses nothing.
+fn drop_effect_is_move(effect: u32) -> bool {
+    effect & DROPEFFECT_MOVE.0 != 0 && effect & DROPEFFECT_COPY.0 == 0
 }
 
 fn with_clipboard_data<F, R>(format: u32, f: F) -> Option<R>

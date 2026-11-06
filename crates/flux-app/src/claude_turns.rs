@@ -21,7 +21,6 @@ use crate::dialog::Dialog;
 use crate::diff_view::DiffSide;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::IconName;
-use crate::image_view::ImageSource;
 use crate::notifications::Notification;
 
 /// The question lists this many files; the rest are "and N more".
@@ -231,9 +230,27 @@ impl ClaudeChat {
         self.show_agent(tool, window, cx);
     }
 
-    /// A picture of the conversation in an image tab.
-    pub fn preview_image(&mut self, source: ImageSource, cx: &mut Context<Self>) {
-        cx.emit(ClaudeChatEvent::PreviewImage(source));
+    /// The pictures of the user's message `id` in the picture popup, the `index`th in sight.
+    pub fn preview_images(&mut self, id: EntryId, index: usize, cx: &mut Context<Self>) {
+        let pictures: Vec<_> = {
+            let session = self.session().read(cx);
+            let Some(user) = crate::claude_transcript::find_user(&session.model().entries, id)
+            else {
+                return;
+            };
+            user.images
+                .iter()
+                .enumerate()
+                .map(|(index, image)| {
+                    crate::image_popup::conversation_picture(
+                        index,
+                        &image.media_type,
+                        Arc::from(image.data.as_slice()),
+                    )
+                })
+                .collect()
+        };
+        cx.emit(ClaudeChatEvent::PreviewImages { pictures, index });
     }
 
     /// The user's message `id`: its text and pictures.

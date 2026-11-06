@@ -81,6 +81,9 @@ pub use semantic_version::SemanticVersion;
 pub(crate) use test::*;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::*;
+// Flux patch: CF_HDROP's data (files on the clipboard), public for Flux's tests.
+#[cfg(target_os = "windows")]
+pub use windows::{decode_dropfiles, encode_dropfiles};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
@@ -1527,6 +1530,9 @@ impl Default for CursorStyle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardItem {
     entries: Vec<ClipboardEntry>,
+    /// Flux patch: the item was cut, not copied — pasting its paths moves them
+    /// ([`ClipboardItem::with_cut`]).
+    cut: bool,
 }
 
 /// Either a ClipboardString or a ClipboardImage
@@ -1536,6 +1542,9 @@ pub enum ClipboardEntry {
     String(ClipboardString),
     /// An image entry
     Image(Image),
+    /// Flux patch: files and folders, as Finder's and Explorer's Copy put them on the clipboard
+    /// ([`ClipboardItem::new_paths`], [`ClipboardItem::paths`]).
+    ExternalPaths(crate::ExternalPaths),
 }
 
 impl ClipboardItem {
@@ -1543,6 +1552,7 @@ impl ClipboardItem {
     pub fn new_string(text: String) -> Self {
         Self {
             entries: vec![ClipboardEntry::String(ClipboardString::new(text))],
+            cut: false,
         }
     }
 
@@ -1553,6 +1563,7 @@ impl ClipboardItem {
                 text,
                 metadata: Some(metadata),
             })],
+            cut: false,
         }
     }
 
@@ -1562,6 +1573,7 @@ impl ClipboardItem {
             entries: vec![ClipboardEntry::String(
                 ClipboardString::new(text).with_json_metadata(metadata),
             )],
+            cut: false,
         }
     }
 
@@ -1569,7 +1581,56 @@ impl ClipboardItem {
     pub fn new_image(image: &Image) -> Self {
         Self {
             entries: vec![ClipboardEntry::Image(image.clone())],
+            cut: false,
         }
+    }
+
+    /// Flux patch: files and folders, as Finder's and Explorer's Copy put them on the clipboard —
+    /// the paths, and for whoever pastes text, the paths one per line.
+    pub fn new_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        let paths = crate::ExternalPaths::new(paths);
+        let text = paths
+            .paths()
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(paths),
+                ClipboardEntry::String(ClipboardString::new(text)),
+            ],
+            cut: false,
+        }
+    }
+
+    /// Flux patch: the item is cut, not copied — pasting its paths moves them. Windows writes it as
+    /// Explorer's Cut does ("Preferred DropEffect": move); macOS has no cut of files.
+    pub fn with_cut(mut self, cut: bool) -> Self {
+        self.cut = cut;
+        self
+    }
+
+    /// Flux patch: the item was cut ([`ClipboardItem::with_cut`]; on Windows, by Explorer's Cut too).
+    pub fn is_cut(&self) -> bool {
+        self.cut
+    }
+
+    /// Flux patch: no entries — written, it empties the clipboard ([`App::clear_clipboard`]).
+    pub(crate) fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            cut: false,
+        }
+    }
+
+    /// Flux patch: the files and folders on the clipboard (Finder's and Explorer's Copy and Cut),
+    /// if it holds any.
+    pub fn paths(&self) -> Option<&[PathBuf]> {
+        self.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
+            _ => None,
+        })
     }
 
     /// Concatenates together all the ClipboardString entries in the item.
@@ -1632,6 +1693,7 @@ impl From<ClipboardEntry> for ClipboardItem {
     fn from(value: ClipboardEntry) -> Self {
         Self {
             entries: vec![value],
+            cut: false,
         }
     }
 }

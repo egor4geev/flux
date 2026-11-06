@@ -129,6 +129,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Accept Edits", "Принимать правки"),
     ("Plan", "План"),
     ("Auto", "Авто"),
+    ("Bypass Permissions", "Без проверок"),
     (
         "A session can change them in the chat; these are what a new one starts with.",
         "Сессия может поменять их в чате; здесь — то, с чем начинается новая.",

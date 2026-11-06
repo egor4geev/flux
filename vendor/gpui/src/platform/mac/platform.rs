@@ -6,9 +6,9 @@ use super::{
 };
 use crate::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardEntry, ClipboardItem, ClipboardString,
-    CursorStyle, ForegroundExecutor, Image, ImageFormat, KeyContext, Keymap, MacDispatcher,
-    MacDisplay, MacWindow, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    CursorStyle, ExternalPaths, ForegroundExecutor, Image, ImageFormat, KeyContext, Keymap,
+    MacDispatcher, MacDisplay, MacWindow, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
+    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, SemanticVersion, SystemMenuType, Task, WindowAppearance, WindowParams,
     hash,
 };
@@ -19,7 +19,7 @@ use cocoa::{
         NSApplication, NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular,
         NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel, NSPasteboard,
         NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeRTFD, NSPasteboardTypeString,
-        NSPasteboardTypeTIFF, NSSavePanel, NSWindow,
+        NSPasteboardTypeTIFF, NSPasteboardURLReadingFileURLsOnlyKey, NSSavePanel, NSWindow,
     },
     base::{BOOL, NO, YES, id, nil, selector},
     foundation::{
@@ -47,6 +47,7 @@ use objc::{
 };
 use parking_lot::Mutex;
 use ptr::null_mut;
+use smallvec::SmallVec;
 use std::{
     cell::Cell,
     convert::TryInto,
@@ -218,7 +219,10 @@ impl MacPlatform {
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
             renderer_context: renderer::Context::default(),
-            pasteboard: unsafe { NSPasteboard::generalPasteboard(nil) },
+            // Flux patch: a UI scenario's own pasteboard ([`scenario_pasteboard`]).
+            pasteboard: unsafe {
+                scenario_pasteboard().unwrap_or_else(|| NSPasteboard::generalPasteboard(nil))
+            },
             text_hash_pasteboard_type: unsafe { ns_string("zed-text-hash") },
             metadata_pasteboard_type: unsafe { ns_string("zed-metadata") },
             reopen: None,
@@ -1081,6 +1085,12 @@ impl Platform for MacPlatform {
     fn write_to_clipboard(&self, item: ClipboardItem) {
         use crate::ClipboardEntry;
 
+        // Flux patch: files and folders go as Finder's Copy puts them.
+        if let Some(paths) = item.paths() {
+            unsafe { self.write_paths_to_clipboard(paths, item.text().as_deref()) };
+            return;
+        }
+
         unsafe {
             // We only want to use NSAttributedString if there are multiple entries to write.
             if item.entries.len() <= 1 {
@@ -1092,6 +1102,8 @@ impl Platform for MacPlatform {
                         ClipboardEntry::Image(image) => {
                             self.write_image_to_clipboard(image);
                         }
+                        // Flux patch: written above.
+                        ClipboardEntry::ExternalPaths(_) => {}
                     },
                     None => {
                         // Writing an empty list of entries just clears the clipboard.
@@ -1154,40 +1166,19 @@ impl Platform for MacPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        let state = self.0.lock();
-        let pasteboard = state.pasteboard;
-
-        // First, see if it's a string.
-        unsafe {
-            let types: id = pasteboard.types();
-            let string_type: id = ns_string("public.utf8-plain-text");
-
-            if msg_send![types, containsObject: string_type] {
-                let data = pasteboard.dataForType(string_type);
-                if data == nil {
-                    return None;
-                } else if data.bytes().is_null() {
-                    // https://developer.apple.com/documentation/foundation/nsdata/1410616-bytes?language=objc
-                    // "If the length of the NSData object is 0, this property returns nil."
-                    return Some(self.read_string_from_clipboard(&state, &[]));
-                } else {
-                    let bytes =
-                        slice::from_raw_parts(data.bytes() as *mut u8, data.length() as usize);
-
-                    return Some(self.read_string_from_clipboard(&state, bytes));
-                }
-            }
-
-            // If it wasn't a string, try the various supported image types.
-            for format in ImageFormat::iter() {
-                if let Some(item) = try_clipboard_image(pasteboard, format) {
-                    return Some(item);
-                }
-            }
-        }
-
-        // If it wasn't a string or a supported image type, give up.
-        None
+        // Flux patch: files and folders (Finder's Copy) — their file URLs become the item's paths,
+        // ahead of what is read as before (Finder's text is their names).
+        let paths = unsafe { self.read_paths_from_clipboard() };
+        let item = self.read_text_or_image_from_clipboard();
+        let Some(paths) = paths else {
+            return item;
+        };
+        let mut item = item.unwrap_or(ClipboardItem {
+            entries: Vec::new(),
+            cut: false,
+        });
+        item.entries.insert(0, ClipboardEntry::ExternalPaths(paths));
+        Some(item)
     }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
@@ -1297,6 +1288,89 @@ impl Platform for MacPlatform {
 }
 
 impl MacPlatform {
+    /// Flux patch: gpui's `read_from_clipboard`, the text or an image; the files are read first
+    /// ([`MacPlatform::read_paths_from_clipboard`]).
+    fn read_text_or_image_from_clipboard(&self) -> Option<ClipboardItem> {
+        let state = self.0.lock();
+        let pasteboard = state.pasteboard;
+
+        // First, see if it's a string.
+        unsafe {
+            let types: id = pasteboard.types();
+            let string_type: id = ns_string("public.utf8-plain-text");
+
+            if msg_send![types, containsObject: string_type] {
+                let data = pasteboard.dataForType(string_type);
+                if data == nil {
+                    return None;
+                } else if data.bytes().is_null() {
+                    // https://developer.apple.com/documentation/foundation/nsdata/1410616-bytes?language=objc
+                    // "If the length of the NSData object is 0, this property returns nil."
+                    return Some(self.read_string_from_clipboard(&state, &[]));
+                } else {
+                    let bytes =
+                        slice::from_raw_parts(data.bytes() as *mut u8, data.length() as usize);
+
+                    return Some(self.read_string_from_clipboard(&state, bytes));
+                }
+            }
+
+            // If it wasn't a string, try the various supported image types.
+            for format in ImageFormat::iter() {
+                if let Some(item) = try_clipboard_image(pasteboard, format) {
+                    return Some(item);
+                }
+            }
+        }
+
+        // If it wasn't a string or a supported image type, give up.
+        None
+    }
+
+    /// Flux patch: the files and folders on the pasteboard (Finder's Copy puts a file URL per
+    /// item); a file reference URL is resolved to its path.
+    unsafe fn read_paths_from_clipboard(&self) -> Option<ExternalPaths> {
+        unsafe {
+            let pasteboard = self.0.lock().pasteboard;
+            let classes = NSArray::arrayWithObject(nil, class!(NSURL) as *const Class as id);
+            let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
+            let options: id = msg_send![class!(NSDictionary),
+                dictionaryWithObject: yes
+                forKey: NSPasteboardURLReadingFileURLsOnlyKey];
+            let urls = pasteboard.readObjectsForClasses_options(classes, options);
+            if urls == nil {
+                return None;
+            }
+            let paths: SmallVec<[PathBuf; 2]> = (0..urls.count())
+                .filter_map(|index| {
+                    let url: id = msg_send![urls.objectAtIndex(index), filePathURL];
+                    (url != nil).then(|| ns_url_to_path(url).ok()).flatten()
+                })
+                .collect();
+            (!paths.is_empty()).then(|| ExternalPaths(paths))
+        }
+    }
+
+    /// Flux patch: files and folders as Finder's Copy puts them — a file URL per item, so Finder
+    /// pastes the files — with `text` (the paths, one per line) as the first item's plain text.
+    unsafe fn write_paths_to_clipboard(&self, paths: &[PathBuf], text: Option<&str>) {
+        unsafe {
+            let state = self.0.lock();
+            state.pasteboard.clearContents();
+            let urls: id = msg_send![class!(NSMutableArray), arrayWithCapacity: paths.len()];
+            for path in paths {
+                let url = NSURL::fileURLWithPath_(nil, ns_string(&path.to_string_lossy()));
+                let _: () = msg_send![urls, addObject: url];
+            }
+            state.pasteboard.writeObjects(urls);
+            if let Some(text) = text {
+                state
+                    .pasteboard
+                    .setString_forType(ns_string(text), NSPasteboardTypeString);
+            }
+        }
+    }
+
     unsafe fn read_string_from_clipboard(
         &self,
         state: &MacPlatformState,
@@ -1321,6 +1395,8 @@ impl MacPlatform {
 
             ClipboardItem {
                 entries: vec![ClipboardEntry::String(ClipboardString { text, metadata })],
+                // Flux patch
+                cut: false,
             }
         }
     }
@@ -1398,6 +1474,8 @@ fn try_clipboard_image(pasteboard: id, format: ImageFormat) -> Option<ClipboardI
 
                 Some(ClipboardItem {
                     entries: vec![ClipboardEntry::Image(Image { format, bytes, id })],
+                    // Flux patch
+                    cut: false,
                 })
             }
         } else {
@@ -1680,6 +1758,21 @@ unsafe fn ns_string(string: &str) -> id {
     unsafe { NSString::alloc(nil).init_str(string).autorelease() }
 }
 
+/// Flux patch: with `FLUX_SCENARIO_PASTEBOARD` (Flux's UI scenarios) the clipboard is the
+/// pasteboard of that name instead of the general one: a scenario's copies and pastes never touch
+/// the clipboard of the user working alongside.
+unsafe fn scenario_pasteboard() -> Option<id> {
+    let name = std::env::var("FLUX_SCENARIO_PASTEBOARD").ok()?;
+    if name.is_empty() {
+        return None;
+    }
+    unsafe {
+        let pasteboard = NSPasteboard::pasteboardWithName(nil, ns_string(&name));
+        // Kept for the app's lifetime, as the general pasteboard is.
+        Some(msg_send![pasteboard, retain])
+    }
+}
+
 unsafe fn ns_url_to_path(url: id) -> Result<PathBuf> {
     let path: *mut c_char = msg_send![url, fileSystemRepresentation];
     anyhow::ensure!(!path.is_null(), "url is not a file path: {}", unsafe {
@@ -1822,6 +1915,8 @@ mod tests {
             entries: vec![ClipboardEntry::String(
                 ClipboardString::new("2".to_string()).with_json_metadata(vec![3, 4]),
             )],
+            // Flux patch
+            cut: false,
         };
         platform.write_to_clipboard(item.clone());
         assert_eq!(platform.read_from_clipboard(), Some(item));

@@ -1,6 +1,7 @@
 //! Operations on project files. None of them overwrites an existing file or directory: a taken name
-//! is an error (a copy gets a free name), and rename and move are atomic "no replace" operations.
-//! They block; call them from the background.
+//! is an error (a copy gets a free name), and rename and move are atomic "no replace" operations —
+//! except a move to another volume, which is a copy, then a delete. They block; call them from the
+//! background.
 //!
 //! Errors are `io::Error` with a short message for the status bar (names are in “ ”).
 
@@ -83,7 +84,8 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
 }
 
 /// Moves `path` into the directory `dir` under the same name. Moving it into the directory it is
-/// already in does nothing. Returns the new path.
+/// already in does nothing. To another volume it is copied, then deleted ([`move_by_copy`]).
+/// Returns the new path.
 pub fn move_into(path: &Path, dir: &Path) -> io::Result<PathBuf> {
     let name = path.file_name().ok_or_else(|| invalid("Nothing to move"))?;
     fs::symlink_metadata(path).map_err(|err| describe(err, path))?;
@@ -100,14 +102,36 @@ pub fn move_into(path: &Path, dir: &Path) -> io::Result<PathBuf> {
         return Err(not_a_folder(dir));
     }
     let target = dir.join(name);
-    rename_no_replace(path, &target).map_err(|err| match err.raw_os_error() {
-        Some(code) if code == libc::EXDEV => io::Error::new(
-            ErrorKind::CrossesDevices,
-            format!("Cannot move “{}” to another volume", display_name(path)),
-        ),
-        _ => describe(err, &target),
+    match rename_no_replace(path, &target) {
+        Ok(()) => Ok(target),
+        // EXDEV, or Windows' ERROR_NOT_SAME_DEVICE.
+        Err(err) if err.kind() == ErrorKind::CrossesDevices => move_by_copy(path, &target),
+        Err(err) => Err(describe(err, &target)),
+    }
+}
+
+/// A move to another volume, as Finder and Explorer make it: a copy to `target`, then the original
+/// deleted — only once the whole copy is there (an unfinished one is removed, and the original
+/// stays). If the original can't be deleted, or only partly, the copy stays and the error says so.
+fn move_by_copy(path: &Path, target: &Path) -> io::Result<PathBuf> {
+    if fs::symlink_metadata(target).is_ok() {
+        return Err(describe(io::Error::from(ErrorKind::AlreadyExists), target));
+    }
+    let copied = copy_entry(path, target);
+    if copied.is_err() {
+        // An unfinished copy is ours and fresh, so it can be removed.
+        let _ = remove_entry(target);
+    }
+    copied.map_err(|err| describe(err, target))?;
+    remove_entry(path).map_err(|err| {
+        let name = display_name(path);
+        let err = describe(err, path);
+        io::Error::new(
+            err.kind(),
+            format!("Copied “{name}”, but couldn't delete the original: {err}"),
+        )
     })?;
-    Ok(target)
+    Ok(target.to_path_buf())
 }
 
 /// Copies `path` (a file, or a whole directory; symlinks are copied as symlinks) into the directory
@@ -414,7 +438,7 @@ fn copy_symlink(_: &Path, _: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes the unfinished copy.
+/// Removes the unfinished copy, or the original of a move to another volume.
 fn remove_entry(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path)? {
         meta if meta.is_dir() => fs::remove_dir_all(path),
@@ -681,6 +705,65 @@ mod tests {
         // The neighboring `a2` is not inside `a`.
         fs::create_dir(root.join("a2")).unwrap();
         assert_eq!(move_into(&a, &root.join("a2")).unwrap(), root.join("a2/a"));
+    }
+
+    /// A move to another volume is a copy, then a delete; a unit test has one volume, so the
+    /// fallback itself is checked.
+    #[test]
+    fn a_move_by_copy_deletes_the_original_after_the_copy() {
+        let dir = temp();
+        let root = dir.path();
+        write(&root.join("a.txt"), "a");
+        write(&root.join("docs/deep/b.md"), "b");
+        fs::create_dir(root.join("other")).unwrap();
+        let target = root.join("other/a.txt");
+        assert_eq!(move_by_copy(&root.join("a.txt"), &target).unwrap(), target);
+        assert_eq!(read(&target), "a");
+        assert!(!root.join("a.txt").exists());
+        let target = root.join("other/docs");
+        assert_eq!(move_by_copy(&root.join("docs"), &target).unwrap(), target);
+        assert_eq!(read(&root.join("other/docs/deep/b.md")), "b");
+        assert!(!root.join("docs").exists());
+        // A taken name is an error, and nothing changes.
+        write(&root.join("c.txt"), "new");
+        write(&root.join("other/c.txt"), "old");
+        assert_eq!(
+            message(move_by_copy(&root.join("c.txt"), &root.join("other/c.txt")).unwrap_err()),
+            "“c.txt” already exists"
+        );
+        assert_eq!(read(&root.join("c.txt")), "new");
+        assert_eq!(read(&root.join("other/c.txt")), "old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_by_copy_keeps_the_original_until_the_copy_is_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path, mode| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let dir = temp();
+        let root = dir.path();
+        fs::create_dir(root.join("other")).unwrap();
+        // A file that can't be read: the copy fails, its unfinished part goes, the original stays.
+        write(&root.join("docs/a.md"), "a");
+        write(&root.join("docs/secret.md"), "s");
+        mode(&root.join("docs/secret.md"), 0o000);
+        assert!(move_by_copy(&root.join("docs"), &root.join("other/docs")).is_err());
+        assert!(!root.join("other/docs").exists());
+        assert_eq!(read(&root.join("docs/a.md")), "a");
+        mode(&root.join("docs/secret.md"), 0o644);
+        // An original that can't be deleted: the whole copy stays, and the error says so.
+        write(&root.join("locked/b.txt"), "b");
+        mode(&root.join("locked"), 0o555);
+        let err = move_by_copy(&root.join("locked/b.txt"), &root.join("other/b.txt"));
+        mode(&root.join("locked"), 0o755);
+        assert_eq!(
+            message(err.unwrap_err()),
+            "Copied “b.txt”, but couldn't delete the original: Permission denied: “b.txt”"
+        );
+        assert_eq!(read(&root.join("other/b.txt")), "b");
+        assert_eq!(read(&root.join("locked/b.txt")), "b");
     }
 
     #[test]

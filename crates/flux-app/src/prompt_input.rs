@@ -12,6 +12,7 @@
 //! frame: the caret, the mouse, the selection and ↑/↓ use it, and the tests check it without gpui.
 
 use std::ops::Range as Utf16Range;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use flux_core::movement::{self, Direction};
@@ -150,6 +151,9 @@ pub enum PromptInputEvent {
     SelectionChanged,
     /// ⌘V with a picture on the clipboard: the parent attaches it.
     ImagePasted(Image),
+    /// ⌘V with files copied in Finder or Explorer, in a field that takes files
+    /// ([`PromptInput::takes_files`]): the parent attaches them.
+    FilesPasted(Vec<PathBuf>),
     /// ⌫ with the caret at the start and nothing selected: nothing to delete (the parent leaves a
     /// mode of the field — the shell mode of Claude's field, part 10.2).
     BackspaceAtStart,
@@ -179,6 +183,9 @@ pub struct PromptInput {
     height_glide: Option<(Pixels, Instant)>,
     /// The height drawn last: where a glide starts from.
     drawn_height: Pixels,
+    /// Files on the clipboard go to the parent ([`PromptInputEvent::FilesPasted`]), not their names
+    /// as text.
+    takes_files: bool,
 }
 
 struct PromptLayout {
@@ -206,12 +213,21 @@ impl PromptInput {
             menu_open: false,
             height_glide: None,
             drawn_height: px(0.),
+            takes_files: false,
         }
     }
 
     /// The field grows up to `rows` rows, then scrolls.
     pub fn max_rows(mut self, rows: usize) -> Self {
         self.max_rows = rows.max(1);
+        self
+    }
+
+    /// Files copied in Finder or Explorer are pasted as files, for the parent to attach
+    /// ([`PromptInputEvent::FilesPasted`]); otherwise their names (Finder) or paths (Explorer) go
+    /// in as text.
+    pub fn takes_files(mut self) -> Self {
+        self.takes_files = true;
         self
     }
 
@@ -405,11 +421,16 @@ impl PromptInput {
     }
 
     /// Text goes in at the caret; a picture (a screenshot copied to the clipboard) goes to the
-    /// parent.
+    /// parent, and so do files copied in Finder or Explorer where the field takes them.
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
+        if self.takes_files
+            && let Some(paths) = item.paths()
+        {
+            return cx.emit(PromptInputEvent::FilesPasted(paths.to_vec()));
+        }
         if let Some(text) = item.text() {
             let text = normalize(&text);
             self.glide_height();

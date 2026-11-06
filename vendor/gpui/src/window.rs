@@ -21,6 +21,8 @@ use crate::{
 };
 // Flux patch (scroll axis): see `ScrollGesture`.
 use crate::{Axis, TouchPhase};
+// Flux patch (pinch): a pinch on the trackpad.
+use crate::PinchEvent;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
@@ -1456,9 +1458,14 @@ impl Window {
     }
 }
 
+/// What became of an event given to [`Window::dispatch_event`].
+// Flux patch: public, so `Window::dispatch_event` can be called outside gpui (Flux's UI scenarios
+// drop files with it).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DispatchEventResult {
+pub struct DispatchEventResult {
+    /// No listener stopped the event.
     pub propagate: bool,
+    /// A listener prevented the platform's default handling.
     pub default_prevented: bool,
 }
 
@@ -4126,6 +4133,12 @@ impl Window {
                 self.scroll_gesture.update(&scroll_wheel, Instant::now());
                 PlatformInput::ScrollWheel(scroll_wheel)
             }
+            // Flux patch (pinch): it happens at the pointer, as the wheel does.
+            PlatformInput::Pinch(pinch) => {
+                self.mouse_position = pinch.position;
+                self.modifiers = pinch.modifiers;
+                PlatformInput::Pinch(pinch)
+            }
             // Translate dragging and dropping of external files from the operating system
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {
@@ -5666,6 +5679,11 @@ fn scale_platform_input(event: PlatformInput, factor: f32) -> PlatformInput {
                 position: position * factor,
             })
         }
+        // Flux patch (pinch): the magnification is a ratio, the same at any scale.
+        PlatformInput::Pinch(event) => PlatformInput::Pinch(PinchEvent {
+            position: event.position * factor,
+            ..event
+        }),
         event @ (PlatformInput::FileDrop(FileDropEvent::Exited)
         | PlatformInput::KeyDown(_)
         | PlatformInput::KeyUp(_)

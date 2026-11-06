@@ -12,6 +12,10 @@
 //! in the background; the affected directories are re-read right after them, without waiting for
 //! events. Workspace updates the open documents in response to [`FileTreeEvent`] events.
 //!
+//! The system clipboard and Finder or Explorer: ⌘C and ⌘X also put the item there as a file, so
+//! Finder and Explorer paste it; ⌘V pastes the files they copied or cut, and files dragged from
+//! them drop into the folder under the pointer ([`paste_source`]).
+//!
 //! Motion (`crate::motion`): a directory the user opens turns its chevron, crossfades its icon and
 //! unfolds its rows, one closed turns it back; whenever the rows change under the eye (a directory
 //! opened or closed, files that came, went or were renamed on disk) the rows that stay glide to
@@ -37,10 +41,10 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
     Action, AnyElement, App, ClickEvent, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
-    DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton,
-    MouseDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString, Stateful, Subscription,
-    Task, UniformListScrollHandle, Window, actions, deferred, div, prelude::*, px, relative,
-    uniform_list,
+    DragMoveEvent, Entity, EventEmitter, ExternalPaths, FileDropEvent, FocusHandle, Focusable,
+    KeyBinding, MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString,
+    Stateful, Subscription, Task, UniformListScrollHandle, Window, actions, canvas, deferred, div,
+    prelude::*, px, relative, uniform_list,
 };
 
 use crate::context_menu::ContextMenu;
@@ -237,6 +241,9 @@ enum EditTarget {
 struct Clipboard {
     path: PathBuf,
     cut: bool,
+    /// What the tree put on the system clipboard for it: while that is still there, ⌘V pastes
+    /// `path`, followed through renames and moves.
+    item: ClipboardItem,
 }
 
 struct Menu {
@@ -534,6 +541,9 @@ pub struct FileTreePanel {
     next_read: u64,
     edit: Option<Edit>,
     clipboard: Option<Clipboard>,
+    /// The system clipboard's files that were cut and have been pasted (or the tree's cut undone
+    /// with Esc): they have left where it says they are, so ⌘V doesn't paste them again.
+    spent_cut: Option<ClipboardItem>,
     menu: Option<Menu>,
     /// Where the dragged row would be dropped: the directory under the cursor.
     drop_target: Option<PathBuf>,
@@ -588,6 +598,7 @@ impl FileTreePanel {
             next_read: 0,
             edit: None,
             clipboard: None,
+            spent_cut: None,
             menu: None,
             drop_target: None,
             drop_fade: None,
@@ -993,7 +1004,9 @@ impl FileTreePanel {
             .as_ref()
             .is_some_and(|clipboard| clipboard.cut)
         {
-            self.clipboard = None;
+            // The file stays on the system clipboard for Finder and Explorer; ⌘V here no longer
+            // pastes it.
+            self.spent_cut = self.clipboard.take().map(|clipboard| clipboard.item);
             return cx.notify();
         }
         cx.emit(FileTreeEvent::FocusEditor);
@@ -1277,26 +1290,147 @@ impl FileTreePanel {
         self.changed(cx);
     }
 
+    /// ⌘C and ⌘X: the selected item, also on the system clipboard as a file, so Finder and
+    /// Explorer paste it (Explorer moves what was cut).
     fn set_clipboard(&mut self, cut: bool, cx: &mut Context<Self>) {
         if let Some(path) = self.selected.clone() {
-            self.clipboard = Some(Clipboard { path, cut });
+            let item = ClipboardItem::new_paths([path.clone()]).with_cut(cut);
+            cx.write_to_clipboard(item.clone());
+            self.clipboard = Some(Clipboard { path, cut, item });
             cx.notify();
         }
     }
 
     /// ⌘V: what was cut moves into the selected directory (for a file, into its directory); what
-    /// was copied is copied there under an unused name.
+    /// was copied is copied there under an unused name ([`paste_source`]).
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(clipboard) = self.clipboard.clone() else {
+        let system = cx.read_from_clipboard();
+        let Some((paths, cut)) = paste_source(
+            self.clipboard.as_ref(),
+            self.spent_cut.as_ref(),
+            system.as_ref(),
+        ) else {
             return;
         };
         let dir = self.tree.target_dir(self.selected.as_deref());
-        if clipboard.cut {
-            self.clipboard = None;
-            self.move_entry(clipboard.path, dir, window, cx);
-        } else {
-            self.copy_entry(clipboard.path, dir, false, window, cx);
+        // The files on the system clipboard that were cut: cleared once they have moved.
+        let cut_files = system.filter(|item| cut && item.paths().is_some());
+        if cut {
+            // A cut is pasted once.
+            if self
+                .clipboard
+                .as_ref()
+                .is_some_and(|own| own.cut && paths == [own.path.clone()])
+            {
+                self.clipboard = None;
+            }
+            self.spent_cut = cut_files.clone();
         }
+        self.paste_paths(paths, dir, cut, cut_files, window, cx);
+    }
+
+    /// Something to paste: ⌘V would paste it.
+    fn can_paste(&self, cx: &App) -> bool {
+        let system = cx.read_from_clipboard();
+        paste_source(
+            self.clipboard.as_ref(),
+            self.spent_cut.as_ref(),
+            system.as_ref(),
+        )
+        .is_some()
+    }
+
+    /// Pastes or drops `paths` into `dir`, in one background operation: moved (`cut`), or copied
+    /// under unused names. The first one pasted is selected, and the first failure is reported.
+    /// Once all of them have moved, the system clipboard is cleared if it still holds `cut_files`
+    /// (where they came from), as Explorer does: Finder and Explorer don't offer files that are
+    /// gone.
+    fn paste_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        dir: PathBuf,
+        cut: bool,
+        cut_files: Option<ClipboardItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let target = dir.clone();
+        self.run(
+            move || {
+                let paste = |path: &PathBuf| {
+                    if cut {
+                        move_into(path, &dir)
+                    } else {
+                        copy_into(path, &dir)
+                    }
+                };
+                Ok(paths
+                    .into_iter()
+                    .map(|path| {
+                        let result = paste(&path);
+                        (path, result)
+                    })
+                    .collect::<Vec<_>>())
+            },
+            window,
+            cx,
+            move |this, results, _, cx| {
+                let results = results.unwrap_or_default();
+                let moved = cut && results.iter().all(|(_, result)| result.is_ok());
+                if let Some(item) = cut_files.filter(|_| moved)
+                    && cx
+                        .read_from_clipboard()
+                        .is_some_and(|now| now.entries() == item.entries())
+                {
+                    cx.clear_clipboard();
+                }
+                this.finish_paste(target, cut, results, cx)
+            },
+        );
+    }
+
+    fn finish_paste(
+        &mut self,
+        dir: PathBuf,
+        cut: bool,
+        results: Vec<(PathBuf, io::Result<PathBuf>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut pasted = None;
+        let mut error = None;
+        for (from, result) in results {
+            match result {
+                Ok(to) => {
+                    if cut {
+                        self.moved(&from, &to, cx);
+                    }
+                    pasted.get_or_insert(to);
+                }
+                Err(err) => {
+                    error.get_or_insert(err);
+                }
+            }
+        }
+        if !cut {
+            self.reread([dir], cx);
+        }
+        if let Some(path) = pasted {
+            self.select_when_shown(path);
+        }
+        if let Some(err) = error {
+            cx.emit(FileTreeEvent::Error {
+                title: if cut {
+                    tr("Couldn't move").into()
+                } else {
+                    tr("Couldn't copy").into()
+                },
+                body: err.to_string().into(),
+            });
+        }
+        self.changed(cx);
     }
 
     fn move_entry(
@@ -1449,7 +1583,7 @@ impl FileTreePanel {
         window.focus(&self.focus_handle);
         self.selected = path.clone();
         self.reveal_target = None;
-        let can_paste = self.clipboard.is_some();
+        let can_paste = self.can_paste(cx);
         // The plugins' items: for the row, or for the root on empty space (part 8.2).
         let plugins = self.plugins.clone();
         let target = crate::plugin_menus::MenuTarget {
@@ -1647,6 +1781,36 @@ impl FileTreePanel {
         };
         cx.notify();
         self.move_entry(entry.path.clone(), dir, window, cx);
+    }
+
+    /// Files dragged from Finder or Explorer over the panel: the target is found as for a row
+    /// ([`FileTreePanel::drag_over`]), for the files that can go there ([`files_drop_dir`]).
+    fn drag_files_over(&mut self, event: &DragMoveEvent<ExternalPaths>, cx: &mut Context<Self>) {
+        let position = event.event.position;
+        let target = event.bounds.contains(&position).then(|| {
+            let over = self
+                .list_index_at(position)
+                .and_then(|index| self.list_row(index))
+                .map(|row| row.path.clone());
+            files_drop_dir(&self.tree, event.drag(cx).paths(), over.as_deref())
+        });
+        self.set_drop_target(target.flatten(), cx);
+    }
+
+    /// Files dropped from Finder or Explorer are copied into the target, as ⌘V copies them; the
+    /// ones already in it stay as they are.
+    fn drop_files(&mut self, files: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = self.drop_target.take() else {
+            return;
+        };
+        cx.notify();
+        let paths = files
+            .paths()
+            .iter()
+            .filter(|path| can_drop_into(path, &dir))
+            .cloned()
+            .collect();
+        self.paste_paths(paths, dir, false, None, window, cx);
     }
 
     /// The tree row at a list index; for the new-file field row, `None`.
@@ -2257,6 +2421,14 @@ impl Render for FileTreePanel {
                 this.drop_entry(entry, window, cx)
             }))
             .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    this.drag_files_over(event, cx)
+                }),
+            )
+            .on_drop(cx.listener(|this, files: &ExternalPaths, window, cx| {
+                this.drop_files(files, window, cx)
+            }))
+            .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedEdge>, _, cx| {
                     // The handle sits in the gap to the right of the edge: the panel edge follows
                     // the mouse without jumping.
@@ -2307,7 +2479,28 @@ impl Render for FileTreePanel {
                 "tree-menu",
                 self.menu.as_ref().map(|menu| (&menu.menu, menu.position)),
             ))
+            .child(files_drag_exit(cx))
     }
+}
+
+/// Files from Finder or Explorer dragged out of the window again end their drag without a drop or
+/// a move over the panel: the drop highlight goes with them.
+fn files_drag_exit(cx: &mut Context<FileTreePanel>) -> impl IntoElement + use<> {
+    let panel = cx.entity().downgrade();
+    canvas(
+        |_, _, _| {},
+        move |_, _, window, _| {
+            window.on_mouse_event(move |event: &FileDropEvent, _, _, cx| {
+                if matches!(event, FileDropEvent::Exited) {
+                    panel
+                        .update(cx, |panel, cx| panel.set_drop_target(None, cx))
+                        .ok();
+                }
+            })
+        },
+    )
+    .absolute()
+    .size_0()
 }
 
 impl Render for DraggedEntry {
@@ -2540,7 +2733,46 @@ fn check_name(target: &EditTarget, name: &str) -> Result<(), String> {
 /// means nowhere to drop: onto itself, into its own subtree, or where it already is.
 fn drop_dir(tree: &FileTree, dragged: &Path, over: Option<&Path>) -> Option<PathBuf> {
     let dir = tree.target_dir(over);
-    (!dir.starts_with(dragged) && dragged.parent() != Some(dir.as_path())).then_some(dir)
+    can_drop_into(dragged, &dir).then_some(dir)
+}
+
+/// `path` can go into `dir`: it isn't there already, and `dir` isn't it or inside it.
+fn can_drop_into(path: &Path, dir: &Path) -> bool {
+    !dir.starts_with(path) && path.parent() != Some(dir)
+}
+
+/// [`drop_dir`] for files from Finder or Explorer: the directory, if any of them can go there.
+fn files_drop_dir(tree: &FileTree, paths: &[PathBuf], over: Option<&Path>) -> Option<PathBuf> {
+    paths.iter().find_map(|path| drop_dir(tree, path, over))
+}
+
+/// What ⌘V pastes, and whether it moves it (a cut) or copies it. Files on the system clipboard
+/// come first. Put there by the tree's own ⌘C or ⌘X (`own`, still there), they are its item,
+/// followed through renames and moved if it was cut. Put there by Finder or Explorer, they are
+/// copied — moved after Explorer's Cut — unless they are a cut pasted already (`spent`). Without
+/// files on the system clipboard, the tree's own item, as before it had them.
+fn paste_source(
+    own: Option<&Clipboard>,
+    spent: Option<&ClipboardItem>,
+    system: Option<&ClipboardItem>,
+) -> Option<(Vec<PathBuf>, bool)> {
+    let own_item = || own.map(|own| (vec![own.path.clone()], own.cut));
+    let Some((system, paths)) = system
+        .and_then(|item| Some((item, item.paths()?)))
+        .filter(|(_, paths)| !paths.is_empty())
+    else {
+        return own_item();
+    };
+    // The tree's own item comes back from the clipboard as it was put there, except for the cut
+    // flag, which only Windows keeps.
+    let same = |item: &ClipboardItem| item.entries() == system.entries();
+    if own.is_some_and(|own| same(&own.item)) {
+        return own_item();
+    }
+    if spent.is_some_and(same) {
+        return None;
+    }
+    Some((paths.to_vec(), system.is_cut()))
 }
 
 /// Where the name starts in a row at nesting depth `depth`, measured from the left edge of the
@@ -2660,6 +2892,128 @@ mod tests {
             drop_dir(&tree, &p("/p/src/app"), Some(&p("/p/src/main.rs"))),
             None
         );
+    }
+
+    #[test]
+    fn files_from_finder_drop_into_the_folder_under_the_pointer() {
+        let tree = tree();
+        let p = |path: &str| PathBuf::from(path);
+        let outside = [p("/Users/me/a.txt"), p("/Users/me/pics")];
+        // A folder row: the folder; a file row: its folder; empty space: the root.
+        assert_eq!(
+            files_drop_dir(&tree, &outside, Some(&p("/p/src/app"))),
+            Some(p("/p/src/app"))
+        );
+        assert_eq!(
+            files_drop_dir(&tree, &outside, Some(&p("/p/src/main.rs"))),
+            Some(p("/p/src"))
+        );
+        assert_eq!(files_drop_dir(&tree, &outside, None), Some(p("/p")));
+        // Files already in the folder go nowhere; one that isn't is enough for a target.
+        assert_eq!(files_drop_dir(&tree, &[p("/p/a.rs")], None), None);
+        assert_eq!(
+            files_drop_dir(&tree, &[p("/p/a.rs"), p("/Users/me/a.txt")], None),
+            Some(p("/p"))
+        );
+        // A folder doesn't go into itself.
+        assert_eq!(
+            files_drop_dir(&tree, &[p("/p/src")], Some(&p("/p/src/app"))),
+            None
+        );
+        assert!(can_drop_into(&p("/Users/me/a.txt"), &p("/p")));
+        assert!(!can_drop_into(&p("/p/src/main.rs"), &p("/p/src")));
+    }
+
+    #[test]
+    fn paste_moves_what_was_cut_and_copies_the_rest() {
+        let p = |path: &str| PathBuf::from(path);
+        let own = |path: &str, cut: bool| Clipboard {
+            path: p(path),
+            cut,
+            item: ClipboardItem::new_paths([p(path)]).with_cut(cut),
+        };
+        let files = |paths: &[&str]| ClipboardItem::new_paths(paths.iter().map(|path| p(path)));
+        let text = ClipboardItem::new_string("text".into());
+        // The tree's own ⌘X and ⌘C, while the system clipboard still holds them — on macOS it
+        // comes back without the cut flag.
+        let cut = own("/p/a.rs", true);
+        assert_eq!(
+            paste_source(Some(&cut), None, Some(&files(&["/p/a.rs"]))),
+            Some((vec![p("/p/a.rs")], true))
+        );
+        let copied = own("/p/a.rs", false);
+        assert_eq!(
+            paste_source(Some(&copied), None, Some(&copied.item)),
+            Some((vec![p("/p/a.rs")], false))
+        );
+        // Renamed since: the tree's item follows it.
+        let renamed = Clipboard {
+            path: p("/p/b.rs"),
+            ..cut.clone()
+        };
+        assert_eq!(
+            paste_source(Some(&renamed), None, Some(&cut.item)),
+            Some((vec![p("/p/b.rs")], true))
+        );
+        // Finder's or Explorer's Copy since: their files, copied.
+        let finder = files(&["/Users/me/x.png", "/Users/me/docs"]);
+        assert_eq!(
+            paste_source(Some(&cut), None, Some(&finder)),
+            Some((vec![p("/Users/me/x.png"), p("/Users/me/docs")], false))
+        );
+        // Explorer's Cut: moved, once.
+        let explorer_cut = files(&["C:/x.txt"]).with_cut(true);
+        assert_eq!(
+            paste_source(None, None, Some(&explorer_cut)),
+            Some((vec![p("C:/x.txt")], true))
+        );
+        assert_eq!(
+            paste_source(None, Some(&explorer_cut), Some(&explorer_cut)),
+            None
+        );
+        // The tree's cut pasted (or undone with Esc) is spent too.
+        assert_eq!(paste_source(None, Some(&cut.item), Some(&cut.item)), None);
+        // No files on the system clipboard: the tree's own item, as before.
+        assert_eq!(
+            paste_source(Some(&copied), None, Some(&text)),
+            Some((vec![p("/p/a.rs")], false))
+        );
+        assert_eq!(
+            paste_source(Some(&cut), None, None),
+            Some((vec![p("/p/a.rs")], true))
+        );
+        assert_eq!(paste_source(None, None, Some(&text)), None);
+        assert_eq!(paste_source(None, None, Some(&files(&[]))), None);
+    }
+
+    /// Files on Windows' clipboard (CF_HDROP): what Flux writes for Explorer reads back.
+    #[cfg(windows)]
+    #[test]
+    fn dropfiles_carry_the_paths_both_ways() {
+        let paths = [
+            PathBuf::from(r"C:\Users\me\a.txt"),
+            PathBuf::from(r"D:\проект\папка с пробелом"),
+            PathBuf::from(r"\\server\share\😀.md"),
+        ];
+        let bytes = gpui::encode_dropfiles(&paths);
+        // DROPFILES: the list starts after its 20 bytes, in UTF-16; it ends in two NULs.
+        assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 20);
+        assert_eq!(i32::from_ne_bytes(bytes[16..20].try_into().unwrap()), 1);
+        assert_eq!(&bytes[bytes.len() - 4..], &[0; 4]);
+        assert_eq!(gpui::decode_dropfiles(&bytes), Some(paths.to_vec()));
+        // The allocation may be larger than the list.
+        let mut padded = bytes.clone();
+        padded.extend([0xAB; 6]);
+        assert_eq!(gpui::decode_dropfiles(&padded), Some(paths.to_vec()));
+        // No paths, an ANSI list (the shell reads it) and a short buffer.
+        assert_eq!(
+            gpui::decode_dropfiles(&gpui::encode_dropfiles(&[])),
+            Some(Vec::new())
+        );
+        let mut ansi = bytes.clone();
+        ansi[16..20].copy_from_slice(&0i32.to_ne_bytes());
+        assert_eq!(gpui::decode_dropfiles(&ansi), None);
+        assert_eq!(gpui::decode_dropfiles(&bytes[..10]), None);
     }
 
     #[test]

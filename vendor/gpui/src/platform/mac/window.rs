@@ -169,6 +169,11 @@ unsafe fn build_classes() {
                     sel!(swipeWithEvent:),
                     handle_view_event as extern "C" fn(&Object, Sel, id),
                 );
+                // Flux patch (pinch): a pinch on the trackpad, a `PinchEvent`.
+                decl.add_method(
+                    sel!(magnifyWithEvent:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
                 decl.add_method(
                     sel!(flagsChanged:),
                     handle_view_event as extern "C" fn(&Object, Sel, id),

@@ -28,7 +28,19 @@
 //!     system's Apple Event; part 10.5);
 //!   - `click:x,y` — a left click at a point of the Flux window opened last, in points from its top
 //!     left corner (a shot's pixels halved): mouse events posted to Flux's own event queue, so
-//!     the window server and the background mode don't stand in the way (part 10.5).
+//!     the window server and the background mode don't stand in the way (part 10.5);
+//!   - `drag-files:x,y=/a,/b` — files from Finder dragged into the window to `x, y` (window pixels,
+//!     as `click:`), and held there: gpui's `FileDropEvent::Entered` and `Pending`;
+//!     `drop-files:x,y` — dropped there: the mouse up that `FileDropEvent::Submit` becomes, without
+//!     its activating Flux (in the background the keyboard stays with the user's app), then
+//!     `Exited`, as AppKit ends a drag;
+//!   - `pinch:x,y=0.5` — a pinch on the trackpad at `x, y` (window points, as `click:`) that makes
+//!     the picture 50 % larger (`-0.5` — half as large): gpui's `PinchEvent`s of a gesture, its
+//!     magnification in steps a frame apart.
+//!
+//!   `FLUX_SCENARIO_PASTEBOARD=<name>` (gpui, Flux's patch) — the clipboard is the macOS pasteboard
+//!   of that name instead of the general one: a scenario copies and pastes without touching the
+//!   user's clipboard; a helper puts files on it as Finder does, or reads what Flux put there.
 //!
 //!   `END` is printed after the last step. Steps go to the window opened last (or brought forward
 //!   by opening its project again), unless `window:N` says otherwise.
@@ -542,6 +554,15 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
         );
         return STEP_PAUSE;
     }
+    if let Some(drag) = step.strip_prefix("drag-files:") {
+        return drag_files(drag, window, cx);
+    }
+    if let Some(point) = step.strip_prefix("drop-files:") {
+        return drop_files(point, window, cx);
+    }
+    if let Some(pinch) = step.strip_prefix("pinch:") {
+        return pinch_at(pinch, window, cx);
+    }
     if step == "app-terminate" {
         request_terminate();
         println!("TERMINATE requested");
@@ -622,6 +643,120 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
         if handled { "handled" } else { "ignored" }
     );
     STEP_PAUSE
+}
+
+/// `x,y` in window pixels.
+fn window_point(point: &str) -> Option<gpui::Point<gpui::Pixels>> {
+    let (x, y) = point.split_once(',')?;
+    Some(gpui::point(
+        gpui::px(x.parse().ok()?),
+        gpui::px(y.parse().ok()?),
+    ))
+}
+
+/// `drag-files:x,y=/a,/b`: files from Finder enter the window and are held at `x, y`.
+fn drag_files(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration {
+    use gpui::{ExternalPaths, FileDropEvent, PlatformInput};
+    let (point, paths) = step.split_once('=').unwrap_or((step, ""));
+    let Some(position) = window_point(point) else {
+        println!("BAD STEP drag-files:{step}: x,y=/path,/path");
+        return STEP_PAUSE;
+    };
+    let paths = ExternalPaths::new(paths.split(',').map(std::path::PathBuf::from));
+    let dispatched = window
+        .update(cx, |_, window, cx| {
+            let entered = FileDropEvent::Entered { position, paths };
+            window.dispatch_event(PlatformInput::FileDrop(entered), cx);
+            let pending = FileDropEvent::Pending { position };
+            window.dispatch_event(PlatformInput::FileDrop(pending), cx);
+        })
+        .is_ok();
+    println!(
+        "DRAG-FILES {step} -> {}",
+        if dispatched { "held" } else { "no window" }
+    );
+    STEP_PAUSE
+}
+
+/// `drop-files:x,y`: the files held by `drag-files:` are dropped at `x, y`. gpui turns
+/// `FileDropEvent::Submit` into this mouse up after activating the app; the step leaves the app
+/// as it is.
+fn drop_files(point: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration {
+    use gpui::{FileDropEvent, MouseButton, MouseUpEvent, PlatformInput};
+    let Some(position) = window_point(point) else {
+        println!("BAD STEP drop-files:{point}: x,y");
+        return STEP_PAUSE;
+    };
+    let dispatched = window
+        .update(cx, |_, window, cx| {
+            let up = MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+            window.dispatch_event(PlatformInput::MouseUp(up), cx);
+            window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Exited), cx);
+        })
+        .is_ok();
+    println!(
+        "DROP-FILES {point} -> {}",
+        if dispatched { "dropped" } else { "no window" }
+    );
+    STEP_PAUSE
+}
+
+/// `pinch:x,y=0.5`: a pinch at `x, y` that magnifies by 0.5 in all — its start, the magnification
+/// in steps of equal ratio a frame apart (the picture redraws between them, as under the
+/// fingers), its end.
+fn pinch_at(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration {
+    use gpui::{PinchEvent, PlatformInput, TouchPhase};
+    const PINCH_STEPS: usize = 8;
+    let (point, magnification) = step.split_once('=').unwrap_or((step, ""));
+    let magnification = magnification
+        .parse::<f32>()
+        .ok()
+        .filter(|magnification| magnification.is_finite() && *magnification > -1.);
+    let (Some(point), Some(magnification)) = (window_point(point), magnification) else {
+        println!("BAD STEP pinch:{step}: x,y=0.5");
+        return STEP_PAUSE;
+    };
+    let delta = (1. + magnification).powf(1. / PINCH_STEPS as f32) - 1.;
+    let events: Vec<(TouchPhase, f32)> = std::iter::once((TouchPhase::Started, 0.))
+        .chain(std::iter::repeat_n((TouchPhase::Moved, delta), PINCH_STEPS))
+        .chain(std::iter::once((TouchPhase::Ended, 0.)))
+        .collect();
+    let count = events.len() as u32;
+    let step = step.to_string();
+    cx.spawn(async move |cx| {
+        let mut handled = Some(true);
+        for (phase, delta) in events {
+            let result = window.update(cx, |_, window, cx| {
+                // Window points, as the platform gives them: the window's pixels at its scale.
+                let event = PinchEvent {
+                    position: point * (1. / window.ui_scale()),
+                    delta,
+                    modifiers: Modifiers::default(),
+                    phase,
+                };
+                !window
+                    .dispatch_event(PlatformInput::Pinch(event), cx)
+                    .propagate
+            });
+            handled = handled.zip(result.ok()).map(|(all, this)| all && this);
+            cx.background_executor().timer(HEADLESS_FRAME).await;
+        }
+        let outcome = match handled {
+            Some(true) => "handled",
+            Some(false) => "ignored",
+            None => "no window",
+        };
+        println!("PINCH {step} -> {outcome}");
+    })
+    .detach();
+    // The events and the frames between them, with room (a debug build draws a frame slower): the
+    // next step comes after the pinch.
+    STEP_PAUSE + HEADLESS_FRAME * count * 6
 }
 
 /// A click on a plugin's tool window element (or ↵ in its field with `text`), delivered to the

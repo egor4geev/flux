@@ -34,6 +34,20 @@ diff -ruN a/src/app.rs b/src/app.rs
      /// Schedules all windows in the application to be redrawn. This can be called
      /// multiple times in an update cycle and still result in a single redraw.
      pub fn refresh_windows(&mut self) {
+@@ -1040,6 +1066,13 @@
+     /// Writes data to the platform clipboard.
+     pub fn write_to_clipboard(&self, item: ClipboardItem) {
+         self.platform.write_to_clipboard(item)
++    }
++
++    /// Flux patch: empties the platform clipboard — after files that were cut have been pasted, as
++    /// Explorer does, so nothing offers to paste files that are gone. macOS clears the pasteboard
++    /// (`clearContents`), Windows empties the clipboard (`EmptyClipboard`).
++    pub fn clear_clipboard(&self) {
++        self.platform.write_to_clipboard(ClipboardItem::empty())
+     }
+ 
+     /// Reads data from the primary selection buffer.
 diff -ruN a/src/elements/animation.rs b/src/elements/animation.rs
 --- a/src/elements/animation.rs	2026-10-30 13:10:46
 +++ b/src/elements/animation.rs	2026-10-30 13:10:46
@@ -119,11 +133,13 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
      DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
      Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
      KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
-@@ -25,20 +25,21 @@
+@@ -25,20 +25,23 @@
      StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
      size,
  };
 +use crate::{BackgroundTag, Fill, Hsla, Rgba};
++// Flux patch (pinch): `Interactivity::on_pinch`.
++use crate::PinchEvent;
  use collections::HashMap;
  use refineable::Refineable;
  use smallvec::SmallVec;
@@ -143,7 +159,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  };
  use util::ResultExt;
  
-@@ -48,6 +49,225 @@
+@@ -48,6 +51,225 @@
  const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
  const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
  
@@ -369,7 +385,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  /// The styling information for a given group.
  pub struct GroupStyle {
      /// The identifier for this group.
-@@ -101,6 +321,17 @@
+@@ -101,6 +323,17 @@
          Interactivity::default()
      }
  
@@ -387,7 +403,75 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
      /// Gets the source location of construction. Returns `None` when not in debug mode.
      pub fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
          #[cfg(any(feature = "inspector", debug_assertions))]
-@@ -1818,7 +2049,8 @@
+@@ -321,6 +554,21 @@
+             }));
+     }
+ 
++    /// Flux patch (pinch): bind the given callback to pinch events of the trackpad during the
++    /// bubble phase. A pinch zooms what is under the pointer as the wheel scrolls it: the callback
++    /// is called where scroll wheel listeners are ([`Hitbox::should_handle_scroll`]).
++    /// The imperative API equivalent to [`InteractiveElement::on_pinch`]
++    ///
++    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
++    pub fn on_pinch(&mut self, listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static) {
++        self.pinch_listeners
++            .push(Box::new(move |event, phase, hitbox, window, cx| {
++                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
++                    (listener)(event, window, cx);
++                }
++            }));
++    }
++
+     /// Bind the given callback to an action dispatch during the capture phase
+     /// The imperative API equivalent to [`InteractiveElement::capture_action`]
+     ///
+@@ -835,6 +1083,16 @@
+         self
+     }
+ 
++    /// Flux patch (pinch): bind the given callback to pinch events of the trackpad during the
++    /// bubble phase.
++    /// The fluent API equivalent to [`Interactivity::on_pinch`]
++    ///
++    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
++    fn on_pinch(mut self, listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static) -> Self {
++        self.interactivity().on_pinch(listener);
++        self
++    }
++
+     /// Capture the given action, before normal action dispatch can fire
+     /// The fluent API equivalent to [`Interactivity::on_scroll_wheel`]
+     ///
+@@ -1192,6 +1450,10 @@
+ pub(crate) type ScrollWheelListener =
+     Box<dyn Fn(&ScrollWheelEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+ 
++/// Flux patch (pinch): see [`Interactivity::on_pinch`].
++pub(crate) type PinchListener =
++    Box<dyn Fn(&PinchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
++
+ pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+ 
+ pub(crate) type DragListener =
+@@ -1510,6 +1772,8 @@
+     pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
+     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
+     pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
++    /// Flux patch (pinch): see [`Interactivity::on_pinch`].
++    pub(crate) pinch_listeners: Vec<PinchListener>,
+     pub(crate) key_down_listeners: Vec<KeyDownListener>,
+     pub(crate) key_up_listeners: Vec<KeyUpListener>,
+     pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
+@@ -1705,6 +1969,8 @@
+             || !self.mouse_move_listeners.is_empty()
+             || !self.click_listeners.is_empty()
+             || !self.scroll_wheel_listeners.is_empty()
++            // Flux patch (pinch).
++            || !self.pinch_listeners.is_empty()
+             || self.drag_listener.is_some()
+             || !self.drop_listeners.is_empty()
+             || self.tooltip_builder.is_some()
+@@ -1818,7 +2084,8 @@
                      window.next_frame.tab_stops.insert(focus_handle);
                  }
  
@@ -397,7 +481,22 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
                      style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                          window.with_text_style(style.text_style().cloned(), |window| {
                              window.with_content_mask(
-@@ -2419,6 +2651,15 @@
+@@ -2065,6 +2332,14 @@
+             })
+         }
+ 
++        // Flux patch (pinch).
++        for listener in self.pinch_listeners.drain(..) {
++            let hitbox = hitbox.clone();
++            window.on_mouse_event(move |event: &PinchEvent, phase, window, cx| {
++                listener(event, phase, &hitbox, window, cx);
++            })
++        }
++
+         if self.hover_style.is_some()
+             || self.base_style.mouse_cursor.is_some()
+             || cx.active_drag.is_some() && !self.drag_over_styles.is_empty()
+@@ -2419,6 +2694,15 @@
                      let mut scroll_offset = scroll_offset.borrow_mut();
                      let old_scroll_offset = *scroll_offset;
                      let delta = event.delta.pixel_delta(line_height);
@@ -413,7 +512,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  
                      let mut delta_x = Pixels::ZERO;
                      if overflow.x == Overflow::Scroll {
-@@ -2473,7 +2714,7 @@
+@@ -2473,7 +2757,7 @@
      fn compute_style_internal(
          &self,
          hitbox: Option<&Hitbox>,
@@ -422,7 +521,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
          window: &mut Window,
          cx: &mut App,
      ) -> Style {
-@@ -2494,20 +2735,74 @@
+@@ -2494,20 +2778,74 @@
              }
          }
  
@@ -507,7 +606,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
              }
  
              if let Some(drag) = cx.active_drag.take() {
-@@ -2541,23 +2836,54 @@
+@@ -2541,23 +2879,54 @@
          }
  
          if let Some(element_state) = element_state {
@@ -572,7 +671,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
          style
      }
  }
-@@ -2572,6 +2898,8 @@
+@@ -2572,6 +2941,8 @@
      pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
      pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
      pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
@@ -581,7 +680,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  }
  
  /// Whether or not the element or a group that contains it is clicked by the mouse.
-@@ -2630,6 +2958,8 @@
+@@ -2630,6 +3001,8 @@
      };
      if should_clear {
          active_tooltip.borrow_mut().take();
@@ -590,7 +689,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
          window.refresh();
      }
  }
-@@ -2749,13 +3079,21 @@
+@@ -2749,13 +3122,21 @@
              active_tooltip.borrow_mut().take();
          }
          Action::ScheduleShow => {
@@ -613,7 +712,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
                          let new_tooltip =
                              build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
                                  let active_tooltip = active_tooltip.clone();
-@@ -2779,6 +3117,7 @@
+@@ -2779,6 +3160,7 @@
                                      is_hoverable: tooltip_is_hoverable,
                                  }
                              });
@@ -621,6 +720,146 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
                          *active_tooltip.borrow_mut() = new_tooltip;
                          window.refresh();
                      })
+diff -ruN a/src/interactive.rs b/src/interactive.rs
+--- a/src/interactive.rs	2026-10-30 13:10:46
++++ b/src/interactive.rs	2026-10-30 13:10:46
+@@ -493,10 +493,17 @@
+ }
+ 
+ /// A collection of paths from the platform, such as from a file drop.
+-#[derive(Debug, Clone, Default)]
++// Flux patch: comparable, as the clipboard's entries are (`ClipboardEntry::ExternalPaths`).
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
+ pub struct ExternalPaths(pub(crate) SmallVec<[PathBuf; 2]>);
+ 
+ impl ExternalPaths {
++    /// Flux patch: paths the app has — files for the clipboard (`ClipboardItem::new_paths`), a
++    /// file drop of a test or a UI scenario (`FileDropEvent`).
++    pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
++        Self(paths.into_iter().collect())
++    }
++
+     /// Convert this collection of paths into a slice.
+     pub fn paths(&self) -> &[PathBuf] {
+         &self.0
+@@ -542,6 +549,40 @@
+ }
+ impl MouseEvent for FileDropEvent {}
+ 
++/// Flux patch (pinch): a pinch on the trackpad — two fingers spread apart or brought together, as
++/// photo viewers zoom. Dispatched as the other mouse events, at the pointer.
++#[derive(Clone, Debug, Default)]
++pub struct PinchEvent {
++    /// The position of the mouse on the window.
++    pub position: Point<Pixels>,
++
++    /// The magnification of this step of the pinch: 0.05 is 5 % larger, -0.05 smaller (macOS:
++    /// `NSEvent.magnification`). The new scale is the old one times `1 + delta`.
++    pub delta: f32,
++
++    /// The modifiers that were held down during the pinch.
++    pub modifiers: Modifiers,
++
++    /// The phase of the pinch: `Started` with its first event, `Ended` with its last.
++    pub phase: TouchPhase,
++}
++
++impl Sealed for PinchEvent {}
++impl InputEvent for PinchEvent {
++    fn to_platform_input(self) -> PlatformInput {
++        PlatformInput::Pinch(self)
++    }
++}
++impl MouseEvent for PinchEvent {}
++
++impl Deref for PinchEvent {
++    type Target = Modifiers;
++
++    fn deref(&self) -> &Self::Target {
++        &self.modifiers
++    }
++}
++
+ /// An enum corresponding to all kinds of platform input events.
+ #[derive(Clone, Debug)]
+ pub enum PlatformInput {
+@@ -563,6 +604,8 @@
+     ScrollWheel(ScrollWheelEvent),
+     /// Files were dragged and dropped onto the window.
+     FileDrop(FileDropEvent),
++    /// Flux patch (pinch): a pinch on the trackpad.
++    Pinch(PinchEvent),
+ }
+ 
+ impl PlatformInput {
+@@ -577,6 +620,7 @@
+             PlatformInput::MouseExited(event) => Some(event),
+             PlatformInput::ScrollWheel(event) => Some(event),
+             PlatformInput::FileDrop(event) => Some(event),
++            PlatformInput::Pinch(event) => Some(event),
+         }
+     }
+ 
+@@ -591,6 +635,7 @@
+             PlatformInput::MouseExited(_) => None,
+             PlatformInput::ScrollWheel(_) => None,
+             PlatformInput::FileDrop(_) => None,
++            PlatformInput::Pinch(_) => None,
+         }
+     }
+ }
+diff -ruN a/src/platform/linux/wayland/clipboard.rs b/src/platform/linux/wayland/clipboard.rs
+--- a/src/platform/linux/wayland/clipboard.rs	2026-10-30 13:10:46
++++ b/src/platform/linux/wayland/clipboard.rs	2026-10-30 13:10:46
+@@ -130,6 +130,8 @@
+                 let id = hash(&bytes);
+                 return Some(ClipboardItem {
+                     entries: vec![ClipboardEntry::Image(Image { format, bytes, id })],
++                    // Flux patch
++                    cut: false,
+                 });
+             }
+         }
+diff -ruN a/src/platform/mac/events.rs b/src/platform/mac/events.rs
+--- a/src/platform/mac/events.rs	2026-10-30 13:10:46
++++ b/src/platform/mac/events.rs	2026-10-30 13:10:46
+@@ -1,7 +1,7 @@
+ use crate::{
+     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
+     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels,
+-    PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
++    PinchEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
+     platform::mac::{
+         LMGetKbdType, NSStringExt, TISCopyCurrentKeyboardLayoutInputSource,
+         TISGetInputSourceProperty, UCKeyTranslate, kTISPropertyUnicodeKeyLayoutData,
+@@ -241,6 +241,27 @@
+                         delta,
+                         touch_phase: phase,
+                         modifiers: read_modifiers(native_event),
++                    })
++                }),
++                // Flux patch (pinch): a pinch on the trackpad (`magnifyWithEvent:`).
++                NSEventType::NSEventTypeMagnify => window_height.map(|window_height| {
++                    let phase = match native_event.phase() {
++                        NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
++                            TouchPhase::Started
++                        }
++                        NSEventPhase::NSEventPhaseEnded | NSEventPhase::NSEventPhaseCancelled => {
++                            TouchPhase::Ended
++                        }
++                        _ => TouchPhase::Moved,
++                    };
++                    Self::Pinch(PinchEvent {
++                        position: point(
++                            px(native_event.locationInWindow().x as f32),
++                            window_height - px(native_event.locationInWindow().y as f32),
++                        ),
++                        delta: native_event.magnification() as f32,
++                        modifiers: read_modifiers(native_event),
++                        phase,
+                     })
+                 }),
+                 NSEventType::NSLeftMouseDragged
 diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
 --- a/src/platform/mac/metal_renderer.rs	2026-10-30 13:10:46
 +++ b/src/platform/mac/metal_renderer.rs	2026-10-30 13:10:46
@@ -755,7 +994,37 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
 diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
 --- a/src/platform/mac/platform.rs	2026-10-30 13:10:46
 +++ b/src/platform/mac/platform.rs	2026-10-30 13:10:46
-@@ -98,7 +98,12 @@
+@@ -6,9 +6,9 @@
+ };
+ use crate::{
+     Action, AnyWindowHandle, BackgroundExecutor, ClipboardEntry, ClipboardItem, ClipboardString,
+-    CursorStyle, ForegroundExecutor, Image, ImageFormat, KeyContext, Keymap, MacDispatcher,
+-    MacDisplay, MacWindow, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
+-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
++    CursorStyle, ExternalPaths, ForegroundExecutor, Image, ImageFormat, KeyContext, Keymap,
++    MacDispatcher, MacDisplay, MacWindow, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
++    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+     PlatformWindow, Result, SemanticVersion, SystemMenuType, Task, WindowAppearance, WindowParams,
+     hash,
+ };
+@@ -19,7 +19,7 @@
+         NSApplication, NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular,
+         NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel, NSPasteboard,
+         NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeRTFD, NSPasteboardTypeString,
+-        NSPasteboardTypeTIFF, NSSavePanel, NSWindow,
++        NSPasteboardTypeTIFF, NSPasteboardURLReadingFileURLsOnlyKey, NSSavePanel, NSWindow,
+     },
+     base::{BOOL, NO, YES, id, nil, selector},
+     foundation::{
+@@ -47,6 +47,7 @@
+ };
+ use parking_lot::Mutex;
+ use ptr::null_mut;
++use smallvec::SmallVec;
+ use std::{
+     cell::Cell,
+     convert::TryInto,
+@@ -98,7 +99,12 @@
                  sel!(applicationWillTerminate:),
                  will_terminate as extern "C" fn(&mut Object, Sel, id),
              );
@@ -768,7 +1037,7 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
                  sel!(handleGPUIMenuItem:),
                  handle_menu_item as extern "C" fn(&mut Object, Sel, id),
              );
-@@ -168,6 +173,15 @@
+@@ -168,6 +174,15 @@
      reopen: Option<Box<dyn FnMut()>>,
      on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
      quit: Option<Box<dyn FnMut()>>,
@@ -784,7 +1053,16 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
      menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
      validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
      will_open_menu: Option<Box<dyn FnMut()>>,
-@@ -209,6 +223,9 @@
+@@ -204,11 +219,17 @@
+             background_executor: BackgroundExecutor::new(dispatcher.clone()),
+             foreground_executor: ForegroundExecutor::new(dispatcher),
+             renderer_context: renderer::Context::default(),
+-            pasteboard: unsafe { NSPasteboard::generalPasteboard(nil) },
++            // Flux patch: a UI scenario's own pasteboard ([`scenario_pasteboard`]).
++            pasteboard: unsafe {
++                scenario_pasteboard().unwrap_or_else(|| NSPasteboard::generalPasteboard(nil))
++            },
+             text_hash_pasteboard_type: unsafe { ns_string("zed-text-hash") },
              metadata_pasteboard_type: unsafe { ns_string("zed-metadata") },
              reopen: None,
              quit: None,
@@ -794,7 +1072,7 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
              menu_command: None,
              validate_menu_command: None,
              will_open_menu: None,
-@@ -510,6 +527,25 @@
+@@ -510,6 +531,25 @@
  
          use super::dispatcher::{dispatch_get_main_queue, dispatch_sys::dispatch_async_f};
  
@@ -820,7 +1098,7 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
          unsafe {
              dispatch_async_f(dispatch_get_main_queue(), ptr::null_mut(), Some(quit));
          }
-@@ -879,6 +915,24 @@
+@@ -879,6 +919,24 @@
          self.0.lock().reopen = Some(callback);
      }
  
@@ -845,13 +1123,194 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
      fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
          self.0.lock().on_keyboard_layout_change = Some(callback);
      }
-@@ -1425,6 +1479,96 @@
-         drop(lock);
-         callback();
-         platform.0.lock().quit.get_or_insert(callback);
-+    }
-+}
+@@ -1027,6 +1085,12 @@
+     fn write_to_clipboard(&self, item: ClipboardItem) {
+         use crate::ClipboardEntry;
+ 
++        // Flux patch: files and folders go as Finder's Copy puts them.
++        if let Some(paths) = item.paths() {
++            unsafe { self.write_paths_to_clipboard(paths, item.text().as_deref()) };
++            return;
++        }
 +
+         unsafe {
+             // We only want to use NSAttributedString if there are multiple entries to write.
+             if item.entries.len() <= 1 {
+@@ -1038,6 +1102,8 @@
+                         ClipboardEntry::Image(image) => {
+                             self.write_image_to_clipboard(image);
+                         }
++                        // Flux patch: written above.
++                        ClipboardEntry::ExternalPaths(_) => {}
+                     },
+                     None => {
+                         // Writing an empty list of entries just clears the clipboard.
+@@ -1100,40 +1166,19 @@
+     }
+ 
+     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
+-        let state = self.0.lock();
+-        let pasteboard = state.pasteboard;
+-
+-        // First, see if it's a string.
+-        unsafe {
+-            let types: id = pasteboard.types();
+-            let string_type: id = ns_string("public.utf8-plain-text");
+-
+-            if msg_send![types, containsObject: string_type] {
+-                let data = pasteboard.dataForType(string_type);
+-                if data == nil {
+-                    return None;
+-                } else if data.bytes().is_null() {
+-                    // https://developer.apple.com/documentation/foundation/nsdata/1410616-bytes?language=objc
+-                    // "If the length of the NSData object is 0, this property returns nil."
+-                    return Some(self.read_string_from_clipboard(&state, &[]));
+-                } else {
+-                    let bytes =
+-                        slice::from_raw_parts(data.bytes() as *mut u8, data.length() as usize);
+-
+-                    return Some(self.read_string_from_clipboard(&state, bytes));
+-                }
+-            }
+-
+-            // If it wasn't a string, try the various supported image types.
+-            for format in ImageFormat::iter() {
+-                if let Some(item) = try_clipboard_image(pasteboard, format) {
+-                    return Some(item);
+-                }
+-            }
+-        }
+-
+-        // If it wasn't a string or a supported image type, give up.
+-        None
++        // Flux patch: files and folders (Finder's Copy) — their file URLs become the item's paths,
++        // ahead of what is read as before (Finder's text is their names).
++        let paths = unsafe { self.read_paths_from_clipboard() };
++        let item = self.read_text_or_image_from_clipboard();
++        let Some(paths) = paths else {
++            return item;
++        };
++        let mut item = item.unwrap_or(ClipboardItem {
++            entries: Vec::new(),
++            cut: false,
++        });
++        item.entries.insert(0, ClipboardEntry::ExternalPaths(paths));
++        Some(item)
+     }
+ 
+     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
+@@ -1243,6 +1288,89 @@
+ }
+ 
+ impl MacPlatform {
++    /// Flux patch: gpui's `read_from_clipboard`, the text or an image; the files are read first
++    /// ([`MacPlatform::read_paths_from_clipboard`]).
++    fn read_text_or_image_from_clipboard(&self) -> Option<ClipboardItem> {
++        let state = self.0.lock();
++        let pasteboard = state.pasteboard;
++
++        // First, see if it's a string.
++        unsafe {
++            let types: id = pasteboard.types();
++            let string_type: id = ns_string("public.utf8-plain-text");
++
++            if msg_send![types, containsObject: string_type] {
++                let data = pasteboard.dataForType(string_type);
++                if data == nil {
++                    return None;
++                } else if data.bytes().is_null() {
++                    // https://developer.apple.com/documentation/foundation/nsdata/1410616-bytes?language=objc
++                    // "If the length of the NSData object is 0, this property returns nil."
++                    return Some(self.read_string_from_clipboard(&state, &[]));
++                } else {
++                    let bytes =
++                        slice::from_raw_parts(data.bytes() as *mut u8, data.length() as usize);
++
++                    return Some(self.read_string_from_clipboard(&state, bytes));
++                }
++            }
++
++            // If it wasn't a string, try the various supported image types.
++            for format in ImageFormat::iter() {
++                if let Some(item) = try_clipboard_image(pasteboard, format) {
++                    return Some(item);
++                }
++            }
++        }
++
++        // If it wasn't a string or a supported image type, give up.
++        None
++    }
++
++    /// Flux patch: the files and folders on the pasteboard (Finder's Copy puts a file URL per
++    /// item); a file reference URL is resolved to its path.
++    unsafe fn read_paths_from_clipboard(&self) -> Option<ExternalPaths> {
++        unsafe {
++            let pasteboard = self.0.lock().pasteboard;
++            let classes = NSArray::arrayWithObject(nil, class!(NSURL) as *const Class as id);
++            let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
++            let options: id = msg_send![class!(NSDictionary),
++                dictionaryWithObject: yes
++                forKey: NSPasteboardURLReadingFileURLsOnlyKey];
++            let urls = pasteboard.readObjectsForClasses_options(classes, options);
++            if urls == nil {
++                return None;
++            }
++            let paths: SmallVec<[PathBuf; 2]> = (0..urls.count())
++                .filter_map(|index| {
++                    let url: id = msg_send![urls.objectAtIndex(index), filePathURL];
++                    (url != nil).then(|| ns_url_to_path(url).ok()).flatten()
++                })
++                .collect();
++            (!paths.is_empty()).then(|| ExternalPaths(paths))
++        }
++    }
++
++    /// Flux patch: files and folders as Finder's Copy puts them — a file URL per item, so Finder
++    /// pastes the files — with `text` (the paths, one per line) as the first item's plain text.
++    unsafe fn write_paths_to_clipboard(&self, paths: &[PathBuf], text: Option<&str>) {
++        unsafe {
++            let state = self.0.lock();
++            state.pasteboard.clearContents();
++            let urls: id = msg_send![class!(NSMutableArray), arrayWithCapacity: paths.len()];
++            for path in paths {
++                let url = NSURL::fileURLWithPath_(nil, ns_string(&path.to_string_lossy()));
++                let _: () = msg_send![urls, addObject: url];
++            }
++            state.pasteboard.writeObjects(urls);
++            if let Some(text) = text {
++                state
++                    .pasteboard
++                    .setString_forType(ns_string(text), NSPasteboardTypeString);
++            }
++        }
++    }
++
+     unsafe fn read_string_from_clipboard(
+         &self,
+         state: &MacPlatformState,
+@@ -1267,6 +1395,8 @@
+ 
+             ClipboardItem {
+                 entries: vec![ClipboardEntry::String(ClipboardString { text, metadata })],
++                // Flux patch
++                cut: false,
+             }
+         }
+     }
+@@ -1344,6 +1474,8 @@
+ 
+                 Some(ClipboardItem {
+                     entries: vec![ClipboardEntry::Image(Image { format, bytes, id })],
++                    // Flux patch
++                    cut: false,
+                 })
+             }
+         } else {
+@@ -1428,6 +1560,96 @@
+     }
+ }
+ 
 +/// `NSApplicationTerminateReply`.
 +const NS_TERMINATE_NOW: NSUInteger = 1;
 +const NS_TERMINATE_LATER: NSUInteger = 2;
@@ -939,13 +1398,60 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
 +    unsafe {
 +        let app = NSApplication::sharedApplication(nil);
 +        let _: () = msg_send![app, replyToApplicationShouldTerminate: NO];
-     }
++    }
++}
++
+ extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
+     let platform = unsafe { get_mac_platform(this) };
+     let mut lock = platform.0.lock();
+@@ -1536,6 +1758,21 @@
+     unsafe { NSString::alloc(nil).init_str(string).autorelease() }
  }
  
++/// Flux patch: with `FLUX_SCENARIO_PASTEBOARD` (Flux's UI scenarios) the clipboard is the
++/// pasteboard of that name instead of the general one: a scenario's copies and pastes never touch
++/// the clipboard of the user working alongside.
++unsafe fn scenario_pasteboard() -> Option<id> {
++    let name = std::env::var("FLUX_SCENARIO_PASTEBOARD").ok()?;
++    if name.is_empty() {
++        return None;
++    }
++    unsafe {
++        let pasteboard = NSPasteboard::pasteboardWithName(nil, ns_string(&name));
++        // Kept for the app's lifetime, as the general pasteboard is.
++        Some(msg_send![pasteboard, retain])
++    }
++}
++
+ unsafe fn ns_url_to_path(url: id) -> Result<PathBuf> {
+     let path: *mut c_char = msg_send![url, fileSystemRepresentation];
+     anyhow::ensure!(!path.is_null(), "url is not a file path: {}", unsafe {
+@@ -1678,6 +1915,8 @@
+             entries: vec![ClipboardEntry::String(
+                 ClipboardString::new("2".to_string()).with_json_metadata(vec![3, 4]),
+             )],
++            // Flux patch
++            cut: false,
+         };
+         platform.write_to_clipboard(item.clone());
+         assert_eq!(platform.read_from_clipboard(), Some(item));
 diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
 --- a/src/platform/mac/window.rs	2026-10-30 13:10:46
 +++ b/src/platform/mac/window.rs	2026-10-30 13:10:46
-@@ -455,6 +455,12 @@
+@@ -169,7 +169,12 @@
+                     sel!(swipeWithEvent:),
+                     handle_view_event as extern "C" fn(&Object, Sel, id),
+                 );
++                // Flux patch (pinch): a pinch on the trackpad, a `PinchEvent`.
+                 decl.add_method(
++                    sel!(magnifyWithEvent:),
++                    handle_view_event as extern "C" fn(&Object, Sel, id),
++                );
++                decl.add_method(
+                     sel!(flagsChanged:),
+                     handle_view_event as extern "C" fn(&Object, Sel, id),
+                 );
+@@ -455,6 +460,12 @@
                          - traffic_light_position.y
                          - px(close_button_frame.size.height as f32),
                  );
@@ -958,7 +1464,7 @@ diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
                  let button_spacing =
                      px((min_button_frame.origin.x - close_button_frame.origin.x) as f32);
  
-@@ -1474,6 +1480,11 @@
+@@ -1474,6 +1485,11 @@
          this.renderer.draw(scene);
      }
  
@@ -970,7 +1476,7 @@ diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
      fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
          self.0.lock().renderer.sprite_atlas().clone()
      }
-@@ -1496,6 +1507,12 @@
+@@ -1496,6 +1512,12 @@
                  }
              })
              .detach()
@@ -983,6 +1489,259 @@ diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
      }
  
      fn titlebar_double_click(&self) {
+diff -ruN a/src/platform/windows/clipboard.rs b/src/platform/windows/clipboard.rs
+--- a/src/platform/windows/clipboard.rs	2026-10-30 13:10:46
++++ b/src/platform/windows/clipboard.rs	2026-10-30 13:10:46
+@@ -1,4 +1,9 @@
+-use std::sync::LazyLock;
++use std::{
++    ffi::OsString,
++    os::windows::ffi::{OsStrExt, OsStringExt},
++    path::PathBuf,
++    sync::LazyLock,
++};
+ 
+ use anyhow::Result;
+ use collections::{FxHashMap, FxHashSet};
+@@ -12,13 +17,15 @@
+             RegisterClipboardFormatW, SetClipboardData,
+         },
+         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
+-        Ole::{CF_HDROP, CF_UNICODETEXT},
++        Ole::{CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_MOVE},
+     },
+-    UI::Shell::{DragQueryFileW, HDROP},
++    UI::Shell::{DROPFILES, DragQueryFileW, HDROP},
+ };
+ use windows_core::PCWSTR;
+ 
+-use crate::{ClipboardEntry, ClipboardItem, ClipboardString, Image, ImageFormat, hash};
++use crate::{
++    ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat, hash,
++};
+ 
+ // https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-dragqueryfilew
+ const DRAGDROP_GET_FILES_COUNT: u32 = 0xFFFFFFFF;
+@@ -36,6 +43,9 @@
+     LazyLock::new(|| register_clipboard_format(windows::core::w!("PNG")));
+ static CLIPBOARD_JPG_FORMAT: LazyLock<u32> =
+     LazyLock::new(|| register_clipboard_format(windows::core::w!("JFIF")));
++/// Flux patch: whether files on the clipboard were cut or copied (Explorer's Cut: move).
++static CLIPBOARD_DROP_EFFECT_FORMAT: LazyLock<u32> =
++    LazyLock::new(|| register_clipboard_format(windows::core::w!("Preferred DropEffect")));
+ 
+ // Helper maps and sets
+ static FORMATS_MAP: LazyLock<FxHashMap<u32, ClipboardFormatType>> = LazyLock::new(|| {
+@@ -80,11 +90,24 @@
+ 
+ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
+     with_clipboard(|| {
+-        with_best_match_format(|item_format| match format_to_type(item_format) {
++        // Flux patch: files and folders (Explorer's Copy and Cut) become the item's paths, ahead of
++        // what is read as before; their text is the paths, one per line.
++        let paths = read_paths_from_clipboard();
++        let item = with_best_match_format(|item_format| match format_to_type(item_format) {
+             ClipboardFormatType::Text => read_string_from_clipboard(),
+             ClipboardFormatType::Image => read_image_from_clipboard(item_format),
+-            ClipboardFormatType::Files => read_files_from_clipboard(),
+-        })
++            ClipboardFormatType::Files => read_files_from_clipboard(paths.as_ref()),
++        });
++        let Some((paths, cut)) = paths else {
++            return item;
++        };
++        let mut item = item.unwrap_or(ClipboardItem {
++            entries: Vec::new(),
++            cut: false,
++        });
++        item.entries.insert(0, ClipboardEntry::ExternalPaths(paths));
++        item.cut = cut;
++        Some(item)
+     })
+     .flatten()
+ }
+@@ -151,6 +174,10 @@
+     unsafe {
+         EmptyClipboard()?;
+     }
++    // Flux patch: files and folders go as Explorer's Copy and Cut put them.
++    if let Some(paths) = item.paths() {
++        return write_paths_to_clipboard(paths, item.text(), item.is_cut());
++    }
+     match item.entries().first() {
+         Some(entry) => match entry {
+             ClipboardEntry::String(string) => {
+@@ -159,6 +186,8 @@
+             ClipboardEntry::Image(image) => {
+                 write_image_to_clipboard(image)?;
+             }
++            // Flux patch: written above.
++            ClipboardEntry::ExternalPaths(_) => {}
+         },
+         None => {
+             // Writing an empty list of entries just clears the clipboard.
+@@ -186,6 +215,77 @@
+     Ok(())
+ }
+ 
++/// Flux patch: files and folders as Explorer puts them — CF_HDROP, "Preferred DropEffect" (move
++/// for a cut, else copy) — and `text` (the paths, one per line) for whoever pastes text.
++fn write_paths_to_clipboard(paths: &[PathBuf], text: Option<String>, cut: bool) -> Result<()> {
++    set_data_to_clipboard(&encode_dropfiles(paths), CF_HDROP.0 as u32)?;
++    let effect = if cut {
++        DROPEFFECT_MOVE
++    } else {
++        DROPEFFECT_COPY
++    };
++    set_data_to_clipboard(&[effect.0], *CLIPBOARD_DROP_EFFECT_FORMAT)?;
++    if let Some(text) = text {
++        write_string_to_clipboard(&ClipboardString::new(text))?;
++    }
++    Ok(())
++}
++
++/// Flux patch: CF_HDROP's data for `paths` — `DROPFILES`, then each path in UTF-16 ending in NUL,
++/// then one more NUL. Public for Flux's tests (gpui's own need the dev-dependencies left out).
++pub fn encode_dropfiles(paths: &[PathBuf]) -> Vec<u8> {
++    let header = DROPFILES {
++        pFiles: std::mem::size_of::<DROPFILES>() as u32,
++        fWide: true.into(),
++        ..Default::default()
++    };
++    // SAFETY: `DROPFILES` is plain data (`repr(C, packed(1))`), read as its bytes.
++    let mut bytes = unsafe {
++        std::slice::from_raw_parts(
++            (&header as *const DROPFILES).cast::<u8>(),
++            std::mem::size_of::<DROPFILES>(),
++        )
++    }
++    .to_vec();
++    let mut wide = Vec::new();
++    for path in paths {
++        wide.extend(path.as_os_str().encode_wide());
++        wide.push(0);
++    }
++    // The list ends in an empty name: two NULs, even with no paths.
++    wide.push(0);
++    if paths.is_empty() {
++        wide.push(0);
++    }
++    bytes.extend(wide.into_iter().flat_map(u16::to_ne_bytes));
++    bytes
++}
++
++/// Flux patch: the paths in CF_HDROP's data (`DROPFILES` and the list after it); `None` unless the
++/// names are UTF-16 — the shell reads the rest ([`with_file_names`]). Public for Flux's tests.
++pub fn decode_dropfiles(bytes: &[u8]) -> Option<Vec<PathBuf>> {
++    if bytes.len() < std::mem::size_of::<DROPFILES>() {
++        return None;
++    }
++    // SAFETY: the bytes hold a whole `DROPFILES`, plain data read unaligned.
++    let header = unsafe { bytes.as_ptr().cast::<DROPFILES>().read_unaligned() };
++    if !header.fWide.as_bool() {
++        return None;
++    }
++    let units: Vec<u16> = bytes
++        .get(header.pFiles as usize..)?
++        .chunks_exact(2)
++        .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
++        .collect();
++    // Names up to the empty one; past it, only the allocation's slack.
++    let paths = units
++        .split(|unit| *unit == 0)
++        .take_while(|name| !name.is_empty())
++        .map(|name| PathBuf::from(OsString::from_wide(name)))
++        .collect();
++    Some(paths)
++}
++
+ fn set_data_to_clipboard<T>(data: &[T], format: u32) -> Result<()> {
+     unsafe {
+         let global = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of_val(data))?;
+@@ -259,6 +359,8 @@
+         if let Some(entry) = f(*item_format) {
+             return Some(ClipboardItem {
+                 entries: vec![entry],
++                // Flux patch
++                cut: false,
+             });
+         }
+     }
+@@ -345,19 +447,65 @@
+     Some(ClipboardEntry::Image(Image { format, bytes, id }))
+ }
+ 
+-fn read_files_from_clipboard() -> Option<ClipboardEntry> {
+-    let text = with_clipboard_data(CF_HDROP.0 as u32, |data_ptr, _size| {
+-        let hdrop = HDROP(data_ptr);
+-        let mut filenames = String::new();
+-        with_file_names(hdrop, |file_name| {
+-            filenames.push_str(&file_name);
+-        });
+-        filenames
+-    })?;
++/// Flux patch: the text of the files on the clipboard ([`read_paths_from_clipboard`]): their paths,
++/// one per line (gpui 0.2.2 ran them together).
++fn read_files_from_clipboard(paths: Option<&(ExternalPaths, bool)>) -> Option<ClipboardEntry> {
++    let (paths, _) = paths?;
++    let text = paths
++        .paths()
++        .iter()
++        .map(|path| path.to_string_lossy())
++        .join("\n");
+     Some(ClipboardEntry::String(ClipboardString {
+         text,
+         metadata: None,
+     }))
++}
++
++/// Flux patch: the files and folders on the clipboard (CF_HDROP), and whether they were cut —
++/// "Preferred DropEffect" is move, as Explorer's Cut sets it.
++fn read_paths_from_clipboard() -> Option<(ExternalPaths, bool)> {
++    unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32).ok()? };
++    let decoded = with_clipboard_data(CF_HDROP.0 as u32, |data_ptr, size| {
++        if data_ptr.is_null() {
++            return None;
++        }
++        // SAFETY: the locked clipboard data, `size` bytes.
++        decode_dropfiles(unsafe { std::slice::from_raw_parts(data_ptr.cast::<u8>(), size) })
++    })
++    .flatten();
++    let paths = match decoded {
++        Some(paths) => paths,
++        // Names that aren't UTF-16: the shell converts them.
++        None => {
++            let handle = unsafe { GetClipboardData(CF_HDROP.0 as u32) }.ok()?;
++            let mut paths = Vec::new();
++            with_file_names(HDROP(handle.0), |name| paths.push(PathBuf::from(name)));
++            paths
++        }
++    };
++    if paths.is_empty() {
++        return None;
++    }
++    let cut = read_drop_effect().is_some_and(drop_effect_is_move);
++    Some((ExternalPaths(paths.into()), cut))
++}
++
++/// Flux patch: "Preferred DropEffect" of the files on the clipboard.
++fn read_drop_effect() -> Option<u32> {
++    unsafe { IsClipboardFormatAvailable(*CLIPBOARD_DROP_EFFECT_FORMAT).ok()? };
++    with_clipboard_data(*CLIPBOARD_DROP_EFFECT_FORMAT, |data_ptr, size| {
++        (!data_ptr.is_null() && size >= std::mem::size_of::<u32>())
++            // SAFETY: the locked clipboard data, at least a DWORD.
++            .then(|| unsafe { data_ptr.cast::<u32>().read_unaligned() })
++    })
++    .flatten()
++}
++
++/// Flux patch: the files were cut — "Preferred DropEffect" says move and not copy (Explorer's Cut
++/// says move; its Copy, copy and link). Both, or neither: a copy, which loses nothing.
++fn drop_effect_is_move(effect: u32) -> bool {
++    effect & DROPEFFECT_MOVE.0 != 0 && effect & DROPEFFECT_COPY.0 == 0
+ }
+ 
+ fn with_clipboard_data<F, R>(format: u32, f: F) -> Option<R>
 diff -ruN a/src/platform/windows/directx_renderer.rs b/src/platform/windows/directx_renderer.rs
 --- a/src/platform/windows/directx_renderer.rs	2026-10-30 13:10:46
 +++ b/src/platform/windows/directx_renderer.rs	2026-10-30 13:10:46
@@ -1218,7 +1977,24 @@ diff -ruN a/src/platform/windows/events.rs b/src/platform/windows/events.rs
      fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
          self.start_tracking_mouse(handle, TME_LEAVE);
  
-@@ -864,18 +889,22 @@
+@@ -523,7 +548,15 @@
+         wparam: WPARAM,
+         lparam: LPARAM,
+     ) -> Option<isize> {
+-        let modifiers = current_modifiers();
++        let mut modifiers = current_modifiers();
++        // Flux patch (pinch): a precision touchpad's pinch comes as the wheel with Ctrl, and only
++        // the message's key state may say so, not the keyboard's: it zooms, as Ctrl with the wheel
++        // does. A Ctrl the keyboard holds stays as read (AltGr isn't Ctrl).
++        if MODIFIERKEYS_FLAGS(wparam.loword() as u32).contains(MK_CONTROL)
++            && !is_virtual_key_pressed(VK_CONTROL)
++        {
++            modifiers.control = true;
++        }
+         let mut lock = self.state.borrow_mut();
+         let Some(mut func) = lock.callbacks.input.take() else {
+             return Some(1);
+@@ -864,18 +897,22 @@
              return None;
          }
  
@@ -1247,7 +2023,7 @@ diff -ruN a/src/platform/windows/events.rs b/src/platform/windows/events.rs
              }
          } else {
              drop(lock);
-@@ -883,7 +912,7 @@
+@@ -883,7 +920,7 @@
  
          if !self.hide_title_bar {
              // If the OS draws the title bar, we don't need to handle hit test messages.
@@ -1256,7 +2032,7 @@ diff -ruN a/src/platform/windows/events.rs b/src/platform/windows/events.rs
          }
  
          // default handler for resize areas
-@@ -919,7 +948,7 @@
+@@ -919,7 +956,7 @@
              return Some(HTTOP as _);
          }
  
@@ -1299,10 +2075,32 @@ diff -ruN a/src/platform/windows/platform.rs b/src/platform/windows/platform.rs
      }
  
      fn close_one_window(&self, target_window: HWND) -> bool {
+diff -ruN a/src/platform/windows.rs b/src/platform/windows.rs
+--- a/src/platform/windows.rs	2026-10-30 13:10:46
++++ b/src/platform/windows.rs	2026-10-30 13:10:46
+@@ -16,6 +16,8 @@
+ mod wrapper;
+ 
+ pub(crate) use clipboard::*;
++// Flux patch: CF_HDROP's data, for Flux's tests.
++pub use clipboard::{decode_dropfiles, encode_dropfiles};
+ pub(crate) use destination_list::*;
+ pub(crate) use direct_write::*;
+ pub(crate) use directx_atlas::*;
 diff -ruN a/src/platform.rs b/src/platform.rs
 --- a/src/platform.rs	2026-10-30 13:10:46
 +++ b/src/platform.rs	2026-10-30 13:10:46
-@@ -230,6 +230,15 @@
+@@ -81,6 +81,9 @@
+ pub(crate) use test::*;
+ #[cfg(target_os = "windows")]
+ pub(crate) use windows::*;
++// Flux patch: CF_HDROP's data (files on the clipboard), public for Flux's tests.
++#[cfg(target_os = "windows")]
++pub use windows::{decode_dropfiles, encode_dropfiles};
+ 
+ #[cfg(any(test, feature = "test-support"))]
+ pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
+@@ -230,6 +233,15 @@
  
      fn on_quit(&self, callback: Box<dyn FnMut()>);
      fn on_reopen(&self, callback: Box<dyn FnMut()>);
@@ -1318,7 +2116,7 @@ diff -ruN a/src/platform.rs b/src/platform.rs
  
      fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
      fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
-@@ -499,6 +508,11 @@
+@@ -499,6 +511,11 @@
      fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
      fn draw(&self, scene: &Scene);
      fn completed_frame(&self) {}
@@ -1330,7 +2128,7 @@ diff -ruN a/src/platform.rs b/src/platform.rs
      fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
  
      // macOS specific methods
-@@ -514,6 +528,8 @@
+@@ -514,6 +531,8 @@
      fn set_edited(&mut self, _edited: bool) {}
      fn show_character_palette(&self) {}
      fn titlebar_double_click(&self) {}
@@ -1339,7 +2137,7 @@ diff -ruN a/src/platform.rs b/src/platform.rs
      fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
      fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
      fn on_select_previous_tab(&self, _callback: Box<dyn FnMut()>) {}
-@@ -940,7 +956,11 @@
+@@ -940,7 +959,11 @@
  
      fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
          self.cx
@@ -1352,7 +2150,7 @@ diff -ruN a/src/platform.rs b/src/platform.rs
              .ok()
              .flatten()
      }
-@@ -970,7 +990,11 @@
+@@ -970,7 +993,11 @@
      #[allow(unused)]
      pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
          self.cx
@@ -1365,6 +2163,117 @@ diff -ruN a/src/platform.rs b/src/platform.rs
              .ok()
              .flatten()
      }
+@@ -1503,6 +1530,9 @@
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct ClipboardItem {
+     entries: Vec<ClipboardEntry>,
++    /// Flux patch: the item was cut, not copied — pasting its paths moves them
++    /// ([`ClipboardItem::with_cut`]).
++    cut: bool,
+ }
+ 
+ /// Either a ClipboardString or a ClipboardImage
+@@ -1512,6 +1542,9 @@
+     String(ClipboardString),
+     /// An image entry
+     Image(Image),
++    /// Flux patch: files and folders, as Finder's and Explorer's Copy put them on the clipboard
++    /// ([`ClipboardItem::new_paths`], [`ClipboardItem::paths`]).
++    ExternalPaths(crate::ExternalPaths),
+ }
+ 
+ impl ClipboardItem {
+@@ -1519,6 +1552,7 @@
+     pub fn new_string(text: String) -> Self {
+         Self {
+             entries: vec![ClipboardEntry::String(ClipboardString::new(text))],
++            cut: false,
+         }
+     }
+ 
+@@ -1529,6 +1563,7 @@
+                 text,
+                 metadata: Some(metadata),
+             })],
++            cut: false,
+         }
+     }
+ 
+@@ -1538,6 +1573,7 @@
+             entries: vec![ClipboardEntry::String(
+                 ClipboardString::new(text).with_json_metadata(metadata),
+             )],
++            cut: false,
+         }
+     }
+ 
+@@ -1545,9 +1581,58 @@
+     pub fn new_image(image: &Image) -> Self {
+         Self {
+             entries: vec![ClipboardEntry::Image(image.clone())],
++            cut: false,
+         }
+     }
+ 
++    /// Flux patch: files and folders, as Finder's and Explorer's Copy put them on the clipboard —
++    /// the paths, and for whoever pastes text, the paths one per line.
++    pub fn new_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
++        let paths = crate::ExternalPaths::new(paths);
++        let text = paths
++            .paths()
++            .iter()
++            .map(|path| path.to_string_lossy())
++            .collect::<Vec<_>>()
++            .join("\n");
++        Self {
++            entries: vec![
++                ClipboardEntry::ExternalPaths(paths),
++                ClipboardEntry::String(ClipboardString::new(text)),
++            ],
++            cut: false,
++        }
++    }
++
++    /// Flux patch: the item is cut, not copied — pasting its paths moves them. Windows writes it as
++    /// Explorer's Cut does ("Preferred DropEffect": move); macOS has no cut of files.
++    pub fn with_cut(mut self, cut: bool) -> Self {
++        self.cut = cut;
++        self
++    }
++
++    /// Flux patch: the item was cut ([`ClipboardItem::with_cut`]; on Windows, by Explorer's Cut too).
++    pub fn is_cut(&self) -> bool {
++        self.cut
++    }
++
++    /// Flux patch: no entries — written, it empties the clipboard ([`App::clear_clipboard`]).
++    pub(crate) fn empty() -> Self {
++        Self {
++            entries: Vec::new(),
++            cut: false,
++        }
++    }
++
++    /// Flux patch: the files and folders on the clipboard (Finder's and Explorer's Copy and Cut),
++    /// if it holds any.
++    pub fn paths(&self) -> Option<&[PathBuf]> {
++        self.entries.iter().find_map(|entry| match entry {
++            ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
++            _ => None,
++        })
++    }
++
+     /// Concatenates together all the ClipboardString entries in the item.
+     /// Returns None if there were no ClipboardString entries.
+     pub fn text(&self) -> Option<String> {
+@@ -1608,6 +1693,7 @@
+     fn from(value: ClipboardEntry) -> Self {
+         Self {
+             entries: vec![value],
++            cut: false,
+         }
+     }
+ }
 diff -ruN a/src/style.rs b/src/style.rs
 --- a/src/style.rs	2026-10-30 13:10:46
 +++ b/src/style.rs	2026-10-30 13:10:46
@@ -1444,7 +2353,7 @@ diff -ruN a/src/taffy.rs b/src/taffy.rs
 diff -ruN a/src/window.rs b/src/window.rs
 --- a/src/window.rs	2026-10-30 13:10:46
 +++ b/src/window.rs	2026-10-30 13:10:46
-@@ -7,17 +7,20 @@
+@@ -7,17 +7,22 @@
      DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
      FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
      KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
@@ -1465,10 +2374,12 @@ diff -ruN a/src/window.rs b/src/window.rs
  };
 +// Flux patch (scroll axis): see `ScrollGesture`.
 +use crate::{Axis, TouchPhase};
++// Flux patch (pinch): a pinch on the trackpad.
++use crate::PinchEvent;
  use anyhow::{Context as _, Result, anyhow};
  use collections::{FxHashMap, FxHashSet};
  #[cfg(target_os = "macos")]
-@@ -95,6 +98,9 @@
+@@ -95,6 +100,9 @@
      pub dirty: bool,
      pub draw_phase: DrawPhase,
      pub dirty_views: FxHashSet<EntityId>,
@@ -1478,7 +2389,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  }
  
  #[derive(Clone)]
-@@ -109,6 +115,7 @@
+@@ -109,6 +117,7 @@
                  dirty: true,
                  draw_phase: DrawPhase::None,
                  dirty_views: FxHashSet::default(),
@@ -1486,7 +2397,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              })),
          }
      }
-@@ -118,6 +125,7 @@
+@@ -118,6 +127,7 @@
          inner.dirty_views.insert(entity);
          if inner.draw_phase == DrawPhase::None {
              inner.dirty = true;
@@ -1494,7 +2405,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              cx.push_effect(Effect::Notify { emitter: entity });
              true
          } else {
-@@ -130,9 +138,18 @@
+@@ -130,9 +140,18 @@
      }
  
      pub fn set_dirty(&self, dirty: bool) {
@@ -1514,7 +2425,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub fn set_phase(&self, phase: DrawPhase) {
          self.inner.borrow_mut().draw_phase = phase
      }
-@@ -815,6 +832,16 @@
+@@ -815,6 +834,16 @@
      }
  }
  
@@ -1531,7 +2442,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  /// Holds the state for a specific window.
  pub struct Window {
      pub(crate) handle: AnyWindowHandle,
-@@ -838,6 +865,10 @@
+@@ -838,6 +867,10 @@
      pub(crate) rendered_entity_stack: Vec<EntityId>,
      pub(crate) element_offset_stack: Vec<Point<Pixels>>,
      pub(crate) element_opacity: f32,
@@ -1542,7 +2453,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
      pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
      pub(crate) image_cache_stack: Vec<AnyImageCache>,
-@@ -846,6 +877,18 @@
+@@ -846,6 +879,18 @@
      next_hitbox_id: HitboxId,
      pub(crate) next_tooltip_id: TooltipId,
      pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -1561,7 +2472,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
      pub(crate) dirty_views: FxHashSet<EntityId>,
      focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
-@@ -856,13 +899,18 @@
+@@ -856,13 +901,18 @@
      modifiers: Modifiers,
      capslock: Capslock,
      scale_factor: f32,
@@ -1581,7 +2492,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub(crate) refreshing: bool,
      pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
      pub(crate) focus: Option<FocusId>,
-@@ -882,6 +930,131 @@
+@@ -882,6 +932,131 @@
      saw_keystroke: bool,
  }
  
@@ -1713,7 +2624,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub(crate) enum DrawPhase {
      None,
-@@ -991,7 +1164,7 @@
+@@ -991,7 +1166,7 @@
          let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
          let needs_present = Rc::new(Cell::new(false));
          let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
@@ -1722,7 +2633,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
          platform_window
              .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
-@@ -1021,7 +1194,7 @@
+@@ -1021,7 +1196,7 @@
              let active = active.clone();
              let needs_present = needs_present.clone();
              let next_frame_callbacks = next_frame_callbacks.clone();
@@ -1731,7 +2642,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              move |request_frame_options| {
                  let next_frame_callbacks = next_frame_callbacks.take();
                  if !next_frame_callbacks.is_empty() {
-@@ -1034,12 +1207,12 @@
+@@ -1034,12 +1209,12 @@
                          .log_err();
                  }
  
@@ -1748,7 +2659,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
                  if invalidator.is_dirty() || request_frame_options.force_render {
                      measure("frame duration", || {
-@@ -1125,7 +1298,12 @@
+@@ -1125,7 +1300,12 @@
              let mut cx = cx.to_async();
              Box::new(move |event| {
                  handle
@@ -1762,7 +2673,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                      .log_err()
                      .unwrap_or(DispatchEventResult::default())
              })
-@@ -1223,6 +1401,8 @@
+@@ -1223,6 +1403,8 @@
              element_offset_stack: Vec::new(),
              content_mask_stack: Vec::new(),
              element_opacity: 1.0,
@@ -1771,7 +2682,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              requested_autoscroll: None,
              rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
              next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
-@@ -1230,6 +1410,11 @@
+@@ -1230,6 +1412,11 @@
              next_hitbox_id: HitboxId(0),
              next_tooltip_id: TooltipId::default(),
              tooltip_bounds: None,
@@ -1783,7 +2694,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              dirty_views: FxHashSet::default(),
              focus_listeners: SubscriberSet::new(),
              focus_lost_listeners: SubscriberSet::new(),
-@@ -1239,13 +1424,15 @@
+@@ -1239,13 +1426,15 @@
              modifiers,
              capslock,
              scale_factor,
@@ -1800,7 +2711,23 @@ diff -ruN a/src/window.rs b/src/window.rs
              refreshing: false,
              activation_observers: SubscriberSet::new(),
              focus: None,
-@@ -1673,8 +1860,10 @@
+@@ -1269,9 +1458,14 @@
+     }
+ }
+ 
++/// What became of an event given to [`Window::dispatch_event`].
++// Flux patch: public, so `Window::dispatch_event` can be called outside gpui (Flux's UI scenarios
++// drop files with it).
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+-pub(crate) struct DispatchEventResult {
++pub struct DispatchEventResult {
++    /// No listener stopped the event.
+     pub propagate: bool,
++    /// A listener prevented the platform's default handling.
+     pub default_prevented: bool,
+ }
+ 
+@@ -1673,8 +1867,10 @@
      }
  
      fn bounds_changed(&mut self, cx: &mut App) {
@@ -1813,7 +2740,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          self.display_id = self.platform_window.display().map(|display| display.id());
  
          self.refresh();
-@@ -1691,7 +1880,9 @@
+@@ -1691,7 +1887,9 @@
  
      /// Set the content size of the window.
      pub fn resize(&mut self, size: Size<Pixels>) {
@@ -1824,7 +2751,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Returns whether or not the window is currently fullscreen
-@@ -1744,7 +1935,9 @@
+@@ -1744,7 +1942,9 @@
  
      /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
      pub fn show_window_menu(&self, position: Point<Pixels>) {
@@ -1835,7 +2762,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Tells the compositor to take control of window movement (Wayland and X11)
-@@ -1816,6 +2009,41 @@
+@@ -1816,6 +2016,41 @@
          self.scale_factor
      }
  
@@ -1877,7 +2804,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// The size of an em for the base font of the application. Adjusting this value allows the
      /// UI to scale, just like zooming a web page.
      pub fn rem_size(&self) -> Pixels {
-@@ -2010,6 +2238,29 @@
+@@ -2010,6 +2245,29 @@
          profiling::finish_frame!();
      }
  
@@ -1907,7 +2834,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      fn draw_roots(&mut self, cx: &mut App) {
          self.invalidator.set_phase(DrawPhase::Prepaint);
          self.tooltip_bounds.take();
-@@ -2052,14 +2303,22 @@
+@@ -2052,14 +2310,22 @@
              element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
              prompt_element = Some(element);
              self.prompt = Some(prompt);
@@ -1931,7 +2858,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          }
  
          self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
-@@ -2077,8 +2336,8 @@
+@@ -2077,8 +2343,8 @@
              prompt_element.paint(self, cx);
          } else if let Some(mut drag_element) = active_drag_element {
              drag_element.paint(self, cx);
@@ -1942,7 +2869,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          }
  
          #[cfg(any(feature = "inspector", debug_assertions))]
-@@ -2149,11 +2408,64 @@
+@@ -2149,11 +2415,64 @@
                  id: tooltip_request.id,
                  bounds: tooltip_bounds,
              });
@@ -2007,7 +2934,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
          assert_eq!(self.element_id_stack.len(), 0);
  
-@@ -2448,6 +2760,166 @@
+@@ -2448,6 +2767,166 @@
          result
      }
  
@@ -2174,7 +3101,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
      /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
      /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
-@@ -2783,8 +3255,10 @@
+@@ -2783,8 +3262,10 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -2187,7 +3114,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          if !clipped_bounds.is_empty() {
              self.next_frame
                  .scene
-@@ -2812,13 +3286,17 @@
+@@ -2812,13 +3293,17 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -2208,7 +3135,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  bounds: shadow_bounds.scale(scale_factor),
                  content_mask: content_mask.scale(scale_factor),
                  corner_radii: corner_radii.scale(scale_factor),
-@@ -2840,16 +3318,22 @@
+@@ -2840,16 +3325,22 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -2235,7 +3162,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              border_style: quad.border_style,
          });
      }
-@@ -2861,9 +3345,20 @@
+@@ -2861,9 +3352,20 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -2257,7 +3184,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let color: Background = color.into();
          path.color = color.opacity(opacity);
          self.next_frame
-@@ -2888,11 +3383,11 @@
+@@ -2888,11 +3390,11 @@
          } else {
              style.thickness
          };
@@ -2272,7 +3199,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let element_opacity = self.element_opacity();
  
          self.next_frame.scene.insert_primitive(Underline {
-@@ -2901,7 +3396,7 @@
+@@ -2901,7 +3403,7 @@
              bounds: bounds.scale(scale_factor),
              content_mask: content_mask.scale(scale_factor),
              color: style.color.unwrap_or_default().opacity(element_opacity),
@@ -2281,7 +3208,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              wavy: if style.wavy { 1 } else { 0 },
          });
      }
-@@ -2919,11 +3414,11 @@
+@@ -2919,11 +3421,11 @@
  
          let scale_factor = self.scale_factor();
          let height = style.thickness;
@@ -2296,7 +3223,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let opacity = self.element_opacity();
  
          self.next_frame.scene.insert_primitive(Underline {
-@@ -2931,7 +3426,7 @@
+@@ -2931,7 +3433,7 @@
              pad: 0,
              bounds: bounds.scale(scale_factor),
              content_mask: content_mask.scale(scale_factor),
@@ -2305,7 +3232,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              color: style.color.unwrap_or_default().opacity(opacity),
              wavy: 0,
          });
-@@ -2981,11 +3476,11 @@
+@@ -2981,11 +3483,11 @@
                      Ok(Some((size, Cow::Owned(bytes))))
                  })?
                  .expect("Callback above only errors or returns Some");
@@ -2320,7 +3247,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              self.next_frame.scene.insert_primitive(MonochromeSprite {
                  order: 0,
                  pad: 0,
-@@ -3038,11 +3533,11 @@
+@@ -3038,11 +3540,11 @@
                  })?
                  .expect("Callback above only errors or returns Some");
  
@@ -2335,7 +3262,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              let opacity = self.element_opacity();
  
              self.next_frame.scene.insert_primitive(PolychromeSprite {
-@@ -3094,7 +3589,7 @@
+@@ -3094,7 +3596,7 @@
          else {
              return Ok(());
          };
@@ -2344,7 +3271,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let svg_bounds = Bounds {
              origin: bounds.center()
                  - Point::new(
-@@ -3110,13 +3605,15 @@
+@@ -3110,13 +3612,15 @@
          self.next_frame.scene.insert_primitive(MonochromeSprite {
              order: 0,
              pad: 0,
@@ -2364,7 +3291,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          });
  
          Ok(())
-@@ -3155,17 +3652,21 @@
+@@ -3155,17 +3659,21 @@
                  )))
              })?
              .expect("Callback above only returns Some");
@@ -2391,7 +3318,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              content_mask,
              corner_radii,
              tile,
-@@ -3184,8 +3685,8 @@
+@@ -3184,8 +3692,8 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -2402,7 +3329,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          self.next_frame.scene.insert_primitive(PaintSurface {
              order: 0,
              bounds,
-@@ -3305,7 +3806,12 @@
+@@ -3305,7 +3813,12 @@
      pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
          self.invalidator.debug_assert_prepaint();
  
@@ -2416,7 +3343,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let mut id = self.next_hitbox_id;
          self.next_hitbox_id = self.next_hitbox_id.next();
          let hitbox = Hitbox {
-@@ -3579,7 +4085,8 @@
+@@ -3579,7 +4092,8 @@
      /// Dispatch a mouse or keyboard event on the window.
      #[profiling::function]
      pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
@@ -2426,7 +3353,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          // Handlers may set this to false by calling `stop_propagation`.
          cx.propagate_event = true;
          // Handlers may set this to true by calling `prevent_default`.
-@@ -3615,6 +4122,8 @@
+@@ -3615,8 +4129,16 @@
              PlatformInput::ScrollWheel(scroll_wheel) => {
                  self.mouse_position = scroll_wheel.position;
                  self.modifiers = scroll_wheel.modifiers;
@@ -2434,8 +3361,16 @@ diff -ruN a/src/window.rs b/src/window.rs
 +                self.scroll_gesture.update(&scroll_wheel, Instant::now());
                  PlatformInput::ScrollWheel(scroll_wheel)
              }
++            // Flux patch (pinch): it happens at the pointer, as the wheel does.
++            PlatformInput::Pinch(pinch) => {
++                self.mouse_position = pinch.position;
++                self.modifiers = pinch.modifiers;
++                PlatformInput::Pinch(pinch)
++            }
              // Translate dragging and dropping of external files from the operating system
-@@ -3668,6 +4177,10 @@
+             // to internal drag and drop events.
+             PlatformInput::FileDrop(file_drop) => match file_drop {
+@@ -3668,6 +4190,10 @@
              self.dispatch_key_event(any_key_event, cx);
          }
  
@@ -2446,7 +3381,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          DispatchEventResult {
              propagate: cx.propagate_event,
              default_prevented: self.default_prevented,
-@@ -4128,7 +4641,10 @@
+@@ -4128,7 +4654,10 @@
          self.on_next_frame(|window, cx| {
              if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                  if let Some(bounds) = input_handler.selected_bounds(window, cx) {
@@ -2458,7 +3393,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  }
                  window.platform_window.set_input_handler(input_handler);
              }
-@@ -5099,5 +5615,76 @@
+@@ -5099,5 +5628,81 @@
          border_widths: (1.).into(),
          border_color: border_color.into(),
          border_style,
@@ -2513,6 +3448,11 @@ diff -ruN a/src/window.rs b/src/window.rs
 +                position: position * factor,
 +            })
 +        }
++        // Flux patch (pinch): the magnification is a ratio, the same at any scale.
++        PlatformInput::Pinch(event) => PlatformInput::Pinch(PinchEvent {
++            position: event.position * factor,
++            ..event
++        }),
 +        event @ (PlatformInput::FileDrop(FileDropEvent::Exited)
 +        | PlatformInput::KeyDown(_)
 +        | PlatformInput::KeyUp(_)
