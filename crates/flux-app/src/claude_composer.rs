@@ -9,8 +9,9 @@
 //! - `@` lists the project's files (fuzzy, as ⌘P), `/` at the start the session's slash commands;
 //!   the list opens above the field, ↑ ↓ ↵ ⇥ Esc drive it.
 //! - The card's bottom row: the model, effort and permission mode pickers (⇧⇥ cycles Ask before
-//!   edits → Accept edits → Plan mode, as in the CLI), the context ring, attach, Send / Stop
-//!   (part 10.2, the chat's new look).
+//!   edits → Accept edits → Plan mode → Auto mode where the model has it, as in the CLI; Bypass
+//!   permissions only from the menu), the context ring, attach, Send / Stop (part 10.2, the chat's
+//!   new look).
 //! - `!` typed first in the empty field: shell mode (part 10.2) — a green `!` badge, ↵ runs the
 //!   command in the project's root ([`ClaudeSession::run_shell`]), its output goes to Claude; ⌫ in
 //!   the empty field or Esc leaves the mode.
@@ -264,7 +265,9 @@ fn mode_label(mode: PermissionMode) -> &'static str {
         PermissionMode::Default => tr("Ask before edits"),
         PermissionMode::AcceptEdits => tr("Accept edits"),
         PermissionMode::Plan => tr("Plan mode"),
-        PermissionMode::DontAsk => tr("Don't ask"),
+        // The CLI's "don't ask" refuses whatever isn't allowed in advance: named for what it does
+        // (0.4.1 — read as "go ahead without asking", it left Claude unable to edit).
+        PermissionMode::DontAsk => tr("Allowed only"),
         PermissionMode::Auto => tr("Auto mode"),
         PermissionMode::BypassPermissions => tr("Bypass permissions"),
     }
@@ -301,13 +304,28 @@ fn effort_short(effort: Effort) -> &'static str {
     }
 }
 
-/// ⇧⇥: the CLI's cycle of the three everyday modes.
-fn next_mode(mode: PermissionMode) -> PermissionMode {
+/// ⇧⇥: the CLI's cycle of the everyday modes, Auto mode among them when the model has it.
+fn next_mode(mode: PermissionMode, auto: bool) -> PermissionMode {
     match mode {
         PermissionMode::Default => PermissionMode::AcceptEdits,
         PermissionMode::AcceptEdits => PermissionMode::Plan,
+        PermissionMode::Plan if auto => PermissionMode::Auto,
         _ => PermissionMode::Default,
     }
+}
+
+/// The modes the picker offers: the CLI's own (Auto mode where the model has it) and Bypass
+/// permissions — Flux starts `claude` allowing it. "Don't ask" only while the session is in it
+/// (the CLI's settings can start one so).
+fn menu_modes(current: PermissionMode, auto: bool) -> Vec<PermissionMode> {
+    PermissionMode::ALL
+        .into_iter()
+        .filter(|&mode| match mode {
+            PermissionMode::Auto => auto || current == mode,
+            PermissionMode::DontAsk => current == mode,
+            _ => true,
+        })
+        .collect()
 }
 
 /// "28.9k".
@@ -1238,7 +1256,7 @@ impl Composer {
     }
 
     fn cycle_mode(&mut self, _: &CycleMode, _window: &mut Window, cx: &mut Context<Self>) {
-        let mode = next_mode(self.shown_mode(cx));
+        let mode = next_mode(self.shown_mode(cx), self.auto_mode(cx));
         self.choose_mode(mode, cx);
     }
 
@@ -1514,6 +1532,13 @@ impl Composer {
         )
     }
 
+    /// The session's model has Auto mode (unknown before the CLI lists its models: no).
+    fn auto_mode(&self, cx: &App) -> bool {
+        let models = &self.session.read(cx).model().models;
+        self.current_model(models, cx)
+            .is_some_and(|model| model.auto_mode)
+    }
+
     fn choose_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
         let reported = self.session.read(cx).model().info.permission_mode;
         self.mode_choice = Some(Choice {
@@ -1585,31 +1610,16 @@ impl Composer {
             }
             Picker::Mode => {
                 let current = self.shown_mode(cx);
-                let bypass = settings::claude(cx).extra_args.iter().any(|arg| {
-                    arg == "--allow-dangerously-skip-permissions"
-                        || arg == "--dangerously-skip-permissions"
-                });
+                let modes = menu_modes(current, self.auto_mode(cx));
                 cx.new(|cx| {
                     let mut menu = ContextMenu::new(window, cx).title(tr("Permission Mode"));
-                    for mode in [
-                        PermissionMode::Default,
-                        PermissionMode::AcceptEdits,
-                        PermissionMode::Plan,
-                        PermissionMode::DontAsk,
-                    ] {
+                    for mode in modes {
+                        // Bypass permissions stands apart: nothing is checked in it.
+                        if mode == PermissionMode::BypassPermissions {
+                            menu = menu.separator();
+                        }
                         menu = menu
                             .entry(mark(current == mode, mode_label(mode)), ChooseMode { mode });
-                    }
-                    if bypass || current == PermissionMode::BypassPermissions {
-                        menu = menu.separator().entry(
-                            mark(
-                                current == PermissionMode::BypassPermissions,
-                                mode_label(PermissionMode::BypassPermissions),
-                            ),
-                            ChooseMode {
-                                mode: PermissionMode::BypassPermissions,
-                            },
-                        );
                     }
                     menu
                 })
@@ -2922,13 +2932,31 @@ mod tests {
 
     #[test]
     fn modes_cycle_like_the_cli() {
+        use PermissionMode::*;
+        assert_eq!(next_mode(Default, false), AcceptEdits);
+        assert_eq!(next_mode(AcceptEdits, false), Plan);
+        assert_eq!(next_mode(Plan, false), Default);
+        assert_eq!(next_mode(Plan, true), Auto);
+        assert_eq!(next_mode(Auto, true), Default);
+        assert_eq!(next_mode(DontAsk, true), Default);
+        // ⇧⇥ never lands in Bypass permissions; from it, back to asking.
+        assert_eq!(next_mode(BypassPermissions, true), Default);
+    }
+
+    #[test]
+    fn the_picker_offers_auto_and_bypass_but_not_dont_ask() {
+        use PermissionMode::*;
         assert_eq!(
-            next_mode(PermissionMode::Default),
-            PermissionMode::AcceptEdits
+            menu_modes(Default, true),
+            [Default, AcceptEdits, Plan, Auto, BypassPermissions]
         );
-        assert_eq!(next_mode(PermissionMode::AcceptEdits), PermissionMode::Plan);
-        assert_eq!(next_mode(PermissionMode::Plan), PermissionMode::Default);
-        assert_eq!(next_mode(PermissionMode::DontAsk), PermissionMode::Default);
+        assert_eq!(
+            menu_modes(Default, false),
+            [Default, AcceptEdits, Plan, BypassPermissions]
+        );
+        // A session already in a mode shows it, checked.
+        assert!(menu_modes(DontAsk, false).contains(&DontAsk));
+        assert!(menu_modes(Auto, false).contains(&Auto));
     }
 
     #[test]

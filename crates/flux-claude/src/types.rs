@@ -18,7 +18,8 @@ pub enum PermissionMode {
     DontAsk,
     /// A classifier decides (not every model has it).
     Auto,
-    /// Nothing is checked; only when `claude` was started allowing it.
+    /// Nothing is checked; only when `claude` was started allowing it (Flux always allows it:
+    /// `--allow-dangerously-skip-permissions`).
     BypassPermissions,
 }
 
@@ -104,6 +105,8 @@ pub struct ModelInfo {
     pub efforts: Vec<Effort>,
     /// Listed but not usable with this CLI ("Update Claude Code to use this model").
     pub disabled: bool,
+    /// Auto mode (a classifier approves what's safe) works with it (`supportsAutoMode`).
+    pub auto_mode: bool,
 }
 
 impl ModelInfo {
@@ -129,6 +132,7 @@ impl ModelInfo {
                 })
                 .unwrap_or_default(),
             disabled: value["disabled"].as_bool().unwrap_or(false),
+            auto_mode: value["supportsAutoMode"].as_bool().unwrap_or(false),
         })
     }
 }
