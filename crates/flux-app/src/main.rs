@@ -343,18 +343,33 @@ fn set_app_user_model_id() {
 /// directory that contains a repository (`.git`, etc.), otherwise the current directory itself. If
 /// not launched from a terminal (the current directory is `/`), there is no project: the projects
 /// open when Flux quit come back instead (a scenario pretends so with `FLUX_SCENARIO_FINDER`).
+///
+/// On Windows only the arguments count (0.4.1): Flux has no command in a terminal there, and the
+/// Start menu, the taskbar, the installer and updates start it in a folder nobody chose
+/// (System32, Flux's own folder) — taken for a project, it hid the projects open at the last quit.
 fn project_root(dirs: Vec<PathBuf>) -> Option<PathBuf> {
     let mut dirs = dirs.into_iter();
     let root = match dirs.next() {
-        Some(dir) => dir,
+        Some(dir) => {
+            log::info!("launch: the project {} from the arguments", dir.display());
+            dir
+        }
         None => {
             #[cfg(feature = "scenario")]
             if scenario::launched_from_finder() {
                 return None;
             }
             let cwd = std::env::current_dir().ok()?;
-            cwd.parent()?;
-            find_vcs_root(&cwd).unwrap_or(cwd)
+            if cfg!(windows) || cwd.parent().is_none() {
+                log::info!("launch: no project folder, the projects open at the last quit");
+                return None;
+            }
+            let root = find_vcs_root(&cwd).unwrap_or(cwd);
+            log::info!(
+                "launch: the project {} from the current directory",
+                root.display()
+            );
+            root
         }
     };
     for extra in dirs {
