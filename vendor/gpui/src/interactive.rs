@@ -549,6 +549,40 @@ impl InputEvent for FileDropEvent {
 }
 impl MouseEvent for FileDropEvent {}
 
+/// Flux patch (pinch): a pinch on the trackpad — two fingers spread apart or brought together, as
+/// photo viewers zoom. Dispatched as the other mouse events, at the pointer.
+#[derive(Clone, Debug, Default)]
+pub struct PinchEvent {
+    /// The position of the mouse on the window.
+    pub position: Point<Pixels>,
+
+    /// The magnification of this step of the pinch: 0.05 is 5 % larger, -0.05 smaller (macOS:
+    /// `NSEvent.magnification`). The new scale is the old one times `1 + delta`.
+    pub delta: f32,
+
+    /// The modifiers that were held down during the pinch.
+    pub modifiers: Modifiers,
+
+    /// The phase of the pinch: `Started` with its first event, `Ended` with its last.
+    pub phase: TouchPhase,
+}
+
+impl Sealed for PinchEvent {}
+impl InputEvent for PinchEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::Pinch(self)
+    }
+}
+impl MouseEvent for PinchEvent {}
+
+impl Deref for PinchEvent {
+    type Target = Modifiers;
+
+    fn deref(&self) -> &Self::Target {
+        &self.modifiers
+    }
+}
+
 /// An enum corresponding to all kinds of platform input events.
 #[derive(Clone, Debug)]
 pub enum PlatformInput {
@@ -570,6 +604,8 @@ pub enum PlatformInput {
     ScrollWheel(ScrollWheelEvent),
     /// Files were dragged and dropped onto the window.
     FileDrop(FileDropEvent),
+    /// Flux patch (pinch): a pinch on the trackpad.
+    Pinch(PinchEvent),
 }
 
 impl PlatformInput {
@@ -584,6 +620,7 @@ impl PlatformInput {
             PlatformInput::MouseExited(event) => Some(event),
             PlatformInput::ScrollWheel(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
+            PlatformInput::Pinch(event) => Some(event),
         }
     }
 
@@ -598,6 +635,7 @@ impl PlatformInput {
             PlatformInput::MouseExited(_) => None,
             PlatformInput::ScrollWheel(_) => None,
             PlatformInput::FileDrop(_) => None,
+            PlatformInput::Pinch(_) => None,
         }
     }
 }

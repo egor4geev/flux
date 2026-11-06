@@ -133,11 +133,13 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
      DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
      Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
      KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
-@@ -25,20 +25,21 @@
+@@ -25,20 +25,23 @@
      StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
      size,
  };
 +use crate::{BackgroundTag, Fill, Hsla, Rgba};
++// Flux patch (pinch): `Interactivity::on_pinch`.
++use crate::PinchEvent;
  use collections::HashMap;
  use refineable::Refineable;
  use smallvec::SmallVec;
@@ -157,7 +159,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  };
  use util::ResultExt;
  
-@@ -48,6 +49,225 @@
+@@ -48,6 +51,225 @@
  const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
  const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
  
@@ -383,7 +385,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  /// The styling information for a given group.
  pub struct GroupStyle {
      /// The identifier for this group.
-@@ -101,6 +321,17 @@
+@@ -101,6 +323,17 @@
          Interactivity::default()
      }
  
@@ -401,7 +403,75 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
      /// Gets the source location of construction. Returns `None` when not in debug mode.
      pub fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
          #[cfg(any(feature = "inspector", debug_assertions))]
-@@ -1818,7 +2049,8 @@
+@@ -321,6 +554,21 @@
+             }));
+     }
+ 
++    /// Flux patch (pinch): bind the given callback to pinch events of the trackpad during the
++    /// bubble phase. A pinch zooms what is under the pointer as the wheel scrolls it: the callback
++    /// is called where scroll wheel listeners are ([`Hitbox::should_handle_scroll`]).
++    /// The imperative API equivalent to [`InteractiveElement::on_pinch`]
++    ///
++    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
++    pub fn on_pinch(&mut self, listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static) {
++        self.pinch_listeners
++            .push(Box::new(move |event, phase, hitbox, window, cx| {
++                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
++                    (listener)(event, window, cx);
++                }
++            }));
++    }
++
+     /// Bind the given callback to an action dispatch during the capture phase
+     /// The imperative API equivalent to [`InteractiveElement::capture_action`]
+     ///
+@@ -835,6 +1083,16 @@
+         self
+     }
+ 
++    /// Flux patch (pinch): bind the given callback to pinch events of the trackpad during the
++    /// bubble phase.
++    /// The fluent API equivalent to [`Interactivity::on_pinch`]
++    ///
++    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
++    fn on_pinch(mut self, listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static) -> Self {
++        self.interactivity().on_pinch(listener);
++        self
++    }
++
+     /// Capture the given action, before normal action dispatch can fire
+     /// The fluent API equivalent to [`Interactivity::on_scroll_wheel`]
+     ///
+@@ -1192,6 +1450,10 @@
+ pub(crate) type ScrollWheelListener =
+     Box<dyn Fn(&ScrollWheelEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+ 
++/// Flux patch (pinch): see [`Interactivity::on_pinch`].
++pub(crate) type PinchListener =
++    Box<dyn Fn(&PinchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
++
+ pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+ 
+ pub(crate) type DragListener =
+@@ -1510,6 +1772,8 @@
+     pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
+     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
+     pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
++    /// Flux patch (pinch): see [`Interactivity::on_pinch`].
++    pub(crate) pinch_listeners: Vec<PinchListener>,
+     pub(crate) key_down_listeners: Vec<KeyDownListener>,
+     pub(crate) key_up_listeners: Vec<KeyUpListener>,
+     pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
+@@ -1705,6 +1969,8 @@
+             || !self.mouse_move_listeners.is_empty()
+             || !self.click_listeners.is_empty()
+             || !self.scroll_wheel_listeners.is_empty()
++            // Flux patch (pinch).
++            || !self.pinch_listeners.is_empty()
+             || self.drag_listener.is_some()
+             || !self.drop_listeners.is_empty()
+             || self.tooltip_builder.is_some()
+@@ -1818,7 +2084,8 @@
                      window.next_frame.tab_stops.insert(focus_handle);
                  }
  
@@ -411,7 +481,22 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
                      style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                          window.with_text_style(style.text_style().cloned(), |window| {
                              window.with_content_mask(
-@@ -2419,6 +2651,15 @@
+@@ -2065,6 +2332,14 @@
+             })
+         }
+ 
++        // Flux patch (pinch).
++        for listener in self.pinch_listeners.drain(..) {
++            let hitbox = hitbox.clone();
++            window.on_mouse_event(move |event: &PinchEvent, phase, window, cx| {
++                listener(event, phase, &hitbox, window, cx);
++            })
++        }
++
+         if self.hover_style.is_some()
+             || self.base_style.mouse_cursor.is_some()
+             || cx.active_drag.is_some() && !self.drag_over_styles.is_empty()
+@@ -2419,6 +2694,15 @@
                      let mut scroll_offset = scroll_offset.borrow_mut();
                      let old_scroll_offset = *scroll_offset;
                      let delta = event.delta.pixel_delta(line_height);
@@ -427,7 +512,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  
                      let mut delta_x = Pixels::ZERO;
                      if overflow.x == Overflow::Scroll {
-@@ -2473,7 +2714,7 @@
+@@ -2473,7 +2757,7 @@
      fn compute_style_internal(
          &self,
          hitbox: Option<&Hitbox>,
@@ -436,7 +521,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
          window: &mut Window,
          cx: &mut App,
      ) -> Style {
-@@ -2494,20 +2735,74 @@
+@@ -2494,20 +2778,74 @@
              }
          }
  
@@ -521,7 +606,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
              }
  
              if let Some(drag) = cx.active_drag.take() {
-@@ -2541,23 +2836,54 @@
+@@ -2541,23 +2879,54 @@
          }
  
          if let Some(element_state) = element_state {
@@ -586,7 +671,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
          style
      }
  }
-@@ -2572,6 +2898,8 @@
+@@ -2572,6 +2941,8 @@
      pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
      pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
      pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
@@ -595,7 +680,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
  }
  
  /// Whether or not the element or a group that contains it is clicked by the mouse.
-@@ -2630,6 +2958,8 @@
+@@ -2630,6 +3001,8 @@
      };
      if should_clear {
          active_tooltip.borrow_mut().take();
@@ -604,7 +689,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
          window.refresh();
      }
  }
-@@ -2749,13 +3079,21 @@
+@@ -2749,13 +3122,21 @@
              active_tooltip.borrow_mut().take();
          }
          Action::ScheduleShow => {
@@ -627,7 +712,7 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
                          let new_tooltip =
                              build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
                                  let active_tooltip = active_tooltip.clone();
-@@ -2779,6 +3117,7 @@
+@@ -2779,6 +3160,7 @@
                                      is_hoverable: tooltip_is_hoverable,
                                  }
                              });
@@ -657,6 +742,72 @@ diff -ruN a/src/interactive.rs b/src/interactive.rs
      /// Convert this collection of paths into a slice.
      pub fn paths(&self) -> &[PathBuf] {
          &self.0
+@@ -542,6 +549,40 @@
+ }
+ impl MouseEvent for FileDropEvent {}
+ 
++/// Flux patch (pinch): a pinch on the trackpad — two fingers spread apart or brought together, as
++/// photo viewers zoom. Dispatched as the other mouse events, at the pointer.
++#[derive(Clone, Debug, Default)]
++pub struct PinchEvent {
++    /// The position of the mouse on the window.
++    pub position: Point<Pixels>,
++
++    /// The magnification of this step of the pinch: 0.05 is 5 % larger, -0.05 smaller (macOS:
++    /// `NSEvent.magnification`). The new scale is the old one times `1 + delta`.
++    pub delta: f32,
++
++    /// The modifiers that were held down during the pinch.
++    pub modifiers: Modifiers,
++
++    /// The phase of the pinch: `Started` with its first event, `Ended` with its last.
++    pub phase: TouchPhase,
++}
++
++impl Sealed for PinchEvent {}
++impl InputEvent for PinchEvent {
++    fn to_platform_input(self) -> PlatformInput {
++        PlatformInput::Pinch(self)
++    }
++}
++impl MouseEvent for PinchEvent {}
++
++impl Deref for PinchEvent {
++    type Target = Modifiers;
++
++    fn deref(&self) -> &Self::Target {
++        &self.modifiers
++    }
++}
++
+ /// An enum corresponding to all kinds of platform input events.
+ #[derive(Clone, Debug)]
+ pub enum PlatformInput {
+@@ -563,6 +604,8 @@
+     ScrollWheel(ScrollWheelEvent),
+     /// Files were dragged and dropped onto the window.
+     FileDrop(FileDropEvent),
++    /// Flux patch (pinch): a pinch on the trackpad.
++    Pinch(PinchEvent),
+ }
+ 
+ impl PlatformInput {
+@@ -577,6 +620,7 @@
+             PlatformInput::MouseExited(event) => Some(event),
+             PlatformInput::ScrollWheel(event) => Some(event),
+             PlatformInput::FileDrop(event) => Some(event),
++            PlatformInput::Pinch(event) => Some(event),
+         }
+     }
+ 
+@@ -591,6 +635,7 @@
+             PlatformInput::MouseExited(_) => None,
+             PlatformInput::ScrollWheel(_) => None,
+             PlatformInput::FileDrop(_) => None,
++            PlatformInput::Pinch(_) => None,
+         }
+     }
+ }
 diff -ruN a/src/platform/linux/wayland/clipboard.rs b/src/platform/linux/wayland/clipboard.rs
 --- a/src/platform/linux/wayland/clipboard.rs	2026-10-30 13:10:46
 +++ b/src/platform/linux/wayland/clipboard.rs	2026-10-30 13:10:46
@@ -669,6 +820,46 @@ diff -ruN a/src/platform/linux/wayland/clipboard.rs b/src/platform/linux/wayland
                  });
              }
          }
+diff -ruN a/src/platform/mac/events.rs b/src/platform/mac/events.rs
+--- a/src/platform/mac/events.rs	2026-10-30 13:10:46
++++ b/src/platform/mac/events.rs	2026-10-30 13:10:46
+@@ -1,7 +1,7 @@
+ use crate::{
+     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
+     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels,
+-    PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
++    PinchEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
+     platform::mac::{
+         LMGetKbdType, NSStringExt, TISCopyCurrentKeyboardLayoutInputSource,
+         TISGetInputSourceProperty, UCKeyTranslate, kTISPropertyUnicodeKeyLayoutData,
+@@ -241,6 +241,27 @@
+                         delta,
+                         touch_phase: phase,
+                         modifiers: read_modifiers(native_event),
++                    })
++                }),
++                // Flux patch (pinch): a pinch on the trackpad (`magnifyWithEvent:`).
++                NSEventType::NSEventTypeMagnify => window_height.map(|window_height| {
++                    let phase = match native_event.phase() {
++                        NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
++                            TouchPhase::Started
++                        }
++                        NSEventPhase::NSEventPhaseEnded | NSEventPhase::NSEventPhaseCancelled => {
++                            TouchPhase::Ended
++                        }
++                        _ => TouchPhase::Moved,
++                    };
++                    Self::Pinch(PinchEvent {
++                        position: point(
++                            px(native_event.locationInWindow().x as f32),
++                            window_height - px(native_event.locationInWindow().y as f32),
++                        ),
++                        delta: native_event.magnification() as f32,
++                        modifiers: read_modifiers(native_event),
++                        phase,
+                     })
+                 }),
+                 NSEventType::NSLeftMouseDragged
 diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
 --- a/src/platform/mac/metal_renderer.rs	2026-10-30 13:10:46
 +++ b/src/platform/mac/metal_renderer.rs	2026-10-30 13:10:46
@@ -1247,7 +1438,20 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
 diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
 --- a/src/platform/mac/window.rs	2026-10-30 13:10:46
 +++ b/src/platform/mac/window.rs	2026-10-30 13:10:46
-@@ -455,6 +455,12 @@
+@@ -169,7 +169,12 @@
+                     sel!(swipeWithEvent:),
+                     handle_view_event as extern "C" fn(&Object, Sel, id),
+                 );
++                // Flux patch (pinch): a pinch on the trackpad, a `PinchEvent`.
+                 decl.add_method(
++                    sel!(magnifyWithEvent:),
++                    handle_view_event as extern "C" fn(&Object, Sel, id),
++                );
++                decl.add_method(
+                     sel!(flagsChanged:),
+                     handle_view_event as extern "C" fn(&Object, Sel, id),
+                 );
+@@ -455,6 +460,12 @@
                          - traffic_light_position.y
                          - px(close_button_frame.size.height as f32),
                  );
@@ -1260,7 +1464,7 @@ diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
                  let button_spacing =
                      px((min_button_frame.origin.x - close_button_frame.origin.x) as f32);
  
-@@ -1474,6 +1480,11 @@
+@@ -1474,6 +1485,11 @@
          this.renderer.draw(scene);
      }
  
@@ -1272,7 +1476,7 @@ diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
      fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
          self.0.lock().renderer.sprite_atlas().clone()
      }
-@@ -1496,6 +1507,12 @@
+@@ -1496,6 +1512,12 @@
                  }
              })
              .detach()
@@ -1773,7 +1977,24 @@ diff -ruN a/src/platform/windows/events.rs b/src/platform/windows/events.rs
      fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
          self.start_tracking_mouse(handle, TME_LEAVE);
  
-@@ -864,18 +889,22 @@
+@@ -523,7 +548,15 @@
+         wparam: WPARAM,
+         lparam: LPARAM,
+     ) -> Option<isize> {
+-        let modifiers = current_modifiers();
++        let mut modifiers = current_modifiers();
++        // Flux patch (pinch): a precision touchpad's pinch comes as the wheel with Ctrl, and only
++        // the message's key state may say so, not the keyboard's: it zooms, as Ctrl with the wheel
++        // does. A Ctrl the keyboard holds stays as read (AltGr isn't Ctrl).
++        if MODIFIERKEYS_FLAGS(wparam.loword() as u32).contains(MK_CONTROL)
++            && !is_virtual_key_pressed(VK_CONTROL)
++        {
++            modifiers.control = true;
++        }
+         let mut lock = self.state.borrow_mut();
+         let Some(mut func) = lock.callbacks.input.take() else {
+             return Some(1);
+@@ -864,18 +897,22 @@
              return None;
          }
  
@@ -1802,7 +2023,7 @@ diff -ruN a/src/platform/windows/events.rs b/src/platform/windows/events.rs
              }
          } else {
              drop(lock);
-@@ -883,7 +912,7 @@
+@@ -883,7 +920,7 @@
  
          if !self.hide_title_bar {
              // If the OS draws the title bar, we don't need to handle hit test messages.
@@ -1811,7 +2032,7 @@ diff -ruN a/src/platform/windows/events.rs b/src/platform/windows/events.rs
          }
  
          // default handler for resize areas
-@@ -919,7 +948,7 @@
+@@ -919,7 +956,7 @@
              return Some(HTTOP as _);
          }
  
@@ -2132,7 +2353,7 @@ diff -ruN a/src/taffy.rs b/src/taffy.rs
 diff -ruN a/src/window.rs b/src/window.rs
 --- a/src/window.rs	2026-10-30 13:10:46
 +++ b/src/window.rs	2026-10-30 13:10:46
-@@ -7,17 +7,20 @@
+@@ -7,17 +7,22 @@
      DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
      FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
      KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
@@ -2153,10 +2374,12 @@ diff -ruN a/src/window.rs b/src/window.rs
  };
 +// Flux patch (scroll axis): see `ScrollGesture`.
 +use crate::{Axis, TouchPhase};
++// Flux patch (pinch): a pinch on the trackpad.
++use crate::PinchEvent;
  use anyhow::{Context as _, Result, anyhow};
  use collections::{FxHashMap, FxHashSet};
  #[cfg(target_os = "macos")]
-@@ -95,6 +98,9 @@
+@@ -95,6 +100,9 @@
      pub dirty: bool,
      pub draw_phase: DrawPhase,
      pub dirty_views: FxHashSet<EntityId>,
@@ -2166,7 +2389,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  }
  
  #[derive(Clone)]
-@@ -109,6 +115,7 @@
+@@ -109,6 +117,7 @@
                  dirty: true,
                  draw_phase: DrawPhase::None,
                  dirty_views: FxHashSet::default(),
@@ -2174,7 +2397,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              })),
          }
      }
-@@ -118,6 +125,7 @@
+@@ -118,6 +127,7 @@
          inner.dirty_views.insert(entity);
          if inner.draw_phase == DrawPhase::None {
              inner.dirty = true;
@@ -2182,7 +2405,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              cx.push_effect(Effect::Notify { emitter: entity });
              true
          } else {
-@@ -130,9 +138,18 @@
+@@ -130,9 +140,18 @@
      }
  
      pub fn set_dirty(&self, dirty: bool) {
@@ -2202,7 +2425,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub fn set_phase(&self, phase: DrawPhase) {
          self.inner.borrow_mut().draw_phase = phase
      }
-@@ -815,6 +832,16 @@
+@@ -815,6 +834,16 @@
      }
  }
  
@@ -2219,7 +2442,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  /// Holds the state for a specific window.
  pub struct Window {
      pub(crate) handle: AnyWindowHandle,
-@@ -838,6 +865,10 @@
+@@ -838,6 +867,10 @@
      pub(crate) rendered_entity_stack: Vec<EntityId>,
      pub(crate) element_offset_stack: Vec<Point<Pixels>>,
      pub(crate) element_opacity: f32,
@@ -2230,7 +2453,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
      pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
      pub(crate) image_cache_stack: Vec<AnyImageCache>,
-@@ -846,6 +877,18 @@
+@@ -846,6 +879,18 @@
      next_hitbox_id: HitboxId,
      pub(crate) next_tooltip_id: TooltipId,
      pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -2249,7 +2472,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
      pub(crate) dirty_views: FxHashSet<EntityId>,
      focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
-@@ -856,13 +899,18 @@
+@@ -856,13 +901,18 @@
      modifiers: Modifiers,
      capslock: Capslock,
      scale_factor: f32,
@@ -2269,7 +2492,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub(crate) refreshing: bool,
      pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
      pub(crate) focus: Option<FocusId>,
-@@ -882,6 +930,131 @@
+@@ -882,6 +932,131 @@
      saw_keystroke: bool,
  }
  
@@ -2401,7 +2624,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub(crate) enum DrawPhase {
      None,
-@@ -991,7 +1164,7 @@
+@@ -991,7 +1166,7 @@
          let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
          let needs_present = Rc::new(Cell::new(false));
          let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
@@ -2410,7 +2633,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
          platform_window
              .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
-@@ -1021,7 +1194,7 @@
+@@ -1021,7 +1196,7 @@
              let active = active.clone();
              let needs_present = needs_present.clone();
              let next_frame_callbacks = next_frame_callbacks.clone();
@@ -2419,7 +2642,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              move |request_frame_options| {
                  let next_frame_callbacks = next_frame_callbacks.take();
                  if !next_frame_callbacks.is_empty() {
-@@ -1034,12 +1207,12 @@
+@@ -1034,12 +1209,12 @@
                          .log_err();
                  }
  
@@ -2436,7 +2659,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
                  if invalidator.is_dirty() || request_frame_options.force_render {
                      measure("frame duration", || {
-@@ -1125,7 +1298,12 @@
+@@ -1125,7 +1300,12 @@
              let mut cx = cx.to_async();
              Box::new(move |event| {
                  handle
@@ -2450,7 +2673,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                      .log_err()
                      .unwrap_or(DispatchEventResult::default())
              })
-@@ -1223,6 +1401,8 @@
+@@ -1223,6 +1403,8 @@
              element_offset_stack: Vec::new(),
              content_mask_stack: Vec::new(),
              element_opacity: 1.0,
@@ -2459,7 +2682,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              requested_autoscroll: None,
              rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
              next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
-@@ -1230,6 +1410,11 @@
+@@ -1230,6 +1412,11 @@
              next_hitbox_id: HitboxId(0),
              next_tooltip_id: TooltipId::default(),
              tooltip_bounds: None,
@@ -2471,7 +2694,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              dirty_views: FxHashSet::default(),
              focus_listeners: SubscriberSet::new(),
              focus_lost_listeners: SubscriberSet::new(),
-@@ -1239,13 +1424,15 @@
+@@ -1239,13 +1426,15 @@
              modifiers,
              capslock,
              scale_factor,
@@ -2488,7 +2711,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              refreshing: false,
              activation_observers: SubscriberSet::new(),
              focus: None,
-@@ -1269,9 +1456,14 @@
+@@ -1269,9 +1458,14 @@
      }
  }
  
@@ -2504,7 +2727,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub default_prevented: bool,
  }
  
-@@ -1673,8 +1865,10 @@
+@@ -1673,8 +1867,10 @@
      }
  
      fn bounds_changed(&mut self, cx: &mut App) {
@@ -2517,7 +2740,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          self.display_id = self.platform_window.display().map(|display| display.id());
  
          self.refresh();
-@@ -1691,7 +1885,9 @@
+@@ -1691,7 +1887,9 @@
  
      /// Set the content size of the window.
      pub fn resize(&mut self, size: Size<Pixels>) {
@@ -2528,7 +2751,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Returns whether or not the window is currently fullscreen
-@@ -1744,7 +1940,9 @@
+@@ -1744,7 +1942,9 @@
  
      /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
      pub fn show_window_menu(&self, position: Point<Pixels>) {
@@ -2539,7 +2762,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Tells the compositor to take control of window movement (Wayland and X11)
-@@ -1816,6 +2014,41 @@
+@@ -1816,6 +2016,41 @@
          self.scale_factor
      }
  
@@ -2581,7 +2804,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// The size of an em for the base font of the application. Adjusting this value allows the
      /// UI to scale, just like zooming a web page.
      pub fn rem_size(&self) -> Pixels {
-@@ -2010,6 +2243,29 @@
+@@ -2010,6 +2245,29 @@
          profiling::finish_frame!();
      }
  
@@ -2611,7 +2834,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      fn draw_roots(&mut self, cx: &mut App) {
          self.invalidator.set_phase(DrawPhase::Prepaint);
          self.tooltip_bounds.take();
-@@ -2052,14 +2308,22 @@
+@@ -2052,14 +2310,22 @@
              element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
              prompt_element = Some(element);
              self.prompt = Some(prompt);
@@ -2635,7 +2858,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          }
  
          self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
-@@ -2077,8 +2341,8 @@
+@@ -2077,8 +2343,8 @@
              prompt_element.paint(self, cx);
          } else if let Some(mut drag_element) = active_drag_element {
              drag_element.paint(self, cx);
@@ -2646,7 +2869,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          }
  
          #[cfg(any(feature = "inspector", debug_assertions))]
-@@ -2149,11 +2413,64 @@
+@@ -2149,11 +2415,64 @@
                  id: tooltip_request.id,
                  bounds: tooltip_bounds,
              });
@@ -2711,7 +2934,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
          assert_eq!(self.element_id_stack.len(), 0);
  
-@@ -2448,6 +2765,166 @@
+@@ -2448,6 +2767,166 @@
          result
      }
  
@@ -2878,7 +3101,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
      /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
      /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
-@@ -2783,8 +3260,10 @@
+@@ -2783,8 +3262,10 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -2891,7 +3114,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          if !clipped_bounds.is_empty() {
              self.next_frame
                  .scene
-@@ -2812,13 +3291,17 @@
+@@ -2812,13 +3293,17 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -2912,7 +3135,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  bounds: shadow_bounds.scale(scale_factor),
                  content_mask: content_mask.scale(scale_factor),
                  corner_radii: corner_radii.scale(scale_factor),
-@@ -2840,16 +3323,22 @@
+@@ -2840,16 +3325,22 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -2939,7 +3162,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              border_style: quad.border_style,
          });
      }
-@@ -2861,9 +3350,20 @@
+@@ -2861,9 +3352,20 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -2961,7 +3184,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let color: Background = color.into();
          path.color = color.opacity(opacity);
          self.next_frame
-@@ -2888,11 +3388,11 @@
+@@ -2888,11 +3390,11 @@
          } else {
              style.thickness
          };
@@ -2976,7 +3199,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let element_opacity = self.element_opacity();
  
          self.next_frame.scene.insert_primitive(Underline {
-@@ -2901,7 +3401,7 @@
+@@ -2901,7 +3403,7 @@
              bounds: bounds.scale(scale_factor),
              content_mask: content_mask.scale(scale_factor),
              color: style.color.unwrap_or_default().opacity(element_opacity),
@@ -2985,7 +3208,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              wavy: if style.wavy { 1 } else { 0 },
          });
      }
-@@ -2919,11 +3419,11 @@
+@@ -2919,11 +3421,11 @@
  
          let scale_factor = self.scale_factor();
          let height = style.thickness;
@@ -3000,7 +3223,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let opacity = self.element_opacity();
  
          self.next_frame.scene.insert_primitive(Underline {
-@@ -2931,7 +3431,7 @@
+@@ -2931,7 +3433,7 @@
              pad: 0,
              bounds: bounds.scale(scale_factor),
              content_mask: content_mask.scale(scale_factor),
@@ -3009,7 +3232,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              color: style.color.unwrap_or_default().opacity(opacity),
              wavy: 0,
          });
-@@ -2981,11 +3481,11 @@
+@@ -2981,11 +3483,11 @@
                      Ok(Some((size, Cow::Owned(bytes))))
                  })?
                  .expect("Callback above only errors or returns Some");
@@ -3024,7 +3247,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              self.next_frame.scene.insert_primitive(MonochromeSprite {
                  order: 0,
                  pad: 0,
-@@ -3038,11 +3538,11 @@
+@@ -3038,11 +3540,11 @@
                  })?
                  .expect("Callback above only errors or returns Some");
  
@@ -3039,7 +3262,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              let opacity = self.element_opacity();
  
              self.next_frame.scene.insert_primitive(PolychromeSprite {
-@@ -3094,7 +3594,7 @@
+@@ -3094,7 +3596,7 @@
          else {
              return Ok(());
          };
@@ -3048,7 +3271,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let svg_bounds = Bounds {
              origin: bounds.center()
                  - Point::new(
-@@ -3110,13 +3610,15 @@
+@@ -3110,13 +3612,15 @@
          self.next_frame.scene.insert_primitive(MonochromeSprite {
              order: 0,
              pad: 0,
@@ -3068,7 +3291,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          });
  
          Ok(())
-@@ -3155,17 +3657,21 @@
+@@ -3155,17 +3659,21 @@
                  )))
              })?
              .expect("Callback above only returns Some");
@@ -3095,7 +3318,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              content_mask,
              corner_radii,
              tile,
-@@ -3184,8 +3690,8 @@
+@@ -3184,8 +3692,8 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3106,7 +3329,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          self.next_frame.scene.insert_primitive(PaintSurface {
              order: 0,
              bounds,
-@@ -3305,7 +3811,12 @@
+@@ -3305,7 +3813,12 @@
      pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
          self.invalidator.debug_assert_prepaint();
  
@@ -3120,7 +3343,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let mut id = self.next_hitbox_id;
          self.next_hitbox_id = self.next_hitbox_id.next();
          let hitbox = Hitbox {
-@@ -3579,7 +4090,8 @@
+@@ -3579,7 +4092,8 @@
      /// Dispatch a mouse or keyboard event on the window.
      #[profiling::function]
      pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
@@ -3130,7 +3353,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          // Handlers may set this to false by calling `stop_propagation`.
          cx.propagate_event = true;
          // Handlers may set this to true by calling `prevent_default`.
-@@ -3615,6 +4127,8 @@
+@@ -3615,8 +4129,16 @@
              PlatformInput::ScrollWheel(scroll_wheel) => {
                  self.mouse_position = scroll_wheel.position;
                  self.modifiers = scroll_wheel.modifiers;
@@ -3138,8 +3361,16 @@ diff -ruN a/src/window.rs b/src/window.rs
 +                self.scroll_gesture.update(&scroll_wheel, Instant::now());
                  PlatformInput::ScrollWheel(scroll_wheel)
              }
++            // Flux patch (pinch): it happens at the pointer, as the wheel does.
++            PlatformInput::Pinch(pinch) => {
++                self.mouse_position = pinch.position;
++                self.modifiers = pinch.modifiers;
++                PlatformInput::Pinch(pinch)
++            }
              // Translate dragging and dropping of external files from the operating system
-@@ -3668,6 +4182,10 @@
+             // to internal drag and drop events.
+             PlatformInput::FileDrop(file_drop) => match file_drop {
+@@ -3668,6 +4190,10 @@
              self.dispatch_key_event(any_key_event, cx);
          }
  
@@ -3150,7 +3381,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          DispatchEventResult {
              propagate: cx.propagate_event,
              default_prevented: self.default_prevented,
-@@ -4128,7 +4646,10 @@
+@@ -4128,7 +4654,10 @@
          self.on_next_frame(|window, cx| {
              if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                  if let Some(bounds) = input_handler.selected_bounds(window, cx) {
@@ -3162,7 +3393,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  }
                  window.platform_window.set_input_handler(input_handler);
              }
-@@ -5099,5 +5620,76 @@
+@@ -5099,5 +5628,81 @@
          border_widths: (1.).into(),
          border_color: border_color.into(),
          border_style,
@@ -3217,6 +3448,11 @@ diff -ruN a/src/window.rs b/src/window.rs
 +                position: position * factor,
 +            })
 +        }
++        // Flux patch (pinch): the magnification is a ratio, the same at any scale.
++        PlatformInput::Pinch(event) => PlatformInput::Pinch(PinchEvent {
++            position: event.position * factor,
++            ..event
++        }),
 +        event @ (PlatformInput::FileDrop(FileDropEvent::Exited)
 +        | PlatformInput::KeyDown(_)
 +        | PlatformInput::KeyUp(_)

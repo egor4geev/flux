@@ -1,10 +1,11 @@
 //! Pictures in an editor tab (part 10.2): image files — PNG, JPEG, GIF, WebP, BMP, ICO, TIFF, SVG —
 //! and Claude's pictures from the chat (a thumbnail clicked). The picture fits the tab at first (a
-//! small one keeps its size), ⌘= / ⌘− and ⌘ with the wheel zoom, 1:1 shows it pixel for point, a
-//! checkerboard shows through transparency, and a large one is looked around by scrolling or
-//! dragging. Raster pictures are decoded once in the background; an SVG is drawn by resvg at the
-//! size it is shown, so it stays sharp at any zoom. An SVG file is text as well: Text / Preview in
-//! the toolbar switch between this tab and the file's editor tab (JetBrains IDEs have the pair).
+//! small one keeps its size), ⌘= / ⌘− zoom, ⌘ with the wheel and a pinch on the trackpad zoom
+//! around the pointer, 1:1 shows it pixel for point, a checkerboard shows through transparency,
+//! and a large one is looked around by scrolling or dragging. Raster pictures are decoded once in
+//! the background; an SVG is drawn by resvg at the size it is shown, so it stays sharp at any zoom.
+//! An SVG file is text as well: Text / Preview in the toolbar switch between this tab and the
+//! file's editor tab (JetBrains IDEs have the pair).
 //!
 //! The picture popup (`image_popup`) shows Claude's pictures with the same view, bare
 //! ([`Place::Popup`]): no toolbar of its own, a wider margin, the picture rounded and lifted by a
@@ -19,9 +20,9 @@ use std::time::{Instant, SystemTime};
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, RenderImage,
-    ScrollHandle, ScrollWheelEvent, SharedString, Size, Task, Window, actions, canvas, div, fill,
-    img, point, prelude::*, px, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point,
+    RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, Size, Task, Window, actions, canvas,
+    div, fill, img, point, prelude::*, px, size,
 };
 use resvg::{tiny_skia, usvg};
 
@@ -219,6 +220,17 @@ impl ZoomGlide {
     }
 }
 
+/// A zoom by hand under way (the wheel, a pinch): the spot of the picture (in its own pixels) it
+/// keeps under the pointer, and the zoom and the scroll it left. While nothing else has moved the
+/// picture and the pointer stays, the next step keeps the same spot: a picture with room beside it
+/// can't follow the pointer at first, and the spot comes back under it as the picture grows.
+struct HandZoom {
+    position: Point<Pixels>,
+    spot: (f32, f32),
+    scale: f32,
+    offset: Point<Pixels>,
+}
+
 pub struct ImageView {
     source: ImageSource,
     place: Place,
@@ -243,6 +255,7 @@ pub struct ImageView {
     /// The picture a reload replaced, fading out under the new one.
     previous: Option<Arc<RenderImage>>,
     glide: Option<ZoomGlide>,
+    hand: Option<HandZoom>,
     _loading: Option<Task<()>>,
 }
 
@@ -283,6 +296,7 @@ impl ImageView {
             appeared: None,
             previous: None,
             glide: None,
+            hand: None,
             _loading: None,
         };
         view.load(cx);
@@ -465,13 +479,52 @@ impl ImageView {
         ));
     }
 
-    /// Zooms at once (the wheel, the trackpad): the point in the middle of the view stays there.
-    fn set_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
-        let old = self.scale(self.viewport.get());
+    /// Zooms at once (the wheel, a pinch) to `scale`: the point of the picture under `position` (in
+    /// the window) stays there; a picture smaller than the view stays in its middle.
+    fn zoom_at(&mut self, scale: f32, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((width, height)) = self.natural_size() else {
+            return;
+        };
+        let viewport = self.viewport.get();
+        let old = self.scale(viewport);
         let scale = scale.clamp(MIN_ZOOM, MAX_ZOOM);
-        let middle = self.middle(old);
+        let anchor = position - self.scroll.bounds().origin;
+        let offset = self.scroll.offset();
+        let padding = self.padding();
+        let span = |natural: f32, viewport: Pixels| Span {
+            natural,
+            viewport: viewport.into(),
+            padding,
+        };
+        let (across, down) = (span(width, viewport.width), span(height, viewport.height));
+        // The spot the last step kept, while the pointer and the picture are where it left them.
+        let near = |a: Pixels, b: Pixels| (a - b).abs() < px(0.5);
+        let spot = match &self.hand {
+            Some(hand)
+                if hand.position == position
+                    && hand.scale == old
+                    && near(hand.offset.x, offset.x)
+                    && near(hand.offset.y, offset.y) =>
+            {
+                hand.spot
+            }
+            _ => (
+                across.point_at(anchor.x.into(), offset.x.into(), old),
+                down.point_at(anchor.y.into(), offset.y.into(), old),
+            ),
+        };
+        let offset = point(
+            px(across.offset_for(spot.0, anchor.x.into(), scale)),
+            px(down.offset_for(spot.1, anchor.y.into(), scale)),
+        );
         self.zoom = Zoom::Scale(scale);
-        self.center(middle, scale);
+        self.scroll.set_offset(offset);
+        self.hand = Some(HandZoom {
+            position,
+            spot,
+            scale,
+            offset,
+        });
         cx.notify();
     }
 
@@ -558,8 +611,9 @@ impl ImageView {
         self.zoom_to(Zoom::Fit, cx);
     }
 
-    /// ⌘ with the wheel or the trackpad zooms; otherwise the wheel scrolls. Either is the hand:
-    /// a zoom glide stops where it is (⌘ — zooming on from there) or ends at its step.
+    /// ⌘ with the wheel or the trackpad zooms around the pointer; otherwise the wheel scrolls.
+    /// Either is the hand: a zoom glide stops where it is (⌘ — zooming on from there) or ends at
+    /// its step. On Windows a touchpad's pinch comes this way, as Ctrl with the wheel.
     fn on_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !event.modifiers.secondary() {
             self.settle_zoom();
@@ -572,8 +626,21 @@ impl ImageView {
             return;
         }
         let scale = self.scale(self.viewport.get());
-        self.set_scale(scale * (1. + step / 200.), cx);
+        self.zoom_at(wheel_zoom(scale, step), event.position, cx);
         cx.stop_propagation();
+        window.refresh();
+    }
+
+    /// A pinch on the trackpad zooms around the point under the fingers, as photo viewers do, and
+    /// the zoom stays where the fingers leave it. A zoom glide stops where it is, as for the wheel.
+    fn on_pinch(&mut self, event: &PinchEvent, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        if event.delta == 0. || !event.delta.is_finite() {
+            return;
+        }
+        self.glide = None;
+        let scale = self.scale(self.viewport.get());
+        self.zoom_at(pinch_zoom(scale, event.delta), event.position, cx);
         window.refresh();
     }
 
@@ -881,6 +948,51 @@ fn zoom_step(scale: f32, up: bool) -> f32 {
     }
 }
 
+/// The scale after ⌘ with the wheel moved `step` pixels (up — larger): about 10 % a line of a
+/// mouse's wheel (20 px); a trackpad's small steps, and a touchpad pinch's on Windows, zoom as
+/// little as they move. In ratio: the way back ends where it started, however it is split.
+fn wheel_zoom(scale: f32, step: f32) -> f32 {
+    (scale * (step / 200.).exp()).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// The scale after a step of a pinch that magnifies by `delta` (0.05 — 5 % larger).
+fn pinch_zoom(scale: f32, delta: f32) -> f32 {
+    (scale * (1. + delta).max(0.)).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// The picture along one axis as [`ImageView::render`] lays it out: its own length, the view's,
+/// and the room on either side.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    natural: f32,
+    viewport: f32,
+    padding: f32,
+}
+
+impl Span {
+    /// The scrolled content's length at `scale`, and where the picture starts in it: in the middle
+    /// while the picture is smaller than the view less the room, else after the room.
+    fn content(self, scale: f32) -> (f32, f32) {
+        let shown = self.natural * scale;
+        let content = shown.max(self.viewport - 2. * self.padding) + 2. * self.padding;
+        (content, (content - shown) / 2.)
+    }
+
+    /// The point of the picture (in its own pixels) at `anchor` from the view's start, the
+    /// content scrolled by `offset` (0 or less) and the picture shown at `scale`.
+    fn point_at(self, anchor: f32, offset: f32, scale: f32) -> f32 {
+        (anchor - offset - self.content(scale).1) / scale
+    }
+
+    /// The scroll offset that brings `spot` of the picture (in its own pixels) to `anchor` with the
+    /// picture at `scale`, as far as the content lets it: a picture smaller than the view stays in
+    /// its middle.
+    fn offset_for(self, spot: f32, anchor: f32, scale: f32) -> f32 {
+        let (content, start) = self.content(scale);
+        (anchor - start - spot * scale).clamp((self.viewport - content).min(0.), 0.)
+    }
+}
+
 /// "12 KB", "1.4 MB", "830 B".
 fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.;
@@ -993,6 +1105,7 @@ impl Render for ImageView {
                     .items_center()
                     .justify_center()
                     .on_scroll_wheel(cx.listener(Self::on_wheel))
+                    .on_pinch(cx.listener(Self::on_pinch))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up));
                 // The tab drags the picture from anywhere; the popup closes on a press beside it.
@@ -1317,6 +1430,88 @@ mod tests {
         assert_eq!(zoom_step(1.02, false), 0.75);
         assert_eq!(zoom_step(MAX_ZOOM, true), MAX_ZOOM);
         assert_eq!(zoom_step(MIN_ZOOM, false), MIN_ZOOM);
+    }
+
+    #[test]
+    fn a_pinch_zooms_by_its_magnification_within_the_limits() {
+        assert_eq!(pinch_zoom(1., 0.5), 1.5);
+        assert_eq!(pinch_zoom(2., -0.25), 1.5);
+        assert_eq!(pinch_zoom(MAX_ZOOM * 0.9, 0.5), MAX_ZOOM);
+        assert_eq!(pinch_zoom(MIN_ZOOM * 1.1, -0.5), MIN_ZOOM);
+        assert_eq!(pinch_zoom(1., -3.), MIN_ZOOM);
+    }
+
+    #[test]
+    fn the_wheel_zooms_as_little_as_it_moves() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        // A mouse's line: about 10 %.
+        assert!(close(wheel_zoom(1., 20.), 0.1f32.exp()));
+        // A touchpad pinch's small step on Windows (Ctrl with a tenth of a line): about 1 %.
+        let small = wheel_zoom(1., 2.);
+        assert!(small > 1. && small < 1.011, "{small}");
+        // Split finely or not, the same way zooms the same, and back to where it started.
+        let fine = (0..30).fold(1., |scale, _| wheel_zoom(scale, 2.));
+        assert!(close(fine, wheel_zoom(1., 60.)), "{fine}");
+        assert!(close(wheel_zoom(fine, -60.), 1.));
+        assert_eq!(wheel_zoom(MAX_ZOOM, 60.), MAX_ZOOM);
+        assert_eq!(wheel_zoom(MIN_ZOOM, -60.), MIN_ZOOM);
+    }
+
+    #[test]
+    fn the_point_under_the_fingers_stays_there() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let span = Span {
+            natural: 1000.,
+            viewport: 800.,
+            padding: PADDING,
+        };
+        // A picture larger than the view, scrolled; the pinch a third of the way in.
+        let (anchor, offset) = (300., -100.);
+        let spot = span.point_at(anchor, offset, 1.);
+        for scale in [0.9, 1.1, 2., 5.] {
+            let moved = span.offset_for(spot, anchor, scale);
+            assert!(close(span.point_at(anchor, moved, scale), spot), "{scale}");
+        }
+        // A picture in the middle of the view, with room beside it: the first steps of a pinch
+        // can't move it (it doesn't scroll past its start); as it grows, the spot the pinch began
+        // on comes back under the fingers.
+        let small = Span {
+            natural: 700.,
+            ..span
+        };
+        let spot = small.point_at(200., 0., 1.);
+        assert!(close(spot, 150.));
+        let (mut scale, mut offset) = (1., 0.);
+        for step in 0..8 {
+            scale = pinch_zoom(scale, 0.05);
+            offset = small.offset_for(spot, 200., scale);
+            if step == 0 {
+                assert_eq!(offset, 0.);
+            }
+        }
+        assert!(offset < 0.);
+        assert!(close(small.point_at(200., offset, scale), spot));
+    }
+
+    #[test]
+    fn a_zoomed_picture_stays_within_its_content() {
+        let span = Span {
+            natural: 1000.,
+            viewport: 800.,
+            padding: PADDING,
+        };
+        let zoomed = |anchor: f32, offset: f32, scale: f32| {
+            span.offset_for(span.point_at(anchor, offset, 1.), anchor, scale)
+        };
+        // Zooming out at the left with the picture scrolled to its end: its end stays at the
+        // view's end, not past it.
+        let end = |scale: f32| 800. - span.content(scale).0;
+        assert_eq!(zoomed(10., end(1.), 0.9), end(0.9));
+        // At the right with the picture scrolled to its start: its start stays at the view's.
+        assert_eq!(zoomed(700., 0., 0.9), 0.);
+        // A picture smaller than the view isn't scrolled: it stays in the middle.
+        assert_eq!(span.content(0.5), (800., 150.));
+        assert_eq!(zoomed(700., -200., 0.5), 0.);
     }
 
     #[test]

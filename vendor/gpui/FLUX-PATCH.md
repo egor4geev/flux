@@ -17,7 +17,7 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
     together and are rasterized sharp at the new size. The pointer keeps its place on the screen.
   - Positions from the platform are in window points: the `on_input` callback divides them by the
     scale (`scale_platform_input`: mouse down / up / move / exit, the scroll wheel's position and its
-    pixel delta — line deltas stay — and file drops; keys untouched). Positions given to the
+    pixel delta — line deltas stay — file drops and the position of a pinch; keys untouched). Positions given to the
     platform are multiplied: `resize`, `show_window_menu`, the IME position of
     `invalidate_character_coordinates`; in `src/platform.rs` the `PlatformInputHandler` multiplies
     `bounds_for_range` (the input method's candidate window) and divides the point of
@@ -201,6 +201,28 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
   - `src/window.rs`: `DispatchEventResult` is public, so `Window::dispatch_event` can be called
     outside gpui (Flux's scenario steps `drag-files:` / `drop-files:` drop files with it).
 
+- **Pinch** (2026-11-07, release 0.4.1, `crates/flux-app/src/image_view.rs`): pictures — an image
+  tab and the picture popup — zoom with a pinch on the trackpad, as photo viewers do. gpui 0.2.2
+  had no pinch or magnify events.
+  - `src/interactive.rs`: `PinchEvent { position, delta, modifiers, phase }` — `delta` is the
+    magnification of the step (macOS `NSEvent.magnification`: 0.05 is 5 % larger, the new scale is
+    the old one times `1 + delta`), `phase` a `TouchPhase` (began — `Started`, ended or cancelled —
+    `Ended`). `PlatformInput::Pinch`; a `MouseEvent`, so `Window::on_mouse_event` takes it.
+  - `src/window.rs`: `dispatch_event` dispatches it as the other mouse events — the window's mouse
+    position and modifiers follow it, the hit test is at its position; `scale_platform_input`
+    divides its position by the interface scale (the magnification is a ratio and stays).
+  - `src/elements/div.rs`: `on_pinch` (`Interactivity` and `InteractiveElement`), called in the
+    bubble phase where scroll wheel listeners are (`Hitbox::should_handle_scroll`); an element with
+    one gets a hitbox.
+  - macOS: `magnifyWithEvent:` of gpui's view (`src/platform/mac/window.rs`) goes the way of the other
+    mouse events; `src/platform/mac/events.rs` turns `NSEventTypeMagnify` into a `PinchEvent`.
+  - Windows has no gesture of its own here: a precision touchpad's pinch comes to an app as the
+    wheel with Ctrl (`WM_MOUSEWHEEL`), small steps of the wheel's delta, which Flux zooms by as
+    Ctrl with the wheel. The Ctrl of such a message may be only in its key state (`MK_CONTROL` in
+    `wParam`), not in the keyboard's: `handle_mouse_wheel_msg` (`src/platform/windows/events.rs`)
+    takes it from there when the keyboard's Ctrl isn't down (a Ctrl that is stays as read, so AltGr
+    isn't taken for Ctrl).
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,
@@ -222,4 +244,5 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
    tabs; the window resizes from its top edge and moves by its title bar. Files: Copy in Finder or
    Explorer, Paste in the project tree copies them in; Copy in the tree, Paste in Finder or
    Explorer copies the file there (Cut in the tree, Paste in Explorer moves it); text copied in
-   Flux still pastes as text elsewhere.
+   Flux still pastes as text elsewhere. A pinch over a picture, in its tab and in the popup, at
+   100 % and 125 %, zooms around the fingers (on Windows with a precision touchpad too).
