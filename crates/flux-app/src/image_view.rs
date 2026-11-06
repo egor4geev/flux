@@ -5,6 +5,10 @@
 //! dragging. Raster pictures are decoded once in the background; an SVG is drawn by resvg at the
 //! size it is shown, so it stays sharp at any zoom. An SVG file is text as well: Text / Preview in
 //! the toolbar switch between this tab and the file's editor tab (JetBrains IDEs have the pair).
+//!
+//! The picture popup (`image_popup`) shows Claude's pictures with the same view, bare
+//! ([`Place::Popup`]): no toolbar of its own, a wider margin, the picture rounded and lifted by a
+//! shadow, and a click beside it closes the popup.
 
 use std::cell::Cell;
 use std::io::Cursor;
@@ -14,7 +18,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Instant, SystemTime};
 
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, MouseButton,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, RenderImage,
     ScrollHandle, ScrollWheelEvent, SharedString, Size, Task, Window, actions, canvas, div, fill,
     img, point, prelude::*, px, size,
@@ -34,9 +38,16 @@ const STEPS: &[f32] = &[
     0.05, 0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 1., 1.25, 1.5, 2., 3., 4., 6., 8., 12., 16., 24., 32.,
 ];
 const MIN_ZOOM: f32 = 0.02;
+/// A zoom step goes at least this much further (a ratio): from a Fit just short of a step (67 %
+/// against 0.67), the step itself would look as if the key did nothing.
+const STEP_GAP: f32 = 1.05;
 const MAX_ZOOM: f32 = 32.;
 /// Room around the picture inside the tab.
 const PADDING: f32 = 16.;
+/// Room around the picture in the popup: the popup's toolbar and arrows sit in it.
+const POPUP_MARGIN: f32 = 64.;
+/// The rounding of the picture in the popup.
+const POPUP_RADIUS: f32 = ui::RADIUS_MD;
 /// A side of a checkerboard square.
 const CELL: f32 = 8.;
 /// The largest side of an SVG drawn for the screen: beyond it the drawing is stretched.
@@ -77,6 +88,8 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("cmd--", ZoomOut, Some(CONTEXT)),
         ],
     );
+    // The popup shows its pictures with this view: its keys come along.
+    crate::image_popup::init(cx);
 }
 
 /// What an image tab shows.
@@ -116,6 +129,19 @@ pub fn is_svg(path: &Path) -> bool {
 pub enum ImageViewEvent {
     /// Text in the toolbar of an SVG file: the file in its editor tab.
     EditAsText(PathBuf),
+    /// A click beside the picture in the popup ([`Place::Popup`]): it closes.
+    Dismiss,
+}
+
+/// Where the picture is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// An editor tab: the toolbar on top, the picture on the island.
+    Tab,
+    /// The picture popup (`image_popup`): bare over the window's veil — the popup draws the
+    /// toolbar — rounded and lifted by a shadow; a press on the picture drags it, beside it closes
+    /// the popup ([`ImageViewEvent::Dismiss`]). The focus stays with the popup.
+    Popup,
 }
 
 /// How large the picture is shown.
@@ -195,6 +221,7 @@ impl ZoomGlide {
 
 pub struct ImageView {
     source: ImageSource,
+    place: Place,
     title: SharedString,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
@@ -223,6 +250,15 @@ impl EventEmitter<ImageViewEvent> for ImageView {}
 
 impl ImageView {
     pub fn new(source: ImageSource, cx: &mut Context<Self>) -> Self {
+        Self::at(source, Place::Tab, cx)
+    }
+
+    /// A picture of the popup ([`Place::Popup`]).
+    pub fn popup(source: ImageSource, cx: &mut Context<Self>) -> Self {
+        Self::at(source, Place::Popup, cx)
+    }
+
+    fn at(source: ImageSource, place: Place, cx: &mut Context<Self>) -> Self {
         let title = match &source {
             ImageSource::File(path) => path
                 .file_name()
@@ -232,6 +268,7 @@ impl ImageView {
         };
         let mut view = Self {
             source,
+            place,
             title: title.into(),
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
@@ -383,13 +420,22 @@ impl ImageView {
         }
     }
 
+    /// The room around the picture.
+    fn padding(&self) -> f32 {
+        match self.place {
+            Place::Tab => PADDING,
+            Place::Popup => POPUP_MARGIN,
+        }
+    }
+
     /// The scale of Fit: the whole picture in the viewport, never larger than it is.
     fn fit_scale(&self, viewport: Size<Pixels>) -> f32 {
         let Some((width, height)) = self.natural_size() else {
             return 1.;
         };
-        let room_w = (f32::from(viewport.width) - 2. * PADDING).max(1.);
-        let room_h = (f32::from(viewport.height) - 2. * PADDING).max(1.);
+        let padding = self.padding();
+        let room_w = (f32::from(viewport.width) - 2. * padding).max(1.);
+        let room_h = (f32::from(viewport.height) - 2. * padding).max(1.);
         (room_w / width.max(1.))
             .min(room_h / height.max(1.))
             .min(1.)
@@ -489,32 +535,26 @@ impl ImageView {
         }
     }
 
-    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
-        let scale = self.step_base();
-        let next = STEPS
-            .iter()
-            .copied()
-            .find(|step| *step > scale * 1.001)
-            .unwrap_or(MAX_ZOOM);
+    pub(crate) fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        let next = zoom_step(self.step_base(), true);
         self.zoom_to(Zoom::Scale(next), cx);
     }
 
-    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
-        let scale = self.step_base();
-        let next = STEPS
-            .iter()
-            .rev()
-            .copied()
-            .find(|step| *step < scale * 0.999)
-            .unwrap_or(MIN_ZOOM);
+    pub(crate) fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        let next = zoom_step(self.step_base(), false);
         self.zoom_to(Zoom::Scale(next), cx);
     }
 
-    fn actual_size(&mut self, _: &ActualSize, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn actual_size(&mut self, _: &ActualSize, _: &mut Window, cx: &mut Context<Self>) {
         self.zoom_to(Zoom::Scale(1.), cx);
     }
 
-    fn fit_to_window(&mut self, _: &FitToWindow, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn fit_to_window(
+        &mut self,
+        _: &FitToWindow,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.zoom_to(Zoom::Fit, cx);
     }
 
@@ -537,13 +577,18 @@ impl ImageView {
         window.refresh();
     }
 
+    /// A press starts a drag: anywhere in the tab, on the picture in the popup (the popup keeps the
+    /// focus, and the press doesn't reach the area beside the picture, which would close it).
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        match self.place {
+            Place::Tab => window.focus(&self.focus_handle),
+            Place::Popup => cx.stop_propagation(),
+        }
         self.settle_zoom();
         self.pan = Some(Pan {
             start: event.position,
@@ -622,10 +667,9 @@ impl ImageView {
         }
     }
 
-    fn render_toolbar(&self, scale: f32, ui: UiColors, cx: &mut Context<Self>) -> impl IntoElement {
-        let zoom = self.target_zoom();
-        let fit = zoom == Zoom::Fit;
-        let percent = format!("{}%", (scale * 100.).round());
+    /// What the toolbar says of the picture: its size, the file's (or the bytes') size and the
+    /// format — "1280 × 800 px · 245 KB · PNG".
+    pub(crate) fn details(&self) -> String {
         let mut details: Vec<String> = Vec::new();
         if let Some((width, height)) = self.natural_size() {
             details.push(trf(
@@ -642,6 +686,97 @@ impl ImageView {
         if !self.format.is_empty() {
             details.push(self.format.to_string());
         }
+        details.join(" · ")
+    }
+
+    /// The scale a toolbar shows when it is drawn before the picture (the popup's): where a zoom
+    /// glide goes, as the glide's last frame redraws only the picture.
+    pub(crate) fn target_scale(&self) -> f32 {
+        self.step_base()
+    }
+
+    /// Fit, 1:1 and − 100 % + of `view` (this one): the tab's toolbar and the popup's. `scale` is
+    /// the zoom the percent shows.
+    pub(crate) fn zoom_controls(
+        &self,
+        view: &Entity<Self>,
+        scale: f32,
+        ui: UiColors,
+        cx: &App,
+    ) -> [gpui::AnyElement; 6] {
+        let zoom = self.target_zoom();
+        let fit = zoom == Zoom::Fit;
+        let actual = zoom == Zoom::Scale(1.);
+        let percent = format!("{}%", (scale * 100.).round());
+        let on = |view: &Entity<Self>, act: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+            let view = view.clone();
+            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| act(view, window, cx))
+            }
+        };
+        [
+            ui::toggle_button("image-fit", IconName::Fit, fit, ui)
+                .tooltip(ui::tooltip(tr("Fit to Window"), None))
+                .on_click(on(view, |view, window, cx| {
+                    view.fit_to_window(&FitToWindow, window, cx)
+                }))
+                .into_any_element(),
+            div()
+                .id("image-actual-size")
+                .flex_none()
+                .h(px(ui::ICON_BUTTON_SIZE))
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded(px(ui::RADIUS_SM))
+                .text_color(if actual {
+                    ui.accent_text
+                } else {
+                    ui.text_muted
+                })
+                .when(actual, |button| button.bg(ui.accent_soft))
+                .when(!actual, |button| {
+                    button.hover(move |style| style.bg(ui.hover))
+                })
+                .cursor_pointer()
+                .child("1:1")
+                .tooltip(ui::tooltip(tr("Actual Size"), None))
+                .on_click(on(view, |view, window, cx| {
+                    view.actual_size(&ActualSize, window, cx)
+                }))
+                .into_any_element(),
+            div()
+                .w(px(1.))
+                .h(px(16.))
+                .mx_1()
+                .bg(ui.divider)
+                .into_any_element(),
+            ui::icon_button("image-zoom-out", IconName::Minus, ui)
+                .tooltip(ui::tooltip(tr("Zoom Out"), ui::shortcut_for(&ZoomOut, cx)))
+                .on_click(on(view, |view, window, cx| {
+                    view.zoom_out(&ZoomOut, window, cx)
+                }))
+                .into_any_element(),
+            // On one line whatever the interface's scale: "200%" mustn't wrap onto the details.
+            div()
+                .flex_none()
+                .min_w(px(44.))
+                .flex()
+                .justify_center()
+                .whitespace_nowrap()
+                .text_color(ui.text_muted)
+                .child(percent)
+                .into_any_element(),
+            ui::icon_button("image-zoom-in", IconName::Plus, ui)
+                .tooltip(ui::tooltip(tr("Zoom In"), ui::shortcut_for(&ZoomIn, cx)))
+                .on_click(on(view, |view, window, cx| {
+                    view.zoom_in(&ZoomIn, window, cx)
+                }))
+                .into_any_element(),
+        ]
+    }
+
+    fn render_toolbar(&self, scale: f32, ui: UiColors, cx: &mut Context<Self>) -> impl IntoElement {
         let svg_file = self
             .path()
             .filter(|path| is_svg(path))
@@ -656,70 +791,13 @@ impl ImageView {
             .border_b_1()
             .border_color(ui.divider)
             .text_size(px(theme::TEXT_SM))
-            .child(
-                ui::toggle_button("image-fit", IconName::Fit, fit, ui)
-                    .tooltip(ui::tooltip(tr("Fit to Window"), None))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.fit_to_window(&FitToWindow, window, cx)
-                    })),
-            )
-            .child(
-                div()
-                    .id("image-actual-size")
-                    .flex_none()
-                    .h(px(ui::ICON_BUTTON_SIZE))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .rounded(px(ui::RADIUS_SM))
-                    .text_color(if zoom == Zoom::Scale(1.) {
-                        ui.accent_text
-                    } else {
-                        ui.text_muted
-                    })
-                    .when(zoom == Zoom::Scale(1.), |button| button.bg(ui.accent_soft))
-                    .when(zoom != Zoom::Scale(1.), |button| {
-                        button.hover(move |style| style.bg(ui.hover))
-                    })
-                    .cursor_pointer()
-                    .child("1:1")
-                    .tooltip(ui::tooltip(tr("Actual Size"), None))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.actual_size(&ActualSize, window, cx)
-                        }),
-                    ),
-            )
-            .child(div().w(px(1.)).h(px(16.)).mx_1().bg(ui.divider))
-            .child(
-                ui::icon_button("image-zoom-out", IconName::Minus, ui)
-                    .tooltip(ui::tooltip(tr("Zoom Out"), ui::shortcut_for(&ZoomOut, cx)))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx)),
-                    ),
-            )
-            // On one line whatever the interface's scale: "200%" mustn't wrap onto the details.
-            .child(
-                div()
-                    .flex_none()
-                    .min_w(px(44.))
-                    .flex()
-                    .justify_center()
-                    .whitespace_nowrap()
-                    .text_color(ui.text_muted)
-                    .child(percent),
-            )
-            .child(
-                ui::icon_button("image-zoom-in", IconName::Plus, ui)
-                    .tooltip(ui::tooltip(tr("Zoom In"), ui::shortcut_for(&ZoomIn, cx)))
-                    .on_click(cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx))),
-            )
+            .children(self.zoom_controls(&cx.entity(), scale, ui, cx))
             .child(div().flex_1())
             .child(
                 div()
                     .text_color(ui.dim)
                     .whitespace_nowrap()
-                    .child(details.join(" · ")),
+                    .child(self.details()),
             )
             .when_some(svg_file, |bar, path| {
                 bar.child(div().w_2()).child(svg_switch(
@@ -785,6 +863,24 @@ pub fn svg_switch(
         )
 }
 
+/// The zoom step after `scale`: the next larger one (`up`) or the next smaller one.
+fn zoom_step(scale: f32, up: bool) -> f32 {
+    if up {
+        STEPS
+            .iter()
+            .copied()
+            .find(|step| *step > scale * STEP_GAP)
+            .unwrap_or(MAX_ZOOM)
+    } else {
+        STEPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|step| *step < scale / STEP_GAP)
+            .unwrap_or(MIN_ZOOM)
+    }
+}
+
 /// "12 KB", "1.4 MB", "830 B".
 fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.;
@@ -841,24 +937,44 @@ impl Render for ImageView {
                         self.svg_image(device, cx)
                     }
                 };
+                let padding = self.padding();
                 let content = size(
-                    shown.width.max(viewport.width - px(2. * PADDING)) + px(2. * PADDING),
-                    shown.height.max(viewport.height - px(2. * PADDING)) + px(2. * PADDING),
+                    shown.width.max(viewport.width - px(2. * padding)) + px(2. * padding),
+                    shown.height.max(viewport.height - px(2. * padding)) + px(2. * padding),
                 );
-                let large = f32::from(shown.width) + 2. * PADDING > f32::from(viewport.width)
-                    || f32::from(shown.height) + 2. * PADDING > f32::from(viewport.height);
+                let large = f32::from(shown.width) + 2. * padding > f32::from(viewport.width)
+                    || f32::from(shown.height) + 2. * padding > f32::from(viewport.height);
+                let grab = |element: gpui::Div| match (large, self.pan.is_some()) {
+                    (false, _) => element,
+                    (true, false) => element.cursor_grab(),
+                    (true, true) => element.cursor_grabbing(),
+                };
+                let popup = self.place == Place::Popup;
+                // In the popup the picture is a card of its own: rounded, over the popover's
+                // surface (a transparent picture shows that, not the shadow), lifted by its shadow.
+                let rounded = if popup { POPUP_RADIUS } else { 0. };
                 let crossfade = previous.is_some();
                 let picture = div()
                     .relative()
                     .flex_none()
                     .w(shown.width)
                     .h(shown.height)
+                    .when(popup, |picture| {
+                        grab(
+                            picture
+                                .rounded(px(rounded))
+                                .bg(ui.elevated)
+                                .shadow(ui::popover_shadow(ui)),
+                        )
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    })
                     .when(appear < 1. && !crossfade, |picture| picture.opacity(appear))
-                    .child(checkerboard(ui).absolute().size_full())
+                    .child(checkerboard(ui, rounded).absolute().size_full())
                     .children(previous.map(|image| {
                         img(gpui::ImageSource::Render(image))
                             .absolute()
                             .size_full()
+                            .rounded(px(rounded))
                             .object_fit(ObjectFit::Fill)
                             .opacity(1. - appear)
                     }))
@@ -866,36 +982,35 @@ impl Render for ImageView {
                         img(gpui::ImageSource::Render(image))
                             .absolute()
                             .size_full()
+                            .rounded(px(rounded))
                             .object_fit(ObjectFit::Fill)
                             .when(crossfade, |image| image.opacity(appear))
                     }));
+                let content = div()
+                    .w(content.width)
+                    .h(content.height)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_scroll_wheel(cx.listener(Self::on_wheel))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up));
+                // The tab drags the picture from anywhere; the popup closes on a press beside it.
+                let content = if popup {
+                    content.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.emit(ImageViewEvent::Dismiss)),
+                    )
+                } else {
+                    grab(content).on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                };
                 div()
                     .id("image-scroll")
                     .absolute()
                     .size_full()
                     .overflow_scroll()
                     .track_scroll(&self.scroll)
-                    .child(
-                        div()
-                            .id("image-content")
-                            .w(content.width)
-                            .h(content.height)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(large, |content| {
-                                if self.pan.is_some() {
-                                    content.cursor_grabbing()
-                                } else {
-                                    content.cursor_grab()
-                                }
-                            })
-                            .on_scroll_wheel(cx.listener(Self::on_wheel))
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-                            .on_mouse_move(cx.listener(Self::on_mouse_move))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                            .child(picture),
-                    )
+                    .child(content.id("image-content").child(picture))
                     .into_any_element()
             }
         };
@@ -914,7 +1029,9 @@ impl Render for ImageView {
             .flex()
             .flex_col()
             .text_color(ui.foreground)
-            .child(self.render_toolbar(scale, ui, cx))
+            .when(self.place == Place::Tab, |view| {
+                view.child(self.render_toolbar(scale, ui, cx))
+            })
             .child(
                 div()
                     .relative()
@@ -951,8 +1068,10 @@ fn message(text: String, ui: UiColors) -> impl IntoElement {
         .child(text)
 }
 
-/// Squares behind a picture with transparency; only those in sight are painted.
-fn checkerboard(ui: UiColors) -> gpui::Canvas<()> {
+/// Squares behind a picture with transparency; only those in sight are painted. A picture with
+/// `rounded` corners (the popup's) has a background of its own instead of the darker squares, and
+/// the lighter ones keep out of its corners: gpui clips children to rectangles only.
+fn checkerboard(ui: UiColors, rounded: f32) -> gpui::Canvas<()> {
     let light: Hsla = UiColors::tint(ui.foreground, 0.10);
     let dark: Hsla = UiColors::tint(ui.foreground, 0.04);
     canvas(
@@ -962,7 +1081,9 @@ fn checkerboard(ui: UiColors) -> gpui::Canvas<()> {
             if visible.size.width <= px(0.) || visible.size.height <= px(0.) {
                 return;
             }
-            window.paint_quad(fill(visible, dark));
+            if rounded <= 0. {
+                window.paint_quad(fill(visible, dark));
+            }
             let first_column = ((visible.left() - bounds.left()) / px(CELL)).floor() as i64;
             let last_column = ((visible.right() - bounds.left()) / px(CELL)).ceil() as i64;
             let first_row = ((visible.top() - bounds.top()) / px(CELL)).floor() as i64;
@@ -977,6 +1098,9 @@ fn checkerboard(ui: UiColors) -> gpui::Canvas<()> {
                         bounds.top() + px(row as f32 * CELL),
                     );
                     let cell = gpui::Bounds::new(origin, size(px(CELL), px(CELL)));
+                    if rounded > 0. && in_corner(cell.intersect(&bounds), bounds, rounded) {
+                        continue;
+                    }
                     let cell = cell.intersect(&visible);
                     if cell.size.width > px(0.) && cell.size.height > px(0.) {
                         window.paint_quad(fill(cell, light));
@@ -985,6 +1109,14 @@ fn checkerboard(ui: UiColors) -> gpui::Canvas<()> {
             }
         },
     )
+}
+
+/// Whether `cell` reaches into a corner of `bounds` rounded by `radius`.
+fn in_corner(cell: gpui::Bounds<Pixels>, bounds: gpui::Bounds<Pixels>, radius: f32) -> bool {
+    let radius = px(radius);
+    let side = cell.left() < bounds.left() + radius || cell.right() > bounds.right() - radius;
+    let end = cell.top() < bounds.top() + radius || cell.bottom() > bounds.bottom() - radius;
+    side && end
 }
 
 // --- Reading and decoding (background) ---
@@ -1174,6 +1306,17 @@ mod tests {
         assert_eq!((size.width.0, size.height.0), (30, 15));
         // Blue, opaque, in BGRA.
         assert_eq!(&image.as_bytes(0).unwrap()[..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_zoom_step_always_shows() {
+        // Fit at 66.9 %: 67 % would look like nothing happened.
+        assert_eq!(zoom_step(0.669, true), 0.75);
+        assert_eq!(zoom_step(0.75, true), 1.);
+        assert_eq!(zoom_step(0.75, false), 0.67);
+        assert_eq!(zoom_step(1.02, false), 0.75);
+        assert_eq!(zoom_step(MAX_ZOOM, true), MAX_ZOOM);
+        assert_eq!(zoom_step(MIN_ZOOM, false), MIN_ZOOM);
     }
 
     #[test]

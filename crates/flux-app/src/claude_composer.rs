@@ -363,6 +363,22 @@ fn is_sendable(format: ImageFormat) -> bool {
     )
 }
 
+/// The message box's pictures in the picture popup, the `index`th in sight.
+fn preview_images(images: &[Arc<Image>], index: usize, window: &mut Window, cx: &mut App) {
+    let pictures = images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            crate::image_popup::conversation_picture(
+                index,
+                image.format.mime_type(),
+                Arc::from(image.bytes.as_slice()),
+            )
+        })
+        .collect();
+    crate::image_popup::show(pictures, index, window, cx);
+}
+
 /// The project's files for `@`: walked in the background when the list opens, matched by nucleo.
 struct FileSearch {
     matcher: PathMatcher,
@@ -1772,8 +1788,11 @@ impl Composer {
         });
         let context_chip = context_chip
             .map(|chip| Appear::pop((0.5, 0.5)).apply("claude-context-chip-appear", chip));
+        // A click on a thumbnail shows the pictures in the popup, this one in sight.
+        let pictures: Rc<[Arc<Image>]> = images.iter().cloned().collect();
         let thumbnails = images.iter().enumerate().map(|(index, image)| {
             let id = image.id();
+            let pictures = pictures.clone();
             let thumbnail = div()
                 .id(("claude-image", index))
                 .group("claude-image")
@@ -1784,6 +1803,13 @@ impl Composer {
                 .border_1()
                 .border_color(ui.input_border)
                 .overflow_hidden()
+                .cursor_pointer()
+                .hover(move |style| style.border_color(ui.accent))
+                // The click is the thumbnail's: the card would take the focus back to the field.
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    preview_images(&pictures, index, window, cx)
+                })
                 .child(img(image.clone()).size_full().object_fit(ObjectFit::Cover))
                 .child(
                     div()
@@ -1804,6 +1830,8 @@ impl Composer {
                         .group_hover("claude-image", |style| style.opacity(1.))
                         .child(icon(IconName::Close, ui.foreground).size(px(10.)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            // Removing it doesn't open it.
+                            cx.stop_propagation();
                             this.images.retain(|image| image.id() != id);
                             cx.notify();
                         })),

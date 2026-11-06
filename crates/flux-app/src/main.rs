@@ -60,6 +60,7 @@ mod hover;
 mod i18n;
 mod icon_themes;
 mod icons;
+mod image_popup;
 mod image_view;
 mod input;
 mod input_dialog;

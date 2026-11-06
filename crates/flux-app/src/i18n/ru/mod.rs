@@ -34,6 +34,7 @@ mod git;
 mod git_gutter;
 mod git_log;
 mod icon_themes;
+mod image_popup;
 mod image_view;
 mod interface;
 mod languages;
@@ -168,6 +169,7 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     claude_turns::STRINGS,
     claude_agents::STRINGS,
     image_view::STRINGS,
+    image_popup::STRINGS,
     ui_scale::STRINGS,
     interface::STRINGS,
     project_popup::STRINGS,
