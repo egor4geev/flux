@@ -5,7 +5,8 @@
 //!   message waits for the turn to end (the CLI queues it); ⌘↵ sends it at once, stopping the
 //!   turn. Esc stops a running turn.
 //! - Chips above the text: the editor's file and selected lines (sent as an `@path#L12-20`
-//!   mention unless removed), pictures pasted (⌘V) or dropped on the field.
+//!   mention unless removed), pictures pasted (⌘V) or dropped on the field. Files copied in Finder
+//!   or Explorer paste as dropped ones do: pictures attached, the rest mentioned (0.4.1).
 //! - `@` lists the project's files (fuzzy, as ⌘P), `/` at the start the session's slash commands;
 //!   the list opens above the field, ↑ ↓ ↵ ⇥ Esc drive it.
 //! - The card's bottom row: the model, effort and permission mode pickers (⇧⇥ cycles Ask before
@@ -328,6 +329,27 @@ fn menu_modes(current: PermissionMode, auto: bool) -> Vec<PermissionMode> {
         .collect()
 }
 
+/// Paths for a `!` command, separated by spaces: quoted (single quotes, as Git Bash on Windows
+/// takes them too) when they hold anything a shell would split or expand — Windows' backslashes
+/// among them.
+fn shell_words(paths: &[std::path::PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| {
+            let path = path.to_string_lossy();
+            let plain = path.chars().all(|ch| {
+                ch.is_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | ':' | '+' | ',' | '@')
+            });
+            if plain {
+                path.into_owned()
+            } else {
+                format!("'{}'", path.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// "28.9k".
 fn short_tokens(tokens: u64) -> String {
     match tokens {
@@ -624,11 +646,13 @@ impl Composer {
         let input = cx.new(|cx| {
             PromptInput::new(tr("Ask Claude… @ for files, / for commands"), cx)
                 .max_rows(MESSAGE_ROWS)
+                .takes_files()
         });
         let subscriptions = vec![
-            cx.subscribe(
+            cx.subscribe_in(
                 &input,
-                |this, _, event: &PromptInputEvent, cx| match event {
+                window,
+                |this, _, event: &PromptInputEvent, window, cx| match event {
                     PromptInputEvent::Changed => {
                         this.notice = None;
                         this.enter_shell_mode(cx);
@@ -640,6 +664,14 @@ impl Composer {
                         this.attach(image.clone(), cx)
                     }
                     PromptInputEvent::ImagePasted(_) => {}
+                    // A `!` command takes the files' paths.
+                    PromptInputEvent::FilesPasted(paths) if this.shell_mode => {
+                        let text = shell_words(paths);
+                        this.input.update(cx, |input, cx| input.insert(&text, cx));
+                    }
+                    PromptInputEvent::FilesPasted(paths) => {
+                        this.add_paths(paths.clone(), window, cx)
+                    }
                     PromptInputEvent::BackspaceAtStart if this.shell_mode => {
                         this.leave_shell_mode(cx)
                     }
@@ -2874,6 +2906,8 @@ fn place_menu(corner: Point<Pixels>, view: impl IntoElement) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -2969,6 +3003,19 @@ mod tests {
         assert_eq!(next_mode(DontAsk, true), Default);
         // ⇧⇥ never lands in Bypass permissions; from it, back to asking.
         assert_eq!(next_mode(BypassPermissions, true), Default);
+    }
+
+    #[test]
+    fn pasted_files_become_shell_words() {
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(
+            shell_words(&paths(&["/p/src/main.rs", "/p/My Docs/it's.txt"])),
+            "/p/src/main.rs '/p/My Docs/it'\\''s.txt'"
+        );
+        assert_eq!(
+            shell_words(&paths(&[r"C:\Users\me\a.txt"])),
+            r"'C:\Users\me\a.txt'"
+        );
     }
 
     #[test]
