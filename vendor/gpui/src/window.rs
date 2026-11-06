@@ -1456,9 +1456,14 @@ impl Window {
     }
 }
 
+/// What became of an event given to [`Window::dispatch_event`].
+// Flux patch: public, so `Window::dispatch_event` can be called outside gpui (Flux's UI scenarios
+// drop files with it).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DispatchEventResult {
+pub struct DispatchEventResult {
+    /// No listener stopped the event.
     pub propagate: bool,
+    /// A listener prevented the platform's default handling.
     pub default_prevented: bool,
 }
 

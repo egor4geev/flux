@@ -493,10 +493,17 @@ impl Deref for MouseExitEvent {
 }
 
 /// A collection of paths from the platform, such as from a file drop.
-#[derive(Debug, Clone, Default)]
+// Flux patch: comparable, as the clipboard's entries are (`ClipboardEntry::ExternalPaths`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExternalPaths(pub(crate) SmallVec<[PathBuf; 2]>);
 
 impl ExternalPaths {
+    /// Flux patch: paths the app has — files for the clipboard (`ClipboardItem::new_paths`), a
+    /// file drop of a test or a UI scenario (`FileDropEvent`).
+    pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self(paths.into_iter().collect())
+    }
+
     /// Convert this collection of paths into a slice.
     pub fn paths(&self) -> &[PathBuf] {
         &self.0

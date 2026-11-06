@@ -168,6 +168,39 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
     (`crates/flux-app/build.rs`).
   - The first change outside `src/`: `flux.patch` now takes `build.rs` too (step 3 below).
 
+- **Files on the clipboard** (2026-11-06, release 0.4.1, `crates/flux-app/src/file_tree.rs`): a
+  tester on Windows copied a file in Explorer and pasted it into Flux's project tree — nothing
+  happened. gpui 0.2.2 read only text and images (a Finder copy came as its name in plain text;
+  Explorer's CF_HDROP as one string of the paths run together) and couldn't write files.
+  - `src/platform.rs`: `ClipboardEntry::ExternalPaths(ExternalPaths)`; `ClipboardItem::new_paths`
+    (the paths, plus their text, one per line), `ClipboardItem::paths`, and a cut flag —
+    `ClipboardItem::with_cut` / `is_cut` (a field of the item, `false` in every gpui constructor).
+    Text consumers are unchanged: `text()` of a Finder copy is still the names; of Explorer's, the
+    paths one per line. `src/interactive.rs`: `ExternalPaths::new` and `PartialEq`/`Eq`.
+  - macOS (`src/platform/mac/platform.rs`): `read_from_clipboard` reads the file URLs first
+    (`readObjectsForClasses:` of `NSURL`, file URLs only; a file reference URL becomes its path) and
+    puts them ahead of what gpui read before (`read_text_or_image_from_clipboard`, the old body). An
+    item with paths is written as Finder's Copy writes it: `writeObjects:` of file `NSURL`s, so
+    Finder pastes the files, and the text as the first item's plain text. macOS has no cut of files:
+    the flag isn't written and reads back `false`.
+  - Windows (`src/platform/windows/clipboard.rs`): CF_HDROP is read first (`decode_dropfiles`; names
+    that aren't UTF-16 go through the shell's `DragQueryFileW`) with "Preferred DropEffect" — move
+    and not copy is a cut (Explorer's Cut sets move, its Copy copy and link). An item with paths is
+    written as Explorer writes it: CF_HDROP (`encode_dropfiles`: `DROPFILES`, UTF-16 names, two NULs
+    at the end), "Preferred DropEffect" (move for a cut, else copy) and CF_UNICODETEXT.
+    `encode_dropfiles` / `decode_dropfiles` are public (Windows only) for Flux's test in
+    `file_tree.rs`, which runs in the Windows CI job (gpui's own tests need the dev-dependencies
+    left out).
+  - Scenario isolation (macOS): with `FLUX_SCENARIO_PASTEBOARD=<name>` the clipboard is
+    `[NSPasteboard pasteboardWithName:]` instead of the general pasteboard (`scenario_pasteboard`),
+    so a UI scenario never touches the clipboard of the user working alongside.
+  - `src/app.rs`: `App::clear_clipboard` writes an item with no entries (`ClipboardItem::empty`),
+    which gpui already turns into `clearContents` on macOS (the scenario pasteboard, if set) and
+    `EmptyClipboard` on Windows. Flux clears the clipboard after files that were cut have moved, as
+    Explorer does after pasting a cut: Finder and Explorer don't offer files that are gone.
+  - `src/window.rs`: `DispatchEventResult` is public, so `Window::dispatch_event` can be called
+    outside gpui (Flux's scenario steps `drag-files:` / `drop-files:` drop files with it).
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,
@@ -186,4 +219,7 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
    lane and doesn't slide the board, a sideways swipe slides it; along a toolbar the next button's
    tooltip shows at once, a tooltip fades out when the mouse leaves, and after a click it waits.
    On Windows: signing out with a project open, then starting Flux, brings the project back with its
-   tabs; the window resizes from its top edge and moves by its title bar.
+   tabs; the window resizes from its top edge and moves by its title bar. Files: Copy in Finder or
+   Explorer, Paste in the project tree copies them in; Copy in the tree, Paste in Finder or
+   Explorer copies the file there (Cut in the tree, Paste in Explorer moves it); text copied in
+   Flux still pastes as text elsewhere.
