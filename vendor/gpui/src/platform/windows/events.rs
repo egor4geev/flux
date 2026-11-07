@@ -548,7 +548,15 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
-        let modifiers = current_modifiers();
+        let mut modifiers = current_modifiers();
+        // Flux patch (pinch): a precision touchpad's pinch comes as the wheel with Ctrl, and only
+        // the message's key state may say so, not the keyboard's: it zooms, as Ctrl with the wheel
+        // does. A Ctrl the keyboard holds stays as read (AltGr isn't Ctrl).
+        if MODIFIERKEYS_FLAGS(wparam.loword() as u32).contains(MK_CONTROL)
+            && !is_virtual_key_pressed(VK_CONTROL)
+        {
+            modifiers.control = true;
+        }
         let mut lock = self.state.borrow_mut();
         let Some(mut func) = lock.callbacks.input.take() else {
             return Some(1);

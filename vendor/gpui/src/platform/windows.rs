@@ -16,6 +16,8 @@ mod window;
 mod wrapper;
 
 pub(crate) use clipboard::*;
+// Flux patch: CF_HDROP's data, for Flux's tests.
+pub use clipboard::{decode_dropfiles, encode_dropfiles};
 pub(crate) use destination_list::*;
 pub(crate) use direct_write::*;
 pub(crate) use directx_atlas::*;

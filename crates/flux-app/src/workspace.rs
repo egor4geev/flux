@@ -740,6 +740,10 @@ pub enum ModalKind {
     /// shortcuts don't replace it with a popup; focus leaving it (a question on top of it) doesn't
     /// close it either.
     Dialog,
+    /// A viewer over the whole window under the title bar, on a veil of its own: the picture popup
+    /// (`image_popup`). It closes as a popup does, except that a click beside its picture is its
+    /// own to handle; the title bar stays live, as under a dialog.
+    Viewer,
 }
 
 /// Where the paths came from: this determines where errors are reported.
@@ -2119,6 +2123,8 @@ impl Workspace {
                 window,
                 |this, _, event: &ImageViewEvent, window, cx| match event {
                     ImageViewEvent::EditAsText(path) => this.open_text(path.clone(), window, cx),
+                    // Only the popup's pictures send it.
+                    ImageViewEvent::Dismiss => {}
                 },
             ),
             cx.observe(view, |_, _, cx| cx.notify()),
@@ -4350,6 +4356,16 @@ impl Workspace {
         self.open_modal(ModalKind::Dialog, window, cx, build)
     }
 
+    /// [`Self::toggle_modal`] for a viewer ([`ModalKind::Viewer`]): over the whole window.
+    pub(crate) fn toggle_viewer<V: ManagedView>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+    ) {
+        self.open_modal(ModalKind::Viewer, window, cx, build)
+    }
+
     fn open_modal<V: ManagedView>(
         &mut self,
         kind: ModalKind,
@@ -4364,7 +4380,7 @@ impl Workspace {
         }
         // Behind a dialog, the window's shortcuts don't open popups (as behind a modal dialog of
         // JetBrains IDEs); a dialog may give way to the next dialog of a flow.
-        if kind == ModalKind::Popup && self.dialog_open() {
+        if kind != ModalKind::Dialog && self.dialog_open() {
             return;
         }
         // Project search is also an overlay window: it gives way without restoring focus.
@@ -4397,7 +4413,7 @@ impl Workspace {
                     this.dismiss_modal(window, cx)
                 }),
             ];
-        if kind == ModalKind::Popup {
+        if kind != ModalKind::Dialog {
             subscriptions.push(
                 cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
                     this.dismiss_modal(window, cx)
@@ -4596,11 +4612,42 @@ impl Workspace {
                 crate::motion::inert(backdrop).into_any_element()
             });
         }
+        // The veil under a viewer, the same way: deeper than a dialog's backdrop.
+        let viewer = self
+            .modal
+            .as_ref()
+            .is_some_and(|modal| modal.kind == ModalKind::Viewer);
+        let viewer_leaving = self
+            .leaving_modal
+            .as_ref()
+            .is_some_and(|leaving| leaving.value.kind == ModalKind::Viewer);
+        if viewer || viewer_leaving {
+            let veil = crate::image_popup::veil(ui)
+                .id("viewer-veil")
+                .absolute()
+                .top(px(TITLE_BAR_HEIGHT))
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .with_transition_from(
+                    "viewer-veil-fade",
+                    0.,
+                    if viewer { 1. } else { 0. },
+                    crate::motion::FADE,
+                    |veil, opacity| veil.opacity(opacity),
+                );
+            layers.push(if viewer {
+                veil.into_any_element()
+            } else {
+                crate::motion::inert(veil).into_any_element()
+            });
+        }
         if let Some(leaving) = &self.leaving_modal {
             let progress = leaving.progress(window);
             let modal = &leaving.value;
             let view = div()
                 .id(("modal-leaving", modal.view.entity_id().as_u64()))
+                .when(modal.kind == ModalKind::Viewer, |view| view.size_full())
                 .child(modal.view.clone());
             // It shrinks toward where it came from. Inert inside the placement: an anchored
             // popup is deferred, prepainted after (and outside) whatever is around it.
@@ -4617,6 +4664,7 @@ impl Workspace {
             // the click's mouse-up chose the row.
             let view = div()
                 .occlude()
+                .when(modal.kind == ModalKind::Viewer, |view| view.size_full())
                 .when(modal.kind == ModalKind::Popup, |view| {
                     view.on_mouse_down_out(
                         cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)),
@@ -4702,8 +4750,18 @@ impl Workspace {
     }
 
     /// An overlay window's place: a dialog under the title bar in the middle (over the backdrop),
-    /// a popup at its anchor or under the title bar.
+    /// a viewer over everything under the title bar, a popup at its anchor or under the title bar.
     fn place_modal(modal: &Modal, view: impl IntoElement) -> AnyElement {
+        if modal.kind == ModalKind::Viewer {
+            return div()
+                .absolute()
+                .top(px(TITLE_BAR_HEIGHT))
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .child(view)
+                .into_any_element();
+        }
         if modal.kind == ModalKind::Dialog {
             return div()
                 .absolute()
@@ -6046,6 +6104,14 @@ impl Render for Workspace {
                     data: data.into(),
                 };
                 this.open_image(source, true, window, cx)
+            },
+        ));
+        #[cfg(feature = "scenario")]
+        let root = root.on_action(cx.listener(
+            |this, _: &crate::image_popup::scenario::PreviewScenarioImages, window, cx| {
+                if let Some((pictures, index)) = crate::image_popup::scenario::pictures() {
+                    crate::image_popup::open(this, pictures, index, window, cx)
+                }
             },
         ));
         #[cfg(feature = "scenario")]
@@ -7847,9 +7913,8 @@ impl Workspace {
             ClaudeChatEvent::OpenLocation(location) => {
                 self.open_location(location.clone(), true, window, cx)
             }
-            // The image tab comes with part 10.2.
-            ClaudeChatEvent::PreviewImage(source) => {
-                self.open_image(source.clone(), true, window, cx)
+            ClaudeChatEvent::PreviewImages { pictures, index } => {
+                crate::image_popup::open(self, pictures.clone(), *index, window, cx)
             }
             ClaudeChatEvent::OpenCompare { path, left, right } => {
                 let repo = self.git.read(cx).repo_index(path).unwrap_or(0);

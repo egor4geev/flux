@@ -80,8 +80,12 @@ pub enum ClaudeChatEvent {
     OpenProposal(String),
     /// A file Claude read or changed, clicked in the conversation.
     OpenLocation(crate::workspace::Location),
-    /// A picture of the conversation clicked: an image tab (part 10.2).
-    PreviewImage(crate::image_view::ImageSource),
+    /// A picture of the conversation clicked: the picture popup with the pictures of its message,
+    /// the `index`th in sight.
+    PreviewImages {
+        pictures: Vec<crate::image_view::ImageSource>,
+        index: usize,
+    },
     /// A file compared with a text of Claude's edits (part 10.2: a turn's Review, an edit's Diff).
     OpenCompare {
         path: PathBuf,

@@ -1068,6 +1068,13 @@ impl App {
         self.platform.write_to_clipboard(item)
     }
 
+    /// Flux patch: empties the platform clipboard — after files that were cut have been pasted, as
+    /// Explorer does, so nothing offers to paste files that are gone. macOS clears the pasteboard
+    /// (`clearContents`), Windows empties the clipboard (`EmptyClipboard`).
+    pub fn clear_clipboard(&self) {
+        self.platform.write_to_clipboard(ClipboardItem::empty())
+    }
+
     /// Reads data from the primary selection buffer.
     /// Only available on Linux.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]

@@ -259,6 +259,9 @@ fn ask_answer(stdout: &str, stderr: &str, code: Option<i32>) -> Result<String, S
     }
 }
 
+/// The flag that lets a session switch to bypass permissions later (`set_permission_mode`).
+const ALLOW_SKIPPING_PERMISSIONS: &str = "--allow-dangerously-skip-permissions";
+
 /// How a session starts.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LaunchOptions {
@@ -319,6 +322,14 @@ impl LaunchOptions {
         }
         if let Some(id) = &self.session_id {
             args.extend(["--session-id".into(), id.clone()]);
+        }
+        // Bypass permissions can be chosen in the chat at any time: the CLI switches to it only
+        // when started allowing it. The flag only allows it — the session starts in its own mode.
+        let allowed = self.extra_args.iter().any(|arg| {
+            arg == ALLOW_SKIPPING_PERMISSIONS || arg == "--dangerously-skip-permissions"
+        });
+        if !allowed {
+            args.push(ALLOW_SKIPPING_PERMISSIONS.into());
         }
         args.extend(self.extra_args.iter().cloned());
         args
@@ -523,6 +534,30 @@ mod tests {
         // Without a session to resume there is nothing to cut.
         let fresh = LaunchOptions { resume: None, ..at };
         assert!(!fresh.args().join(" ").contains("--resume-session-at"));
+    }
+
+    #[test]
+    fn bypass_permissions_can_always_be_chosen() {
+        let count = |options: &LaunchOptions| {
+            let args = options.args();
+            let allow = args.iter().filter(|arg| *arg == ALLOW_SKIPPING_PERMISSIONS);
+            (
+                allow.count(),
+                args.contains(&"--dangerously-skip-permissions".to_string()),
+            )
+        };
+        assert_eq!(count(&LaunchOptions::default()), (1, false));
+        // The settings' extra arguments have it already: not twice.
+        let given = LaunchOptions {
+            extra_args: vec![ALLOW_SKIPPING_PERMISSIONS.into()],
+            ..LaunchOptions::default()
+        };
+        assert_eq!(count(&given), (1, false));
+        let skipping = LaunchOptions {
+            extra_args: vec!["--dangerously-skip-permissions".into()],
+            ..LaunchOptions::default()
+        };
+        assert_eq!(count(&skipping), (0, true));
     }
 
     #[test]

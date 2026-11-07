@@ -44,7 +44,6 @@ use crate::claude_select::{self, Collect};
 use crate::claude_session::ClaudeSession;
 use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, IconSource, file_icon, icon, source_icon};
-use crate::image_view::ImageSource;
 use crate::markdown::{self, Block, Marks};
 use crate::motion::{self, Appear, Curve, TransitionExt};
 use crate::region_guard::{self, Verdict};
@@ -871,6 +870,15 @@ pub(crate) fn find_tool(entries: &[Entry], id: EntryId) -> Option<&ToolEntry> {
     })
 }
 
+/// The user's message with the entry id `id`, at any depth (a subagent's view shows its own).
+pub(crate) fn find_user(entries: &[Entry], id: EntryId) -> Option<&UserEntry> {
+    entries.iter().find_map(|entry| match &entry.kind {
+        EntryKind::User(user) if entry.id == id => Some(user),
+        EntryKind::Tool(tool) => find_user(&tool.children, id),
+        _ => None,
+    })
+}
+
 impl Item {
     /// The entries it shows.
     fn range(self) -> std::ops::Range<usize> {
@@ -1618,16 +1626,6 @@ impl Renderer<'_> {
         let thumbnails: Vec<AnyElement> = (0..user.images.len())
             .filter_map(|index| {
                 let image = self.state.images.get(&(id, index))?.clone();
-                let attachment = user.images.get(index)?;
-                let source = ImageSource::Bytes {
-                    name: format!(
-                        "image-{}.{}",
-                        index + 1,
-                        image_extension(&attachment.media_type)
-                    ),
-                    media_type: attachment.media_type.clone(),
-                    data: Arc::from(attachment.data.as_slice()),
-                };
                 let chat = self.chat.clone();
                 Some(
                     div()
@@ -1643,8 +1641,9 @@ impl Renderer<'_> {
                         .tooltip(ui::tooltip(tr("Preview"), None))
                         .child(img(image).size_full().object_fit(gpui::ObjectFit::Cover))
                         .on_click(move |_, _, cx| {
-                            let source = source.clone();
-                            chat.update(cx, |chat, cx| chat.preview_image(source, cx))
+                            // The popup takes the focus: nothing under the thumbnail may take it.
+                            cx.stop_propagation();
+                            chat.update(cx, |chat, cx| chat.preview_images(id, index, cx))
                                 .ok();
                         })
                         .into_any_element(),
@@ -4265,15 +4264,6 @@ fn clock_label(at: i64, now: i64) -> String {
 }
 
 /// A file name's extension for a picture's media type.
-fn image_extension(media_type: &str) -> &'static str {
-    match media_type {
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        _ => "png",
-    }
-}
-
 /// What a plugin's Claude session sends before the message (part 10.3, `claude.new-session`):
 /// `<attachment name="TRACK-142">…</attachment>` — a chip above the bubble, not text in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

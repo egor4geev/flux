@@ -1930,6 +1930,7 @@ impl SettingsView {
                     (Some("acceptEdits"), tr("Accept Edits")),
                     (Some("plan"), tr("Plan")),
                     (Some("auto"), tr("Auto")),
+                    (Some("bypassPermissions"), tr("Bypass Permissions")),
                 ],
                 current.permission_mode.clone(),
                 |claude, value| claude.permission_mode = value,

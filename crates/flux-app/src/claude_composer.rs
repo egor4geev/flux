@@ -5,12 +5,14 @@
 //!   message waits for the turn to end (the CLI queues it); ⌘↵ sends it at once, stopping the
 //!   turn. Esc stops a running turn.
 //! - Chips above the text: the editor's file and selected lines (sent as an `@path#L12-20`
-//!   mention unless removed), pictures pasted (⌘V) or dropped on the field.
+//!   mention unless removed), pictures pasted (⌘V) or dropped on the field. Files copied in Finder
+//!   or Explorer paste as dropped ones do: pictures attached, the rest mentioned (0.4.1).
 //! - `@` lists the project's files (fuzzy, as ⌘P), `/` at the start the session's slash commands;
 //!   the list opens above the field, ↑ ↓ ↵ ⇥ Esc drive it.
 //! - The card's bottom row: the model, effort and permission mode pickers (⇧⇥ cycles Ask before
-//!   edits → Accept edits → Plan mode, as in the CLI), the context ring, attach, Send / Stop
-//!   (part 10.2, the chat's new look).
+//!   edits → Accept edits → Plan mode → Auto mode where the model has it, as in the CLI; Bypass
+//!   permissions only from the menu), the context ring, attach, Send / Stop (part 10.2, the chat's
+//!   new look).
 //! - `!` typed first in the empty field: shell mode (part 10.2) — a green `!` badge, ↵ runs the
 //!   command in the project's root ([`ClaudeSession::run_shell`]), its output goes to Claude; ⌫ in
 //!   the empty field or Esc leaves the mode.
@@ -264,7 +266,9 @@ fn mode_label(mode: PermissionMode) -> &'static str {
         PermissionMode::Default => tr("Ask before edits"),
         PermissionMode::AcceptEdits => tr("Accept edits"),
         PermissionMode::Plan => tr("Plan mode"),
-        PermissionMode::DontAsk => tr("Don't ask"),
+        // The CLI's "don't ask" refuses whatever isn't allowed in advance: named for what it does
+        // (0.4.1 — read as "go ahead without asking", it left Claude unable to edit).
+        PermissionMode::DontAsk => tr("Allowed only"),
         PermissionMode::Auto => tr("Auto mode"),
         PermissionMode::BypassPermissions => tr("Bypass permissions"),
     }
@@ -301,13 +305,49 @@ fn effort_short(effort: Effort) -> &'static str {
     }
 }
 
-/// ⇧⇥: the CLI's cycle of the three everyday modes.
-fn next_mode(mode: PermissionMode) -> PermissionMode {
+/// ⇧⇥: the CLI's cycle of the everyday modes, Auto mode among them when the model has it.
+fn next_mode(mode: PermissionMode, auto: bool) -> PermissionMode {
     match mode {
         PermissionMode::Default => PermissionMode::AcceptEdits,
         PermissionMode::AcceptEdits => PermissionMode::Plan,
+        PermissionMode::Plan if auto => PermissionMode::Auto,
         _ => PermissionMode::Default,
     }
+}
+
+/// The modes the picker offers: the CLI's own (Auto mode where the model has it) and Bypass
+/// permissions — Flux starts `claude` allowing it. "Don't ask" only while the session is in it
+/// (the CLI's settings can start one so).
+fn menu_modes(current: PermissionMode, auto: bool) -> Vec<PermissionMode> {
+    PermissionMode::ALL
+        .into_iter()
+        .filter(|&mode| match mode {
+            PermissionMode::Auto => auto || current == mode,
+            PermissionMode::DontAsk => current == mode,
+            _ => true,
+        })
+        .collect()
+}
+
+/// Paths for a `!` command, separated by spaces: quoted (single quotes, as Git Bash on Windows
+/// takes them too) when they hold anything a shell would split or expand — Windows' backslashes
+/// among them.
+fn shell_words(paths: &[std::path::PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| {
+            let path = path.to_string_lossy();
+            let plain = path.chars().all(|ch| {
+                ch.is_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | ':' | '+' | ',' | '@')
+            });
+            if plain {
+                path.into_owned()
+            } else {
+                format!("'{}'", path.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// "28.9k".
@@ -343,6 +383,22 @@ fn is_sendable(format: ImageFormat) -> bool {
         format,
         ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::Webp
     )
+}
+
+/// The message box's pictures in the picture popup, the `index`th in sight.
+fn preview_images(images: &[Arc<Image>], index: usize, window: &mut Window, cx: &mut App) {
+    let pictures = images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            crate::image_popup::conversation_picture(
+                index,
+                image.format.mime_type(),
+                Arc::from(image.bytes.as_slice()),
+            )
+        })
+        .collect();
+    crate::image_popup::show(pictures, index, window, cx);
 }
 
 /// The project's files for `@`: walked in the background when the list opens, matched by nucleo.
@@ -590,11 +646,13 @@ impl Composer {
         let input = cx.new(|cx| {
             PromptInput::new(tr("Ask Claude… @ for files, / for commands"), cx)
                 .max_rows(MESSAGE_ROWS)
+                .takes_files()
         });
         let subscriptions = vec![
-            cx.subscribe(
+            cx.subscribe_in(
                 &input,
-                |this, _, event: &PromptInputEvent, cx| match event {
+                window,
+                |this, _, event: &PromptInputEvent, window, cx| match event {
                     PromptInputEvent::Changed => {
                         this.notice = None;
                         this.enter_shell_mode(cx);
@@ -606,6 +664,14 @@ impl Composer {
                         this.attach(image.clone(), cx)
                     }
                     PromptInputEvent::ImagePasted(_) => {}
+                    // A `!` command takes the files' paths.
+                    PromptInputEvent::FilesPasted(paths) if this.shell_mode => {
+                        let text = shell_words(paths);
+                        this.input.update(cx, |input, cx| input.insert(&text, cx));
+                    }
+                    PromptInputEvent::FilesPasted(paths) => {
+                        this.add_paths(paths.clone(), window, cx)
+                    }
                     PromptInputEvent::BackspaceAtStart if this.shell_mode => {
                         this.leave_shell_mode(cx)
                     }
@@ -1238,7 +1304,7 @@ impl Composer {
     }
 
     fn cycle_mode(&mut self, _: &CycleMode, _window: &mut Window, cx: &mut Context<Self>) {
-        let mode = next_mode(self.shown_mode(cx));
+        let mode = next_mode(self.shown_mode(cx), self.auto_mode(cx));
         self.choose_mode(mode, cx);
     }
 
@@ -1514,6 +1580,13 @@ impl Composer {
         )
     }
 
+    /// The session's model has Auto mode (unknown before the CLI lists its models: no).
+    fn auto_mode(&self, cx: &App) -> bool {
+        let models = &self.session.read(cx).model().models;
+        self.current_model(models, cx)
+            .is_some_and(|model| model.auto_mode)
+    }
+
     fn choose_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
         let reported = self.session.read(cx).model().info.permission_mode;
         self.mode_choice = Some(Choice {
@@ -1585,31 +1658,16 @@ impl Composer {
             }
             Picker::Mode => {
                 let current = self.shown_mode(cx);
-                let bypass = settings::claude(cx).extra_args.iter().any(|arg| {
-                    arg == "--allow-dangerously-skip-permissions"
-                        || arg == "--dangerously-skip-permissions"
-                });
+                let modes = menu_modes(current, self.auto_mode(cx));
                 cx.new(|cx| {
                     let mut menu = ContextMenu::new(window, cx).title(tr("Permission Mode"));
-                    for mode in [
-                        PermissionMode::Default,
-                        PermissionMode::AcceptEdits,
-                        PermissionMode::Plan,
-                        PermissionMode::DontAsk,
-                    ] {
+                    for mode in modes {
+                        // Bypass permissions stands apart: nothing is checked in it.
+                        if mode == PermissionMode::BypassPermissions {
+                            menu = menu.separator();
+                        }
                         menu = menu
                             .entry(mark(current == mode, mode_label(mode)), ChooseMode { mode });
-                    }
-                    if bypass || current == PermissionMode::BypassPermissions {
-                        menu = menu.separator().entry(
-                            mark(
-                                current == PermissionMode::BypassPermissions,
-                                mode_label(PermissionMode::BypassPermissions),
-                            ),
-                            ChooseMode {
-                                mode: PermissionMode::BypassPermissions,
-                            },
-                        );
                     }
                     menu
                 })
@@ -1762,8 +1820,11 @@ impl Composer {
         });
         let context_chip = context_chip
             .map(|chip| Appear::pop((0.5, 0.5)).apply("claude-context-chip-appear", chip));
+        // A click on a thumbnail shows the pictures in the popup, this one in sight.
+        let pictures: Rc<[Arc<Image>]> = images.iter().cloned().collect();
         let thumbnails = images.iter().enumerate().map(|(index, image)| {
             let id = image.id();
+            let pictures = pictures.clone();
             let thumbnail = div()
                 .id(("claude-image", index))
                 .group("claude-image")
@@ -1774,6 +1835,13 @@ impl Composer {
                 .border_1()
                 .border_color(ui.input_border)
                 .overflow_hidden()
+                .cursor_pointer()
+                .hover(move |style| style.border_color(ui.accent))
+                // The click is the thumbnail's: the card would take the focus back to the field.
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    preview_images(&pictures, index, window, cx)
+                })
                 .child(img(image.clone()).size_full().object_fit(ObjectFit::Cover))
                 .child(
                     div()
@@ -1794,6 +1862,8 @@ impl Composer {
                         .group_hover("claude-image", |style| style.opacity(1.))
                         .child(icon(IconName::Close, ui.foreground).size(px(10.)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            // Removing it doesn't open it.
+                            cx.stop_propagation();
                             this.images.retain(|image| image.id() != id);
                             cx.notify();
                         })),
@@ -2836,6 +2906,8 @@ fn place_menu(corner: Point<Pixels>, view: impl IntoElement) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -2922,13 +2994,44 @@ mod tests {
 
     #[test]
     fn modes_cycle_like_the_cli() {
+        use PermissionMode::*;
+        assert_eq!(next_mode(Default, false), AcceptEdits);
+        assert_eq!(next_mode(AcceptEdits, false), Plan);
+        assert_eq!(next_mode(Plan, false), Default);
+        assert_eq!(next_mode(Plan, true), Auto);
+        assert_eq!(next_mode(Auto, true), Default);
+        assert_eq!(next_mode(DontAsk, true), Default);
+        // ⇧⇥ never lands in Bypass permissions; from it, back to asking.
+        assert_eq!(next_mode(BypassPermissions, true), Default);
+    }
+
+    #[test]
+    fn pasted_files_become_shell_words() {
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
         assert_eq!(
-            next_mode(PermissionMode::Default),
-            PermissionMode::AcceptEdits
+            shell_words(&paths(&["/p/src/main.rs", "/p/My Docs/it's.txt"])),
+            "/p/src/main.rs '/p/My Docs/it'\\''s.txt'"
         );
-        assert_eq!(next_mode(PermissionMode::AcceptEdits), PermissionMode::Plan);
-        assert_eq!(next_mode(PermissionMode::Plan), PermissionMode::Default);
-        assert_eq!(next_mode(PermissionMode::DontAsk), PermissionMode::Default);
+        assert_eq!(
+            shell_words(&paths(&[r"C:\Users\me\a.txt"])),
+            r"'C:\Users\me\a.txt'"
+        );
+    }
+
+    #[test]
+    fn the_picker_offers_auto_and_bypass_but_not_dont_ask() {
+        use PermissionMode::*;
+        assert_eq!(
+            menu_modes(Default, true),
+            [Default, AcceptEdits, Plan, Auto, BypassPermissions]
+        );
+        assert_eq!(
+            menu_modes(Default, false),
+            [Default, AcceptEdits, Plan, BypassPermissions]
+        );
+        // A session already in a mode shows it, checked.
+        assert!(menu_modes(DontAsk, false).contains(&DontAsk));
+        assert!(menu_modes(Auto, false).contains(&Auto));
     }
 
     #[test]
