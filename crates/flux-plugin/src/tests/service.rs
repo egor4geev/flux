@@ -288,6 +288,7 @@ fn file_server(body: Vec<u8>, pause: Duration) -> (u16, Arc<AtomicUsize>) {
     (port, count)
 }
 
+#[cfg(unix)]
 fn gzip(bytes: &[u8]) -> Vec<u8> {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(bytes).unwrap();
@@ -463,24 +464,28 @@ fn service_numbers() {
         at(0.99),
         times.last().unwrap()
     );
-    let cpu = || {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        // SAFETY: getrusage fills the struct it is given.
-        unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-        // SAFETY: filled above.
-        let usage = unsafe { usage.assume_init() };
-        let time = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
-        time(usage.ru_utime) + time(usage.ru_stime)
-    };
-    std::thread::sleep(Duration::from_millis(500));
-    let before = cpu();
-    let idle = Duration::from_secs(5);
-    std::thread::sleep(idle);
-    let used = cpu() - before;
-    eprintln!(
-        "idle: a window's instance and the service with nothing to do (and the engine's epoch \
-         ticker, shared by every plugin): {:?} of CPU in {idle:?} = {:.3} %",
-        used,
-        used.as_secs_f64() / idle.as_secs_f64() * 100.
-    );
+    // The idle CPU through `getrusage` — Unix only (the numbers are taken on the Mac).
+    #[cfg(unix)]
+    {
+        let cpu = || {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // SAFETY: getrusage fills the struct it is given.
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+            // SAFETY: filled above.
+            let usage = unsafe { usage.assume_init() };
+            let time = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+            time(usage.ru_utime) + time(usage.ru_stime)
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        let before = cpu();
+        let idle = Duration::from_secs(5);
+        std::thread::sleep(idle);
+        let used = cpu() - before;
+        eprintln!(
+            "idle: a window's instance and the service with nothing to do (and the engine's epoch \
+             ticker, shared by every plugin): {:?} of CPU in {idle:?} = {:.3} %",
+            used,
+            used.as_secs_f64() / idle.as_secs_f64() * 100.
+        );
+    }
 }

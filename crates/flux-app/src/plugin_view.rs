@@ -1065,7 +1065,6 @@ impl PluginView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn render_tree_row(
         &self,
         tree_id: &str,
