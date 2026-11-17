@@ -19,11 +19,11 @@
 //! views by it. To start an element afresh — Expand All applying the rows' `expanded` again —
 //! give it a new id.
 
+pub use crate::host::ui::{AvatarSpec, ImageShape, ImageSpec, ToggleStyle, Tone};
 use crate::host::ui::{
-    BadgeSpec, ButtonSpec, Element as RawElement, ElementKind, Property, RowAction, Span,
-    TextFieldSpec, ToggleSpec, TreeRow, TreeSpec, View,
+    BadgeSpec, ButtonSpec, ConversationSpec, Element as RawElement, ElementKind, Property,
+    RowAction, Span, TextFieldSpec, ToggleSpec, TreeRow, TreeSpec, View,
 };
-pub use crate::host::ui::{ToggleStyle, Tone};
 
 /// An element with its children, before flattening.
 pub struct Element {
@@ -59,9 +59,27 @@ impl Element {
     }
 }
 
-/// Shows `root` as the content of the tool window `window` (`[[tool-windows]]` of the manifest).
+/// Shows `root` as the content of the tool window `window` (`[[tool-windows]]` of the manifest),
+/// or of a tab `<window>/<key>` of a window with tabs.
 pub fn set_view(window: &str, root: Element) {
     crate::host::ui::set_view(window, &root.into_view());
+}
+
+/// Opens the tab `key` of a window declared with `tabs = true` (API 0.5), titled `title`, or
+/// brings it forward (retitled); `focus` — it takes the keyboard. Returns the tab's window name,
+/// `<window>/<key>`, for [`set_view`], [`set_badge`], `ui::set_title`, `ui::hide` and the
+/// conversation's updates; the events name the tab by it, and `Event::TabClosed` tells when it
+/// is closed. Flux keeps the tab with the project: the plugin fills it again from its key when
+/// it comes into sight (`Event::ToolWindowShown`).
+pub fn open_tab(window: &str, key: &str, title: &str, focus: bool) -> String {
+    crate::host::ui::open_tab(window, key, title, focus)
+}
+
+/// The window's mark (API 0.5): on the launchpad icon of a window of the left or the right
+/// island, a count ("4"); on a tab, a dot after the title. `None` takes it away; it goes when the
+/// plugin stops, too.
+pub fn set_badge(window: &str, badge: Option<&str>) {
+    crate::host::ui::set_badge(window, badge);
 }
 
 /// Appends the element and its subtree; returns its index.
@@ -311,12 +329,14 @@ impl SpanStyle for Span {
     }
 }
 
-/// The rows of a tree or a list — or of cards, as a board's column (`Tree::cards`).
+/// The rows of a tree or a list — or of cards, as a board's column (`Tree::cards`), or of two
+/// lines, as a list of chats (`Tree::two_line`, API 0.5).
 #[derive(Default)]
 pub struct Tree {
     rows: Vec<TreeRow>,
     empty_text: Option<String>,
     cards: bool,
+    two_line: bool,
 }
 
 impl Tree {
@@ -335,6 +355,13 @@ impl Tree {
     /// line, the subtitle under them (two lines at most), then the detail.
     pub fn cards(mut self) -> Self {
         self.cards = true;
+        self
+    }
+
+    /// Rows of two lines (API 0.5), as a list of chats: the avatar or the icon on the left; the
+    /// label and the detail on the first line, the subtitle and the badge on the second.
+    pub fn two_line(mut self) -> Self {
+        self.two_line = true;
         self
     }
 
@@ -360,6 +387,9 @@ impl Tree {
             subtitle: row.subtitle,
             tags: row.tags,
             actions: row.actions,
+            avatar: row.avatar,
+            badge_tone: row.badge_tone,
+            label_icons: row.label_icons,
         });
         (self.rows.len() - 1) as u32
     }
@@ -379,6 +409,7 @@ impl Tree {
                 rows: self.rows,
                 empty_text: self.empty_text,
                 cards: self.cards,
+                two_line: self.two_line,
             }),
         )
     }
@@ -395,6 +426,9 @@ pub struct RowSpec {
     subtitle: Option<Vec<Span>>,
     tags: Vec<BadgeSpec>,
     actions: Vec<RowAction>,
+    avatar: Option<AvatarSpec>,
+    badge_tone: Option<Tone>,
+    label_icons: Vec<String>,
 }
 
 impl RowSpec {
@@ -415,6 +449,9 @@ impl RowSpec {
             subtitle: None,
             tags: Vec::new(),
             actions: Vec::new(),
+            avatar: None,
+            badge_tone: None,
+            label_icons: Vec::new(),
         }
     }
 
@@ -433,6 +470,24 @@ impl RowSpec {
     /// A count on the right.
     pub fn badge(mut self, badge: &str) -> Self {
         self.badge = Some(badge.to_string());
+        self
+    }
+
+    /// The badge's color (API 0.5): `Tone::Accent` — unread, `Tone::Muted` — muted.
+    pub fn badge_tone(mut self, tone: Tone) -> Self {
+        self.badge_tone = Some(tone);
+        self
+    }
+
+    /// A person's or a chat's picture in place of the icon (API 0.5).
+    pub fn avatar(mut self, avatar: AvatarSpec) -> Self {
+        self.avatar = Some(avatar);
+        self
+    }
+
+    /// A small named icon right after the label (API 0.5): pinned, muted.
+    pub fn label_icon(mut self, icon: &str) -> Self {
+        self.label_icons.push(icon.to_string());
         self
     }
 
@@ -502,6 +557,29 @@ pub fn editable_property(id: &str, label: &str, value: Vec<Span>) -> Property {
 /// Properties in two aligned columns (API 0.3): a task's fields.
 pub fn properties(id: &str, properties: Vec<Property>) -> Element {
     Element::new(id, ElementKind::Properties(properties))
+}
+
+/// A picture (API 0.5), as wide as the column lets it, up to its own size; a click comes as
+/// `UiEvent::Clicked`. Build the spec with [`crate::conversation::picture`].
+pub fn image(id: &str, spec: ImageSpec) -> Element {
+    Element::new(id, ElementKind::Image(spec))
+}
+
+/// A person's or a chat's picture (API 0.5), the size of a header's:
+/// `avatar("chat-avatar", AvatarSpec::initials("АС", 6))`.
+pub fn avatar(id: &str, spec: AvatarSpec) -> Element {
+    Element::new(id, ElementKind::Avatar(spec))
+}
+
+/// A QR code of `text` (API 0.5): dark on light whatever the theme, for a phone's camera.
+pub fn qr(id: &str, text: &str) -> Element {
+    Element::new(id, ElementKind::Qr(text.to_string()))
+}
+
+/// A message feed with a field (API 0.5); it takes the remaining height. Its messages come by
+/// [`crate::conversation::update`], not with the view: a new view keeps them by the id.
+pub fn conversation(id: &str, spec: ConversationSpec) -> Element {
+    Element::new(id, ElementKind::Conversation(spec))
 }
 
 #[cfg(test)]

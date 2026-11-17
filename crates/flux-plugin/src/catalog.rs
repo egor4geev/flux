@@ -406,6 +406,19 @@ fn download_http(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Vec<u8>, String> {
+    download_bytes(url, size, MAX_PACKAGE, cancel, progress)
+}
+
+/// Downloads `url` (`https://`, `http://`) up to `limit` bytes, telling the progress (bytes so
+/// far, all bytes — `size` when the server doesn't say); stops when `cancel` is set. The plugins'
+/// helpers come this way too.
+pub(crate) fn download_bytes(
+    url: &str,
+    size: u64,
+    limit: u64,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Vec<u8>, String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(format!("{url}: not an https:// or file:// address"));
     }
@@ -416,12 +429,8 @@ fn download_http(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(size);
-    let mut reader = response
-        .body_mut()
-        .with_config()
-        .limit(MAX_PACKAGE)
-        .reader();
-    let mut bytes = Vec::with_capacity(total.min(MAX_PACKAGE) as usize);
+    let mut reader = response.body_mut().with_config().limit(limit).reader();
+    let mut bytes = Vec::with_capacity(total.min(limit) as usize);
     let mut buffer = vec![0; CHUNK];
     progress(0, total);
     loop {

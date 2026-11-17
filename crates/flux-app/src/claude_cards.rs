@@ -7,6 +7,10 @@
 //! The cards are stacked oldest first; the newest has the keyboard: ↑/↓ and the number keys pick
 //! a row, ↵ takes it, Esc denies (keeps planning), ⌘↵ accepts an edit. A text field (what to do
 //! instead, "Other") is outside the rows, so typing in it never picks one.
+//!
+//! A plugin's card (API 0.5, `tools.confirm` of a `write` tool) is one of the session's questions
+//! too, drawn as the plugin says: what will be done, its quote, the plugin's buttons — ↵ confirms,
+//! Esc rejects.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -23,12 +27,14 @@ use serde_json::Value;
 use crate::claude_chat::{ClaudeChat, ClaudeChatEvent};
 use crate::claude_session::ClaudeSession;
 use crate::i18n::{tr, trf};
-use crate::icons::{IconName, icon};
+use crate::icons::{IconName, IconSource, icon, source_icon};
 use crate::input::TextInput;
 use crate::markdown::{self, Block};
 use crate::motion::{Disclosure, unfold_style};
+use crate::plugin_tools::PluginTool;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
+use flux_plugin::api::tools::{ConfirmChoice, Confirmation};
 
 actions!(
     claude_cards,
@@ -154,9 +160,19 @@ pub fn render(
         .iter()
         .map(|pending| {
             let keyboard = state.keyboard.as_deref() == Some(pending.id.as_str());
-            render_card(
-                state, session, pending, model, keyboard, &focus, ui, window, cx,
-            )
+            let plugin_card = session
+                .read(cx)
+                .plugin_tools()
+                .card(&pending.id)
+                .map(|(tool, card)| (tool.clone(), card.clone()));
+            match plugin_card {
+                Some((tool, card)) => {
+                    render_plugin_card(&pending.id, &tool, &card, keyboard, &focus, ui, window, cx)
+                }
+                None => render_card(
+                    state, session, pending, model, keyboard, &focus, ui, window, cx,
+                ),
+            }
         })
         .collect();
     let tasks = render_tasks(state, model, ui, window, cx);
@@ -948,6 +964,189 @@ fn render_card(
         .child(rows_element)
         .children(field)
         .children(footer)
+        .into_any_element()
+}
+
+/// The user's choice on a plugin's card: the plugin hears it.
+fn choose(chat: &mut ClaudeChat, id: &str, choice: ConfirmChoice, cx: &mut Context<ClaudeChat>) {
+    let session = chat.session().clone();
+    session.update(cx, |session, cx| session.choose_on_card(id, choice, cx));
+}
+
+/// A plugin's card (API 0.5): its icon, the title with a dim subtitle and "waiting for you"; the
+/// quote of what is answered, the text in a box; the plugin's buttons — confirm (↵), edit, reject
+/// (Esc) — and its hint on the right.
+#[allow(clippy::too_many_arguments)]
+fn render_plugin_card(
+    id: &str,
+    tool: &PluginTool,
+    card: &Confirmation,
+    keyboard: bool,
+    focus: &FocusHandle,
+    ui: UiColors,
+    window: &mut Window,
+    cx: &mut Context<ClaudeChat>,
+) -> AnyElement {
+    let focused = keyboard && focus.is_focused(window);
+    let mark = match &tool.icon {
+        Some(path) => source_icon(&IconSource::Asset(path.clone()), ui.accent_text)
+            .size(px(13.))
+            .into_any_element(),
+        None => icon(IconName::Plug, ui.accent_text)
+            .size(px(13.))
+            .into_any_element(),
+    };
+    let header = div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .min_w_0()
+        .child(
+            div()
+                .flex_none()
+                .size(px(22.))
+                .rounded(px(6.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(UiColors::tint(ui.accent, 0.18))
+                .child(mark),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(card.title.clone()),
+        )
+        .children(card.subtitle.clone().map(|subtitle| {
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.dim)
+                .child(subtitle)
+        }))
+        .child(div().flex_1())
+        .child(ui::badge(tr("waiting for you"), ui.accent_text));
+    let quote = card.quote.clone().map(|(author, text)| {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .px(px(10.))
+            .py(px(6.))
+            .rounded(px(ui::RADIUS_SM))
+            .border_l_2()
+            .border_color(ui.accent)
+            .bg(UiColors::tint(ui.accent, 0.06))
+            .text_size(px(theme::TEXT_SM))
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(ui.accent_text)
+                    .child(author),
+            )
+            .child(div().text_color(ui.text_muted).child(text))
+    });
+    let text = div()
+        .px(px(12.))
+        .py(px(9.))
+        .rounded(px(ui::RADIUS_MD))
+        .border_1()
+        .border_color(UiColors::tint(ui.accent, 0.3))
+        .bg(UiColors::tint(ui.foreground, 0.03))
+        .text_color(ui.foreground)
+        .child(card.text.clone());
+    let button = |suffix: &str| SharedString::from(format!("claude-plugin-card-{suffix}-{id}"));
+    let on = |choice: ConfirmChoice| {
+        let id = id.to_string();
+        cx.listener(move |chat, _: &ClickEvent, _, cx| choose(chat, &id, choice, cx))
+    };
+    let confirm = ui::primary_button(button("confirm"), card.confirm.clone(), true, ui)
+        .gap(px(6.))
+        .child(div().text_size(px(theme::TEXT_XS)).opacity(0.7).child("↵"))
+        .on_click(on(ConfirmChoice::Confirmed));
+    let edit = card.edit.clone().map(|label| {
+        ui::text_button(button("edit"), label, false, ui).on_click(on(ConfirmChoice::Edit))
+    });
+    let reject = div()
+        .id(button("reject"))
+        .flex_none()
+        .h(px(24.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .rounded(px(ui::RADIUS_SM))
+        .text_size(px(theme::TEXT_SM))
+        .text_color(ui.text_muted)
+        .cursor_pointer()
+        .hover(move |style| style.bg(ui.hover).text_color(ui.foreground))
+        .child(card.reject.clone())
+        .on_click(on(ConfirmChoice::Rejected));
+    // The buttons of the card with the keyboard take ↵ and Esc.
+    let buttons = div()
+        .id(button("buttons"))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .when(keyboard, |row| {
+            row.key_context(ROWS_CONTEXT)
+                .track_focus(focus)
+                .on_action(cx.listener(|chat, _: &Confirm, _, cx| {
+                    if let Some(id) = chat.cards.keyboard.clone() {
+                        choose(chat, &id, ConfirmChoice::Confirmed, cx);
+                    }
+                }))
+                .on_action(cx.listener(|chat, _: &Dismiss, _, cx| {
+                    if let Some(id) = chat.cards.keyboard.clone() {
+                        choose(chat, &id, ConfirmChoice::Rejected, cx);
+                    }
+                }))
+        })
+        .child(confirm)
+        .children(edit)
+        .child(reject)
+        .child(div().flex_1())
+        .children(card.hint.clone().map(|hint| {
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(theme::TEXT_XS))
+                .text_color(ui.dim)
+                .child(hint)
+        }));
+    let id = id.to_string();
+    div()
+        .id(SharedString::from(format!("claude-card-{id}")))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .p(px(10.))
+        .rounded(px(ui::RADIUS_LG))
+        .bg(ui.elevated)
+        .border_1()
+        .border_color(if focused {
+            UiColors::tint(ui.accent, 0.55)
+        } else {
+            ui.elevated_border
+        })
+        .shadow(ui::popover_shadow(ui))
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |chat, _, window, cx| {
+                chat.cards.keyboard = Some(id.clone());
+                if let Some(focus) = &chat.cards.focus {
+                    window.focus(focus);
+                }
+                cx.notify();
+            }),
+        )
+        .child(header)
+        .children(quote)
+        .child(text)
+        .child(buttons)
         .into_any_element()
 }
 

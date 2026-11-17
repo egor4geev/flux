@@ -1,6 +1,6 @@
 //! Plugins without UI (stage 8, ADR-029): WebAssembly components of the `flux:plugin` world
-//! (`wit/v0.3/flux-plugin.wit`, which API 0.4 keeps; plugins built for 0.2 — `wit/v0.2`,
-//! [`compat`]) run by wasmtime, each on its own thread.
+//! (`wit/v0.5/flux-plugin.wit`; plugins built for 0.2 — `wit/v0.2`, for 0.3 and 0.4 —
+//! `wit/v0.3`, [`compat`]) run by wasmtime, each on its own thread.
 //!
 //! - [`manifest`] — `flux-plugin.toml`: who the plugin is, its permissions and what it adds
 //!   (commands, tool windows, status bar items, settings; with 8.3 — languages, grammars, language
@@ -13,6 +13,9 @@
 //!   ([`runtime::PluginMessage`]); limits on time and memory; the sandbox. `host` answers the
 //!   API's functions on the plugin's side of the thread: what needs the window becomes a message,
 //!   the rest (the network, the server, programs, timers, secrets) is done right there.
+//! - [`services`] — the plugins' services (API 0.5): messages between a plugin's instance for the
+//!   whole app and its windows' instances, thread to thread.
+//! - [`helpers`] — the plugins' own programs (API 0.5): downloaded, checked, kept.
 //! - [`secrets`] — the plugins' secrets, kept by Flux encrypted.
 //! - [`api`] — the types of the WIT interfaces, shared with the window.
 //! - [`log`], [`locales`], [`dev`], [`paths`] — the plugin's log, its translations, building a
@@ -22,6 +25,7 @@ pub mod api;
 pub mod catalog;
 pub(crate) mod compat;
 pub mod dev;
+pub mod helpers;
 mod host;
 pub mod install;
 pub mod locales;
@@ -31,6 +35,7 @@ pub mod paths;
 pub mod registry;
 pub mod runtime;
 pub(crate) mod secrets;
+pub mod services;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -40,13 +45,14 @@ pub use host::login_env;
 /// The version of the plugin API a manifest names in `api`: what plugins are built for now (the
 /// SDK, the template). API 0.4 added keys of the manifest only — a language's `injections` and
 /// `file-patterns` — so its components are built with the 0.3 interfaces (`flux:plugin@0.3.0`,
-/// [`wit_version`]).
-pub const API_VERSION: &str = "0.4";
+/// [`wit_version`]); 0.5 (FluxGram) added the service, helpers, pictures, the conversation, tabs,
+/// the file dialog and Claude's tools.
+pub const API_VERSION: &str = "0.5";
 
 /// The versions this Flux runs, oldest first: a plugin built for an older one keeps working (its
 /// calls are answered through `wit/v0.2`), and a plugin without code (a language, a theme) names
 /// any of them.
-pub const SUPPORTED_API_VERSIONS: &[&str] = &["0.2", "0.3", API_VERSION];
+pub const SUPPORTED_API_VERSIONS: &[&str] = &["0.2", "0.3", "0.4", API_VERSION];
 
 /// This Flux runs plugins built for `api`.
 pub fn supports_api(api: &str) -> bool {

@@ -23,7 +23,7 @@ use crate::api::bindings::flux::plugin::process;
 use crate::api::events::Event;
 use crate::host::HostState;
 use crate::log::Level;
-use crate::runtime::{EventSender, State};
+use crate::runtime::{EventSender, HostCall, State};
 
 /// `run`'s time limit when the plugin gives none.
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -145,6 +145,69 @@ impl process::Host for State {
             terminate(started.group, started.ended.clone());
         }
     }
+
+    /// API 0.5: the path of the plugin's own program, downloaded and checked first when it isn't
+    /// in place ([`crate::helpers`]); the plugin waits, and the wait doesn't count toward its time
+    /// limit. A download longer than [`PROGRESS_AFTER`] is shown in the window.
+    fn helper(&mut self, name: String) -> Result<String, String> {
+        let started = Instant::now();
+        let result = self.host.helper(&name);
+        self.host.waited += started.elapsed();
+        result
+    }
+}
+
+/// A helper's download is shown in the window once it takes longer than this.
+const PROGRESS_AFTER: Duration = Duration::from_secs(1);
+/// …and its progress told at most this often.
+const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+
+impl HostState {
+    /// `process.helper`: the path, downloaded first when needed; the progress of a long download
+    /// goes to the window ([`HostCall::HelperProgress`]).
+    fn helper(&mut self, name: &str) -> Result<String, String> {
+        let entry = self.entry.clone();
+        let begun = Instant::now();
+        let mut told: Option<Instant> = None;
+        let result = {
+            let host = &*self;
+            let mut progress = |done: u64, total: u64| {
+                let now = Instant::now();
+                if now.duration_since(begun) < PROGRESS_AFTER
+                    || told.is_some_and(|told| now.duration_since(told) < PROGRESS_EVERY)
+                {
+                    return;
+                }
+                told = Some(now);
+                host.call(HostCall::HelperProgress {
+                    helper: name.to_string(),
+                    progress: Some((done, total)),
+                });
+            };
+            crate::helpers::ensure(&entry, name, &mut progress)
+        };
+        if told.is_some() {
+            self.call(HostCall::HelperProgress {
+                helper: name.to_string(),
+                progress: None,
+            });
+        }
+        let path = result
+            .inspect_err(|err| self.warn(&format!("process.helper: {err}")))?
+            .to_string_lossy()
+            .into_owned();
+        if begun.elapsed() >= PROGRESS_EVERY {
+            self.log.write(
+                Level::Info,
+                &format!(
+                    "The helper \"{name}\" is in place ({:.1} s): {path}",
+                    begun.elapsed().as_secs_f64()
+                ),
+            );
+        }
+        self.helpers.insert(path.clone());
+        Ok(path)
+    }
 }
 
 fn no_program(process: u64) -> String {
@@ -157,7 +220,9 @@ impl HostState {
     /// additions, in a process group of its own, with all three pipes.
     fn command(&self, command: &process::Command) -> Result<Command, String> {
         let permissions = &self.entry.manifest.permissions;
-        if !permissions.allows_program(&command.program) {
+        // The plugin's own program (API 0.5): exactly the path `helper` gave.
+        let helper = self.helpers.contains(&command.program);
+        if !helper && !permissions.allows_program(&command.program) {
             let name = Path::new(&command.program)
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())

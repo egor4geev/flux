@@ -2,7 +2,8 @@
 //! CLI learns its name from `initialize.sdkMcpServers` and talks to it in JSON-RPC wrapped in
 //! `mcp_message` control requests (PROTOCOL.md §7.3); every message gets one reply, the
 //! `mcp_response` of the control response. Tool calls go to the window ([`McpReply::Call`]) —
-//! the language servers, the tabs — and come back as a [`ToolOutput`].
+//! the language servers, the tabs, the plugins' tools (API 0.5) — and come back as a
+//! [`ToolOutput`].
 
 use serde_json::{Value, json};
 
@@ -12,15 +13,18 @@ pub const SERVER: &str = "flux";
 /// The protocol version Flux answers with when the CLI doesn't name one.
 const PROTOCOL_VERSION: &str = "2025-11-25";
 
-/// A tool Claude may call.
+/// The longest name a tool may have with the server's prefix (`mcp__flux__…`): the API's limit.
+pub const MAX_TOOL_NAME: usize = 64;
+
+/// A tool Claude may call: Flux's own, or a plugin's (its name has the plugin's prefix).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
-    /// The name without the server's prefix: "get_diagnostics".
-    pub name: &'static str,
+    /// The name without the server's prefix: "get_diagnostics", "fluxgram_read_chat".
+    pub name: String,
     /// For people: "Get Diagnostics".
-    pub title: &'static str,
+    pub title: String,
     /// For the model: what the tool does and when to use it.
-    pub description: &'static str,
+    pub description: String,
     /// The JSON schema of the arguments.
     pub input_schema: Value,
     /// It only reads: Claude calls it without asking the user.
@@ -60,6 +64,9 @@ pub enum McpReply {
         id: Value,
         name: String,
         arguments: Value,
+        /// The `tool_use` block of the call in the conversation (`_meta.claudecode/toolUseId`):
+        /// ties the call to its step in the chat.
+        tool_use_id: Option<String>,
     },
 }
 
@@ -133,10 +140,15 @@ impl McpServer {
                     Value::Null => json!({}),
                     arguments => arguments.clone(),
                 };
+                let tool_use_id = params["_meta"]["claudecode/toolUseId"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
                 McpReply::Call {
                     id,
                     name: name.to_string(),
                     arguments,
+                    tool_use_id,
                 }
             }
             method => McpReply::Respond(json!({
@@ -180,13 +192,23 @@ mod tests {
     use super::*;
 
     fn server() -> McpServer {
-        McpServer::new(vec![ToolSpec {
-            name: "open_file",
-            title: "Open File",
-            description: "Opens a file in Flux.",
-            input_schema: json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
-            read_only: true,
-        }])
+        McpServer::new(vec![
+            ToolSpec {
+                name: "open_file".into(),
+                title: "Open File".into(),
+                description: "Opens a file in Flux.".into(),
+                input_schema: json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+                read_only: true,
+            },
+            // A plugin's tool: its name has the plugin's prefix; it changes something.
+            ToolSpec {
+                name: "fluxgram_send_reply".into(),
+                title: "Reply in a Chat".into(),
+                description: "Sends a reply once the user confirms it.".into(),
+                input_schema: json!({ "type": "object", "properties": { "text": { "type": "string" } } }),
+                read_only: false,
+            },
+        ])
     }
 
     #[test]
@@ -218,6 +240,14 @@ mod tests {
             reply["result"]["tools"][0]["annotations"]["readOnlyHint"],
             true
         );
+        let plugin = &reply["result"]["tools"][1];
+        assert_eq!(plugin["name"], "fluxgram_send_reply");
+        assert_eq!(plugin["title"], "Reply in a Chat");
+        assert_eq!(
+            plugin["inputSchema"]["properties"]["text"]["type"],
+            "string"
+        );
+        assert_eq!(plugin["annotations"]["readOnlyHint"], false);
     }
 
     #[test]
@@ -234,6 +264,7 @@ mod tests {
                 id: json!(2),
                 name: "open_file".into(),
                 arguments: json!({ "path": "a.rs" }),
+                tool_use_id: Some("toolu_1".into()),
             }
         );
         let result = McpServer::result(&json!(2), &ToolOutput::text("Opened a.rs."));
@@ -247,6 +278,39 @@ mod tests {
             panic!("an unknown tool is answered at once");
         };
         assert_eq!(reply["result"]["isError"], true);
+    }
+
+    #[test]
+    fn a_plugin_tool_call_keeps_its_tool_use_id() {
+        let server = server();
+        let call = json!({
+            "method": "tools/call", "jsonrpc": "2.0", "id": 4,
+            "params": { "name": "fluxgram_send_reply", "arguments": { "text": "Hi" },
+                        "_meta": { "claudecode/toolUseId": "toolu_9" } },
+        });
+        let McpReply::Call {
+            name, tool_use_id, ..
+        } = server.handle(&call)
+        else {
+            panic!("a plugin's tool goes to the window");
+        };
+        assert_eq!(name, "fluxgram_send_reply");
+        assert_eq!(tool_use_id.as_deref(), Some("toolu_9"));
+
+        // Without `_meta` (an older CLI) the call still goes, untied to a step.
+        let bare = json!({ "method": "tools/call", "jsonrpc": "2.0", "id": 5,
+                           "params": { "name": "fluxgram_send_reply" } });
+        let McpReply::Call {
+            arguments,
+            tool_use_id,
+            ..
+        } = server.handle(&bare)
+        else {
+            panic!("a plugin's tool goes to the window");
+        };
+        assert_eq!(arguments, json!({}));
+        assert_eq!(tool_use_id, None);
+        assert!(tool_name("fluxgram_send_reply").len() <= MAX_TOOL_NAME);
     }
 
     #[test]

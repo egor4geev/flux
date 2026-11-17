@@ -11,7 +11,9 @@ mod http;
 mod process;
 mod secrets;
 mod server;
+mod service;
 mod timers;
+mod tools;
 mod window;
 
 pub use process::login_env;
@@ -21,7 +23,7 @@ pub(crate) use http::test_overrides;
 #[cfg(test)]
 pub(crate) use window::{local_time_zone, local_utc_offset};
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,8 +45,8 @@ use crate::api::types::{EditorInfo, Range};
 use crate::log::{Level, PluginLog};
 use crate::registry::PluginEntry;
 use crate::runtime::{
-    EditorCall, EditorReply, EventSender, HostCall, MessageKind, PluginMessage, State, WindowCall,
-    WindowReply,
+    EditorCall, EditorReply, EventSender, HostCall, InstanceRole, MessageKind, PluginMessage,
+    State, WindowCall, WindowReply,
 };
 
 /// How long the plugin waits for the window to answer about documents.
@@ -62,6 +64,8 @@ const STORAGE: &str = "storage.json";
 pub(crate) struct HostState {
     pub id: Arc<str>,
     pub entry: Arc<PluginEntry>,
+    /// A window's instance or the plugin's service (API 0.5).
+    pub role: InstanceRole,
     pub language: String,
     pub root: Option<PathBuf>,
     pub settings: Map<String, Value>,
@@ -89,15 +93,33 @@ pub(crate) struct HostState {
     /// The plugin's started programs.
     pub processes: process::Processes,
     pub timers: timers::Timers,
+    /// The calls of Claude's tools in progress (API 0.5): `tool-called` adds one, `tool-cancelled`
+    /// and the answer remove it.
+    pub tool_calls: HashSet<u64>,
+    /// The paths `process.helper` gave (API 0.5): `run` and `spawn` take exactly these without the
+    /// `processes` permission.
+    pub helpers: HashSet<String>,
 }
+
+/// The first id of the service's notifications (API 0.5): they go to the windows, whose stores
+/// map the plugin's ids — the service's never meet a window's instance's.
+pub(crate) const SERVICE_IDS: u64 = 1 << 48;
 
 impl HostState {
     /// A call for the window; dropped once the window has let the instance go (a document call
-    /// then gets no reply at once).
+    /// then gets no reply at once). The service's calls go to the app, those it can carry out
+    /// without a window ([`HostState::service_call`]).
     pub(crate) fn call(&self, call: HostCall) {
         if self.cancel.load(Ordering::Relaxed) {
             return;
         }
+        let call = match self.role {
+            InstanceRole::Service => match self.service_call(call) {
+                Some(call) => call,
+                None => return,
+            },
+            InstanceRole::Window(_) => call,
+        };
         let _ = self.messages.unbounded_send(PluginMessage {
             plugin: self.id.clone(),
             kind: MessageKind::Call(call),
@@ -143,8 +165,16 @@ impl HostState {
         known
     }
 
+    /// Whether the manifest declares the tool window — or, for `<window>/<key>`, a window with
+    /// tabs (API 0.5); warns about one it doesn't.
     fn known_window(&self, window: &str, what: &str) -> bool {
-        let known = self.entry.manifest.tool_window(window).is_some();
+        let manifest = &self.entry.manifest;
+        let known = match window.split_once('/') {
+            Some((tabbed, key)) => {
+                !key.is_empty() && manifest.tool_window(tabbed).is_some_and(|spec| spec.tabs)
+            }
+            None => manifest.tool_window(window).is_some(),
+        };
         if !known {
             self.warn(&format!(
                 "{what}: the tool window \"{window}\" isn't in flux-plugin.toml"
@@ -272,6 +302,12 @@ impl dialogs::Host for State {
     fn ask_form(&mut self, form: dialogs::Form) -> u64 {
         let id = self.host.next_id();
         self.host.call(HostCall::AskForm { id, form });
+        id
+    }
+
+    fn pick_files(&mut self, options: dialogs::FilePick) -> u64 {
+        let id = self.host.next_id();
+        self.host.call(HostCall::PickFiles { id, options });
         id
     }
 }
@@ -540,6 +576,52 @@ impl ui::Host for State {
         if self.host.known_window(&window, "ui.set-title") {
             self.host
                 .call(HostCall::SetToolWindowTitle { window, title });
+        }
+    }
+
+    fn update_conversation(
+        &mut self,
+        window: String,
+        element: String,
+        changes: Vec<ui::ConversationChange>,
+    ) {
+        if self.host.known_window(&window, "ui.update-conversation") && !changes.is_empty() {
+            self.host.call(HostCall::UpdateConversation {
+                window,
+                element,
+                changes,
+            });
+        }
+    }
+
+    fn open_tab(&mut self, window: String, key: String, title: String, focus: bool) -> String {
+        let tab = format!("{window}/{key}");
+        let tabbed = self
+            .host
+            .entry
+            .manifest
+            .tool_window(&window)
+            .is_some_and(|spec| spec.tabs);
+        if !tabbed {
+            self.host.warn(&format!(
+                "ui.open-tab: \"{window}\" isn't a tool window with tabs = true in flux-plugin.toml"
+            ));
+        } else if key.is_empty() {
+            self.host.warn("ui.open-tab: the key is empty");
+        } else {
+            self.host.call(HostCall::OpenTab {
+                window,
+                key,
+                title,
+                focus,
+            });
+        }
+        tab
+    }
+
+    fn set_badge(&mut self, window: String, badge: Option<String>) {
+        if self.host.known_window(&window, "ui.set-badge") {
+            self.host.call(HostCall::SetBadge { window, badge });
         }
     }
 }

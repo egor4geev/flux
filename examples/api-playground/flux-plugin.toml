@@ -1,14 +1,16 @@
-# The API Playground: every capability of the plugin API (0.3) behind a button (docs/plugins.md).
+# The API Playground: every capability of the plugin API (0.5) behind a button (docs/plugins.md).
 # Not bundled into Flux — install the folder: Settings → Plugins → ⚙ → Install Plugin from Disk….
 id = "flux.api-playground"
 name = "API Playground"
 version = "0.1.0"
-api = "0.3"
+api = "0.5"
 authors = ["Egor Ageev"]
 description = "Every capability of the plugin API behind a button: requests, a local server, programs, terminals, proposed edits, Git, problems, secrets, timers, context menus; forms, pickers, the settings page, branches, links, Claude sessions, contexts, a window in the editor."
 repository = "https://github.com/egor4geev/flux"
 icon = "icons/playground.svg"
 wasm = "target/wasm32-wasip2/release/flux_api_playground.wasm"
+# One more instance for the whole app (API 0.5): the windows ping it and share its counter.
+service = true
 
 # Everything the API asks permission for, to try each: the install question lists them.
 [permissions]
@@ -73,6 +75,20 @@ id = "board"
 title = "Playground Board"
 icon = "icons/playground.svg"
 location = "editor"
+
+# Tools for Claude (API 0.5): the window's Claude sessions get them as mcp__flux__api_playground_*.
+[[tools]]
+name = "echo"
+title = "Echo"
+description = "Sends the text back. A check that Flux passes Claude's calls to a plugin: use it when the user asks to try the API Playground's echo."
+schema = "tools/echo.json"
+
+[[tools]]
+name = "note"
+title = "Write a Note"
+description = "Writes a line to the API Playground's log once the user confirms it on a card in the chat. Use it when the user asks to leave a note in the playground; tell the user what came of it."
+schema = "tools/note.json"
+write = true
 
 # The clock of the timers' section.
 [[status-items]]

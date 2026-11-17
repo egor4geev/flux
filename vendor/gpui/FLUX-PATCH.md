@@ -48,7 +48,9 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
 - **Headless scenario frames** (`crates/flux-app/src/scenario.rs`, `FLUX_SCENARIO_HEADLESS`): a
   locked screen stops the display link of every window, and the window server won't capture
   them. `Window::headless_frame` does what the platform's frame callback does, without presenting
-  (next-frame callbacks, `draw` when dirty); `Window::render_to_image` renders the current frame
+  (next-frame callbacks, `draw` when dirty) and says whether it drew; `observe_frames(fn(WindowId,
+  Duration))` is told of every frame `Window::draw` draws and how long it took (FluxGram part 1:
+  the scenarios' frame log, `FLUX_SCENARIO_FRAMES`); `Window::render_to_image` renders the current frame
   offscreen (`PlatformWindow::render_to_image`, default `None`; mac: `MetalRenderer::render_to_image`
   into a texture of the drawable's size, read back as RGBA with premultiplied alpha). For that
   `draw_primitives` and `new_command_encoder` take the target texture instead of the drawable.

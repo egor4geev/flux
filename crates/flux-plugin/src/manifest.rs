@@ -79,7 +79,7 @@
 //! file = "icon-themes/flux.toml"
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -123,6 +123,83 @@ pub struct Manifest {
     pub themes: Vec<ThemeSpec>,
     /// Sets of file icons: files in the plugin's folder.
     pub icon_themes: Vec<IconThemeSpec>,
+    /// One more instance of the plugin for the whole app, next to the windows' (API 0.5): its
+    /// service (the WIT's `service` interface).
+    pub service: bool,
+    /// The plugin's own programs, downloaded by Flux for the computer's platform (API 0.5).
+    pub helpers: Vec<HelperSpec>,
+    /// Tools for Claude, in Flux's MCP server (API 0.5).
+    pub tools: Vec<ClaudeToolSpec>,
+}
+
+/// One of the plugin's own programs (API 0.5, `[[helpers]]`): Flux downloads the file of the
+/// computer's platform, checks its SHA-256 and keeps it apart from the plugin's folder (an update
+/// replaces that folder); `process.helper(<name>)` gives its path, which `process.spawn` runs
+/// without the `processes` permission.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HelperSpec {
+    /// Lowercase letters, digits and dashes: "fluxgram-helper". On Windows the file is
+    /// `<name>.exe`.
+    pub name: String,
+    /// The file of each platform Flux runs on, by [`HELPER_PLATFORMS`]: "macos-aarch64",
+    /// "macos-x86_64", "windows-x86_64", "windows-aarch64".
+    pub platforms: BTreeMap<String, HelperFile>,
+}
+
+/// The file of a helper for one platform.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HelperFile {
+    /// An `https` address; a file ending in `.gz` is unpacked after the check.
+    pub url: String,
+    /// The SHA-256 of the file at the address (before unpacking), lowercase hex.
+    pub sha256: String,
+}
+
+/// The platforms a helper names its files by.
+pub const HELPER_PLATFORMS: &[&str] = &[
+    "macos-aarch64",
+    "macos-x86_64",
+    "windows-x86_64",
+    "windows-aarch64",
+];
+
+/// The platform of this build of Flux, as [`HELPER_PLATFORMS`] names it; none — one helpers have
+/// no files for.
+pub fn helper_platform() -> Option<&'static str> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("macos-aarch64")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("macos-x86_64")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("windows-x86_64")
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some("windows-aarch64")
+    } else {
+        None
+    }
+}
+
+/// A tool for Claude (API 0.5, `[[tools]]`): Flux adds it to its MCP server `flux`, and a call
+/// comes to the plugin's instance of the session's window as `tool-called`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ClaudeToolSpec {
+    /// Lowercase letters, digits and `_`, up to 40: "read_chat". Claude sees it with the plugin's
+    /// prefix (`mcp__flux__fluxgram_read_chat`).
+    pub name: String,
+    /// For people (translated by the plugin's locales): the step in Claude's chat, the install
+    /// question — "Read a chat".
+    pub title: String,
+    /// For Claude, in English: what the tool does, when to use it, what it returns.
+    pub description: String,
+    /// The JSON schema of the arguments: a file in the plugin's folder; none — no arguments.
+    pub schema: Option<String>,
+    /// The tool changes something (sends a message): the plugin asks the user with its card
+    /// (`tools.confirm`) before it acts.
+    #[serde(default)]
+    pub write: bool,
 }
 
 /// What a plugin may do beyond its own folder and the API's notifications, questions and windows.
@@ -302,6 +379,10 @@ pub struct ToolWindowSpec {
     /// Where the window opens (API 0.3).
     #[serde(default)]
     pub location: ToolWindowLocation,
+    /// A tab per key (API 0.5, `location = "editor"` only): `ui.open-tab(<id>, <key>, …)` opens
+    /// the tab `<id>/<key>` — a chat. The palette and the keys don't open such a window.
+    #[serde(default)]
+    pub tabs: bool,
 }
 
 /// Where a plugin's window opens.
@@ -315,6 +396,9 @@ pub enum ToolWindowLocation {
     /// preview. `ui.show` opens it (or brings it forward), `ui.hide` and the user close it; the
     /// palette and the window's keys open it too.
     Editor,
+    /// The island on the left (API 0.5), in place of the project tree, with an icon among the
+    /// launchpad's tools at the top: a list to work from — the chats.
+    Left,
 }
 
 /// An item of a context menu: runs one of the plugin's commands on what the menu was opened on
@@ -763,7 +847,18 @@ impl Manifest {
         }
         files.extend(self.themes.iter().map(|theme| theme.file.as_str()));
         files.extend(self.icon_themes.iter().map(|icons| icons.file.as_str()));
+        files.extend(self.tools.iter().filter_map(|tool| tool.schema.as_deref()));
         files
+    }
+
+    /// The helper by its name (API 0.5).
+    pub fn helper(&self, name: &str) -> Option<&HelperSpec> {
+        self.helpers.iter().find(|helper| helper.name == name)
+    }
+
+    /// The tool for Claude by its name (API 0.5).
+    pub fn tool(&self, name: &str) -> Option<&ClaudeToolSpec> {
+        self.tools.iter().find(|tool| tool.name == name)
     }
 }
 
@@ -824,6 +919,15 @@ struct RawManifest {
     themes: Vec<ThemeSpec>,
     #[serde(default)]
     icon_themes: Vec<IconThemeSpec>,
+    /// API 0.5.
+    #[serde(default)]
+    service: bool,
+    /// API 0.5.
+    #[serde(default)]
+    helpers: Vec<HelperSpec>,
+    /// API 0.5.
+    #[serde(default)]
+    tools: Vec<ClaudeToolSpec>,
 }
 
 #[derive(Deserialize)]
@@ -1163,6 +1267,7 @@ impl RawManifest {
                 ));
             }
         }
+        check_api_05(&self)?;
         let permissions = self.permissions.check()?;
         let settings = self
             .settings
@@ -1213,8 +1318,108 @@ impl RawManifest {
             language_servers,
             themes: self.themes,
             icon_themes: self.icon_themes,
+            service: self.service,
+            helpers: self.helpers,
+            tools: self.tools,
         })
     }
+}
+
+/// The keys of API 0.5: the service, helpers, tools, tabs and the left island need `api = "0.5"`
+/// or later; helpers and tools are checked (names, addresses, checksums, files).
+fn check_api_05(raw: &RawManifest) -> Result<(), ManifestError> {
+    let error = |message: String| Err(ManifestError(message));
+    let api = &raw.api;
+    let needs = |what: &str| {
+        Err(ManifestError(format!(
+            "{what} needs api = \"0.5\" or later"
+        )))
+    };
+    if raw.service && !api_at_least(api, 0, 5) {
+        return needs("service");
+    }
+    if !raw.helpers.is_empty() && !api_at_least(api, 0, 5) {
+        return needs("[[helpers]]");
+    }
+    if !raw.tools.is_empty() && !api_at_least(api, 0, 5) {
+        return needs("[[tools]]");
+    }
+    for window in &raw.tool_windows {
+        if window.location == ToolWindowLocation::Left && !api_at_least(api, 0, 5) {
+            return needs("location = \"left\"");
+        }
+        if window.tabs && !api_at_least(api, 0, 5) {
+            return needs("tabs");
+        }
+        if window.tabs && window.location != ToolWindowLocation::Editor {
+            return error(format!(
+                "tool window \"{}\": tabs need location = \"editor\"",
+                window.id
+            ));
+        }
+    }
+    unique("helper", raw.helpers.iter().map(|h| h.name.as_str()))?;
+    for helper in &raw.helpers {
+        let name_ok = !helper.name.is_empty()
+            && helper
+                .name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !name_ok {
+            return error(format!(
+                "helper \"{}\": lowercase letters, digits and dashes",
+                helper.name
+            ));
+        }
+        for (platform, file) in &helper.platforms {
+            if !HELPER_PLATFORMS.contains(&platform.as_str()) {
+                return error(format!(
+                    "helper \"{}\": unknown platform \"{platform}\" ({})",
+                    helper.name,
+                    HELPER_PLATFORMS.join(", ")
+                ));
+            }
+            if !file.url.starts_with("https://") {
+                return error(format!(
+                    "helper \"{}\" ({platform}): the url must be https",
+                    helper.name
+                ));
+            }
+            let hex = file.sha256.len() == 64
+                && file
+                    .sha256
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+            if !hex {
+                return error(format!(
+                    "helper \"{}\" ({platform}): sha256 is 64 lowercase hex digits",
+                    helper.name
+                ));
+            }
+        }
+    }
+    unique("tool", raw.tools.iter().map(|t| t.name.as_str()))?;
+    for tool in &raw.tools {
+        let name_ok = !tool.name.is_empty()
+            && tool.name.len() <= 40
+            && tool
+                .name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !name_ok {
+            return error(format!(
+                "tool \"{}\": lowercase letters, digits and _, up to 40",
+                tool.name
+            ));
+        }
+        if tool.description.trim().is_empty() {
+            return error(format!("tool \"{}\": the description is empty", tool.name));
+        }
+        if let Some(schema) = &tool.schema {
+            check_relative("tools", schema)?;
+        }
+    }
+    Ok(())
 }
 
 /// The languages, grammars and language servers of a manifest.

@@ -22,9 +22,9 @@ color themes: [Themes](themes.md); sets of file icons: [File icon sets](icon-the
 
 A plugin is a **WebAssembly component** of the `flux:plugin` world, run by
 [wasmtime](https://wasmtime.dev) inside Flux. The API is described in WIT —
-[`crates/flux-plugin/wit/v0.3/flux-plugin.wit`](../crates/flux-plugin/wit/v0.3/flux-plugin.wit) is
-the reference — API 0.4 keeps its interfaces and adds keys of the manifest only (`wit/v0.2` — the
-previous interfaces, which Flux still runs); this guide summarizes it.
+[`crates/flux-plugin/wit/v0.5/flux-plugin.wit`](../crates/flux-plugin/wit/v0.5/flux-plugin.wit) is
+the reference (`wit/v0.3` and `wit/v0.2` — the previous interfaces, which Flux still runs; API 0.4
+kept the 0.3 interfaces and added keys of the manifest only); this guide summarizes it.
 Plugins are written in Rust with the SDK ([`crates/flux-plugin-api`](../crates/flux-plugin-api)) and
 built for the `wasm32-wasip2` target.
 
@@ -167,6 +167,7 @@ The SDK's shortcuts:
 | `storage::{get, set, remove, dir}` | The plugin's data, kept between launches. |
 | `status::{set, hide, item}` | The plugin's status bar items. |
 | `view::*` | A tool window's content ([Tool windows](#tool-windows)). |
+| `view::{open_tab, set_badge}`, `conversation::{update, put…}` | API 0.5: a window's tabs, its mark, a conversation ([Windows on the left, tabs, badges](#windows-on-the-left-tabs-badges), [The conversation](#the-conversation)). |
 | `CommandContext` — `path`, `selection`, `selected_text`, `from_menu` | What a command acts on. |
 | `http::{get, post, request…}`, `http::EventStream` | Requests to web services ([The network](#the-network)). |
 | `server::{listen, respond_html, start_events, ws_send_text…}` | The plugin's server on 127.0.0.1 ([A local server](#a-local-server)). |
@@ -241,7 +242,7 @@ default = "Hello!"
 | `id` | required | Lowercase letters and digits, words joined by `.` or `-`: `someone.hello-world`. The plugin's key everywhere: its folder, settings, notification group, secrets. |
 | `name` | required | Shown in the manager, the palette's chips, Settings. |
 | `version` | required | The plugin's version. |
-| `api` | required | The plugin API it is built for: `"0.4"`. Flux runs 0.4, 0.3 and 0.2 ([From 0.3 to 0.4](#from-03-to-04), [From 0.2 to 0.3](#from-02-to-03)); a plugin with code names the version of the SDK it was built with — Flux checks it against the component (a 0.4 plugin's component imports the 0.3 interfaces). |
+| `api` | required | The plugin API it is built for: `"0.5"`. Flux runs 0.5, 0.4, 0.3 and 0.2 ([From 0.4 to 0.5](#from-04-to-05), [From 0.3 to 0.4](#from-03-to-04), [From 0.2 to 0.3](#from-02-to-03)); a plugin with code names the version of the SDK it was built with — Flux checks it against the component (a 0.4 plugin's component imports the 0.3 interfaces). |
 | `authors` | `[]` | |
 | `description` | `""` | Shown in the manager. |
 | `repository` | — | A link for the manager. |
@@ -292,7 +293,8 @@ items below its own; an item shows while the plugin runs and hasn't grayed the c
 | `when` | always | `"selection"` — the editor has a selection (`editor`); `"file"` — on a file (`tree`, `tab`); `"folder"` — on a folder (`tree`). |
 
 **`[[tool-windows]]`** — a window in the island on the right, opened by its icon in the launchpad —
-or a tab among the editor's tabs ([Tool windows](#tool-windows)).
+or a tab among the editor's tabs, or (API 0.5) a window in the island on the left
+([Tool windows](#tool-windows)).
 
 | Key | | |
 |-----|-|-|
@@ -300,7 +302,8 @@ or a tab among the editor's tabs ([Tool windows](#tool-windows)).
 | `title` | required | `ui.set-title` changes it while the plugin runs. |
 | `icon` | a puzzle piece | A monochrome 16×16 SVG in the folder, drawn in the launchpad's colors. |
 | `keys` | — | A default shortcut that opens and hides the window. |
-| `location` | `"island"` | `"editor"` — a tab among the editor's tabs, for something wide: a board, a preview. No launchpad icon: `ui.show` and the palette open it. |
+| `location` | `"island"` | `"editor"` — a tab among the editor's tabs, for something wide: a board, a preview. No launchpad icon: `ui.show` and the palette open it. `"left"` (API 0.5) — the island on the left, in place of the project tree, its icon among the launchpad's tools at the top: a list to work from, the chats ([Windows on the left, tabs, badges](#windows-on-the-left-tabs-badges)). |
+| `tabs` | `false` | API 0.5, with `location = "editor"`: a tab per key — a chat each — that the plugin opens with `view::open_tab`; the palette and the keys don't open such a window. |
 
 **`[[status-items]]`** — `id`: an item of the status bar; the plugin sets its text with
 `status-bar.set` (`status::set`).
@@ -969,6 +972,12 @@ plugin with the `project` permission is also restarted when the window's project
 | `link-activated((pattern, text))` | One of the plugin's links was clicked. |
 | `link-hovered((request, pattern, text))` | A link of a pattern with `tooltip` wants its tooltip: answer with `links.describe`. |
 | `git-done((id, result))` | `new-branch` or `checkout` ended: done, or why not. |
+| `tab-closed(window)` | 0.5: the tab `<window>/<key>` of a window with tabs was closed — by the user, by `hide`, with the window. |
+| `files-picked((id, paths?))` | 0.5: the answer to `pick-files`: absolute paths; none — cancelled. |
+| `service-message((window?, message))` | 0.5: a message by `service.send` — in the service, from that window's instance; in a window, from the service (none). |
+| `window-opened(window)`, `window-closed(window)` | 0.5, in the service: the plugin's instance in a window started or stopped. |
+| `service-started` | 0.5, in a window's instance: the service started (again) and knows nothing of the window yet. |
+| `tool-called(call)`, `tool-confirmed((id, choice))`, `tool-cancelled(id)` | 0.5: Claude called one of the plugin's tools; the user answered its card; the call is gone (interrupted, the session closed). |
 
 ## Signing in to a web service
 
@@ -1060,6 +1069,296 @@ Yandex Tracker and Calendar — is built of these pieces:
 7. **News** — polling with `timers::every`; notifications whose actions carry the task's key
    (`Notice::action_with`, `context.argument()`).
 
+## From 0.4 to 0.5
+
+API 0.5 (`wit/v0.5`) is what a plugin like a messenger needs: one connection for the whole app, a
+program of its own, tools for Claude, pictures and a conversation, a list on the left and a tab per
+chat. A manifest that uses its keys says `api = "0.5"`; plugins built for 0.2, 0.3 and 0.4 keep
+working as they are — Flux answers their calls through their own interfaces and never sends them
+what their version doesn't know (a service's message, a tool call, a conversation's input).
+
+### The plugin's service
+
+```toml
+service = true
+```
+
+Flux runs one more instance of the plugin for the whole app — the **service** — next to the
+instance in each window: from the first window that starts the plugin until the plugin is turned
+off, removed or reloaded, or Flux quits (its `deactivate` then gets a second to close what it
+holds). Closing the last window doesn't stop it. The service keeps what must be one: a connection,
+a database that can't be opened twice, a program. The windows' instances show things and talk to
+it by messages (`flux_plugin_api::service`):
+
+```rust
+// In a window's instance: ask the service; hello again whenever it (re)starts.
+service::send("ping")?;                       // → the service: ServiceMessage((Some(window), "ping"))
+Event::ServiceStarted => service::send_json(&Hello { … })?,
+Event::ServiceMessage((None, text)) => …,     // the service's answer or news
+
+// In the service (service::is_service()):
+Event::ServiceMessage((Some(window), text)) => service::send_to(window, "pong")?,
+service::broadcast("count 3")?;               // every window's instance
+Event::WindowOpened(window) | Event::WindowClosed(window) => …,
+service::windows()                            // the windows running the plugin, in `activate` too
+```
+
+Messages are text (JSON suits: `send_json`, `parse`), in order, from thread to thread — a round trip
+window → service → window takes tens of microseconds. `send` fails when nobody can take the
+message: the service isn't running (yet — `ServiceStarted` says when it is), or the window is gone.
+A service that stops by itself (a panic, a limit) is told like a window's plugin, with Restart;
+the windows hear `ServiceStarted` when it runs again, and it starts from nothing.
+
+The service has no window and no project: documents, the project, tool windows, questions (they
+come back dismissed), pickers, terminals, proposals, Git, problems, links, Claude sessions,
+contexts, commands and the status bar fail or do nothing there, with a line in the plugin's log.
+Its notifications go to the window the user works in, the `status` lines of its settings page to
+every window; it hears `settings-changed` once per change. Commands and Claude's tools go to the
+windows' instances.
+
+### The plugin's own programs
+
+```toml
+[[helpers]]
+name = "chat-helper"
+[helpers.platforms.macos-aarch64]
+url = "https://github.com/someone/chat/releases/download/v1.0.0/chat-helper-macos-aarch64.gz"
+sha256 = "…"   # of the file at the address, lowercase hex
+```
+
+Platforms: `macos-aarch64`, `macos-x86_64`, `windows-x86_64`, `windows-aarch64`; an `https`
+address; a `.gz` file is unpacked after the check. `process::helper("chat-helper")` gives the
+program's path: the first time Flux downloads the file of this computer's platform (the call
+waits; a download over a second shows its progress in the window), checks its SHA-256 and keeps it
+apart from the plugin's folder (`helpers/<plugin>/<sha256>/`), so an update of the plugin doesn't
+download it again unless the checksum changed; the older versions go once a new one is in place,
+all of them when the plugin is removed. The address is in the manifest the user approved: no
+`network` permission is needed, and `process::command(&path)` runs exactly that path without the
+`processes` permission. The install question says the plugin downloads and runs its own program,
+and from where.
+
+### Tools for Claude
+
+```toml
+[[tools]]
+name = "read_chat"                 # Claude sees mcp__flux__<plugin>_read_chat
+title = "Read a chat"              # the step in Claude's chat, the install question
+description = "Reads the last messages of a chat. …"   # for Claude, in English
+schema = "tools/read_chat.json"    # the JSON schema of the arguments
+write = false                      # true: the plugin asks the user before it acts
+```
+
+Flux puts the tools of the plugins running in a window into its MCP server `flux` of each Claude
+session the window starts (with Settings → Claude Code → Flux's tools on). The CLI reads the list
+once, when its process starts: a plugin turned on later offers its tools in the next sessions (or
+when a session's process starts again). Claude's name of a tool is `mcp__flux__<prefix>_<name>`:
+the prefix is the last part of the plugin's id (`flux.fluxgram` → `fluxgram`, `acme.issue-tracker`
+→ `issue_tracker`), with a number when two plugins of the window end the same, cut so that the
+whole name stays within 64 characters. The `description` and the schema go to Claude as they are;
+a schema file that is missing or isn't a JSON schema of an object is replaced by "any object" (a
+line in the plugin's log says why). `write = false` tells Claude the tool only reads.
+
+A call comes to the instance of the session's window as `Event::ToolCalled(call)` (`call.arguments`
+is a JSON object; `call.parse::<T>()` reads it); the plugin answers with
+`tools::respond(call.id, ToolOutput::text(…))`, at once or later — there is no timeout: Claude shows
+the step running until the plugin answers or the user stops Claude. `text` is what Claude reads
+(`ToolOutput::error(…)` — the call failed). The rest is how the step looks in Claude's chat: it
+shows the tool's `title` (translated by the plugin's locales) with the plugin's icon until the
+answer, then `summary` as its line ("Backend · team — 50 messages"), `detail` dim on the right
+("15–17 Nov") and `excerpt` — Markdown under the line when the user opens the step (what Claude
+read). Several steps of one plugin in a row fold into a group: "FluxGram · 3 steps".
+
+A `write` tool asks the user first, in any of Claude's permission modes (also the one that never
+asks: Flux allows its server's tools itself, and the plugin asks):
+
+```rust
+let card = Confirmation::new("Reply in «Backend · team»", &text, "Send", "Don't send")
+    .subtitle("to Peter")
+    .quote("Peter", "Do we release on Friday?")
+    .edit("Edit")
+    .hint("Edit puts the text into the chat's field");
+tools::confirm(call.id, &card)?;
+```
+
+The card shows in the chat above the message field, like a permission card: the plugin's icon, the
+title and the dim subtitle, "waiting for you", the quote, the text, the buttons — the confirm one
+takes ↵, the reject one Esc — and the hint. The session waits for the user meanwhile: the status bar,
+the console and the notifications say so. The choice comes as `Event::ToolConfirmed((call,
+choice))` — `Confirmed`, `Edit` or `Rejected` — and the card goes; the plugin then acts (or not) and
+answers the call, saying what came of it (Claude reads "the user declined" as well as a result).
+`confirm` again for the same call replaces the card.
+
+`Event::ToolCancelled(call)`: the call is gone — the user stopped Claude, the session closed, the
+CLI withdrew it; its card goes, an answer to it is dropped and `confirm` fails. A plugin that isn't
+running (turned off, starting, stopped) gets no calls: Claude gets an error at once; a plugin that
+stops during a call fails it the same way. Only the windows' instances get calls, never the
+service. The install question lists the tools, and which of them ask first. The API Playground's
+`echo` and `note` (`examples/api-playground`) are both kinds in a few lines.
+
+### Pictures, avatars, QR codes
+
+A picture is a file the plugin names by its absolute path — PNG, JPEG, WebP, GIF (the first frame)
+— in its own folders: where it is installed, its data folder (`storage::dir()`) with what its
+program downloads; a path elsewhere isn't shown (a line in the plugin's log). Flux decodes pictures
+off the window's thread at the size they are shown and keeps the decoded ones within a memory
+budget: a chat of hundreds of photos holds only what is on screen.
+
+```rust
+use flux_plugin_api::conversation as chat;
+let photo = chat::picture(&path, 1280, 720)  // the room it takes until it loads (0 — unknown)
+    .preview(jpeg)                           // a tiny JPEG (up to 4 KB), blurred until it loads
+    .full(&original);                        // a larger file for the viewer
+set_view("profile", column("root", [
+    avatar("avatar", AvatarSpec::initials("AS", 6).picture(&userpic)),
+    image("photo", photo),                   // as wide as the column lets it; a click — `clicked`
+    qr("qr", &sign_in_link),                 // dark on light whatever the theme, for a phone
+]));
+```
+
+`chat::pending_picture(width, height)` isn't downloaded yet: its preview blurred, or a dim box;
+`.progress(0.4)` draws the download over it, and the plugin sends it again with the path once the
+file is there. `.shape(ImageShape::Circle)` — round (`Rounded` by default, `Square`). An avatar is
+the picture, or — while there is none, or it loads — the initials on one of the design system's
+seven avatar colors (0–6, the same for the same person).
+
+### Chat lists: two-line rows
+
+```rust
+let mut list = Tree::new().two_line().empty_text("No chats");
+list.add(
+    RowSpec::new("1234", "Anna Smirnova")             // the key: the chat's id
+        .avatar(AvatarSpec::initials("AS", 6).picture(&userpic))
+        .detail("14:32")                              // the first line, on the right: the time
+        .subtitle(vec![span("Sent the mockups")])     // the second line: the last message
+        .badge("3").badge_tone(Tone::Accent)          // unread; Tone::Muted — a muted chat
+        .label_icon("claude"),                        // after the name: Claude may read it
+);
+set_view("chats", list.into_element("list"));
+```
+
+`Tree::two_line()` draws rows of two lines, as a chat client's list: the avatar (or the icon) on
+the left; the label, its `label_icon`s (pinned, muted) and the detail on the first line, the
+subtitle and the badge on the second. A list's rows take `avatar` and `badge_tone` too. A click on
+a chat comes as `activated(key)`. The list goes whole by `set_view` — tens of rows, matched by key,
+so the selection and the scroll stay.
+
+### The conversation
+
+```rust
+use flux_plugin_api::conversation::{self as chat, History, Message};
+
+let field = chat::composer("Message…")
+    .attachments()                                    // the paperclip, dropping, pasting
+    .action("claude", "Reply with Claude", Some("claude"));
+let feed = conversation("feed", chat::spec()
+    .composer(field)                                  // none — reading only
+    .message_action("reply", "Reply", Some("arrow-left"))
+    .empty_text("No messages yet"));
+set_view(&tab, column("root", [header, feed]));
+
+// The messages come as changes, in order — never as the whole feed.
+let hello = Message::new("m1", 1, 1_763_380_000)       // id, order, date (seconds, UTC)
+    .author("Anna", 6, Some(AvatarSpec::initials("A", 6)))
+    .text("See the plan")
+    .part(chat::image(chat::picture(&path, 1280, 720).preview(jpeg)));
+chat::update(&tab, "feed", vec![chat::put(vec![hello]), chat::older(History::More)]);
+```
+
+A `conversation` is a message feed with a field under it, as in a chat client; it takes the
+remaining height, as a tree does. The view holds only its spec — the field and its buttons beside
+Send, the messages' actions (in a message's menu and, with an icon, on its hover bar; Copy Text,
+Open, Save As… are Flux's own) — so a new view keeps the messages (by the element's id). Only the
+messages on screen, and a screen around them, are laid out and drawn.
+
+| Change (`chat::…`) | |
+|--------------------|-|
+| `put(messages)` | Adds messages, or replaces those with the same id. Each goes where its `order` puts it — a page of history above, a new message below; one put below the last keeps the feed at the bottom if it was there. |
+| `remove(ids)`, `clear()` | Removes these messages; every message. |
+| `older(state)`, `newer(state)` | `History::More` — there is more that way: scrolling near the end asks for it; `Loading` — a spinner there; `Complete` — the chat's start, the latest message. `newer` is for a jump back into the history. |
+| `unread_from(Some(id))` | The "New messages" line above this message; the first fill opens there. |
+| `reveal(id)` | Scrolls to the message and marks it for a moment: a found message, a quote's original. |
+| `reply_to(Some(quote))`, `draft(text)` | The quote over the field (`message.quote("You")` makes one); the field's text — a draft, what Claude proposed. |
+
+**A message** — `Message::new(id, order, date)`: the id names it in changes, events and quotes;
+the feed is sorted by `order` (message ids that grow suit); the date (seconds since 1970, UTC)
+shows as the local time. `.outgoing(Delivery::Sending)` — the user's own, on the right in the accent
+bubble, its mark going ✓ `Sent`, ✓✓ `Read` or `Failed`; `.author(name, color, avatar)` — in a group
+the colored name and the avatar; `.reply`, `.forwarded`, `.edited`, `.reaction`. Parts, top to
+bottom: `.text(…)` or `chat::text` of `rich(…)` spans (bold, italic, code, a spoiler, a link…);
+`code(text, Some("rust"))`, highlighted; `quote`; `image` — pictures in a row make an album;
+`sticker` — no bubble; `file(name, size, path)`; `link_preview`; `placeholder(icon, text)` — what
+Flux can't show yet, "Voice message · 0:42"; `notice(text)` — a line of the chat itself.
+
+| Event (`ui-event`) | |
+|--------------------|-|
+| `load-older`, `load-newer` | Scrolled near an end whose history is `More` (once per state): send `older(Loading)`, the page with `put`, then `older(More)` or `older(Complete)`. |
+| `visible((first, last))` | The messages on screen changed: mark them read, download what is seen first. A burst of scrolling is one event. |
+| `composed(composed)` | ↵ or Send (⇧↵ — a new line): its `text`, `files` (absolute — chosen, dropped, pasted; a pasted picture is saved to a file first), `reply_to`. The field is empty again: put the message as `outgoing(Delivery::Sending)` at once, then again as it goes. |
+| `composer-action((id, composed))` | A button of the field; what is in the field stays. |
+| `draft-changed(text)`, `reply-cancelled` | The field's text changed — for "typing…" and the draft (a burst is one event); the quote over the field was closed. |
+| `message-action((message, id))` | A message's action was chosen. |
+| `part-clicked((message, index))` | A part Flux can't open by itself: a picture or a file not downloaded, a placeholder — download it, `put` the message with its `progress`, then with its path. A downloaded picture opens in Flux's viewer, a file in the system's app. |
+| `link-clicked((message, link))`, `quote-clicked((message, quoted))` | A link that isn't `http`, `https` or `mailto` — a mention, the plugin's own; a quote whose message isn't loaded. |
+
+### Windows on the left, tabs, badges
+
+```toml
+[[tool-windows]]
+id = "chats"
+title = "Chats"
+location = "left"      # the island on the left, in place of the project tree
+
+[[tool-windows]]
+id = "chat"
+title = "Chat"
+location = "editor"
+tabs = true            # a tab per chat: "chat/1234"
+```
+
+**On the left.** `location = "left"` puts a window in the island on the left in place of the
+project tree, as the commit window is, its icon among the launchpad's tools at the top after the
+built-in ones. The icon, the window's keys and the palette toggle it; it takes the tree's width;
+Flux remembers per project that it was shown. `ui::show`, `ui::hide`, `tool-window-shown` and
+`tool-window-hidden` work as on the right.
+
+**Tabs.** With `tabs = true` (and `location = "editor"`) the window is a kind of tab, not one tab:
+
+```rust
+let tab = open_tab("chat", "1234", "Anna", true);      // "chat/1234"
+set_view(&tab, chat_view());
+chat::update(&tab, "feed", vec![chat::put(last_page), chat::older(History::More)]);
+```
+
+`view::open_tab(window, key, title, focus)` opens the tab `<window>/<key>` with the title and the
+window's icon, or brings the open one forward; with `focus` it takes the keyboard (`false` leaves
+it where it is: in the list, going through the chats). The name it returns, `"chat/1234"`, is the
+window that `set_view`, `ui::set_title`, `chat::update`, `set_badge`, `ui::show` (brings the tab
+forward) and `ui::hide` (closes it) take and the events carry; many tabs are open at once.
+`tool-window-shown("chat/1234")` — the tab came into sight (it is the active tab);
+`tool-window-hidden` — it went out of sight (another tab came forward, or it closed);
+`tab-closed("chat/1234")` — it closed: by the user (⌘W, ×), by `hide`, with the window gone from
+the manifest. Only the plugin opens such tabs: the palette and the window's keys don't.
+
+Flux remembers a project's tabs with their titles. A restored tab is empty until its plugin fills
+it: the plugin hears `tool-window-shown` as the tab comes into sight (each time it comes forward)
+and rebuilds it from the key — so the key must be enough: a chat's id, not an index. A tab whose
+plugin is off or not installed says so in place of the content. When the plugin stops, its tabs stay
+with the stopped placeholder and Restart; the restarted plugin hears `tool-window-shown` for the tab
+in sight and fills it again. Turning the plugin off closes its tabs.
+
+**Badges.** `view::set_badge(window, Some("4"))` marks a window: on the launchpad icon of a window
+on the left or on the right — the text, as a count in the icon's corner (keep it a count); on a
+tab — of a window with tabs, or an `editor` window — a small accent dot after the title (the text
+isn't shown). `None` removes it. Badges go when the plugin stops; a restarted plugin sets them
+again.
+
+### The file dialog
+
+`dialog::pick_files(Some("Attach"), true)` (or `pick_folders`) opens the system's dialog; the
+absolute paths come as `Event::FilesPicked((id, Some(paths)))`, none — cancelled. The plugin passes
+them on (to its program, to a web service); it reads them through the file system only where its
+permissions open the folder.
+
 ## From 0.3 to 0.4
 
 - API 0.4 adds two keys of a language ([Language plugins](languages.md)): `injections` — the
@@ -1139,11 +1438,15 @@ set_view(
 | `button` | A label and/or an icon, a tooltip, primary, enabled. `icon_button` — the toolbar's kind. | `clicked` |
 | `text_field` | A text field. | `changed(text)`, `submitted(text)` on ↵ |
 | `switch`, `checkbox` | A toggle with a label. | `toggled(on)` |
-| `tree` | Rows with a key, a parent, an icon, a label of spans, a dim detail, a badge; flat rows make a list. Takes the remaining height, scrolls, draws only the visible rows. API 0.3: a row's `subtitle` (spans under the label), and `cards` — each row a card: the icon, the label and the badge, the subtitle in up to two lines, the detail (`Tree::cards()`, `RowSpec::subtitle`; a board's column is a tree of cards — a row of columns of cards scrolls sideways when narrow). | `selected(key)`; `activated(key)` — ↵, a double click, a click on a row without children; `expanded((key, expanded))`; `row-action((key, id))` — a row's button (0.3) |
+| `tree` | Rows with a key, a parent, an icon, a label of spans, a dim detail, a badge; flat rows make a list. Takes the remaining height, scrolls, draws only the visible rows. API 0.3: a row's `subtitle` (spans under the label), and `cards` — each row a card: the icon, the label and the badge, the subtitle in up to two lines, the detail (`Tree::cards()`, `RowSpec::subtitle`; a board's column is a tree of cards — a row of columns of cards scrolls sideways when narrow). API 0.5: a row's `avatar` in place of the icon, `badge-tone` (`accent` — unread, `muted`), `label-icons` after the label; `two-line` — rows of two lines, as a list of chats (`Tree::two_line()`, `RowSpec::avatar`, `badge_tone`, `label_icon`; [Chat lists](#chat-lists-two-line-rows)). | `selected(key)`; `activated(key)` — ↵, a double click, a click on a row without children; `expanded((key, expanded))`; `row-action((key, id))` — a row's button (0.3) |
 | `divider`, `spacer`, `progress` | A line; the free space; a progress bar (none — indeterminate). | |
 | `badge` | A short colored label in a tone: a status, a priority, a count. `menu_badge` — with ▾: open a [menu](#pickers) under it. | `clicked` (`menu_badge`) |
 | `multiline_field` | A field of several lines that grows with the text: ↵ — a new line, ⌘↵ — `submitted`. A comment, a description. | `changed(text)`, `submitted(text)` on ⌘↵ |
 | `properties` | API 0.3: labels and their values in two aligned columns — a task's fields. The labels' column is as wide as the longest label (at most 40% of the list; a longer one truncates), a value takes one line (a longer one ends with "…" — long text belongs in Markdown), an empty one is a dim "—". An `editable_property` has a ▾ and its whole row answers the mouse. | `activated(id)` — a click on an editable property |
+| `image` | API 0.5: a picture of the plugin's folders, as wide as the column lets it, up to its own size; a blurred preview or a dim box until it loads ([Pictures](#pictures-avatars-qr-codes)). | `clicked` |
+| `avatar` | API 0.5: a person's or a chat's picture, the size of a header's — or the initials on one of seven colors. | |
+| `qr` | API 0.5: a QR code of a text, dark on light whatever the theme, for a phone's camera: a sign-in link. | |
+| `conversation` | API 0.5: a message feed with a field, as a chat; takes the remaining height. Its messages come by `conversation::update`, not with the view ([The conversation](#the-conversation)). | `load-older`, `load-newer`, `visible`, `composed`, `composer-action`, `draft-changed`, `reply-cancelled`, `message-action`, `part-clicked`, `link-clicked`, `quote-clicked` |
 
 A tree's row can carry **tags** and **buttons** (API 0.3): `RowSpec::tag(text, tone)` — small colored
 labels (a tag, a deadline, story points), on a card in a line under the subtitle (the ones that
@@ -1182,6 +1485,11 @@ tab of the editor — for something wide: a board of tasks in columns, a preview
 icon: `ui.show` opens the tab (or brings it forward), `ui.hide` closes it, and so can the user; the
 palette and the window's keys open it too, and `tool-window-shown` / `tool-window-hidden` say when it
 is on screen. Its content is a view like any tool window's.
+
+**On the left, tabs, badges** (API 0.5). `location = "left"` puts a window in the island on the
+left, in place of the project tree; `tabs = true` makes an `editor` window a tab per key, opened by
+the plugin with `view::open_tab`; `view::set_badge` puts a count on a window's launchpad icon, a dot
+on its tab — [Windows on the left, tabs, badges](#windows-on-the-left-tabs-badges).
 
 **Titles.** `ui.set-title(window, title)` renames a window while the plugin runs — its header in the
 island, its tab in the editor: «Board: Backend». An empty title brings back the manifest's.

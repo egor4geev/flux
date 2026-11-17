@@ -297,6 +297,14 @@ pub fn register_plugin_files(plugin: &str, files: PluginFiles) {
         .insert(plugin.to_string(), files);
 }
 
+/// The folder a plugin is installed in (API 0.5: its pictures); `None` for a bundled one.
+pub fn plugin_folder(plugin: &str) -> Option<std::path::PathBuf> {
+    match PLUGIN_FILES.lock().unwrap().get(plugin)? {
+        PluginFiles::Disk(dir) => Some(dir.clone()),
+        PluginFiles::Embedded(_) => None,
+    }
+}
+
 /// Forgets a plugin's files: it was turned off or removed.
 pub fn unregister_plugin_files(plugin: &str) {
     PLUGIN_FILES.lock().unwrap().remove(plugin);

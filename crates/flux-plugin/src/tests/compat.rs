@@ -117,9 +117,9 @@ fn the_manifest_must_name_the_api_the_component_is_built_for() {
         error,
         "The component is built for plugin API 0.2, but flux-plugin.toml says api = \"0.3\""
     );
-    // A 0.3 component that says it is 0.2 (the probe's manifest says the current API, 0.4, whose
-    // components are 0.3 ones — every other probe test runs that way).
-    let Some(entry) = probe_manifest("test.v03-says-02", "project = \"none\"", &[], "") else {
+    // A 0.5 component that says it is 0.2 (the probe's manifest says the current API — every
+    // other probe test runs that way).
+    let Some(entry) = probe_manifest("test.v05-says-02", "project = \"none\"", &[], "") else {
         return;
     };
     let dir = entry.files.dir().expect("a folder").to_path_buf();
@@ -137,7 +137,7 @@ fn the_manifest_must_name_the_api_the_component_is_built_for() {
     let (error, _) = probe.stopped();
     assert_eq!(
         error,
-        "The component is built for plugin API 0.3, but flux-plugin.toml says api = \"0.2\""
+        "The component is built for plugin API 0.5, but flux-plugin.toml says api = \"0.2\""
     );
 }
 
@@ -146,6 +146,7 @@ fn start_stopped(entry: PluginEntry) -> Probe {
     let (messages, receiver) = futures::channel::mpsc::unbounded();
     let log = crate::log::PluginLog::memory();
     let instance = crate::runtime::Instance::start(crate::runtime::InstanceConfig {
+        role: crate::runtime::InstanceRole::Window(1),
         entry: std::sync::Arc::new(entry),
         project_root: None,
         language: "en".into(),
@@ -162,7 +163,13 @@ fn start_stopped(entry: PluginEntry) -> Probe {
 
 #[test]
 fn plugins_without_code_load_for_either_api_and_not_for_others() {
-    for (api, works) in [("0.2", true), ("0.3", true), ("0.4", true), ("9.9", false)] {
+    for (api, works) in [
+        ("0.2", true),
+        ("0.3", true),
+        ("0.4", true),
+        ("0.5", true),
+        ("9.9", false),
+    ] {
         let dir = temp_dir("declarative-api");
         std::fs::write(
             dir.join("flux-plugin.toml"),
@@ -177,7 +184,7 @@ fn plugins_without_code_load_for_either_api_and_not_for_others() {
         } else {
             assert_eq!(
                 entry.problem.as_deref(),
-                Some("Built for plugin API 9.9; this Flux runs 0.2, 0.3, 0.4")
+                Some("Built for plugin API 9.9; this Flux runs 0.2, 0.3, 0.4, 0.5")
             );
         }
     }

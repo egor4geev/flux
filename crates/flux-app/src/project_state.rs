@@ -1,7 +1,8 @@
 //! The state of a project's window between launches (part 10.1), kept per project as JetBrains IDEs
 //! keep theirs: the documents open in tabs (in order, the active one, the caret and the scroll of
-//! each), what the left island shows (the tree or the commit window), the terminal panel, the tool
-//! window on the right (Claude, Notifications), and the window's frame. Next to them — which project
+//! each) and the tabs of plugins' windows with tabs (API 0.5), what the left island shows (the tree,
+//! the commit window, the console, a plugin's window), the terminal panel, the tool window on the
+//! right (Notifications), and the window's frame. Next to them — which project
 //! windows are open (Settings → System Settings → "Reopen projects on startup").
 //!
 //! Kept in `~/Library/Application Support/flux/projects.json` (`FLUX_PROJECTS_FILE` — another
@@ -31,6 +32,11 @@ pub struct ProjectState {
     /// The active one among `tabs`.
     pub active: Option<usize>,
     pub left: LeftIsland,
+    /// The plugin's window of [`LeftIsland::Plugin`].
+    pub left_plugin: Option<SavedWindow>,
+    /// The tabs of plugins' windows with tabs (API 0.5): the plugin fills them again as they come
+    /// into sight.
+    pub plugin_tabs: Vec<SavedPluginTab>,
     /// The terminal panel was shown.
     pub terminal: bool,
     /// The tool window in the island on the right.
@@ -50,6 +56,26 @@ pub struct SavedTab {
     pub scroll: f32,
 }
 
+/// A tab of a plugin's window with tabs (API 0.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedPluginTab {
+    /// The plugin's id and the tab's window, `<window>/<key>`.
+    pub window: SavedWindow,
+    /// As the plugin last titled it: the tab shows it until the plugin fills it.
+    pub title: String,
+    /// Its place among the saved tabs (the documents' and these).
+    pub index: usize,
+    /// It was the active tab.
+    pub active: bool,
+}
+
+/// A plugin's window: the plugin's id and the window's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedWindow {
+    pub plugin: String,
+    pub window: String,
+}
+
 /// What the left island shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LeftIsland {
@@ -58,6 +84,8 @@ pub enum LeftIsland {
     Commit,
     /// The Claude console (part «Пульт Claude»).
     Claude,
+    /// A plugin's window (`location = "left"`, API 0.5): [`ProjectState::left_plugin`].
+    Plugin,
     Hidden,
 }
 
@@ -222,8 +250,10 @@ fn read(file: &Path) -> Value {
     }
 }
 
-/// `{"tabs": [{"path", "line", "column", "scroll"}], "active", "left", "terminal", "right",
-/// "bounds": {"x", "y", "width", "height", "mode"}, "saved_at"}`; what doesn't fit is skipped.
+/// `{"tabs": [{"path", "line", "column", "scroll"}], "active", "left", "left_plugin": {"plugin",
+/// "window"}, "plugin_tabs": [{"plugin", "window", "title", "index", "active"}], "terminal",
+/// "right", "bounds": {"x", "y", "width", "height", "mode"}, "saved_at"}`; what doesn't fit is
+/// skipped.
 fn parse_project(value: &Value) -> Option<ProjectState> {
     if !value.is_object() {
         return None;
@@ -246,12 +276,29 @@ fn parse_project(value: &Value) -> Option<ProjectState> {
         .as_u64()
         .map(|active| active as usize)
         .filter(|active| *active < tabs.len());
+    let left_plugin = parse_window(&value["left_plugin"]);
     let left = match value["left"].as_str() {
         Some("commit") => LeftIsland::Commit,
         Some("claude") => LeftIsland::Claude,
+        Some("plugin") if left_plugin.is_some() => LeftIsland::Plugin,
         Some("hidden") => LeftIsland::Hidden,
         _ => LeftIsland::Tree,
     };
+    let plugin_tabs = value["plugin_tabs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tab| {
+            let window = parse_window(tab)?;
+            window.window.split_once('/')?;
+            Some(SavedPluginTab {
+                window,
+                title: tab["title"].as_str().unwrap_or_default().to_string(),
+                index: tab["index"].as_u64().unwrap_or(u64::MAX) as usize,
+                active: tab["active"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect();
     let right = match value["right"].as_str() {
         Some("notifications") => Some(RightIsland::Notifications),
         _ => None,
@@ -260,9 +307,25 @@ fn parse_project(value: &Value) -> Option<ProjectState> {
         tabs,
         active,
         left,
+        left_plugin: left_plugin.filter(|_| left == LeftIsland::Plugin),
+        plugin_tabs,
         terminal: value["terminal"].as_bool().unwrap_or(false),
         right,
         bounds: parse_bounds(&value["bounds"]),
+    })
+}
+
+/// `{"plugin", "window"}`, both there.
+fn parse_window(value: &Value) -> Option<SavedWindow> {
+    let plugin = value["plugin"]
+        .as_str()
+        .filter(|plugin| !plugin.is_empty())?;
+    let window = value["window"]
+        .as_str()
+        .filter(|window| !window.is_empty())?;
+    Some(SavedWindow {
+        plugin: plugin.to_string(),
+        window: window.to_string(),
     })
 }
 
@@ -303,8 +366,28 @@ fn project_json(state: &ProjectState, saved_at: u64) -> Value {
         LeftIsland::Tree => "tree",
         LeftIsland::Commit => "commit",
         LeftIsland::Claude => "claude",
+        LeftIsland::Plugin => "plugin",
         LeftIsland::Hidden => "hidden",
     };
+    let left_plugin = state.left_plugin.as_ref().map(|left| {
+        json!({
+            "plugin": left.plugin,
+            "window": left.window,
+        })
+    });
+    let plugin_tabs: Vec<Value> = state
+        .plugin_tabs
+        .iter()
+        .map(|tab| {
+            json!({
+                "plugin": tab.window.plugin,
+                "window": tab.window.window,
+                "title": tab.title,
+                "index": tab.index,
+                "active": tab.active,
+            })
+        })
+        .collect();
     let right = state.right.map(|right| match right {
         RightIsland::Notifications => "notifications",
     });
@@ -326,6 +409,8 @@ fn project_json(state: &ProjectState, saved_at: u64) -> Value {
         "tabs": tabs,
         "active": state.active,
         "left": left,
+        "left_plugin": left_plugin,
+        "plugin_tabs": plugin_tabs,
         "terminal": state.terminal,
         "right": right,
         "bounds": bounds,
@@ -442,6 +527,16 @@ mod tests {
             ],
             active: Some(1),
             left: LeftIsland::Claude,
+            left_plugin: None,
+            plugin_tabs: vec![SavedPluginTab {
+                window: SavedWindow {
+                    plugin: "flux.chats".into(),
+                    window: "chat/42".into(),
+                },
+                title: "Anna".into(),
+                index: 1,
+                active: false,
+            }],
             terminal: true,
             right: Some(RightIsland::Notifications),
             bounds: Some(SavedBounds {
@@ -466,6 +561,29 @@ mod tests {
         put_project(&mut value, Path::new(&abs("/q")), &empty, 8);
         assert_eq!(parse_project(&value["projects"][&abs("/q")]), Some(empty));
         assert_eq!(parse_project(&value["projects"][&abs("/r")]), None);
+    }
+
+    #[test]
+    fn a_plugins_window_on_the_left_and_its_tabs_round_trip() {
+        let state = ProjectState {
+            left: LeftIsland::Plugin,
+            left_plugin: Some(SavedWindow {
+                plugin: "flux.chats".into(),
+                window: "chats".into(),
+            }),
+            ..state()
+        };
+        let back = parse_project(&project_json(&state, 1)).unwrap();
+        assert_eq!(back, state);
+        // A window that isn't a tab's (`<window>/<key>`) isn't a tab; a plugin's window on the
+        // left without its name is the tree.
+        let value = json!({
+            "left": "plugin",
+            "plugin_tabs": [{"plugin": "p", "window": "board", "title": "Board"}],
+        });
+        let back = parse_project(&value).unwrap();
+        assert_eq!(back.left, LeftIsland::Tree);
+        assert!(back.plugin_tabs.is_empty());
     }
 
     #[test]

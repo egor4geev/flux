@@ -2,7 +2,9 @@
 //! window of its tool (an island or an overlay window); the open one is highlighted. A new tool is
 //! a [`Tool`] variant with its icon, label, and action, plus an entry in [`Tool::ALL`]. Plugins'
 //! tool windows (stage 8) come from the window's plugins and sit above Notifications: they live in
-//! the same island on the right.
+//! the same island on the right. A plugin's window of the left island (API 0.5) sits after the
+//! tools at the top, as it takes the tree's place; a plugin's mark (`ui.set-badge`) is a count in
+//! its icon's corner, as Commit's.
 //!
 //! Claude's icon is a toggle of its own ([`ToggleClaude`]): the console shows in the left island or,
 //! when shown, goes, whatever has the focus; ⌘Esc, which its tooltip shows, goes by the focus
@@ -145,6 +147,16 @@ pub fn render(workspace: &Workspace, cx: &Context<Workspace>) -> impl IntoElemen
                 .filter(|tool| workspace.tool_visible(*tool, cx))
                 .map(|tool| tool_button(workspace, tool, cx)),
         )
+        .children(
+            workspace
+                .plugins
+                .read(cx)
+                .tool_windows()
+                .iter()
+                .filter(|tool| tool.on_left())
+                .map(|tool| plugin_tool_button(workspace, tool, cx))
+                .collect::<Vec<_>>(),
+        )
         // Settings: at the bottom of the strip, apart from the tools; above them, the windows of the
         // right island: the plugins', then Notifications. A plugin's window among the editor's tabs
         // has no icon here: it opens from the palette, its keys, the plugin.
@@ -155,7 +167,7 @@ pub fn render(workspace: &Workspace, cx: &Context<Workspace>) -> impl IntoElemen
                 .read(cx)
                 .tool_windows()
                 .iter()
-                .filter(|tool| !tool.in_editor())
+                .filter(|tool| !tool.in_editor() && !tool.on_left())
                 .map(|tool| plugin_tool_button(workspace, tool, cx))
                 .collect::<Vec<_>>(),
         )
@@ -203,34 +215,12 @@ fn tool_button(
                 .tooltip(ui::tooltip(tool.label(), keys))
                 .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)),
         ))
-        // A count in the corner: changes waiting for a commit, unread notifications. It bumps as it
-        // comes and grows (`crate::badge`): drawn empty while there is none, it keeps its count.
-        .child(crate::badge::bump(
+        // A count in the corner: changes waiting for a commit, unread notifications.
+        .child(count_badge(
             ("tool-badge", tool as usize),
-            badge.unwrap_or(0),
-            match badge {
-                Some(count) => div()
-                    .absolute()
-                    .top(px(-3.))
-                    .right(px(-5.))
-                    .min_w(px(15.))
-                    .h(px(15.))
-                    .px(px(3.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(8.))
-                    .bg(if alarm { ui.error } else { ui.accent })
-                    .text_size(px(crate::theme::TEXT_XS - 2.))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(ui.frame)
-                    .child(if count > 99 {
-                        "99+".to_string()
-                    } else {
-                        count.to_string()
-                    }),
-                None => div().absolute(),
-            },
+            badge.map(|count| (count, count_text(count))),
+            alarm,
+            ui,
         ))
         // A dot in the corner: Claude working or waiting for the user.
         .child(claude_dot(
@@ -246,8 +236,60 @@ fn tool_button(
         ))
 }
 
+/// A count in a tool button's corner. It bumps as it comes and grows (`crate::badge`): drawn
+/// empty while there is none, it keeps its count.
+fn count_badge(
+    id: impl Into<ElementId>,
+    badge: Option<(usize, String)>,
+    alarm: bool,
+    ui: UiColors,
+) -> impl IntoElement {
+    let count = badge.as_ref().map_or(0, |(count, _)| *count);
+    crate::badge::bump(
+        id,
+        count,
+        match badge {
+            Some((_, text)) => div()
+                .absolute()
+                .top(px(-3.))
+                .right(px(-5.))
+                .min_w(px(15.))
+                .h(px(15.))
+                .px(px(3.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .bg(if alarm { ui.error } else { ui.accent })
+                .text_size(px(crate::theme::TEXT_XS - 2.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(ui.frame)
+                .child(text),
+            None => div().absolute(),
+        },
+    )
+}
+
+/// A count as the corner shows it: «99+» past 99.
+fn count_text(count: usize) -> String {
+    if count > 99 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    }
+}
+
+/// A plugin's mark (`ui.set-badge`, API 0.5) as a count: a number shows as the corner shows
+/// counts; other text, its first few characters (the bump counts it as one).
+fn plugin_badge(badge: &str) -> (usize, String) {
+    match badge.parse::<usize>() {
+        Ok(count) => (count, count_text(count)),
+        Err(_) => (1, badge.chars().take(3).collect()),
+    }
+}
+
 /// A plugin's tool window: its icon from the manifest (a puzzle piece without one), its title and
-/// keys in the tooltip.
+/// keys in the tooltip, its mark in the corner.
 fn plugin_tool_button(
     workspace: &Workspace,
     tool: &ToolWindow,
@@ -275,6 +317,12 @@ fn plugin_tool_button(
                 .rounded(px(ui::RADIUS_MD))
                 .tooltip(ui::tooltip(tool.title.clone(), keys))
                 .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)),
+        ))
+        .child(count_badge(
+            ("plugin-tool-badge", tool.key.0 as usize),
+            tool.badge.as_ref().map(|badge| plugin_badge(badge)),
+            false,
+            ui,
         ))
         .child(open_marker(
             ("plugin-tool-marker", tool.key.0 as usize),

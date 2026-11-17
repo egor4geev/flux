@@ -1101,6 +1101,16 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> Bounds<Pixels>
         })
 }
 
+/// Flux patch (FluxGram part 1, the scenarios' frame log): told of every frame a window draws —
+/// the window and how long laying it out and painting it took — whoever asked for it (the display
+/// link, a headless scenario's timer).
+static FRAME_OBSERVER: std::sync::OnceLock<fn(WindowId, Duration)> = std::sync::OnceLock::new();
+
+/// Flux patch: sets the observer of drawn frames, once for the process ([`FRAME_OBSERVER`]).
+pub fn observe_frames(observer: fn(WindowId, Duration)) {
+    let _ = FRAME_OBSERVER.set(observer);
+}
+
 impl Window {
     pub(crate) fn new(
         handle: AnyWindowHandle,
@@ -2147,6 +2157,7 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let started = std::time::Instant::now();
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -2212,6 +2223,9 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
 
+        if let Some(observer) = FRAME_OBSERVER.get() {
+            observer(self.handle.window_id(), started.elapsed());
+        }
         ArenaClearNeeded
     }
 
@@ -2248,23 +2262,26 @@ impl Window {
     /// Flux patch (headless scenario frames): what the platform's frame callback does, without
     /// presenting — runs the next-frame callbacks and draws the window if it is dirty. The display
     /// link that drives frames stops for an occluded window, and a locked screen occludes all of
-    /// them; Flux's scenarios then call this on a timer.
-    pub fn headless_frame(&mut self, cx: &mut App) {
+    /// them; Flux's scenarios then call this on a timer. Returns whether the window was drawn (it
+    /// was dirty): the scenarios' frame log counts and times those.
+    pub fn headless_frame(&mut self, cx: &mut App) -> bool {
         let callbacks = self.next_frame_callbacks.take();
         for callback in callbacks {
             callback(self, cx);
         }
-        if self.invalidator.is_dirty() {
+        let dirty = self.invalidator.is_dirty();
+        if dirty {
             let arena_clear_needed = self.draw(cx);
             arena_clear_needed.clear();
         }
         self.complete_frame();
+        dirty
     }
 
     /// Flux patch (headless scenario screenshots): the window's current frame rendered offscreen —
     /// RGBA with premultiplied alpha, in device pixels — without the window server.
     pub fn render_to_image(&mut self, cx: &mut App) -> Option<image::RgbaImage> {
-        self.headless_frame(cx);
+        let _ = self.headless_frame(cx);
         self.platform_window.render_to_image(&self.rendered_frame.scene)
     }
 
