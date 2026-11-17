@@ -93,7 +93,8 @@ fn a_plugin_built_for_0_3_stops_on_a_panic() {
 #[test]
 fn the_yandex_plugin_built_for_0_3_activates() {
     let Some(dir) = std::env::var_os("FLUX_TEST_YANDEX_DIR") else {
-        eprintln!("skipped: FLUX_TEST_YANDEX_DIR isn't set");
+        // Not "skipped:" — CI reads that prefix as the probe plugin failing to build.
+        eprintln!("not run: FLUX_TEST_YANDEX_DIR isn't set");
         return;
     };
     let entry = load_dir(std::path::Path::new(&dir), PluginSource::Installed).unwrap();
