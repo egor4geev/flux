@@ -1107,15 +1107,17 @@ fn render_plugin_card(
         .child(confirm)
         .children(edit)
         .child(reject)
-        .child(div().flex_1())
-        .children(card.hint.clone().map(|hint| {
+        // The hint takes the rest of the row, on the right, and wraps rather than being cut off
+        // ("Edit puts the text into the chat's field").
+        .child(
             div()
+                .flex_1()
                 .min_w_0()
-                .truncate()
+                .text_right()
                 .text_size(px(theme::TEXT_XS))
                 .text_color(ui.dim)
-                .child(hint)
-        }));
+                .children(card.hint.clone()),
+        );
     let id = id.to_string();
     div()
         .id(SharedString::from(format!("claude-card-{id}")))

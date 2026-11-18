@@ -227,6 +227,10 @@ impl Render for PluginDialog {
             .w(px(WIDTH))
             .max_w(relative(0.9))
             .max_h(px(max_height))
+            // A gallery (a profile's media) scrolls by itself in the height a dialog may have.
+            .when(self.view.read(cx).fills_dialog(), |dialog| {
+                dialog.h(px(max_height))
+            })
             .flex()
             .flex_col()
             // Clicks on the dialog stay on it.

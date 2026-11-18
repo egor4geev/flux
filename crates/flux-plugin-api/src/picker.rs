@@ -114,6 +114,7 @@ pub fn item(key: &str, label: &str) -> Item {
         detail: None,
         badge: None,
         group: None,
+        avatar: None,
     })
 }
 
@@ -145,6 +146,12 @@ impl Item {
     /// The heading of the item's group: "Today", "In Progress".
     pub fn group(mut self, group: &str) -> Self {
         self.0.group = Some(group.to_string());
+        self
+    }
+
+    /// A person's or a chat's picture in place of the icon (API 0.5).
+    pub fn avatar(mut self, avatar: crate::host::ui::AvatarSpec) -> Self {
+        self.0.avatar = Some(avatar);
         self
     }
 }

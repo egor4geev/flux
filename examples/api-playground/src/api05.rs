@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use flux_plugin_api::host::ui::AvatarSpec;
+use flux_plugin_api::picker::{Picker, item};
 use flux_plugin_api::tools::{self, ConfirmChoice, Confirmation, ToolCall, ToolOutput};
-use flux_plugin_api::view::{Element, button};
+use flux_plugin_api::view::{Element, SpanStyle, Tone, button, header, row, span};
 use flux_plugin_api::{Event, dialog, log, service, tr, trf};
 use serde::Deserialize;
 
@@ -24,7 +26,19 @@ pub(crate) struct State {
     pick: Option<u64>,
     /// The notes waiting for the user's choice on their cards, by Claude's call.
     notes: HashMap<u64, String>,
+    /// The Chats section: the inbox's count, the open picker of people.
+    unread: u32,
+    people: Option<u64>,
 }
+
+/// The people of the Chats section's picker: key, name, initials, color, group.
+const PEOPLE: [(&str, &str, &str, u8, &str); 5] = [
+    ("anna", "Anna Smirnova", "AS", 6, "Contacts"),
+    ("dima", "Dima Kim", "DK", 4, "Contacts"),
+    ("oleg", "Oleg", "O", 1, "Contacts"),
+    ("backend", "Backend · team", "B", 0, "Groups"),
+    ("design", "Design review", "D", 5, "Groups"),
+];
 
 /// The arguments of both tools (their schemas in `tools/`).
 #[derive(Deserialize)]
@@ -75,6 +89,14 @@ impl Playground {
             // Claude was stopped: the card is gone, the note isn't written.
             Event::ToolCancelled(call) => {
                 self.v5.notes.remove(&call);
+            }
+            Event::PickerChosen((id, key)) if Some(id) == self.v5.people => {
+                self.v5.people = None;
+                let text = match key {
+                    Some(key) => trf("Chose `{0}`.", &[&key]),
+                    None => tr("Dismissed."),
+                };
+                self.set(Section::Chats, text);
             }
             Event::FilesPicked((id, paths)) if Some(id) == self.v5.pick => {
                 self.v5.pick = None;
@@ -168,6 +190,30 @@ impl Playground {
             "files-pick" => {
                 self.v5.pick = Some(dialog::pick_files(Some(&tr("Choose")), true));
             }
+            "chats-inbox" => {
+                self.v5.unread += 1;
+                self.render();
+            }
+            "chats-work" | "chats-starred" => {
+                self.v5.unread = 0;
+                self.render();
+            }
+            "chats-add" => {
+                let people = PEOPLE.iter().map(|(key, name, initials, color, group)| {
+                    item(key, name)
+                        .avatar(AvatarSpec::initials(initials, *color))
+                        .group(&tr(group))
+                });
+                self.v5.people = Some(
+                    Picker::new(&tr("Find a person or a group"))
+                        .items(people)
+                        .under(crate::WINDOW, "chats-add")
+                        .open(),
+                );
+            }
+            "chats-header" | "chats-profile" => {
+                self.set(Section::Chats, trf("`{0}` clicked.", &[&element]));
+            }
             _ => {}
         }
     }
@@ -187,6 +233,45 @@ impl Playground {
                 Section::Files,
                 vec![b("files-pick", "Pick Files…")],
                 Vec::new(),
+            ),
+            (
+                Section::Chats,
+                vec![
+                    button("chats-inbox", &tr("Inbox"))
+                        .badge(&self.v5.unread.to_string())
+                        .into(),
+                    button("chats-work", &tr("Work"))
+                        .primary()
+                        .badge("12")
+                        .into(),
+                    button("chats-starred", &tr("Starred"))
+                        .icon("star")
+                        .primary()
+                        .badge("3")
+                        .into(),
+                    button("chats-add", &tr("Add Chat…"))
+                        .icon("plus")
+                        .badge("5")
+                        .into(),
+                ],
+                vec![
+                    row(
+                        "chats-headers",
+                        [header("chats-header", &tr("Backend · team"))
+                            .avatar(AvatarSpec::initials("B", 0))
+                            .subtitle([
+                                span(&tr("5 members")).tone(Tone::Dim),
+                                span(" · ").tone(Tone::Dim),
+                                span(&tr("Petya is typing…")).tone(Tone::Accent),
+                            ])
+                            .into()],
+                    ),
+                    header("chats-profile", "Anna Smirnova")
+                        .avatar(AvatarSpec::initials("AS", 6))
+                        .subtitle([span(&tr("online")).tone(Tone::Accent)])
+                        .large()
+                        .into(),
+                ],
             ),
         ]
     }

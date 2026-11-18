@@ -19,7 +19,14 @@ use crate::runtime::{HostCall, Instance, InstanceConfig, InstanceRole, MessageKi
 const PROBE_03: &[u8] = include_bytes!("../../tests/fixtures/probe-0.3.wasm");
 
 fn probe_03(id: &str, api: &str) -> PluginEntry {
-    plugin_folder(id, api, PROBE_03, "project = \"none\"", &["v3:form"], "")
+    plugin_folder(
+        id,
+        api,
+        PROBE_03,
+        "project = \"none\"",
+        &["v3:form", "v3:picker"],
+        "",
+    )
 }
 
 #[test]
@@ -64,6 +71,18 @@ fn a_plugin_built_for_0_3_or_0_4_runs_and_hears_only_what_it_knows() {
             probe.notification(),
             format!("form {id}: branch=true name=TRACK-7")
         );
+        // A 0.3 picker goes through the 0.3 `picker` (0.5's items grew an avatar): its items
+        // come without one.
+        probe.instance.run_command("v3:picker", palette());
+        match probe.next() {
+            MessageKind::Call(HostCall::OpenPicker { spec, .. }) => {
+                assert_eq!(spec.placeholder, "Find");
+                assert_eq!(spec.items.len(), 1);
+                assert_eq!(spec.items[0].key, "a");
+                assert!(spec.items[0].avatar.is_none());
+            }
+            other => panic!("expected a picker, got {other:?}"),
+        }
         // The context keeps the argument (0.3 has it).
         probe.instance.run_command(
             "context",

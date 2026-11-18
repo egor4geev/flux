@@ -344,3 +344,20 @@
 "Type the password." = "Введите пароль."
 
 "Cancel" = "Отмена"
+
+# The Chats section (API 0.5).
+"Chats" = "Чаты"
+"Counts on buttons, a chat's header and a profile's, a picker of people with their pictures." = "Счётчики на кнопках, шапка чата и профиля, выбор людей с их аватарами."
+"Inbox" = "Входящие"
+"Starred" = "Избранное"
+"Add Chat…" = "Добавить чат…"
+"Backend · team" = "Бэкенд · команда"
+"5 members" = "5 участников"
+"Petya is typing…" = "Петя печатает…"
+"online" = "в сети"
+"Find a person or a group" = "Найти человека или группу"
+"Contacts" = "Контакты"
+"Groups" = "Группы"
+"Chose `{0}`." = "Выбрано: `{0}`."
+"Dismissed." = "Закрыто без выбора."
+"`{0}` clicked." = "Нажато: `{0}`."

@@ -201,6 +201,7 @@ fn from_v2_kind(kind: v2::ui::ElementKind) -> ui::ElementKind {
             primary: button.primary,
             enabled: button.enabled,
             busy: false,
+            badge: None,
         }),
         Kind::TextField(field) => ui::ElementKind::TextField(ui::TextFieldSpec {
             text: field.text,
@@ -235,6 +236,7 @@ fn from_v2_kind(kind: v2::ui::ElementKind) -> ui::ElementKind {
                     avatar: None,
                     badge_tone: None,
                     label_icons: Vec::new(),
+                    mention: false,
                 })
                 .collect(),
             empty_text: tree.empty_text,
@@ -388,6 +390,7 @@ fn ui_input(input: &UiInput) -> Option<v2::events::UiInput> {
             | UiEvent::LoadNewer
             | UiEvent::Visible(_)
             | UiEvent::MessageAction(_)
+            | UiEvent::MessageActionQuoted(_)
             | UiEvent::PartClicked(_)
             | UiEvent::LinkClicked(_)
             | UiEvent::QuoteClicked(_)
@@ -397,7 +400,11 @@ fn ui_input(input: &UiInput) -> Option<v2::events::UiInput> {
             | UiEvent::ReplyCancelled
             | UiEvent::Edited(_)
             | UiEvent::EditCancelled
-            | UiEvent::EditLast => return None,
+            | UiEvent::EditLast
+            | UiEvent::Find
+            | UiEvent::FindNext
+            | UiEvent::FindPrevious
+            | UiEvent::Cancelled => return None,
         },
     })
 }

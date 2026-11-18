@@ -759,8 +759,8 @@ self.transitions = Some(
 
 Where it opens: under the title bar, as the command palette (the default); above one of the plugin's
 status bar items (`at_status_item`) — the day's meetings from a «Meeting in 12 min» item; under an
-element of its tool window (`under`). An item or an element
-that isn't on screen — under the title bar.
+element of its tool window (`under`) — a property as `"<list>/<id>"`, a tree's row as
+`"<tree>/<row key>"`. An item or an element that isn't on screen — under the title bar.
 
 ### The settings page
 
@@ -1231,6 +1231,7 @@ list.add(
         .detail("14:32")                              // the first line, on the right: the time
         .subtitle(vec![span("Sent the mockups")])     // the second line: the last message
         .badge("3").badge_tone(Tone::Accent)          // unread; Tone::Muted — a muted chat
+        .mention()                                    // "@" by the count: the user is mentioned
         .label_icon("claude"),                        // after the name: Claude may read it
 );
 set_view("chats", list.into_element("list"));
@@ -1249,6 +1250,7 @@ use flux_plugin_api::conversation::{self as chat, History, Message};
 
 let field = chat::composer("Message…")
     .attachments()                                    // the paperclip, dropping, pasting
+    .formatting()                                     // ⌘B ⌘I ⇧⌘X ⇧⌘P ⇧⌘M ⌘K: Markdown marks
     .action("claude", "Reply with Claude", Some("claude"));
 let feed = conversation("feed", chat::spec()
     .composer(field)                                  // none — reading only
@@ -1269,6 +1271,13 @@ remaining height, as a tree does. The view holds only its spec — the field and
 Send, the messages' actions (in a message's menu and, with an icon, on its hover bar; Copy Text,
 Open, Save As… are Flux's own) — so a new view keeps the messages (by the element's id). Only the
 messages on screen, and a screen around them, are laid out and drawn.
+
+The user selects a message's text with the mouse (a double click takes a word) and copies it (⌘C,
+or Copy Text over the selection); an action chosen over a selection comes as
+`message-action-quoted` — a reply quoting that part. With `formatting` (API 0.5) the field's menu
+(Formatting) and keys put Markdown marks around the selection — `**bold**`, `__italic__`,
+`~~strikethrough~~`, `||spoiler||`, `` `code` `` (```` ``` ```` on lines of their own around
+several lines), `[text](address)` — and the field sends the text with them: the plugin parses them.
 
 | Change (`chat::…`) | |
 |--------------------|-|
@@ -1297,7 +1306,8 @@ Flux can't show yet, "Voice message · 0:42"; `notice(text)` — a line of the c
 | `composer-action((id, composed))` | A button of the field; what is in the field stays. |
 | `draft-changed(text)`, `reply-cancelled` | The field's text changed — for "typing…" and the draft (a burst is one event); the quote over the field was closed. |
 | `message-action((message, id))` | A message's action was chosen. |
-| `part-clicked((message, index))` | A part Flux can't open by itself: a picture or a file not downloaded, a placeholder — download it, `put` the message with its `progress`, then with its path. A downloaded picture opens in Flux's viewer, a file in the system's app. |
+| `message-action-quoted((message, id, text, offset))` | …chosen while part of the message's text was selected (dragged over, a double click takes a word): reply quoting that part. `offset` — where it starts in the message's text (its `text`, `quote` and `code` parts, a line break between two), in UTF-16 code units. |
+| `part-clicked((message, index))` | A part Flux can't open by itself: a picture or a file not downloaded, a placeholder — download it, `put` the message with its `progress`, then with its path. A picture without its `full` size opens in Flux's viewer at once — on its `path`, else its preview blurred, with a spinner — and comes here too: `put` the message with `full` and the viewer swaps to it. A file opens in the system's app. |
 | `link-clicked((message, link))`, `quote-clicked((message, quoted))` | A link that isn't `http`, `https` or `mailto` — a mention, the plugin's own; a quote whose message isn't loaded. |
 
 ### Windows on the left, tabs, badges
@@ -1452,10 +1462,12 @@ A tree's row can carry **tags** and **buttons** (API 0.3): `RowSpec::tag(text, t
 labels (a tag, a deadline, story points), on a card in a line under the subtitle (the ones that
 don't fit are counted as "+N"), in a list after the label; `RowSpec::action(id, label, icon,
 primary)` — on a card at its foot on the right (a board's "Take to Work"), in a list at the row's
-end while it is hovered or selected. A press comes as `row-action((row key, action id))` with the
-tree's element id, and neither selects nor opens the row; ⌘↵ on the selected row presses its first
-primary button. A tree of cards where some row has tags or buttons leaves room for them on every
-card (one card height per tree).
+end while it is hovered or selected (in two-line rows over the row's end, taking no room from the
+label). A press comes as `row-action((row key, action id))` with the tree's element id, and neither
+selects nor opens the row; ⌘↵ on the selected row presses its first primary button. A menu of a
+row's button opens under the row with the anchor `element((window, "<tree>/<row key>"))` (API 0.5;
+`Picker::menu()….under(WINDOW, &format!("chats/{key}"))`). A tree of cards where some row has tags
+or buttons leaves room for them on every card (one card height per tree).
 
 **Properties** (API 0.3) are a task's fields that the user changes in place: a click on an editable
 one comes as `activated(id)` with the list's element id, and the plugin opens a picker right under

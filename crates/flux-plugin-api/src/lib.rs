@@ -84,7 +84,9 @@ pub mod bindings {
         export_macro_name: "export_plugin",
         default_bindings_module: "flux_plugin_api::bindings",
         // Values compare: events, positions, views (a plugin can skip sending an unchanged one).
-        additional_derives: [PartialEq],
+        // They also go as JSON (0.5): a service builds messages of a conversation and sends them
+        // to the windows' instances, which hand them to Flux as they are.
+        additional_derives: [PartialEq, serde::Serialize, serde::Deserialize],
     });
 }
 

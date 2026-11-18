@@ -56,7 +56,7 @@ impl HostState {
             | HostCall::SetSettingStatus { .. }
             | HostCall::HelperProgress { .. }
             | HostCall::Window {
-                call: WindowCall::OpenUrl(_) | WindowCall::CopyText(_),
+                call: WindowCall::OpenUrl(_) | WindowCall::CopyText(_) | WindowCall::OpenFile { .. },
                 ..
             } => return Some(call),
             HostCall::Ask { id, .. } => {
@@ -88,7 +88,9 @@ impl HostState {
             | HostCall::SetToolWindowTitle { .. }
             | HostCall::UpdateConversation { .. }
             | HostCall::OpenTab { .. }
-            | HostCall::SetBadge { .. } => "ui",
+            | HostCall::SetBadge { .. }
+            | HostCall::SetRestorable { .. }
+            | HostCall::FocusElement { .. } => "ui",
             HostCall::ToolRespond { .. } | HostCall::ToolConfirm { .. } => "tools",
             HostCall::Editor { call, reply } => {
                 let _ = reply.send(editor_reply(call));
@@ -157,6 +159,7 @@ fn window_reply(call: &WindowCall) -> Option<WindowReply> {
         | WindowCall::ClearDiagnostics
         | WindowCall::OpenUrl(_)
         | WindowCall::CopyText(_)
+        | WindowCall::OpenFile { .. }
         | WindowCall::OpenSettings
         | WindowCall::GitNewBranch { .. }
         | WindowCall::GitCheckout { .. }
@@ -185,7 +188,10 @@ fn window_call_name(call: &WindowCall) -> &'static str {
         WindowCall::Diagnostics(_)
         | WindowCall::PublishDiagnostics { .. }
         | WindowCall::ClearDiagnostics => "diagnostics",
-        WindowCall::OpenUrl(_) | WindowCall::CopyText(_) | WindowCall::OpenSettings => "system",
+        WindowCall::OpenUrl(_)
+        | WindowCall::CopyText(_)
+        | WindowCall::OpenFile { .. }
+        | WindowCall::OpenSettings => "system",
         WindowCall::SetLinkPatterns(_) | WindowCall::DescribeLink { .. } => "links",
         WindowCall::NewClaudeSession(_) => "claude",
         WindowCall::SwitchContext { .. } | WindowCall::RemoveContext(_) => "contexts",

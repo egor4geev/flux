@@ -8,6 +8,10 @@
 //! A picture that isn't there yet shows its placeholder: the tiny JPEG a message carries
 //! (`image-spec.preview`), decoded and blurred here as well, or a dim box of the picture's size.
 //! Animated GIF and WebP show their first frame.
+//!
+//! A picture is cut to the proportions of its box (its middle) before it is scaled: gpui rounds an
+//! image's own corners, so a picture that overflowed its box (covering it) would lose the rounded
+//! and the round corners to the box's straight edges.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -34,15 +38,19 @@ const PREVIEW_BLUR: f32 = 6.;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Key {
-    /// A file at a size, in device pixels (rounded up to [`SIZE_STEP`]).
+    /// A file at a size, in device pixels (the longer side rounded up to [`SIZE_STEP`], the
+    /// other keeping the box's proportions).
     File {
         path: PathBuf,
         width: u32,
         height: u32,
     },
-    /// A message's preview, by the hash of its bytes.
-    Preview(u64),
+    /// A message's preview, by the hash of its bytes, cut to proportions (out of [`ASPECT_BASE`]).
+    Preview(u64, u32, u32),
 }
+
+/// A preview's proportions are kept as its box's sides scaled to this longer side.
+const ASPECT_BASE: u32 = 256;
 
 enum Slot {
     /// Being decoded; the views that asked are drawn again when it is ready.
@@ -130,18 +138,11 @@ pub fn file(
     view: EntityId,
     cx: &mut App,
 ) -> Option<Arc<RenderImage>> {
-    let step = |side: u32| match side {
-        0 => MAX_SIDE,
-        side => side.div_ceil(SIZE_STEP) * SIZE_STEP,
-    };
+    let (max_width, max_height) = decoded_size(width, height);
     let key = Key::File {
         path: path.to_path_buf(),
-        width: step(width).min(MAX_SIDE * 2),
-        height: step(height).min(MAX_SIDE * 2),
-    };
-    let (max_width, max_height) = match &key {
-        Key::File { width, height, .. } => (*width, *height),
-        Key::Preview(_) => unreachable!(),
+        width: max_width,
+        height: max_height,
     };
     let path = path.to_path_buf();
     get(key, view, cx, move || {
@@ -149,15 +150,75 @@ pub fn file(
     })
 }
 
-/// A message's preview (`image-spec.preview`: a tiny JPEG), enlarged and blurred; `None` while it
-/// is decoded or when the bytes aren't a picture.
-pub fn preview(bytes: &[u8], view: EntityId, cx: &mut App) -> Option<Arc<RenderImage>> {
+/// The size a picture shown at `width` × `height` device pixels is decoded at: the longer side
+/// rounded up to [`SIZE_STEP`] (within twice [`MAX_SIDE`]), the other keeping the proportions —
+/// the picture is cut to them. An unknown side (0) is [`MAX_SIDE`].
+fn decoded_size(width: u32, height: u32) -> (u32, u32) {
+    let (width, height) = match (width, height) {
+        (0, 0) => (MAX_SIDE, MAX_SIDE),
+        (0, height) => (MAX_SIDE, height),
+        (width, 0) => (width, MAX_SIDE),
+        sides => sides,
+    };
+    let longer = width.max(height);
+    let stepped = (longer.div_ceil(SIZE_STEP) * SIZE_STEP).min(MAX_SIDE * 2);
+    let scale = |side: u32| ((side as f64 * stepped as f64 / longer as f64).round() as u32).max(1);
+    (scale(width), scale(height))
+}
+
+/// A message's preview (`image-spec.preview`: a tiny JPEG) for a box of `width` × `height`
+/// (any unit: only the proportions count), enlarged and blurred; `None` while it is decoded or
+/// when the bytes aren't a picture.
+pub fn preview(
+    bytes: &[u8],
+    width: f32,
+    height: f32,
+    view: EntityId,
+    cx: &mut App,
+) -> Option<Arc<RenderImage>> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
+    let (aspect_width, aspect_height) = aspect(width, height);
     let bytes = bytes.to_vec();
-    get(Key::Preview(hasher.finish()), view, cx, move || {
-        decode_preview(&bytes)
-    })
+    get(
+        Key::Preview(hasher.finish(), aspect_width, aspect_height),
+        view,
+        cx,
+        move || decode_preview(&bytes, aspect_width, aspect_height),
+    )
+}
+
+/// A box's proportions as whole sides, the longer one [`ASPECT_BASE`].
+fn aspect(width: f32, height: f32) -> (u32, u32) {
+    if !(width > 0. && height > 0.) {
+        return (ASPECT_BASE, ASPECT_BASE);
+    }
+    let longer = width.max(height);
+    let side = |side: f32| ((side / longer * ASPECT_BASE as f32).round() as u32).max(1);
+    (side(width), side(height))
+}
+
+/// The middle of a picture with the proportions `width` : `height` (all of it when they match).
+fn cut_to(image: DynamicImage, width: u32, height: u32) -> DynamicImage {
+    let (have_width, have_height) = (image.width().max(1), image.height().max(1));
+    let (width, height) = (width.max(1) as u64, height.max(1) as u64);
+    // The widest part of the proportions that fits, then the tallest.
+    let mut cut_width = have_width as u64;
+    let mut cut_height = (cut_width * height).div_ceil(width);
+    if cut_height > have_height as u64 {
+        cut_height = have_height as u64;
+        cut_width = ((cut_height * width).div_ceil(height)).min(have_width as u64);
+    }
+    let (cut_width, cut_height) = (cut_width.max(1) as u32, cut_height.max(1) as u32);
+    if (cut_width, cut_height) == (have_width, have_height) {
+        return image;
+    }
+    image.crop_imm(
+        (have_width - cut_width) / 2,
+        (have_height - cut_height) / 2,
+        cut_width,
+        cut_height,
+    )
 }
 
 fn get(
@@ -255,13 +316,14 @@ fn evict(pictures: &mut Pictures, now: Instant) -> Vec<Arc<RenderImage>> {
     gone
 }
 
-/// A file decoded and scaled down to fit the size (never up), in gpui's BGRA order.
+/// A file decoded, cut to the size's proportions and scaled down to it (never up), in gpui's BGRA
+/// order.
 fn decode_file(path: &Path, max_width: u32, max_height: u32) -> Option<RgbaImage> {
     let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?;
-    let decoded = reader.decode().ok()?;
+    let decoded = cut_to(reader.decode().ok()?, max_width, max_height);
     let decoded = if decoded.width() > max_width || decoded.height() > max_height {
         decoded.thumbnail(max_width.max(1), max_height.max(1))
     } else {
@@ -270,9 +332,9 @@ fn decode_file(path: &Path, max_width: u32, max_height: u32) -> Option<RgbaImage
     Some(to_bgra(decoded))
 }
 
-/// A preview enlarged and blurred: it stands for the picture, not shows it.
-fn decode_preview(bytes: &[u8]) -> Option<RgbaImage> {
-    let decoded = image::load_from_memory(bytes).ok()?;
+/// A preview cut to the proportions, enlarged and blurred: it stands for the picture, not shows it.
+fn decode_preview(bytes: &[u8], width: u32, height: u32) -> Option<RgbaImage> {
+    let decoded = cut_to(image::load_from_memory(bytes).ok()?, width, height);
     let (width, height) = (decoded.width().max(1), decoded.height().max(1));
     let larger = decoded.resize_exact(
         width * PREVIEW_SCALE,
@@ -337,5 +399,24 @@ mod tests {
         picture(&mut pictures, "a", BUDGET, now);
         picture(&mut pictures, "b", BUDGET / 2, now);
         assert!(evict(&mut pictures, now).is_empty());
+    }
+
+    #[test]
+    fn a_picture_is_cut_to_its_boxs_proportions() {
+        // The longer side steps up, the other keeps the box's proportions.
+        assert_eq!(decoded_size(400, 300), (448, 336));
+        assert_eq!(decoded_size(68, 68), (128, 128));
+        assert_eq!(decoded_size(0, 0), (MAX_SIDE, MAX_SIDE));
+        // A wide picture in a square box (a round video, an album's square): its middle.
+        let wide = DynamicImage::new_rgba8(300, 100);
+        let cut = cut_to(wide, 128, 128);
+        assert_eq!((cut.width(), cut.height()), (100, 100));
+        let tall = DynamicImage::new_rgba8(90, 400);
+        let cut = cut_to(tall, 4, 3);
+        assert_eq!((cut.width(), cut.height()), (90, 68));
+        let same = DynamicImage::new_rgba8(40, 30);
+        let cut = cut_to(same, 448, 336);
+        assert_eq!((cut.width(), cut.height()), (40, 30));
+        assert_eq!(aspect(200., 100.), (256, 128));
     }
 }

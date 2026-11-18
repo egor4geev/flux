@@ -12,8 +12,18 @@
 //! it edited. A chat's tab in sight reads its messages; the unread ones count on the launchpad
 //! icon and put a dot on their tabs. A closed tab forgets its chat (the log says `tab-closed`); a
 //! tab Flux restored with the project is filled again from its key.
+//!
+//! Videos (API 0.5): a video's picture with its length and ▶, a GIF, a round video message — a
+//! click on one comes as `part-clicked` (the log says `play`). Edit is offered on the user's own
+//! messages only (`Message::actions`).
+//!
+//! FluxGram part 3 (API 0.5): the field has formatting (its menu, ⌘B ⌘I ⇧⌘X ⇧⌘P ⇧⌘M ⌘K) and the
+//! echo reads the Markdown crudely; Reply over a selected part of a message quotes that part
+//! (`message-action-quoted`, the log says `quoted`); a click on a picture without its full size
+//! opens the viewer at once and the full size comes a moment later; "Backend · team" is marked
+//! with "@" while it has unread messages.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use flux_plugin_api::conversation::{
@@ -27,6 +37,10 @@ use flux_plugin_api::{Event, Plugin, UiEvent, log, register_plugin, storage, tim
 
 const CHATS: &str = "chats";
 const CHAT: &str = "chat";
+/// A chat's profile: a dialog with the chat's media.
+const PROFILE: &str = "profile";
+/// The profile's gallery holds this many pictures, and pages of this many more.
+const MEDIA: usize = 60;
 const FEED: &str = "feed";
 /// The history: message 0 is the oldest, `TOTAL - 1` the newest.
 const TOTAL: u64 = 10_000;
@@ -35,6 +49,8 @@ const FIRST: u64 = 60;
 const PAGE: u64 = 100;
 /// The newest message's date, and the step between messages.
 const NEWEST: i64 = 1_763_380_000;
+/// A download's step (ms): files and pictures come in three.
+const DOWNLOAD_STEP: u64 = 700;
 const STEP: i64 = 600;
 
 /// The people of the group: name, color, initials.
@@ -165,6 +181,12 @@ struct Playground {
     sent: HashMap<(u64, u64), Message>,
     /// The new texts of edited messages, by (chat's seed, index).
     edits: HashMap<(u64, u64), String>,
+    /// The messages whose files and pictures were downloaded, by (chat's seed, index).
+    downloaded: HashSet<(u64, u64)>,
+    /// The part of a message the quote over a chat's field quotes (a reply to a selection).
+    quoted: HashMap<String, String>,
+    /// The chat whose profile is open, and how many pictures its gallery holds.
+    profile: Option<(String, usize)>,
 }
 
 impl Plugin for Playground {
@@ -202,6 +224,7 @@ impl Plugin for Playground {
                     self.set_in_sight(key, true);
                 }
             }
+            Event::ToolWindowHidden(window) if window == PROFILE => self.profile = None,
             Event::ToolWindowHidden(window) => {
                 if let Some(key) = chat_key(&window) {
                     self.set_in_sight(key, false);
@@ -213,8 +236,19 @@ impl Plugin for Playground {
                     self.forget(key);
                 }
             }
+            Event::Ui(input) if input.window == PROFILE => self.profile_event(input.event),
             Event::Ui(input) if input.window == CHATS => match input.event {
                 UiEvent::Activated(key) => self.open_chat(&key),
+                // A row's ⋯: the chat's menu under its row (API 0.5: "<tree>/<row key>").
+                UiEvent::RowAction((key, action)) if action == "menu" => {
+                    flux_plugin_api::picker::Picker::menu()
+                        .item(flux_plugin_api::picker::item("read", "Mark as Read").icon("check"))
+                        .item(flux_plugin_api::picker::item("pin", "Pin").icon("pin"))
+                        .item(flux_plugin_api::picker::item("hide", "Hide the Chat").icon("close"))
+                        .under(CHATS, &format!("list/{key}"))
+                        .open();
+                }
+                UiEvent::RowAction((key, action)) => log::info(&format!("{action}: {key}")),
                 // A scenario's `ui:<plugin>/chats/show`, `…/chats/<chat>` (open it),
                 // `…/chats/incoming/<chat>` (a message comes) and `…/chats/close/<chat>`.
                 UiEvent::Clicked if input.element == "show" => ui::show(CHATS),
@@ -269,6 +303,19 @@ impl Playground {
             if row.key == "team" || row.key == "flux" {
                 spec = spec.label_icon("claude");
             }
+            // A mention of the user among the unread messages (API 0.5): "@" by the count.
+            if row.key == "team" && unread > 0 {
+                spec = spec.mention();
+            }
+            // A chat's buttons over the row's end while it is hovered or selected (they take no
+            // room from the title); ⋯ opens the chat's menu under its row.
+            spec = spec
+                .action("mute", None, Some("bell"), false)
+                .action_tooltip("mute", "Mute")
+                .action("hide", None, Some("close"), false)
+                .action_tooltip("hide", "Hide")
+                .action("menu", None, Some("more"), false)
+                .action_tooltip("menu", "More");
             if row.key == "anna"
                 && let Some(picture) = self.pictures.first()
             {
@@ -403,29 +450,25 @@ impl Playground {
         let (Some(chat), Some((_, info))) = (self.open.get(key), chat_row(key)) else {
             return;
         };
+        // The header opens the chat's profile (API 0.5: a `header` is a button).
         let header = row(
             "header",
             [
-                avatar("avatar", AvatarSpec::initials(info.initials, info.color)),
-                column(
-                    "titles",
-                    [
-                        text("title", [span(info.title).bold()]),
-                        text(
-                            "subtitle",
-                            [span(&format!("5 members · {}", chat.shown_visible))
-                                .tone(Tone::Muted)],
-                        ),
-                    ],
-                ),
+                header("titles", info.title)
+                    .avatar(AvatarSpec::initials(info.initials, info.color))
+                    .subtitle([
+                        span(&format!("5 members · {}", chat.shown_visible)).tone(Tone::Muted)
+                    ])
+                    .into(),
                 switch("ticker", "New messages", chat.ticker.is_some()),
                 button("reveal", "Reveal Oldest").into(),
+                icon_button("more", "more", "More"),
             ],
         );
         let feed = conversation(
             FEED,
             chat::spec()
-                .composer(composer("Message…").attachments().action(
+                .composer(composer("Message…").attachments().formatting().action(
                     "claude",
                     "Reply with Claude",
                     Some("claude"),
@@ -458,18 +501,23 @@ impl Playground {
                 self.render_chat(key);
             }
             (FEED, UiEvent::MessageAction((message, action))) => {
-                self.message_action(key, &message, &action)
+                self.message_action(key, &message, &action, None)
+            }
+            // An action over a selected part of the message (API 0.5): the quote quotes the part.
+            (FEED, UiEvent::MessageActionQuoted((message, action, text, offset))) => {
+                log::info(&format!("quoted: {message} {action} @{offset}: {text}"));
+                self.message_action(key, &message, &action, Some(&text))
             }
             // A scenario's `ui:<plugin>/chat/<chat>/reply/<message>` (and `…/edit/…`, `…/claude/…`):
             // the message's action, as its menu would send it.
             (element, UiEvent::Clicked) if element.contains('/') => {
                 if let Some((action, message)) = element.split_once('/') {
-                    self.message_action(key, message, action);
+                    self.message_action(key, message, action, None);
                 }
             }
             (FEED, UiEvent::EditLast) => {
                 if let Some(index) = self.last_own(key) {
-                    self.message_action(key, &id(index), "edit");
+                    self.message_action(key, &id(index), "edit", None);
                 }
             }
             (FEED, UiEvent::Edited((message, text))) => {
@@ -480,15 +528,30 @@ impl Playground {
                 }
             }
             (FEED, UiEvent::EditCancelled) => log::info("edit-cancelled"),
-            (FEED, UiEvent::ReplyCancelled) => log::info("reply-cancelled"),
+            (FEED, UiEvent::ReplyCancelled) => {
+                self.quoted.remove(key);
+                log::info("reply-cancelled")
+            }
             (FEED, UiEvent::ComposerAction((_, composed))) => {
                 let text = format!("{} — rewritten by Claude", composed.text.trim());
                 chat::update(&tab, FEED, vec![draft(&text)]);
             }
             (FEED, UiEvent::Composed(composed)) => self.send(key, composed),
+            // A video's picture: the plugin would play it.
+            (FEED, UiEvent::PartClicked((message, part)))
+                if index(&message).is_some_and(|index| {
+                    matches!(
+                        self.message(seed, index).parts.get(part as usize),
+                        Some(Part::Image(spec)) if spec.play
+                    )
+                }) =>
+            {
+                log::info(&format!("play: {message}/{part}"));
+            }
             (FEED, UiEvent::PartClicked((message, _))) => {
                 if let Some(index) = index(&message) {
-                    let timer = timers::after(Duration::from_millis(300));
+                    // A download of a few steps: the viewer opened on a picture waits for it.
+                    let timer = timers::after(Duration::from_millis(DOWNLOAD_STEP));
                     self.downloads.insert(timer, (key.to_string(), index, 0.3));
                     self.put_download(key, index, 0.0);
                 }
@@ -504,6 +567,24 @@ impl Playground {
                 }
                 self.render_chat(key);
             }
+            ("titles", UiEvent::Clicked) => {
+                self.profile = Some((key.to_string(), MEDIA));
+                self.render_profile();
+                ui::show(PROFILE);
+            }
+            // ⌘F, ⌘G, ⇧⌘G in the tab (API 0.5): the chat's search would show.
+            (_, event @ (UiEvent::Find | UiEvent::FindNext | UiEvent::FindPrevious)) => {
+                log::info(&format!("{event:?}: {key}"));
+            }
+            // The chat's menu, under its ⋯ in the tab (a picker anchored to an element of a tab).
+            ("more", UiEvent::Clicked) => {
+                flux_plugin_api::picker::Picker::menu()
+                    .item(flux_plugin_api::picker::item("profile", "Profile").icon("info"))
+                    .item(flux_plugin_api::picker::item("search", "Search").icon("search"))
+                    .item(flux_plugin_api::picker::item("hide", "Hide the Chat").icon("close"))
+                    .under(&tab, "more")
+                    .open();
+            }
             ("reveal", UiEvent::Clicked) => {
                 let oldest = self.open.get(key).map_or(0, |chat| chat.oldest);
                 chat::update(&tab, FEED, vec![reveal(&id(oldest))])
@@ -512,14 +593,93 @@ impl Playground {
         }
     }
 
-    /// A message's action: Reply puts its quote over the field; Edit — on the user's own message —
-    /// puts it in the field; Reply with Claude adds Claude's draft.
-    fn message_action(&self, key: &str, message: &str, action: &str) {
+    /// The profile of the chat: its large header over its media by month — photos, videos (the
+    /// length and ▶), some not downloaded yet (a click downloads them: `activated`).
+    fn render_profile(&self) {
+        let (Some((key, count)), false) = (self.profile.as_ref(), self.pictures.is_empty()) else {
+            return;
+        };
+        let Some((_, info)) = chat_row(key) else {
+            return;
+        };
+        const MONTHS: [&str; 4] = [
+            "November 2026",
+            "October 2026",
+            "September 2026",
+            "August 2026",
+        ];
+        let items = (0..*count)
+            .map(|n| {
+                let p = &self.pictures[n % self.pictures.len()];
+                // The square shows the picture; its full size is there too: a click opens the
+                // viewer (a messenger would download it first).
+                let mut image = chat::picture(&p.path, p.width, p.height)
+                    .full(&p.path)
+                    .preview(p.preview.clone());
+                if n % 7 == 3 {
+                    image = image.label(&format!("0:{:02}", 10 + n % 50)).play();
+                } else if n % 11 == 5 {
+                    image = chat::pending_picture(p.width, p.height).preview(p.preview.clone());
+                }
+                gallery_item(&format!("media-{n}"), image, Some(MONTHS[(n / 16).min(3)]))
+            })
+            .collect();
+        let more = if *count < 200 {
+            History::More
+        } else {
+            History::Complete
+        };
+        set_view(
+            PROFILE,
+            column(
+                "root",
+                [
+                    header("profile-header", info.title)
+                        .avatar(AvatarSpec::initials(info.initials, info.color))
+                        .subtitle([span("5 members").tone(Tone::Dim)])
+                        .large()
+                        .into(),
+                    gallery("media", items, more, Some("No photos or videos yet")),
+                ],
+            ),
+        );
+    }
+
+    fn profile_event(&mut self, event: UiEvent) {
+        match event {
+            UiEvent::LoadOlder => {
+                if let Some((_, count)) = self.profile.as_mut() {
+                    *count += MEDIA;
+                }
+                self.render_profile();
+            }
+            UiEvent::Activated(key) => log::info(&format!("activated: {key}")),
+            UiEvent::Visible((first, last)) => {
+                log::info(&format!("media visible: {first} … {last}"))
+            }
+            UiEvent::Clicked => log::info("profile header clicked"),
+            _ => {}
+        }
+    }
+
+    /// A message's action: Reply puts its quote over the field — of the selected part (`quoted`)
+    /// when there is one; Edit — on the user's own message — puts it in the field; Reply with
+    /// Claude adds Claude's draft.
+    fn message_action(&mut self, key: &str, message: &str, action: &str, quoted: Option<&str>) {
         let (Some(index), Some(chat)) = (index(message), self.open.get(key)) else {
             return;
         };
         let message = self.message(seed(key), index);
-        let quote = message.quote("You");
+        let mut quote = message.quote("You");
+        match quoted {
+            Some(text) if action != "edit" => {
+                quote.text = text.replace('\n', " ");
+                self.quoted.insert(key.to_string(), text.to_string());
+            }
+            _ => {
+                self.quoted.remove(key);
+            }
+        }
         let changes = match action {
             "reply" => vec![reply_to(Some(quote))],
             "edit" if message.outgoing => {
@@ -613,31 +773,26 @@ impl Playground {
         } else if let Some((key, index, done)) = self.downloads.remove(&timer) {
             self.put_download(&key, index, done);
             if done < 1.0 {
-                let timer = timers::after(Duration::from_millis(300));
+                let timer = timers::after(Duration::from_millis(DOWNLOAD_STEP));
                 self.downloads
                     .insert(timer, (key, index, (done + 0.35).min(1.0)));
             }
         }
     }
 
-    /// A file part being downloaded (`done` < 1) or downloaded.
-    fn put_download(&self, key: &str, index: u64, done: f32) {
+    /// A message's files and pictures being downloaded (`done` < 1) or downloaded: a picture's
+    /// full size too (the viewer opened on it swaps to it).
+    fn put_download(&mut self, key: &str, index: u64, done: f32) {
+        if done >= 1.0 {
+            self.downloaded.insert((seed(key), index));
+        }
         let mut message = self.message(seed(key), index);
-        for part in &mut message.parts {
-            if let Part::File(file) = part {
-                if done >= 1.0 {
-                    file.progress = None;
-                    file.path = Some(format!("{}/notes.txt", storage::dir()));
-                } else {
-                    file.progress = Some(done);
-                }
-            }
-            if let Part::Image(spec) = part {
-                if done >= 1.0 {
-                    spec.progress = None;
-                    spec.path = self.pictures.first().map(|picture| picture.path.clone());
-                } else {
-                    spec.progress = Some(done);
+        if done < 1.0 {
+            for part in &mut message.parts {
+                match part {
+                    Part::File(file) if file.path.is_none() => file.progress = Some(done),
+                    Part::Image(spec) if !spec.play => spec.progress = Some(done),
+                    _ => {}
                 }
             }
         }
@@ -654,8 +809,13 @@ impl Playground {
         if let Some(reply) = &composed.reply_to
             && let Some(original) = flux_index(reply)
         {
-            message = message.reply(self.message(seed(key), original).quote("You"));
+            let mut quote = self.message(seed(key), original).quote("You");
+            if let Some(text) = self.quoted.get(key) {
+                quote.text = text.replace('\n', " ");
+            }
+            message = message.reply(quote);
         }
+        self.quoted.remove(key);
         for path in &composed.files {
             let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
             let picture = [".png", ".jpg", ".jpeg", ".webp", ".gif"]
@@ -670,8 +830,9 @@ impl Playground {
                 message.part(file(name, size, Some(path)))
             };
         }
-        if !composed.text.trim().is_empty() {
-            message = message.text(composed.text.trim());
+        // The field's formatting comes as Markdown (API 0.5): read crudely.
+        for part in markdown_parts(composed.text.trim()) {
+            message = message.part(part);
         }
         self.sent.insert((seed(key), index), message.clone());
         chat::update(
@@ -691,9 +852,36 @@ impl Playground {
             Some(sent) => sent.clone(),
             None => self.history_message(seed, index),
         };
-        match self.edits.get(&(seed, index)) {
+        let mut message = match self.edits.get(&(seed, index)) {
             Some(text) => with_text(message, text),
             None => message,
+        };
+        // Downloaded: the files on disk, the pictures in full size.
+        if self.downloaded.contains(&(seed, index)) {
+            for part in &mut message.parts {
+                match part {
+                    Part::File(file) => {
+                        file.progress = None;
+                        file.path = Some(format!("{}/notes.txt", storage::dir()));
+                    }
+                    Part::Image(spec) if !spec.play => {
+                        spec.progress = None;
+                        if spec.path.is_none() {
+                            spec.path = self.pictures.first().map(|picture| picture.path.clone());
+                        }
+                        spec.full = spec.path.clone();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Edit only on the user's own messages (API 0.5); a notice offers nothing.
+        if matches!(message.parts.first(), Some(Part::Notice(_))) {
+            return message.actions(Vec::<String>::new());
+        }
+        match message.outgoing {
+            true => message.actions(["reply", "edit", "claude"]),
+            false => message.actions(["reply", "claude"]),
         }
     }
 
@@ -781,6 +969,23 @@ impl Playground {
                 .part(chat::image(chat::pending_picture(1200, 800).preview(self.pictures[0].preview.clone())))
                 .text("Not downloaded yet: a click downloads it."),
             11 => message.edited().text("Edited: release on Friday? Or Thursday?"),
+            // Videos (API 0.5): the length and ▶ over the first frame, a GIF, a round one.
+            12 if !self.pictures.is_empty() => message
+                .part(chat::image(picture(index).label("0:42").play()))
+                .text("The demo of the new map screen"),
+            13 if !self.pictures.is_empty() => {
+                message.part(chat::image(picture(index).label("GIF").play()))
+            }
+            14 if !self.pictures.is_empty() => {
+                let p = &self.pictures[(index as usize) % self.pictures.len()];
+                message.part(chat::image(
+                    chat::picture(&p.path, 240, 240)
+                        .preview(p.preview.clone())
+                        .shape(ImageShape::Circle)
+                        .label("0:07")
+                        .play(),
+                ))
+            }
             _ => message.text(&format!(
                 "Message {index}: {}",
                 [
@@ -793,6 +998,76 @@ impl Playground {
         };
         message
     }
+}
+
+/// The field's Markdown (API 0.5 formatting) as parts, crudely: a ``` block is a code part; in the
+/// rest `**bold**`, `__italic__`, `~~strikethrough~~`, `||spoiler||`, `` `code` `` and
+/// `[text](address)` are styled spans (marks don't nest).
+fn markdown_parts(text: &str) -> Vec<Part> {
+    let mut parts = Vec::new();
+    for (index, piece) in text.split("```").enumerate() {
+        let piece = piece.trim_matches('\n');
+        if piece.is_empty() {
+            continue;
+        }
+        if index % 2 == 1 {
+            parts.push(code(piece, None));
+        } else {
+            parts.push(chat::text(markdown_spans(piece)));
+        }
+    }
+    parts
+}
+
+/// One paragraph's inline marks as spans.
+fn markdown_spans(text: &str) -> Vec<flux_plugin_api::conversation::RichSpan> {
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut rest = text;
+    'scan: while !rest.is_empty() {
+        for mark in ["**", "__", "~~", "||", "`"] {
+            if let Some(after) = rest.strip_prefix(mark)
+                && let Some(end) = after.find(mark)
+                && end > 0
+            {
+                let inner = &after[..end];
+                let span = match mark {
+                    "**" => rich(inner).bold(),
+                    "__" => rich(inner).italic(),
+                    "~~" => rich(inner).strikethrough(),
+                    "||" => rich(inner).spoiler(),
+                    _ => rich(inner).code(),
+                };
+                if !plain.is_empty() {
+                    spans.push(rich(&std::mem::take(&mut plain)));
+                }
+                spans.push(span);
+                rest = &after[end + mark.len()..];
+                continue 'scan;
+            }
+        }
+        if let Some(after) = rest.strip_prefix('[')
+            && let Some((label, tail)) = after.split_once("](")
+            && let Some((address, tail)) = tail.split_once(')')
+            && !label.contains(']')
+        {
+            if !plain.is_empty() {
+                spans.push(rich(&std::mem::take(&mut plain)));
+            }
+            spans.push(rich(label).link(address));
+            rest = tail;
+            continue;
+        }
+        let mut chars = rest.chars();
+        if let Some(c) = chars.next() {
+            plain.push(c);
+        }
+        rest = chars.as_str();
+    }
+    if !plain.is_empty() {
+        spans.push(rich(&plain));
+    }
+    spans
 }
 
 /// A chat's place in the list: its history starts at another kind of message.

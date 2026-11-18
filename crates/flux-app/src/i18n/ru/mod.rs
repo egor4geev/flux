@@ -32,6 +32,7 @@ mod diff;
 mod feedback;
 mod fluxgram_chat;
 mod fluxgram_runtime;
+mod fluxgram_select;
 mod fluxgram_tools;
 mod fluxgram_windows;
 mod git;
@@ -195,6 +196,7 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     updates::STRINGS,
     fluxgram_runtime::STRINGS,
     fluxgram_chat::STRINGS,
+    fluxgram_select::STRINGS,
     fluxgram_tools::STRINGS,
     fluxgram_windows::STRINGS,
 ];
@@ -274,6 +276,7 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     motion::PLURALS,
     fluxgram_runtime::PLURALS,
     fluxgram_chat::PLURALS,
+    fluxgram_select::PLURALS,
     fluxgram_tools::PLURALS,
     fluxgram_windows::PLURALS,
 ];

@@ -624,6 +624,19 @@ impl ui::Host for State {
             self.host.call(HostCall::SetBadge { window, badge });
         }
     }
+
+    fn set_restorable(&mut self, window: String, restorable: bool) {
+        if self.host.known_window(&window, "ui.set-restorable") {
+            self.host
+                .call(HostCall::SetRestorable { window, restorable });
+        }
+    }
+
+    fn focus(&mut self, window: String, element: String) {
+        if self.host.known_window(&window, "ui.focus") {
+            self.host.call(HostCall::FocusElement { window, element });
+        }
+    }
 }
 
 /// Tells the window that the plugin's log has new lines: at most once per [`LOGGED_EVERY`]; a

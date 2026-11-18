@@ -137,6 +137,9 @@ pub struct ImagePopup {
     pictures: Vec<ImageSource>,
     /// The pictures' views, made as they (or their neighbors) come into sight: each keeps its zoom.
     views: Vec<Option<Entity<ImageView>>>,
+    /// The pictures whose full size is on the way (a plugin's conversation downloads it): a
+    /// spinner over them until it comes ([`Self::replace_picture`]).
+    loading: Vec<bool>,
     index: usize,
     _subscriptions: Vec<Subscription>,
 }
@@ -155,6 +158,7 @@ impl ImagePopup {
         let mut popup = Self {
             focus_handle: cx.focus_handle(),
             views: vec![None; pictures.len()],
+            loading: vec![false; pictures.len()],
             pictures,
             index,
             _subscriptions: Vec::new(),
@@ -190,6 +194,27 @@ impl ImagePopup {
         ]);
         self.views[index] = Some(view.clone());
         Some(view)
+    }
+
+    /// The `index`th picture's full size is on the way (a spinner over it), or came.
+    pub fn set_loading(&mut self, index: usize, loading: bool, cx: &mut Context<Self>) {
+        if let Some(slot) = self.loading.get_mut(index) {
+            *slot = loading;
+            cx.notify();
+        }
+    }
+
+    /// The `index`th picture is now `source`: its full size came (a plugin's conversation).
+    pub fn replace_picture(&mut self, index: usize, source: ImageSource, cx: &mut Context<Self>) {
+        if index >= self.pictures.len() || self.pictures[index] == source {
+            return;
+        }
+        self.pictures[index] = source;
+        self.views[index] = None;
+        if index.abs_diff(self.index) <= 1 {
+            self.view(index, cx);
+        }
+        cx.notify();
     }
 
     /// The picture `step` away from the one in sight, if there is one.
@@ -365,6 +390,35 @@ impl ImagePopup {
     }
 }
 
+/// Over a picture whose full size is on the way: a spinner and "Loading…" in a pill in the
+/// middle, white on dark glass in both themes as over a picture in the chat. It takes no clicks.
+fn loading_pill(index: usize) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .h(px(30.))
+                .px(px(12.))
+                .rounded_full()
+                .bg(gpui::black().opacity(0.6))
+                .text_size(px(theme::TEXT_SM))
+                .text_color(gpui::white())
+                .child(ui::pulse_dot(
+                    ("image-popup-loading", index),
+                    8.,
+                    gpui::white(),
+                ))
+                .child(tr("Loading…")),
+        )
+}
+
 /// A thin line between the toolbar's groups.
 fn separator(ui: UiColors) -> Div {
     div().flex_none().w(px(1.)).h(px(16.)).mx_1().bg(ui.divider)
@@ -414,6 +468,9 @@ impl Render for ImagePopup {
                     div().absolute().size_full().child(view),
                 )
             }))
+            .when(self.loading.get(self.index) == Some(&true), |popup| {
+                popup.child(loading_pill(self.index))
+            })
             .children(view.map(|view| self.render_toolbar(&view, ui, cx)))
             .when(several, |popup| {
                 popup

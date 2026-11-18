@@ -2908,7 +2908,9 @@ impl Renderer<'_> {
         let ui = self.ui;
         let plugin = self.plugin_tools.of_step(&tool.name);
         let summary = match plugin {
-            Some(plugin) => plugin_summary(plugin, self.plugin_tools.output(&tool.tool_use_id)),
+            Some(plugin) => {
+                plugin_summary(plugin, self.plugin_tools.output(&tool.tool_use_id).as_ref())
+            }
             None => tool_summary(tool, self.root, self.tasks),
         };
         let running = matches!(tool.state, ToolState::Streaming | ToolState::Running);

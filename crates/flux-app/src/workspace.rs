@@ -1411,7 +1411,11 @@ impl Workspace {
             // A tab of a plugin's window with tabs: its plugin, its name and its title.
             if let Some(key) = tab.item.plugin_tool() {
                 let store = self.plugins.read(cx);
-                if let Some(tool) = store.tool_window(key).filter(|tool| tool.tab_of.is_some()) {
+                // Not a tab the plugin keeps out (API 0.5: a hidden chat's).
+                if let Some(tool) = store
+                    .tool_window(key)
+                    .filter(|tool| tool.tab_of.is_some() && store.restorable(tool))
+                {
                     plugin_tabs.push(SavedPluginTab {
                         window: SavedWindow {
                             plugin: tool.plugin.to_string(),
@@ -8054,7 +8058,24 @@ impl Workspace {
                 } else {
                     format!("{title} · {body}")
                 };
-                let mut notification = Notification::info(claude::attention_title(&pending.kind))
+                // A plugin's card (API 0.5) names what it asks: "Reply in «Backend · team»".
+                let card_title = session
+                    .read(cx)
+                    .plugin_tools()
+                    .card(&pending.id)
+                    .map(|(_, card)| card.title.clone())
+                    .filter(|title| !title.trim().is_empty());
+                let (heading, body) = match card_title {
+                    Some(card_title) => {
+                        let body = match &pending.description {
+                            Some(description) => format!("{title} · {description}"),
+                            None => title.to_string(),
+                        };
+                        (SharedString::from(card_title), body)
+                    }
+                    None => (claude::attention_title(&pending.kind).into(), body),
+                };
+                let mut notification = Notification::info(heading)
                     .body(body)
                     .action(tr("Show"), claude::ShowSession(session.entity_id()))
                     .group(NotificationGroup::Claude);

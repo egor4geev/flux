@@ -13,7 +13,11 @@
 //! stopped plugin ends the call: the plugin hears `tool-cancelled`, Claude gets an error. A plugin
 //! that doesn't answer keeps the call running until Claude is stopped (reading a long history
 //! takes its time).
+//!
+//! How the answered steps look is kept across restarts too ([`kept`]: a file next to the open
+//! sessions', the newest [`KEPT_STEPS`] steps): a resumed session shows the same step lines.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -78,6 +82,9 @@ pub(crate) struct SessionTools {
     calls: HashMap<u64, PendingCall>,
     /// By the step's tool use id.
     steps: HashMap<String, StepOutput>,
+    /// The steps of earlier runs (a resumed session), by tool use id, read from [`kept`] when
+    /// first drawn; none — not kept.
+    restored: RefCell<HashMap<String, Option<StepOutput>>>,
 }
 
 /// A call ended by Flux or the user, not by the plugin's answer.
@@ -126,9 +133,17 @@ impl SessionTools {
         mcp::flux_tool(tool_name).and_then(|name| self.tool(name))
     }
 
-    /// How an answered step looks, by its tool use id.
-    pub fn output(&self, tool_use_id: &str) -> Option<&StepOutput> {
-        self.steps.get(tool_use_id)
+    /// How an answered step looks, by its tool use id: answered in this run, or kept from an
+    /// earlier one (a resumed session).
+    pub fn output(&self, tool_use_id: &str) -> Option<StepOutput> {
+        if let Some(output) = self.steps.get(tool_use_id) {
+            return Some(output.clone());
+        }
+        self.restored
+            .borrow_mut()
+            .entry(tool_use_id.to_string())
+            .or_insert_with(|| kept::get(tool_use_id).map(|step| StepOutput::of(&step)))
+            .clone()
     }
 
     /// The card of a plugin shown under this request id, with its tool.
@@ -203,6 +218,7 @@ impl SessionTools {
         let pending = self.calls.remove(&call)?;
         if let Some(id) = &pending.tool_use_id {
             self.steps.insert(id.clone(), StepOutput::of(output));
+            kept::keep(id, output);
         }
         Some((pending.request, pending.card.is_some()))
     }
@@ -315,6 +331,121 @@ impl StepOutput {
             detail: output.detail.clone().filter(|line| !line.trim().is_empty()),
             excerpt,
         }
+    }
+}
+
+/// How many answered steps are kept across restarts (the newest), and how much of an excerpt.
+const KEPT_STEPS: usize = 400;
+const KEPT_EXCERPT: usize = 16 * 1024;
+
+/// The answered steps' looks kept across restarts (`claude-plugin-steps.json` next to the open
+/// sessions' file; in scenarios without one — neither read nor written): the newest
+/// [`KEPT_STEPS`], by tool use id, as the plugin gave them (an excerpt cut at [`KEPT_EXCERPT`]).
+mod kept {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use serde_json::{Value, json};
+
+    use super::{KEPT_EXCERPT, KEPT_STEPS, PluginOutput};
+
+    /// The file's steps, oldest first; read at the first use.
+    static STEPS: Mutex<Option<VecDeque<(String, PluginOutput)>>> = Mutex::new(None);
+
+    fn with<T>(f: impl FnOnce(&mut VecDeque<(String, PluginOutput)>) -> T) -> T {
+        let mut steps = STEPS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(steps.get_or_insert_with(read))
+    }
+
+    pub(super) fn get(tool_use_id: &str) -> Option<PluginOutput> {
+        with(|steps| {
+            steps
+                .iter()
+                .rev()
+                .find(|(id, _)| id == tool_use_id)
+                .map(|(_, output)| output.clone())
+        })
+    }
+
+    /// Keeps a step's look and writes the file (off the window's thread).
+    pub(super) fn keep(tool_use_id: &str, output: &PluginOutput) {
+        let Some(file) = crate::claude_history::plugin_steps_path() else {
+            return;
+        };
+        let mut output = output.clone();
+        if let Some(excerpt) = output.excerpt.as_mut()
+            && excerpt.len() > KEPT_EXCERPT
+        {
+            let mut cut = KEPT_EXCERPT;
+            while !excerpt.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            excerpt.truncate(cut);
+        }
+        let text = with(|steps| {
+            steps.retain(|(id, _)| id != tool_use_id);
+            steps.push_back((tool_use_id.to_string(), output));
+            while steps.len() > KEPT_STEPS {
+                steps.pop_front();
+            }
+            serialize(steps)
+        });
+        std::thread::spawn(move || {
+            if let Some(folder) = file.parent() {
+                let _ = std::fs::create_dir_all(folder);
+            }
+            let temp = file.with_extension("json.tmp");
+            if let Err(error) =
+                std::fs::write(&temp, text).and_then(|()| std::fs::rename(&temp, &file))
+            {
+                log::warn!("{}: {error}", file.display());
+            }
+        });
+    }
+
+    fn read() -> VecDeque<(String, PluginOutput)> {
+        crate::claude_history::plugin_steps_path()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .map(|text| parse(&text))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn parse(text: &str) -> VecDeque<(String, PluginOutput)> {
+        let Ok(Value::Array(items)) = serde_json::from_str::<Value>(text) else {
+            return VecDeque::new();
+        };
+        let line = |item: &Value, key: &str| item[key].as_str().map(str::to_string);
+        items
+            .iter()
+            .filter_map(|item| {
+                let id = line(item, "id")?;
+                let output = PluginOutput {
+                    text: String::new(),
+                    error: false,
+                    summary: line(item, "summary"),
+                    detail: line(item, "detail"),
+                    excerpt: line(item, "excerpt"),
+                };
+                Some((id, output))
+            })
+            .collect()
+    }
+
+    pub(super) fn serialize(steps: &VecDeque<(String, PluginOutput)>) -> String {
+        let items: Vec<Value> = steps
+            .iter()
+            .map(|(id, output)| {
+                json!({
+                    "id": id,
+                    "summary": output.summary,
+                    "detail": output.detail,
+                    "excerpt": output.excerpt,
+                })
+            })
+            .collect();
+        serde_json::to_string(&items).unwrap_or_default()
     }
 }
 
@@ -544,6 +675,32 @@ pub(crate) fn group_title(plugin_name: &str, steps: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kept_steps_read_back_as_written() {
+        let mut steps = std::collections::VecDeque::new();
+        steps.push_back((
+            "toolu_1".to_string(),
+            PluginOutput {
+                text: "for Claude".into(),
+                error: false,
+                summary: Some("Read 40 messages of «Backend»".into()),
+                detail: Some("14:02–14:32".into()),
+                excerpt: Some("> Anna: ok".into()),
+            },
+        ));
+        let back = kept::parse(&kept::serialize(&steps));
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, "toolu_1");
+        assert_eq!(
+            back[0].1.summary.as_deref(),
+            Some("Read 40 messages of «Backend»")
+        );
+        assert_eq!(back[0].1.excerpt.as_deref(), Some("> Anna: ok"));
+        // The text for Claude isn't kept: the step's look is.
+        assert!(back[0].1.text.is_empty());
+        assert!(kept::parse("not json").is_empty());
+    }
     use std::borrow::Cow;
 
     #[test]

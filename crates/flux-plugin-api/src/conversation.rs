@@ -103,6 +103,7 @@ impl Message {
             reply: None,
             parts: Vec::new(),
             reactions: Vec::new(),
+            actions: None,
         }
     }
 
@@ -147,6 +148,13 @@ impl Message {
 
     pub fn part(mut self, part: Part) -> Self {
         self.parts.push(part);
+        self
+    }
+
+    /// The conversation's message actions this message offers, by id (API 0.5): Edit only on the
+    /// user's own messages. Without it — every one.
+    pub fn actions(mut self, actions: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.actions = Some(actions.into_iter().map(Into::into).collect());
         self
     }
 
@@ -328,6 +336,8 @@ pub fn picture(path: &str, width: u32, height: u32) -> ImageSpec {
         height,
         progress: None,
         shape: ImageShape::Rounded,
+        label: None,
+        play: false,
     }
 }
 
@@ -359,6 +369,17 @@ impl ImageSpec {
         self.shape = shape;
         self
     }
+    /// A short text in a pill at the corner (API 0.5): a video's length "0:42", "GIF".
+    pub fn label(mut self, label: &str) -> Self {
+        self.label = Some(label.to_string());
+        self
+    }
+    /// A ▶ in the middle (API 0.5): a video, a GIF, a round video message; a click comes as
+    /// `part-clicked`.
+    pub fn play(mut self) -> Self {
+        self.play = true;
+        self
+    }
 }
 
 impl AvatarSpec {
@@ -385,6 +406,7 @@ pub fn composer(placeholder: &str) -> ComposerSpec {
         placeholder: placeholder.to_string(),
         attachments: false,
         actions: Vec::new(),
+        formatting: false,
     }
 }
 
@@ -397,6 +419,13 @@ impl ComposerSpec {
     /// A button beside Send; a press comes as `UiEvent::ComposerAction((id, composed))`.
     pub fn action(mut self, id: &str, label: &str, icon: Option<&str>) -> Self {
         self.actions.push(row_action(id, label, icon));
+        self
+    }
+    /// Formatting (API 0.5): the field's menu and keys (⌘B, ⌘I, ⇧⌘X, ⇧⌘P, ⇧⌘M, ⌘K) wrap the
+    /// selection in Markdown marks — `**bold**`, `__italic__`, `~~strikethrough~~`,
+    /// `||spoiler||`, `` `monospace` ``, `[text](address)`; the text is sent with them.
+    pub fn formatting(mut self) -> Self {
+        self.formatting = true;
         self
     }
 }
@@ -421,7 +450,8 @@ impl ConversationSpec {
         self
     }
     /// An action of every message: in its menu, and with an icon on its hover bar; a choice comes
-    /// as `UiEvent::MessageAction((message, id))`.
+    /// as `UiEvent::MessageAction((message, id))` — chosen while part of the message's text is
+    /// selected, as `UiEvent::MessageActionQuoted((message, id, text, offset))`.
     pub fn message_action(mut self, id: &str, label: &str, icon: Option<&str>) -> Self {
         self.message_actions.push(row_action(id, label, icon));
         self

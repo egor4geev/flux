@@ -457,6 +457,9 @@ interface ui {
         /// Work is in progress after its press (0.5): a spinner in place of the icon, the label
         /// stays, the button doesn't press — a sign-in's Next while the server answers.
         busy: bool,
+        /// A count after the label (0.5), in a small pill: the unread messages of an account; none
+        /// — no pill.
+        badge: option<string>,
     }
 
     record text-field-spec {
@@ -509,8 +512,9 @@ interface ui {
         /// after the label — tags, a deadline, story points.
         tags: list<badge-spec>,
         /// The row's buttons (0.3): on a card, at its foot on the right; in a list, at the row's
-        /// end while it is hovered or selected. A press comes as `row-action` and neither selects
-        /// nor opens the row.
+        /// end while it is hovered or selected — in two-line rows over the row's end, taking no
+        /// room from the label. A press comes as `row-action` and neither selects nor opens the
+        /// row; a picker anchored to `element((window, "<tree>/<row key>"))` opens under the row.
         actions: list<row-action>,
         /// A person's or a chat's picture in place of the icon (0.5).
         avatar: option<avatar-spec>,
@@ -518,6 +522,10 @@ interface ui {
         badge-tone: option<tone>,
         /// Small named icons right after the label (0.5): pinned, muted, Claude may read it.
         label-icons: list<string>,
+        /// An accent "@" in a small circle before the badge (0.5): a chat where the user is
+        /// mentioned in a message not read yet. In two-line rows it goes on the second line, next
+        /// to the badge.
+        mention: bool,
     }
 
     /// The shape of a picture (0.5).
@@ -526,7 +534,8 @@ interface ui {
         rounded,
         /// Square corners.
         square,
-        /// A circle: an avatar.
+        /// A circle: an avatar, a round video message (cut from the picture's middle; alone in a
+        /// message it goes without the bubble, as a sticker).
         circle,
     }
 
@@ -534,8 +543,10 @@ interface ui {
     record image-spec {
         /// The picture to show, absolute; none — not there yet: `preview` blurred, or a dim box.
         path: option<string>,
-        /// A larger one for the viewer, absolute; none — `path`. A click on a picture without it
-        /// comes as an event (the plugin downloads it).
+        /// A larger one for the viewer, absolute. None — not there yet: a click on the picture
+        /// opens the viewer at once on what is there (`path`, else `preview` blurred) with a
+        /// spinner and comes as `part-clicked` (the plugin downloads it); the message put again
+        /// with it swaps the open viewer to it.
         full: option<string>,
         /// A tiny picture shown blurred until `path` is there: the bytes of a JPEG of a few dozen
         /// pixels (up to 4 KB), carried right in the message.
@@ -547,6 +558,12 @@ interface ui {
         /// Being downloaded: 0.0–1.0 over the placeholder; none — not.
         progress: option<f32>,
         shape: image-shape,
+        /// A short text in a pill at the picture's top-left corner (0.5) — at the bottom of a
+        /// round one: a video's length "0:42", "GIF".
+        label: option<string>,
+        /// A ▶ in the middle (0.5): the picture stands for a video, a GIF, a round video message;
+        /// a click comes as `part-clicked` (the plugin plays or opens it).
+        play: bool,
     }
 
     /// A person or a chat (0.5): a picture, or the initials on a color.
@@ -733,6 +750,9 @@ interface ui {
         reply: option<message-quote>,
         parts: list<message-part>,
         reactions: list<reaction>,
+        /// The conversation's `message-actions` this message offers (0.5), by id: Edit only on the
+        /// user's own messages that can still be edited. None — every one.
+        actions: option<list<string>>,
     }
 
     /// Whether there is more of a conversation's history in a direction (0.5).
@@ -753,6 +773,15 @@ interface ui {
         attachments: bool,
         /// Buttons beside Send: "Reply with Claude"; a press comes as `composer-action`.
         actions: list<row-action>,
+        /// Formatting (0.5): the field's menu offers Formatting — Bold (⌘B), Italic (⌘I),
+        /// Strikethrough (⇧⌘X), Spoiler (⇧⌘P), Monospace (⇧⌘M), Link… (⌘K, asks the address); on
+        /// Windows Ctrl in place of ⌘. Each wraps the selection in Markdown marks — `**bold**`,
+        /// `__italic__`, `~~strikethrough~~`, `||spoiler||`, `` `monospace` `` (```` ``` ```` on
+        /// lines of their own around a selection of several lines), `[text](address)` — or puts
+        /// them around the caret. The field sends the text with the marks (`composed`, `edited`):
+        /// the plugin parses them. The keys work only in the field; without formatting they do
+        /// what they do elsewhere.
+        formatting: bool,
     }
 
     /// A message feed with a field (0.5), as a chat. Its messages come by
@@ -766,6 +795,41 @@ interface ui {
         /// "Reply with Claude". Copy Text, Open, Save As… are Flux's own. A choice comes as
         /// `message-action`.
         message-actions: list<row-action>,
+    }
+
+    /// A header (0.5): a picture, a title and a line under it — a chat's header over its feed, a
+    /// profile's top. A click on it comes as `clicked`.
+    record header-spec {
+        avatar: option<avatar-spec>,
+        title: string,
+        /// The line under the title, in its tones: "online" (accent), "5 members" (dim).
+        subtitle: list<span>,
+        /// A profile's: a large picture over the centered title and line.
+        large: bool,
+    }
+
+    /// A picture of a gallery (0.5).
+    record gallery-item {
+        /// Names it in the events (`activated`, `visible`).
+        key: string,
+        image: image-spec,
+        /// The heading of the item's group ("November 2026"): a group starts where it changes.
+        group: option<string>,
+    }
+
+    /// Pictures in a grid of squares (0.5), as a chat's photos and videos by month: takes the
+    /// remaining height and scrolls by itself (in a dialog, the dialog is then as tall as it may
+    /// be); only the squares on screen are drawn, each from its `path` (a small picture will do).
+    /// A click on a picture whose full size is there (`full`, not `play`) opens it in Flux's
+    /// picture viewer, the gallery's full pictures around it; any other click comes as
+    /// `activated(key)` (the plugin downloads the full size, or opens a video). The squares on
+    /// screen come as `visible(first, last)` (their keys), the end near — as `load-older` while
+    /// `more` is `more`.
+    record gallery-spec {
+        items: list<gallery-item>,
+        more: history,
+        /// Shown in the middle when there are no items.
+        empty-text: option<string>,
     }
 
     /// A change of a conversation (0.5): the plugin sends what changed, never the whole feed.
@@ -848,6 +912,10 @@ interface ui {
         qr(string),
         /// A message feed with a field (0.5); takes the remaining height, as a tree does.
         conversation(conversation-spec),
+        /// A header (0.5): a picture, a title, a line under it; a click comes as `clicked`.
+        header(header-spec),
+        /// Pictures in a grid by groups (0.5); takes the remaining height, as a tree does.
+        gallery(gallery-spec),
     }
 
     record element {
@@ -883,6 +951,13 @@ interface ui {
     /// A mark of the window (0.5): on its launchpad icon a count ("4"), on its tab a dot; none —
     /// no mark.
     set-badge: func(window: string, badge: option<string>);
+    /// Whether the tab `<window>/<key>` comes back with the project after a restart, and is kept
+    /// in a context (0.5); a tab does by default. `false` — a tab nobody should find later: a
+    /// hidden chat's.
+    set-restorable: func(window: string, restorable: bool);
+    /// Puts the keyboard in a text field of the window's view (0.5): a search bar opened by ⌘F.
+    /// The field may come in the same call's `set-view`.
+    focus: func(window: string, element: string);
 }
 
 /// Requests to web services, as the manifest's `network` permission allows: a request goes only to
@@ -1272,13 +1347,18 @@ interface system {
     time-zone: func() -> string;
     /// Opens Settings on the plugin's page.
     open-settings: func();
+    /// Opens a file with the system's app (0.5): a downloaded video, a document. Only a file of the
+    /// plugin's data folder, or one the user gave the plugin (chosen, dropped, pasted).
+    open-file: func(path: string) -> result<_, string>;
+    /// Shows a file in Finder (Explorer) (0.5), the same files as `open-file`.
+    show-file: func(path: string) -> result<_, string>;
 }
 
 /// A popup list to choose from, drawn by Flux as its own (Open Task, the branches, the palette):
 /// a search field over grouped items, or a short menu without one. The choice comes as
 /// `picker-chosen`.
 interface picker {
-    use ui.{span};
+    use ui.{span, avatar-spec};
 
     record picker-item {
         /// Names the item in `picker-chosen`.
@@ -1293,6 +1373,8 @@ interface picker {
         /// The heading of the item's group ("Today", "In Progress"); the items of a group come
         /// together, in the order of their first item.
         group: option<string>,
+        /// A person's or a chat's picture in place of the icon (0.5).
+        avatar: option<avatar-spec>,
     }
 
     variant picker-anchor {
@@ -1300,7 +1382,10 @@ interface picker {
         window,
         /// Above one of the plugin's status bar items (its id).
         status-item(string),
-        /// Under an element of one of the plugin's tool windows: (window, element).
+        /// Under an element of one of the plugin's tool windows: (window, element). A property of
+        /// a `properties` list is named "<list>/<property id>" (0.3), a row of a tree
+        /// "<tree>/<row key>" (0.5): a menu of a row's button opens under the row (under the
+        /// list while the row isn't drawn).
         element(tuple<string, string>),
     }
 
@@ -1519,10 +1604,19 @@ interface events {
         /// …near its newest one while `newer` is `more`.
         load-newer,
         /// The messages on screen changed (0.5): the first and the last, by id — to mark them read
-        /// and download what is seen first. One event for a burst of scrolling.
+        /// and download what is seen first. One event for a burst of scrolling. Only while the
+        /// user can see them: the conversation is in sight in the active window — it comes again
+        /// when the window becomes active or the conversation comes into sight.
         visible(tuple<string, string>),
         /// A message's action was chosen (0.5): (the message, the action's id).
         message-action(tuple<string, string>),
+        /// A message's action was chosen while part of its text was selected (0.5), in place of
+        /// `message-action`: (the message, the action's id, the selected text, where it starts in
+        /// the message's text — in UTF-16 code units). The message's text is that of its `text`,
+        /// `quote` and `code` parts in order (a part's spans joined, a code block's text as it
+        /// came), a line break between two parts, empty parts left out; the selected text is the
+        /// stretch of it that starts there — a reply quoting part of the message.
+        message-action-quoted(tuple<string, string, string, u32>),
         /// A part of a message was clicked (0.5) that Flux can't open by itself: a file or a
         /// picture not downloaded, a placeholder — (the message, the part's index).
         part-clicked(tuple<string, u32>),
@@ -1546,6 +1640,16 @@ interface events {
         /// ↑ in the empty field (0.5), as in messengers: the plugin may answer with `editing` of
         /// the user's last message it lets edit.
         edit-last,
+        /// ⌘F (Ctrl+F) in the window (0.5): the plugin shows its search — a chat's. The element is
+        /// the window's root.
+        find,
+        /// ⌘G (F3) and ⇧⌘G (⇧F3) in the window (0.5): the next and the previous match of the
+        /// plugin's search.
+        find-next,
+        find-previous,
+        /// Esc in a text field (0.5): close what the field belongs to (a search bar). Sent for the
+        /// field's element in a tool window or a tab; in a dialog Esc closes the dialog.
+        cancelled,
     }
 
     record ui-input {

@@ -11,7 +11,10 @@
 //! a message put below the last one keeps the feed at the bottom if it was there. Scrolling within
 //! about a screen of an end asks for more (`load-older`, `load-newer`, once per state of the
 //! history); the messages on screen go to the plugin as `visible(first, last)`, at most every
-//! [`VISIBLE_EVERY`] while scrolling and once more when it settles.
+//! [`VISIBLE_EVERY`] while scrolling and once more when it settles — only while the user can see
+//! them: the conversation in sight (its window shown, its tab the active one) in the active window.
+//! They go again when the window becomes active or the conversation comes into sight, and when a
+//! put changes what is on screen (a new message at the bottom): the plugin marks them read.
 //!
 //! A message: incoming on the left (in a group the author's colored name on the first of a run,
 //! the avatar beside the last), outgoing on the right in the accent bubble; the time, "edited" and
@@ -42,17 +45,21 @@ use flux_plugin::api::ui::{
     RowAction,
 };
 use gpui::{
-    Action, AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle, Hsla,
-    InteractiveText, KeyBinding, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent,
-    ObjectFit, Pixels, Point, Render, SharedString, StrikethroughStyle, StyledText, Subscription,
-    Task, TextRun, UnderlineStyle, WeakEntity, Window, actions, div, font, img, list, prelude::*,
-    px, relative,
+    Action, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DismissEvent,
+    DispatchPhase, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontStyle,
+    FontWeight, Hsla, InteractiveText, KeyBinding, KeyDownEvent, ListAlignment, ListOffset,
+    ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point,
+    Render, SharedString, StrikethroughStyle, StyledText, Subscription, Task, TextRun,
+    UnderlineStyle, WeakEntity, Window, actions, canvas, div, font, img, list, prelude::*, px,
+    relative,
 };
 
+use crate::claude_select::{self, Collect, Joint, Selection};
 use crate::context_menu::ContextMenu;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon, plugin_icon};
+use crate::image_popup::ImagePopup;
+use crate::image_view::ImageSource;
 use crate::markdown::{self, Block, CodeBlock};
 use crate::prompt_input::{PromptInput, PromptInputEvent};
 use crate::theme::{self, Theme, UiColors};
@@ -65,22 +72,39 @@ actions!(
         Send,
         /// Esc in the field: leaves the editing of a message.
         CancelEdit,
+        /// ⌘C: the selected part of a message's text.
+        CopySelection,
+        /// Esc: the selection goes (only then — otherwise Esc does what it did).
+        ClearSelection,
+        /// The field's formatting (API 0.5): the selection between Markdown marks.
+        FormatBold,
+        FormatItalic,
+        FormatStrikethrough,
+        FormatSpoiler,
+        FormatMonospace,
+        /// ⌘K: asks the address, then `[text](address)`.
+        FormatLink,
+        /// ⇧F10 in the field: its menu, from the keyboard.
+        ShowFieldMenu,
     ]
 );
 
-/// A plugin's action of a message, from its menu.
+/// A plugin's action of a message, from its menu: with the selected part of the message's text
+/// and where it starts, when the menu opened over a selection in it.
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = plugin_conversation, no_json)]
 struct ChooseAction {
     message: String,
     action: String,
+    quote: Option<(String, u32)>,
 }
 
-/// Copy Text of a message's menu.
+/// Copy Text of a message's menu: the selected part of its text, when the menu opened over one.
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = plugin_conversation, no_json)]
 struct CopyText {
     message: String,
+    selected: Option<String>,
 }
 
 /// Open, Show in Finder, Save As… of a downloaded picture or file (by the part's index).
@@ -105,14 +129,27 @@ struct SavePartAs {
     part: usize,
 }
 
+const CONTEXT: &str = "PluginConversation";
 const FIELD_CONTEXT: &str = "PluginConversationField";
 
 pub fn init(cx: &mut App) {
+    let field = Some(FIELD_CONTEXT);
     crate::keymap::bind_keys(
         cx,
         [
-            KeyBinding::new("enter", Send, Some(FIELD_CONTEXT)),
-            KeyBinding::new("escape", CancelEdit, Some(FIELD_CONTEXT)),
+            KeyBinding::new("enter", Send, field),
+            KeyBinding::new("escape", CancelEdit, field),
+            KeyBinding::new("cmd-c", CopySelection, Some(CONTEXT)),
+            KeyBinding::new("escape", ClearSelection, Some(CONTEXT)),
+            // The field's formatting: in the field they win over the window's keys (⌘K Commit,
+            // ⇧⌘P the palette); without formatting the action passes them on.
+            KeyBinding::new("cmd-b", FormatBold, field),
+            KeyBinding::new("cmd-i", FormatItalic, field),
+            KeyBinding::new("cmd-shift-x", FormatStrikethrough, field),
+            KeyBinding::new("cmd-shift-p", FormatSpoiler, field),
+            KeyBinding::new("cmd-shift-m", FormatMonospace, field),
+            KeyBinding::new("cmd-k", FormatLink, field),
+            KeyBinding::new("shift-f10", ShowFieldMenu, field),
         ],
     );
 }
@@ -149,6 +186,8 @@ const OVERDRAW: f32 = 1000.;
 const VISIBLE_EVERY: Duration = Duration::from_millis(200);
 /// `draft-changed` goes out this long after the typing stops.
 const DRAFT_DELAY: Duration = Duration::from_millis(300);
+/// The viewer's blurred preview of a picture not downloaded yet is at most this large across.
+const PREVIEW_SIDE: f32 = 1280.;
 /// A revealed message stays marked this long.
 const REVEAL_MARK: Duration = Duration::from_millis(1400);
 const TEXT_SIZE: f32 = 13.;
@@ -163,6 +202,8 @@ pub enum ConversationEvent {
 struct Menu {
     menu: Entity<ContextMenu>,
     position: Point<Pixels>,
+    /// Where the keyboard goes back when the menu closes with it (Esc): the feed, or the field.
+    return_focus: FocusHandle,
     _subscriptions: [Subscription; 2],
 }
 
@@ -173,6 +214,20 @@ struct Sight {
     viewport: Option<Bounds<Pixels>>,
     /// Each drawn message's index and bounds (with the screen around what is seen).
     drawn: Vec<(usize, Bounds<Pixels>)>,
+    /// The frame was drawn in the active window: the user may be looking.
+    active: bool,
+}
+
+/// The picture viewer opened on a picture whose full size isn't there yet (API 0.5): the message
+/// put again with it swaps the viewer to it.
+struct Viewer {
+    popup: WeakEntity<ImagePopup>,
+    message: String,
+    part: usize,
+    /// The picture's place among the viewer's pictures.
+    index: usize,
+    /// The viewer shows the picture's `path` (not its preview).
+    shows_path: bool,
 }
 
 /// A code block of a message, highlighted in the background.
@@ -211,8 +266,11 @@ pub struct Conversation {
     plugin_draft: Option<String>,
     draft_timer: Option<Task<()>>,
     sight: Rc<RefCell<Sight>>,
-    /// The last `visible` sent, when, and the one waiting for its turn.
+    /// The last `visible` sent, when, and the one waiting for its turn. None while the user can't
+    /// see the conversation: the range goes again when they can.
     visible_sent: Option<(String, String)>,
+    /// In sight: the window shown, the tab the active one ([`Conversation::set_shown`]).
+    shown: bool,
     visible_at: Option<Instant>,
     visible_timer: Option<Task<()>>,
     /// The newest message is on screen: no jump-to-bottom button.
@@ -221,6 +279,17 @@ pub struct Conversation {
     /// Spoilers the user opened: (message, part).
     open_spoilers: HashSet<(String, usize)>,
     code: HashMap<(String, usize), Code>,
+    /// The selected part of a message's text: the message, and the selection in the texts it
+    /// draws ([`claude_select`], by the message's [`select_key`]).
+    selection: Option<(String, Selection)>,
+    /// The texts of the messages drawn lately and where they were laid out: the mouse finds its
+    /// place in them.
+    drawn: claude_select::Drawn,
+    /// Frames drawn: the texts of a frame replace those of the frame before.
+    frame: u64,
+    viewer: Option<Viewer>,
+    /// Where the field was drawn last: its menu from the keyboard opens there.
+    field_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     menu: Option<Menu>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -265,12 +334,18 @@ impl Conversation {
             draft_timer: None,
             sight: Rc::default(),
             visible_sent: None,
+            shown: true,
             visible_at: None,
             visible_timer: None,
             at_bottom: true,
             revealed: None,
             open_spoilers: HashSet::new(),
             code: HashMap::new(),
+            selection: None,
+            drawn: Rc::default(),
+            frame: 0,
+            viewer: None,
+            field_bounds: Rc::default(),
             menu: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -297,6 +372,18 @@ impl Conversation {
         cx.emit(ConversationEvent::Ui(event));
     }
 
+    /// The conversation came into sight or went out of it (its window shown or hidden, its tab
+    /// the active one or not). Out of sight nothing is `visible`; back, the range goes again.
+    pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        if self.shown == shown {
+            return;
+        }
+        self.shown = shown;
+        self.visible_sent = None;
+        self.visible_timer = None;
+        cx.notify();
+    }
+
     // --- Changes ---
 
     /// Applies the plugin's changes in order.
@@ -307,6 +394,10 @@ impl Conversation {
                     for message in messages {
                         self.put(message);
                     }
+                    // What is on screen may have changed (a new message at the bottom): the next
+                    // frame's range goes without waiting for its turn.
+                    self.visible_at = None;
+                    self.update_viewer(cx);
                 }
                 ConversationChange::Remove(ids) => {
                     for id in ids {
@@ -318,6 +409,7 @@ impl Conversation {
                     self.order.clear();
                     self.code.clear();
                     self.open_spoilers.clear();
+                    self.selection = None;
                     self.list.reset(0);
                     self.filled = false;
                     self.visible_sent = None;
@@ -410,6 +502,15 @@ impl Conversation {
             if *old == message {
                 return;
             }
+            // The selection stays while the texts it is in stay.
+            if self
+                .selection
+                .as_ref()
+                .is_some_and(|(selected, _)| *selected == id)
+                && selectable_texts(old) != selectable_texts(&message)
+            {
+                self.selection = None;
+            }
             if old.order == message.order {
                 let ix = self.position(&id);
                 self.code.retain(|(owner, _), _| *owner != id);
@@ -444,6 +545,13 @@ impl Conversation {
         };
         self.order.remove(ix);
         self.messages.remove(id);
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|(selected, _)| selected == id)
+        {
+            self.selection = None;
+        }
         self.code.retain(|(owner, _), _| owner != id);
         self.list.splice(ix..ix + 1, 0);
         if ix > 0 {
@@ -521,6 +629,14 @@ impl Conversation {
         let (Some(first), Some(last)) = (first, last) else {
             return;
         };
+        // Only what the user can see counts as seen (it marks messages read): not in a window in
+        // the background, not out of sight. The range goes again when they can see it.
+        let active = self.sight.borrow().active;
+        if !active || !self.shown {
+            self.visible_sent = None;
+            self.visible_timer = None;
+            return;
+        }
         let pair = (self.order[first].clone(), self.order[last].clone());
         if self.visible_sent.as_ref() == Some(&pair) {
             self.visible_timer = None;
@@ -722,8 +838,11 @@ impl Conversation {
         }
     }
 
-    /// A click on a picture: Flux's viewer with the conversation's pictures, or the plugin's
-    /// download when it has no file yet.
+    /// A click on a picture: Flux's viewer with the conversation's pictures. One whose full size
+    /// isn't there yet opens at once on what is there — its file, else its preview made as large
+    /// as the picture and blurred — with a spinner, and the plugin downloads the full size
+    /// (`part-clicked`): the viewer swaps to it when the message comes with it
+    /// ([`Self::update_viewer`]). A video's (`play`) goes to the plugin: it plays it.
     fn click_picture(
         &mut self,
         message: &str,
@@ -732,28 +851,137 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) {
         let mut pictures = Vec::new();
-        let mut index = None;
+        let mut clicked = None;
+        let mut preview = None;
         for id in &self.order {
             for (ix, spec) in self.messages[id].parts.iter().enumerate() {
                 let (MessagePart::Image(spec) | MessagePart::Sticker(spec)) = spec else {
                     continue;
                 };
-                let Some(path) = spec.full.as_ref().or(spec.path.as_ref()) else {
+                if spec.play {
                     continue;
+                }
+                let this = id == message && ix == part;
+                let full = self.allowed_path(spec.full.as_ref(), cx);
+                let path = self.allowed_path(spec.path.as_ref(), cx);
+                let source = match (full.clone().or(path.clone()), &spec.preview) {
+                    (Some(path), _) => ImageSource::File(path),
+                    (None, Some(bytes)) if this => {
+                        preview = Some((bytes.clone(), spec.width, spec.height));
+                        crate::image_popup::conversation_picture(
+                            pictures.len(),
+                            "image/jpeg",
+                            bytes.as_slice().into(),
+                        )
+                    }
+                    _ => continue,
                 };
-                let path = PathBuf::from(path);
-                if !crate::plugin_images::allowed(&self.plugin, &path, cx) {
-                    continue;
+                if this {
+                    clicked = Some((pictures.len(), full.is_none(), path.is_some()));
                 }
-                if id == message && ix == part {
-                    index = Some(pictures.len());
-                }
-                pictures.push(crate::image_view::ImageSource::File(path));
+                pictures.push(source);
             }
         }
-        match index {
-            Some(index) => crate::image_popup::show(pictures, index, window, cx),
-            None => self.emit(UiEvent::PartClicked((message.to_string(), part as u32)), cx),
+        let Some((index, waiting, shows_path)) = clicked else {
+            return self.emit(UiEvent::PartClicked((message.to_string(), part as u32)), cx);
+        };
+        if waiting {
+            self.emit(UiEvent::PartClicked((message.to_string(), part as u32)), cx);
+        }
+        let viewer = waiting.then(|| (message.to_string(), part, shows_path));
+        let Some((bytes, width, height)) = preview else {
+            return self.open_viewer(pictures, index, viewer, window, cx);
+        };
+        // Only the preview: made large and blurred off the window's thread, then the viewer opens.
+        let blurred = cx
+            .background_executor()
+            .spawn(async move { blurred_preview(&bytes, width, height) });
+        cx.spawn_in(window, async move |this, cx| {
+            let blurred = blurred.await;
+            this.update_in(cx, |this, window, cx| {
+                if let Some(data) = blurred {
+                    pictures[index] =
+                        crate::image_popup::conversation_picture(index, "image/jpeg", data.into());
+                }
+                this.open_viewer(pictures, index, viewer, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Opens the viewer on the `index`th of `pictures`; `waiting` — that picture's full size is on
+    /// the way (the message, the part, whether its file is shown): a spinner until it comes.
+    fn open_viewer(
+        &mut self,
+        pictures: Vec<ImageSource>,
+        index: usize,
+        waiting: Option<(String, usize, bool)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::image_popup::show(pictures, index, window, cx);
+        let Some((message, part, shows_path)) = waiting else {
+            return;
+        };
+        let popup = window
+            .root::<crate::workspace::Workspace>()
+            .flatten()
+            .and_then(|workspace| workspace.read(cx).modal_view::<ImagePopup>());
+        if let Some(popup) = popup {
+            popup.update(cx, |popup, cx| popup.set_loading(index, true, cx));
+            self.viewer = Some(Viewer {
+                popup: popup.downgrade(),
+                message,
+                part,
+                index,
+                shows_path,
+            });
+            // The full size may have come while the preview was made.
+            self.update_viewer(cx);
+        }
+    }
+
+    /// A picture's file the plugin may show.
+    fn allowed_path(&self, path: Option<&String>, cx: &mut App) -> Option<PathBuf> {
+        let path = PathBuf::from(path?);
+        crate::plugin_images::allowed(&self.plugin, &path, cx).then_some(path)
+    }
+
+    /// Messages were put: the viewer waiting for a picture's full size swaps to it (to its file
+    /// while the full size is still on the way).
+    fn update_viewer(&mut self, cx: &mut Context<Self>) {
+        let Some(viewer) = &self.viewer else {
+            return;
+        };
+        let Some(popup) = viewer.popup.upgrade() else {
+            self.viewer = None;
+            return;
+        };
+        let spec = match self
+            .messages
+            .get(&viewer.message)
+            .and_then(|message| message.parts.get(viewer.part))
+        {
+            Some(MessagePart::Image(spec) | MessagePart::Sticker(spec)) => spec.clone(),
+            _ => return,
+        };
+        let index = viewer.index;
+        if let Some(full) = self.allowed_path(spec.full.as_ref(), cx) {
+            popup.update(cx, |popup, cx| {
+                popup.replace_picture(index, ImageSource::File(full), cx);
+                popup.set_loading(index, false, cx);
+            });
+            self.viewer = None;
+        } else if !viewer.shows_path
+            && let Some(path) = self.allowed_path(spec.path.as_ref(), cx)
+        {
+            popup.update(cx, |popup, cx| {
+                popup.replace_picture(index, ImageSource::File(path), cx)
+            });
+            if let Some(viewer) = &mut self.viewer {
+                viewer.shows_path = true;
+            }
         }
     }
 
@@ -791,12 +1019,21 @@ impl Conversation {
             return;
         };
         let text = message_text(found);
+        // A selection in this message: Copy Text copies it, an action quotes it.
+        let quote = self.selected_quote(&message);
+        let selected = self.selected_text(&message);
         let part = part
             .filter(|part| self.part_path(&message, *part).is_some())
             .or_else(|| {
                 (0..found.parts.len()).find(|part| self.part_path(&message, *part).is_some())
             });
-        let actions = self.spec.message_actions.clone();
+        let actions: Vec<RowAction> = self
+            .spec
+            .message_actions
+            .iter()
+            .filter(|action| offers(found, action))
+            .cloned()
+            .collect();
         window.focus(&self.focus_handle);
         let menu = cx.new(|cx| {
             let mut menu = ContextMenu::new(window, cx);
@@ -806,14 +1043,21 @@ impl Conversation {
                     ChooseAction {
                         message: message.clone(),
                         action: action.id.clone(),
+                        quote: quote.clone(),
                     },
                 );
             }
+            let copy = if selected.is_some() {
+                tr("Copy Selected Text")
+            } else {
+                tr("Copy Text")
+            };
             menu = menu.separator().entry_if(
                 !text.is_empty(),
-                tr("Copy Text"),
+                copy,
                 CopyText {
                     message: message.clone(),
+                    selected,
                 },
             );
             if let Some(part) = part {
@@ -847,43 +1091,326 @@ impl Conversation {
             }
             menu
         });
+        self.show_menu(menu, position, window, cx);
+    }
+
+    /// Shows a menu at `position`, with the keyboard (taken from whoever has it now, and given
+    /// back when the menu closes with it); it closes as menus do.
+    fn show_menu(
+        &mut self,
+        menu: Entity<ContextMenu>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let return_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.focus_handle.clone());
         let focus = menu.focus_handle(cx);
         let subscriptions = [
-            cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, _, cx| {
-                this.close_menu(menu, cx)
+            cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
+                this.close_menu(menu, window, cx)
             }),
             cx.on_focus_out(&focus, window, {
                 let menu = menu.clone();
-                move |this, _, _, cx| this.close_menu(&menu, cx)
+                move |this, _, window, cx| this.close_menu(&menu, window, cx)
             }),
         ];
         window.focus(&focus);
         self.menu = Some(Menu {
             menu,
             position,
+            return_focus,
             _subscriptions: subscriptions,
         });
         cx.notify();
     }
 
-    fn close_menu(&mut self, menu: &Entity<ContextMenu>, cx: &mut Context<Self>) {
-        if self.menu.as_ref().is_some_and(|open| open.menu == *menu) {
-            self.menu = None;
+    /// The menu closed: the keyboard goes back where it was if the menu still had it (Esc; a
+    /// chosen item has given it back already, a click elsewhere took it).
+    fn close_menu(
+        &mut self,
+        menu: &Entity<ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.menu.as_ref().is_none_or(|open| open.menu != *menu) {
+            return;
+        }
+        let had_focus = menu.focus_handle(cx).contains_focused(window, cx);
+        if let Some(open) = self.menu.take()
+            && had_focus
+        {
+            window.focus(&open.return_focus);
+        }
+        cx.notify();
+    }
+
+    fn choose_action(&mut self, action: &ChooseAction, _: &mut Window, cx: &mut Context<Self>) {
+        self.choose(&action.message, &action.action, action.quote.clone(), cx);
+    }
+
+    /// A message's action: with the selected part of its text, a quoted one (API 0.5) — the
+    /// selection has served then and goes.
+    fn choose(
+        &mut self,
+        message: &str,
+        action: &str,
+        quote: Option<(String, u32)>,
+        cx: &mut Context<Self>,
+    ) {
+        let (message, action) = (message.to_string(), action.to_string());
+        match quote {
+            Some((text, offset)) => {
+                self.selection = None;
+                cx.notify();
+                self.emit(
+                    UiEvent::MessageActionQuoted((message, action, text, offset)),
+                    cx,
+                )
+            }
+            None => self.emit(UiEvent::MessageAction((message, action)), cx),
+        }
+    }
+
+    fn copy_text(&mut self, action: &CopyText, _: &mut Window, cx: &mut Context<Self>) {
+        let text = match &action.selected {
+            Some(selected) => Some(selected.clone()),
+            None => self.messages.get(&action.message).map(message_text),
+        };
+        if let Some(text) = text {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    // --- Selecting a message's text ---
+
+    /// The selection in `message`'s text: the stretch of the message's text it covers (see
+    /// [`stretch`]), when it isn't empty.
+    fn selection_in(&self, message: &str) -> Option<(String, std::ops::Range<usize>)> {
+        let (selected, selection) = self.selection.as_ref()?;
+        if selected != message || selection.is_empty() {
+            return None;
+        }
+        let (start, end) = selection.range();
+        let (text, range) = stretch(&selectable_texts(self.messages.get(message)?), start, end);
+        (!range.is_empty()).then_some((text, range))
+    }
+
+    /// The selected part of `message`'s text, as copied.
+    fn selected_text(&self, message: &str) -> Option<String> {
+        self.selection_in(message)
+            .map(|(text, range)| text[range].to_string())
+    }
+
+    /// The selected part of `message`'s text as a quote: the text without the white space around
+    /// it, and where it starts in the message's text in UTF-16 code units.
+    fn selected_quote(&self, message: &str) -> Option<(String, u32)> {
+        let (text, range) = self.selection_in(message)?;
+        quote(&text, range)
+    }
+
+    /// The mouse went down on a message: over its text a selection starts there (a double click
+    /// takes the word, a triple one the part, ⇧ extends the selection), and the conversation takes
+    /// the keyboard for ⌘C; over a picture or a file nothing starts.
+    fn select_down(
+        &mut self,
+        message: &str,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = select_key(message);
+        if !claude_select::in_text_rows(&self.drawn, key, event.position) {
+            return;
+        }
+        let Some(point) = claude_select::point_at(&self.drawn, key, event.position) else {
+            return;
+        };
+        let (anchor, head) = match event.click_count {
+            2 => claude_select::word_at(&self.drawn, key, point),
+            count if count >= 3 => claude_select::text_at(&self.drawn, key, point),
+            _ => match self
+                .selection
+                .as_ref()
+                .filter(|(selected, _)| event.modifiers.shift && selected == message)
+            {
+                Some((_, old)) => (old.anchor, point),
+                None => (point, point),
+            },
+        };
+        self.selection = Some((
+            message.to_string(),
+            Selection {
+                entry: key,
+                anchor,
+                head,
+                dragging: event.click_count <= 1,
+            },
+        ));
+        window.focus(&self.focus_handle);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// The mouse moved with the button down: a selection being dragged follows it (within its
+    /// message, over the others and out of the feed too).
+    fn drag_selection(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((_, selection)) = self.selection.as_mut() else {
+            return;
+        };
+        if !selection.dragging {
+            return;
+        }
+        if let Some(point) = claude_select::point_at(&self.drawn, selection.entry, position)
+            && point != selection.head
+        {
+            selection.head = point;
             cx.notify();
         }
     }
 
-    fn choose_action(&mut self, action: &ChooseAction, _: &mut Window, cx: &mut Context<Self>) {
-        self.emit(
-            UiEvent::MessageAction((action.message.clone(), action.action.clone())),
-            cx,
-        );
+    /// The button went up: the dragged selection stays; a click without a drag selects nothing.
+    fn end_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((_, selection)) = self.selection.as_mut() else {
+            return;
+        };
+        if !selection.dragging {
+            return;
+        }
+        selection.dragging = false;
+        if selection.is_empty() {
+            self.selection = None;
+        }
+        cx.notify();
     }
 
-    fn copy_text(&mut self, action: &CopyText, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(message) = self.messages.get(&action.message) {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(message_text(message)));
+    /// Part of `message`'s text is selected (a click that made it isn't a link's click).
+    fn selects_in(&self, message: &str) -> bool {
+        self.selection
+            .as_ref()
+            .is_some_and(|(selected, selection)| selected == message && !selection.is_empty())
+    }
+
+    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        let text = self
+            .selection
+            .as_ref()
+            .and_then(|(message, _)| self.selected_text(message));
+        match text {
+            Some(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            None => cx.propagate(),
         }
+    }
+
+    fn clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.take().is_some() {
+            cx.notify();
+        } else {
+            cx.propagate();
+        }
+    }
+
+    // --- The field's formatting (API 0.5) ---
+
+    fn formatting(&self) -> bool {
+        self.spec
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.formatting)
+    }
+
+    /// Puts `mark` around the field's selection (takes it away when it is there), or passes the
+    /// key on when the field has no formatting.
+    fn format(&mut self, mark: Mark, cx: &mut Context<Self>) {
+        if !self.formatting() {
+            return cx.propagate();
+        }
+        self.input.update(cx, |input, cx| {
+            let edit = format_marks(&input.text(), input.selected_range(), mark);
+            input.replace_selecting(edit.range, &edit.text, edit.selected, cx);
+        });
+    }
+
+    /// ⌘K: asks the link's address, then the selection (or the address itself) becomes
+    /// `[text](address)`.
+    fn format_link(&mut self, _: &FormatLink, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.formatting() {
+            return cx.propagate();
+        }
+        let Some(workspace) = window.root::<crate::workspace::Workspace>().flatten() else {
+            return;
+        };
+        let selected = self.input.read(cx).selected_range();
+        let input = self.input.downgrade();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                crate::input_dialog::InputDialog::new(tr("Link"), "https://", window, cx)
+                    .confirm_label(tr("Insert"))
+                    .validate(
+                        |text, _, _| {
+                            if text.is_empty() {
+                                Err(tr("Enter an address").into())
+                            } else {
+                                Ok(())
+                            }
+                        },
+                        cx,
+                    )
+                    .on_confirm(move |address, _, window, cx| {
+                        input
+                            .update(cx, |input, cx| {
+                                let edit = link_marks(&input.text(), selected, &address);
+                                input.replace_selecting(edit.range, &edit.text, edit.selected, cx);
+                                window.focus(&input.focus_handle(cx));
+                            })
+                            .ok();
+                    })
+            })
+        });
+    }
+
+    /// ⇧F10 in the field: its menu at the field's corner.
+    fn show_field_menu(&mut self, _: &ShowFieldMenu, window: &mut Window, cx: &mut Context<Self>) {
+        let position = match self.field_bounds.get() {
+            Some(bounds) => bounds.origin + gpui::point(px(16.), px(12.)),
+            None => window.mouse_position(),
+        };
+        self.open_field_menu(position, window, cx);
+    }
+
+    /// The field's menu: Cut, Copy, Paste, Select All, and Formatting when the field has it.
+    fn open_field_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The menu's actions go to the field.
+        window.focus(&self.input.focus_handle(cx));
+        let selected = self.input.read(cx).has_selection();
+        let formatting = self.formatting();
+        let menu = cx.new(|cx| {
+            let menu = ContextMenu::new(window, cx)
+                .entry_if(selected, tr("Cut"), crate::prompt_input::Cut)
+                .entry_if(selected, tr("Copy"), crate::prompt_input::Copy)
+                .entry(tr("Paste"), crate::prompt_input::Paste)
+                .entry(tr("Select All"), crate::prompt_input::SelectAll);
+            if !formatting {
+                return menu;
+            }
+            menu.separator().submenu(tr("Formatting"), |submenu| {
+                submenu
+                    .entry(tr("Bold"), FormatBold)
+                    .entry(tr("Italic"), FormatItalic)
+                    .entry(tr("Strikethrough"), FormatStrikethrough)
+                    .entry(tr("Spoiler"), FormatSpoiler)
+                    .entry(tr("Monospace"), FormatMonospace)
+                    .separator()
+                    .entry(tr("Link…"), FormatLink)
+            })
+        });
+        self.show_menu(menu, position, window, cx);
     }
 
     fn open_part(&mut self, action: &OpenPart, _: &mut Window, cx: &mut Context<Self>) {
@@ -1054,7 +1581,15 @@ impl Conversation {
         let body = if let Some(MessagePart::Notice(spans)) = message.parts.first() {
             render_notice(spans, ui)
         } else {
-            self.render_message(message, &codes, &look, window, cx)
+            // The message's texts, selectable with the mouse.
+            let select = Collect::new(
+                select_key(&id),
+                self.frame,
+                self.selection.as_ref().map(|(_, selection)| selection),
+                ui.selection,
+                self.drawn.clone(),
+            );
+            self.render_message(message, &codes, &look, &select, window, cx)
         };
         let sight = self.sight.clone();
         div()
@@ -1085,6 +1620,7 @@ impl Conversation {
         message: &Message,
         codes: &[(usize, Vec<Block>)],
         look: &Look,
+        select: &Collect,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1105,8 +1641,13 @@ impl Conversation {
             };
         let bubble_width = (room * BUBBLE_SHARE).clamp(160., BUBBLE_WIDTH);
         let inner = bubble_width - 2. * BUBBLE_PADDING_X;
+        // A sticker, or a round picture (a video message), alone goes without a bubble.
         let sticker_only = message.parts.len() == 1
-            && matches!(message.parts[0], MessagePart::Sticker(_))
+            && match &message.parts[0] {
+                MessagePart::Sticker(_) => true,
+                MessagePart::Image(spec) => spec.shape == ImageShape::Circle,
+                _ => false,
+            }
             && message.reply.is_none();
         let mut content: Vec<AnyElement> = Vec::new();
         // The author's name on the first of a run, in a group.
@@ -1142,12 +1683,12 @@ impl Conversation {
         let mut parts = message.parts.iter().enumerate().peekable();
         while let Some((index, part)) = parts.next() {
             let element = match part {
-                MessagePart::Text(spans) => self.render_rich(&id, index, spans, ui, cx),
+                MessagePart::Text(spans) => self.render_rich(&id, index, spans, select, ui, cx),
                 MessagePart::Quote(spans) => div()
                     .pl(px(8.))
                     .border_l_2()
                     .border_color(ui.accent)
-                    .child(self.render_rich(&id, index, spans, ui, cx))
+                    .child(self.render_rich(&id, index, spans, select, ui, cx))
                     .into_any_element(),
                 MessagePart::Code(_) => {
                     let blocks = codes
@@ -1158,7 +1699,13 @@ impl Conversation {
                     div()
                         .min_w_0()
                         .text_size(px(TEXT_SIZE))
-                        .child(markdown::render(&blocks, ui.foreground, Theme::get(cx)))
+                        .cursor_text()
+                        .child(markdown::render_with_selection(
+                            &blocks,
+                            ui.foreground,
+                            Theme::get(cx),
+                            select,
+                        ))
                         .into_any_element()
                 }
                 MessagePart::Image(spec) => {
@@ -1227,7 +1774,7 @@ impl Conversation {
                 UiColors::tint(ui.foreground, 0.063),
             )
         };
-        let menu_id = id.clone();
+        let (menu_id, select_id) = (id.clone(), id.clone());
         let bubble = if sticker_only {
             div()
                 .flex()
@@ -1268,6 +1815,12 @@ impl Conversation {
                 spread_radius: px(3.),
             }])
         })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                this.select_down(&select_id, event, window, cx)
+            }),
+        )
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -1313,11 +1866,12 @@ impl Conversation {
         ui: UiColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let message = self.messages.get(id)?;
         let actions: Vec<&RowAction> = self
             .spec
             .message_actions
             .iter()
-            .filter(|action| action.icon.is_some())
+            .filter(|action| action.icon.is_some() && offers(message, action))
             .collect();
         if actions.is_empty() {
             return None;
@@ -1330,6 +1884,8 @@ impl Conversation {
                 .mb(px(2.))
                 .opacity(0.)
                 .group_hover("fg-message", |style| style.opacity(1.))
+                // A press here keeps the selection: the action quotes it.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .children(actions.into_iter().map(|action| {
                     let name = action.icon.clone().unwrap_or_default();
                     let glyph = plugin_icon(&self.plugin, &name, &ui);
@@ -1351,10 +1907,8 @@ impl Conversation {
                         .tooltip(ui::tooltip(tooltip, None))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
-                            this.emit(
-                                UiEvent::MessageAction((message.clone(), action_id.clone())),
-                                cx,
-                            )
+                            let quote = this.selected_quote(&message);
+                            this.choose(&message, &action_id, quote, cx)
                         }))
                 }))
                 .into_any_element(),
@@ -1382,17 +1936,21 @@ impl Conversation {
             .into_any_element()
     }
 
-    /// Styled text with links and spoilers: a click on a link opens it, on a spoiler lifts it.
+    /// Styled text with links and spoilers: a click on a link opens it, on a spoiler lifts it —
+    /// a click, not a drag that selects (`select` marks the selection in it and records where it
+    /// was laid out).
     fn render_rich(
         &self,
         message: &str,
         part: usize,
         spans: &[RichSpan],
+        select: &Collect,
         ui: UiColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.open_spoilers.contains(&(message.to_string(), part));
-        let (text, runs, highlights, links, spoilers) = rich_runs(spans, open, ui);
+        let (text, runs, links, spoilers) = rich_runs(spans, open, ui);
+        let (index, runs) = select.text(&text, runs, Joint::Line, None);
         let mut clickable: Vec<std::ops::Range<usize>> = Vec::new();
         let mut targets: Vec<Option<String>> = Vec::new();
         for (range, link) in links {
@@ -1408,16 +1966,13 @@ impl Conversation {
         let styled = StyledText::new(text)
             .with_default_highlights(&gpui::TextStyle::default(), Vec::new())
             .with_runs(runs);
-        let styled = if highlights.is_empty() {
-            styled
-        } else {
-            styled.with_highlights(highlights)
-        };
+        let layout = styled.layout().clone();
         let weak = cx.entity().downgrade();
         let message = message.to_string();
-        div()
+        let element = div()
             .text_size(px(TEXT_SIZE))
             .line_height(px(LINE_HEIGHT))
+            .cursor_text()
             .child(
                 InteractiveText::new(
                     SharedString::from(format!("fg-text-{message}-{part}")),
@@ -1425,17 +1980,24 @@ impl Conversation {
                 )
                 .on_click(clickable, move |index, _, cx| {
                     let target = targets.get(index).cloned().flatten();
-                    weak.update(cx, |this, cx| match target {
-                        Some(link) => this.click_link(&message, &link, cx),
-                        None => {
-                            this.open_spoilers.insert((message.clone(), part));
-                            cx.notify();
+                    weak.update(cx, |this, cx| {
+                        // The press selected (a drag, a double click): not a click on the link.
+                        if this.selects_in(&message) {
+                            return;
+                        }
+                        match target {
+                            Some(link) => this.click_link(&message, &link, cx),
+                            None => {
+                                this.open_spoilers.insert((message.clone(), part));
+                                cx.notify();
+                            }
                         }
                     })
                     .ok();
                 }),
             )
-            .into_any_element()
+            .into_any_element();
+        select.wrap(index, &layout, element)
     }
 
     fn render_album(
@@ -1774,8 +2336,12 @@ impl Conversation {
                 }))
         });
         let attachments = composer.attachments && !editing;
+        let field_bounds = self.field_bounds.clone();
         Some(
             div()
+                .on_children_prepainted(move |children, _, _| {
+                    field_bounds.set(children.first().copied())
+                })
                 .w_full()
                 .flex()
                 .justify_center()
@@ -1803,6 +2369,30 @@ impl Conversation {
                         })
                         .on_action(cx.listener(Self::send))
                         .on_action(cx.listener(Self::cancel_edit))
+                        .on_action(
+                            cx.listener(|this, _: &FormatBold, _, cx| this.format(Mark::Bold, cx)),
+                        )
+                        .on_action(cx.listener(|this, _: &FormatItalic, _, cx| {
+                            this.format(Mark::Italic, cx)
+                        }))
+                        .on_action(cx.listener(|this, _: &FormatStrikethrough, _, cx| {
+                            this.format(Mark::Strikethrough, cx)
+                        }))
+                        .on_action(cx.listener(|this, _: &FormatSpoiler, _, cx| {
+                            this.format(Mark::Spoiler, cx)
+                        }))
+                        .on_action(cx.listener(|this, _: &FormatMonospace, _, cx| {
+                            this.format(Mark::Monospace, cx)
+                        }))
+                        .on_action(cx.listener(Self::format_link))
+                        .on_action(cx.listener(Self::show_field_menu))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_field_menu(event.position, window, cx)
+                            }),
+                        )
                         .when(attachments, |field| {
                             field
                                 .drag_over::<ExternalPaths>(move |style, _, _, _| {
@@ -1882,6 +2472,12 @@ impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         self.sight.borrow_mut().drawn.clear();
+        self.frame += 1;
+        claude_select::prune(
+            &self.drawn,
+            self.frame,
+            self.selection.as_ref().map(|(_, selection)| selection),
+        );
         let feed =
             if self.order.is_empty() {
                 div()
@@ -1908,10 +2504,15 @@ impl Render for Conversation {
                         )
                         .size_full(),
                     )
+                    .child(drag_listener(weak.clone()))
                     // After the feed is laid out (its messages recorded where they were drawn): what
                     // is on screen, and the ends in sight.
-                    .on_children_prepainted(move |children, _, cx| {
-                        sight.borrow_mut().viewport = children.first().copied();
+                    .on_children_prepainted(move |children, window, cx| {
+                        {
+                            let mut sight = sight.borrow_mut();
+                            sight.viewport = children.first().copied();
+                            sight.active = window_active(window);
+                        }
                         weak.update(cx, |this, cx| this.observe_sight(cx)).ok();
                     })
                     .when(loading(self.older), |feed| {
@@ -1952,12 +2553,48 @@ impl Render for Conversation {
         }
         let composer = self.render_composer(window, cx);
         div()
+            .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()
             .flex_col()
             .on_action(cx.listener(Self::choose_action))
             .on_action(cx.listener(Self::copy_text))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::clear_selection))
+            // A press elsewhere (one on a message's text starts a new selection) clears it.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if this.selection.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            // Typing while the feed has the keyboard (after a selection) goes on in the field.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let keys = &event.keystroke;
+                let Some(typed) = keys
+                    .key_char
+                    .clone()
+                    .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+                else {
+                    return;
+                };
+                if keys.modifiers.platform
+                    || keys.modifiers.control
+                    || keys.modifiers.function
+                    || this.spec.composer.is_none()
+                    || !this.focus_handle.is_focused(window)
+                {
+                    return;
+                }
+                this.selection = None;
+                window.focus(&this.input.focus_handle(cx));
+                this.input.update(cx, |input, cx| input.insert(&typed, cx));
+                cx.stop_propagation();
+                cx.notify();
+            }))
             .on_action(cx.listener(Self::open_part))
             .on_action(cx.listener(Self::reveal_part))
             .on_action(cx.listener(Self::save_part_as))
@@ -2109,7 +2746,9 @@ fn fit(width: u32, height: u32, max_width: f32, max_height: f32) -> (f32, f32) {
 }
 
 /// A picture at `size` (logical pixels): its file decoded at that size, the blurred preview until
-/// then, or a dim box; the download's progress over it. Shared with the window's `image` element.
+/// then, or a dim box; the download's progress over it; a video's ▶ in the middle and its label
+/// (the length, "GIF") in a pill at the top-left corner — at the bottom's middle of a round one,
+/// whose box is a square. Shared with the window's `image` element and the gallery.
 pub fn render_picture(
     spec: &ImageSpec,
     size: (f32, f32),
@@ -2120,10 +2759,15 @@ pub fn render_picture(
 ) -> AnyElement {
     let ui = Theme::ui(cx);
     let scale = window.scale_factor();
+    let round = spec.shape == ImageShape::Circle;
+    let size = match round {
+        true => (size.0.min(size.1), size.0.min(size.1)),
+        false => size,
+    };
     let radius = match spec.shape {
         ImageShape::Rounded => px(PICTURE_RADIUS),
         ImageShape::Square => px(0.),
-        ImageShape::Circle => px(size.0.min(size.1) / 2.),
+        ImageShape::Circle => px(size.0 / 2.),
     };
     let device = |side: f32| (side * scale).ceil() as u32;
     let file = spec
@@ -2137,7 +2781,59 @@ pub fn render_picture(
     let shown = file.or_else(|| {
         spec.preview
             .as_ref()
-            .and_then(|bytes| crate::plugin_images::preview(bytes, view, cx))
+            .and_then(|bytes| crate::plugin_images::preview(bytes, size.0, size.1, view, cx))
+    });
+    // Over the picture, white on a dark glass in both themes, as a player's controls.
+    let shade = |alpha: f32| gpui::black().opacity(alpha);
+    let label = spec.label.as_deref().map(|label| {
+        let pill = div()
+            .absolute()
+            .h(px(18.))
+            .px(px(6.))
+            .flex()
+            .items_center()
+            .rounded_full()
+            .bg(shade(0.55))
+            .text_size(px(theme::TEXT_XS))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(gpui::white())
+            .whitespace_nowrap()
+            .child(label.replace('\n', " "));
+        match round {
+            true => div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px((size.1 * 0.08).max(6.)))
+                .flex()
+                .justify_center()
+                .child(pill.relative()),
+            false => pill.top(px(6.)).left(px(6.)),
+        }
+    });
+    let play = (spec.play && spec.progress.is_none()).then(|| {
+        let side = (size.0.min(size.1) * 0.28).clamp(26., 48.);
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .size(px(side))
+                    .rounded_full()
+                    .bg(shade(0.45))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    // The triangle's weight sits left of its box: a nudge centers it by eye.
+                    .child(
+                        icon(IconName::Play, gpui::white())
+                            .size(px((side * 0.42).round()))
+                            .ml(px(side * 0.05)),
+                    ),
+            )
     });
     div()
         .relative()
@@ -2153,6 +2849,7 @@ pub fn render_picture(
                 .rounded(radius)
                 .object_fit(ObjectFit::Cover)
         }))
+        .children(play)
         .children(spec.progress.map(|done| {
             div()
                 .absolute()
@@ -2175,6 +2872,7 @@ pub fn render_picture(
                         .child(format!("{}%", (done.clamp(0., 1.) * 100.).round() as u32)),
                 )
         }))
+        .children(label)
         .into_any_element()
 }
 
@@ -2484,13 +3182,11 @@ fn rich_runs(
 ) -> (
     String,
     Vec<TextRun>,
-    Vec<(std::ops::Range<usize>, HighlightStyle)>,
     Vec<(std::ops::Range<usize>, String)>,
     Vec<std::ops::Range<usize>>,
 ) {
     let mut text = String::new();
     let mut runs = Vec::new();
-    let mut highlights = Vec::new();
     let mut links = Vec::new();
     let mut spoilers = Vec::new();
     for span in spans {
@@ -2523,8 +3219,12 @@ fn rich_runs(
             len: span.text.len(),
             font: run_font,
             color,
+            // A search's match is the run's own background: gpui's delayed highlights would lay the
+            // runs out again and lose the bold, the links and the code.
             background_color: if hidden {
                 Some(UiColors::tint(ui.text_muted, 0.55))
+            } else if span.highlight {
+                Some(ui.search_match)
             } else if span.code {
                 Some(UiColors::tint(ui.foreground, 0.08))
             } else {
@@ -2540,15 +3240,6 @@ fn rich_runs(
                 color: Some(color),
             }),
         });
-        if span.highlight {
-            highlights.push((
-                range.clone(),
-                HighlightStyle {
-                    background_color: Some(ui.search_match),
-                    ..Default::default()
-                },
-            ));
-        }
         if let Some(link) = &span.link {
             links.push((range.clone(), link.clone()));
         }
@@ -2556,7 +3247,231 @@ fn rich_runs(
             spoilers.push(range);
         }
     }
-    (text, runs, highlights, links, spoilers)
+    (text, runs, links, spoilers)
+}
+
+/// A message's key in the selection's store ([`claude_select`] numbers its messages).
+fn select_key(id: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::hash::DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The texts a message draws selectable, in drawing order: those of its `text`, `quote` and `code`
+/// parts (a part's spans joined, a code block's text as it came).
+fn selectable_texts(message: &Message) -> Vec<String> {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text(spans) | MessagePart::Quote(spans) => {
+                Some(spans.iter().map(|span| span.text.as_str()).collect())
+            }
+            MessagePart::Code(code) => Some(code.text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The message's text — `texts` (in drawing order) without the empty ones, a line break between
+/// two — and the bytes of it a selection from `start` to `end` (points in `texts`) covers.
+fn stretch(
+    texts: &[String],
+    start: claude_select::Point,
+    end: claude_select::Point,
+) -> (String, std::ops::Range<usize>) {
+    let mut joined = String::new();
+    // Where each text starts in the joined text (an empty one: where the next one would).
+    let mut starts = Vec::with_capacity(texts.len());
+    for text in texts {
+        if !text.is_empty() && !joined.is_empty() {
+            joined.push('\n');
+        }
+        starts.push(joined.len());
+        joined.push_str(text);
+    }
+    let place = |point: claude_select::Point| match texts.get(point.text) {
+        Some(text) => {
+            let mut byte = starts[point.text] + point.byte.min(text.len());
+            while !joined.is_char_boundary(byte) {
+                byte -= 1;
+            }
+            byte
+        }
+        None => joined.len(),
+    };
+    let (from, to) = (place(start), place(end));
+    let range = from.min(to)..to.max(from);
+    (joined, range)
+}
+
+/// The selected `range` of a message's `text` as a quote (API 0.5): without the white space around
+/// it, and where it starts in UTF-16 code units; none when nothing but white space is selected.
+fn quote(text: &str, range: std::ops::Range<usize>) -> Option<(String, u32)> {
+    let selected = &text[range.clone()];
+    let trimmed = selected.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let start = range.start + (selected.len() - selected.trim_start().len());
+    let offset = text[..start].encode_utf16().count() as u32;
+    Some((trimmed.to_string(), offset))
+}
+
+/// The field's formatting (API 0.5): the Markdown marks Telegram reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mark {
+    Bold,
+    Italic,
+    Strikethrough,
+    Spoiler,
+    Monospace,
+}
+
+impl Mark {
+    fn marks(self) -> &'static str {
+        match self {
+            Mark::Bold => "**",
+            Mark::Italic => "__",
+            Mark::Strikethrough => "~~",
+            Mark::Spoiler => "||",
+            Mark::Monospace => "`",
+        }
+    }
+}
+
+/// A change of the field: the characters `range` become `text`, then the characters `selected`
+/// of the new text are selected.
+#[derive(Debug, PartialEq)]
+struct FieldEdit {
+    range: std::ops::Range<usize>,
+    text: String,
+    selected: std::ops::Range<usize>,
+}
+
+/// `mark` put around the characters `selected` of `text` (the white space at their ends left
+/// outside), or taken away when they are between such marks already; with nothing selected, the
+/// marks around the caret. Monospace over several lines makes a block: ``` on lines of their own.
+/// What was selected stays selected, between the marks.
+fn format_marks(text: &str, selected: std::ops::Range<usize>, mark: Mark) -> FieldEdit {
+    let chars: Vec<char> = text.chars().collect();
+    let (mut start, mut end) = (
+        selected.start.min(chars.len()),
+        selected.end.min(chars.len()),
+    );
+    // `**word **` isn't bold to Markdown: the marks hug the text.
+    if chars[start..end].iter().any(|c| !c.is_whitespace()) {
+        while chars[start].is_whitespace() {
+            start += 1;
+        }
+        while chars[end - 1].is_whitespace() {
+            end -= 1;
+        }
+    }
+    let inner: String = chars[start..end].iter().collect();
+    let length = end - start;
+    if mark == Mark::Monospace && inner.contains('\n') {
+        let before = if start > 0 && chars[start - 1] != '\n' {
+            "\n"
+        } else {
+            ""
+        };
+        let after = if end < chars.len() && chars[end] != '\n' {
+            "\n"
+        } else {
+            ""
+        };
+        let open = format!("{before}```\n");
+        let from = start + open.chars().count();
+        return FieldEdit {
+            range: start..end,
+            text: format!("{open}{inner}\n```{after}"),
+            selected: from..from + length,
+        };
+    }
+    let marks: Vec<char> = mark.marks().chars().collect();
+    let width = marks.len();
+    if start >= width
+        && end + width <= chars.len()
+        && chars[start - width..start] == marks[..]
+        && chars[end..end + width] == marks[..]
+    {
+        return FieldEdit {
+            range: start - width..end + width,
+            text: inner,
+            selected: start - width..end - width,
+        };
+    }
+    let marks = mark.marks();
+    FieldEdit {
+        range: start..end,
+        text: format!("{marks}{inner}{marks}"),
+        selected: start + width..end + width,
+    }
+}
+
+/// The characters `selected` of `text` as a link to `address`: `[text](address)` — the address
+/// itself as the text when nothing is selected; the caret after it.
+fn link_marks(text: &str, selected: std::ops::Range<usize>, address: &str) -> FieldEdit {
+    let chars: Vec<char> = text.chars().collect();
+    let (start, end) = (
+        selected.start.min(chars.len()),
+        selected.end.min(chars.len()),
+    );
+    let inner: String = chars[start..end].iter().collect();
+    let label = if inner.trim().is_empty() {
+        address
+    } else {
+        inner.as_str()
+    };
+    let link = format!("[{label}]({address})");
+    let caret = start + link.chars().count();
+    FieldEdit {
+        range: start..end,
+        text: link,
+        selected: caret..caret,
+    }
+}
+
+/// An invisible element of the feed that follows the mouse while a selection is dragged — over
+/// other messages and out of the feed too — and ends it when the button goes up. Painted after
+/// the messages, it hears the button go up before their links do: a drag that ends on a link
+/// doesn't open it.
+fn drag_listener(conversation: WeakEntity<Conversation>) -> AnyElement {
+    canvas(
+        |_, _, _| {},
+        move |_, _, window, _| {
+            let moved = conversation.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble || event.pressed_button != Some(MouseButton::Left)
+                {
+                    return;
+                }
+                moved
+                    .update(cx, |this, cx| this.drag_selection(event.position, cx))
+                    .ok();
+            });
+            let released = conversation.clone();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+                    return;
+                }
+                released.update(cx, |this, cx| this.end_selection(cx)).ok();
+            });
+        },
+    )
+    .absolute()
+    .size_0()
+    .into_any_element()
+}
+
+/// The message offers the conversation's action (API 0.5): its own list names it, or it has none.
+fn offers(message: &Message, action: &RowAction) -> bool {
+    message
+        .actions
+        .as_ref()
+        .is_none_or(|ids| ids.contains(&action.id))
 }
 
 /// A message's text for Copy Text: its text, quotes and code, a part a line.
@@ -2627,7 +3542,7 @@ fn civil_date(days: i64) -> (i64, u32, u32) {
 
 /// The system's app opens a file — in a scenario with `FLUX_SCENARIO_OPEN_URL`, a line in that
 /// file instead.
-fn open_with_system(path: &Path, cx: &mut App) {
+pub(crate) fn open_with_system(path: &Path, cx: &mut App) {
     #[cfg(feature = "scenario")]
     if let Some(file) = std::env::var_os("FLUX_SCENARIO_OPEN_URL") {
         use std::io::Write as _;
@@ -2644,7 +3559,7 @@ fn open_with_system(path: &Path, cx: &mut App) {
 }
 
 /// Finder (Explorer) with the file selected — in a scenario a line in `FLUX_SCENARIO_OPEN_URL`.
-fn reveal_path(path: &Path, cx: &mut App) {
+pub(crate) fn reveal_path(path: &Path, cx: &mut App) {
     #[cfg(feature = "scenario")]
     if let Some(file) = std::env::var_os("FLUX_SCENARIO_OPEN_URL") {
         use std::io::Write as _;
@@ -2668,6 +3583,39 @@ fn dirs_downloads() -> PathBuf {
         .unwrap_or_default();
     let downloads = home.join("Downloads");
     if downloads.is_dir() { downloads } else { home }
+}
+
+/// A picture's tiny preview (a JPEG of a few dozen pixels) made as large as the picture
+/// (`width` × `height`, at most [`PREVIEW_SIDE`] across; the preview's shape when unknown) and
+/// blurred, as a JPEG: what the viewer shows until the full size comes.
+fn blurred_preview(preview: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    use image::imageops::FilterType;
+    let small = image::load_from_memory(preview).ok()?;
+    let (width, height) = match (width, height) {
+        (0, _) | (_, 0) => (small.width().max(1) * 20, small.height().max(1) * 20),
+        size => size,
+    };
+    let scale = (PREVIEW_SIDE / width.max(height) as f32).min(1.);
+    let (width, height) = (
+        ((width as f32 * scale) as u32).max(1),
+        ((height as f32 * scale) as u32).max(1),
+    );
+    // Up in two steps, soft both times: a tenth of the size blurred, then the whole.
+    let middle = small
+        .resize_exact(
+            (width / 10).max(1),
+            (height / 10).max(1),
+            FilterType::Triangle,
+        )
+        .blur(1.5);
+    let large = image::DynamicImage::ImageRgb8(
+        middle
+            .resize_exact(width, height, FilterType::Triangle)
+            .to_rgb8(),
+    );
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    large.write_to(&mut bytes, image::ImageFormat::Jpeg).ok()?;
+    Some(bytes.into_inner())
 }
 
 /// A pasted picture saved as a PNG file in the temporary folder (the field sends paths).
@@ -2734,10 +3682,92 @@ mod tests {
             },
         ];
         let ui = Theme::flux_night().ui;
-        let (text, runs, _, links, spoilers) = rich_runs(&spans, false, ui);
+        let (text, runs, links, spoilers) = rich_runs(&spans, false, ui);
         assert_eq!(text, "see this secret");
         assert_eq!(runs.len(), 3);
         assert_eq!(links, vec![(4..8, "https://example.com".to_string())]);
         assert_eq!(spoilers, vec![8..15]);
+    }
+
+    fn point(text: usize, byte: usize) -> claude_select::Point {
+        claude_select::Point { text, byte }
+    }
+
+    #[test]
+    fn a_selection_is_a_stretch_of_the_texts_joined_by_line_breaks() {
+        let texts = [
+            "Hello world".to_string(),
+            String::new(),
+            "fn main() {}".into(),
+        ];
+        let (text, range) = stretch(&texts, point(0, 6), point(2, 2));
+        assert_eq!(text, "Hello world\nfn main() {}");
+        assert_eq!(&text[range.clone()], "world\nfn");
+        assert_eq!(quote(&text, range), Some(("world\nfn".to_string(), 6)));
+        // Backwards, and ending in the empty text: up to the end of the one before it.
+        let (text, range) = stretch(&texts, point(1, 0), point(0, 6));
+        assert_eq!(&text[range], "world");
+        // White space around a quote stays out; the place counts UTF-16 code units.
+        let texts = ["Привет, 🌍 мир ".to_string()];
+        let start = texts[0].find('🌍').unwrap() - 1;
+        let (text, range) = stretch(&texts, point(0, start), point(0, texts[0].len()));
+        assert_eq!(quote(&text, range), Some(("🌍 мир".to_string(), 8)));
+        let (text, range) = stretch(&texts, point(0, 13), point(0, 14));
+        assert_eq!(quote(&text, range), None);
+        // A place inside a character goes back to its start.
+        let (text, range) = stretch(&texts, point(0, 7), point(0, 8));
+        assert_eq!(&text[range], "в");
+    }
+
+    #[test]
+    fn formatting_wraps_the_selection_in_markdown_marks() {
+        let edit = |range, text: &str, selected| FieldEdit {
+            range,
+            text: text.to_string(),
+            selected,
+        };
+        assert_eq!(
+            format_marks("make it bold", 8..12, Mark::Bold),
+            edit(8..12, "**bold**", 10..14)
+        );
+        // Again: the marks go.
+        assert_eq!(
+            format_marks("make it **bold**", 10..14, Mark::Bold),
+            edit(8..16, "bold", 8..12)
+        );
+        // At the caret, and around the words only.
+        assert_eq!(
+            format_marks("ab", 1..1, Mark::Italic),
+            edit(1..1, "____", 3..3)
+        );
+        assert_eq!(
+            format_marks("a word ", 2..7, Mark::Strikethrough),
+            edit(2..6, "~~word~~", 4..8)
+        );
+        assert_eq!(
+            format_marks("пароль 42", 7..9, Mark::Spoiler),
+            edit(7..9, "||42||", 9..11)
+        );
+        assert_eq!(
+            format_marks("run ls", 4..6, Mark::Monospace),
+            edit(4..6, "`ls`", 5..7)
+        );
+        // Several lines of code: a block on lines of its own.
+        assert_eq!(
+            format_marks("x\nline1\nline2", 2..13, Mark::Monospace),
+            edit(2..13, "```\nline1\nline2\n```", 6..17)
+        );
+        assert_eq!(
+            format_marks("say a\nb now", 4..7, Mark::Monospace),
+            edit(4..7, "\n```\na\nb\n```\n", 9..12)
+        );
+        assert_eq!(
+            link_marks("see docs", 4..8, "https://x.y"),
+            edit(4..8, "[docs](https://x.y)", 23..23)
+        );
+        assert_eq!(
+            link_marks("go ", 3..3, "https://x.y"),
+            edit(3..3, "[https://x.y](https://x.y)", 29..29)
+        );
     }
 }

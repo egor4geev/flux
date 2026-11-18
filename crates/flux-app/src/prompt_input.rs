@@ -288,6 +288,32 @@ impl PromptInput {
         self.apply(tx, EditKind::Other, cx);
     }
 
+    /// The primary selection's characters, in order; an empty range is the caret.
+    pub fn selected_range(&self) -> std::ops::Range<usize> {
+        let primary = self.document.selection().primary();
+        primary.from()..primary.to()
+    }
+
+    /// Replaces the characters of `range` with `text` as one edit that can be undone, the
+    /// characters `selected` of the new text selected after: a formatting mark put around the
+    /// selection keeps it selected.
+    pub fn replace_selecting(
+        &mut self,
+        range: std::ops::Range<usize>,
+        text: &str,
+        selected: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let len = self.document.text().len_chars();
+        let (start, end) = (range.start.min(len), range.end.min(len));
+        let text = normalize(text);
+        let new_len = len - (end - start) + text.chars().count();
+        let selection = Selection::single(selected.start.min(new_len), selected.end.min(new_len));
+        let tx = Transaction::change(self.document.text(), [(start, end, Some(text))])
+            .with_selection(selection);
+        self.apply(tx, EditKind::Other, cx);
+    }
+
     /// Types `text` at the caret (over the selection).
     pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = normalize(text);

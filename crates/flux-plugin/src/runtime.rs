@@ -336,6 +336,17 @@ pub enum HostCall {
         window: String,
         badge: Option<String>,
     },
+    /// `ui.set-restorable` (API 0.5): whether the tab `<window>/<key>` comes back with the project
+    /// and is kept in a context.
+    SetRestorable {
+        window: String,
+        restorable: bool,
+    },
+    /// `ui.focus` (API 0.5): the keyboard to a text field of the window's view.
+    FocusElement {
+        window: String,
+        element: String,
+    },
     /// `dialogs.pick-files` (API 0.5): the system's file dialog; the paths go back as
     /// `Event::FilesPicked(id, …)`.
     PickFiles {
@@ -415,6 +426,10 @@ pub enum WindowCall {
     OpenUrl(String),
     /// `system.copy-text`: no reply.
     CopyText(String),
+    /// `system.open-file` (`reveal` false) and `system.show-file` (API 0.5): an absolute path
+    /// without "..", there (checked); Flux opens it only when it is in the plugin's data folder or
+    /// the user gave it to the plugin. No reply.
+    OpenFile { path: String, reveal: bool },
     /// `system.open-settings`: Settings on the plugin's page; no reply.
     OpenSettings,
     /// `git.branches` (the work tree's root) → `Branches`.

@@ -28,7 +28,11 @@ const TASKS: &[(&str, &str, &str)] = &[
     ("PLAY-1", "Sign in with Yandex ID", "Done"),
     ("PLAY-2", "Show my tasks by status", "Done"),
     ("PLAY-3", "Open a task's card", "Review"),
-    ("PLAY-4", "Comments with a field for a new one", "In Progress"),
+    (
+        "PLAY-4",
+        "Comments with a field for a new one",
+        "In Progress",
+    ),
     ("PLAY-5", "History of a task's changes", "In Progress"),
     ("PLAY-6", "Links between tasks", "Open"),
     ("PLAY-7", "A board of tasks in an editor tab", "Open"),
@@ -91,13 +95,16 @@ impl Playground {
             }
             Event::PickerChosen((id, key)) => self.picker_chosen(id, key),
             Event::LinkHovered((request, _, text)) => {
-                let title = TASKS
-                    .iter()
-                    .find(|(key, _, _)| *key == text)
-                    .map_or_else(|| tr("Not a playground task"), |(_, title, _)| title.to_string());
+                let title = TASKS.iter().find(|(key, _, _)| *key == text).map_or_else(
+                    || tr("Not a playground task"),
+                    |(_, title, _)| title.to_string(),
+                );
                 links::tooltip(
                     request,
-                    &format!("**{text}** · {title}\n\n{}", tr("The tooltip comes from the plugin.")),
+                    &format!(
+                        "**{text}** · {title}\n\n{}",
+                        tr("The tooltip comes from the plugin.")
+                    ),
                 );
             }
             Event::LinkActivated((pattern, text)) => {
@@ -120,19 +127,24 @@ impl Playground {
             Event::ToolWindowShown(window) if window == BOARD => {
                 self.v3.board_shown = true;
                 self.render_board();
-                self.set(Section::EditorWindows, tr("The board is open among the editor's tabs."));
+                self.set(
+                    Section::EditorWindows,
+                    tr("The board is open among the editor's tabs."),
+                );
             }
             Event::ToolWindowHidden(window) if window == BOARD => {
                 self.v3.board_shown = false;
                 self.set(Section::EditorWindows, tr("The board's tab is closed."));
             }
             Event::Ui(input) if input.window == BOARD => match input.event {
-                UiEvent::Selected(key) => {
-                    self.set(Section::EditorWindows, trf("Selected {0} on the board.", &[&key]))
-                }
-                UiEvent::Activated(key) => {
-                    self.set(Section::EditorWindows, trf("Opened {0} on the board.", &[&key]))
-                }
+                UiEvent::Selected(key) => self.set(
+                    Section::EditorWindows,
+                    trf("Selected {0} on the board.", &[&key]),
+                ),
+                UiEvent::Activated(key) => self.set(
+                    Section::EditorWindows,
+                    trf("Opened {0} on the board.", &[&key]),
+                ),
                 UiEvent::Clicked if input.element == "board-rename" => self.rename_board(),
                 _ => {}
             },
@@ -196,7 +208,10 @@ impl Playground {
             }
             "settings-busy" => {
                 settings::busy(STATUS, &tr("Checking…"));
-                self.set(Section::SettingsPage, tr("The status line has a spinner now."));
+                self.set(
+                    Section::SettingsPage,
+                    tr("The status line has a spinner now."),
+                );
             }
             "settings-set" => {
                 let now = system::local_time(system::now()).hm();
@@ -234,7 +249,10 @@ impl Playground {
             }
             "links-clear" => {
                 links::clear();
-                self.set(Section::Links, tr("No patterns: PLAY-12 is plain text again."));
+                self.set(
+                    Section::Links,
+                    tr("No patterns: PLAY-12 is plain text again."),
+                );
             }
             "claude-discuss" => self.claude(false),
             "claude-plan" => self.claude(true),
@@ -258,7 +276,10 @@ impl Playground {
         let argument = context.argument().unwrap_or("—").to_string();
         settings::status(
             STATUS,
-            &trf("Checked from {0}: \"{1}\"", &[&context.source.name(), &argument]),
+            &trf(
+                "Checked from {0}: \"{1}\"",
+                &[&context.source.name(), &argument],
+            ),
             settings::Tone::Success,
         );
         self.set(
@@ -273,10 +294,18 @@ impl Playground {
     /// The 0.3 sections: their buttons and what else they show under them.
     pub(crate) fn sections_03(&self) -> Vec<(Section, Vec<Element>, Vec<Element>)> {
         let b = |id: &str, label: &str| -> Element { button(id, &tr(label)).into() };
-        let template = if self.v3.template { "Template Off" } else { "Template On" };
+        let template = if self.v3.template {
+            "Template Off"
+        } else {
+            "Template On"
+        };
         let status = STATUSES[self.v3.badge];
         vec![
-            (Section::Forms, vec![b("forms-open-task", "Open Task…")], Vec::new()),
+            (
+                Section::Forms,
+                vec![b("forms-open-task", "Open Task…")],
+                Vec::new(),
+            ),
             (
                 Section::Pickers,
                 vec![
@@ -329,7 +358,10 @@ impl Playground {
             ),
             (
                 Section::Contexts,
-                vec![b("contexts-switch", "Switch A ↔ B"), b("contexts-forget", "Forget")],
+                vec![
+                    b("contexts-switch", "Switch A ↔ B"),
+                    b("contexts-forget", "Forget"),
+                ],
                 Vec::new(),
             ),
             (Section::Time, vec![b("time-now", "Local Time")], Vec::new()),
@@ -384,11 +416,18 @@ impl Playground {
             ("review", tr("Review")),
             ("keep", tr("Don't change")),
         ];
-        let options: Vec<(&str, &str)> =
-            statuses.iter().map(|(value, title)| (*value, title.as_str())).collect();
+        let options: Vec<(&str, &str)> = statuses
+            .iter()
+            .map(|(value, title)| (*value, title.as_str()))
+            .collect();
         let mut form = Form::new(&tr("Open Task"), &tr("Start"))
             .message(&tr("PLAY-12 · Remind about a meeting"))
-            .choice("status", &tr("Move to"), &options, Some(value("status", "in-progress").as_str()))
+            .choice(
+                "status",
+                &tr("Move to"),
+                &options,
+                Some(value("status", "in-progress").as_str()),
+            )
             .toggle("branch", &tr("Create a branch"), on("branch"))
             .text(
                 "branch-name",
@@ -433,7 +472,11 @@ impl Playground {
                 tr("no")
             },
             tr("Switch the tabs"),
-            if values.on("tabs") { tr("yes") } else { tr("no") },
+            if values.on("tabs") {
+                tr("yes")
+            } else {
+                tr("no")
+            },
             tr("Comment"),
             if comment.is_empty() {
                 "—".to_string()
@@ -472,7 +515,10 @@ impl Playground {
                 .empty_text(&tr("No such task"))
                 .open(),
         );
-        self.set(Section::Pickers, tr("Flux filters this one by the query, fuzzily."));
+        self.set(
+            Section::Pickers,
+            tr("Flux filters this one by the query, fuzzily."),
+        );
     }
 
     fn open_clock_menu(&mut self) {
@@ -562,7 +608,10 @@ impl Playground {
 
     fn list_branches(&mut self) {
         let Some((root, _)) = Self::repository() else {
-            self.set(Section::Branches, tr("No repositories (or no `project` permission)."));
+            self.set(
+                Section::Branches,
+                tr("No repositories (or no `project` permission)."),
+            );
             return;
         };
         let text = match git::branches(&root) {
@@ -575,14 +624,23 @@ impl Playground {
                             "- `{}`{}{}",
                             branch.name,
                             if branch.remote { " · remote" } else { "" },
-                            if branch.current { " · **current**" } else { "" }
+                            if branch.current {
+                                " · **current**"
+                            } else {
+                                ""
+                            }
                         )
                     })
                     .collect();
                 if branches.len() > 15 {
                     lines.push(trf("- … {0} more", &[&(branches.len() - 15)]));
                 }
-                format!("{}: {}\n\n{}", tr("Branches"), branches.len(), lines.join("\n"))
+                format!(
+                    "{}: {}\n\n{}",
+                    tr("Branches"),
+                    branches.len(),
+                    lines.join("\n")
+                )
             }
             Err(err) => failed(&err),
         };
@@ -599,12 +657,18 @@ impl Playground {
         let id = git::new_branch(&root, &name, None);
         self.v3.branched_from = Some((root, branch.clone()));
         self.v3.git_operation = Some((id, trf("New branch {0} from {1}", &[&name, &branch])));
-        self.set(Section::Branches, trf("Creating {0}… (git-done says how it ended)", &[&name]));
+        self.set(
+            Section::Branches,
+            trf("Creating {0}… (git-done says how it ended)", &[&name]),
+        );
     }
 
     fn branch_back(&mut self) {
         let Some((root, branch)) = self.v3.branched_from.clone() else {
-            self.set(Section::Branches, tr("Make a branch with New Branch first."));
+            self.set(
+                Section::Branches,
+                tr("Make a branch with New Branch first."),
+            );
             return;
         };
         let id = git::checkout(&root, &branch);
@@ -638,7 +702,9 @@ impl Playground {
             .attach("PLAY-12", task);
         session = if plan {
             session
-                .prompt(&tr("Study the task and the code it concerns, then propose a plan."))
+                .prompt(&tr(
+                    "Study the task and the code it concerns, then propose a plan.",
+                ))
                 .send()
                 .plan_mode()
         } else {
@@ -700,7 +766,10 @@ impl Playground {
         self.v3.renames += 1;
         let title = trf("Playground Board {0}", &[&self.v3.renames]);
         ui::set_title(BOARD, &title);
-        self.set(Section::EditorWindows, trf("Renamed the board's tab to «{0}».", &[&title]));
+        self.set(
+            Section::EditorWindows,
+            trf("Renamed the board's tab to «{0}».", &[&title]),
+        );
     }
 
     /// The board: a column of tasks per status, side by side.
@@ -711,7 +780,10 @@ impl Playground {
         let columns = STATUSES.iter().map(|status| {
             let mut tree = Tree::new().empty_text(&tr("No tasks"));
             for (key, title, _) in TASKS.iter().filter(|(_, _, task)| task == status) {
-                let label = vec![span(key).code().tone(Tone::Accent), span(&format!(" {title}"))];
+                let label = vec![
+                    span(key).code().tone(Tone::Accent),
+                    span(&format!(" {title}")),
+                ];
                 tree.add(RowSpec::spans(key, label).icon("icons/playground.svg"));
             }
             column(
@@ -719,7 +791,11 @@ impl Playground {
                 [
                     row(
                         &format!("board-heading-{status}"),
-                        [badge(&format!("board-badge-{status}"), &tr(status), status_tone(status))],
+                        [badge(
+                            &format!("board-badge-{status}"),
+                            &tr(status),
+                            status_tone(status),
+                        )],
                     ),
                     tree.into_element(&format!("board-tasks-{status}")),
                 ],

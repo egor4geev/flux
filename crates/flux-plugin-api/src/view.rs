@@ -65,6 +65,13 @@ pub fn set_view(window: &str, root: Element) {
     crate::host::ui::set_view(window, &root.into_view());
 }
 
+/// Puts the keyboard in the text field `element` of the window's view (API 0.5): a search bar
+/// opened by ⌘F (`UiEvent::Find`); Esc in it comes as `UiEvent::Cancelled`. The field may come
+/// in the view set just before.
+pub fn focus(window: &str, element: &str) {
+    crate::host::ui::focus(window, element)
+}
+
 /// Opens the tab `key` of a window declared with `tabs = true` (API 0.5), titled `title`, or
 /// brings it forward (retitled); `focus` — it takes the keyboard. Returns the tab's window name,
 /// `<window>/<key>`, for [`set_view`], [`set_badge`], `ui::set_title`, `ui::hide` and the
@@ -140,6 +147,7 @@ pub fn button(id: &str, label: &str) -> Button {
             primary: false,
             enabled: true,
             busy: false,
+            badge: None,
         },
     }
 }
@@ -155,6 +163,7 @@ pub fn icon_button(id: &str, icon: &str, tooltip: &str) -> Element {
             primary: false,
             enabled: true,
             busy: false,
+            badge: None,
         },
     }
     .into()
@@ -195,6 +204,12 @@ impl Button {
     /// button doesn't press — Next while the server answers.
     pub fn busy(mut self, busy: bool) -> Self {
         self.spec.busy = busy;
+        self
+    }
+
+    /// A count after the label, in a small pill (API 0.5): an account's unread messages.
+    pub fn badge(mut self, badge: &str) -> Self {
+        self.spec.badge = Some(badge.to_string());
         self
     }
 }
@@ -416,6 +431,7 @@ impl Tree {
             avatar: row.avatar,
             badge_tone: row.badge_tone,
             label_icons: row.label_icons,
+            mention: row.mention,
         });
         (self.rows.len() - 1) as u32
     }
@@ -455,6 +471,7 @@ pub struct RowSpec {
     avatar: Option<AvatarSpec>,
     badge_tone: Option<Tone>,
     label_icons: Vec<String>,
+    mention: bool,
 }
 
 impl RowSpec {
@@ -478,6 +495,7 @@ impl RowSpec {
             avatar: None,
             badge_tone: None,
             label_icons: Vec::new(),
+            mention: false,
         }
     }
 
@@ -514,6 +532,13 @@ impl RowSpec {
     /// A small named icon right after the label (API 0.5): pinned, muted.
     pub fn label_icon(mut self, icon: &str) -> Self {
         self.label_icons.push(icon.to_string());
+        self
+    }
+
+    /// An accent "@" before the badge (API 0.5): the user is mentioned in a message of the chat
+    /// not read yet.
+    pub fn mention(mut self) -> Self {
+        self.mention = true;
         self
     }
 
@@ -557,6 +582,15 @@ impl RowSpec {
             tooltip: None,
             primary,
         });
+        self
+    }
+
+    /// The tooltip of the row's button `id` added by [`Self::action`]: an icon button's name
+    /// ("Pin"), shown on hover. Nothing happens when the row has no such button.
+    pub fn action_tooltip(mut self, id: &str, tooltip: &str) -> Self {
+        if let Some(action) = self.actions.iter_mut().find(|action| action.id == id) {
+            action.tooltip = Some(tooltip.to_string());
+        }
         self
     }
 }
@@ -608,6 +642,83 @@ pub fn conversation(id: &str, spec: ConversationSpec) -> Element {
     Element::new(id, ElementKind::Conversation(spec))
 }
 
+/// A header (API 0.5): a picture, a title, a line under it; a click comes as `clicked` —
+/// `header("chat-header", "Anna").avatar(…).subtitle([span("online").tone(Tone::Accent)])`.
+pub fn header(id: &str, title: &str) -> Header {
+    Header {
+        id: id.to_string(),
+        spec: crate::host::ui::HeaderSpec {
+            avatar: None,
+            title: title.to_string(),
+            subtitle: Vec::new(),
+            large: false,
+        },
+    }
+}
+
+/// A header being built; it becomes an [`Element`] with `.into()`.
+pub struct Header {
+    id: String,
+    spec: crate::host::ui::HeaderSpec,
+}
+
+impl Header {
+    pub fn avatar(mut self, avatar: AvatarSpec) -> Self {
+        self.spec.avatar = Some(avatar);
+        self
+    }
+
+    /// The line under the title.
+    pub fn subtitle(mut self, spans: impl IntoIterator<Item = Span>) -> Self {
+        self.spec.subtitle = spans.into_iter().collect();
+        self
+    }
+
+    /// A profile's: a large picture over the centered title and line.
+    pub fn large(mut self) -> Self {
+        self.spec.large = true;
+        self
+    }
+}
+
+impl From<Header> for Element {
+    fn from(header: Header) -> Element {
+        Element::new(&header.id, ElementKind::Header(header.spec))
+    }
+}
+
+/// Pictures in a grid of squares by groups (API 0.5): a chat's photos and videos by month. It
+/// takes the remaining height; `more` — whether scrolling near the end asks for more
+/// (`load-older`).
+pub fn gallery(
+    id: &str,
+    items: Vec<crate::host::ui::GalleryItem>,
+    more: crate::host::ui::History,
+    empty_text: Option<&str>,
+) -> Element {
+    Element::new(
+        id,
+        ElementKind::Gallery(crate::host::ui::GallerySpec {
+            items,
+            more,
+            empty_text: empty_text.map(str::to_string),
+        }),
+    )
+}
+
+/// A picture of a gallery, named by `key` in the events, under the heading `group`.
+pub fn gallery_item(
+    key: &str,
+    image: ImageSpec,
+    group: Option<&str>,
+) -> crate::host::ui::GalleryItem {
+    crate::host::ui::GalleryItem {
+        key: key.to_string(),
+        image,
+        group: group.map(str::to_string),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +749,26 @@ mod tests {
         };
         assert_eq!(spec.rows[1].parent, Some(0));
         assert!(spec.rows[0].expanded);
+    }
+
+    #[test]
+    fn a_row_actions_tooltip_names_its_button() {
+        let mut tree = Tree::new();
+        tree.add(
+            RowSpec::new("chat", "Backend")
+                .action("pin", None, Some("star"), false)
+                .action("close", None, Some("close"), false)
+                .action_tooltip("pin", "Pin")
+                .action_tooltip("missing", "Nothing"),
+        );
+        let ElementKind::Tree(spec) = tree.into_element("chats").kind else {
+            panic!("not a tree");
+        };
+        let tooltips: Vec<Option<&str>> = spec.rows[0]
+            .actions
+            .iter()
+            .map(|action| action.tooltip.as_deref())
+            .collect();
+        assert_eq!(tooltips, [Some("Pin"), None]);
     }
 }

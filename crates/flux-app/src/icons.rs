@@ -112,6 +112,7 @@ icons! {
     Palette => "palette",
     Pencil => "pencil",
     Plan => "plan",
+    Play => "play",
     Plug => "plug",
     Plus => "plus",
     Project => "project",

@@ -6,7 +6,8 @@
 //!   plugin simply doesn't import them.
 //! - `ui` has a 0.3 implementation that converts and goes on to the current one: a tree row and a
 //!   tree grew (an avatar, a badge's tone, icons after the label, two lines), and so did the
-//!   elements (a picture, an avatar, a QR code, a conversation).
+//!   elements (a picture, an avatar, a QR code, a conversation) and a button (a count). So does
+//!   `picker`: its item grew an avatar.
 //! - The exports are called through the 0.3 bindings: an event or a window's input 0.3 doesn't
 //!   know (a tab closed, a service's message, Claude's tool call, a conversation's input) isn't
 //!   delivered — such a plugin can't have asked for it.
@@ -72,13 +73,59 @@ pub(crate) fn add_to_linker(linker: &mut Linker<State>) -> wasmtime::Result<()> 
         secrets = "secrets",
         timers = "timers",
         system = "system",
-        picker = "picker",
         links = "links",
         claude = "claude",
         contexts = "contexts",
     );
     v3::ui::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
+    v3::picker::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
     Ok(())
+}
+
+// --- `picker`: 0.3 items, without an avatar ---
+
+impl v3::picker::Host for State {
+    fn open(&mut self, spec: v3::picker::PickerSpec) -> u64 {
+        let spec = current::picker::PickerSpec {
+            placeholder: spec.placeholder,
+            items: spec.items.into_iter().map(from_v3_item).collect(),
+            searchable: spec.searchable,
+            live_query: spec.live_query,
+            empty_text: spec.empty_text,
+            loading: spec.loading,
+            anchor: match spec.anchor {
+                v3::picker::PickerAnchor::Window => current::picker::PickerAnchor::Window,
+                v3::picker::PickerAnchor::StatusItem(item) => {
+                    current::picker::PickerAnchor::StatusItem(item)
+                }
+                v3::picker::PickerAnchor::Element(element) => {
+                    current::picker::PickerAnchor::Element(element)
+                }
+            },
+        };
+        current::picker::Host::open(self, spec)
+    }
+
+    fn update(&mut self, picker: u64, items: Vec<v3::picker::PickerItem>, loading: bool) {
+        let items = items.into_iter().map(from_v3_item).collect();
+        current::picker::Host::update(self, picker, items, loading)
+    }
+
+    fn close(&mut self, picker: u64) {
+        current::picker::Host::close(self, picker)
+    }
+}
+
+fn from_v3_item(item: v3::picker::PickerItem) -> current::picker::PickerItem {
+    current::picker::PickerItem {
+        key: item.key,
+        icon: item.icon,
+        label: from_v3_spans(item.label),
+        detail: item.detail,
+        badge: item.badge,
+        group: item.group,
+        avatar: None,
+    }
 }
 
 // --- `ui`: 0.3 calls in, the current ones out ---
@@ -130,6 +177,7 @@ fn from_v3_kind(kind: v3::ui::ElementKind) -> ui::ElementKind {
             primary: button.primary,
             enabled: button.enabled,
             busy: false,
+            badge: None,
         }),
         Kind::TextField(field) => ui::ElementKind::TextField(ui::TextFieldSpec {
             text: field.text,
@@ -164,6 +212,7 @@ fn from_v3_kind(kind: v3::ui::ElementKind) -> ui::ElementKind {
                     avatar: None,
                     badge_tone: None,
                     label_icons: Vec::new(),
+                    mention: false,
                 })
                 .collect(),
             empty_text: tree.empty_text,
@@ -351,6 +400,7 @@ fn ui_input(input: &UiInput) -> Option<v3::events::UiInput> {
             | UiEvent::LoadNewer
             | UiEvent::Visible(_)
             | UiEvent::MessageAction(_)
+            | UiEvent::MessageActionQuoted(_)
             | UiEvent::PartClicked(_)
             | UiEvent::LinkClicked(_)
             | UiEvent::QuoteClicked(_)
@@ -360,7 +410,11 @@ fn ui_input(input: &UiInput) -> Option<v3::events::UiInput> {
             | UiEvent::ReplyCancelled
             | UiEvent::Edited(_)
             | UiEvent::EditCancelled
-            | UiEvent::EditLast => return None,
+            | UiEvent::EditLast
+            | UiEvent::Find
+            | UiEvent::FindNext
+            | UiEvent::FindPrevious
+            | UiEvent::Cancelled => return None,
         },
     })
 }
@@ -496,7 +550,7 @@ mod tests {
                 assert_eq!(row.subtitle.as_ref().unwrap()[0].tone, ui::Tone::Accent);
                 assert_eq!(row.tags[0].tone, ui::Tone::Warning);
                 assert_eq!(row.actions[0].id, "take");
-                assert!(row.avatar.is_none() && row.label_icons.is_empty());
+                assert!(row.avatar.is_none() && row.label_icons.is_empty() && !row.mention);
             }
             other => panic!("expected a tree, got {other:?}"),
         }

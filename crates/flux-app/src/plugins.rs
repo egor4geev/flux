@@ -434,6 +434,9 @@ pub struct PluginStore {
     placeholders: HashSet<ToolKey>,
     /// The tool windows on screen: a plugin that starts (again) hears that they are shown.
     visible_tools: HashSet<ToolKey>,
+    /// Tabs that don't come back with the project nor stay in a context (`ui.set-restorable`,
+    /// API 0.5): (plugin, `<window>/<key>`) — a hidden chat's.
+    unrestorable: HashSet<(SharedString, SharedString)>,
     _view_subscriptions: HashMap<ToolKey, Subscription>,
     /// The plugins were found once: a restored tab of a plugin that is off or missing can say so.
     scanned: bool,
@@ -524,6 +527,7 @@ impl PluginStore {
             next_tool: 0,
             placeholders: HashSet::new(),
             visible_tools: HashSet::new(),
+            unrestorable: HashSet::new(),
             _view_subscriptions: HashMap::new(),
             scanned: false,
             status_items: Vec::new(),
@@ -1767,15 +1771,26 @@ impl PluginStore {
             ToolWindowLocation::Dialog => Chrome::Dialog,
             ToolWindowLocation::Settings => Chrome::Settings,
         };
+        // API 0.5's events of a window (Esc in a field as `cancelled`) go to a plugin that knows
+        // them.
+        let hears_cancel = self
+            .plugins
+            .iter()
+            .find(|state| state.id() == plugin.as_ref())
+            .is_some_and(|state| {
+                !matches!(state.entry.manifest.api.as_str(), "0.2" | "0.3" | "0.4")
+            });
         let view = cx.new(|cx| {
-            PluginView::new(
+            let mut view = PluginView::new(
                 plugin.clone(),
                 window.clone(),
                 title.clone(),
                 width,
                 chrome,
                 cx,
-            )
+            );
+            view.set_hears_cancel(hears_cancel);
+            view
         });
         let subscription = cx.subscribe(&view, move |this, _, event, cx| {
             this.on_view_event(key, event, cx)
@@ -1794,6 +1809,14 @@ impl PluginStore {
             view,
         });
         key
+    }
+
+    /// The tab comes back with the project and stays in a context: not one the plugin keeps out
+    /// (`ui.set-restorable`, API 0.5).
+    pub fn restorable(&self, tool: &ToolWindow) -> bool {
+        !self
+            .unrestorable
+            .contains(&(tool.plugin.clone(), tool.id.clone()))
     }
 
     // --- Tabs of a window (API 0.5) ---
@@ -2269,6 +2292,13 @@ impl PluginStore {
                 title,
                 focus,
             } => self.open_tab(&plugin, &window, &key, &title, focus, cx),
+            HostCall::SetRestorable { window, restorable } => {
+                let tab = (SharedString::from(plugin.to_string()), SharedString::from(window));
+                match restorable {
+                    true => self.unrestorable.remove(&tab),
+                    false => self.unrestorable.insert(tab),
+                };
+            }
             HostCall::SetBadge { window, badge } => {
                 let badge = badge
                     .map(|badge| badge.trim().to_string())
@@ -2301,6 +2331,7 @@ impl PluginStore {
             | HostCall::OpenPicker { .. }
             | HostCall::UpdatePicker { .. }
             | HostCall::ClosePicker { .. }
+            | HostCall::FocusElement { .. }
             | HostCall::Editor { .. }
             | HostCall::Window { .. }) => cx.emit(PluginStoreEvent::Call { plugin, call }),
         }
@@ -2685,6 +2716,7 @@ fn stopped_view(name: &str, error: &str) -> View {
                     primary: true,
                     enabled: true,
                     busy: false,
+                    badge: None,
                 }),
                 children: Vec::new(),
             },
@@ -2893,6 +2925,35 @@ pub(crate) fn handle_call(
         }
         HostCall::ClosePicker { id } => {
             crate::plugin_picker::close(workspace, plugin, *id, window, cx)
+        }
+        // API 0.5: a search bar's field takes the keyboard.
+        HostCall::FocusElement {
+            window: tool,
+            element,
+        } => {
+            let view = workspace
+                .plugins
+                .read(cx)
+                .tool_windows()
+                .iter()
+                .find(|known| known.plugin == plugin && known.id == *tool)
+                .map(|known| known.view.clone());
+            match view {
+                Some(view) => {
+                    if !view.update(cx, |view, cx| view.focus_field(element, window, cx)) {
+                        workspace.plugins.read(cx).log(
+                            plugin,
+                            Level::Warn,
+                            &format!("ui.focus: \"{element}\" isn't a text field of \"{tool}\""),
+                        );
+                    }
+                }
+                None => workspace.plugins.read(cx).log(
+                    plugin,
+                    Level::Debug,
+                    &format!("ui.focus: the window \"{tool}\" isn't open"),
+                ),
+            }
         }
         HostCall::Editor { call, reply } => editor_call(workspace, plugin, call, reply, window, cx),
         HostCall::Window { call, reply } => {

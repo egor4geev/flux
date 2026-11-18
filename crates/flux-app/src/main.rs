@@ -89,6 +89,7 @@ mod plugin_claude;
 mod plugin_conversation;
 mod plugin_dialog;
 mod plugin_form;
+mod plugin_gallery;
 mod plugin_git;
 mod plugin_images;
 mod plugin_links;

@@ -533,6 +533,21 @@ pub fn point_at(drawn: &Drawn, entry: EntryId, position: gpui::Point<Pixels>) ->
     })
 }
 
+/// The position is in the rows of one of the message's texts, or beside them: a press there starts
+/// a selection, one on a picture between the texts doesn't (a plugin's conversation).
+pub fn in_text_rows(drawn: &Drawn, entry: EntryId, position: gpui::Point<Pixels>) -> bool {
+    drawn.borrow().get(&entry).is_some_and(|texts| {
+        texts
+            .texts
+            .iter()
+            .filter_map(|text| text.layout.as_ref())
+            .any(|layout| {
+                let bounds = layout.bounds();
+                position.y >= bounds.top() && position.y <= bounds.bottom()
+            })
+    })
+}
+
 /// The character boundary of `text` (drawn with `layout`) nearest to `position`: past the middle
 /// of a character, after it (gpui gives the character under the position).
 fn boundary_at(layout: &TextLayout, text: &str, position: gpui::Point<Pixels>) -> usize {

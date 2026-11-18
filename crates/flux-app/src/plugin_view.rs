@@ -33,8 +33,9 @@ use std::time::{Duration, Instant};
 
 use flux_plugin::api::events::{UiEvent, UiInput};
 use flux_plugin::api::ui::{
-    BadgeSpec, ButtonSpec, ConversationSpec, Element, ElementKind, ImageSpec, Property, Span,
-    TextFieldSpec, ToggleSpec, ToggleStyle, Tone, TreeRow, TreeSpec, View,
+    BadgeSpec, ButtonSpec, ConversationSpec, Element, ElementKind, GallerySpec, HeaderSpec,
+    ImageSpec, Property, Span, TextFieldSpec, ToggleSpec, ToggleStyle, Tone, TreeRow, TreeSpec,
+    View,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DragMoveEvent, ElementId, Entity,
@@ -52,6 +53,7 @@ use crate::motion::{self, Appear, Disclosure, TransitionExt, unfold_style};
 use crate::notifications::{Progress, progress_bar};
 use crate::notifications_panel::{FocusEditor, Hide};
 use crate::plugin_conversation::{Conversation, ConversationEvent};
+use crate::plugin_gallery::{Gallery, GalleryEvent};
 use crate::prompt_input::{PromptInput, PromptInputEvent};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, CheckState, GAP, RADIUS_SM};
@@ -82,6 +84,13 @@ actions!(
         /// ⌘↵: the first primary button of the selected row (a card's "Take to Work"):
         /// `row-action`.
         RunRowAction,
+        /// Esc in a text field (API 0.5): `cancelled` — the plugin closes the field's search bar.
+        CancelField,
+        /// ⌘F in a tool window or a tab (API 0.5): the plugin's own search (`find`).
+        Find,
+        /// ⌘G, ⇧⌘G: the next and the previous match of the plugin's search.
+        FindNext,
+        FindPrevious,
     ]
 );
 
@@ -95,11 +104,20 @@ const MAX_FIELD_ROWS: usize = 6;
 const HEADER_HEIGHT: f32 = 40.;
 /// An `avatar` element (API 0.5): the size of a chat header's.
 const HEADER_AVATAR: f32 = 36.;
+/// A `header` element's (API 0.5): a chat's over its feed, a profile's large one.
+const HEADER_ELEMENT_AVATAR: f32 = 34.;
+const PROFILE_AVATAR: f32 = 72.;
 /// A row of two lines (API 0.5, a list of chats): its avatar, its height with the gap under it.
 const TWO_LINE_AVATAR: f32 = 40.;
 const TWO_LINE_HEIGHT: f32 = 60.;
 /// An avatar in place of a list row's icon.
 const ROW_AVATAR: f32 = 18.;
+/// The "@" of a chat where the user is mentioned (API 0.5): beside a two-line row's unread count
+/// (as tall as it), and a smaller one in a list row or on a card.
+const MENTION_SIZE: f32 = 18.;
+const MENTION_SMALL: f32 = 15.;
+/// The text of a two-line row fades out under its buttons over this width.
+const ROW_ACTIONS_FADE: f32 = 24.;
 /// Rows of a tree, as in the file tree: inset from the island's edges, the highlight is a rounded
 /// box inside the row.
 const ROW_HEIGHT: f32 = 26.;
@@ -222,6 +240,10 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("left", Collapse, context),
             KeyBinding::new("enter", Activate, context),
             KeyBinding::new("cmd-enter", RunRowAction, context),
+            // The plugin's search, not Flux's find in the editor (API 0.5).
+            KeyBinding::new("cmd-f", Find, context),
+            KeyBinding::new("cmd-g", FindNext, context),
+            KeyBinding::new("cmd-shift-g", FindPrevious, context),
             KeyBinding::new("tab", FocusNextField, context),
             KeyBinding::new("shift-tab", FocusPreviousField, context),
             // The island on the right handles them for whichever window it shows.
@@ -233,6 +255,7 @@ pub fn init(cx: &mut App) {
         cx,
         [
             KeyBinding::new("enter", SubmitField, Some(FIELD_CONTEXT)),
+            KeyBinding::new("escape", CancelField, Some(FIELD_CONTEXT)),
             KeyBinding::new("enter", NewLine, Some(LINES_CONTEXT)),
             KeyBinding::new("cmd-enter", SubmitField, Some(LINES_CONTEXT)),
         ],
@@ -291,6 +314,11 @@ pub struct PluginView {
     /// Conversations by element id (API 0.5): their messages come by `update_conversation`; each
     /// is a view of its own, its events passed on as the window's.
     conversations: HashMap<String, (Entity<Conversation>, Subscription)>,
+    /// Galleries by element id (API 0.5): views of their own, drawing only the squares on screen.
+    galleries: HashMap<String, (Entity<Gallery>, Subscription)>,
+    /// The view has a gallery: in a dialog, the dialog is as tall as it may be and the gallery
+    /// takes the height left, scrolling by itself (what is on screen is what it says).
+    holds_gallery: bool,
     /// Toggles the user flipped, until the plugin's next view says how they are.
     toggled: HashMap<String, bool>,
     /// Elements with a tree inside (by index in the view): they take the height left.
@@ -320,6 +348,9 @@ pub struct PluginView {
     refocus: bool,
     /// When the plugin last switched to another screen ([`another_screen`]): it fades in.
     screen_since: Option<Instant>,
+    /// The plugin hears API 0.5's `cancelled` (Esc in a text field); an older one's Esc stays
+    /// Flux's (back to the editor).
+    hears_cancel: bool,
 }
 
 /// How long after a click its `activated` counts as the reason of the plugin's `editors.open`.
@@ -428,6 +459,8 @@ impl PluginView {
             active_tree: None,
             markdown: HashMap::new(),
             conversations: HashMap::new(),
+            galleries: HashMap::new(),
+            holds_gallery: false,
             toggled: HashMap::new(),
             holds_tree: Vec::new(),
             holds_cards: Vec::new(),
@@ -440,22 +473,55 @@ impl PluginView {
             focused_field: None,
             refocus: false,
             screen_since: None,
+            hears_cancel: false,
         }
+    }
+
+    /// The plugin is built for API 0.5 or later: Esc in a field is its `cancelled`.
+    pub fn set_hears_cancel(&mut self, hears: bool) {
+        self.hears_cancel = hears;
+    }
+
+    /// `ui.focus` (API 0.5): the keyboard to the text field `element`; false — no such field.
+    pub fn focus_field(
+        &mut self,
+        element: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(field) = self.fields.get(element) else {
+            return false;
+        };
+        let handle = field.input.focus_handle(cx);
+        window.focus(&handle);
+        cx.notify();
+        true
+    }
+
+    /// Esc in a text field: the plugin's `cancelled` in a tool window or a tab (API 0.5); in a
+    /// dialog, a Settings block or an older plugin's window, Flux's own Esc.
+    fn cancel_field(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.hears_cancel || matches!(self.chrome, Chrome::Dialog | Chrome::Settings) {
+            cx.propagate();
+            return;
+        }
+        self.emit(id, UiEvent::Cancelled, cx);
     }
 
     /// Where the element `element` was drawn last; none while the window is hidden, the element
     /// isn't in the view or is scrolled out of sight (part 10.3: a plugin's picker under it — the
     /// window's anchor then).
     ///
-    /// A property of a `properties` list is named "<list>/<property>" (API 0.3): its row, or the
-    /// list when the row hasn't been drawn yet.
+    /// A property of a `properties` list is named "<list>/<property>" (API 0.3), a row of a tree
+    /// "<tree>/<row key>" (API 0.5): its row, or the list when the row hasn't been drawn yet (or
+    /// is scrolled away).
     pub fn element_bounds(&self, element: &str) -> Option<Bounds<Pixels>> {
         if !self.visible {
             return None;
         }
         let drawn = self.element_bounds.borrow();
         let bounds = drawn.get(element).copied().or_else(|| {
-            let (list, _) = element.rsplit_once('/')?;
+            let (list, _) = element.split_once('/')?;
             drawn.get(list).copied()
         })?;
         let area = self.content_bounds.get()?;
@@ -493,6 +559,10 @@ impl PluginView {
             HashMap::new()
         };
         let now = Instant::now();
+        self.holds_gallery = view
+            .elements
+            .iter()
+            .any(|element| matches!(element.kind, ElementKind::Gallery(_)));
         let fields_before: HashSet<String> = self.fields.keys().cloned().collect();
         // Each tree's place among the view's trees: a board's column.
         let mut column = 0;
@@ -532,6 +602,7 @@ impl PluginView {
                 }
                 ElementKind::Markdown(source) => self.sync_markdown(&element.id, source, cx),
                 ElementKind::Conversation(spec) => self.sync_conversation(&element.id, spec, cx),
+                ElementKind::Gallery(spec) => self.sync_gallery(&element.id, spec, cx),
                 _ => {}
             }
         }
@@ -540,7 +611,7 @@ impl PluginView {
         self.element_bounds.borrow_mut().retain(|id, _| {
             present.contains(id)
                 || id
-                    .rsplit_once('/')
+                    .split_once('/')
                     .is_some_and(|(list, _)| present.contains(list))
         });
         self.fields.retain(|id, _| present.contains(id));
@@ -557,6 +628,7 @@ impl PluginView {
         self.trees.retain(|id, _| present.contains(id));
         self.markdown.retain(|id, _| present.contains(id));
         self.conversations.retain(|id, _| present.contains(id));
+        self.galleries.retain(|id, _| present.contains(id));
         if !self
             .active_tree
             .as_ref()
@@ -600,6 +672,10 @@ impl PluginView {
 
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
+        // A conversation tells the plugin what is seen only while it is in sight (API 0.5).
+        for (conversation, _) in self.conversations.values() {
+            conversation.update(cx, |conversation, cx| conversation.set_shown(visible, cx));
+        }
         cx.notify();
     }
 
@@ -741,7 +817,17 @@ impl PluginView {
     /// The view's content keeps its own height (a dialog, a Settings block — API 0.5) rather
     /// than taking the height it is given.
     fn natural_height(&self) -> bool {
-        matches!(self.chrome, Chrome::Dialog | Chrome::Settings)
+        match self.chrome {
+            Chrome::Settings => true,
+            Chrome::Dialog => !self.holds_gallery,
+            _ => false,
+        }
+    }
+
+    /// A dialog of this view is as tall as it may be: its gallery takes the height left (a
+    /// profile's media).
+    pub fn fills_dialog(&self) -> bool {
+        self.chrome == Chrome::Dialog && self.holds_gallery
     }
 
     /// The inset of text, fields and buttons from the content's edge: none in a Settings block,
@@ -843,6 +929,38 @@ impl PluginView {
         );
         self.conversations
             .insert(id.to_string(), (conversation, subscription));
+    }
+
+    /// A `gallery` element of the view (API 0.5): made the first time, its spec passed on later.
+    fn sync_gallery(&mut self, id: &str, spec: &GallerySpec, cx: &mut Context<Self>) {
+        let natural = self.natural_height();
+        if let Some((gallery, _)) = self.galleries.get(id) {
+            gallery.update(cx, |gallery, cx| gallery.set_spec(spec, natural, cx));
+            return;
+        }
+        let plugin = self.plugin.clone();
+        let gallery = cx.new(|_| Gallery::new(plugin, spec.clone(), natural));
+        let element = id.to_string();
+        let subscription =
+            cx.subscribe(
+                &gallery,
+                move |this, _, event: &GalleryEvent, cx| match event {
+                    GalleryEvent::Ui(event) => this.emit(&element, event.clone(), cx),
+                },
+            );
+        self.galleries
+            .insert(id.to_string(), (gallery, subscription));
+    }
+
+    /// ⌘F, ⌘G, ⇧⌘G (API 0.5): to the plugin, from the window's root.
+    fn find(&mut self, event: UiEvent, cx: &mut Context<Self>) {
+        let root = self
+            .view
+            .as_ref()
+            .and_then(|view| view.elements.first())
+            .map(|element| element.id.clone())
+            .unwrap_or_default();
+        self.emit(&root, event, cx);
     }
 
     // --- Trees ---
@@ -1080,6 +1198,21 @@ impl PluginView {
             .collect()
     }
 
+    /// Records where a row of a tree is drawn, as "<tree>/<row key>" (API 0.5): a picker the
+    /// plugin opens for the row (from one of its buttons) stands under it.
+    fn record_row(
+        &self,
+        tree_id: &str,
+        key: &str,
+    ) -> impl Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static {
+        let (bounds, key) = (self.element_bounds.clone(), format!("{tree_id}/{key}"));
+        move |children, _, _| {
+            if let Some(row) = children.first() {
+                bounds.borrow_mut().insert(key.clone(), *row);
+            }
+        }
+    }
+
     /// A row's buttons (`tree-row.actions`): compact, the primary one in the accent. A press is
     /// `row-action`; it doesn't reach the row (no selection, no opening).
     fn render_row_actions(
@@ -1276,6 +1409,9 @@ impl PluginView {
                 detail
             }))
             .child(div().flex_1().min_w(px(LABEL_GAP)))
+            .when(row.mention, |body| {
+                body.child(mention_mark(MENTION_SMALL, ui).mr(px(4.)))
+            })
             .children(row.badge.clone().map(|badge| {
                 ui::badge(
                     single_line(&badge),
@@ -1326,6 +1462,7 @@ impl PluginView {
         };
         let tree = tree_id.to_string();
         let element = div()
+            .on_children_prepainted(self.record_row(tree_id, &row.key))
             .id(("plugin-tree-row", index))
             .group(ROW_GROUP)
             .h(px(ROW_HEIGHT))
@@ -1433,6 +1570,8 @@ impl PluginView {
                                     .child(styled(&row.label, ui, selected, true)),
                             )
                             .children(label_icons)
+                            // Tags after the name (API 0.5): a member's roles.
+                            .children(row.tags.iter().map(|tag| tag_badge(tag, ui).flex_none()))
                             .child(div().flex_1())
                             .children(row.detail.clone().map(|detail| {
                                 div()
@@ -1460,6 +1599,10 @@ impl PluginView {
                                             .map(|subtitle| styled(subtitle, ui, selected, true)),
                                     ),
                             )
+                            // A mention as the messengers mark it: "@" next to the unread count.
+                            .when(row.mention, |line| {
+                                line.child(mention_mark(MENTION_SIZE, ui))
+                            })
                             .children(badge),
                     ),
             );
@@ -1475,18 +1618,51 @@ impl PluginView {
             })
             .when(!row.actions.is_empty(), |body| {
                 let actions = self.render_row_actions(tree_id, row, ui, cx);
-                if card || selected {
-                    body.child(actions)
-                } else {
-                    body.child(
-                        div()
-                            .id("plugin-row-actions")
-                            .flex_none()
-                            .opacity(0.)
-                            .group_hover(ROW_GROUP, |style| style.opacity(1.))
-                            .child(actions),
-                    )
+                if card {
+                    return body.child(actions);
                 }
+                // Over the row's end on the row's own color, the text fading under them: a
+                // chat's buttons take no room from its title (a list of chats has several).
+                let tint = match (selected, focused) {
+                    (true, true) => ui.list_selected,
+                    (true, false) => ui.list_selected_inactive,
+                    (false, _) => ui.hover,
+                };
+                let color = ui.island.blend(tint);
+                body.relative().child(
+                    div()
+                        .id("plugin-row-actions")
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .flex()
+                        .when(!selected, |overlay| {
+                            overlay
+                                .opacity(0.)
+                                .group_hover(ROW_GROUP, |style| style.opacity(1.))
+                        })
+                        .child(
+                            div()
+                                .w(px(ROW_ACTIONS_FADE))
+                                .h_full()
+                                .bg(gpui::linear_gradient(
+                                    90.,
+                                    gpui::linear_color_stop(UiColors::tint(color, 0.), 0.),
+                                    gpui::linear_color_stop(color, 1.),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .h_full()
+                                .pr(px(10.))
+                                .flex()
+                                .items_center()
+                                .rounded_r(px(9.))
+                                .bg(color)
+                                .child(actions),
+                        ),
+                )
             });
         let body = if selected {
             selection_colors(body, &row.key, focused, false, ui).into_any_element()
@@ -1497,6 +1673,7 @@ impl PluginView {
         let tree = tree_id.to_string();
         let gap = if card { SETTINGS_ROW_GAP } else { 2. };
         let element = div()
+            .on_children_prepainted(self.record_row(tree_id, &row.key))
             .id(("plugin-tree-row", index))
             .group(ROW_GROUP)
             .h(px(TWO_LINE_HEIGHT - 2. + gap))
@@ -1567,6 +1744,9 @@ impl PluginView {
                     .child(styled(&row.label, ui, selected, true)),
             )
             .child(div().flex_1())
+            .when(row.mention, |line| {
+                line.child(mention_mark(MENTION_SMALL, ui).mr(px(4.)))
+            })
             .children(
                 row.badge
                     .clone()
@@ -1657,6 +1837,7 @@ impl PluginView {
         };
         let tree = tree_id.to_string();
         let element = div()
+            .on_children_prepainted(self.record_row(tree_id, &row.key))
             .id(("plugin-tree-row", index))
             .group(ROW_GROUP)
             .h(px(look.height))
@@ -1745,6 +1926,18 @@ impl PluginView {
                     .child(root)
                     .into_any_element();
             }
+            // A gallery takes the height the dialog has left and scrolls by itself.
+            Chrome::Dialog if self.holds_gallery => {
+                return div()
+                    .size_full()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .pb_3()
+                    .when(shown < 1., |content| content.opacity(shown))
+                    .child(root)
+                    .into_any_element();
+            }
             // As tall as the content until the dialog stops growing, then it scrolls.
             Chrome::Dialog => {
                 return div()
@@ -1764,12 +1957,28 @@ impl PluginView {
             Chrome::Island | Chrome::Tab | Chrome::Left => {}
         }
         if self.holds_tree.first().copied().unwrap_or(false) {
-            // A tree scrolls by itself and takes the height left.
+            // A tree scrolls by itself and takes the height left. What comes under it (a button
+            // at the foot: FluxGram's Add Chat) keeps the island's bottom gap; a tree at the very
+            // end has its own.
+            let tree_last = view
+                .elements
+                .first()
+                .and_then(|root| root.children.last())
+                .and_then(|last| view.elements.get(*last as usize))
+                .is_some_and(|last| {
+                    matches!(
+                        last.kind,
+                        ElementKind::Tree(_)
+                            | ElementKind::Conversation(_)
+                            | ElementKind::Gallery(_)
+                    )
+                });
             div()
                 .size_full()
                 .flex()
                 .flex_col()
                 .pt_1()
+                .when(!tree_last, |content| content.pb_3())
                 .when(shown < 1., |content| content.opacity(shown))
                 .child(root)
                 .into_any_element()
@@ -1925,6 +2134,7 @@ impl PluginView {
                 Some(FieldInput::Line(input)) => {
                     let element = id.to_string();
                     // In a row, as the project search query: the field takes the row's width.
+                    let cancelled = element.clone();
                     div()
                         .key_context(FIELD_CONTEXT)
                         .w_full()
@@ -1932,6 +2142,9 @@ impl PluginView {
                         .items_center()
                         .on_action(cx.listener(move |this, _: &SubmitField, _, cx| {
                             this.submit_field(&element, cx)
+                        }))
+                        .on_action(cx.listener(move |this, _: &CancelField, _, cx| {
+                            this.cancel_field(&cancelled, cx)
                         }))
                         .child(div().flex_1().min_w_0().flex().child(input.clone()))
                         .into_any_element()
@@ -1987,6 +2200,17 @@ impl PluginView {
                 .justify_center()
                 .child(crate::plugin_qr::render(text))
                 .into_any_element(),
+            ElementKind::Header(spec) => self.render_header_element(id, spec, window, cx),
+            ElementKind::Gallery(_) => match self.galleries.get(id) {
+                Some((gallery, _)) => div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .when(!natural, |block| block.flex_1().min_h_0())
+                    .child(gallery.clone())
+                    .into_any_element(),
+                None => div().into_any_element(),
+            },
             ElementKind::Conversation(_) => match self.conversations.get(id) {
                 Some((conversation, _)) => div()
                     .flex_1()
@@ -2017,7 +2241,7 @@ impl PluginView {
             || (!natural
                 && matches!(
                     element.kind,
-                    ElementKind::Tree(_) | ElementKind::Conversation(_)
+                    ElementKind::Tree(_) | ElementKind::Conversation(_) | ElementKind::Gallery(_)
                 ))
             || (matches!(element.kind, ElementKind::Column | ElementKind::Row) && holds_tree);
         let block = div().when(inset, |block| block.px(px(self.content_inset())));
@@ -2041,8 +2265,10 @@ impl PluginView {
                 _ if grows => block.flex_1(),
                 ElementKind::TextField(_) => block.flex_1().min_w_0().flex().flex_col(),
                 // A column of text in a row (a chat's header: the title over the subtitle) takes
-                // the room left, its lines truncating, rather than none.
-                ElementKind::Column => block.flex_1().min_w_0().flex().flex_col(),
+                // the room left, its lines truncating, rather than none; so does a header.
+                ElementKind::Column | ElementKind::Header(_) => {
+                    block.flex_1().min_w_0().flex().flex_col()
+                }
                 ElementKind::Text(_) | ElementKind::Markdown(_) => block.min_w_0().flex_shrink(),
                 _ => block.flex_none(),
             }
@@ -2122,6 +2348,97 @@ impl PluginView {
                 this.emit(&element, UiEvent::Clicked, cx)
             }))
             .into_any_element()
+    }
+
+    /// A header (API 0.5): the avatar, the title and the line under it — a chat's over its feed;
+    /// `large`, a profile's top: the large avatar over the centered title and line. The whole of
+    /// it is a button (`clicked`), lit while the mouse is over it.
+    fn render_header_element(
+        &self,
+        id: &str,
+        spec: &HeaderSpec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ui = Theme::ui(cx);
+        let avatar = spec.avatar.as_ref().map(|avatar| {
+            crate::plugin_conversation::render_avatar(
+                avatar,
+                if spec.large {
+                    PROFILE_AVATAR
+                } else {
+                    HEADER_ELEMENT_AVATAR
+                },
+                &self.plugin,
+                cx.entity_id(),
+                window,
+                cx,
+            )
+        });
+        let title = div()
+            .min_w_0()
+            .max_w_full()
+            .truncate()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_size(px(if spec.large {
+                theme::TEXT_LG
+            } else {
+                theme::TEXT_MD
+            }))
+            .text_color(ui.foreground)
+            .child(single_line(&spec.title));
+        let subtitle = (!spec.subtitle.is_empty()).then(|| {
+            div()
+                .min_w_0()
+                .max_w_full()
+                .truncate()
+                .text_size(px(theme::TEXT_SM))
+                .text_color(ui.text_muted)
+                .child(styled(&spec.subtitle, ui, false, true))
+        });
+        let element = id.to_string();
+        let header = div()
+            .id(ElementId::Name(format!("plugin-header-{id}").into()))
+            .w_full()
+            .min_w_0()
+            .rounded(px(ui::RADIUS_MD))
+            .cursor_pointer()
+            .hover(move |style| style.bg(ui.hover))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.emit(&element, UiEvent::Clicked, cx)
+            }));
+        match spec.large {
+            true => header
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(4.))
+                .px(px(12.))
+                .pt(px(12.))
+                .pb(px(10.))
+                .children(avatar.map(|avatar| avatar.mb(px(6.))))
+                .child(title)
+                .children(subtitle)
+                .into_any_element(),
+            false => header
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(6.))
+                .py(px(4.))
+                .children(avatar)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.))
+                        .child(title)
+                        .children(subtitle),
+                )
+                .into_any_element(),
+        }
     }
 
     /// The labels' column of every properties list (API 0.3) — the longest label as the UI font
@@ -2418,16 +2735,25 @@ impl PluginView {
             .as_deref()
             .and_then(|name| plugin_icon(&self.plugin, name, &ui));
         let label = spec.label.as_deref().map(single_line);
+        let has_label = label.is_some();
         let button = match (label, button_icon) {
             // The accent button keeps its icon, before the label, as the other buttons do.
-            (Some(label), Some(button_icon)) if spec.primary => {
-                ui::primary_button(element_id, label, spec.enabled, ui)
+            (Some(label), Some(button_icon)) if spec.primary => match spec.badge.as_deref() {
+                None => ui::primary_button(element_id, label, spec.enabled, ui)
                     .pl(px(8.))
                     .gap_1p5()
                     .flex_row_reverse()
                     .justify_end()
-                    .child(button_icon.render(ui.accent_text).size(px(14.)))
-            }
+                    .child(button_icon.render(ui.accent_text).size(px(14.))),
+                // With a count after the label: in order, the frame's own label left empty.
+                Some(badge) => {
+                    ui::primary_button(element_id, SharedString::default(), spec.enabled, ui)
+                        .pl(px(8.))
+                        .child(button_icon.render(ui.accent_text).size(px(14.)).mr(px(6.)))
+                        .child(label)
+                        .child(count_pill(badge, true, ui).ml(px(6.)))
+                }
+            },
             (Some(label), None) if spec.primary => {
                 ui::primary_button(element_id, label, spec.enabled, ui)
             }
@@ -2440,6 +2766,25 @@ impl PluginView {
             (Some(label), None) => ui::text_button(element_id, label, false, ui),
             (None, Some(button_icon)) => ui::icon_button_at(element_id, button_icon.path(), ui),
             (None, None) => ui::icon_button(element_id, IconName::More, ui),
+        };
+        // A count (API 0.5): a pill after the label; on an icon button, at its corner.
+        let button = match spec.badge.as_deref() {
+            Some(badge) if has_label && spec.primary => match spec.icon.is_some() {
+                true => button,
+                false => button.gap_1p5().child(count_pill(badge, true, ui)),
+            },
+            Some(badge) if has_label => button.gap_1p5().child(count_pill(badge, false, ui)),
+            Some(badge) => button.relative().child(
+                count_pill(badge, false, ui)
+                    .absolute()
+                    .top(px(-4.))
+                    .right(px(-5.))
+                    .min_w(px(14.))
+                    .h(px(14.))
+                    .px(px(3.))
+                    .text_size(px(9.)),
+            ),
+            None => button,
         };
         let button = match spec.tooltip.as_deref() {
             Some(tooltip) => button.tooltip(ui::tooltip(single_line(tooltip), None)),
@@ -2629,6 +2974,25 @@ impl Render for PluginView {
             .on_action(cx.listener(|this, _: &FocusNextField, window, cx| {
                 this.focus_field_step(true, window, cx)
             }))
+            // A tool window's or a tab's search is the plugin's (API 0.5); a dialog and a Settings
+            // block leave the keys to Flux.
+            .when(
+                matches!(self.chrome, Chrome::Island | Chrome::Tab | Chrome::Left),
+                |frame| {
+                    frame
+                        .on_action(
+                            cx.listener(|this, _: &Find, _, cx| this.find(UiEvent::Find, cx)),
+                        )
+                        .on_action(
+                            cx.listener(|this, _: &FindNext, _, cx| {
+                                this.find(UiEvent::FindNext, cx)
+                            }),
+                        )
+                        .on_action(cx.listener(|this, _: &FindPrevious, _, cx| {
+                            this.find(UiEvent::FindPrevious, cx)
+                        }))
+                },
+            )
             .on_action(cx.listener(|this, _: &FocusPreviousField, window, cx| {
                 this.focus_field_step(false, window, cx)
             }))
@@ -2838,6 +3202,47 @@ fn text_button_with_icon(
         .active(move |style| motion::press(style.bg(ui.pressed)))
         .child(button_icon)
         .child(label)
+}
+
+/// A button's count (API 0.5): a small pill, as a list row's unread count — the accent on a plain
+/// button (the mockup's account chips), a lighter one on the accent button.
+fn count_pill(text: &str, primary: bool, ui: UiColors) -> gpui::Div {
+    let (background, color) = match primary {
+        true => (UiColors::tint(ui.accent_text, 0.22), ui.accent_text),
+        false => (ui.accent, ui.on_accent),
+    };
+    div()
+        .flex_none()
+        .min_w(px(16.))
+        .h(px(16.))
+        .px(px(4.5))
+        .rounded(px(8.))
+        .bg(background)
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(theme::TEXT_XS))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color)
+        .child(single_line(text))
+}
+
+/// The mark of a chat where the user is mentioned (API 0.5): an accent "@" in a circle `size`
+/// across, as the messengers mark one.
+fn mention_mark(size: f32, ui: UiColors) -> gpui::Div {
+    div()
+        .flex_none()
+        .size(px(size))
+        .rounded_full()
+        .bg(ui.accent)
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px((size * 0.66).round()))
+        .line_height(px(size))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(ui.on_accent)
+        .child("@")
 }
 
 /// The color of a tone.
@@ -3101,9 +3506,12 @@ fn came_in(
 /// Which elements have a tree inside them (by index), following children as drawn: each element
 /// once, no deeper than [`MAX_DEPTH`].
 fn holds_tree(elements: &[Element]) -> Vec<bool> {
-    // A conversation takes the remaining height as a tree does.
+    // A conversation and a gallery take the remaining height as a tree does.
     holds(elements, |kind| {
-        matches!(kind, ElementKind::Tree(_) | ElementKind::Conversation(_))
+        matches!(
+            kind,
+            ElementKind::Tree(_) | ElementKind::Conversation(_) | ElementKind::Gallery(_)
+        )
     })
 }
 
@@ -3515,6 +3923,7 @@ mod tests {
             avatar: None,
             badge_tone: None,
             label_icons: Vec::new(),
+            mention: false,
         }
     }
 

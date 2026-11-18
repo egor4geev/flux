@@ -63,6 +63,7 @@ enum Section {
     EditorWindows,
     Service,
     Files,
+    Chats,
 }
 
 impl Section {
@@ -91,6 +92,7 @@ impl Section {
             Section::EditorWindows => "board",
             Section::Service => "service",
             Section::Files => "files",
+            Section::Chats => "chats",
         }
     }
 
@@ -118,6 +120,7 @@ impl Section {
             Section::Widgets => "Badges and Fields",
             Section::Service => "The Plugin's Service",
             Section::Files => "File Dialog",
+            Section::Chats => "Chats",
             Section::EditorWindows => "A Window in the Editor",
         }
     }
@@ -129,6 +132,10 @@ impl Section {
                  at once — open a second window to see the counter shared."
             }
             Section::Files => "The system's dialog: the paths of the chosen files.",
+            Section::Chats => {
+                "Counts on buttons, a chat's header and a profile's, a picker of people with \
+                 their pictures."
+            }
             Section::Network => {
                 "Requests to the hosts the manifest allows: api.github.com and localhost."
             }
@@ -492,7 +499,10 @@ impl Playground {
                 };
                 self.set(Section::System, text);
             }
-            _ if element.starts_with("service-") || element.starts_with("files-") => {
+            _ if element.starts_with("service-")
+                || element.starts_with("files-")
+                || element.starts_with("chats-") =>
+            {
                 self.clicked_05(element)
             }
             _ => self.clicked_03(element),

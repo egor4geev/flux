@@ -32,3 +32,10 @@ title = "Chat"
 icon = "icons/plane.svg"
 location = "editor"
 tabs = true
+
+# A chat's profile (API 0.5): a click on the chat's header opens it — a large header over the
+# chat's photos and videos by month (a gallery).
+[[tool-windows]]
+id = "profile"
+title = "Profile"
+location = "dialog"
