@@ -129,12 +129,14 @@ fn from_v3_kind(kind: v3::ui::ElementKind) -> ui::ElementKind {
             tooltip: button.tooltip,
             primary: button.primary,
             enabled: button.enabled,
+            busy: false,
         }),
         Kind::TextField(field) => ui::ElementKind::TextField(ui::TextFieldSpec {
             text: field.text,
             placeholder: field.placeholder,
             code: field.code,
             multiline: field.multiline,
+            secret: false,
         }),
         Kind::Toggle(toggle) => ui::ElementKind::Toggle(ui::ToggleSpec {
             label: toggle.label,
@@ -355,7 +357,10 @@ fn ui_input(input: &UiInput) -> Option<v3::events::UiInput> {
             | UiEvent::Composed(_)
             | UiEvent::ComposerAction(_)
             | UiEvent::DraftChanged(_)
-            | UiEvent::ReplyCancelled => return None,
+            | UiEvent::ReplyCancelled
+            | UiEvent::Edited(_)
+            | UiEvent::EditCancelled
+            | UiEvent::EditLast => return None,
         },
     })
 }

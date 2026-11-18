@@ -157,6 +157,9 @@ pub enum PromptInputEvent {
     /// ⌫ with the caret at the start and nothing selected: nothing to delete (the parent leaves a
     /// mode of the field — the shell mode of Claude's field, part 10.2).
     BackspaceAtStart,
+    /// ↑ in the empty field: nowhere to go (the parent may take it — a plugin's conversation edits
+    /// the user's last message, as the messengers do).
+    UpWhenEmpty,
 }
 
 pub struct PromptInput {
@@ -761,7 +764,13 @@ impl Render for PromptInput {
             .on_action(cx.listener(|this, _: &SelectWordRight, _, cx| {
                 this.motion(cx, |t, r| movement::move_word(t, r, Forward, true))
             }))
-            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.vertical(-1, false, cx)))
+            .on_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                if this.is_empty() {
+                    cx.emit(PromptInputEvent::UpWhenEmpty);
+                    return;
+                }
+                this.vertical(-1, false, cx)
+            }))
             .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.vertical(1, false, cx)))
             .on_action(cx.listener(|this, _: &SelectUp, _, cx| this.vertical(-1, true, cx)))
             .on_action(cx.listener(|this, _: &SelectDown, _, cx| this.vertical(1, true, cx)))

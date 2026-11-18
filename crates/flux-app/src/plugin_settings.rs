@@ -13,6 +13,12 @@
 //! (`settings.set-status`: "Signed in as …", a spinner while it works). A value the plugin writes
 //! itself (`settings.set`) shows at once.
 //!
+//! API 0.5 adds the plugin's own blocks at the top of the page, under its header: each window of
+//! `location = "settings"` — its title as a heading, the view of the plugin's instance of this
+//! Flux window at its own height (a list the plugin keeps itself: the accounts with their
+//! buttons). Its clicks and fields reach the plugin as a window's do; the plugin hears
+//! `tool-window-shown` when the page comes into sight and `tool-window-hidden` when it goes.
+//!
 //! And what a plugin's own actions need: `text` — several lines (a prompt, a template), growing
 //! with the text; `records` — a list of records with the same fields (a name, a prompt, a mode, a
 //! switch), a card each: collapsed to its name and what's switched on, added (the new one open,
@@ -30,9 +36,9 @@ use flux_plugin::api::ui::Tone;
 use flux_plugin::manifest::{RecordField, RecordFieldKind, SettingKind, SettingSpec};
 use flux_plugin::registry::PluginEntry;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, AppContext as _, ClickEvent,
-    Context, CursorStyle, Div, Entity, FocusHandle, Focusable, KeyBinding, Render, SharedString,
-    Subscription, WeakEntity, Window, actions, div, prelude::*, px,
+    AnyElement, AnyWindowHandle, App, AppContext as _, ClickEvent, Context, CursorStyle, Div,
+    Entity, FocusHandle, Focusable, KeyBinding, Render, SharedString, Subscription, WeakEntity,
+    Window, actions, div, prelude::*, px,
 };
 use serde_json::{Map, Value};
 
@@ -41,7 +47,8 @@ use crate::i18n::{lang_code, tr, trf};
 use crate::icons::IconName;
 use crate::input::{InputEvent, TextInput};
 use crate::motion::TransitionExt as _;
-use crate::plugins::{CommandOrigin, PluginStore};
+use crate::plugin_view::PluginView;
+use crate::plugins::{CommandOrigin, PluginStore, ToolKey};
 use crate::prompt_input::{PromptInput, PromptInputEvent};
 use crate::settings;
 use crate::theme::{self, Theme, UiColors};
@@ -158,6 +165,8 @@ pub struct PluginSettingsPage {
     next_card: Cell<u64>,
     /// The cards' chevrons turning as the user opens and closes them, by (setting, card).
     disclosure: crate::motion::Disclosure<(usize, u64)>,
+    /// The page is shown in Settings: its blocks (API 0.5) are in sight.
+    in_sight: bool,
 }
 
 struct Field {
@@ -248,6 +257,7 @@ impl PluginSettingsPage {
             _subscription: Some(subscription),
             next_card: Cell::new(0),
             disclosure: crate::motion::Disclosure::default(),
+            in_sight: false,
         };
         let specs = page
             .entry
@@ -486,7 +496,40 @@ impl PluginSettingsPage {
 
     /// The store changed: values the plugin wrote (`settings.set`) refill their fields — unless the
     /// user is typing in one.
+    /// The page comes into sight in Settings or leaves it: its blocks (API 0.5) are shown or
+    /// hidden, and their plugin hears it.
+    pub fn set_in_sight(&mut self, in_sight: bool, cx: &mut Context<Self>) {
+        self.in_sight = in_sight;
+        self.sync_blocks(cx);
+    }
+
+    /// The plugin's windows drawn on the page (`location = "settings"`, API 0.5): (key, title,
+    /// view), in the manifest's order.
+    fn blocks(&self, cx: &App) -> Vec<(ToolKey, SharedString, Entity<PluginView>)> {
+        self.plugins
+            .read(cx)
+            .tool_windows()
+            .iter()
+            .filter(|tool| tool.plugin == self.plugin && tool.in_settings())
+            .map(|tool| (tool.key, tool.title.clone(), tool.view.clone()))
+            .collect()
+    }
+
+    /// The blocks are as visible as the page: one that came with a plugin started (or reloaded)
+    /// while the page is shown comes into sight too.
+    fn sync_blocks(&mut self, cx: &mut Context<Self>) {
+        let in_sight = self.in_sight;
+        for (key, _, view) in self.blocks(cx) {
+            if view.read(cx).is_visible() != in_sight {
+                view.update(cx, |view, cx| view.set_visible(in_sight, cx));
+            }
+            self.plugins
+                .update(cx, |store, _| store.tool_window_visibility(key, in_sight));
+        }
+    }
+
     fn sync(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.sync_blocks(cx);
         for index in 0..self.fields.len() {
             let field = &self.fields[index];
             if !field.spec.kind.has_value() {
@@ -1752,6 +1795,14 @@ impl Render for PluginSettingsPage {
             Some(entry) => self.tr(&entry.manifest.name).to_string(),
             None => self.plugin.to_string(),
         };
+        // The manifest's description says what the plugin is (a client of a service says whose
+        // API it works through — FluxGram must, by Telegram's terms).
+        let description = self
+            .entry
+            .as_ref()
+            .map(|entry| entry.manifest.description.trim())
+            .filter(|text| !text.is_empty())
+            .map(|text| self.tr(text).to_string());
         // Buttons that follow one another share a line; next to a status line (just before or
         // just after it) they join its card.
         let is_button = |fields: &[Field], index: usize| {
@@ -1791,6 +1842,8 @@ impl Render for PluginSettingsPage {
                 index += 1;
             }
         }
+        let blocks = self.blocks(cx);
+        let has_blocks = !blocks.is_empty();
         let page = cx.entity().downgrade();
         let handle = window.window_handle();
         OPEN_PAGE.with(|open| *open.borrow_mut() = Some((page, handle)));
@@ -1822,8 +1875,18 @@ impl Render for PluginSettingsPage {
             .flex()
             .flex_col()
             .gap_3()
-            .child(header(&name, ui))
-            .when(fields.is_empty(), |page| {
+            .child(header(&name, description.as_deref(), ui))
+            // The plugin's blocks (API 0.5): a heading as a section's, the view at its height.
+            .children(blocks.into_iter().map(|(_, title, view)| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .pb_2()
+                    .child(ui::section_label(title, ui))
+                    .child(view)
+            }))
+            .when(fields.is_empty() && !has_blocks, |page| {
                 page.child(
                     div()
                         .text_color(ui.dim)
@@ -1834,8 +1897,9 @@ impl Render for PluginSettingsPage {
     }
 }
 
-/// The page's title (the plugin's name) and a line about whose settings these are.
-fn header(name: &str, ui: UiColors) -> Div {
+/// The page's title (the plugin's name) and under it the plugin's description — or, without one,
+/// a line about whose settings these are.
+fn header(name: &str, description: Option<&str>, ui: UiColors) -> Div {
     div()
         .flex()
         .flex_col()
@@ -1846,10 +1910,15 @@ fn header(name: &str, ui: UiColors) -> Div {
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .child(name.to_string()),
         )
-        .child(div().text_color(ui.text_muted).child(trf(
-            "Settings of the plugin “{0}”: it reads them and follows their changes.",
-            &[&name],
-        )))
+        .child(div().text_color(ui.text_muted).child(
+            description.map(str::to_string).unwrap_or_else(|| {
+                trf(
+                    "Settings of the plugin “{0}”: it reads them and follows their changes.",
+                    &[&name],
+                )
+                .to_string()
+            }),
+        ))
 }
 
 /// A multi-line field in a box like a text field's: ↵ — a new line; a click on the box's padding
@@ -1903,16 +1972,11 @@ fn tone_color(tone: Tone, ui: UiColors) -> gpui::Hsla {
 
 /// A pulsing dot: the plugin works ("Checking…"). With the animations off, a still one.
 fn busy_dot(index: usize, ui: UiColors) -> AnyElement {
-    let dot = div().flex_none().size(px(8.)).rounded(px(4.)).bg(ui.accent);
-    if !crate::motion::enabled() {
-        return dot.opacity(0.65).into_any_element();
-    }
-    dot.with_animation(
+    ui::pulse_dot(
         SharedString::from(format!("plugin-setting-busy-{index}")),
-        Animation::new(Duration::from_millis(900)).repeat(),
-        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+        8.,
+        ui.accent,
     )
-    .into_any_element()
 }
 
 /// A field's validation message: fades in, and again when it says something else.

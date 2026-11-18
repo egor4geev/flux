@@ -3514,6 +3514,14 @@ impl Workspace {
             || self.left_tool() == Some(LeftTool::Plugin(key))
     }
 
+    /// Whether a plugin's tool window is a dialog (API 0.5).
+    fn plugin_tool_in_dialog(&self, key: ToolKey, cx: &App) -> bool {
+        self.plugins
+            .read(cx)
+            .tool_window(key)
+            .is_some_and(|tool| tool.in_dialog())
+    }
+
     /// Whether a plugin's tool window lives in the island on the left (API 0.5).
     fn plugin_tool_on_left(&self, key: ToolKey, cx: &App) -> bool {
         self.plugins
@@ -3652,6 +3660,12 @@ impl Workspace {
                 {
                     self.hide_left_plugin(window, cx);
                 }
+                // And its dialog (API 0.5).
+                if let Some(key) = crate::plugin_dialog::shown(self, cx)
+                    && self.plugin_tool_view(key, cx).is_none()
+                {
+                    crate::plugin_dialog::hide(self, key, window, cx);
+                }
                 // The window the project's state had on the left, once the plugins are found.
                 if self.plugins.read(cx).scanned()
                     && let Some((plugin, id)) = self.pending_left.take()
@@ -3682,6 +3696,13 @@ impl Workspace {
                     self.hide_plugin_tab(key, window, cx);
                 }
                 cx.notify();
+            }
+            // A dialog (API 0.5): over everything, Settings too.
+            PluginStoreEvent::ShowToolWindow(key) if self.plugin_tool_in_dialog(*key, cx) => {
+                crate::plugin_dialog::show(self, *key, window, cx)
+            }
+            PluginStoreEvent::HideToolWindow(key) if self.plugin_tool_in_dialog(*key, cx) => {
+                crate::plugin_dialog::hide(self, *key, window, cx)
             }
             PluginStoreEvent::ShowToolWindow(key) if self.plugin_tool_on_left(*key, cx) => {
                 if self.left_tool() != Some(LeftTool::Plugin(*key)) {
@@ -4695,12 +4716,12 @@ impl Workspace {
             }
         }
         if let Some(over) = self.over.take() {
-            self.leave_over(over);
+            self.leave_over(over, cx);
         }
         let previous_focus = match self.modal.take() {
             Some(modal) => {
                 let previous_focus = modal.previous_focus.clone();
-                self.leave(modal);
+                self.leave(modal, cx);
                 previous_focus
             }
             None => window.focused(cx),
@@ -4783,7 +4804,7 @@ impl Workspace {
                 None => self.focus_active(window, cx),
             }
         }
-        self.leave(modal);
+        self.leave(modal, cx);
         // A plugin's question that waited for the overlay window comes now.
         cx.defer_in(window, |this, window, cx| {
             plugins::ask_pending(this, window, cx)
@@ -4810,7 +4831,7 @@ impl Workspace {
             return self.toggle_dialog(window, cx, build);
         }
         if let Some(over) = self.over.take() {
-            self.leave_over(over);
+            self.leave_over(over, cx);
         }
         let previous_focus = window.focused(cx);
         let view = cx.new(|cx| build(window, cx));
@@ -4834,9 +4855,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The dialog over Settings, when it is a `V` (a plugin's dialog window, API 0.5).
+    pub(crate) fn over_view<V: 'static>(&self) -> Option<Entity<V>> {
+        self.over
+            .as_ref()
+            .and_then(|over| over.view.clone().downcast::<V>().ok())
+    }
+
     /// Closes the dialog over Settings: they get the focus back, and a plugin's question that
     /// waited comes next.
-    fn dismiss_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn dismiss_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(over) = self.over.take() else {
             return;
         };
@@ -4850,7 +4878,7 @@ impl Workspace {
                 None => self.focus_active(window, cx),
             }
         }
-        self.leave_over(over);
+        self.leave_over(over, cx);
         cx.defer_in(window, |this, window, cx| {
             plugins::ask_pending(this, window, cx)
         });
@@ -4858,16 +4886,38 @@ impl Workspace {
     }
 
     /// [`Self::leave`] for the dialog over Settings.
-    fn leave_over(&mut self, mut over: Modal) {
+    fn leave_over(&mut self, mut over: Modal, cx: &mut Context<Self>) {
         over._subscriptions.clear();
+        self.closed(&over, cx);
         self.leaving_over = crate::motion::enabled().then(|| crate::motion::Leaving::new(over));
     }
 
     /// A closed overlay window fades out (`crate::motion`): drawn without input — its
     /// subscriptions go now, so it can't close the next one — until its exit ends.
-    fn leave(&mut self, mut modal: Modal) {
+    fn leave(&mut self, mut modal: Modal, cx: &mut Context<Self>) {
         modal._subscriptions.clear();
+        self.closed(&modal, cx);
         self.leaving_modal = crate::motion::enabled().then(|| crate::motion::Leaving::new(modal));
+    }
+
+    /// An overlay window has just closed, however it went: the plugins hear that their windows
+    /// in it are out of sight — a plugin's dialog, the blocks of a plugin's Settings page (API
+    /// 0.5).
+    fn closed(&mut self, modal: &Modal, cx: &mut Context<Self>) {
+        if let Ok(dialog) = modal
+            .view
+            .clone()
+            .downcast::<crate::plugin_dialog::PluginDialog>()
+        {
+            dialog.update(cx, |dialog, cx| dialog.closed(cx));
+        }
+        if let Ok(settings) = modal
+            .view
+            .clone()
+            .downcast::<crate::settings_view::SettingsView>()
+        {
+            settings.update(cx, |settings, cx| settings.closed(cx));
+        }
     }
 
     fn render_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {

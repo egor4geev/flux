@@ -399,6 +399,14 @@ pub enum ToolWindowLocation {
     /// The island on the left (API 0.5), in place of the project tree, with an icon among the
     /// launchpad's tools at the top: a list to work from — the chats.
     Left,
+    /// A dialog in the middle of the Flux window, over everything — the settings too (API 0.5):
+    /// a sign-in, a few steps of a setup. No launchpad icon; `ui.show` opens it, `ui.hide`, Esc
+    /// and its × close it (`tool-window-hidden`).
+    Dialog,
+    /// A block of the plugin's page in Settings, above the manifest's settings (API 0.5): the
+    /// title is its heading, the view its content at its own height — a list the plugin keeps
+    /// itself (the accounts). No launchpad icon; the page shows it.
+    Settings,
 }
 
 /// An item of a context menu: runs one of the plugin's commands on what the menu was opened on
@@ -809,6 +817,16 @@ impl Manifest {
 
     pub fn tool_window(&self, id: &str) -> Option<&ToolWindowSpec> {
         self.tool_windows.iter().find(|window| window.id == id)
+    }
+
+    /// The plugin has a page in Settings: settings of its own, or a window drawn on that page
+    /// (`location = "settings"`, API 0.5).
+    pub fn has_settings_page(&self) -> bool {
+        !self.settings.is_empty()
+            || self
+                .tool_windows
+                .iter()
+                .any(|window| window.location == ToolWindowLocation::Settings)
     }
 
     pub fn setting(&self, key: &str) -> Option<&SettingSpec> {
@@ -1345,8 +1363,16 @@ fn check_api_05(raw: &RawManifest) -> Result<(), ManifestError> {
         return needs("[[tools]]");
     }
     for window in &raw.tool_windows {
-        if window.location == ToolWindowLocation::Left && !api_at_least(api, 0, 5) {
-            return needs("location = \"left\"");
+        let location = match window.location {
+            ToolWindowLocation::Left => Some("left"),
+            ToolWindowLocation::Dialog => Some("dialog"),
+            ToolWindowLocation::Settings => Some("settings"),
+            ToolWindowLocation::Island | ToolWindowLocation::Editor => None,
+        };
+        if let Some(location) = location
+            && !api_at_least(api, 0, 5)
+        {
+            return needs(&format!("location = \"{location}\""));
         }
         if window.tabs && !api_at_least(api, 0, 5) {
             return needs("tabs");
@@ -2632,5 +2658,57 @@ title = "Actions"
             error(&field_default),
             "setting \"actions\", field \"mode\": the default doesn't fit the type"
         );
+    }
+
+    /// A plugin of API 0.5 with a dialog and a block of its Settings page (FluxGram's sign-in
+    /// and accounts).
+    const DIALOG_AND_SETTINGS: &str = r#"
+id = "test.accounts"
+name = "Accounts"
+version = "0.1.0"
+api = "0.5"
+wasm = "plugin.wasm"
+
+[[tool-windows]]
+id = "accounts"
+title = "Accounts"
+location = "settings"
+
+[[tool-windows]]
+id = "sign-in"
+title = "Add Account"
+location = "dialog"
+"#;
+
+    #[test]
+    fn api_05_reads_dialog_and_settings_windows() {
+        let manifest = Manifest::parse(DIALOG_AND_SETTINGS).unwrap();
+        assert_eq!(
+            manifest.tool_window("accounts").unwrap().location,
+            ToolWindowLocation::Settings
+        );
+        assert_eq!(
+            manifest.tool_window("sign-in").unwrap().location,
+            ToolWindowLocation::Dialog
+        );
+        // A window on the Settings page gives the plugin a page there, settings or none.
+        assert!(manifest.settings.is_empty());
+        assert!(manifest.has_settings_page());
+        let without = DIALOG_AND_SETTINGS.replace("location = \"settings\"", "");
+        assert!(!Manifest::parse(&without).unwrap().has_settings_page());
+    }
+
+    #[test]
+    fn dialog_and_settings_windows_need_api_05() {
+        for (location, other) in [("dialog", "settings"), ("settings", "dialog")] {
+            let text = DIALOG_AND_SETTINGS
+                .replace("api = \"0.5\"", "api = \"0.4\"")
+                .replace(&format!("location = \"{other}\"\n"), "");
+            let err = Manifest::parse(&text).unwrap_err().0;
+            assert!(
+                err.contains(&format!("location = \"{location}\"")) && err.contains("0.5"),
+                "{location}: {err}"
+            );
+        }
     }
 }

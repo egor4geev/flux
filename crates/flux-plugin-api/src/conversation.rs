@@ -21,7 +21,7 @@ use crate::host::ui::RowAction;
 pub use crate::host::ui::{
     AvatarSpec, CodeBlock, Composed, ComposerSpec, ConversationChange as Change, ConversationSpec,
     Delivery, FileSpec, History, ImageShape, ImageSpec, LinkPreview, Message, MessageAuthor,
-    MessagePart as Part, MessageQuote, PlaceholderSpec, Reaction, RichSpan,
+    MessageEdit, MessagePart as Part, MessageQuote, PlaceholderSpec, Reaction, RichSpan,
 };
 
 /// Sends changes of the `element` conversation of `window`'s view, in order.
@@ -74,6 +74,15 @@ pub fn reply_to(quote: Option<MessageQuote>) -> Change {
 /// Replaces the field's text.
 pub fn draft(text: &str) -> Change {
     Change::Draft(text.to_string())
+}
+
+/// The field edits the message `message` with `text` (API 0.5): ↵ comes as `edited`, Esc as
+/// `edit-cancelled`; `None` — back to a new message.
+pub fn editing(edit: Option<(&str, &str)>) -> Change {
+    Change::Editing(edit.map(|(message, text)| MessageEdit {
+        message: message.to_string(),
+        text: text.to_string(),
+    }))
 }
 
 // --- Messages ---

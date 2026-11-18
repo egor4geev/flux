@@ -318,10 +318,28 @@ impl ToolWindow {
         self.location == ToolWindowLocation::Left
     }
 
+    /// A window of the island on the right (`location = "island"`): an icon at the launchpad's
+    /// bottom.
+    pub fn on_right(&self) -> bool {
+        self.location == ToolWindowLocation::Island
+    }
+
+    /// A dialog (`location = "dialog"`, API 0.5): the plugin shows and hides it.
+    pub fn in_dialog(&self) -> bool {
+        self.location == ToolWindowLocation::Dialog
+    }
+
+    /// A block of the plugin's Settings page (`location = "settings"`, API 0.5): the page shows
+    /// it.
+    pub fn in_settings(&self) -> bool {
+        self.location == ToolWindowLocation::Settings
+    }
+
     /// The user opens it — its launchpad icon, the palette, its keys: not a window with tabs
-    /// (the plugin opens those) nor one of its tabs.
+    /// (the plugin opens those) nor one of its tabs, not a dialog (the plugin shows it) nor a
+    /// block of the Settings page (the page does).
     pub fn openable(&self) -> bool {
-        !self.tabs && self.tab_of.is_none()
+        !self.tabs && self.tab_of.is_none() && !self.in_dialog() && !self.in_settings()
     }
 }
 
@@ -389,6 +407,8 @@ pub(crate) enum PendingQuestion {
         id: u64,
         form: Form,
     },
+    /// A plugin's dialog window (API 0.5) shown while a dialog or a popup of the user's is open.
+    Dialog(ToolKey),
 }
 
 /// The plugins of a window.
@@ -1744,6 +1764,8 @@ impl PluginStore {
             ToolWindowLocation::Island => Chrome::Island,
             ToolWindowLocation::Left => Chrome::Left,
             ToolWindowLocation::Editor => Chrome::Tab,
+            ToolWindowLocation::Dialog => Chrome::Dialog,
+            ToolWindowLocation::Settings => Chrome::Settings,
         };
         let view = cx.new(|cx| {
             PluginView::new(
@@ -2009,8 +2031,15 @@ impl PluginStore {
                 bind_plugin_keys(keys, action, &what, &log, cx);
             }
         }
-        // A window with tabs has no keys: the plugin opens its tabs.
-        for window in manifest.tool_windows.iter().filter(|window| !window.tabs) {
+        // A window with tabs has no keys: the plugin opens its tabs; nor has a dialog or a block
+        // of the Settings page (API 0.5).
+        for window in manifest.tool_windows.iter().filter(|window| {
+            !window.tabs
+                && !matches!(
+                    window.location,
+                    ToolWindowLocation::Dialog | ToolWindowLocation::Settings
+                )
+        }) {
             if let Some(keys) = &window.keys {
                 let action = ToggleToolWindow {
                     plugin: plugin.clone(),
@@ -2170,6 +2199,18 @@ impl PluginStore {
                     cx.emit(PluginStoreEvent::HideToolWindow(key));
                 }
             }
+            // A block of the Settings page is shown by the page (API 0.5).
+            HostCall::ShowToolWindow { window } | HostCall::HideToolWindow { window }
+                if self.in_settings(&plugin, &window) =>
+            {
+                self.log(
+                    &plugin,
+                    Level::Warn,
+                    &format!(
+                        "ui.show / ui.hide: \"{window}\" is a block of the plugin's settings page — the page shows it"
+                    ),
+                )
+            }
             HostCall::ShowToolWindow { window } => {
                 if let Some(key) = self.tool_key(&plugin, &window) {
                     cx.emit(PluginStoreEvent::ShowToolWindow(key));
@@ -2276,6 +2317,13 @@ impl PluginStore {
             ),
             None => self.log(plugin, Level::Warn, &undeclared("tool window", window)),
         }
+    }
+
+    /// The plugin's window is a block of its Settings page (`location = "settings"`).
+    fn in_settings(&self, plugin: &str, window: &str) -> bool {
+        self.tool_windows
+            .iter()
+            .any(|tool| tool.plugin == plugin && tool.id == window && tool.in_settings())
     }
 
     /// The plugin's window has tabs (`tabs = true`).
@@ -2470,6 +2518,15 @@ impl PluginStore {
     pub(crate) fn queue_question(&mut self, question: PendingQuestion) {
         self.pending_questions.push_back(question);
     }
+
+    /// A dialog window waits to be shown: its plugin hid it before its turn came.
+    pub(crate) fn forget_pending_dialog(&mut self, key: ToolKey) -> bool {
+        let before = self.pending_questions.len();
+        self.pending_questions.retain(
+            |question| !matches!(question, PendingQuestion::Dialog(waiting) if *waiting == key),
+        );
+        self.pending_questions.len() != before
+    }
 }
 
 /// The plugin's settings: the manifest's defaults with the user's values over them.
@@ -2627,6 +2684,7 @@ fn stopped_view(name: &str, error: &str) -> View {
                     tooltip: None,
                     primary: true,
                     enabled: true,
+                    busy: false,
                 }),
                 children: Vec::new(),
             },
@@ -2998,6 +3056,7 @@ fn ask_queued(
         PendingQuestion::Form { plugin, id, form } => {
             crate::plugin_form::show_form(workspace, plugin, id, form, window, cx)
         }
+        PendingQuestion::Dialog(key) => crate::plugin_dialog::show(workspace, key, window, cx),
     }
 }
 

@@ -7,17 +7,19 @@
 //! new messages every few seconds) over a conversation. Each chat has its own 10 000 messages of
 //! every kind, paged by `load-older`; pictures are drawn by the plugin into its data folder at
 //! activation, each with a tiny JPEG preview; the field echoes what is sent as an outgoing message
-//! that goes sending → sent → read. A chat's tab in sight reads its messages; the unread ones
-//! count on the launchpad icon and put a dot on their tabs. A closed tab forgets its chat (the
-//! log says `tab-closed`); a tab Flux restored with the project is filled again from its key.
+//! that goes sending → sent → read (a picture file as a photo). Edit on the user's own message (or
+//! ↑ in the empty field for the last one) puts it in the field; saving replaces its text and marks
+//! it edited. A chat's tab in sight reads its messages; the unread ones count on the launchpad
+//! icon and put a dot on their tabs. A closed tab forgets its chat (the log says `tab-closed`); a
+//! tab Flux restored with the project is filled again from its key.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use flux_plugin_api::conversation::{
     self as chat, Composed, Delivery, History, ImageShape, Message, Part, clear, code, composer,
-    draft, file, link_preview, newer, notice, older, placeholder, put, quote, reply_to, reveal,
-    rich, sticker, unread_from,
+    draft, editing, file, link_preview, newer, notice, older, placeholder, put, quote, reply_to,
+    reveal, rich, sticker, unread_from,
 };
 use flux_plugin_api::host::ui;
 use flux_plugin_api::view::*;
@@ -159,6 +161,10 @@ struct Playground {
     deliveries: HashMap<u64, (String, Message, Delivery)>,
     /// Download timers of files: timer → (chat, message, progress).
     downloads: HashMap<u64, (String, u64, f32)>,
+    /// The messages the user sent, by (chat's seed, index).
+    sent: HashMap<(u64, u64), Message>,
+    /// The new texts of edited messages, by (chat's seed, index).
+    edits: HashMap<(u64, u64), String>,
 }
 
 impl Plugin for Playground {
@@ -426,6 +432,7 @@ impl Playground {
                 ))
                 .empty_text("No messages yet")
                 .message_action("reply", "Reply", Some("arrow-left"))
+                .message_action("edit", "Edit", Some("pencil"))
                 .message_action("claude", "Reply with Claude", Some("claude")),
         );
         set_view(&chat.tab, column("root", [header, feed]));
@@ -451,22 +458,29 @@ impl Playground {
                 self.render_chat(key);
             }
             (FEED, UiEvent::MessageAction((message, action))) => {
-                let Some(index) = index(&message) else {
-                    return;
-                };
-                let quote = self.message(seed, index).quote("You");
-                match action.as_str() {
-                    "reply" => chat::update(&tab, FEED, vec![reply_to(Some(quote))]),
-                    _ => chat::update(
-                        &tab,
-                        FEED,
-                        vec![
-                            reply_to(Some(quote)),
-                            draft("Claude's draft: sounds good, let's ship it on Friday."),
-                        ],
-                    ),
+                self.message_action(key, &message, &action)
+            }
+            // A scenario's `ui:<plugin>/chat/<chat>/reply/<message>` (and `…/edit/…`, `…/claude/…`):
+            // the message's action, as its menu would send it.
+            (element, UiEvent::Clicked) if element.contains('/') => {
+                if let Some((action, message)) = element.split_once('/') {
+                    self.message_action(key, message, action);
                 }
             }
+            (FEED, UiEvent::EditLast) => {
+                if let Some(index) = self.last_own(key) {
+                    self.message_action(key, &id(index), "edit");
+                }
+            }
+            (FEED, UiEvent::Edited((message, text))) => {
+                if let Some(index) = index(&message) {
+                    log::info(&format!("edited: {message}"));
+                    self.edits.insert((seed, index), text);
+                    chat::update(&tab, FEED, vec![put(vec![self.message(seed, index)])]);
+                }
+            }
+            (FEED, UiEvent::EditCancelled) => log::info("edit-cancelled"),
+            (FEED, UiEvent::ReplyCancelled) => log::info("reply-cancelled"),
             (FEED, UiEvent::ComposerAction((_, composed))) => {
                 let text = format!("{} — rewritten by Claude", composed.text.trim());
                 chat::update(&tab, FEED, vec![draft(&text)]);
@@ -496,6 +510,48 @@ impl Playground {
             }
             _ => {}
         }
+    }
+
+    /// A message's action: Reply puts its quote over the field; Edit — on the user's own message —
+    /// puts it in the field; Reply with Claude adds Claude's draft.
+    fn message_action(&self, key: &str, message: &str, action: &str) {
+        let (Some(index), Some(chat)) = (index(message), self.open.get(key)) else {
+            return;
+        };
+        let message = self.message(seed(key), index);
+        let quote = message.quote("You");
+        let changes = match action {
+            "reply" => vec![reply_to(Some(quote))],
+            "edit" if message.outgoing => {
+                vec![editing(Some((&message.id, &message_text(&message))))]
+            }
+            "edit" => {
+                log::info("edit: only the user's own messages are edited");
+                return;
+            }
+            _ => vec![
+                reply_to(Some(quote)),
+                draft("Claude's draft: sounds good, let's ship it on Friday."),
+            ],
+        };
+        chat::update(&chat.tab, FEED, changes);
+    }
+
+    /// The user's last message in a chat: the last one sent, or the newest own one of the
+    /// history.
+    fn last_own(&self, key: &str) -> Option<u64> {
+        let seed = seed(key);
+        let sent = self
+            .sent
+            .keys()
+            .filter(|(chat, _)| *chat == seed)
+            .map(|(_, index)| *index)
+            .max();
+        sent.or_else(|| {
+            (0..TOTAL)
+                .rev()
+                .find(|&index| self.message(seed, index).outgoing)
+        })
     }
 
     fn timer(&mut self, timer: u64) {
@@ -540,7 +596,16 @@ impl Playground {
                 delivery: Some(delivery),
                 ..message.clone()
             };
-            chat::update(&view_tab(&key), FEED, vec![put(vec![updated.clone()])]);
+            // The message as it is now: edited meanwhile, perhaps.
+            let seed = seed(&key);
+            let shown = match index(&message.id) {
+                Some(index) => {
+                    self.sent.insert((seed, index), updated.clone());
+                    self.message(seed, index)
+                }
+                None => updated.clone(),
+            };
+            chat::update(&view_tab(&key), FEED, vec![put(vec![shown])]);
             if let Some(next) = next {
                 let timer = timers::after(Duration::from_millis(900));
                 self.deliveries.insert(timer, (key, updated, next));
@@ -579,7 +644,9 @@ impl Playground {
         chat::update(&view_tab(key), FEED, vec![put(vec![message])]);
     }
 
-    /// The field's message comes back as an outgoing one: sending → sent → read.
+    /// The field's message comes back as an outgoing one: sending → sent → read. A picture file
+    /// comes as a photo (Flux shows it: the user handed it to the conversation), another file as a
+    /// file.
     fn send(&mut self, key: &str, composed: Composed) {
         let index = self.next;
         self.next += 1;
@@ -591,12 +658,22 @@ impl Playground {
         }
         for path in &composed.files {
             let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-            let size = std::fs::metadata(path).map_or(0, |meta| meta.len());
-            message = message.part(file(name, size, Some(path)));
+            let picture = [".png", ".jpg", ".jpeg", ".webp", ".gif"]
+                .iter()
+                .any(|extension| name.to_ascii_lowercase().ends_with(extension));
+            message = if picture {
+                // The plugin can't read the file (it is outside its folders): the size is
+                // Flux's to guess.
+                message.part(chat::image(chat::picture(path, 0, 0)))
+            } else {
+                let size = std::fs::metadata(path).map_or(0, |meta| meta.len());
+                message.part(file(name, size, Some(path)))
+            };
         }
         if !composed.text.trim().is_empty() {
             message = message.text(composed.text.trim());
         }
+        self.sent.insert((seed(key), index), message.clone());
         chat::update(
             &view_tab(key),
             FEED,
@@ -610,6 +687,18 @@ impl Playground {
     /// The `index`th message of a chat's history (`seed` — the chat's): every kind of part in
     /// turn, each chat starting at another.
     fn message(&self, seed: u64, index: u64) -> Message {
+        let message = match self.sent.get(&(seed, index)) {
+            Some(sent) => sent.clone(),
+            None => self.history_message(seed, index),
+        };
+        match self.edits.get(&(seed, index)) {
+            Some(text) => with_text(message, text),
+            None => message,
+        }
+    }
+
+    /// The `index`th message of a chat's generated history.
+    fn history_message(&self, seed: u64, index: u64) -> Message {
         let date = NEWEST - (TOTAL as i64 - 1 - index as i64) * STEP;
         let person = PEOPLE[((index / 3) % 4) as usize];
         let outgoing = index.is_multiple_of(5);
@@ -721,6 +810,36 @@ fn index(id: &str) -> Option<u64> {
 
 fn flux_index(id: &str) -> Option<u64> {
     index(id)
+}
+
+/// The text of a message's text parts, as the field takes it to edit.
+fn message_text(message: &Message) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Text(spans) => Some(spans.iter().map(|span| span.text.as_str()).collect()),
+            _ => None,
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// The message with its text replaced by `text` (in place of its first text part, or after its
+/// other parts), marked edited.
+fn with_text(mut message: Message, text: &str) -> Message {
+    let first = message
+        .parts
+        .iter()
+        .position(|part| matches!(part, Part::Text(_)));
+    message.parts.retain(|part| !matches!(part, Part::Text(_)));
+    let part = chat::text(vec![rich(text)]);
+    match first {
+        Some(at) => message.parts.insert(at.min(message.parts.len()), part),
+        None => message.parts.push(part),
+    }
+    message.edited = true;
+    message
 }
 
 fn now() -> i64 {

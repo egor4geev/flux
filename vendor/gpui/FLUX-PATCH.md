@@ -225,6 +225,14 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
     takes it from there when the keyboard's Ctrl isn't down (a Ctrl that is stays as read, so AltGr
     isn't taken for Ctrl).
 
+- **Truncated text** (2026-11-18, FluxGram, `crates/flux-app/src/plugin_conversation.rs`): a text
+  with `text_overflow` (`truncate()`) kept its first measurement of the frame whatever width taffy
+  offered next, and taffy's first call may offer none (`Definite(0)`): a conversation's reply
+  quote — in the feed and over the field — came out as "…" for the author and "…" for the text.
+  `src/elements/text.rs`: `TextLayoutInner::truncate_width` — the width the text was truncated
+  to; a measurement at another width truncates and shapes it again, from the text's own runs
+  (`truncate_line` shortens the runs it is given); wrapped text is unchanged.
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,

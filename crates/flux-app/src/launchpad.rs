@@ -159,7 +159,8 @@ pub fn render(workspace: &Workspace, cx: &Context<Workspace>) -> impl IntoElemen
         )
         // Settings: at the bottom of the strip, apart from the tools; above them, the windows of the
         // right island: the plugins', then Notifications. A plugin's window among the editor's tabs
-        // has no icon here: it opens from the palette, its keys, the plugin.
+        // has no icon here: it opens from the palette, its keys, the plugin; nor have its dialog and
+        // the blocks of its Settings page (API 0.5).
         .child(div().flex_1())
         .children(
             workspace
@@ -167,7 +168,7 @@ pub fn render(workspace: &Workspace, cx: &Context<Workspace>) -> impl IntoElemen
                 .read(cx)
                 .tool_windows()
                 .iter()
-                .filter(|tool| !tool.in_editor() && !tool.on_left())
+                .filter(|tool| tool.on_right())
                 .map(|tool| plugin_tool_button(workspace, tool, cx))
                 .collect::<Vec<_>>(),
         )

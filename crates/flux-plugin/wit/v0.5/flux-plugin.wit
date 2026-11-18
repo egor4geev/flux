@@ -412,6 +412,18 @@ interface status-bar {
 /// A window declared with `tabs = true` (`location = "editor"`, 0.5) opens a tab per key: the tab
 /// is the window `<window>/<key>` ("chat/1234") for `set-view`, `set-title`, `set-badge`, `hide`
 /// and in the events.
+///
+/// Two more places of a window (0.5):
+/// - `location = "dialog"` — a dialog in the middle of the Flux window, over everything (the
+///   settings too): its title in the header, the plugin's view under it, as tall as the view (up
+///   to most of the window, then it scrolls). `show` opens it (and focuses its first text field),
+///   `hide` closes it; Esc and the header's × close it too — `tool-window-hidden` says so. A
+///   sign-in, a few steps of a setup.
+/// - `location = "settings"` — a block of the plugin's page in Settings, above the manifest's
+///   settings: its title as the heading, the view at its own height (no scrolling of its own).
+///   The instance of the Flux window the settings are open in draws it: `set-view` before the
+///   page is opened (at `activate`, on a change) — `tool-window-shown` says when it is on screen.
+///   A list the plugin keeps itself: the accounts with their buttons.
 interface ui {
     /// The role of a text's color.
     enum tone {
@@ -442,6 +454,9 @@ interface ui {
         /// The accent button.
         primary: bool,
         enabled: bool,
+        /// Work is in progress after its press (0.5): a spinner in place of the icon, the label
+        /// stays, the button doesn't press — a sign-in's Next while the server answers.
+        busy: bool,
     }
 
     record text-field-spec {
@@ -450,6 +465,8 @@ interface ui {
         code: bool,
         /// Several lines, growing with the text up to a limit: ↵ — a new line, ⌘↵ — `submitted`.
         multiline: bool,
+        /// A password (0.5): the text shows as dots and isn't copied; a single line.
+        secret: bool,
     }
 
     /// A short colored label: a status, a priority, a count.
@@ -773,6 +790,18 @@ interface ui {
         reply-to(option<message-quote>),
         /// Replaces the field's text: a draft, the text Claude proposed.
         draft(string),
+        /// The field edits a message (0.5): the bar "Editing" with the message's text over the
+        /// field, which takes the text; ↵ — `edited`, Esc or the bar's × — `edit-cancelled`.
+        /// None — the field is back to a new message (its text cleared).
+        editing(option<message-edit>),
+    }
+
+    /// The message the field edits (0.5).
+    record message-edit {
+        /// The message's id.
+        message: string,
+        /// Its text, as the field takes it.
+        text: string,
     }
 
     /// What the field sends (0.5).
@@ -814,7 +843,8 @@ interface ui {
         /// A person's or a chat's picture (0.5), the size of a header's.
         avatar(avatar-spec),
         /// A QR code of the text (0.5), dark on light whatever the theme, for a phone's camera: a
-        /// sign-in link.
+        /// sign-in link. An empty text — the code isn't there yet: a placeholder of the same size
+        /// with a spinner.
         qr(string),
         /// A message feed with a field (0.5); takes the remaining height, as a tree does.
         conversation(conversation-spec),
@@ -1508,6 +1538,14 @@ interface events {
         draft-changed(string),
         /// The quote over the field was closed (0.5).
         reply-cancelled,
+        /// The edited message's new text (0.5): ↵ in the field while it edits (`editing`) — the
+        /// message's id and the text.
+        edited(tuple<string, string>),
+        /// The editing was left (0.5): Esc in the field, or the bar's ×.
+        edit-cancelled,
+        /// ↑ in the empty field (0.5), as in messengers: the plugin may answer with `editing` of
+        /// the user's last message it lets edit.
+        edit-last,
     }
 
     record ui-input {

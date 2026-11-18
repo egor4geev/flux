@@ -200,12 +200,14 @@ fn from_v2_kind(kind: v2::ui::ElementKind) -> ui::ElementKind {
             tooltip: button.tooltip,
             primary: button.primary,
             enabled: button.enabled,
+            busy: false,
         }),
         Kind::TextField(field) => ui::ElementKind::TextField(ui::TextFieldSpec {
             text: field.text,
             placeholder: field.placeholder,
             code: field.code,
             multiline: false,
+            secret: false,
         }),
         Kind::Toggle(toggle) => ui::ElementKind::Toggle(ui::ToggleSpec {
             label: toggle.label,
@@ -392,7 +394,10 @@ fn ui_input(input: &UiInput) -> Option<v2::events::UiInput> {
             | UiEvent::Composed(_)
             | UiEvent::ComposerAction(_)
             | UiEvent::DraftChanged(_)
-            | UiEvent::ReplyCancelled => return None,
+            | UiEvent::ReplyCancelled
+            | UiEvent::Edited(_)
+            | UiEvent::EditCancelled
+            | UiEvent::EditLast => return None,
         },
     })
 }
@@ -549,6 +554,7 @@ mod tests {
                 placeholder: Some("Find".into()),
                 code: true,
                 multiline: false,
+                secret: false,
             })
         );
         match &view.elements[2].kind {

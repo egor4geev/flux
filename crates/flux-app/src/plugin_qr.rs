@@ -1,6 +1,7 @@
 //! A plugin's QR code (API 0.5, `ui.element-kind.qr`): a sign-in link for a phone's camera. Dark
 //! modules on a light square whatever the theme, with the quiet zone the readers need (four
-//! modules), each module a whole number of device pixels — crisp, not a scaled picture.
+//! modules), each module a whole number of device pixels — crisp, not a scaled picture. Before
+//! the code comes (an empty text), a placeholder of the same square with a spinner.
 
 use gpui::{
     App, Bounds, IntoElement, ParentElement, Pixels, Styled, Window, canvas, div, fill, point, px,
@@ -25,22 +26,35 @@ pub fn modules(text: &str) -> Option<Vec<Vec<bool>>> {
 }
 
 /// The code of `text`, [`SIZE`] square; a text too long for a code draws the light square alone.
+/// An empty text — the code isn't there yet (API 0.5): the light square with the spinner in the
+/// middle, so the code takes its place without the view moving.
 pub fn render(text: &str) -> impl IntoElement + use<> {
-    let modules = modules(text).unwrap_or_default();
-    div()
+    let square = div()
         .flex_none()
         .size(px(SIZE))
         .rounded(px(crate::ui::RADIUS_MD))
-        .bg(rgb(0xffffff))
-        .child(
-            canvas(
-                |_, _, _| {},
-                move |bounds: Bounds<Pixels>, _, window: &mut Window, _: &mut App| {
-                    paint(&modules, bounds, window)
-                },
-            )
-            .size_full(),
+        .bg(rgb(0xffffff));
+    if text.is_empty() {
+        return square
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(crate::ui::pulse_dot(
+                "plugin-qr-waiting",
+                10.,
+                rgb(0x8a8a8a).into(),
+            ));
+    }
+    let modules = modules(text).unwrap_or_default();
+    square.child(
+        canvas(
+            |_, _, _| {},
+            move |bounds: Bounds<Pixels>, _, window: &mut Window, _: &mut App| {
+                paint(&modules, bounds, window)
+            },
         )
+        .size_full(),
+    )
 }
 
 /// Runs of dark modules as rectangles, snapped to device pixels.

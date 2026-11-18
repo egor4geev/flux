@@ -64,6 +64,8 @@ pub struct Pictures {
     total: usize,
     /// Paths refused once (outside the plugin's folders): logged once each.
     refused: HashSet<PathBuf>,
+    /// Files the user handed to a plugin (its conversation's field), by plugin: its pictures too.
+    granted: HashMap<String, HashSet<PathBuf>>,
 }
 
 impl Global for Pictures {}
@@ -76,14 +78,22 @@ pub fn memory(cx: &App) -> usize {
 }
 
 /// Whether a plugin may show the picture at `path`: an absolute path without `..` in the plugin's
-/// install folder or its data folder. Others are refused with a line in the log, once.
+/// install folder or its data folder, or a file the user handed to the plugin ([`grant`]). Others
+/// are refused with a line in the log, once.
 pub fn allowed(plugin: &str, path: &Path, cx: &mut App) -> bool {
     let inside = |root: &Path| path.starts_with(root);
+    let granted = cx.try_global::<Pictures>().is_some_and(|pictures| {
+        pictures
+            .granted
+            .get(plugin)
+            .is_some_and(|files| files.contains(path))
+    });
     let ok = path.is_absolute()
         && !path
             .components()
             .any(|component| matches!(component, Component::ParentDir))
-        && (inside(&flux_plugin::paths::data_dir(plugin))
+        && (granted
+            || inside(&flux_plugin::paths::data_dir(plugin))
             || crate::icons::plugin_folder(plugin).is_some_and(|folder| inside(&folder)));
     if !ok {
         let pictures = cx.default_global::<Pictures>();
@@ -95,6 +105,19 @@ pub fn allowed(plugin: &str, path: &Path, cx: &mut App) -> bool {
         }
     }
     ok
+}
+
+/// The user handed the file at `path` to the plugin — picked, dropped or pasted into its
+/// conversation's field: the plugin may show it as a picture (a sent message's photo from
+/// ~/Downloads), until Flux quits.
+pub fn grant(plugin: &str, path: &Path, cx: &mut App) {
+    let pictures = cx.default_global::<Pictures>();
+    pictures.refused.remove(path);
+    pictures
+        .granted
+        .entry(plugin.to_string())
+        .or_default()
+        .insert(path.to_path_buf());
 }
 
 /// The picture at `path` decoded to fit `width` × `height` device pixels (0 — unknown: up to

@@ -9,6 +9,9 @@
 //! the service may ask at once: one downloads (a lock per file), the others wait and take its
 //! file; the file is written beside and renamed into place, so a half-written one is never run.
 //! Once a new version is in place the older ones go; all of them go when the plugin is removed.
+//!
+//! `FLUX_DEV_HELPERS=<folder>` puts a developer's own build in place of the download
+//! ([`dev_build`]).
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -50,6 +53,9 @@ pub(crate) fn ensure(
         .manifest
         .helper(name)
         .ok_or_else(|| format!("There's no helper \"{name}\" in flux-plugin.toml ([[helpers]])"))?;
+    if let Some(path) = dev_build(name) {
+        return Ok(path);
+    }
     let platform = helper_platform().ok_or("Helpers don't run on this system")?;
     let file = spec.platforms.get(platform).ok_or_else(|| {
         format!("flux-plugin.toml has no file of the helper \"{name}\" for {platform}")
@@ -99,6 +105,14 @@ pub(crate) fn ensure(
         .map_err(|err| format!("{}: {err}", marker.display()))?;
     remove_old_versions(entry);
     Ok(target)
+}
+
+/// A developer's own build of the helper: `FLUX_DEV_HELPERS=<folder>` with `<name>[.exe]` in it
+/// is taken as it is — no download, no checksum — for working on a plugin and its program
+/// together (the manifest may have no files yet). Not for users: Flux is started with it by hand.
+fn dev_build(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("FLUX_DEV_HELPERS")?).join(file_name(name));
+    path.is_file().then_some(path)
 }
 
 /// The file is in place and was checked: the marker names its size.

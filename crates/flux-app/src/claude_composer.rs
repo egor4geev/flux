@@ -675,7 +675,7 @@ impl Composer {
                     PromptInputEvent::BackspaceAtStart if this.shell_mode => {
                         this.leave_shell_mode(cx)
                     }
-                    PromptInputEvent::BackspaceAtStart => {}
+                    PromptInputEvent::BackspaceAtStart | PromptInputEvent::UpWhenEmpty => {}
                 },
             ),
             // The session refreshes the context meter after each turn itself.

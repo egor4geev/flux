@@ -21,7 +21,12 @@
 //! middle; reactions under it. Its menu holds the plugin's actions (also on a bar over the hovered
 //! message) and Flux's own: Copy Text; Open, Show in Finder (Explorer), Save As… for a downloaded
 //! picture or file. The field: ↵ sends, ⇧↵ starts a line; the quote being answered with ×; files
-//! by the paperclip, by dropping, by pasting (a pasted picture is saved to a file first).
+//! by the paperclip, by dropping, by pasting (a pasted picture is saved to a file first), a picture
+//! file's chip with its thumbnail; a file handed to the conversation is a picture the plugin may
+//! show (`plugin_images::grant`). Editing a message (`editing`): a bar over the field with the
+//! original text, the field takes the text; ↵ sends `edited`, Esc or × `edit-cancelled`; ↑ in the
+//! empty field asks for the last message to edit (`edit-last`). A quote or an edit the plugin puts
+//! over the field gives it the keyboard, when the window is the active one.
 //!
 //! Nothing here asks for frames by itself: an idle conversation draws nothing.
 
@@ -33,7 +38,8 @@ use std::{cell::RefCell, rc::Rc};
 use flux_plugin::api::events::UiEvent;
 use flux_plugin::api::ui::{
     AvatarSpec, Composed, ConversationChange, ConversationSpec, Delivery, FileSpec, History,
-    ImageShape, ImageSpec, LinkPreview, Message, MessagePart, MessageQuote, RichSpan, RowAction,
+    ImageShape, ImageSpec, LinkPreview, Message, MessageEdit, MessagePart, MessageQuote, RichSpan,
+    RowAction,
 };
 use gpui::{
     Action, AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Entity, EventEmitter,
@@ -55,8 +61,10 @@ use crate::ui;
 actions!(
     plugin_conversation,
     [
-        /// ↵ in the field: sends it.
+        /// ↵ in the field: sends it (saves the edited message).
         Send,
+        /// Esc in the field: leaves the editing of a message.
+        CancelEdit,
     ]
 );
 
@@ -100,7 +108,13 @@ struct SavePartAs {
 const FIELD_CONTEXT: &str = "PluginConversationField";
 
 pub fn init(cx: &mut App) {
-    crate::keymap::bind_keys(cx, [KeyBinding::new("enter", Send, Some(FIELD_CONTEXT))]);
+    crate::keymap::bind_keys(
+        cx,
+        [
+            KeyBinding::new("enter", Send, Some(FIELD_CONTEXT)),
+            KeyBinding::new("escape", CancelEdit, Some(FIELD_CONTEXT)),
+        ],
+    );
 }
 
 /// The feed's column: centered, no wider than this.
@@ -125,6 +139,10 @@ const ALBUM_GAP: f32 = 3.;
 const STICKER_SIZE: f32 = 160.;
 const PICTURE_RADIUS: f32 = 8.;
 const FILE_ICON: f32 = 38.;
+/// The thumbnail of a picture file's chip in the field.
+const CHIP_THUMBNAIL: f32 = 18.;
+/// The files the field shows as pictures: a chip with a thumbnail.
+const PICTURE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
 /// About a screen is laid out above and below what is seen: scrolling into it asks for more.
 const OVERDRAW: f32 = 1000.;
 /// `visible` goes out at most this often while scrolling.
@@ -182,6 +200,11 @@ pub struct Conversation {
     filled: bool,
     /// The quote over the field.
     reply_to: Option<MessageQuote>,
+    /// The message the field edits (`editing`): its bar over the field, ↵ saves it.
+    editing: Option<MessageEdit>,
+    /// A quote or an edit came over the field: the next frame gives it the keyboard (when the
+    /// window is the active one).
+    take_keyboard: bool,
     input: Entity<PromptInput>,
     attachments: Vec<PathBuf>,
     /// The text the plugin put in the field last (`draft`): not echoed as `draft-changed`.
@@ -234,6 +257,8 @@ impl Conversation {
             unread_from: None,
             filled: false,
             reply_to: None,
+            editing: None,
+            take_keyboard: false,
             input,
             attachments: Vec::new(),
             plugin_draft: None,
@@ -320,10 +345,38 @@ impl Conversation {
                     }
                 }
                 ConversationChange::Reveal(id) => self.reveal(&id),
-                ConversationChange::ReplyTo(quote) => self.reply_to = quote,
+                ConversationChange::ReplyTo(quote) => {
+                    // Replying leaves an edit, as the messengers do.
+                    if quote.is_some() {
+                        if self.editing.is_some() {
+                            self.leave_editing(cx);
+                            self.emit(UiEvent::EditCancelled, cx);
+                        }
+                        self.take_keyboard = true;
+                    }
+                    self.reply_to = quote;
+                }
                 ConversationChange::Draft(text) => {
                     self.plugin_draft = Some(text.clone());
                     self.input.update(cx, |input, cx| input.set_text(&text, cx));
+                }
+                ConversationChange::Editing(Some(edit)) => {
+                    // Editing drops the quote being answered.
+                    if self.reply_to.take().is_some() {
+                        self.emit(UiEvent::ReplyCancelled, cx);
+                    }
+                    self.draft_timer = None;
+                    self.input
+                        .update(cx, |input, cx| input.set_text(&edit.text, cx));
+                    self.editing = Some(edit);
+                    self.take_keyboard = true;
+                }
+                // Flux has left the mode itself on ↵, Esc or ×: a late `None` finds nothing to do
+                // (and leaves the text the user may be typing).
+                ConversationChange::Editing(None) => {
+                    if self.editing.is_some() {
+                        self.leave_editing(cx);
+                    }
                 }
             }
         }
@@ -508,7 +561,8 @@ impl Conversation {
         match event {
             PromptInputEvent::Changed => {
                 let text = self.input.read(cx).text();
-                if self.plugin_draft.as_deref() == Some(text.as_str()) {
+                // An edited message's text isn't the new message's draft.
+                if self.editing.is_some() || self.plugin_draft.as_deref() == Some(text.as_str()) {
                     return;
                 }
                 self.plugin_draft = None;
@@ -536,24 +590,56 @@ impl Conversation {
             PromptInputEvent::FilesPasted(paths) if self.takes_files() => {
                 self.attach(paths.clone(), cx)
             }
+            // ↑ in the empty field, as in the messengers: the plugin may answer with the user's
+            // last message to edit.
+            PromptInputEvent::UpWhenEmpty if self.editing.is_none() => {
+                self.emit(UiEvent::EditLast, cx)
+            }
             _ => {}
         }
     }
 
+    /// The field takes files: its spec says so, and it isn't editing a message.
     fn takes_files(&self) -> bool {
-        self.spec
-            .composer
-            .as_ref()
-            .is_some_and(|composer| composer.attachments)
+        self.editing.is_none()
+            && self
+                .spec
+                .composer
+                .as_ref()
+                .is_some_and(|composer| composer.attachments)
     }
 
+    /// Files handed to the conversation: chips in the field, and pictures the plugin may show —
+    /// the message it sends with them shows the photo from wherever it was.
     fn attach(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         for path in paths {
             if path.is_file() && !self.attachments.contains(&path) {
+                crate::plugin_images::grant(&self.plugin, &path, cx);
                 self.attachments.push(path);
             }
         }
         cx.notify();
+    }
+
+    /// Leaves the editing of a message: the bar goes, the field is emptied (not echoed as a
+    /// draft).
+    fn leave_editing(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        self.draft_timer = None;
+        self.plugin_draft = Some(String::new());
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        cx.notify();
+    }
+
+    /// Esc in the field: leaves the editing (`edit-cancelled`); otherwise Esc does what it does
+    /// around the field.
+    fn cancel_edit(&mut self, _: &CancelEdit, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_none() {
+            cx.propagate();
+            return;
+        }
+        self.leave_editing(cx);
+        self.emit(UiEvent::EditCancelled, cx);
     }
 
     fn choose_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -588,6 +674,13 @@ impl Conversation {
     }
 
     fn send(&mut self, _: &Send, _: &mut Window, cx: &mut Context<Self>) {
+        // Editing: the message's new text goes out, and the field is back to a new message.
+        if let Some(edit) = self.editing.clone() {
+            let text = self.input.read(cx).text();
+            self.leave_editing(cx);
+            self.emit(UiEvent::Edited((edit.message, text)), cx);
+            return;
+        }
         let composed = self.composed(cx);
         if composed.text.trim().is_empty() && composed.files.is_empty() {
             return;
@@ -1568,52 +1661,80 @@ impl Conversation {
         let composer = self.spec.composer.as_ref()?;
         let ui = Theme::ui(cx);
         let focused = self.input.focus_handle(cx).is_focused(window);
-        let reply = self.reply_to.as_ref().map(|quote| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(9.))
-                .px(px(4.))
-                .pb(px(6.))
-                .border_b_1()
-                .border_color(ui.divider)
-                .child(icon(IconName::ArrowLeft, ui.accent_text))
-                .child(
-                    quote_block(quote, theme::avatar_color(quote.color), ui)
-                        .flex_1()
-                        .min_w_0(),
-                )
-                .child(
-                    ui::icon_button("fg-reply-cancel", IconName::Close, ui).on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| {
-                            this.reply_to = None;
-                            this.emit(UiEvent::ReplyCancelled, cx);
-                            cx.notify();
-                        },
-                    )),
-                )
-        });
+        let editing = self.editing.is_some();
+        // Over the field: the message being edited, or the quote being answered.
+        let bar = match (&self.editing, &self.reply_to) {
+            (Some(edit), _) => Some(field_bar(
+                IconName::Pencil,
+                quote_lines(tr("Editing").into(), &edit.text, ui.accent_text, ui),
+                ui::icon_button("fg-edit-cancel", IconName::Close, ui).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.leave_editing(cx);
+                        this.emit(UiEvent::EditCancelled, cx);
+                    },
+                )),
+                ui,
+            )),
+            (None, Some(quote)) => Some(field_bar(
+                IconName::ArrowLeft,
+                quote_block(quote, theme::avatar_color(quote.color), ui),
+                ui::icon_button("fg-reply-cancel", IconName::Close, ui).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.reply_to = None;
+                        this.emit(UiEvent::ReplyCancelled, cx);
+                        cx.notify();
+                    },
+                )),
+                ui,
+            )),
+            (None, None) => None,
+        };
+        // A picture file's chip shows its thumbnail, decoded off the window's thread.
+        let thumbnail_side = (CHIP_THUMBNAIL * window.scale_factor()).ceil() as u32;
         let chips =
-            (!self.attachments.is_empty()).then(|| {
+            (!self.attachments.is_empty() && !editing).then(|| {
                 div().flex().flex_wrap().gap(px(6.)).children(
                     self.attachments.iter().enumerate().map(|(index, path)| {
                         let name = path
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default();
+                        let thumbnail = is_picture(path)
+                            .then(|| {
+                                crate::plugin_images::file(
+                                    path,
+                                    thumbnail_side,
+                                    thumbnail_side,
+                                    cx.entity_id(),
+                                    cx,
+                                )
+                            })
+                            .flatten();
+                        let shows_thumbnail = thumbnail.is_some();
+                        let glyph = match thumbnail {
+                            Some(image) => img(image)
+                                .flex_none()
+                                .size(px(CHIP_THUMBNAIL))
+                                .rounded(px(ui::RADIUS_XS))
+                                .object_fit(ObjectFit::Cover)
+                                .into_any_element(),
+                            None => crate::icons::file_icon(&name, &ui)
+                                .render()
+                                .into_any_element(),
+                        };
                         div()
                             .flex()
                             .items_center()
                             .gap(px(6.))
                             .h(px(24.))
-                            .pl(px(8.))
+                            .pl(px(if shows_thumbnail { 3. } else { 8. }))
                             .pr(px(4.))
                             .rounded(px(ui::RADIUS_SM))
                             .bg(UiColors::tint(ui.foreground, 0.05))
                             .border_1()
                             .border_color(ui.divider)
                             .text_size(px(theme::TEXT_SM))
-                            .child(crate::icons::file_icon(&name, &ui).render())
+                            .child(glyph)
                             .child(div().max_w(px(220.)).truncate().child(name))
                             .child(
                                 ui::icon_button(("fg-chip-remove", index), IconName::Close, ui)
@@ -1652,7 +1773,7 @@ impl Conversation {
                     this.emit(UiEvent::ComposerAction((action_id.clone(), composed)), cx)
                 }))
         });
-        let attachments = composer.attachments;
+        let attachments = composer.attachments && !editing;
         Some(
             div()
                 .w_full()
@@ -1681,6 +1802,7 @@ impl Conversation {
                             ui.input_border
                         })
                         .on_action(cx.listener(Self::send))
+                        .on_action(cx.listener(Self::cancel_edit))
                         .when(attachments, |field| {
                             field
                                 .drag_over::<ExternalPaths>(move |style, _, _, _| {
@@ -1693,7 +1815,7 @@ impl Conversation {
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             window.focus(&this.input.focus_handle(cx))
                         }))
-                        .children(reply)
+                        .children(bar)
                         .children(chips)
                         .child(
                             div()
@@ -1730,8 +1852,19 @@ impl Conversation {
                                         .items_center()
                                         .justify_center()
                                         .cursor_pointer()
-                                        .child(icon(IconName::ArrowUp, ui.on_accent))
-                                        .tooltip(ui::tooltip(tr("Send"), None))
+                                        // Editing: a check mark — Save.
+                                        .child(icon(
+                                            if editing {
+                                                IconName::Check
+                                            } else {
+                                                IconName::ArrowUp
+                                            },
+                                            ui.on_accent,
+                                        ))
+                                        .tooltip(ui::tooltip(
+                                            if editing { tr("Save") } else { tr("Send") },
+                                            None,
+                                        ))
                                         .on_click(cx.listener(
                                             |this, _: &ClickEvent, window, cx| {
                                                 this.send(&Send, window, cx)
@@ -1812,6 +1945,11 @@ impl Render for Conversation {
                     })
                     .into_any_element()
             };
+        // A quote or an edit the plugin put over the field: the field takes the keyboard — only in
+        // the active window (the user may work in another one).
+        if std::mem::take(&mut self.take_keyboard) && window_active(window) {
+            window.focus(&self.input.focus_handle(cx));
+        }
         let composer = self.render_composer(window, cx);
         div()
             .track_focus(&self.focus_handle)
@@ -1890,8 +2028,11 @@ fn natural_width(message: &Message, inner: f32, ui: UiColors, window: &mut Windo
                     .0
                 }
             }
+            // The name is drawn in the medium weight.
             MessagePart::File(file) => {
-                FILE_ICON + 11. + regular(&file.name, TEXT_SIZE, window).max(140.)
+                let mut medium = font(theme::UI_FONT);
+                medium.weight = FontWeight::MEDIUM;
+                FILE_ICON + 11. + shaped_width(&file.name, medium, TEXT_SIZE, window).max(140.)
             }
             MessagePart::Placeholder(placeholder) => {
                 22. + regular(&placeholder.text, TEXT_SIZE, window)
@@ -2081,6 +2222,12 @@ pub fn render_avatar(
 
 /// A quote: the author in their color, one line of the text, a bar on the left.
 fn quote_block(quote: &MessageQuote, color: Hsla, ui: UiColors) -> gpui::Div {
+    quote_lines(quote.author.clone().into(), &quote.text, color, ui)
+}
+
+/// A title in `color` over one line of text, a bar on the left: a quote, the message being
+/// edited.
+fn quote_lines(title: SharedString, text: &str, color: Hsla, ui: UiColors) -> gpui::Div {
     div()
         .min_w_0()
         .flex()
@@ -2098,14 +2245,54 @@ fn quote_block(quote: &MessageQuote, color: Hsla, ui: UiColors) -> gpui::Div {
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(color)
                 .truncate()
-                .child(quote.author.clone()),
+                .child(title),
         )
         .child(
             div()
                 .text_color(ui.text_muted)
                 .truncate()
-                .child(quote.text.replace('\n', " ")),
+                .child(text.replace('\n', " ")),
         )
+}
+
+/// The bar over the field: an icon, what it is about (a quote, the message being edited), ×.
+fn field_bar(
+    glyph: IconName,
+    block: gpui::Div,
+    close: gpui::Stateful<gpui::Div>,
+    ui: UiColors,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(9.))
+        .px(px(4.))
+        .pb(px(6.))
+        .border_b_1()
+        .border_color(ui.divider)
+        .child(icon(glyph, ui.accent_text))
+        .child(block.flex_1().min_w_0())
+        .child(close)
+}
+
+/// A file the field shows as a picture (its chip has a thumbnail): PNG, JPEG, WebP, GIF.
+fn is_picture(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            PICTURE_EXTENSIONS
+                .iter()
+                .any(|picture| extension.eq_ignore_ascii_case(picture))
+        })
+}
+
+/// The window is the one the user works in (a scenario in the background counts as such).
+fn window_active(window: &Window) -> bool {
+    #[cfg(feature = "scenario")]
+    if crate::scenario::background() {
+        return true;
+    }
+    window.is_window_active()
 }
 
 fn render_notice(spans: &[RichSpan], ui: UiColors) -> AnyElement {

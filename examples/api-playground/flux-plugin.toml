@@ -76,6 +76,20 @@ title = "Playground Board"
 icon = "icons/playground.svg"
 location = "editor"
 
+# A block of the plugin's Settings page (API 0.5): fake accounts, as FluxGram's — Settings →
+# Plugins → API Playground.
+[[tool-windows]]
+id = "accounts"
+title = "Accounts"
+location = "settings"
+
+# A dialog (API 0.5): the accounts' Add Account opens it — a QR code, or a phone number, a code
+# and a password.
+[[tool-windows]]
+id = "sign-in"
+title = "Add Account"
+location = "dialog"
+
 # Tools for Claude (API 0.5): the window's Claude sessions get them as mcp__flux__api_playground_*.
 [[tools]]
 name = "echo"

@@ -139,6 +139,7 @@ pub fn button(id: &str, label: &str) -> Button {
             tooltip: None,
             primary: false,
             enabled: true,
+            busy: false,
         },
     }
 }
@@ -153,6 +154,7 @@ pub fn icon_button(id: &str, icon: &str, tooltip: &str) -> Element {
             tooltip: Some(tooltip.to_string()),
             primary: false,
             enabled: true,
+            busy: false,
         },
     }
     .into()
@@ -188,6 +190,13 @@ impl Button {
         self.spec.enabled = enabled;
         self
     }
+
+    /// Work is in progress after its press (API 0.5): a spinner in place of the icon, and the
+    /// button doesn't press — Next while the server answers.
+    pub fn busy(mut self, busy: bool) -> Self {
+        self.spec.busy = busy;
+        self
+    }
 }
 
 impl From<Button> for Element {
@@ -205,6 +214,22 @@ pub fn text_field(id: &str, text: &str, placeholder: Option<&str>) -> Element {
             placeholder: placeholder.map(str::to_string),
             code: false,
             multiline: false,
+            secret: false,
+        }),
+    )
+}
+
+/// A password field (API 0.5): the text shows as dots and isn't copied; changes come as
+/// `changed`, ↵ as `submitted`.
+pub fn password_field(id: &str, text: &str, placeholder: Option<&str>) -> Element {
+    Element::new(
+        id,
+        ElementKind::TextField(TextFieldSpec {
+            text: text.to_string(),
+            placeholder: placeholder.map(str::to_string),
+            code: false,
+            multiline: false,
+            secret: true,
         }),
     )
 }
@@ -219,6 +244,7 @@ pub fn multiline_field(id: &str, text: &str, placeholder: Option<&str>) -> Eleme
             placeholder: placeholder.map(str::to_string),
             code: false,
             multiline: true,
+            secret: false,
         }),
     )
 }

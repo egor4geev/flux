@@ -87,6 +87,7 @@ mod plugin_calls;
 mod plugin_catalog;
 mod plugin_claude;
 mod plugin_conversation;
+mod plugin_dialog;
 mod plugin_form;
 mod plugin_git;
 mod plugin_images;
@@ -269,6 +270,7 @@ fn main() {
         plugins::init(cx);
         plugin_services::init(cx);
         plugin_view::init(cx);
+        plugin_dialog::init(cx);
         claude::init(cx);
         region_guard::init(cx);
         region_status::init(cx);

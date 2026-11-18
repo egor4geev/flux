@@ -1574,7 +1574,7 @@ impl PluginManager {
                     .into_any_element(),
             );
         }
-        if on && !plugin.manifest().settings.is_empty() {
+        if on && plugin.manifest().has_settings_page() {
             let id = plugin.id.clone();
             buttons.push(
                 ui::text_button("plugin-settings", tr("Settings"), false, ui)

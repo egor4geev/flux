@@ -6,6 +6,8 @@
 //! pickers, the settings page, branches, links, Claude, contexts, the time, badges, a window in the
 //! editor) are in [`api03`].
 
+/// The API 0.5's two more places of a window: a block of the Settings page, a dialog.
+mod accounts;
 mod api03;
 /// The API 0.5's sections: the plugin's service, the file dialog.
 mod api05;
@@ -223,11 +225,13 @@ struct Playground {
     /// The sections of API 0.3.
     v3: api03::State,
     v5: api05::State,
+    /// The fake accounts of the Settings page and their sign-in dialog.
+    accounts: accounts::State,
 }
 
 impl Plugin for Playground {
     fn new() -> Self {
-        Playground {
+        let playground = Playground {
             shown: false,
             results: HashMap::new(),
             notes: HashMap::new(),
@@ -249,7 +253,11 @@ impl Plugin for Playground {
             clock: None,
             v3: api03::State::default(),
             v5: api05::State::default(),
-        }
+            accounts: accounts::State::default(),
+        };
+        // The Settings page's block has its view before the page is opened.
+        playground.accounts.render_accounts();
+        playground
     }
 
     fn run_command(&mut self, command: &str, context: &CommandContext) {
@@ -266,6 +274,9 @@ impl Plugin for Playground {
     }
 
     fn on_event(&mut self, event: Event) {
+        let Some(event) = self.accounts.handle(event) else {
+            return;
+        };
         let Some(event) = self.handle_05(event) else {
             return;
         };

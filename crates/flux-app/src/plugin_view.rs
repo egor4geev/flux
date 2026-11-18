@@ -77,6 +77,8 @@ actions!(
         NewLine,
         /// ⇥: the next text field of the view takes the keyboard (the first after the last).
         FocusNextField,
+        /// ⇧⇥: the previous text field (the last before the first).
+        FocusPreviousField,
         /// ⌘↵: the first primary button of the selected row (a card's "Take to Work"):
         /// `row-action`.
         RunRowAction,
@@ -139,6 +141,10 @@ const PROPERTY_LABEL_SHARE: f32 = 0.4;
 const PROPERTY_LABEL_MIN_WIDTH: f32 = 72.;
 /// A tab's content keeps this far from the editor island's edges.
 const TAB_PADDING: f32 = GAP;
+/// A dialog's content lines up with its title: the frame's padding less the elements' inset.
+const DIALOG_PADDING: f32 = 20. - CONTENT_INSET;
+/// The gap between the cards of two-line rows in a Settings block.
+const SETTINGS_ROW_GAP: f32 = 8.;
 /// Elements nested deeper are not drawn: a broken view can't take the window down.
 const MAX_DEPTH: usize = 32;
 const RESIZE_HANDLE_WIDTH: f32 = GAP;
@@ -217,6 +223,7 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("enter", Activate, context),
             KeyBinding::new("cmd-enter", RunRowAction, context),
             KeyBinding::new("tab", FocusNextField, context),
+            KeyBinding::new("shift-tab", FocusPreviousField, context),
             // The island on the right handles them for whichever window it shows.
             KeyBinding::new("escape", FocusEditor, context),
             KeyBinding::new("shift-escape", Hide, context),
@@ -250,6 +257,15 @@ pub enum Chrome {
     /// The island on the left in place of the tree (API 0.5): the title and Hide in the header;
     /// the window gives it the left island's width.
     Left,
+    /// A dialog in the middle of the window, over everything (API 0.5, `location = "dialog"`):
+    /// the dialog's frame (`crate::plugin_dialog`) has the title and ×; the view is as tall as its
+    /// content, scrolling when the frame stops growing. A tree in it is as tall as its rows.
+    Dialog,
+    /// A block of the plugin's Settings page (API 0.5, `location = "settings"`): no header (the
+    /// page heads it with the title), the content's own height, no scrolling of its own — the
+    /// page scrolls. A tree in it is as tall as its rows; two-line rows are cards with their
+    /// buttons always shown (the accounts and their Sign Out).
+    Settings,
 }
 
 pub struct PluginView {
@@ -299,6 +315,9 @@ pub struct PluginView {
     content_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     /// The field that had the keyboard when the view was last drawn (its focus ring).
     focused_field: Option<String>,
+    /// A dialog's new view brought fields while none had the keyboard, or took away the one that
+    /// had it: the first field takes the keyboard at the next frame.
+    refocus: bool,
     /// When the plugin last switched to another screen ([`another_screen`]): it fades in.
     screen_since: Option<Instant>,
 }
@@ -309,6 +328,8 @@ const CLICK_OPEN_WINDOW: Duration = Duration::from_secs(2);
 /// A text field of the view.
 struct Field {
     input: FieldInput,
+    /// A password (API 0.5): masked.
+    secret: bool,
     /// The text the plugin last gave: a new view replaces what the user typed only when the
     /// plugin's text changes.
     plugin_text: String,
@@ -417,6 +438,7 @@ impl PluginView {
             element_bounds: Rc::new(RefCell::new(HashMap::new())),
             content_bounds: Rc::new(std::cell::Cell::new(None)),
             focused_field: None,
+            refocus: false,
             screen_since: None,
         }
     }
@@ -471,6 +493,7 @@ impl PluginView {
             HashMap::new()
         };
         let now = Instant::now();
+        let fields_before: HashSet<String> = self.fields.keys().cloned().collect();
         // Each tree's place among the view's trees: a board's column.
         let mut column = 0;
         let mut present = HashSet::new();
@@ -521,6 +544,16 @@ impl PluginView {
                     .is_some_and(|(list, _)| present.contains(list))
         });
         self.fields.retain(|id, _| present.contains(id));
+        if self.chrome == Chrome::Dialog {
+            let came = self.fields.keys().any(|id| !fields_before.contains(id));
+            let lost = self
+                .focused_field
+                .as_ref()
+                .is_some_and(|id| !self.fields.contains_key(id));
+            if lost || (came && self.focused_field.is_none()) {
+                self.refocus = true;
+            }
+        }
         self.trees.retain(|id, _| present.contains(id));
         self.markdown.retain(|id, _| present.contains(id));
         self.conversations.retain(|id, _| present.contains(id));
@@ -585,12 +618,11 @@ impl PluginView {
     // --- Fields ---
 
     fn sync_field(&mut self, id: &str, spec: &TextFieldSpec, cx: &mut Context<Self>) {
-        // A field that became multi-line (or single-line) is made anew.
-        if self
-            .fields
-            .get(id)
-            .is_some_and(|field| field.input.multiline() != spec.multiline)
-        {
+        // A field that became multi-line (or single-line), or a password (or plain), is made
+        // anew.
+        if self.fields.get(id).is_some_and(|field| {
+            field.input.multiline() != spec.multiline || field.secret != spec.secret
+        }) {
             self.fields.remove(id);
         }
         if let Some(field) = self.fields.get_mut(id) {
@@ -614,10 +646,11 @@ impl PluginView {
             });
             (FieldInput::Lines(input), subscription)
         } else {
-            let code = spec.code;
+            let (code, secret) = (spec.code, spec.secret);
             let input = cx.new(|cx| {
                 let input = TextInput::new(placeholder, cx);
-                if code { input.code() } else { input }
+                let input = if code { input.code() } else { input };
+                if secret { input.masked() } else { input }
             });
             input.update(cx, |input, cx| input.set_text(&spec.text, cx));
             let subscription = cx.subscribe(&input, move |this, input, _: &InputEvent, cx| {
@@ -630,6 +663,7 @@ impl PluginView {
             id.to_string(),
             Field {
                 input,
+                secret: spec.secret,
                 plugin_text: spec.text.clone(),
                 echo: Some(spec.text.clone()),
                 _subscription: subscription,
@@ -655,30 +689,87 @@ impl PluginView {
         }
     }
 
-    /// ⇥: the next field of the view, in the order of the elements, takes the keyboard.
-    fn focus_next_field(
-        &mut self,
-        _: &FocusNextField,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(view) = &self.view else {
-            return;
-        };
-        let order: Vec<&Field> = view
-            .elements
-            .iter()
-            .filter_map(|element| self.fields.get(&element.id))
-            .collect();
+    /// ⇥ (⇧⇥ — `forward` false): the next (previous) text field of the view, in the order of
+    /// the elements, takes the keyboard; from outside the fields — the first (the last).
+    pub fn focus_field_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let order = self.field_order(cx);
         if order.is_empty() {
             return;
         }
         let current = order
             .iter()
-            .position(|field| field.input.focus_handle(cx).is_focused(window));
-        let next = current.map_or(0, |index| (index + 1) % order.len());
-        window.focus(&order[next].input.focus_handle(cx));
+            .position(|handle| handle.contains_focused(window, cx));
+        let next = match (current, forward) {
+            (Some(index), true) => (index + 1) % order.len(),
+            (Some(index), false) => (index + order.len() - 1) % order.len(),
+            (None, true) => 0,
+            (None, false) => order.len() - 1,
+        };
+        window.focus(&order[next]);
         cx.notify();
+    }
+
+    /// The text fields' focus handles in the order of the view's elements.
+    fn field_order(&self, cx: &App) -> Vec<FocusHandle> {
+        let Some(view) = &self.view else {
+            return Vec::new();
+        };
+        view.elements
+            .iter()
+            .filter_map(|element| self.fields.get(&element.id))
+            .map(|field| field.input.focus_handle(cx))
+            .collect()
+    }
+
+    /// The view's first text field takes the keyboard (a dialog that opens, API 0.5); false when
+    /// the view has none.
+    pub fn focus_first_field(&self, window: &mut Window, cx: &App) -> bool {
+        match self.field_order(cx).first() {
+            Some(handle) => {
+                window.focus(handle);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the plugin has given the view its content.
+    pub fn has_view(&self) -> bool {
+        self.view.is_some()
+    }
+
+    /// The view's content keeps its own height (a dialog, a Settings block — API 0.5) rather
+    /// than taking the height it is given.
+    fn natural_height(&self) -> bool {
+        matches!(self.chrome, Chrome::Dialog | Chrome::Settings)
+    }
+
+    /// The inset of text, fields and buttons from the content's edge: none in a Settings block,
+    /// which lines up with the page's headings.
+    fn content_inset(&self) -> f32 {
+        match self.chrome {
+            Chrome::Settings => 0.,
+            _ => CONTENT_INSET,
+        }
+    }
+
+    /// The inset of a tree's rows from the content's edge.
+    fn row_inset(&self) -> f32 {
+        match self.chrome {
+            Chrome::Settings => 0.,
+            _ => ROW_INSET,
+        }
+    }
+
+    /// The height of a tree's row as this window draws it: a two-line row of a Settings block is
+    /// a card with a gap under it.
+    fn tree_row_height(&self, tree: &TreeState) -> f32 {
+        if self.chrome == Chrome::Settings && tree.two_line && !tree.cards {
+            // The row's own 2 px gap gives way to the cards' gap.
+            TWO_LINE_HEIGHT - 2. + SETTINGS_ROW_GAP
+        } else {
+            tree.row_height()
+        }
     }
 
     /// ↵ in a multi-line field: a line break at the caret.
@@ -1372,6 +1463,31 @@ impl PluginView {
                             .children(badge),
                     ),
             );
+        // A Settings block's row is a card (an account) with its buttons always there; elsewhere
+        // the buttons show at the row's end while it is selected or hovered, as a list row's.
+        let card = self.chrome == Chrome::Settings;
+        let body = body
+            .when(card, |body| {
+                body.px(px(12.))
+                    .rounded(px(ui::RADIUS_MD))
+                    .border_1()
+                    .border_color(ui.island_border)
+            })
+            .when(!row.actions.is_empty(), |body| {
+                let actions = self.render_row_actions(tree_id, row, ui, cx);
+                if card || selected {
+                    body.child(actions)
+                } else {
+                    body.child(
+                        div()
+                            .id("plugin-row-actions")
+                            .flex_none()
+                            .opacity(0.)
+                            .group_hover(ROW_GROUP, |style| style.opacity(1.))
+                            .child(actions),
+                    )
+                }
+            });
         let body = if selected {
             selection_colors(body, &row.key, focused, false, ui).into_any_element()
         } else {
@@ -1379,13 +1495,14 @@ impl PluginView {
                 .into_any_element()
         };
         let tree = tree_id.to_string();
+        let gap = if card { SETTINGS_ROW_GAP } else { 2. };
         let element = div()
             .id(("plugin-tree-row", index))
             .group(ROW_GROUP)
-            .h(px(TWO_LINE_HEIGHT))
+            .h(px(TWO_LINE_HEIGHT - 2. + gap))
             .w_full()
-            .px(px(ROW_INSET))
-            .pb(px(2.))
+            .px(px(self.row_inset()))
+            .pb(px(gap))
             .whitespace_nowrap()
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_row(&tree, index, event.click_count(), window, cx)
@@ -1603,13 +1720,49 @@ impl PluginView {
     ) -> AnyElement {
         let ui = Theme::ui(cx);
         let Some(view) = &self.view else {
-            return empty_state(tr("Nothing to show"), ui).into_any_element();
+            // A Settings block waits for its plugin without a word: the page has its own.
+            return match self.chrome {
+                Chrome::Settings => div().into_any_element(),
+                _ => empty_state(tr("Nothing to show"), ui).into_any_element(),
+            };
         };
         if view.elements.is_empty() {
-            return empty_state(tr("Nothing to show"), ui).into_any_element();
+            return match self.chrome {
+                Chrome::Settings => div().into_any_element(),
+                _ => empty_state(tr("Nothing to show"), ui).into_any_element(),
+            };
         }
         let mut drawn = HashSet::new();
         let root = self.render_element(&view.elements, 0, Parent::Root, 0, &mut drawn, window, cx);
+        match self.chrome {
+            // The page scrolls: the block is as tall as its content.
+            Chrome::Settings => {
+                return div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .when(shown < 1., |content| content.opacity(shown))
+                    .child(root)
+                    .into_any_element();
+            }
+            // As tall as the content until the dialog stops growing, then it scrolls.
+            Chrome::Dialog => {
+                return div()
+                    .id("plugin-view-content")
+                    .w_full()
+                    .min_h_0()
+                    .flex_shrink()
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .pb_5()
+                    .when(shown < 1., |content| content.opacity(shown))
+                    .child(root)
+                    .into_any_element();
+            }
+            Chrome::Island | Chrome::Tab | Chrome::Left => {}
+        }
         if self.holds_tree.first().copied().unwrap_or(false) {
             // A tree scrolls by itself and takes the height left.
             div()
@@ -1656,7 +1809,10 @@ impl PluginView {
         if depth > MAX_DEPTH || !drawn.insert(index) {
             return div().into_any_element();
         }
-        let holds_tree = self.holds_tree.get(index).copied().unwrap_or(false);
+        // A dialog and a Settings block keep their content's height: nothing in them takes the
+        // height left.
+        let natural = self.natural_height();
+        let holds_tree = !natural && self.holds_tree.get(index).copied().unwrap_or(false);
         let mut children =
             |window: &mut Window, cx: &mut Context<Self>, parent: Parent| -> Vec<AnyElement> {
                 element
@@ -1857,12 +2013,14 @@ impl PluginView {
                     | ElementKind::Badge(_)
                     | ElementKind::Row
             );
-        let grows = matches!(
-            element.kind,
-            ElementKind::Tree(_) | ElementKind::Spacer | ElementKind::Conversation(_)
-        ) || (matches!(element.kind, ElementKind::Column | ElementKind::Row)
-            && holds_tree);
-        let block = div().when(inset, |block| block.px(px(CONTENT_INSET)));
+        let grows = matches!(element.kind, ElementKind::Spacer)
+            || (!natural
+                && matches!(
+                    element.kind,
+                    ElementKind::Tree(_) | ElementKind::Conversation(_)
+                ))
+            || (matches!(element.kind, ElementKind::Column | ElementKind::Row) && holds_tree);
+        let block = div().when(inset, |block| block.px(px(self.content_inset())));
         let block = if parent == Parent::Row {
             match element.kind {
                 // Trees side by side share the row's width and take its whole height; a column of
@@ -2244,6 +2402,17 @@ impl PluginView {
     fn render_button(&self, id: &str, spec: &ButtonSpec, cx: &mut Context<Self>) -> AnyElement {
         let ui = Theme::ui(cx);
         let element_id = ElementId::Name(format!("plugin-button-{id}").into());
+        // At work after its press (API 0.5): the spinner in place of the icon, the label stays,
+        // no press.
+        if spec.busy {
+            let label = spec.label.as_deref().map(|label| single_line(label).into());
+            let button = ui::busy_button(element_id, label, spec.primary, ui);
+            return match spec.tooltip.as_deref() {
+                Some(tooltip) => button.tooltip(ui::tooltip(single_line(tooltip), None)),
+                None => button,
+            }
+            .into_any_element();
+        }
         let button_icon = spec
             .icon
             .as_deref()
@@ -2358,6 +2527,16 @@ impl PluginView {
         // A sideways swipe over a board's lane slides the board, not the lane down.
         .map(own_axis_only)
         .size_full();
+        if self.natural_height() {
+            // As tall as its rows: the dialog or the Settings page scrolls, not the tree.
+            let rows = tree.visible.len() as f32 * self.tree_row_height(tree);
+            return div()
+                .flex_none()
+                .w_full()
+                .h(px(rows))
+                .child(list)
+                .into_any_element();
+        }
         div()
             .flex_1()
             .min_h_0()
@@ -2387,16 +2566,26 @@ impl Render for PluginView {
         self.measure_properties(window, cx);
         let shown = self.screen_shown(window);
         let content = self.render_content(shown, window, cx);
+        // A dialog's next screen (a sign-in's next step): its first field takes the keyboard; when
+        // the field that had it went and none came, the view does — the keys (Esc, ⇥) keep working.
+        if self.refocus && self.visible {
+            self.refocus = false;
+            if !self.focus_first_field(window, cx) && window.focused(cx).is_none() {
+                window.focus(&self.focus_handle);
+            }
+        }
         let frame = div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
             .relative()
-            .h_full()
+            .when(!self.natural_height(), |frame| frame.h_full())
             .flex()
             .flex_col();
         let frame = match self.chrome {
             Chrome::Island => frame.flex_none().w(px(self.width.get())),
             Chrome::Tab | Chrome::Left => frame.w_full().min_w_0(),
+            Chrome::Dialog => frame.w_full().min_w_0().min_h_0().flex_shrink(),
+            Chrome::Settings => frame.w_full().min_w_0(),
         };
         frame
             .font_family(theme::UI_FONT)
@@ -2437,7 +2626,12 @@ impl Render for PluginView {
             .on_action(cx.listener(Self::collapse))
             .on_action(cx.listener(Self::activate))
             .on_action(cx.listener(Self::run_row_action))
-            .on_action(cx.listener(Self::focus_next_field))
+            .on_action(cx.listener(|this, _: &FocusNextField, window, cx| {
+                this.focus_field_step(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusPreviousField, window, cx| {
+                this.focus_field_step(false, window, cx)
+            }))
             .map(|frame| match self.chrome {
                 Chrome::Island => frame
                     .on_drag_move(
@@ -2480,6 +2674,27 @@ impl Render for PluginView {
                             .on_children_prepainted(record_area(&self.content_bounds))
                             .child(content),
                     ),
+                // A dialog: its frame has the title; the content lines up with it.
+                Chrome::Dialog => frame.child(
+                    div()
+                        .w_full()
+                        .min_h_0()
+                        .flex_shrink()
+                        .px(px(DIALOG_PADDING))
+                        .flex()
+                        .flex_col()
+                        .on_children_prepainted(record_area(&self.content_bounds))
+                        .child(content),
+                ),
+                // A Settings block: the page heads it and scrolls it.
+                Chrome::Settings => frame.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .on_children_prepainted(record_area(&self.content_bounds))
+                        .child(content),
+                ),
                 // A tab: the editor's island frames it, the tab names it.
                 Chrome::Tab => frame.child(
                     div()

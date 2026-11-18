@@ -29,6 +29,8 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("GB", "ГБ"),
     // The field.
     ("Attach Files", "Приложить файлы"),
+    // The bar over the field while a message is edited.
+    ("Editing", "Редактирование"),
 ];
 
 pub(super) const PLURALS: &[(&str, [&str; 3])] = &[];
