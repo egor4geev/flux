@@ -76,3 +76,11 @@ The sections of API 0.3:
 | A Window in the Editor | **Open Board** | A window of the plugin among the editor's tabs: the tasks in columns by status. **Playground: Open Playground Board** in the palette too. |
 | | **Rename** | The tab's title changes (`ui.set-title`). |
 | | **Close** | The tab closes (`ui.hide`). |
+
+**Playground: Open Panel Playground** in the palette (API 0.5, FluxGram part 4): a conversation among
+the editor's tabs whose field has the panel of emoji, stickers and GIFs (☺ by the field). The emoji
+are Flux's own; the stickers (favorite, recent, two sets, a search) and the GIFs (saved ones paged by
+`panel-load-more`, a search) are the plugin's, from `panel/` of its data folder — `sticker.jpg`,
+`sticker-0.fxa` … `sticker-3.fxa` (FXA animations of 144 px), `gif.mp4` and its poster `gif.jpg`,
+copied there by hand or by a scenario. A choice posts a message saying what was chosen; the panel's
+events go to the plugin's log.

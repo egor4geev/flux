@@ -720,6 +720,27 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
                          *active_tooltip.borrow_mut() = new_tooltip;
                          window.refresh();
                      })
+diff -ruN a/src/elements/surface.rs b/src/elements/surface.rs
+--- a/src/elements/surface.rs	2026-11-18 18:46:58
++++ b/src/elements/surface.rs	2026-11-18 18:46:58
+@@ -96,8 +96,15 @@
+             SurfaceSource::Surface(surface) => {
+                 let size = crate::size(surface.get_width().into(), surface.get_height().into());
+                 let new_bounds = self.object_fit.get_bounds(bounds, size);
+-                // TODO: Add support for corner_radii
+-                window.paint_surface(new_bounds, surface.clone());
++                // Flux patch (FluxGram part 4): the corner radii of the element's style, as
++                // `img` rounds its picture.
++                let mut style = Style::default();
++                style.refine(&self.style);
++                let corner_radii = style
++                    .corner_radii
++                    .to_pixels(window.rem_size())
++                    .clamp_radii_for_quad_size(new_bounds.size);
++                window.paint_surface(new_bounds, corner_radii, surface.clone());
+             }
+             #[allow(unreachable_patterns)]
+             _ => {}
 diff -ruN a/src/elements/text.rs b/src/elements/text.rs
 --- a/src/elements/text.rs	2026-11-18 10:51:46
 +++ b/src/elements/text.rs	2026-11-18 10:51:46
@@ -917,8 +938,20 @@ diff -ruN a/src/platform/mac/events.rs b/src/platform/mac/events.rs
                  }),
                  NSEventType::NSLeftMouseDragged
 diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
---- a/src/platform/mac/metal_renderer.rs	2026-10-30 13:10:46
-+++ b/src/platform/mac/metal_renderer.rs	2026-10-30 13:10:46
+--- a/src/platform/mac/metal_renderer.rs	2026-11-18 18:46:58
++++ b/src/platform/mac/metal_renderer.rs	2026-11-18 18:46:58
+@@ -1,8 +1,8 @@
+ use super::metal_atlas::MetalAtlas;
+ use crate::{
+-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
+-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+-    Surface, Underline, point, size,
++    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, MonochromeSprite,
++    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
++    Size, Underline, point, size,
+ };
+ use anyhow::Result;
+ use block::ConcreteBlock;
 @@ -370,8 +370,12 @@
          loop {
              let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
@@ -1029,7 +1062,38 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
                          viewport_size,
                          |color_attachment| {
                              color_attachment.set_load_action(metal::MTLLoadAction::Load);
-@@ -1158,7 +1226,7 @@
+@@ -1111,7 +1179,7 @@
+                 .unwrap();
+ 
+             align_offset(instance_offset);
+-            let next_offset = *instance_offset + mem::size_of::<Surface>();
++            let next_offset = *instance_offset + mem::size_of::<SurfaceBounds>();
+             if next_offset > instance_buffer.size {
+                 return false;
+             }
+@@ -1121,6 +1189,12 @@
+                 Some(&instance_buffer.metal_buffer),
+                 *instance_offset as u64,
+             );
++            // Flux patch (FluxGram part 4): the fragment shader rounds the corners.
++            command_encoder.set_fragment_buffer(
++                SurfaceInputIndex::Surfaces as u64,
++                Some(&instance_buffer.metal_buffer),
++                *instance_offset as u64,
++            );
+             command_encoder.set_vertex_bytes(
+                 SurfaceInputIndex::TextureSize as u64,
+                 mem::size_of_val(&texture_size) as u64,
+@@ -1145,6 +1219,8 @@
+                     SurfaceBounds {
+                         bounds: surface.bounds,
+                         content_mask: surface.content_mask.clone(),
++                        corner_radii: surface.corner_radii.clone(),
++                        opacity: surface.opacity,
+                     },
+                 );
+             }
+@@ -1158,7 +1234,7 @@
  
  fn new_command_encoder<'a>(
      command_buffer: &'a metal::CommandBufferRef,
@@ -1038,7 +1102,7 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
      viewport_size: Size<DevicePixels>,
      configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
  ) -> &'a metal::RenderCommandEncoderRef {
-@@ -1167,7 +1235,7 @@
+@@ -1167,7 +1243,7 @@
          .color_attachments()
          .object_at(0)
          .unwrap();
@@ -1047,6 +1111,20 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
      color_attachment.set_store_action(metal::MTLStoreAction::Store);
      configure_color_attachment(color_attachment);
  
+@@ -1347,9 +1423,12 @@
+     pub bounds: Bounds<ScaledPixels>,
+ }
+ 
+-#[derive(Clone, Debug, Eq, PartialEq)]
++#[derive(Clone, Debug, PartialEq)]
+ #[repr(C)]
+ pub struct SurfaceBounds {
+     pub bounds: Bounds<ScaledPixels>,
+     pub content_mask: ContentMask<ScaledPixels>,
++    /// Flux patch (FluxGram part 4): rounded corners and opacity.
++    pub corner_radii: Corners<ScaledPixels>,
++    pub opacity: f32,
+ }
 diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
 --- a/src/platform/mac/platform.rs	2026-10-30 13:10:46
 +++ b/src/platform/mac/platform.rs	2026-10-30 13:10:46
@@ -1491,6 +1569,54 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
          };
          platform.write_to_clipboard(item.clone());
          assert_eq!(platform.read_from_clipboard(), Some(item));
+diff -ruN a/src/platform/mac/shaders.metal b/src/platform/mac/shaders.metal
+--- a/src/platform/mac/shaders.metal	2026-11-18 18:46:58
++++ b/src/platform/mac/shaders.metal	2026-11-18 18:46:58
+@@ -837,12 +837,14 @@
+ struct SurfaceVertexOutput {
+   float4 position [[position]];
+   float2 texture_position;
++  uint surface_id [[flat]];
+   float clip_distance [[clip_distance]][4];
+ };
+ 
+ struct SurfaceFragmentInput {
+   float4 position [[position]];
+   float2 texture_position;
++  uint surface_id [[flat]];
+ };
+ 
+ vertex SurfaceVertexOutput surface_vertex(
+@@ -865,10 +867,13 @@
+   return SurfaceVertexOutput{
+       device_position,
+       texture_position,
++      surface_id,
+       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+ }
+ 
+ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
++                                 constant SurfaceBounds *surfaces
++                                 [[buffer(SurfaceInputIndex_Surfaces)]],
+                                  texture2d<float> y_texture
+                                  [[texture(SurfaceInputIndex_YTexture)]],
+                                  texture2d<float> cb_cr_texture
+@@ -883,7 +888,14 @@
+       y_texture.sample(texture_sampler, input.texture_position).r,
+       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+ 
+-  return ycbcrToRGBTransform * ycbcr;
++  // Flux patch (FluxGram part 4): rounded corners, antialiased as a sprite's, and the
++  // element's opacity.
++  SurfaceBounds surface = surfaces[input.surface_id];
++  float distance =
++      quad_sdf(input.position.xy, surface.bounds, surface.corner_radii);
++  float4 color = ycbcrToRGBTransform * ycbcr;
++  color.a *= surface.opacity * saturate(0.5 - distance);
++  return color;
+ }
+ 
+ float4 hsla_to_rgba(Hsla hsla) {
 diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
 --- a/src/platform/mac/window.rs	2026-10-30 13:10:46
 +++ b/src/platform/mac/window.rs	2026-10-30 13:10:46
@@ -2330,6 +2456,19 @@ diff -ruN a/src/platform.rs b/src/platform.rs
          }
      }
  }
+diff -ruN a/src/scene.rs b/src/scene.rs
+--- a/src/scene.rs	2026-11-18 18:46:58
++++ b/src/scene.rs	2026-11-18 18:46:58
+@@ -658,6 +658,9 @@
+     pub order: DrawOrder,
+     pub bounds: Bounds<ScaledPixels>,
+     pub content_mask: ContentMask<ScaledPixels>,
++    /// Flux patch (FluxGram part 4): rounded corners and the element's opacity, as an image's.
++    pub corner_radii: Corners<ScaledPixels>,
++    pub opacity: f32,
+     #[cfg(target_os = "macos")]
+     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+ }
 diff -ruN a/src/style.rs b/src/style.rs
 --- a/src/style.rs	2026-10-30 13:10:46
 +++ b/src/style.rs	2026-10-30 13:10:46
@@ -2407,8 +2546,8 @@ diff -ruN a/src/taffy.rs b/src/taffy.rs
          }
  
 diff -ruN a/src/window.rs b/src/window.rs
---- a/src/window.rs	2026-10-30 13:10:46
-+++ b/src/window.rs	2026-10-30 13:10:46
+--- a/src/window.rs	2026-11-18 18:46:58
++++ b/src/window.rs	2026-11-18 18:46:58
 @@ -7,17 +7,22 @@
      DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
      FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
@@ -2680,7 +2819,24 @@ diff -ruN a/src/window.rs b/src/window.rs
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub(crate) enum DrawPhase {
      None,
-@@ -991,7 +1166,7 @@
+@@ -926,6 +1101,16 @@
+         })
+ }
+ 
++/// Flux patch (FluxGram part 1, the scenarios' frame log): told of every frame a window draws —
++/// the window and how long laying it out and painting it took — whoever asked for it (the display
++/// link, a headless scenario's timer).
++static FRAME_OBSERVER: std::sync::OnceLock<fn(WindowId, Duration)> = std::sync::OnceLock::new();
++
++/// Flux patch: sets the observer of drawn frames, once for the process ([`FRAME_OBSERVER`]).
++pub fn observe_frames(observer: fn(WindowId, Duration)) {
++    let _ = FRAME_OBSERVER.set(observer);
++}
++
+ impl Window {
+     pub(crate) fn new(
+         handle: AnyWindowHandle,
+@@ -991,7 +1176,7 @@
          let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
          let needs_present = Rc::new(Cell::new(false));
          let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
@@ -2689,7 +2845,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
          platform_window
              .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
-@@ -1021,7 +1196,7 @@
+@@ -1021,7 +1206,7 @@
              let active = active.clone();
              let needs_present = needs_present.clone();
              let next_frame_callbacks = next_frame_callbacks.clone();
@@ -2698,7 +2854,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              move |request_frame_options| {
                  let next_frame_callbacks = next_frame_callbacks.take();
                  if !next_frame_callbacks.is_empty() {
-@@ -1034,12 +1209,12 @@
+@@ -1034,12 +1219,12 @@
                          .log_err();
                  }
  
@@ -2715,7 +2871,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
                  if invalidator.is_dirty() || request_frame_options.force_render {
                      measure("frame duration", || {
-@@ -1125,7 +1300,12 @@
+@@ -1125,7 +1310,12 @@
              let mut cx = cx.to_async();
              Box::new(move |event| {
                  handle
@@ -2729,7 +2885,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                      .log_err()
                      .unwrap_or(DispatchEventResult::default())
              })
-@@ -1223,6 +1403,8 @@
+@@ -1223,6 +1413,8 @@
              element_offset_stack: Vec::new(),
              content_mask_stack: Vec::new(),
              element_opacity: 1.0,
@@ -2738,7 +2894,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              requested_autoscroll: None,
              rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
              next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
-@@ -1230,6 +1412,11 @@
+@@ -1230,6 +1422,11 @@
              next_hitbox_id: HitboxId(0),
              next_tooltip_id: TooltipId::default(),
              tooltip_bounds: None,
@@ -2750,7 +2906,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              dirty_views: FxHashSet::default(),
              focus_listeners: SubscriberSet::new(),
              focus_lost_listeners: SubscriberSet::new(),
-@@ -1239,13 +1426,15 @@
+@@ -1239,13 +1436,15 @@
              modifiers,
              capslock,
              scale_factor,
@@ -2767,7 +2923,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              refreshing: false,
              activation_observers: SubscriberSet::new(),
              focus: None,
-@@ -1269,9 +1458,14 @@
+@@ -1269,9 +1468,14 @@
      }
  }
  
@@ -2783,7 +2939,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub default_prevented: bool,
  }
  
-@@ -1673,8 +1867,10 @@
+@@ -1673,8 +1877,10 @@
      }
  
      fn bounds_changed(&mut self, cx: &mut App) {
@@ -2796,7 +2952,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          self.display_id = self.platform_window.display().map(|display| display.id());
  
          self.refresh();
-@@ -1691,7 +1887,9 @@
+@@ -1691,7 +1897,9 @@
  
      /// Set the content size of the window.
      pub fn resize(&mut self, size: Size<Pixels>) {
@@ -2807,7 +2963,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Returns whether or not the window is currently fullscreen
-@@ -1744,7 +1942,9 @@
+@@ -1744,7 +1952,9 @@
  
      /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
      pub fn show_window_menu(&self, position: Point<Pixels>) {
@@ -2818,7 +2974,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Tells the compositor to take control of window movement (Wayland and X11)
-@@ -1816,6 +2016,41 @@
+@@ -1816,6 +2026,41 @@
          self.scale_factor
      }
  
@@ -2860,37 +3016,58 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// The size of an em for the base font of the application. Adjusting this value allows the
      /// UI to scale, just like zooming a web page.
      pub fn rem_size(&self) -> Pixels {
-@@ -2010,6 +2245,29 @@
+@@ -1912,6 +2157,7 @@
+     /// the contents of the new [`Scene`], use [`Self::present`].
+     #[profiling::function]
+     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
++        let started = std::time::Instant::now();
+         self.invalidate_entities();
+         cx.entities.clear_accessed();
+         debug_assert!(self.rendered_entity_stack.is_empty());
+@@ -1977,6 +2223,9 @@
+         self.invalidator.set_phase(DrawPhase::None);
+         self.needs_present.set(true);
+ 
++        if let Some(observer) = FRAME_OBSERVER.get() {
++            observer(self.handle.window_id(), started.elapsed());
++        }
+         ArenaClearNeeded
+     }
+ 
+@@ -2010,6 +2259,32 @@
          profiling::finish_frame!();
      }
  
 +    /// Flux patch (headless scenario frames): what the platform's frame callback does, without
 +    /// presenting — runs the next-frame callbacks and draws the window if it is dirty. The display
 +    /// link that drives frames stops for an occluded window, and a locked screen occludes all of
-+    /// them; Flux's scenarios then call this on a timer.
-+    pub fn headless_frame(&mut self, cx: &mut App) {
++    /// them; Flux's scenarios then call this on a timer. Returns whether the window was drawn (it
++    /// was dirty): the scenarios' frame log counts and times those.
++    pub fn headless_frame(&mut self, cx: &mut App) -> bool {
 +        let callbacks = self.next_frame_callbacks.take();
 +        for callback in callbacks {
 +            callback(self, cx);
 +        }
-+        if self.invalidator.is_dirty() {
++        let dirty = self.invalidator.is_dirty();
++        if dirty {
 +            let arena_clear_needed = self.draw(cx);
 +            arena_clear_needed.clear();
 +        }
 +        self.complete_frame();
++        dirty
 +    }
 +
 +    /// Flux patch (headless scenario screenshots): the window's current frame rendered offscreen —
 +    /// RGBA with premultiplied alpha, in device pixels — without the window server.
 +    pub fn render_to_image(&mut self, cx: &mut App) -> Option<image::RgbaImage> {
-+        self.headless_frame(cx);
++        let _ = self.headless_frame(cx);
 +        self.platform_window.render_to_image(&self.rendered_frame.scene)
 +    }
 +
      fn draw_roots(&mut self, cx: &mut App) {
          self.invalidator.set_phase(DrawPhase::Prepaint);
          self.tooltip_bounds.take();
-@@ -2052,14 +2310,22 @@
+@@ -2052,14 +2327,22 @@
              element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
              prompt_element = Some(element);
              self.prompt = Some(prompt);
@@ -2914,7 +3091,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          }
  
          self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
-@@ -2077,8 +2343,8 @@
+@@ -2077,8 +2360,8 @@
              prompt_element.paint(self, cx);
          } else if let Some(mut drag_element) = active_drag_element {
              drag_element.paint(self, cx);
@@ -2925,7 +3102,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          }
  
          #[cfg(any(feature = "inspector", debug_assertions))]
-@@ -2149,11 +2415,64 @@
+@@ -2149,11 +2432,64 @@
                  id: tooltip_request.id,
                  bounds: tooltip_bounds,
              });
@@ -2990,7 +3167,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
          assert_eq!(self.element_id_stack.len(), 0);
  
-@@ -2448,6 +2767,166 @@
+@@ -2448,6 +2784,166 @@
          result
      }
  
@@ -3157,7 +3334,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
      /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
      /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
-@@ -2783,8 +3262,10 @@
+@@ -2783,8 +3279,10 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3170,7 +3347,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          if !clipped_bounds.is_empty() {
              self.next_frame
                  .scene
-@@ -2812,13 +3293,17 @@
+@@ -2812,13 +3310,17 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3191,7 +3368,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  bounds: shadow_bounds.scale(scale_factor),
                  content_mask: content_mask.scale(scale_factor),
                  corner_radii: corner_radii.scale(scale_factor),
-@@ -2840,16 +3325,22 @@
+@@ -2840,16 +3342,22 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3218,7 +3395,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              border_style: quad.border_style,
          });
      }
-@@ -2861,9 +3352,20 @@
+@@ -2861,9 +3369,20 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3240,7 +3417,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let color: Background = color.into();
          path.color = color.opacity(opacity);
          self.next_frame
-@@ -2888,11 +3390,11 @@
+@@ -2888,11 +3407,11 @@
          } else {
              style.thickness
          };
@@ -3255,7 +3432,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let element_opacity = self.element_opacity();
  
          self.next_frame.scene.insert_primitive(Underline {
-@@ -2901,7 +3403,7 @@
+@@ -2901,7 +3420,7 @@
              bounds: bounds.scale(scale_factor),
              content_mask: content_mask.scale(scale_factor),
              color: style.color.unwrap_or_default().opacity(element_opacity),
@@ -3264,7 +3441,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              wavy: if style.wavy { 1 } else { 0 },
          });
      }
-@@ -2919,11 +3421,11 @@
+@@ -2919,11 +3438,11 @@
  
          let scale_factor = self.scale_factor();
          let height = style.thickness;
@@ -3279,7 +3456,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let opacity = self.element_opacity();
  
          self.next_frame.scene.insert_primitive(Underline {
-@@ -2931,7 +3433,7 @@
+@@ -2931,7 +3450,7 @@
              pad: 0,
              bounds: bounds.scale(scale_factor),
              content_mask: content_mask.scale(scale_factor),
@@ -3288,7 +3465,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              color: style.color.unwrap_or_default().opacity(opacity),
              wavy: 0,
          });
-@@ -2981,11 +3483,11 @@
+@@ -2981,11 +3500,11 @@
                      Ok(Some((size, Cow::Owned(bytes))))
                  })?
                  .expect("Callback above only errors or returns Some");
@@ -3303,7 +3480,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              self.next_frame.scene.insert_primitive(MonochromeSprite {
                  order: 0,
                  pad: 0,
-@@ -3038,11 +3540,11 @@
+@@ -3038,11 +3557,11 @@
                  })?
                  .expect("Callback above only errors or returns Some");
  
@@ -3318,7 +3495,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              let opacity = self.element_opacity();
  
              self.next_frame.scene.insert_primitive(PolychromeSprite {
-@@ -3094,7 +3596,7 @@
+@@ -3094,7 +3613,7 @@
          else {
              return Ok(());
          };
@@ -3327,7 +3504,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let svg_bounds = Bounds {
              origin: bounds.center()
                  - Point::new(
-@@ -3110,13 +3612,15 @@
+@@ -3110,13 +3629,15 @@
          self.next_frame.scene.insert_primitive(MonochromeSprite {
              order: 0,
              pad: 0,
@@ -3347,7 +3524,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          });
  
          Ok(())
-@@ -3155,17 +3659,21 @@
+@@ -3155,17 +3676,21 @@
                  )))
              })?
              .expect("Callback above only returns Some");
@@ -3374,7 +3551,24 @@ diff -ruN a/src/window.rs b/src/window.rs
              content_mask,
              corner_radii,
              tile,
-@@ -3184,8 +3692,8 @@
+@@ -3176,20 +3701,34 @@
+ 
+     /// Paint a surface into the scene for the next frame at the current z-index.
+     ///
++    /// Flux patch (FluxGram part 4): with corner radii, as [`Window::paint_image`] — a video's
++    /// rounded corners, a round video message — and the element's opacity.
++    ///
+     /// This method should only be called as part of the paint phase of element drawing.
+     #[cfg(target_os = "macos")]
+-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
++    pub fn paint_surface(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++        image_buffer: CVPixelBuffer,
++    ) {
+         use crate::PaintSurface;
+ 
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3382,10 +3576,20 @@ diff -ruN a/src/window.rs b/src/window.rs
 -        let content_mask = self.content_mask().scale(scale_factor);
 +        let bounds = self.transform_bounds(bounds).scale(scale_factor);
 +        let content_mask = self.transformed_content_mask().scale(scale_factor);
++        let corner_radii = corner_radii
++            .map(|radius| self.transform_length(*radius))
++            .scale(scale_factor);
++        let opacity = self.element_opacity();
          self.next_frame.scene.insert_primitive(PaintSurface {
              order: 0,
              bounds,
-@@ -3305,7 +3813,12 @@
+             content_mask,
++            corner_radii,
++            opacity,
+             image_buffer,
+         });
+     }
+@@ -3305,7 +3844,12 @@
      pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
          self.invalidator.debug_assert_prepaint();
  
@@ -3399,7 +3603,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let mut id = self.next_hitbox_id;
          self.next_hitbox_id = self.next_hitbox_id.next();
          let hitbox = Hitbox {
-@@ -3579,7 +4092,8 @@
+@@ -3579,7 +4123,8 @@
      /// Dispatch a mouse or keyboard event on the window.
      #[profiling::function]
      pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
@@ -3409,7 +3613,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          // Handlers may set this to false by calling `stop_propagation`.
          cx.propagate_event = true;
          // Handlers may set this to true by calling `prevent_default`.
-@@ -3615,8 +4129,16 @@
+@@ -3615,8 +4160,16 @@
              PlatformInput::ScrollWheel(scroll_wheel) => {
                  self.mouse_position = scroll_wheel.position;
                  self.modifiers = scroll_wheel.modifiers;
@@ -3426,7 +3630,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              // Translate dragging and dropping of external files from the operating system
              // to internal drag and drop events.
              PlatformInput::FileDrop(file_drop) => match file_drop {
-@@ -3668,6 +4190,10 @@
+@@ -3668,6 +4221,10 @@
              self.dispatch_key_event(any_key_event, cx);
          }
  
@@ -3437,7 +3641,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          DispatchEventResult {
              propagate: cx.propagate_event,
              default_prevented: self.default_prevented,
-@@ -4128,7 +4654,10 @@
+@@ -4128,7 +4685,10 @@
          self.on_next_frame(|window, cx| {
              if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                  if let Some(bounds) = input_handler.selected_bounds(window, cx) {
@@ -3449,7 +3653,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  }
                  window.platform_window.set_input_handler(input_handler);
              }
-@@ -5099,5 +5628,81 @@
+@@ -5099,5 +5659,81 @@
          border_widths: (1.).into(),
          border_color: border_color.into(),
          border_style,

@@ -31,7 +31,14 @@
 //! empty field asks for the last message to edit (`edit-last`). A quote or an edit the plugin puts
 //! over the field gives it the keyboard, when the window is the active one.
 //!
+//! Part 4 (API 0.5): voice messages, videos and animated stickers are [`media`]'s — players by
+//! `flux-media`, frames asked for only while something plays on screen; the field's panel of
+//! emoji, stickers and GIFs is [`panel`]'s.
+//!
 //! Nothing here asks for frames by itself: an idle conversation draws nothing.
+
+mod media;
+mod panel;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -42,7 +49,7 @@ use flux_plugin::api::events::UiEvent;
 use flux_plugin::api::ui::{
     AvatarSpec, Composed, ConversationChange, ConversationSpec, Delivery, FileSpec, History,
     ImageShape, ImageSpec, LinkPreview, Message, MessageEdit, MessagePart, MessageQuote, RichSpan,
-    RowAction,
+    RowAction, VideoKind,
 };
 use gpui::{
     Action, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DismissEvent,
@@ -58,7 +65,7 @@ use crate::claude_select::{self, Collect, Joint, Selection};
 use crate::context_menu::ContextMenu;
 use crate::i18n::{tr, trf};
 use crate::icons::{IconName, icon, plugin_icon};
-use crate::image_popup::ImagePopup;
+use crate::image_popup::{ImagePopup, MediaItem, VideoItem};
 use crate::image_view::ImageSource;
 use crate::markdown::{self, Block, CodeBlock};
 use crate::prompt_input::{PromptInput, PromptInputEvent};
@@ -291,6 +298,10 @@ pub struct Conversation {
     /// Where the field was drawn last: its menu from the keyboard opens there.
     field_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     menu: Option<Menu>,
+    /// The players of the voice messages, videos and animated stickers (part 4).
+    media: media::Media,
+    /// The field's panel of emoji, stickers and GIFs (part 4).
+    panel: panel::Panel,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -313,6 +324,7 @@ impl Conversation {
         let input = cx.new(|cx| PromptInput::new(placeholder, cx).max_rows(8).takes_files());
         let subscriptions = vec![cx.subscribe(&input, Self::on_input)];
         let list = ListState::new(0, ListAlignment::Bottom, px(OVERDRAW));
+        let media = media::Media::new(plugin.clone());
         Self {
             plugin,
             spec,
@@ -347,6 +359,8 @@ impl Conversation {
             viewer: None,
             field_bounds: Rc::default(),
             menu: None,
+            media,
+            panel: panel::Panel::new(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -391,6 +405,8 @@ impl Conversation {
         for change in changes {
             match change {
                 ConversationChange::Put(messages) => {
+                    let ids: Vec<String> =
+                        messages.iter().map(|message| message.id.clone()).collect();
                     for message in messages {
                         self.put(message);
                     }
@@ -398,6 +414,8 @@ impl Conversation {
                     // frame's range goes without waiting for its turn.
                     self.visible_at = None;
                     self.update_viewer(cx);
+                    // A voice message or a video whose ▶ was pressed before its file came plays.
+                    self.media_put(&ids, cx);
                 }
                 ConversationChange::Remove(ids) => {
                     for id in ids {
@@ -470,6 +488,8 @@ impl Conversation {
                         self.leave_editing(cx);
                     }
                 }
+                ConversationChange::Panel(content) => self.panel.set_content(content),
+                ConversationChange::PanelPut((tab, items)) => self.panel.put(tab, items),
             }
         }
         // The first fill opens at the "New messages" line.
@@ -855,8 +875,24 @@ impl Conversation {
         let mut preview = None;
         for id in &self.order {
             for (ix, spec) in self.messages[id].parts.iter().enumerate() {
-                let (MessagePart::Image(spec) | MessagePart::Sticker(spec)) = spec else {
-                    continue;
+                let spec = match spec {
+                    MessagePart::Image(spec) | MessagePart::Sticker(spec) => spec,
+                    // The downloaded videos and GIFs among them (part 4): the viewer plays them.
+                    MessagePart::Video(video) if video.kind != VideoKind::Round => {
+                        if let Some(path) = self.allowed_path(video.path.as_ref(), cx) {
+                            let poster = self
+                                .allowed_path(video.poster.path.as_ref(), cx)
+                                .map(ImageSource::File);
+                            pictures.push(MediaItem::Video(VideoItem {
+                                path: Some(path),
+                                poster,
+                                duration: video.duration,
+                                gif: video.kind == VideoKind::Gif,
+                            }));
+                        }
+                        continue;
+                    }
+                    _ => continue,
                 };
                 if spec.play {
                     continue;
@@ -879,7 +915,7 @@ impl Conversation {
                 if this {
                     clicked = Some((pictures.len(), full.is_none(), path.is_some()));
                 }
-                pictures.push(source);
+                pictures.push(MediaItem::Picture(source));
             }
         }
         let Some((index, waiting, shows_path)) = clicked else {
@@ -900,8 +936,11 @@ impl Conversation {
             let blurred = blurred.await;
             this.update_in(cx, |this, window, cx| {
                 if let Some(data) = blurred {
-                    pictures[index] =
-                        crate::image_popup::conversation_picture(index, "image/jpeg", data.into());
+                    pictures[index] = MediaItem::Picture(crate::image_popup::conversation_picture(
+                        index,
+                        "image/jpeg",
+                        data.into(),
+                    ));
                 }
                 this.open_viewer(pictures, index, viewer, window, cx)
             })
@@ -910,24 +949,21 @@ impl Conversation {
         .detach();
     }
 
-    /// Opens the viewer on the `index`th of `pictures`; `waiting` — that picture's full size is on
-    /// the way (the message, the part, whether its file is shown): a spinner until it comes.
+    /// Opens the viewer on the `index`th of `pictures` (and videos); `waiting` — that picture's
+    /// full size is on the way (the message, the part, whether its file is shown): a spinner until
+    /// it comes.
     fn open_viewer(
         &mut self,
-        pictures: Vec<ImageSource>,
+        pictures: Vec<MediaItem>,
         index: usize,
         waiting: Option<(String, usize, bool)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        crate::image_popup::show(pictures, index, window, cx);
+        let popup = crate::image_popup::show_media(pictures, index, window, cx);
         let Some((message, part, shows_path)) = waiting else {
             return;
         };
-        let popup = window
-            .root::<crate::workspace::Workspace>()
-            .flatten()
-            .and_then(|workspace| workspace.read(cx).modal_view::<ImagePopup>());
         if let Some(popup) = popup {
             popup.update(cx, |popup, cx| popup.set_loading(index, true, cx));
             self.viewer = Some(Viewer {
@@ -1522,16 +1558,20 @@ impl Conversation {
         let Some(id) = self.order.get(ix).cloned() else {
             return div().into_any_element();
         };
-        // Code blocks first: they need `self` mutably.
-        let codes: Vec<(usize, Vec<Block>)> = self.messages[&id]
+        // Code blocks first: they need `self` mutably (only the code parts are copied for that —
+        // the item is drawn each frame something in the feed plays).
+        let code_parts: Vec<(usize, flux_plugin::api::ui::CodeBlock)> = self.messages[&id]
             .parts
-            .clone()
             .iter()
             .enumerate()
             .filter_map(|(part, kind)| match kind {
-                MessagePart::Code(code) => Some((part, self.code_blocks(&id, part, code, cx))),
+                MessagePart::Code(code) => Some((part, code.clone())),
                 _ => None,
             })
+            .collect();
+        let codes: Vec<(usize, Vec<Block>)> = code_parts
+            .into_iter()
+            .map(|(part, code)| (part, self.code_blocks(&id, part, &code, cx)))
             .collect();
         let ui = Theme::ui(cx);
         let message = &self.messages[&id];
@@ -1641,11 +1681,12 @@ impl Conversation {
             };
         let bubble_width = (room * BUBBLE_SHARE).clamp(160., BUBBLE_WIDTH);
         let inner = bubble_width - 2. * BUBBLE_PADDING_X;
-        // A sticker, or a round picture (a video message), alone goes without a bubble.
+        // A sticker, or a round video message, alone goes without a bubble.
         let sticker_only = message.parts.len() == 1
             && match &message.parts[0] {
                 MessagePart::Sticker(_) => true,
                 MessagePart::Image(spec) => spec.shape == ImageShape::Circle,
+                MessagePart::Video(spec) => spec.kind == VideoKind::Round,
                 _ => false,
             }
             && message.reply.is_none();
@@ -1719,7 +1760,20 @@ impl Conversation {
                 }
                 MessagePart::Sticker(spec) => {
                     let size = fit(spec.width, spec.height, STICKER_SIZE, STICKER_SIZE);
-                    self.render_picture_part(&id, index, spec, size, window, cx)
+                    match spec.animation {
+                        Some(_) => self
+                            .media
+                            .render_sticker(&id, index, spec, size, window, cx),
+                        None => self.render_picture_part(&id, index, spec, size, window, cx),
+                    }
+                }
+                MessagePart::Voice(spec) => {
+                    let outgoing = message.outgoing;
+                    self.media
+                        .render_voice(&id, index, spec, outgoing, inner, window, cx)
+                }
+                MessagePart::Video(spec) => {
+                    self.media.render_video(&id, index, spec, inner, window, cx)
                 }
                 MessagePart::File(file) => self.render_file(&id, index, file, ui, cx),
                 MessagePart::Link(preview) => {
@@ -2310,6 +2364,9 @@ impl Conversation {
                     }),
                 )
             });
+        // The ☺ button of the field's panel (part 4), with the panel while it is open.
+        let panel_button = (!composer.panel.is_empty())
+            .then(|| self.render_panel_button(&composer.panel, window, cx));
         let actions = composer.actions.iter().map(|action| {
             let action_id = action.id.clone();
             let label = action.label.clone().unwrap_or_default();
@@ -2368,6 +2425,8 @@ impl Conversation {
                             ui.input_border
                         })
                         .on_action(cx.listener(Self::send))
+                        // Esc closes the field's panel first, then leaves an edit.
+                        .capture_action(cx.listener(panel::field_escape))
                         .on_action(cx.listener(Self::cancel_edit))
                         .on_action(
                             cx.listener(|this, _: &FormatBold, _, cx| this.format(Mark::Bold, cx)),
@@ -2431,6 +2490,7 @@ impl Conversation {
                                         .child(self.input.clone()),
                                 )
                                 .children(actions)
+                                .children(panel_button)
                                 .child(
                                     div()
                                         .id("fg-send")
@@ -2463,6 +2523,9 @@ impl Conversation {
                                 ),
                         ),
                 )
+                // The panel over the feed (part 4): outside the field's keys — ↵ in its search
+                // isn't Send.
+                .children(self.render_panel(window, cx))
                 .into_any_element(),
         )
     }
@@ -2552,6 +2615,10 @@ impl Render for Conversation {
             window.focus(&self.input.focus_handle(cx));
         }
         let composer = self.render_composer(window, cx);
+        // What plays (part 4): the players of what was on screen in the last frame start, the
+        // others go; a voice message's bar under the window's header, over the feed.
+        self.media.begin_frame(self.shown, window, cx);
+        let playing = self.media.render_playing_bar(window, cx);
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -2598,6 +2665,7 @@ impl Render for Conversation {
             .on_action(cx.listener(Self::open_part))
             .on_action(cx.listener(Self::reveal_part))
             .on_action(cx.listener(Self::save_part_as))
+            .children(playing)
             .child(feed)
             .children(composer)
             .child(ContextMenu::slot(
@@ -2674,6 +2742,20 @@ fn natural_width(message: &Message, inner: f32, ui: UiColors, window: &mut Windo
             MessagePart::Placeholder(placeholder) => {
                 22. + regular(&placeholder.text, TEXT_SIZE, window)
             }
+            // ▶, a waveform worth looking at, the length.
+            MessagePart::Voice(_) => inner.min(280.),
+            MessagePart::Video(spec) => match spec.kind {
+                VideoKind::Round => media::ROUND_SIDE,
+                VideoKind::Video | VideoKind::Gif => {
+                    fit(
+                        spec.poster.width,
+                        spec.poster.height,
+                        inner.min(PHOTO_WIDTH),
+                        PHOTO_HEIGHT,
+                    )
+                    .0
+                }
+            },
         };
         width = width.max(part_width);
     }

@@ -57,6 +57,11 @@ id = "open-board"
 title = "Open Playground Board"
 category = "Playground"
 
+[[commands]]
+id = "open-panel"
+title = "Open Panel Playground"
+category = "Playground"
+
 # The settings page's Check button runs it, with the button's argument; not in the palette.
 [[commands]]
 id = "settings-check"
@@ -68,6 +73,15 @@ palette = false
 id = "playground"
 title = "API Playground"
 icon = "icons/playground.svg"
+
+# A conversation among the editor's tabs whose field has the panel of emoji, stickers and GIFs
+# (API 0.5, FluxGram part 4): the stickers and GIFs are the plugin's, from `panel/` of its data
+# folder.
+[[tool-windows]]
+id = "panel"
+title = "Panel Playground"
+icon = "icons/playground.svg"
+location = "editor"
 
 # A window among the editor's tabs: a board of tasks, as wide as the editor.
 [[tool-windows]]

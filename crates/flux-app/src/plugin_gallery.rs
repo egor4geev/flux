@@ -8,9 +8,11 @@
 //! known heights, and the scroll offset picks the ones in sight. Each square is drawn as the
 //! conversation's pictures are (`plugin_conversation::render_picture`: the preview, the progress,
 //! the label, the ▶). A click on a picture whose full size is there (`full`; not a video's, `play`)
-//! opens it in Flux's picture viewer with the gallery's full pictures around it; any other click —
-//! a square with only its small picture (`path`), a video, one not downloaded — is
-//! `activated(key)`. The squares on screen go to the plugin as `visible(first, last)` (their keys),
+//! opens it in Flux's media viewer with the gallery's full pictures and videos around it; any other
+//! click — a square with only its small picture (`path`), one not downloaded — is
+//! `activated(key)`. A video (`video`, FluxGram part 4) has its length in the corner and opens in
+//! the viewer, where it plays; one not downloaded opens at once on its poster with a spinner, goes
+//! to the plugin as `activated(key)`, and plays when the gallery comes again with its file. The squares on screen go to the plugin as `visible(first, last)` (their keys),
 //! at most every [`VISIBLE_EVERY`] while scrolling and once more when it settles; within a screen
 //! of the end, `load-older` while `more` is `more` (once per state of it).
 //!
@@ -24,10 +26,11 @@ use std::time::{Duration, Instant};
 use flux_plugin::api::events::UiEvent;
 use flux_plugin::api::ui::{GalleryItem, GallerySpec, History};
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, EventEmitter, Pixels, Render, ScrollHandle,
+    AnyElement, App, Bounds, ClickEvent, Context, EventEmitter, Pixels, Render, ScrollHandle,
     SharedString, Task, WeakEntity, Window, div, prelude::*, px,
 };
 
+use crate::image_popup::{ImagePopup, MediaItem, VideoItem};
 use crate::theme::Theme;
 use crate::ui;
 
@@ -154,6 +157,8 @@ pub struct Gallery {
     visible_timer: Option<Task<()>>,
     /// `load-older` went out in this state of `more`.
     asked_older: bool,
+    /// The viewer opened on a video not downloaded yet: its key and place there.
+    viewer: Option<(gpui::WeakEntity<ImagePopup>, String, usize)>,
 }
 
 impl EventEmitter<GalleryEvent> for Gallery {}
@@ -170,6 +175,7 @@ impl Gallery {
             visible_at: None,
             visible_timer: None,
             asked_older: false,
+            viewer: None,
         }
     }
 
@@ -187,7 +193,35 @@ impl Gallery {
             self.asked_older = false;
         }
         self.spec = spec.clone();
+        self.update_viewer(cx);
         cx.notify();
+    }
+
+    /// The viewer waiting for a video's file gets it.
+    fn update_viewer(&mut self, cx: &mut Context<Self>) {
+        let Some((popup, key, index)) = &self.viewer else {
+            return;
+        };
+        let Some(popup) = popup.upgrade() else {
+            self.viewer = None;
+            return;
+        };
+        let path = self
+            .spec
+            .items
+            .iter()
+            .find(|item| item.key == *key)
+            .and_then(|item| item.video.as_ref()?.path.as_ref())
+            .map(PathBuf::from)
+            .filter(|path| crate::plugin_images::allowed(&self.plugin, path, cx));
+        if let Some(path) = path {
+            let index = *index;
+            popup.update(cx, |popup, cx| {
+                popup.set_video_path(index, path, cx);
+                popup.set_loading(index, false, cx);
+            });
+            self.viewer = None;
+        }
     }
 
     fn emit(&self, event: UiEvent, cx: &mut Context<Self>) {
@@ -246,33 +280,57 @@ impl Gallery {
         }
     }
 
-    /// A click on a square: the viewer for a picture whose full size is there, the plugin
-    /// otherwise (it downloads the picture, or opens the video).
+    /// A click on a square: the media viewer for a picture whose full size is there and for a
+    /// video (one not downloaded — on its poster, and the plugin downloads it), the plugin
+    /// otherwise (it downloads the picture).
     fn click(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let mut pictures = Vec::new();
+        let allowed = |path: Option<&String>, cx: &mut App| {
+            let path = PathBuf::from(path?);
+            (crate::plugin_images::allowed(&self.plugin, &path, cx) && path.exists())
+                .then_some(path)
+        };
+        let mut items = Vec::new();
         let mut shown = None;
         for (ix, item) in self.spec.items.iter().enumerate() {
-            if item.image.play {
-                continue;
-            }
-            let Some(path) = item.image.full.as_ref() else {
-                continue;
-            };
-            let path = PathBuf::from(path);
-            if !crate::plugin_images::allowed(&self.plugin, &path, cx) || !path.exists() {
-                continue;
-            }
-            if ix == index {
-                shown = Some(pictures.len());
-            }
-            pictures.push(crate::image_view::ImageSource::File(path));
-        }
-        match shown {
-            Some(shown) => crate::image_popup::show(pictures, shown, window, cx),
-            None => {
-                if let Some(item) = self.spec.items.get(index) {
-                    self.emit(UiEvent::Activated(item.key.clone()), cx);
+            let media = match &item.video {
+                Some(video) => {
+                    let path = allowed(video.path.as_ref(), cx);
+                    if path.is_none() && ix != index {
+                        continue;
+                    }
+                    MediaItem::Video(VideoItem {
+                        path,
+                        poster: allowed(item.image.path.as_ref(), cx)
+                            .map(crate::image_view::ImageSource::File),
+                        duration: video.duration,
+                        gif: video.kind == flux_plugin::api::ui::VideoKind::Gif,
+                    })
                 }
+                None if item.image.play => continue,
+                None => match allowed(item.image.full.as_ref(), cx) {
+                    Some(path) => MediaItem::Picture(crate::image_view::ImageSource::File(path)),
+                    None => continue,
+                },
+            };
+            if ix == index {
+                shown = Some(items.len());
+            }
+            items.push(media);
+        }
+        let Some(item) = self.spec.items.get(index) else {
+            return;
+        };
+        let key = item.key.clone();
+        let Some(shown) = shown else {
+            return self.emit(UiEvent::Activated(key), cx);
+        };
+        let waiting = matches!(&items[shown], MediaItem::Video(video) if video.path.is_none());
+        let popup = crate::image_popup::show_media(items, shown, window, cx);
+        if waiting {
+            self.emit(UiEvent::Activated(key.clone()), cx);
+            if let Some(popup) = popup {
+                popup.update(cx, |popup, cx| popup.set_loading(shown, true, cx));
+                self.viewer = Some((popup.downgrade(), key, shown));
             }
         }
     }
@@ -285,8 +343,21 @@ impl Gallery {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let item = &self.spec.items[index];
+        // A video: its length in the corner (the plugin leaves the label to Flux).
+        let image = match &item.video {
+            Some(video) => {
+                let mut image = item.image.clone();
+                image.label = Some(match video.kind {
+                    flux_plugin::api::ui::VideoKind::Gif => crate::i18n::tr("GIF").to_string(),
+                    _ => format!("{}:{:02}", video.duration / 60, video.duration % 60),
+                });
+                image.play = false;
+                image
+            }
+            None => item.image.clone(),
+        };
         let picture = crate::plugin_conversation::render_picture(
-            &item.image,
+            &image,
             (side, side),
             &self.plugin,
             cx.entity_id(),
@@ -405,8 +476,10 @@ mod tests {
                 shape: ImageShape::Square,
                 label: None,
                 play: false,
+                animation: None,
             },
             group: group.map(str::to_string),
+            video: None,
         }
     }
 

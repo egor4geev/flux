@@ -716,6 +716,22 @@ pub fn gallery_item(
         key: key.to_string(),
         image,
         group: group.map(str::to_string),
+        video: None,
+    }
+}
+
+/// A video of a gallery (API 0.5, part 4): its poster in the square, its length in the corner; a
+/// click opens it in Flux's media viewer.
+pub fn gallery_video(
+    key: &str,
+    video: crate::host::ui::VideoSpec,
+    group: Option<&str>,
+) -> crate::host::ui::GalleryItem {
+    crate::host::ui::GalleryItem {
+        key: key.to_string(),
+        image: video.poster.clone(),
+        group: group.map(str::to_string),
+        video: Some(video),
     }
 }
 

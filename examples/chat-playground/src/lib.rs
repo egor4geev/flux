@@ -17,6 +17,13 @@
 //! click on one comes as `part-clicked` (the log says `play`). Edit is offered on the user's own
 //! messages only (`Message::actions`).
 //!
+//! FluxGram part 4 (API 0.5): the newest messages of "Dima Kim" are media — voice messages (one
+//! to download first), a round video message and a GIF that play by themselves, a video, an
+//! animated sticker — from `media/` of the plugin's folder (`voice.ogg`, `round.mp4` and
+//! `round.jpg`, `gif.mp4` and `gif.jpg`, `video.mp4` and `video.jpg`, `sticker.fxa`: copied there
+//! by hand or by a scenario; a plugin may give Flux only files in its folders). Their first plays
+//! come as `media-played` (the log says so).
+//!
 //! FluxGram part 3 (API 0.5): the field has formatting (its menu, ⌘B ⌘I ⇧⌘X ⇧⌘P ⇧⌘M ⌘K) and the
 //! echo reads the Markdown crudely; Reply over a selected part of a message quotes that part
 //! (`message-action-quoted`, the log says `quoted`); a click on a picture without its full size
@@ -51,6 +58,9 @@ const PAGE: u64 = 100;
 const NEWEST: i64 = 1_763_380_000;
 /// A download's step (ms): files and pictures come in three.
 const DOWNLOAD_STEP: u64 = 700;
+/// The chat whose newest messages are media (part 4), and how many of them.
+const MEDIA_CHAT: &str = "dima";
+const MEDIA_MESSAGES: u64 = 7;
 const STEP: i64 = 600;
 
 /// The people of the group: name, color, initials.
@@ -267,6 +277,79 @@ impl Plugin for Playground {
             }
             Event::Timer(timer) => self.timer(timer),
             _ => {}
+        }
+    }
+}
+
+impl Playground {
+    /// A media message of [`MEDIA_CHAT`] (part 4): the files are in `media/` of the plugin's
+    /// folder; the second voice message and the video come only after a click downloads them.
+    fn media_message(&self, message: Message, index: u64) -> Message {
+        let dir = format!("{}/media", storage::dir());
+        let file = |name: &str| format!("{dir}/{name}");
+        let downloaded = self.downloaded.contains(&(seed(MEDIA_CHAT), index));
+        // Speech-like loudness: syllables of a few samples, pauses between words.
+        let waveform = |shift: u32| -> Vec<u8> {
+            (0..64u32)
+                .map(|i| {
+                    let word = (i + shift) % 11;
+                    match word {
+                        0 | 1 => 2,
+                        _ => (4 + ((i * 37 + shift * 13) % 23) * (11 - word) / 9).min(31) as u8,
+                    }
+                })
+                .collect()
+        };
+        let poster =
+            |name: &str, width: u32, height: u32| chat::picture(&file(name), width, height);
+        match TOTAL - 1 - index {
+            6 => message.part(chat::voice(
+                chat::voice_spec(Some(&file("voice.ogg")), 5, waveform(0)).unheard(),
+            )),
+            5 => {
+                let path = downloaded.then(|| file("voice.ogg"));
+                message.part(chat::voice(chat::voice_spec(
+                    path.as_deref(),
+                    5,
+                    waveform(5),
+                )))
+            }
+            4 => message.part(chat::video(
+                chat::video_spec(
+                    chat::VideoKind::Round,
+                    poster("round.jpg", 384, 384),
+                    Some(&file("round.mp4")),
+                    6,
+                )
+                .autoplay()
+                .unheard(),
+            )),
+            3 => message.part(chat::video(
+                chat::video_spec(
+                    chat::VideoKind::Gif,
+                    poster("gif.jpg", 320, 240),
+                    Some(&file("gif.mp4")),
+                    3,
+                )
+                .autoplay(),
+            )),
+            2 => {
+                let path = downloaded.then(|| file("video.mp4"));
+                message
+                    .part(chat::video(chat::video_spec(
+                        chat::VideoKind::Video,
+                        poster("video.jpg", 640, 360),
+                        path.as_deref(),
+                        10,
+                    )))
+                    .text("The demo of the new map screen")
+            }
+            1 => message.part(sticker(
+                poster("sticker.png", 320, 320).animation(&file("sticker.fxa"), true),
+            )),
+            _ => message.part(sticker(
+                poster("sticker.png", 320, 320).animation(&file("sticker.fxa"), false),
+            )),
         }
     }
 }
@@ -537,6 +620,10 @@ impl Playground {
                 chat::update(&tab, FEED, vec![draft(&text)]);
             }
             (FEED, UiEvent::Composed(composed)) => self.send(key, composed),
+            // A voice message or a round one played for the first time (part 4): it is heard.
+            (FEED, UiEvent::MediaPlayed((message, part))) => {
+                log::info(&format!("media-played: {message}/{part}"));
+            }
             // A video's picture: the plugin would play it.
             (FEED, UiEvent::PartClicked((message, part)))
                 if index(&message).is_some_and(|index| {
@@ -792,6 +879,8 @@ impl Playground {
                 match part {
                     Part::File(file) if file.path.is_none() => file.progress = Some(done),
                     Part::Image(spec) if !spec.play => spec.progress = Some(done),
+                    Part::Voice(spec) if spec.path.is_none() => spec.progress = Some(done),
+                    Part::Video(spec) if spec.path.is_none() => spec.poster.progress = Some(done),
                     _ => {}
                 }
             }
@@ -909,6 +998,9 @@ impl Playground {
             chat::picture(&picture.path, picture.width, picture.height)
                 .preview(picture.preview.clone())
         };
+        if seed == crate::seed(MEDIA_CHAT) && index + MEDIA_MESSAGES >= TOTAL {
+            return self.media_message(message, index);
+        }
         let kind = (index + seed * 7) % 20;
         message = match kind {
             _ if index.is_multiple_of(97) => {

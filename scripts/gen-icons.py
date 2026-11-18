@@ -83,6 +83,8 @@ ICONS = {
   "layout-preview": (S, '<rect x="1.75" y="2.75" width="12.5" height="10.5" rx="2"/><path d="M4.75 6h3" stroke-width="2"/><path d="M4.5 11l2.25-2.5 1.75 1.75 1.25-1.25 1.75 2"/><circle cx="11.25" cy="6" r=".9" fill="#000" stroke="none"/>'),
   "branch": (S, '<circle cx="4.75" cy="3.75" r="1.5"/><circle cx="4.75" cy="12.25" r="1.5"/><circle cx="11.25" cy="5.75" r="1.5"/><path d="M4.75 5.25v5.5M11.25 7.25c0 2.5-6.5 1.5-6.5 3.5"/>'),
   "clock": (S, '<circle cx="8" cy="8" r="6.25"/><path d="M8 4.75V8l2.25 1.5"/>'),
+  # The field's panel of emoji, stickers and GIFs (FluxGram part 4).
+  "smile": (S, '<circle cx="8" cy="8" r="6.25"/><path d="M5.5 9.5a3 3 0 0 0 5 0M6 6.25v.5M10 6.25v.5"/>'),
   "hash": (S, '<path d="M6.5 2.5 5.25 13.5M10.75 2.5 9.5 13.5M2.75 5.75h10.75M2.25 10.25H13"/>'),
   "warning": (S, '<path d="M7.13 2.5a1 1 0 0 1 1.74 0l5.55 9.75a1 1 0 0 1-.87 1.5H2.45a1 1 0 0 1-.87-1.5z"/><path d="M8 6.25v3"/><circle cx="8" cy="11.25" r=".4" fill="#000"/>'),
   "error": (S, '<circle cx="8" cy="8" r="6.25"/><path d="M5.75 5.75l4.5 4.5M10.25 5.75l-4.5 4.5"/>'),

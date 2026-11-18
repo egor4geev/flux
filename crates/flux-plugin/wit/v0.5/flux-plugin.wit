@@ -11,9 +11,10 @@
 //
 // 0.5 adds: the plugin's service — one instance for the whole app next to the one in each window,
 // and messages between them (`service`); the plugin's own programs, downloaded by Flux
-// (`process.helper`); pictures, avatars, QR codes and a conversation fed by changes (`ui`); tabs
-// of one editor window (`ui.open-tab`) and windows on the left; the system's file dialog
-// (`dialogs.pick-files`); tools for Claude (`tools`).
+// (`process.helper`); pictures, avatars, QR codes and a conversation fed by changes (`ui`) —
+// with voice messages, videos, animated stickers and a panel of emoji, stickers and GIFs by its
+// field, played by Flux; tabs of one editor window (`ui.open-tab`) and windows on the left; the
+// system's file dialog (`dialogs.pick-files`); tools for Claude (`tools`).
 //
 // Plugins built for 0.2 and 0.3 (and 0.4, which kept the 0.3 interfaces) keep working: Flux
 // answers their calls (`wit/v0.2`, `wit/v0.3`) with the same code, and doesn't send them what
@@ -564,6 +565,83 @@ interface ui {
         /// A ▶ in the middle (0.5): the picture stands for a video, a GIF, a round video message;
         /// a click comes as `part-clicked` (the plugin plays or opens it).
         play: bool,
+        /// An animation over the picture (0.5, part 4): a sticker's, an animated emoji's. The
+        /// picture stands for it until its first frame is ready, and in its place where it
+        /// doesn't play.
+        animation: option<animation-spec>,
+    }
+
+    /// An animation of frames (0.5, part 4): a sticker's, an animated emoji's, rendered once into
+    /// a file of Flux's frame format — FXA, `flux-media`'s `fxa` module: "FXA1", the size, the
+    /// frames' count and length, then each frame's BGRA pixels (straight alpha) compressed with
+    /// LZ4. Flux plays it only while it is on screen in the active window — a few at a time, the
+    /// others stay on their first frame — reading a frame ahead off the window's thread; in
+    /// memory only the frames in sight.
+    record animation-spec {
+        /// The FXA file, absolute (in the plugin's folders).
+        path: string,
+        /// Plays again from the start when it ends; false — once each time it comes into sight,
+        /// then stays on its last frame.
+        looped: bool,
+    }
+
+    /// A voice message (0.5, part 4): Flux plays it — ▶ / ⏸, the waveform (a click or a drag on it
+    /// seeks), the speed (1×, 1.5×, 2×, pitch kept); one sound at a time in Flux. While it plays —
+    /// a bar over the feed and a line in the status bar; when it ends, the next voice message
+    /// below in the feed plays.
+    record voice-spec {
+        /// The OGG/Opus file, absolute; none — not downloaded: ▶ comes as `part-clicked` (the
+        /// plugin downloads it; a click while `progress` is there cancels the download), and Flux
+        /// plays it when the message is put again with the file, if ▶ was the last thing pressed.
+        path: option<string>,
+        /// In seconds.
+        duration: u32,
+        /// The loudness over time, values 0–31, any count (Telegram's waveform: 5-bit samples);
+        /// empty — an even line.
+        waveform: list<u8>,
+        /// Being downloaded: 0.0–1.0, a ring around ▶; none — not.
+        progress: option<f32>,
+        /// Not listened to yet (someone else's message): an accent dot after the length. The
+        /// first play comes as `media-played`.
+        unheard: bool,
+    }
+
+    /// What a video is (0.5, part 4).
+    enum video-kind {
+        /// A video: ▶ on the poster; a click opens Flux's media viewer, where it plays with sound.
+        video,
+        /// A GIF (Telegram's are MP4 without sound): plays by itself, looped, without sound,
+        /// while on screen; a click opens it in the viewer.
+        gif,
+        /// A round video message: plays by itself without sound, looped, while on screen; a
+        /// click plays it with sound from the start, larger, with a ring of progress (a click
+        /// again pauses it; one sound at a time).
+        round,
+    }
+
+    /// A video of a message (0.5, part 4): Flux plays it with the system's (hardware) decoder,
+    /// only while it is on screen in the active window — a video off screen is paused and its
+    /// decoder let go.
+    record video-spec {
+        kind: video-kind,
+        /// The picture standing for it until it plays: the thumbnail once downloaded, else the
+        /// blurred `preview`; its size is the video's room (a round one's — the circle's side).
+        /// `progress` is the video file's download. The pill (the length, "GIF") and ▶ are
+        /// Flux's to draw: leave `label` and `play` empty.
+        poster: image-spec,
+        /// The MP4 file (H.264, HEVC), absolute; none — not downloaded: a click comes as
+        /// `part-clicked` (the plugin downloads it; again while `progress` is there — cancels).
+        /// A video's click opens the viewer at once on the poster with the progress; it plays
+        /// there when the message is put again with the file.
+        path: option<string>,
+        /// In seconds.
+        duration: u32,
+        /// GIF and round: plays by itself while on screen (the plugin's setting); false — ▶ on
+        /// the poster, a click plays it.
+        autoplay: bool,
+        /// A round message not watched yet (someone else's): an accent dot. Its first play with
+        /// sound comes as `media-played`.
+        unheard: bool,
     }
 
     /// A person or a chat (0.5): a picture, or the initials on a color.
@@ -679,8 +757,14 @@ interface ui {
         quote(list<rich-span>),
         /// A photo; a video's or a GIF's preview.
         image(image-spec),
-        /// A sticker: a picture without the bubble, the time under it.
+        /// A sticker: a picture without the bubble, the time under it; an animated one has its
+        /// `animation`.
         sticker(image-spec),
+        /// A voice message (0.5, part 4): ▶, the waveform, the length, the speed.
+        voice(voice-spec),
+        /// A video, a GIF, a round video message (0.5, part 4); a round one alone goes without
+        /// the bubble, as a sticker.
+        video(video-spec),
         file(file-spec),
         link(link-preview),
         placeholder(placeholder-spec),
@@ -782,6 +866,56 @@ interface ui {
         /// the plugin parses them. The keys work only in the field; without formatting they do
         /// what they do elsewhere.
         formatting: bool,
+        /// The tabs of the field's panel (0.5, part 4), in order: a ☺ button by the field opens
+        /// it over the feed. Emoji are Flux's own and go into the field; stickers and GIFs are
+        /// the plugin's (`panel` changes) and a click sends one (`panel-chosen`). Empty — no
+        /// panel.
+        panel: list<panel-tab>,
+    }
+
+    /// A tab of the field's panel (0.5, part 4).
+    enum panel-tab {
+        /// Flux's own emoji: by category, the recent ones first, a search by their Russian and
+        /// English names, skin tones.
+        emoji,
+        /// The plugin's stickers: its sets, the recent and the favorite ones, a search.
+        stickers,
+        /// The plugin's GIFs: the saved ones, a search.
+        gifs,
+    }
+
+    /// An item of the panel (0.5, part 4): a sticker, a GIF.
+    record panel-item {
+        /// Names it in `panel-chosen` and `panel-visible`; `panel-put` replaces it by it.
+        key: string,
+        /// The picture: a sticker's (with its `animation`), a GIF's poster. Its size gives the
+        /// item's proportions (a sticker is fit into a square, a GIF keeps its own).
+        image: image-spec,
+        /// A GIF's MP4, absolute: plays looped without sound while on screen; none — the poster.
+        video: option<string>,
+        /// The emoji it stands for ("😂"): its tooltip, a sticker search's match.
+        emoji: option<string>,
+    }
+
+    /// A group of the panel's items under a heading (0.5, part 4): a sticker set, "Recent".
+    record panel-section {
+        /// Names it: the tab's strip of sections (by its `icon`) scrolls to it.
+        key: string,
+        title: string,
+        /// Its picture in the strip: a set's thumbnail; none — its first item's.
+        icon: option<image-spec>,
+        items: list<panel-item>,
+    }
+
+    /// What a tab of the panel shows (0.5, part 4): sections of items.
+    record panel-content {
+        tab: panel-tab,
+        /// The search it answers; empty — the tab's own content (sets, saved GIFs).
+        query: string,
+        sections: list<panel-section>,
+        /// More of it below (a search's next page): scrolling near the end comes as
+        /// `panel-load-more` while it is `more`; `loading` — a spinner at the end.
+        more: history,
     }
 
     /// A message feed with a field (0.5), as a chat. Its messages come by
@@ -815,6 +949,10 @@ interface ui {
         image: image-spec,
         /// The heading of the item's group ("November 2026"): a group starts where it changes.
         group: option<string>,
+        /// The square stands for a video (0.5, part 4): its length in the corner; a click opens
+        /// it in Flux's media viewer among the gallery's pictures and videos (not downloaded — at
+        /// once on the poster, and `activated(key)` comes so the plugin downloads it).
+        video: option<video-spec>,
     }
 
     /// Pictures in a grid of squares (0.5), as a chat's photos and videos by month: takes the
@@ -858,6 +996,12 @@ interface ui {
         /// field, which takes the text; ↵ — `edited`, Esc or the bar's × — `edit-cancelled`.
         /// None — the field is back to a new message (its text cleared).
         editing(option<message-edit>),
+        /// What a tab of the field's panel shows (0.5, part 4): replaces the tab's content (for
+        /// its `query`; an answer to an older search is dropped).
+        panel(panel-content),
+        /// Replaces items of a panel's tab by their keys, wherever they are (0.5, part 4): a
+        /// sticker downloaded, its animation rendered.
+        panel-put(tuple<panel-tab, list<panel-item>>),
     }
 
     /// The message the field edits (0.5).
@@ -1579,7 +1723,7 @@ interface events {
     use server.{server-request, ws-open, ws-message};
     use process.{process-output};
     use review.{proposal-outcome};
-    use ui.{composed};
+    use ui.{composed, panel-tab};
     use tools.{tool-call, confirm-choice};
 
     variant ui-event {
@@ -1650,6 +1794,25 @@ interface events {
         /// Esc in a text field (0.5): close what the field belongs to (a search bar). Sent for the
         /// field's element in a tool window or a tab; in a dialog Esc closes the dialog.
         cancelled,
+        /// A voice message, or a round one with sound, started playing for the first time since
+        /// it was put (0.5, part 4): (the message, the part's index) — the plugin marks it
+        /// listened to (`unheard`).
+        media-played(tuple<string, u32>),
+        /// A tab of the field's panel was opened (0.5, part 4): the plugin sends its content
+        /// (`panel`) — again on every opening, so it can be fresh.
+        panel-opened(panel-tab),
+        /// A search in a panel's tab (0.5, part 4): (the tab, the text); empty — the search was
+        /// cleared. One event for a burst of typing. The emoji tab searches by itself.
+        panel-searched(tuple<panel-tab, string>),
+        /// An item of the panel was chosen (0.5, part 4): (the tab, the item's key) — the plugin
+        /// sends it (a sticker, a GIF), answering the quote over the field if there is one. The
+        /// panel stays open.
+        panel-chosen(tuple<panel-tab, string>),
+        /// The panel's items on screen changed (0.5, part 4): (the tab, the first key, the last
+        /// key, in the order of the content) — to download what is seen. One event for a burst.
+        panel-visible(tuple<panel-tab, string, string>),
+        /// The panel's tab scrolled near its end while its `more` is `more` (0.5, part 4).
+        panel-load-more(panel-tab),
     }
 
     record ui-input {

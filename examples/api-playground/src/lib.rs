@@ -11,6 +11,8 @@ mod accounts;
 mod api03;
 /// The API 0.5's sections: the plugin's service, the file dialog.
 mod api05;
+/// The field's panel of emoji, stickers and GIFs (API 0.5, FluxGram part 4): a window of its own.
+mod panel;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -234,6 +236,8 @@ struct Playground {
     v5: api05::State,
     /// The fake accounts of the Settings page and their sign-in dialog.
     accounts: accounts::State,
+    /// The window of the field's panel.
+    panel: panel::State,
 }
 
 impl Plugin for Playground {
@@ -261,6 +265,7 @@ impl Plugin for Playground {
             v3: api03::State::default(),
             v5: api05::State::default(),
             accounts: accounts::State::default(),
+            panel: panel::State::default(),
         };
         // The Settings page's block has its view before the page is opened.
         playground.accounts.render_accounts();
@@ -276,6 +281,7 @@ impl Plugin for Playground {
             "stop-clock" if self.clock.is_some() => self.toggle_clock(),
             "settings-check" => self.settings_check(context),
             "open-board" => ui::show(api03::BOARD),
+            "open-panel" => ui::show(panel::PANEL),
             _ => {}
         }
     }
@@ -285,6 +291,9 @@ impl Plugin for Playground {
             return;
         };
         let Some(event) = self.handle_05(event) else {
+            return;
+        };
+        let Some(event) = self.handle_panel(event) else {
             return;
         };
         let Some(event) = self.handle_03(event) else {

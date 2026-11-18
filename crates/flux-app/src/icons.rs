@@ -128,6 +128,7 @@ icons! {
     Search => "search",
     Settings => "settings",
     Sidebar => "sidebar",
+    Smile => "smile",
     Sparkle => "sparkle",
     SplitDown => "split-down",
     SplitRight => "split-right",

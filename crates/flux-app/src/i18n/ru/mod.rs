@@ -31,6 +31,8 @@ mod dialog;
 mod diff;
 mod feedback;
 mod fluxgram_chat;
+mod fluxgram_media;
+mod fluxgram_panel;
 mod fluxgram_runtime;
 mod fluxgram_select;
 mod fluxgram_tools;
@@ -199,6 +201,8 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     fluxgram_select::STRINGS,
     fluxgram_tools::STRINGS,
     fluxgram_windows::STRINGS,
+    fluxgram_media::STRINGS,
+    fluxgram_panel::STRINGS,
 ];
 
 /// Plural forms (`trn`): the English singular → "1 файл", "2 файла", "5 файлов"; one table per
@@ -279,4 +283,6 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     fluxgram_select::PLURALS,
     fluxgram_tools::PLURALS,
     fluxgram_windows::PLURALS,
+    fluxgram_media::PLURALS,
+    fluxgram_panel::PLURALS,
 ];

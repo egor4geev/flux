@@ -361,3 +361,14 @@
 "Chose `{0}`." = "Выбрано: `{0}`."
 "Dismissed." = "Закрыто без выбора."
 "`{0}` clicked." = "Нажато: `{0}`."
+
+# The field's panel (API 0.5, FluxGram part 4).
+"Open Panel Playground" = "Открыть песочницу панели"
+"Panel Playground" = "Песочница панели"
+"Message…" = "Сообщение…"
+"Choose an emoji, a sticker or a GIF in the panel by the field" = "Выберите эмодзи, стикер или GIF в панели у поля"
+"Favorites" = "Избранные"
+"Recent" = "Недавние"
+"Cats" = "Коты"
+"Dogs" = "Собаки"
+"Saved" = "Сохранённые"

@@ -1,0 +1,48 @@
+[package]
+name = "flux-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Sound and video for Flux (FluxGram part 4): voice messages (OGG/Opus), videos by the system's
+# decoders (AVFoundation on macOS, Media Foundation on Windows), animations of frames (FXA). No
+# gpui: the app draws what it gives.
+[dependencies]
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+# Voice messages: the OGG container, libopus (its C source built by cmake and linked statically —
+# the same decoder on every platform) and the system's sound (CoreAudio, WASAPI).
+ogg = "0.9.2"
+opus = "0.4.0"
+cpal = "0.18.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The frames of a video, drawn by gpui's `surface` without a copy (gpui's own version).
+core-video = "0.4.3"
+core-foundation = "0.10"
+# AVFoundation: the player, its item and the output its frames are pulled from.
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSArray", "NSDictionary", "NSError", "NSNotification", "NSOperation", "NSString", "NSURL", "NSValue"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "CFRunLoop"] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMTime", "CMSync"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "CABase"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-media",
+    "objc2-core-video",
+    "AVAsset",
+    "AVAssetTrack",
+    "AVAsynchronousKeyValueLoading",
+    "AVMediaFormat",
+    "AVPlayer",
+    "AVPlayerItem",
+    "AVPlayerItemOutput",
+] }
+
+# AVFoundation's player lives on the main thread: the test runs there, without the test harness.
+[[test]]
+name = "video"
+harness = false

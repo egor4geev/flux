@@ -3701,9 +3701,17 @@ impl Window {
 
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
+    /// Flux patch (FluxGram part 4): with corner radii, as [`Window::paint_image`] — a video's
+    /// rounded corners, a round video message — and the element's opacity.
+    ///
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        image_buffer: CVPixelBuffer,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
@@ -3711,10 +3719,16 @@ impl Window {
         let scale_factor = self.scale_factor();
         let bounds = self.transform_bounds(bounds).scale(scale_factor);
         let content_mask = self.transformed_content_mask().scale(scale_factor);
+        let corner_radii = corner_radii
+            .map(|radius| self.transform_length(*radius))
+            .scale(scale_factor);
+        let opacity = self.element_opacity();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
+            corner_radii,
+            opacity,
             image_buffer,
         });
     }

@@ -19,9 +19,10 @@
 
 use crate::host::ui::RowAction;
 pub use crate::host::ui::{
-    AvatarSpec, CodeBlock, Composed, ComposerSpec, ConversationChange as Change, ConversationSpec,
-    Delivery, FileSpec, History, ImageShape, ImageSpec, LinkPreview, Message, MessageAuthor,
-    MessageEdit, MessagePart as Part, MessageQuote, PlaceholderSpec, Reaction, RichSpan,
+    AnimationSpec, AvatarSpec, CodeBlock, Composed, ComposerSpec, ConversationChange as Change,
+    ConversationSpec, Delivery, FileSpec, History, ImageShape, ImageSpec, LinkPreview, Message,
+    MessageAuthor, MessageEdit, MessagePart as Part, MessageQuote, PanelContent, PanelItem,
+    PanelSection, PanelTab, PlaceholderSpec, Reaction, RichSpan, VideoKind, VideoSpec, VoiceSpec,
 };
 
 /// Sends changes of the `element` conversation of `window`'s view, in order.
@@ -83,6 +84,16 @@ pub fn editing(edit: Option<(&str, &str)>) -> Change {
         message: message.to_string(),
         text: text.to_string(),
     }))
+}
+
+/// What a tab of the field's panel shows (API 0.5, part 4): replaces the tab's content.
+pub fn panel(content: PanelContent) -> Change {
+    Change::Panel(content)
+}
+
+/// Replaces items of a panel's tab by their keys (API 0.5, part 4): a sticker downloaded.
+pub fn panel_put(tab: PanelTab, items: Vec<PanelItem>) -> Change {
+    Change::PanelPut((tab, items))
 }
 
 // --- Messages ---
@@ -185,6 +196,13 @@ impl Message {
                 Part::Code(code) => code.text.clone(),
                 Part::Image(_) => "Photo".to_string(),
                 Part::Sticker(_) => "Sticker".to_string(),
+                Part::Voice(_) => "Voice message".to_string(),
+                Part::Video(video) => match video.kind {
+                    VideoKind::Video => "Video",
+                    VideoKind::Gif => "GIF",
+                    VideoKind::Round => "Video message",
+                }
+                .to_string(),
                 Part::File(file) => file.name.clone(),
                 Part::Link(link) => link.url.clone(),
                 Part::Placeholder(placeholder) => placeholder.text.clone(),
@@ -283,6 +301,17 @@ pub fn sticker(spec: ImageSpec) -> Part {
     Part::Sticker(spec)
 }
 
+/// A voice message (API 0.5, part 4): Flux plays it; build it with [`voice_spec`].
+pub fn voice(spec: VoiceSpec) -> Part {
+    Part::Voice(spec)
+}
+
+/// A video, a GIF, a round video message (API 0.5, part 4): Flux plays it; build it with
+/// [`video_spec`].
+pub fn video(spec: VideoSpec) -> Part {
+    Part::Video(spec)
+}
+
 /// A file of `size` bytes; `path` once it is downloaded.
 pub fn file(name: &str, size: u64, path: Option<&str>) -> Part {
     Part::File(FileSpec {
@@ -338,6 +367,7 @@ pub fn picture(path: &str, width: u32, height: u32) -> ImageSpec {
         shape: ImageShape::Rounded,
         label: None,
         play: false,
+        animation: None,
     }
 }
 
@@ -380,6 +410,130 @@ impl ImageSpec {
         self.play = true;
         self
     }
+    /// An animation over the picture (API 0.5, part 4): an FXA file (`flux-media`'s frame
+    /// format), played while on screen; `looped` — again and again, else once each time it comes
+    /// into sight.
+    pub fn animation(mut self, path: &str, looped: bool) -> Self {
+        self.animation = Some(AnimationSpec {
+            path: path.to_string(),
+            looped,
+        });
+        self
+    }
+}
+
+// --- Voice messages and videos (API 0.5, part 4) ---
+
+/// A voice message of `duration` seconds: the OGG/Opus file once downloaded, the waveform
+/// (values 0–31, any count; empty — an even line).
+pub fn voice_spec(path: Option<&str>, duration: u32, waveform: Vec<u8>) -> VoiceSpec {
+    VoiceSpec {
+        path: path.map(str::to_string),
+        duration,
+        waveform,
+        progress: None,
+        unheard: false,
+    }
+}
+
+impl VoiceSpec {
+    /// Being downloaded: 0.0–1.0.
+    pub fn progress(mut self, done: f32) -> Self {
+        self.progress = Some(done);
+        self
+    }
+    /// Not listened to yet: an accent dot; its first play comes as `UiEvent::MediaPlayed`.
+    pub fn unheard(mut self) -> Self {
+        self.unheard = true;
+        self
+    }
+}
+
+/// A video of `duration` seconds: its kind, the picture standing for it (its size is the
+/// video's room), the MP4 file once downloaded.
+pub fn video_spec(
+    kind: VideoKind,
+    poster: ImageSpec,
+    path: Option<&str>,
+    duration: u32,
+) -> VideoSpec {
+    VideoSpec {
+        kind,
+        poster,
+        path: path.map(str::to_string),
+        duration,
+        autoplay: false,
+        unheard: false,
+    }
+}
+
+impl VideoSpec {
+    /// A GIF, a round message: plays by itself without sound while on screen.
+    pub fn autoplay(mut self) -> Self {
+        self.autoplay = true;
+        self
+    }
+    /// A round message not watched yet: an accent dot; its first play with sound comes as
+    /// `UiEvent::MediaPlayed`.
+    pub fn unheard(mut self) -> Self {
+        self.unheard = true;
+        self
+    }
+}
+
+// --- The field's panel (API 0.5, part 4) ---
+
+/// What a tab of the panel shows: its sections, for `query` (empty — the tab's own content).
+pub fn panel_content(
+    tab: PanelTab,
+    query: &str,
+    sections: Vec<PanelSection>,
+    more: History,
+) -> PanelContent {
+    PanelContent {
+        tab,
+        query: query.to_string(),
+        sections,
+        more,
+    }
+}
+
+/// A section of a panel's tab: a sticker set, "Recent"; `icon` — its picture in the tab's strip.
+pub fn panel_section(
+    key: &str,
+    title: &str,
+    icon: Option<ImageSpec>,
+    items: Vec<PanelItem>,
+) -> PanelSection {
+    PanelSection {
+        key: key.to_string(),
+        title: title.to_string(),
+        icon,
+        items,
+    }
+}
+
+/// An item of the panel: a sticker's picture (with its animation), a GIF's poster.
+pub fn panel_item(key: &str, image: ImageSpec) -> PanelItem {
+    PanelItem {
+        key: key.to_string(),
+        image,
+        video: None,
+        emoji: None,
+    }
+}
+
+impl PanelItem {
+    /// A GIF's MP4: plays looped without sound while on screen.
+    pub fn video(mut self, path: &str) -> Self {
+        self.video = Some(path.to_string());
+        self
+    }
+    /// The emoji it stands for: its tooltip.
+    pub fn emoji(mut self, emoji: &str) -> Self {
+        self.emoji = Some(emoji.to_string());
+        self
+    }
 }
 
 impl AvatarSpec {
@@ -407,6 +561,7 @@ pub fn composer(placeholder: &str) -> ComposerSpec {
         attachments: false,
         actions: Vec::new(),
         formatting: false,
+        panel: Vec::new(),
     }
 }
 
@@ -426,6 +581,12 @@ impl ComposerSpec {
     /// `||spoiler||`, `` `monospace` ``, `[text](address)`; the text is sent with them.
     pub fn formatting(mut self) -> Self {
         self.formatting = true;
+        self
+    }
+    /// The field's panel (API 0.5, part 4): a ☺ button opens these tabs — Flux's emoji, the
+    /// plugin's stickers and GIFs (their content comes as [`panel`] changes).
+    pub fn panel(mut self, tabs: impl IntoIterator<Item = PanelTab>) -> Self {
+        self.panel = tabs.into_iter().collect();
         self
     }
 }

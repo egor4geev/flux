@@ -1,8 +1,8 @@
 use super::metal_atlas::MetalAtlas;
 use crate::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, MonochromeSprite,
+    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, Underline, point, size,
 };
 use anyhow::Result;
 use block::ConcreteBlock;
@@ -1179,12 +1179,18 @@ impl MetalRenderer {
                 .unwrap();
 
             align_offset(instance_offset);
-            let next_offset = *instance_offset + mem::size_of::<Surface>();
+            let next_offset = *instance_offset + mem::size_of::<SurfaceBounds>();
             if next_offset > instance_buffer.size {
                 return false;
             }
 
             command_encoder.set_vertex_buffer(
+                SurfaceInputIndex::Surfaces as u64,
+                Some(&instance_buffer.metal_buffer),
+                *instance_offset as u64,
+            );
+            // Flux patch (FluxGram part 4): the fragment shader rounds the corners.
+            command_encoder.set_fragment_buffer(
                 SurfaceInputIndex::Surfaces as u64,
                 Some(&instance_buffer.metal_buffer),
                 *instance_offset as u64,
@@ -1213,6 +1219,8 @@ impl MetalRenderer {
                     SurfaceBounds {
                         bounds: surface.bounds,
                         content_mask: surface.content_mask.clone(),
+                        corner_radii: surface.corner_radii.clone(),
+                        opacity: surface.opacity,
                     },
                 );
             }
@@ -1415,9 +1423,12 @@ pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Flux patch (FluxGram part 4): rounded corners and opacity.
+    pub corner_radii: Corners<ScaledPixels>,
+    pub opacity: f32,
 }

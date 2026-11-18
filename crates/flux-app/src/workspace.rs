@@ -3829,7 +3829,9 @@ impl Workspace {
 
     /// A tool of the left island. The tree is a cached view (see the editor's tab in `render`):
     /// its root style is the panel's own (`FileTreePanel::render`) — but not while it glides or
-    /// fades, which the cache wouldn't see.
+    /// fades, which the cache wouldn't see. A plugin's window is one too: a frame of something
+    /// playing in the tab beside it (FluxGram part 4: a GIF, a sticker) doesn't lay out its list
+    /// again (2026-11-18: ~40 % of such a frame).
     fn render_left_tool(&self, tool: LeftTool, cached: bool, cx: &App) -> Option<AnyElement> {
         match tool {
             LeftTool::Console => Some(
@@ -3840,13 +3842,15 @@ impl Workspace {
                     .child(self.claude_console.clone())
                     .into_any_element(),
             ),
-            // A plugin's window takes the island's width (the tree's and the commit window's).
+            // A plugin's window takes the island's width (the tree's and the commit window's); its
+            // root fills it (`PluginView::render`, the left island's chrome).
             LeftTool::Plugin(key) => self.plugin_tool_view(key, cx).map(|view| {
-                div()
-                    .flex_none()
-                    .w(px(self.left_width.get()))
-                    .h_full()
-                    .child(view)
+                let island = div().flex_none().w(px(self.left_width.get())).h_full();
+                if !cached {
+                    return island.child(view).into_any_element();
+                }
+                island
+                    .child(AnyView::from(view).cached(StyleRefinement::default().size_full()))
                     .into_any_element()
             }),
             LeftTool::Commit => self
@@ -6752,6 +6756,8 @@ impl Render for Workspace {
                         crate::motion::Appear::fade()
                             .apply("claude-status", div().flex_none().child(status))
                     }))
+                    // A voice message playing anywhere in Flux (FluxGram part 4): who, ⏸.
+                    .children(crate::now_playing::status_item(cx))
                     // An update of Flux on its way (part 10.8): the download, a restart to finish.
                     .children(crate::updates::status_item(cx).map(|update| {
                         crate::motion::Appear::fade()

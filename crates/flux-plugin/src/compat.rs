@@ -404,7 +404,13 @@ fn ui_input(input: &UiInput) -> Option<v2::events::UiInput> {
             | UiEvent::Find
             | UiEvent::FindNext
             | UiEvent::FindPrevious
-            | UiEvent::Cancelled => return None,
+            | UiEvent::Cancelled
+            | UiEvent::MediaPlayed(_)
+            | UiEvent::PanelOpened(_)
+            | UiEvent::PanelSearched(_)
+            | UiEvent::PanelChosen(_)
+            | UiEvent::PanelVisible(_)
+            | UiEvent::PanelLoadMore(_) => return None,
         },
     })
 }

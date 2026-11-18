@@ -59,6 +59,9 @@ enum Slot {
         image: Arc<RenderImage>,
         bytes: usize,
         used: Instant,
+        /// The views that drew it: drawn again when it goes — a cached view (the left island's
+        /// window) would go on painting the atlas tile it no longer has.
+        views: HashSet<EntityId>,
     },
     /// The file isn't there or isn't a picture: the placeholder stays.
     Failed,
@@ -229,8 +232,11 @@ fn get(
 ) -> Option<Arc<RenderImage>> {
     let pictures = cx.default_global::<Pictures>();
     match pictures.slots.get_mut(&key) {
-        Some(Slot::Ready { image, used, .. }) => {
+        Some(Slot::Ready {
+            image, used, views, ..
+        }) => {
             *used = Instant::now();
+            views.insert(view);
             return Some(image.clone());
         }
         Some(Slot::Loading(views)) => {
@@ -255,7 +261,7 @@ fn get(
 /// A picture is decoded: it takes its place, the views that asked are drawn again, and the least
 /// recently drawn pictures go while the budget is exceeded.
 fn ready(key: Key, decoded: Option<RgbaImage>, cx: &mut App) {
-    let views = {
+    let mut views = {
         let pictures = cx.default_global::<Pictures>();
         let views = match pictures.slots.remove(&key) {
             Some(Slot::Loading(views)) => views,
@@ -269,6 +275,7 @@ fn ready(key: Key, decoded: Option<RgbaImage>, cx: &mut App) {
                     image: Arc::new(RenderImage::new([Frame::new(buffer)])),
                     bytes,
                     used: Instant::now(),
+                    views: views.clone(),
                 }
             }
             None => Slot::Failed,
@@ -276,8 +283,9 @@ fn ready(key: Key, decoded: Option<RgbaImage>, cx: &mut App) {
         pictures.slots.insert(key, slot);
         views
     };
-    for image in evict(cx.default_global::<Pictures>(), Instant::now()) {
+    for (image, drew) in evict(cx.default_global::<Pictures>(), Instant::now()) {
         cx.drop_image(image, None);
+        views.extend(drew);
     }
     for view in views {
         cx.notify(view);
@@ -285,8 +293,9 @@ fn ready(key: Key, decoded: Option<RgbaImage>, cx: &mut App) {
 }
 
 /// Takes the least recently drawn pictures out while the total is over the budget — those on
-/// screen only when the screen alone is over it — and returns them for the atlases to let go.
-fn evict(pictures: &mut Pictures, now: Instant) -> Vec<Arc<RenderImage>> {
+/// screen only when the screen alone is over it — and returns them for the atlases to let go,
+/// with the views that drew them.
+fn evict(pictures: &mut Pictures, now: Instant) -> Vec<(Arc<RenderImage>, HashSet<EntityId>)> {
     if pictures.total <= BUDGET {
         return Vec::new();
     }
@@ -308,9 +317,15 @@ fn evict(pictures: &mut Pictures, now: Instant) -> Vec<Arc<RenderImage>> {
         if now.duration_since(used) < IN_SIGHT && pictures.total <= BUDGET * 2 {
             break;
         }
-        if let Some(Slot::Ready { image, bytes, .. }) = pictures.slots.remove(&key) {
+        if let Some(Slot::Ready {
+            image,
+            bytes,
+            views,
+            ..
+        }) = pictures.slots.remove(&key)
+        {
             pictures.total -= bytes;
-            gone.push(image);
+            gone.push((image, views));
         }
     }
     gone
@@ -369,6 +384,7 @@ mod tests {
                 image: Arc::new(RenderImage::new([Frame::new(buffer)])),
                 bytes,
                 used,
+                views: HashSet::new(),
             },
         );
     }

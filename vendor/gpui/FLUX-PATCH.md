@@ -233,6 +233,24 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
   to; a measurement at another width truncates and shapes it again, from the text's own runs
   (`truncate_line` shortens the runs it is given); wrapped text is unchanged.
 
+- **Rounded videos** (2026-11-18, FluxGram part 4, `crates/flux-media/src/video.rs`): a video's
+  frames are `CVPixelBuffer`s drawn by `surface` — in the feed with rounded corners, a round video
+  message as a circle — and gpui 0.2.2's surface had square corners only (`// TODO: Add support
+  for corner_radii`) and ignored the element's opacity.
+  - `src/elements/surface.rs`: the corner radii of the element's style (`.rounded(px(8.))`,
+    `.rounded_full()`), clamped to the drawn picture as `img` does — they round the picture as
+    fitted (`object_fit`), as `img`'s do.
+  - `src/window.rs`: `Window::paint_surface(bounds, corner_radii, image_buffer)` — the radii as
+    `paint_image` takes them (scaled by the element transform of the Motion patch and the scale
+    factor), and the element's opacity. `src/scene.rs`: `PaintSurface::corner_radii`, `opacity`.
+  - `src/platform/mac/metal_renderer.rs`: `SurfaceBounds` carries them (no longer `Eq`: the
+    opacity is a float); the surface's instance is bound for the fragment stage too, and the space
+    reserved for it is `SurfaceBounds`' size (it was the `Surface` element's). `shaders.metal`:
+    `surface_fragment` multiplies the alpha by the opacity and by the rounded rectangle's coverage,
+    `saturate(0.5 - quad_sdf(...))`, as `polychrome_sprite_fragment` does — antialiased edges, a
+    circle for a square with `rounded_full`. Blade's surfaces and Windows' (an empty
+    `draw_surfaces`) are untouched.
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,
@@ -255,4 +273,6 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
    Explorer, Paste in the project tree copies them in; Copy in the tree, Paste in Finder or
    Explorer copies the file there (Cut in the tree, Paste in Explorer moves it); text copied in
    Flux still pastes as text elsewhere. A pinch over a picture, in its tab and in the popup, at
-   100 % and 125 %, zooms around the fingers (on Windows with a precision touchpad too).
+   100 % and 125 %, zooms around the fingers (on Windows with a precision touchpad too). In a
+   FluxGram chat a round video message plays as a circle with smooth edges and a video's corners
+   are rounded, at 100 % and 125 %.
