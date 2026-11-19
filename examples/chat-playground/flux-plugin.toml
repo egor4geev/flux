@@ -1,0 +1,41 @@
+# The Chat Playground: a chat-like mock of API 0.5 — the list of chats on the left (rows of two
+# lines with avatars and unread badges), a chat per tab, each a conversation fed with every kind of
+# message (10 000 of them, paged by `load-older`), pictures with blurred previews, a QR code. Not
+# bundled into Flux — install the folder: Settings → Plugins → ⚙ → Install Plugin from Disk….
+id = "flux.chat-playground"
+name = "Chat Playground"
+version = "0.1.0"
+api = "0.5"
+authors = ["Egor Ageev"]
+description = "A chat-like mock of the conversation, pictures, avatars and QR codes of the plugin API."
+repository = "https://github.com/egor4geev/flux"
+wasm = "target/wasm32-wasip2/release/flux_chat_playground.wasm"
+
+[[commands]]
+id = "open"
+title = "Open Chat Playground"
+category = "Playground"
+
+# The list of chats, on the left island in place of the tree; its icon counts the unread
+# messages (`ui.set-badge`).
+[[tool-windows]]
+id = "chats"
+title = "Chats"
+icon = "icons/plane.svg"
+location = "left"
+
+# A chat per tab among the editor's tabs: `ui.open-tab("chat", <chat>, <title>, …)` opens the tab
+# `chat/<chat>`; a dot on the tab marks a chat with unread messages.
+[[tool-windows]]
+id = "chat"
+title = "Chat"
+icon = "icons/plane.svg"
+location = "editor"
+tabs = true
+
+# A chat's profile (API 0.5): a click on the chat's header opens it — a large header over the
+# chat's photos and videos by month (a gallery).
+[[tool-windows]]
+id = "profile"
+title = "Profile"
+location = "dialog"

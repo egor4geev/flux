@@ -658,6 +658,9 @@ pub(crate) struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Flux patch (FluxGram part 4): rounded corners and the element's opacity, as an image's.
+    pub corner_radii: Corners<ScaledPixels>,
+    pub opacity: f32,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
 }

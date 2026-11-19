@@ -168,9 +168,9 @@ fn a_flux_tool_call_waits_for_the_host() {
         return;
     };
     let server = McpServer::new(vec![ToolSpec {
-        name: "get_diagnostics",
-        title: "Get Diagnostics",
-        description: "Problems.",
+        name: "get_diagnostics".into(),
+        title: "Get Diagnostics".into(),
+        description: "Problems.".into(),
         input_schema: serde_json::json!({ "type": "object" }),
         read_only: true,
     }]);
@@ -205,7 +205,10 @@ fn a_flux_tool_call_waits_for_the_host() {
                             id: rpc,
                             name,
                             arguments,
+                            tool_use_id,
                         } => {
+                            // The call names its step in the conversation.
+                            assert_eq!(tool_use_id.as_deref(), Some("toolu_flux_diagnostics_1"));
                             call = Some((name, arguments));
                             let output = ToolOutput::text("src/main.rs:3:5: error: expected `;`");
                             process.respond(

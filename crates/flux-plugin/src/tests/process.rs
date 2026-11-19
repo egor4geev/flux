@@ -58,7 +58,7 @@ fn store(id: &str, values: serde_json::Value) {
 
 impl Probe {
     /// No notification for `duration` (log lines don't count).
-    fn quiet(&mut self, duration: Duration) {
+    pub(super) fn quiet(&mut self, duration: Duration) {
         let until = Instant::now() + duration;
         while Instant::now() < until {
             match self.messages.try_recv() {

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
     Action, App, AppContext, Context, Entity, EntityId, EventEmitter, KeyBinding, Subscription,
-    Task, actions,
+    Task, WeakEntity, actions,
 };
 
 use flux_claude::{
@@ -27,6 +27,7 @@ use crate::claude_console::SessionRef;
 use crate::claude_history::{self, ConsoleState, OpenSessions, SessionPlace};
 use crate::claude_session::{ClaudeSession, SessionEvent};
 use crate::i18n::{tr, trf};
+use crate::plugins::PluginStore;
 use crate::settings;
 
 actions!(
@@ -277,6 +278,9 @@ pub struct ClaudeStore {
     _saved: Option<Task<()>>,
     /// The console as last written for the root: `None` until it was read.
     saved_console: Option<ConsoleState>,
+    /// The window's plugins: the tools of those running join each new session's MCP server
+    /// (API 0.5, [`crate::plugin_tools`]).
+    plugins: Option<WeakEntity<PluginStore>>,
 }
 
 impl EventEmitter<ClaudeStoreEvent> for ClaudeStore {}
@@ -305,6 +309,7 @@ impl ClaudeStore {
             saved: None,
             _saved: None,
             saved_console: None,
+            plugins: None,
         };
         store.load_console();
         store.refresh_saved(cx);
@@ -314,6 +319,12 @@ impl ClaudeStore {
 
     pub fn cli(&self) -> &CliState {
         &self.cli
+    }
+
+    /// The window's plugins, whose tools the sessions offer Claude (set once the window made
+    /// them).
+    pub(crate) fn set_plugins(&mut self, plugins: WeakEntity<PluginStore>) {
+        self.plugins = Some(plugins);
     }
 
     pub fn is_ready(&self) -> bool {
@@ -774,7 +785,8 @@ impl ClaudeStore {
         if mode.is_some() {
             options.permission_mode = mode;
         }
-        let session = cx.new(|cx| ClaudeSession::new(cli, options, cx));
+        let plugins = self.plugins.clone();
+        let session = cx.new(|cx| ClaudeSession::new(cli, options, plugins, cx));
         self.add(session.clone(), cx);
         Some(session)
     }
@@ -894,8 +906,9 @@ impl ClaudeStore {
         options.resume = Some(saved.id.clone());
         let path = saved.path.clone();
         let title = saved.title.clone();
+        let plugins = self.plugins.clone();
         Some(cx.new(|cx| {
-            let mut session = ClaudeSession::resumed(cli, options, path, cx);
+            let mut session = ClaudeSession::resumed(cli, options, path, plugins, cx);
             session.set_title_hint(title);
             session
         }))
@@ -969,7 +982,10 @@ impl ClaudeStore {
 
     /// Ends a session: its process stops, its chat goes.
     pub fn close_session(&mut self, session: &Entity<ClaudeSession>, cx: &mut Context<Self>) {
-        session.update(cx, |session, _| session.shutdown());
+        session.update(cx, |session, cx| {
+            session.end_plugin_calls_on_close(cx);
+            session.shutdown();
+        });
         crate::region_guard::note_working(session.entity_id(), false, cx);
         self.sessions.retain(|known| known != session);
         self.subscriptions.retain(|(known, _)| known != session);

@@ -22,6 +22,10 @@
 //! sight ([`ClaudeSession::ensure_started`]) or the user writes. Flux's MCP server (`flux`, the
 //! tools of [`crate::claude_tools`]) is registered in `initialize`; its tools run without a
 //! permission card (a PreToolUse hook allows them).
+//!
+//! API 0.5: the server also lists the tools of the plugins running in the window when the process
+//! starts ([`crate::plugin_tools`]); their calls go to the plugins, a `write` tool's card is a
+//! question of the session like a permission card.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,13 +41,17 @@ use flux_claude::mcp::{self, McpReply, McpServer, ToolOutput};
 use flux_claude::process::ProcessEvent;
 use flux_claude::protocol::{CliRequest, HostRequest, Incoming};
 use flux_claude::session::EDIT_HOOK;
+use flux_claude::session::{Pending, PendingKind};
 use flux_claude::shell::{self, ShellCommand, ShellEvent};
 use flux_claude::{
-    Answer, Change, Cli, Effort, EntryId, LaunchOptions, Notice, PermissionMode, Process, Session,
-    ShellState, Status, UserInput,
+    Answer, Change, Cli, Effort, Entry, EntryId, EntryKind, LaunchOptions, Notice, PermissionMode,
+    Process, Session, ShellState, Status, ToolEntry, ToolState, UserInput,
 };
+use flux_plugin::api::tools::{ConfirmChoice, Confirmation, ToolOutput as PluginOutput};
 
 use crate::i18n::tr;
+use crate::plugin_tools::{CallEnd, SessionTools};
+use crate::plugins::{PluginStore, PluginStoreEvent};
 use crate::region_guard::{self, Gate, Refusal, RegionEvent};
 
 /// How often `get_usage` is asked again while the CLI hasn't fetched the limits yet (right after
@@ -130,6 +138,11 @@ pub struct ClaudeSession {
     mcp: McpServer,
     /// Tool calls the window runs: the CLI's request id → the JSON-RPC id of the call.
     tool_calls: HashMap<String, Value>,
+    /// The tools of the window's plugins (API 0.5): those the server lists, their calls, how
+    /// their steps look.
+    plugin_tools: SessionTools,
+    /// A plugin that stops ends its calls.
+    _plugin_events: Option<Subscription>,
     /// Edit hooks waiting for the window ([`SessionEvent::EditHook`]): the CLI's request id → the
     /// answer of the session model, which the problems join.
     edit_hooks: HashMap<String, Value>,
@@ -226,9 +239,16 @@ struct ShellRun {
 impl EventEmitter<SessionEvent> for ClaudeSession {}
 
 impl ClaudeSession {
-    pub fn new(cli: Cli, options: LaunchOptions, cx: &mut Context<Self>) -> Self {
-        let mut session = Self::idle(cli, options);
+    /// `plugins` — the window's: the tools of those running join the server.
+    pub fn new(
+        cli: Cli,
+        options: LaunchOptions,
+        plugins: Option<WeakEntity<PluginStore>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut session = Self::idle(cli, options, plugins);
         session.watch_region(cx);
+        session.watch_plugins(cx);
         session.start(cx);
         session
     }
@@ -241,10 +261,12 @@ impl ClaudeSession {
         cli: Cli,
         options: LaunchOptions,
         transcript: PathBuf,
+        plugins: Option<WeakEntity<PluginStore>>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut session = Self::idle(cli, options);
+        let mut session = Self::idle(cli, options, plugins);
         session.watch_region(cx);
+        session.watch_plugins(cx);
         session.model.info.session_id = session.options.resume.clone();
         session.model.status = Status::Idle;
         session.loading = true;
@@ -259,7 +281,7 @@ impl ClaudeSession {
         session
     }
 
-    fn idle(cli: Cli, options: LaunchOptions) -> Self {
+    fn idle(cli: Cli, options: LaunchOptions, plugins: Option<WeakEntity<PluginStore>>) -> Self {
         Self {
             model: Session::new(options.cwd.clone()),
             cli,
@@ -268,6 +290,8 @@ impl ClaudeSession {
             _pump: None,
             mcp: McpServer::new(crate::claude_tools::specs()),
             tool_calls: HashMap::new(),
+            plugin_tools: SessionTools::new(plugins),
+            _plugin_events: None,
             edit_hooks: HashMap::new(),
             loading: false,
             _load: None,
@@ -355,6 +379,164 @@ impl ClaudeSession {
                 json!({ "mcp_response": McpServer::result(&id, &output) }),
             );
         }
+    }
+
+    // --- The plugins' tools (API 0.5) ---
+
+    /// The tools of the window's plugins in this session: the chat's steps and cards read them.
+    pub(crate) fn plugin_tools(&self) -> &SessionTools {
+        &self.plugin_tools
+    }
+
+    /// A plugin answered a call of its tool (`tools.respond`): Claude gets the text, the step
+    /// its look; a card still up goes.
+    pub(crate) fn plugin_tool_answered(
+        &mut self,
+        call: u64,
+        output: PluginOutput,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((request, card)) = self.plugin_tools.answered(call, &output) else {
+            return;
+        };
+        if card {
+            let changes = self.model.resolve(
+                &request,
+                &Answer::Allow {
+                    remember: Vec::new(),
+                },
+            );
+            self.emit(changes, cx);
+        }
+        let output = ToolOutput {
+            text: output.text,
+            is_error: output.error,
+        };
+        self.answer_tool(&request, output, cx);
+        cx.emit(SessionEvent::Changed);
+        cx.notify();
+    }
+
+    /// A plugin shows the card of a call (`tools.confirm`): a question of the session, as a
+    /// permission card is — the chat draws the plugin's card, the status bar, the console and
+    /// the notifications count it.
+    pub(crate) fn show_plugin_card(
+        &mut self,
+        call: u64,
+        card: Confirmation,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(shown) = self.plugin_tools.show_card(call, card) else {
+            return;
+        };
+        if shown.replaced {
+            cx.emit(SessionEvent::Changed);
+            cx.notify();
+            return;
+        }
+        if let Some(tool) = find_tool_mut(&mut self.model.entries, &shown.tool_use_id) {
+            tool.state = ToolState::Waiting;
+        }
+        self.model.pending.push(Pending {
+            id: shown.request.clone(),
+            tool_use_id: shown.tool_use_id,
+            tool: shown.tool_name,
+            display_name: shown.title,
+            description: shown.subtitle,
+            input: shown.input,
+            kind: PendingKind::Tool,
+            suggestions: Vec::new(),
+            blocked_path: None,
+            reason: None,
+            default_to_no: false,
+            suppress_always_allow: true,
+            from_agent: false,
+        });
+        self.model.status = Status::WaitingForUser;
+        self.emit(
+            vec![
+                Change::PendingAdded(shown.request),
+                Change::Entries,
+                Change::Status,
+            ],
+            cx,
+        );
+    }
+
+    /// The user's choice on a plugin's card: the card goes, the plugin hears it (and answers).
+    pub(crate) fn choose_on_card(
+        &mut self,
+        request: &str,
+        choice: ConfirmChoice,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.plugin_tools.choose(request, choice, cx) {
+            return;
+        }
+        let answer = match choice {
+            ConfirmChoice::Rejected => Answer::Deny {
+                message: String::new(),
+                interrupt: false,
+            },
+            ConfirmChoice::Confirmed | ConfirmChoice::Edit => Answer::Allow {
+                remember: Vec::new(),
+            },
+        };
+        let changes = self.model.resolve(request, &answer);
+        self.emit(changes, cx);
+    }
+
+    /// The plugins' calls in progress end (of `plugin` only, when given): their cards go; Claude
+    /// gets an error unless nobody waits for it.
+    fn end_plugin_calls(&mut self, plugin: Option<&str>, end: CallEnd, cx: &mut Context<Self>) {
+        let ended = self.plugin_tools.end_calls(plugin, end, cx);
+        let mut changes = Vec::new();
+        for (request, card) in ended {
+            if card {
+                changes.extend(self.model.resolve(
+                    &request,
+                    &Answer::Deny {
+                        message: String::new(),
+                        interrupt: false,
+                    },
+                ));
+            }
+            let error = match end {
+                CallEnd::Interrupted => Some("The user interrupted the call.".to_string()),
+                CallEnd::PluginStopped => Some(format!(
+                    "The plugin {} stopped before it answered.",
+                    plugin.unwrap_or("of this tool")
+                )),
+                CallEnd::Withdrawn => None,
+            };
+            match error {
+                Some(error) => self.answer_tool(&request, ToolOutput::error(error), cx),
+                None => {
+                    self.tool_calls.remove(&request);
+                }
+            }
+        }
+        if !changes.is_empty() {
+            self.emit(changes, cx);
+        }
+    }
+
+    /// The session closes: the plugins' calls in progress end, the plugins hear it (before
+    /// [`Self::shutdown`], which has no app to tell them).
+    pub(crate) fn end_plugin_calls_on_close(&mut self, cx: &mut Context<Self>) {
+        self.end_plugin_calls(None, CallEnd::Withdrawn, cx);
+    }
+
+    /// A plugin that stops (turned off, reloaded, failed) ends its calls.
+    fn watch_plugins(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = self.plugin_tools.store().and_then(WeakEntity::upgrade) else {
+            return;
+        };
+        self._plugin_events = Some(cx.subscribe(&store, |this, _, event, cx| {
+            if let PluginStoreEvent::PluginStopped(plugin) = event {
+                this.end_plugin_calls(Some(plugin), CallEnd::PluginStopped, cx);
+            }
+        }));
     }
 
     /// The window looked at the file an edit changed ([`SessionEvent::EditHook`]): `problems` —
@@ -569,6 +751,14 @@ impl ClaudeSession {
 
     /// Answers a question of the CLI (a permission, an edit, Claude's questions, the plan).
     pub fn answer(&mut self, request: &str, answer: Answer, cx: &mut Context<Self>) {
+        // A plugin's card answered as a permission (the console's quick answers): allow sends.
+        if self.plugin_tools.card(request).is_some() {
+            let choice = match answer {
+                Answer::Allow { .. } => ConfirmChoice::Confirmed,
+                _ => ConfirmChoice::Rejected,
+            };
+            return self.choose_on_card(request, choice, cx);
+        }
         let Some(pending) = self.model.pending(request).cloned() else {
             return;
         };
@@ -809,6 +999,8 @@ impl ClaudeSession {
     /// (`control_cancel_request`).
     pub fn interrupt(&mut self, cx: &mut Context<Self>) {
         self.request(HostRequest::Interrupt, cx);
+        // The plugins' calls end too: their cards go, the plugins hear it.
+        self.end_plugin_calls(None, CallEnd::Interrupted, cx);
     }
 
     /// Takes back a message queued while a turn runs.
@@ -941,6 +1133,11 @@ impl ClaudeSession {
             }
             Gate::Refuse(refusal) => return self.refused(&refusal, cx),
         }
+        // The CLI reads the server's tools once: the plugins running now are in this process's.
+        let mut specs = crate::claude_tools::specs();
+        let taken: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
+        specs.extend(self.plugin_tools.refresh(&taken, cx));
+        self.mcp = McpServer::new(specs);
         let (process, events) = match Process::spawn(&self.cli, &self.options) {
             Ok(started) => started,
             Err(err) => {
@@ -1010,6 +1207,7 @@ impl ClaudeSession {
                 self.process = None;
                 self.tool_calls.clear();
                 self.edit_hooks.clear();
+                self.end_plugin_calls(None, CallEnd::Withdrawn, cx);
                 // Outside the old process's pump, which this event comes from: the new process
                 // replaces it.
                 cx.spawn(async move |this, cx| {
@@ -1024,14 +1222,35 @@ impl ClaudeSession {
         {
             self.answer_request(id, request, cx);
         }
+        // The CLI withdrew a plugin's call: the plugin hears it (its card goes with the model's
+        // question below).
+        if let ProcessEvent::Frame(frame) = &event
+            && let Incoming::Cancel { id } = frame.as_ref()
+            && self.plugin_tools.withdraw(id, cx).is_some()
+        {
+            self.tool_calls.remove(id);
+        }
         // The pump ends by itself: the channel closes after this event. The requests waiting for
         // the window go with the process.
         if matches!(event, ProcessEvent::Exited { .. }) {
             self.process = None;
             self.tool_calls.clear();
             self.edit_hooks.clear();
+            self.end_plugin_calls(None, CallEnd::Withdrawn, cx);
         }
-        let changes = self.model.apply(&event);
+        let mut changes = self.model.apply(&event);
+        // A plugin's card still waits: the session waits for the user, whatever the CLI says of
+        // its turn meanwhile.
+        if matches!(self.model.status, Status::Working { .. })
+            && self
+                .model
+                .pending
+                .iter()
+                .any(|pending| self.plugin_tools.card(&pending.id).is_some())
+        {
+            self.model.status = Status::WaitingForUser;
+            changes.push(Change::Status);
+        }
         self.emit(changes, cx);
     }
 
@@ -1089,13 +1308,30 @@ impl ClaudeSession {
                         id: call,
                         name,
                         arguments,
+                        tool_use_id,
                     } => {
                         self.tool_calls.insert(id.to_string(), call);
-                        cx.emit(SessionEvent::ToolCall {
-                            request: id.to_string(),
-                            tool: name,
-                            input: arguments,
-                        });
+                        if self.plugin_tools.tool(&name).is_some() {
+                            // A plugin's tool: its instance in the window answers, maybe later.
+                            let session = cx.weak_entity();
+                            let started = self.plugin_tools.start_call(
+                                id,
+                                &name,
+                                arguments,
+                                tool_use_id,
+                                session,
+                                cx,
+                            );
+                            if let Err(error) = started {
+                                self.answer_tool(id, ToolOutput::error(error), cx);
+                            }
+                        } else {
+                            cx.emit(SessionEvent::ToolCall {
+                                request: id.to_string(),
+                                tool: name,
+                                input: arguments,
+                            });
+                        }
                     }
                 }
             }
@@ -1351,4 +1587,19 @@ impl Drop for ClaudeSession {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// The call `tool_use_id` among the entries, a subagent's too.
+fn find_tool_mut<'a>(entries: &'a mut [Entry], tool_use_id: &str) -> Option<&'a mut ToolEntry> {
+    for entry in entries {
+        if let EntryKind::Tool(tool) = &mut entry.kind {
+            if tool.tool_use_id == tool_use_id {
+                return Some(tool);
+            }
+            if let Some(found) = find_tool_mut(&mut tool.children, tool_use_id) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }

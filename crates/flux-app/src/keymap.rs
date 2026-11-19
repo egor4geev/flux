@@ -134,6 +134,9 @@ pub const WINDOWS_KEYS: &[(&str, &str, &[&str])] = &[
     // JetBrains: Find Next / Previous (⌘G / ⇧⌘G) — F3 / Shift+F3.
     ("find_bar::FindNext", "cmd-g", &["f3"]),
     ("find_bar::FindPrevious", "cmd-shift-g", &["shift-f3"]),
+    // A plugin's own search in its window (API 0.5): the same keys as Flux's find.
+    ("plugin_view::FindNext", "cmd-g", &["f3"]),
+    ("plugin_view::FindPrevious", "cmd-shift-g", &["shift-f3"]),
     // The search options (⌥⌘C/W/R): Alt+C/W/R, the Windows keys of the same set; Ctrl+Alt+C
     // opens the Claude console.
     ("find_bar::ToggleCaseSensitive", "alt-cmd-c", &["alt-c"]),

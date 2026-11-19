@@ -1,10 +1,12 @@
 diff -ruN a/src/app.rs b/src/app.rs
---- a/src/app.rs	2026-10-30 13:10:46
-+++ b/src/app.rs	2026-10-30 13:10:46
-@@ -750,6 +750,32 @@
+--- a/src/app.rs	2026-11-19 10:04:16
++++ b/src/app.rs	2026-11-19 10:04:16
+@@ -748,6 +748,32 @@
+     /// Gracefully quit the application via the platform's standard routine.
+     pub fn quit(&self) {
          self.platform.quit();
-     }
- 
++    }
++
 +    /// Flux patch (part 10.5): `callback` is asked when the platform wants the application to quit
 +    /// on its own — macOS: Quit in the Dock or its menu, the end of the user's session (logging
 +    /// out, restarting, shutting down) — but not after [`App::quit`]. The platform waits while the
@@ -29,25 +31,57 @@ diff -ruN a/src/app.rs b/src/app.rs
 +    /// ([`App::on_quit_requested`]); does nothing without such a request.
 +    pub fn cancel_quit(&self) {
 +        self.platform.cancel_quit();
-+    }
-+
+     }
+ 
      /// Schedules all windows in the application to be redrawn. This can be called
-     /// multiple times in an update cycle and still result in a single redraw.
-     pub fn refresh_windows(&mut self) {
-@@ -1040,6 +1066,13 @@
-     /// Writes data to the platform clipboard.
-     pub fn write_to_clipboard(&self, item: ClipboardItem) {
+@@ -1042,6 +1068,13 @@
          self.platform.write_to_clipboard(item)
-+    }
-+
+     }
+ 
 +    /// Flux patch: empties the platform clipboard — after files that were cut have been pasted, as
 +    /// Explorer does, so nothing offers to paste files that are gone. macOS clears the pasteboard
 +    /// (`clearContents`), Windows empties the clipboard (`EmptyClipboard`).
 +    pub fn clear_clipboard(&self) {
 +        self.platform.write_to_clipboard(ClipboardItem::empty())
++    }
++
+     /// Reads data from the primary selection buffer.
+     /// Only available on Linux.
+     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+@@ -2068,6 +2101,9 @@
+     ///
+     /// If the current window is being updated, it will be removed from `App.windows`, you can use `current_window` to specify the current window.
+     /// This is a no-op if the image is not in the sprite atlas.
++    ///
++    /// Flux patch: without `current_window`, the windows being updated lose the image too, once
++    /// their update is over.
+     pub fn drop_image(&mut self, image: Arc<RenderImage>, current_window: Option<&mut Window>) {
+         // remove the texture from all other windows
+         for window in self.windows.values_mut().flatten() {
+@@ -2076,7 +2112,22 @@
+ 
+         // remove the texture from the current window
+         if let Some(window) = current_window {
+-            _ = window.drop_image(image);
++            _ = window.drop_image(image.clone());
++        }
++
++        // Flux patch: a window being updated — drawn, or handling an event — is out of
++        // `self.windows` for the update; gpui 0.2.2 left the image in its atlas for good unless it
++        // was passed as `current_window` (Flux's players drop their frames while the window draws).
++        // Such a window lets the image go once the update is over; removing it twice does nothing.
++        if !self.window_update_stack.is_empty() {
++            let windows = self.window_update_stack.clone();
++            self.defer(move |cx| {
++                for id in windows {
++                    if let Some(Some(window)) = cx.windows.get_mut(id) {
++                        _ = window.drop_image(image.clone());
++                    }
++                }
++            });
+         }
      }
  
-     /// Reads data from the primary selection buffer.
 diff -ruN a/src/elements/animation.rs b/src/elements/animation.rs
 --- a/src/elements/animation.rs	2026-10-30 13:10:46
 +++ b/src/elements/animation.rs	2026-10-30 13:10:46
@@ -720,6 +754,83 @@ diff -ruN a/src/elements/div.rs b/src/elements/div.rs
                          *active_tooltip.borrow_mut() = new_tooltip;
                          window.refresh();
                      })
+diff -ruN a/src/elements/surface.rs b/src/elements/surface.rs
+--- a/src/elements/surface.rs	2026-11-18 18:46:58
++++ b/src/elements/surface.rs	2026-11-18 18:46:58
+@@ -96,8 +96,15 @@
+             SurfaceSource::Surface(surface) => {
+                 let size = crate::size(surface.get_width().into(), surface.get_height().into());
+                 let new_bounds = self.object_fit.get_bounds(bounds, size);
+-                // TODO: Add support for corner_radii
+-                window.paint_surface(new_bounds, surface.clone());
++                // Flux patch (FluxGram part 4): the corner radii of the element's style, as
++                // `img` rounds its picture.
++                let mut style = Style::default();
++                style.refine(&self.style);
++                let corner_radii = style
++                    .corner_radii
++                    .to_pixels(window.rem_size())
++                    .clamp_radii_for_quad_size(new_bounds.size);
++                window.paint_surface(new_bounds, corner_radii, surface.clone());
+             }
+             #[allow(unreachable_patterns)]
+             _ => {}
+diff -ruN a/src/elements/text.rs b/src/elements/text.rs
+--- a/src/elements/text.rs	2026-11-18 10:51:46
++++ b/src/elements/text.rs	2026-11-18 10:51:46
+@@ -316,6 +316,10 @@
+     lines: SmallVec<[WrappedLine; 1]>,
+     line_height: Pixels,
+     wrap_width: Option<Pixels>,
++    /// Flux patch: the width a `text_overflow` text was truncated to. A measurement at another
++    /// width truncates it again — taffy's first call may offer no room at all (a quote cut down
++    /// to "…" for the whole frame).
++    truncate_width: Option<Pixels>,
+     size: Option<Size<Pixels>>,
+     bounds: Option<Bounds<Pixels>>,
+ }
+@@ -334,7 +338,7 @@
+             .line_height
+             .to_pixels(font_size.into(), window.rem_size());
+ 
+-        let mut runs = if let Some(runs) = runs {
++        let runs = if let Some(runs) = runs {
+             runs
+         } else {
+             vec![text_style.to_run(text.len())]
+@@ -373,11 +377,16 @@
+                 if let Some(text_layout) = element_state.0.borrow().as_ref()
+                     && text_layout.size.is_some()
+                     && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
++                    // Flux patch: truncated at the same width.
++                    && text_layout.truncate_width == truncate_width
+                 {
+                     return text_layout.size.unwrap();
+                 }
+ 
+                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
++                // Flux patch: truncation shortens the runs to the text it keeps — a measurement at
++                // another width starts from the text's own runs.
++                let mut runs = runs.clone();
+                 let text = if let Some(truncate_width) = truncate_width {
+                     line_wrapper.truncate_line(
+                         text.clone(),
+@@ -406,6 +415,7 @@
+                         len: 0,
+                         line_height,
+                         wrap_width,
++                        truncate_width,
+                         size: Some(Size::default()),
+                         bounds: None,
+                     });
+@@ -424,6 +434,7 @@
+                     len,
+                     line_height,
+                     wrap_width,
++                    truncate_width,
+                     size: Some(size),
+                     bounds: None,
+                 });
 diff -ruN a/src/interactive.rs b/src/interactive.rs
 --- a/src/interactive.rs	2026-10-30 13:10:46
 +++ b/src/interactive.rs	2026-10-30 13:10:46
@@ -808,6 +919,193 @@ diff -ruN a/src/interactive.rs b/src/interactive.rs
          }
      }
  }
+diff -ruN a/src/platform.rs b/src/platform.rs
+--- a/src/platform.rs	2026-10-30 13:10:46
++++ b/src/platform.rs	2026-10-30 13:10:46
+@@ -81,6 +81,9 @@
+ pub(crate) use test::*;
+ #[cfg(target_os = "windows")]
+ pub(crate) use windows::*;
++// Flux patch: CF_HDROP's data (files on the clipboard), public for Flux's tests.
++#[cfg(target_os = "windows")]
++pub use windows::{decode_dropfiles, encode_dropfiles};
+ 
+ #[cfg(any(test, feature = "test-support"))]
+ pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
+@@ -230,6 +233,15 @@
+ 
+     fn on_quit(&self, callback: Box<dyn FnMut()>);
+     fn on_reopen(&self, callback: Box<dyn FnMut()>);
++    /// Flux patch (part 10.5): `callback` is asked when the platform wants the application to quit
++    /// on its own (macOS: Quit in the Dock, the end of the user's session). The platform waits
++    /// until the application answers with [`Platform::quit`] or [`Platform::cancel_quit`].
++    /// `callback` returns `false` when it can't ask now (the app is busy): it is asked again a
++    /// little later. Platforms without such requests ignore it.
++    fn on_quit_requested(&self, _callback: Box<dyn FnMut() -> bool>) {}
++    /// Flux patch (part 10.5): the application keeps running after a quit the platform asked for
++    /// ([`Platform::on_quit_requested`]); nothing to do without such a request.
++    fn cancel_quit(&self) {}
+ 
+     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
+     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
+@@ -499,6 +511,11 @@
+     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
+     fn draw(&self, scene: &Scene);
+     fn completed_frame(&self) {}
++    /// Flux patch (headless scenario screenshots): `scene` rendered offscreen, RGBA with
++    /// premultiplied alpha, if the platform can.
++    fn render_to_image(&self, _scene: &Scene) -> Option<image::RgbaImage> {
++        None
++    }
+     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+ 
+     // macOS specific methods
+@@ -514,6 +531,8 @@
+     fn set_edited(&mut self, _edited: bool) {}
+     fn show_character_palette(&self) {}
+     fn titlebar_double_click(&self) {}
++    /// Flux patch: see `Window::set_traffic_light_position`.
++    fn set_traffic_light_position(&self, _position: Option<Point<Pixels>>) {}
+     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
+     fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
+     fn on_select_previous_tab(&self, _callback: Box<dyn FnMut()>) {}
+@@ -940,7 +959,11 @@
+ 
+     fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
+         self.cx
+-            .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
++            .update(|window, cx| {
++                // Flux patch (interface scale): the platform takes window points.
++                let bounds = self.handler.bounds_for_range(range_utf16, window, cx)?;
++                Some(crate::window::scale_bounds(bounds, window.ui_scale()))
++            })
+             .ok()
+             .flatten()
+     }
+@@ -970,7 +993,11 @@
+     #[allow(unused)]
+     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
+         self.cx
+-            .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
++            .update(|window, cx| {
++                // Flux patch (interface scale): the platform gives window points.
++                let point = point * (1. / window.ui_scale());
++                self.handler.character_index_for_point(point, window, cx)
++            })
+             .ok()
+             .flatten()
+     }
+@@ -1503,6 +1530,9 @@
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct ClipboardItem {
+     entries: Vec<ClipboardEntry>,
++    /// Flux patch: the item was cut, not copied — pasting its paths moves them
++    /// ([`ClipboardItem::with_cut`]).
++    cut: bool,
+ }
+ 
+ /// Either a ClipboardString or a ClipboardImage
+@@ -1512,6 +1542,9 @@
+     String(ClipboardString),
+     /// An image entry
+     Image(Image),
++    /// Flux patch: files and folders, as Finder's and Explorer's Copy put them on the clipboard
++    /// ([`ClipboardItem::new_paths`], [`ClipboardItem::paths`]).
++    ExternalPaths(crate::ExternalPaths),
+ }
+ 
+ impl ClipboardItem {
+@@ -1519,6 +1552,7 @@
+     pub fn new_string(text: String) -> Self {
+         Self {
+             entries: vec![ClipboardEntry::String(ClipboardString::new(text))],
++            cut: false,
+         }
+     }
+ 
+@@ -1529,6 +1563,7 @@
+                 text,
+                 metadata: Some(metadata),
+             })],
++            cut: false,
+         }
+     }
+ 
+@@ -1538,6 +1573,7 @@
+             entries: vec![ClipboardEntry::String(
+                 ClipboardString::new(text).with_json_metadata(metadata),
+             )],
++            cut: false,
+         }
+     }
+ 
+@@ -1545,9 +1581,58 @@
+     pub fn new_image(image: &Image) -> Self {
+         Self {
+             entries: vec![ClipboardEntry::Image(image.clone())],
++            cut: false,
+         }
+     }
+ 
++    /// Flux patch: files and folders, as Finder's and Explorer's Copy put them on the clipboard —
++    /// the paths, and for whoever pastes text, the paths one per line.
++    pub fn new_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
++        let paths = crate::ExternalPaths::new(paths);
++        let text = paths
++            .paths()
++            .iter()
++            .map(|path| path.to_string_lossy())
++            .collect::<Vec<_>>()
++            .join("\n");
++        Self {
++            entries: vec![
++                ClipboardEntry::ExternalPaths(paths),
++                ClipboardEntry::String(ClipboardString::new(text)),
++            ],
++            cut: false,
++        }
++    }
++
++    /// Flux patch: the item is cut, not copied — pasting its paths moves them. Windows writes it as
++    /// Explorer's Cut does ("Preferred DropEffect": move); macOS has no cut of files.
++    pub fn with_cut(mut self, cut: bool) -> Self {
++        self.cut = cut;
++        self
++    }
++
++    /// Flux patch: the item was cut ([`ClipboardItem::with_cut`]; on Windows, by Explorer's Cut too).
++    pub fn is_cut(&self) -> bool {
++        self.cut
++    }
++
++    /// Flux patch: no entries — written, it empties the clipboard ([`App::clear_clipboard`]).
++    pub(crate) fn empty() -> Self {
++        Self {
++            entries: Vec::new(),
++            cut: false,
++        }
++    }
++
++    /// Flux patch: the files and folders on the clipboard (Finder's and Explorer's Copy and Cut),
++    /// if it holds any.
++    pub fn paths(&self) -> Option<&[PathBuf]> {
++        self.entries.iter().find_map(|entry| match entry {
++            ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
++            _ => None,
++        })
++    }
++
+     /// Concatenates together all the ClipboardString entries in the item.
+     /// Returns None if there were no ClipboardString entries.
+     pub fn text(&self) -> Option<String> {
+@@ -1608,6 +1693,7 @@
+     fn from(value: ClipboardEntry) -> Self {
+         Self {
+             entries: vec![value],
++            cut: false,
+         }
+     }
+ }
 diff -ruN a/src/platform/linux/wayland/clipboard.rs b/src/platform/linux/wayland/clipboard.rs
 --- a/src/platform/linux/wayland/clipboard.rs	2026-10-30 13:10:46
 +++ b/src/platform/linux/wayland/clipboard.rs	2026-10-30 13:10:46
@@ -860,10 +1158,320 @@ diff -ruN a/src/platform/mac/events.rs b/src/platform/mac/events.rs
                      })
                  }),
                  NSEventType::NSLeftMouseDragged
+diff -ruN a/src/platform/mac/metal_atlas.rs b/src/platform/mac/metal_atlas.rs
+--- a/src/platform/mac/metal_atlas.rs	2026-11-19 10:04:16
++++ b/src/platform/mac/metal_atlas.rs	2026-11-19 10:04:16
+@@ -5,26 +5,55 @@
+ use anyhow::{Context as _, Result};
+ use collections::FxHashMap;
+ use derive_more::{Deref, DerefMut};
+-use etagere::BucketedAtlasAllocator;
++use etagere::AtlasAllocator;
+ use metal::Device;
+ use parking_lot::Mutex;
+ use std::borrow::Cow;
++use std::sync::atomic::{AtomicU64, Ordering};
+ 
+-pub(crate) struct MetalAtlas(Mutex<MetalAtlasState>);
++pub(crate) struct MetalAtlas {
++    state: Mutex<MetalAtlasState>,
++    /// Flux patch: the number of the last frame the GPU has completed
++    /// ([`MetalAtlas::frame_completed`]).
++    completed_frame: AtomicU64,
++}
+ 
+ impl MetalAtlas {
+     pub(crate) fn new(device: Device) -> Self {
+-        MetalAtlas(Mutex::new(MetalAtlasState {
+-            device: AssertSend(device),
+-            monochrome_textures: Default::default(),
+-            polychrome_textures: Default::default(),
+-            tiles_by_key: Default::default(),
+-        }))
++        MetalAtlas {
++            state: Mutex::new(MetalAtlasState {
++                device: AssertSend(device),
++                monochrome_textures: Default::default(),
++                polychrome_textures: Default::default(),
++                tiles_by_key: Default::default(),
++                removed_tiles: Vec::new(),
++                removed_since_draw: false,
++                committed_frame: 0,
++            }),
++            completed_frame: AtomicU64::new(0),
++        }
+     }
+ 
+     pub(crate) fn metal_texture(&self, id: AtlasTextureId) -> metal::Texture {
+-        self.0.lock().texture(id).metal_texture.clone()
++        self.state.lock().texture(id).metal_texture.clone()
+     }
++
++    /// Flux patch: the renderer commits a frame that samples the atlas; returns its number for
++    /// [`MetalAtlas::frame_completed`]. The removed tiles no frame samples any more are freed.
++    pub(crate) fn frame_committed(&self) -> u64 {
++        let completed = self.completed_frame.load(Ordering::Acquire);
++        let mut lock = self.state.lock();
++        lock.free_removed_tiles(completed);
++        lock.committed_frame += 1;
++        lock.committed_frame
++    }
++
++    /// Flux patch: the GPU has completed frame `frame` — and every frame committed before it: a
++    /// command queue runs its command buffers in order. Called on Metal's thread, by the command
++    /// buffer's completion handler.
++    pub(crate) fn frame_completed(&self, frame: u64) {
++        self.completed_frame.fetch_max(frame, Ordering::AcqRel);
++    }
+ }
+ 
+ struct MetalAtlasState {
+@@ -32,21 +61,52 @@
+     monochrome_textures: AtlasTextureList<MetalAtlasTexture>,
+     polychrome_textures: AtlasTextureList<MetalAtlasTexture>,
+     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
++    /// Flux patch: tiles removed whose space isn't free yet ([`RemovedTile`]).
++    removed_tiles: Vec<RemovedTile>,
++    /// Some of `removed_tiles` were removed after the window last began to draw.
++    removed_since_draw: bool,
++    /// The number of the last frame the renderer committed ([`MetalAtlas::frame_committed`]).
++    committed_frame: u64,
+ }
+ 
++/// Flux patch: a tile removed from the atlas ([`PlatformAtlas::remove`]). Its space is freed for
++/// other tiles once no frame can sample it: neither a frame the GPU hasn't completed yet (the
++/// renderer doesn't wait for the previous frame, and a tile is written by the CPU at once), nor
++/// the window's scene drawn before the removal, which the window may present again until it draws
++/// a new one.
++struct RemovedTile {
++    tile: AtlasTile,
++    /// The last frame that may sample it: the last one committed when the window began to draw
++    /// after the removal — the first [`PlatformAtlas::get_or_insert_with`] since, as only the
++    /// window's drawing (its paint) asks for tiles. `None` until then.
++    last_frame: Option<u64>,
++}
++
+ impl PlatformAtlas for MetalAtlas {
+     fn get_or_insert_with<'a>(
+         &self,
+         key: &AtlasKey,
+         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+     ) -> Result<Option<AtlasTile>> {
+-        let mut lock = self.0.lock();
++        let mut lock = self.state.lock();
++        // Flux patch: the window draws a new scene, without the tiles removed before: no frame
++        // committed from now on samples them.
++        if lock.removed_since_draw {
++            lock.removed_since_draw = false;
++            let frame = lock.committed_frame;
++            for removed in &mut lock.removed_tiles {
++                removed.last_frame.get_or_insert(frame);
++            }
++        }
+         if let Some(tile) = lock.tiles_by_key.get(key) {
+             Ok(Some(tile.clone()))
+         } else {
+             let Some((size, bytes)) = build()? else {
+                 return Ok(None);
+             };
++            // Flux patch: the space of the removed tiles no frame samples any more is taken
++            // again first.
++            lock.free_removed_tiles(self.completed_frame.load(Ordering::Acquire));
+             let tile = lock
+                 .allocate(size, key.texture_kind())
+                 .context("failed to allocate")?;
+@@ -57,39 +117,93 @@
+         }
+     }
+ 
++    /// Flux patch: the key goes at once (drawn again, it gets a new tile); the tile's space is
++    /// freed once no frame samples it ([`RemovedTile`]), and a texture left without tiles is
++    /// released. gpui 0.2.2 kept the key and never freed a tile: a texture was released only once
++    /// every one of its tiles had been removed, so the frames of an animation, each a new image,
++    /// filled one texture after another, and a texture also holding a picture still shown was
++    /// never released.
+     fn remove(&self, key: &AtlasKey) {
+-        let mut lock = self.0.lock();
+-        let Some(id) = lock.tiles_by_key.get(key).map(|v| v.texture_id) else {
++        let mut lock = self.state.lock();
++        let Some(tile) = lock.tiles_by_key.remove(key) else {
+             return;
+         };
++        lock.removed_tiles.push(RemovedTile {
++            tile,
++            last_frame: None,
++        });
++        lock.removed_since_draw = true;
++    }
++}
+ 
+-        let textures = match id.kind {
+-            AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
+-            AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
+-        };
++impl MetalAtlasState {
++    /// Flux patch: frees the space of the removed tiles no frame samples any more — their last
++    /// frame is known and the GPU has completed it (`completed`).
++    fn free_removed_tiles(&mut self, completed: u64) {
++        let mut index = 0;
++        while index < self.removed_tiles.len() {
++            if self.removed_tiles[index]
++                .last_frame
++                .is_some_and(|frame| frame <= completed)
++            {
++                let removed = self.removed_tiles.swap_remove(index);
++                self.free_tile(&removed.tile);
++            } else {
++                index += 1;
++            }
++        }
++    }
+ 
+-        let Some(texture_slot) = textures
+-            .textures
+-            .iter_mut()
+-            .find(|texture| texture.as_ref().is_some_and(|v| v.id == id))
+-        else {
++    /// Flux patch: gives a tile's space back to its texture's allocator; a texture left without
++    /// tiles is released (its slot taken by the next new texture).
++    fn free_tile(&mut self, tile: &AtlasTile) {
++        let id = tile.texture_id;
++        let textures = match id.kind {
++            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
++            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
++        };
++        let Some(Some(texture)) = textures.textures.get_mut(id.index as usize) else {
+             return;
+         };
++        texture.allocator.deallocate(tile.tile_id.into());
++        texture.live_atlas_keys -= 1;
++        if texture.live_atlas_keys == 0 {
++            textures.textures[id.index as usize] = None;
++            textures.free_list.push(id.index as usize);
++            self.log_textures("released", id);
++        }
++    }
+ 
+-        if let Some(mut texture) = texture_slot.take() {
+-            texture.decrement_ref_count();
+-
+-            if texture.is_unreferenced() {
+-                textures.free_list.push(id.index as usize);
+-                lock.tiles_by_key.remove(key);
+-            } else {
+-                *texture_slot = Some(texture);
+-            }
++    /// Flux patch: a debug line of the atlas's textures, as one is created or released
++    /// (`FLUX_LOG=gpui::platform::mac::metal_atlas=debug`).
++    fn log_textures(&self, change: &str, id: AtlasTextureId) {
++        if !log::log_enabled!(log::Level::Debug) {
++            return;
+         }
++        let (mut count, mut bytes) = (0, 0u64);
++        for texture in self
++            .monochrome_textures
++            .textures
++            .iter()
++            .chain(&self.polychrome_textures.textures)
++            .flatten()
++        {
++            count += 1;
++            bytes += texture.metal_texture.width()
++                * texture.metal_texture.height()
++                * texture.bytes_per_pixel() as u64;
++        }
++        log::debug!(
++            "texture {change}: {:?} {}; {count} textures, {:.1} MB, {} tiles removed not freed \
++             yet; frame {}",
++            id.kind,
++            id.index,
++            bytes as f64 / (1024. * 1024.),
++            self.removed_tiles.len(),
++            self.committed_frame,
++        );
+     }
+-}
+ 
+-impl MetalAtlasState {
+     fn allocate(
+         &mut self,
+         size: Size<DevicePixels>,
+@@ -160,21 +274,26 @@
+                 index: index.unwrap_or(texture_list.textures.len()) as u32,
+                 kind,
+             },
+-            allocator: etagere::BucketedAtlasAllocator::new(size.into()),
++            // Flux patch: an allocator tracking each tile, so the space of one removed is free
++            // again at once (`free_tile`); gpui 0.2.2's bucketed one frees a tile's space only
++            // with every tile of its bucket, and a bucket takes at most 4095 tiles in its life.
++            allocator: AtlasAllocator::new(size.into()),
+             metal_texture: AssertSend(metal_texture),
+             live_atlas_keys: 0,
+         };
++        let id = atlas_texture.id;
+ 
+         if let Some(ix) = index {
+             texture_list.textures[ix] = Some(atlas_texture);
+-            texture_list.textures.get_mut(ix)
+         } else {
+             texture_list.textures.push(Some(atlas_texture));
+-            texture_list.textures.last_mut()
+         }
+-        .unwrap()
+-        .as_mut()
+-        .unwrap()
++        self.log_textures("created", id);
++        let texture_list = match kind {
++            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
++            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
++        };
++        texture_list.textures[id.index as usize].as_mut().unwrap()
+     }
+ 
+     fn texture(&self, id: AtlasTextureId) -> &MetalAtlasTexture {
+@@ -188,8 +307,10 @@
+ 
+ struct MetalAtlasTexture {
+     id: AtlasTextureId,
+-    allocator: BucketedAtlasAllocator,
++    allocator: AtlasAllocator,
+     metal_texture: AssertSend<metal::Texture>,
++    /// Flux patch: the tiles allocated and not freed yet — a removed tile counts until its space
++    /// is freed ([`RemovedTile`]).
+     live_atlas_keys: u32,
+ }
+ 
+@@ -232,14 +353,6 @@
+             _ => unimplemented!(),
+         }
+     }
+-
+-    fn decrement_ref_count(&mut self) {
+-        self.live_atlas_keys -= 1;
+-    }
+-
+-    fn is_unreferenced(&mut self) -> bool {
+-        self.live_atlas_keys == 0
+-    }
+ }
+ 
+ impl From<Size<DevicePixels>> for etagere::Size {
 diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer.rs
---- a/src/platform/mac/metal_renderer.rs	2026-10-30 13:10:46
-+++ b/src/platform/mac/metal_renderer.rs	2026-10-30 13:10:46
-@@ -370,8 +370,12 @@
+--- a/src/platform/mac/metal_renderer.rs	2026-11-19 10:04:16
++++ b/src/platform/mac/metal_renderer.rs	2026-11-19 10:04:16
+@@ -1,8 +1,8 @@
+ use super::metal_atlas::MetalAtlas;
+ use crate::{
+-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
+-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+-    Surface, Underline, point, size,
++    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, MonochromeSprite,
++    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
++    Size, Underline, point, size,
+ };
+ use anyhow::Result;
+ use block::ConcreteBlock;
+@@ -370,17 +370,26 @@
          loop {
              let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
  
@@ -878,10 +1486,29 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
  
              match command_buffer {
                  Ok(command_buffer) => {
-@@ -416,11 +420,75 @@
-         }
-     }
- 
++                    // Flux patch: the atlas frees the space of removed tiles once the frames that
++                    // may sample them have completed (`MetalAtlas::frame_committed`).
++                    let frame = self.sprite_atlas.frame_committed();
++                    let sprite_atlas = self.sprite_atlas.clone();
+                     let instance_buffer_pool = self.instance_buffer_pool.clone();
+                     let instance_buffer = Cell::new(Some(instance_buffer));
+                     let block = ConcreteBlock::new(move |_| {
+                         if let Some(instance_buffer) = instance_buffer.take() {
+                             instance_buffer_pool.lock().release(instance_buffer);
+                         }
++                        sprite_atlas.frame_completed(frame);
+                     });
+                     let block = block.copy();
+                     command_buffer.add_completed_handler(&block);
+@@ -411,16 +420,80 @@
+                         "increased instance buffer size to {}",
+                         instance_buffer_pool.buffer_size
+                     );
++                }
++            }
++        }
++    }
++
 +    /// Flux patch (headless scenario screenshots): renders `scene` into an offscreen texture the
 +    /// size of the drawable and returns its pixels — RGBA with premultiplied alpha (the glass
 +    /// behind a transparent window is not there). Needs neither the window server nor a visible
@@ -918,7 +1545,7 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
 +                    command_buffer.wait_until_completed();
 +                    self.instance_buffer_pool.lock().release(instance_buffer);
 +                    break;
-+                }
+                 }
 +                Err(err) => {
 +                    log::error!("failed to render offscreen: {err}");
 +                    let mut instance_buffer_pool = self.instance_buffer_pool.lock();
@@ -928,8 +1555,8 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
 +                    }
 +                    instance_buffer_pool.reset(buffer_size * 2);
 +                }
-+            }
-+        }
+             }
+         }
 +        let mut bytes = vec![0u8; (width * height * 4) as usize];
 +        texture.get_bytes(
 +            bytes.as_mut_ptr() as *mut c_void,
@@ -942,8 +1569,8 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
 +            pixel.swap(0, 2);
 +        }
 +        image::RgbaImage::from_raw(width as u32, height as u32, bytes)
-+    }
-+
+     }
+ 
 +    /// Flux patch: draws into `target` — the layer's drawable, or an offscreen texture
 +    /// ([`Self::render_to_image`]).
      fn draw_primitives(
@@ -955,7 +1582,7 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
          viewport_size: Size<DevicePixels>,
      ) -> Result<metal::CommandBuffer> {
          let command_queue = self.command_queue.clone();
-@@ -430,7 +498,7 @@
+@@ -430,7 +503,7 @@
  
          let mut command_encoder = new_command_encoder(
              command_buffer,
@@ -964,7 +1591,7 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
              viewport_size,
              |color_attachment| {
                  color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-@@ -467,7 +535,7 @@
+@@ -467,7 +540,7 @@
  
                      command_encoder = new_command_encoder(
                          command_buffer,
@@ -973,7 +1600,36 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
                          viewport_size,
                          |color_attachment| {
                              color_attachment.set_load_action(metal::MTLLoadAction::Load);
-@@ -1158,7 +1226,7 @@
+@@ -1111,12 +1184,18 @@
+                 .unwrap();
+ 
+             align_offset(instance_offset);
+-            let next_offset = *instance_offset + mem::size_of::<Surface>();
++            let next_offset = *instance_offset + mem::size_of::<SurfaceBounds>();
+             if next_offset > instance_buffer.size {
+                 return false;
+             }
+ 
+             command_encoder.set_vertex_buffer(
++                SurfaceInputIndex::Surfaces as u64,
++                Some(&instance_buffer.metal_buffer),
++                *instance_offset as u64,
++            );
++            // Flux patch (FluxGram part 4): the fragment shader rounds the corners.
++            command_encoder.set_fragment_buffer(
+                 SurfaceInputIndex::Surfaces as u64,
+                 Some(&instance_buffer.metal_buffer),
+                 *instance_offset as u64,
+@@ -1145,6 +1224,8 @@
+                     SurfaceBounds {
+                         bounds: surface.bounds,
+                         content_mask: surface.content_mask.clone(),
++                        corner_radii: surface.corner_radii.clone(),
++                        opacity: surface.opacity,
+                     },
+                 );
+             }
+@@ -1158,7 +1239,7 @@
  
  fn new_command_encoder<'a>(
      command_buffer: &'a metal::CommandBufferRef,
@@ -982,7 +1638,7 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
      viewport_size: Size<DevicePixels>,
      configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
  ) -> &'a metal::RenderCommandEncoderRef {
-@@ -1167,7 +1235,7 @@
+@@ -1167,7 +1248,7 @@
          .color_attachments()
          .object_at(0)
          .unwrap();
@@ -991,6 +1647,20 @@ diff -ruN a/src/platform/mac/metal_renderer.rs b/src/platform/mac/metal_renderer
      color_attachment.set_store_action(metal::MTLStoreAction::Store);
      configure_color_attachment(color_attachment);
  
+@@ -1347,9 +1428,12 @@
+     pub bounds: Bounds<ScaledPixels>,
+ }
+ 
+-#[derive(Clone, Debug, Eq, PartialEq)]
++#[derive(Clone, Debug, PartialEq)]
+ #[repr(C)]
+ pub struct SurfaceBounds {
+     pub bounds: Bounds<ScaledPixels>,
+     pub content_mask: ContentMask<ScaledPixels>,
++    /// Flux patch (FluxGram part 4): rounded corners and opacity.
++    pub corner_radii: Corners<ScaledPixels>,
++    pub opacity: f32,
+ }
 diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
 --- a/src/platform/mac/platform.rs	2026-10-30 13:10:46
 +++ b/src/platform/mac/platform.rs	2026-10-30 13:10:46
@@ -1435,6 +2105,54 @@ diff -ruN a/src/platform/mac/platform.rs b/src/platform/mac/platform.rs
          };
          platform.write_to_clipboard(item.clone());
          assert_eq!(platform.read_from_clipboard(), Some(item));
+diff -ruN a/src/platform/mac/shaders.metal b/src/platform/mac/shaders.metal
+--- a/src/platform/mac/shaders.metal	2026-11-18 18:46:58
++++ b/src/platform/mac/shaders.metal	2026-11-18 18:46:58
+@@ -837,12 +837,14 @@
+ struct SurfaceVertexOutput {
+   float4 position [[position]];
+   float2 texture_position;
++  uint surface_id [[flat]];
+   float clip_distance [[clip_distance]][4];
+ };
+ 
+ struct SurfaceFragmentInput {
+   float4 position [[position]];
+   float2 texture_position;
++  uint surface_id [[flat]];
+ };
+ 
+ vertex SurfaceVertexOutput surface_vertex(
+@@ -865,10 +867,13 @@
+   return SurfaceVertexOutput{
+       device_position,
+       texture_position,
++      surface_id,
+       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+ }
+ 
+ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
++                                 constant SurfaceBounds *surfaces
++                                 [[buffer(SurfaceInputIndex_Surfaces)]],
+                                  texture2d<float> y_texture
+                                  [[texture(SurfaceInputIndex_YTexture)]],
+                                  texture2d<float> cb_cr_texture
+@@ -883,7 +888,14 @@
+       y_texture.sample(texture_sampler, input.texture_position).r,
+       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+ 
+-  return ycbcrToRGBTransform * ycbcr;
++  // Flux patch (FluxGram part 4): rounded corners, antialiased as a sprite's, and the
++  // element's opacity.
++  SurfaceBounds surface = surfaces[input.surface_id];
++  float distance =
++      quad_sdf(input.position.xy, surface.bounds, surface.corner_radii);
++  float4 color = ycbcrToRGBTransform * ycbcr;
++  color.a *= surface.opacity * saturate(0.5 - distance);
++  return color;
+ }
+ 
+ float4 hsla_to_rgba(Hsla hsla) {
 diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
 --- a/src/platform/mac/window.rs	2026-10-30 13:10:46
 +++ b/src/platform/mac/window.rs	2026-10-30 13:10:46
@@ -1489,6 +2207,18 @@ diff -ruN a/src/platform/mac/window.rs b/src/platform/mac/window.rs
      }
  
      fn titlebar_double_click(&self) {
+diff -ruN a/src/platform/windows.rs b/src/platform/windows.rs
+--- a/src/platform/windows.rs	2026-10-30 13:10:46
++++ b/src/platform/windows.rs	2026-10-30 13:10:46
+@@ -16,6 +16,8 @@
+ mod wrapper;
+ 
+ pub(crate) use clipboard::*;
++// Flux patch: CF_HDROP's data, for Flux's tests.
++pub use clipboard::{decode_dropfiles, encode_dropfiles};
+ pub(crate) use destination_list::*;
+ pub(crate) use direct_write::*;
+ pub(crate) use directx_atlas::*;
 diff -ruN a/src/platform/windows/clipboard.rs b/src/platform/windows/clipboard.rs
 --- a/src/platform/windows/clipboard.rs	2026-10-30 13:10:46
 +++ b/src/platform/windows/clipboard.rs	2026-10-30 13:10:46
@@ -1742,6 +2472,154 @@ diff -ruN a/src/platform/windows/clipboard.rs b/src/platform/windows/clipboard.r
  }
  
  fn with_clipboard_data<F, R>(format: u32, f: F) -> Option<R>
+diff -ruN a/src/platform/windows/directx_atlas.rs b/src/platform/windows/directx_atlas.rs
+--- a/src/platform/windows/directx_atlas.rs	2026-11-19 10:04:16
++++ b/src/platform/windows/directx_atlas.rs	2026-11-19 10:04:16
+@@ -1,5 +1,5 @@
+ use collections::FxHashMap;
+-use etagere::BucketedAtlasAllocator;
++use etagere::AtlasAllocator;
+ use parking_lot::Mutex;
+ use windows::Win32::Graphics::{
+     Direct3D11::{
+@@ -22,14 +22,22 @@
+     monochrome_textures: AtlasTextureList<DirectXAtlasTexture>,
+     polychrome_textures: AtlasTextureList<DirectXAtlasTexture>,
+     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
++    /// Flux patch: tiles removed whose space isn't free yet: the window's scene drawn before the
++    /// removal may be presented again until the window draws a new one. Freed as the window
++    /// begins to draw (`get_or_insert_with`); the frames drawn with them were submitted before,
++    /// and Direct3D 11's immediate context keeps the order: an upload into their space comes
++    /// after them.
++    removed_tiles: Vec<AtlasTile>,
+ }
+ 
+ struct DirectXAtlasTexture {
+     id: AtlasTextureId,
+     bytes_per_pixel: u32,
+-    allocator: BucketedAtlasAllocator,
++    allocator: AtlasAllocator,
+     texture: ID3D11Texture2D,
+     view: [Option<ID3D11ShaderResourceView>; 1],
++    /// Flux patch: the tiles allocated and not freed yet — a removed tile counts until its space
++    /// is freed.
+     live_atlas_keys: u32,
+ }
+ 
+@@ -41,6 +49,7 @@
+             monochrome_textures: Default::default(),
+             polychrome_textures: Default::default(),
+             tiles_by_key: Default::default(),
++            removed_tiles: Vec::new(),
+         }))
+     }
+ 
+@@ -64,6 +73,7 @@
+         lock.monochrome_textures = AtlasTextureList::default();
+         lock.polychrome_textures = AtlasTextureList::default();
+         lock.tiles_by_key.clear();
++        lock.removed_tiles.clear();
+     }
+ }
+ 
+@@ -76,6 +86,10 @@
+         >,
+     ) -> anyhow::Result<Option<AtlasTile>> {
+         let mut lock = self.0.lock();
++        // Flux patch: the window draws a new scene, without the tiles removed before.
++        while let Some(tile) = lock.removed_tiles.pop() {
++            lock.free_tile(&tile);
++        }
+         if let Some(tile) = lock.tiles_by_key.get(key) {
+             Ok(Some(tile.clone()))
+         } else {
+@@ -92,35 +106,39 @@
+         }
+     }
+ 
++    /// Flux patch: the tile's space is freed as the window begins to draw again
++    /// (`DirectXAtlasState::removed_tiles`), and a texture left without tiles is released. gpui
++    /// 0.2.2 never freed a tile: a texture was released only once every one of its tiles had
++    /// been removed, so the frames of an animation, each a new image, filled one texture after
++    /// another, and a texture also holding a picture still shown was never released.
+     fn remove(&self, key: &AtlasKey) {
+         let mut lock = self.0.lock();
++        if let Some(tile) = lock.tiles_by_key.remove(key) {
++            lock.removed_tiles.push(tile);
++        }
++    }
++}
+ 
+-        let Some(id) = lock.tiles_by_key.remove(key).map(|tile| tile.texture_id) else {
+-            return;
+-        };
+-
+-        let textures = match id.kind {
+-            AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
+-            AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
++impl DirectXAtlasState {
++    /// Flux patch: gives a tile's space back to its texture's allocator; a texture left without
++    /// tiles is released (its slot taken by the next new texture).
++    fn free_tile(&mut self, tile: &AtlasTile) {
++        let id = tile.texture_id;
++        let textures = match id.kind {
++            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
++            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+         };
+-
+-        let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
++        let Some(Some(texture)) = textures.textures.get_mut(id.index as usize) else {
+             return;
+         };
+-
+-        if let Some(mut texture) = texture_slot.take() {
+-            texture.decrement_ref_count();
+-            if texture.is_unreferenced() {
+-                textures.free_list.push(texture.id.index as usize);
+-                lock.tiles_by_key.remove(key);
+-            } else {
+-                *texture_slot = Some(texture);
+-            }
++        texture.allocator.deallocate(tile.tile_id.into());
++        texture.live_atlas_keys -= 1;
++        if texture.live_atlas_keys == 0 {
++            textures.textures[id.index as usize] = None;
++            textures.free_list.push(id.index as usize);
+         }
+     }
+-}
+ 
+-impl DirectXAtlasState {
+     fn allocate(
+         &mut self,
+         size: Size<DevicePixels>,
+@@ -219,7 +237,10 @@
+                 kind,
+             },
+             bytes_per_pixel,
+-            allocator: etagere::BucketedAtlasAllocator::new(size.into()),
++            // Flux patch: an allocator tracking each tile, so the space of one removed is free
++            // again at once (`free_tile`); gpui 0.2.2's bucketed one frees a tile's space only
++            // with every tile of its bucket, and a bucket takes at most 4095 tiles in its life.
++            allocator: AtlasAllocator::new(size.into()),
+             texture,
+             view,
+             live_atlas_keys: 0,
+@@ -282,14 +303,6 @@
+             );
+         }
+     }
+-
+-    fn decrement_ref_count(&mut self) {
+-        self.live_atlas_keys -= 1;
+-    }
+-
+-    fn is_unreferenced(&mut self) -> bool {
+-        self.live_atlas_keys == 0
+-    }
+ }
+ 
+ impl From<Size<DevicePixels>> for etagere::Size {
 diff -ruN a/src/platform/windows/directx_renderer.rs b/src/platform/windows/directx_renderer.rs
 --- a/src/platform/windows/directx_renderer.rs	2026-10-30 13:10:46
 +++ b/src/platform/windows/directx_renderer.rs	2026-10-30 13:10:46
@@ -2075,204 +2953,18 @@ diff -ruN a/src/platform/windows/platform.rs b/src/platform/windows/platform.rs
      }
  
      fn close_one_window(&self, target_window: HWND) -> bool {
-diff -ruN a/src/platform/windows.rs b/src/platform/windows.rs
---- a/src/platform/windows.rs	2026-10-30 13:10:46
-+++ b/src/platform/windows.rs	2026-10-30 13:10:46
-@@ -16,6 +16,8 @@
- mod wrapper;
- 
- pub(crate) use clipboard::*;
-+// Flux patch: CF_HDROP's data, for Flux's tests.
-+pub use clipboard::{decode_dropfiles, encode_dropfiles};
- pub(crate) use destination_list::*;
- pub(crate) use direct_write::*;
- pub(crate) use directx_atlas::*;
-diff -ruN a/src/platform.rs b/src/platform.rs
---- a/src/platform.rs	2026-10-30 13:10:46
-+++ b/src/platform.rs	2026-10-30 13:10:46
-@@ -81,6 +81,9 @@
- pub(crate) use test::*;
- #[cfg(target_os = "windows")]
- pub(crate) use windows::*;
-+// Flux patch: CF_HDROP's data (files on the clipboard), public for Flux's tests.
-+#[cfg(target_os = "windows")]
-+pub use windows::{decode_dropfiles, encode_dropfiles};
- 
- #[cfg(any(test, feature = "test-support"))]
- pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
-@@ -230,6 +233,15 @@
- 
-     fn on_quit(&self, callback: Box<dyn FnMut()>);
-     fn on_reopen(&self, callback: Box<dyn FnMut()>);
-+    /// Flux patch (part 10.5): `callback` is asked when the platform wants the application to quit
-+    /// on its own (macOS: Quit in the Dock, the end of the user's session). The platform waits
-+    /// until the application answers with [`Platform::quit`] or [`Platform::cancel_quit`].
-+    /// `callback` returns `false` when it can't ask now (the app is busy): it is asked again a
-+    /// little later. Platforms without such requests ignore it.
-+    fn on_quit_requested(&self, _callback: Box<dyn FnMut() -> bool>) {}
-+    /// Flux patch (part 10.5): the application keeps running after a quit the platform asked for
-+    /// ([`Platform::on_quit_requested`]); nothing to do without such a request.
-+    fn cancel_quit(&self) {}
- 
-     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
-     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
-@@ -499,6 +511,11 @@
-     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
-     fn draw(&self, scene: &Scene);
-     fn completed_frame(&self) {}
-+    /// Flux patch (headless scenario screenshots): `scene` rendered offscreen, RGBA with
-+    /// premultiplied alpha, if the platform can.
-+    fn render_to_image(&self, _scene: &Scene) -> Option<image::RgbaImage> {
-+        None
-+    }
-     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
- 
-     // macOS specific methods
-@@ -514,6 +531,8 @@
-     fn set_edited(&mut self, _edited: bool) {}
-     fn show_character_palette(&self) {}
-     fn titlebar_double_click(&self) {}
-+    /// Flux patch: see `Window::set_traffic_light_position`.
-+    fn set_traffic_light_position(&self, _position: Option<Point<Pixels>>) {}
-     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
-     fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
-     fn on_select_previous_tab(&self, _callback: Box<dyn FnMut()>) {}
-@@ -940,7 +959,11 @@
- 
-     fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
-         self.cx
--            .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
-+            .update(|window, cx| {
-+                // Flux patch (interface scale): the platform takes window points.
-+                let bounds = self.handler.bounds_for_range(range_utf16, window, cx)?;
-+                Some(crate::window::scale_bounds(bounds, window.ui_scale()))
-+            })
-             .ok()
-             .flatten()
-     }
-@@ -970,7 +993,11 @@
-     #[allow(unused)]
-     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
-         self.cx
--            .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
-+            .update(|window, cx| {
-+                // Flux patch (interface scale): the platform gives window points.
-+                let point = point * (1. / window.ui_scale());
-+                self.handler.character_index_for_point(point, window, cx)
-+            })
-             .ok()
-             .flatten()
-     }
-@@ -1503,6 +1530,9 @@
- #[derive(Clone, Debug, Eq, PartialEq)]
- pub struct ClipboardItem {
-     entries: Vec<ClipboardEntry>,
-+    /// Flux patch: the item was cut, not copied — pasting its paths moves them
-+    /// ([`ClipboardItem::with_cut`]).
-+    cut: bool,
- }
- 
- /// Either a ClipboardString or a ClipboardImage
-@@ -1512,6 +1542,9 @@
-     String(ClipboardString),
-     /// An image entry
-     Image(Image),
-+    /// Flux patch: files and folders, as Finder's and Explorer's Copy put them on the clipboard
-+    /// ([`ClipboardItem::new_paths`], [`ClipboardItem::paths`]).
-+    ExternalPaths(crate::ExternalPaths),
- }
- 
- impl ClipboardItem {
-@@ -1519,6 +1552,7 @@
-     pub fn new_string(text: String) -> Self {
-         Self {
-             entries: vec![ClipboardEntry::String(ClipboardString::new(text))],
-+            cut: false,
-         }
-     }
- 
-@@ -1529,6 +1563,7 @@
-                 text,
-                 metadata: Some(metadata),
-             })],
-+            cut: false,
-         }
-     }
- 
-@@ -1538,6 +1573,7 @@
-             entries: vec![ClipboardEntry::String(
-                 ClipboardString::new(text).with_json_metadata(metadata),
-             )],
-+            cut: false,
-         }
-     }
- 
-@@ -1545,9 +1581,58 @@
-     pub fn new_image(image: &Image) -> Self {
-         Self {
-             entries: vec![ClipboardEntry::Image(image.clone())],
-+            cut: false,
-         }
-     }
- 
-+    /// Flux patch: files and folders, as Finder's and Explorer's Copy put them on the clipboard —
-+    /// the paths, and for whoever pastes text, the paths one per line.
-+    pub fn new_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-+        let paths = crate::ExternalPaths::new(paths);
-+        let text = paths
-+            .paths()
-+            .iter()
-+            .map(|path| path.to_string_lossy())
-+            .collect::<Vec<_>>()
-+            .join("\n");
-+        Self {
-+            entries: vec![
-+                ClipboardEntry::ExternalPaths(paths),
-+                ClipboardEntry::String(ClipboardString::new(text)),
-+            ],
-+            cut: false,
-+        }
-+    }
-+
-+    /// Flux patch: the item is cut, not copied — pasting its paths moves them. Windows writes it as
-+    /// Explorer's Cut does ("Preferred DropEffect": move); macOS has no cut of files.
-+    pub fn with_cut(mut self, cut: bool) -> Self {
-+        self.cut = cut;
-+        self
-+    }
-+
-+    /// Flux patch: the item was cut ([`ClipboardItem::with_cut`]; on Windows, by Explorer's Cut too).
-+    pub fn is_cut(&self) -> bool {
-+        self.cut
-+    }
-+
-+    /// Flux patch: no entries — written, it empties the clipboard ([`App::clear_clipboard`]).
-+    pub(crate) fn empty() -> Self {
-+        Self {
-+            entries: Vec::new(),
-+            cut: false,
-+        }
-+    }
-+
-+    /// Flux patch: the files and folders on the clipboard (Finder's and Explorer's Copy and Cut),
-+    /// if it holds any.
-+    pub fn paths(&self) -> Option<&[PathBuf]> {
-+        self.entries.iter().find_map(|entry| match entry {
-+            ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
-+            _ => None,
-+        })
-+    }
-+
-     /// Concatenates together all the ClipboardString entries in the item.
-     /// Returns None if there were no ClipboardString entries.
-     pub fn text(&self) -> Option<String> {
-@@ -1608,6 +1693,7 @@
-     fn from(value: ClipboardEntry) -> Self {
-         Self {
-             entries: vec![value],
-+            cut: false,
-         }
-     }
+diff -ruN a/src/scene.rs b/src/scene.rs
+--- a/src/scene.rs	2026-11-18 18:46:58
++++ b/src/scene.rs	2026-11-18 18:46:58
+@@ -658,6 +658,9 @@
+     pub order: DrawOrder,
+     pub bounds: Bounds<ScaledPixels>,
+     pub content_mask: ContentMask<ScaledPixels>,
++    /// Flux patch (FluxGram part 4): rounded corners and the element's opacity, as an image's.
++    pub corner_radii: Corners<ScaledPixels>,
++    pub opacity: f32,
+     #[cfg(target_os = "macos")]
+     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
  }
 diff -ruN a/src/style.rs b/src/style.rs
 --- a/src/style.rs	2026-10-30 13:10:46
@@ -2351,8 +3043,8 @@ diff -ruN a/src/taffy.rs b/src/taffy.rs
          }
  
 diff -ruN a/src/window.rs b/src/window.rs
---- a/src/window.rs	2026-10-30 13:10:46
-+++ b/src/window.rs	2026-10-30 13:10:46
+--- a/src/window.rs	2026-11-18 18:46:58
++++ b/src/window.rs	2026-11-18 18:46:58
 @@ -7,17 +7,22 @@
      DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
      FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
@@ -2624,7 +3316,24 @@ diff -ruN a/src/window.rs b/src/window.rs
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub(crate) enum DrawPhase {
      None,
-@@ -991,7 +1166,7 @@
+@@ -926,6 +1101,16 @@
+         })
+ }
+ 
++/// Flux patch (FluxGram part 1, the scenarios' frame log): told of every frame a window draws —
++/// the window and how long laying it out and painting it took — whoever asked for it (the display
++/// link, a headless scenario's timer).
++static FRAME_OBSERVER: std::sync::OnceLock<fn(WindowId, Duration)> = std::sync::OnceLock::new();
++
++/// Flux patch: sets the observer of drawn frames, once for the process ([`FRAME_OBSERVER`]).
++pub fn observe_frames(observer: fn(WindowId, Duration)) {
++    let _ = FRAME_OBSERVER.set(observer);
++}
++
+ impl Window {
+     pub(crate) fn new(
+         handle: AnyWindowHandle,
+@@ -991,7 +1176,7 @@
          let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
          let needs_present = Rc::new(Cell::new(false));
          let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
@@ -2633,7 +3342,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
          platform_window
              .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
-@@ -1021,7 +1196,7 @@
+@@ -1021,7 +1206,7 @@
              let active = active.clone();
              let needs_present = needs_present.clone();
              let next_frame_callbacks = next_frame_callbacks.clone();
@@ -2642,7 +3351,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              move |request_frame_options| {
                  let next_frame_callbacks = next_frame_callbacks.take();
                  if !next_frame_callbacks.is_empty() {
-@@ -1034,12 +1209,12 @@
+@@ -1034,12 +1219,12 @@
                          .log_err();
                  }
  
@@ -2659,7 +3368,7 @@ diff -ruN a/src/window.rs b/src/window.rs
  
                  if invalidator.is_dirty() || request_frame_options.force_render {
                      measure("frame duration", || {
-@@ -1125,7 +1300,12 @@
+@@ -1125,7 +1310,12 @@
              let mut cx = cx.to_async();
              Box::new(move |event| {
                  handle
@@ -2673,7 +3382,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                      .log_err()
                      .unwrap_or(DispatchEventResult::default())
              })
-@@ -1223,6 +1403,8 @@
+@@ -1223,6 +1413,8 @@
              element_offset_stack: Vec::new(),
              content_mask_stack: Vec::new(),
              element_opacity: 1.0,
@@ -2682,7 +3391,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              requested_autoscroll: None,
              rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
              next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
-@@ -1230,6 +1412,11 @@
+@@ -1230,6 +1422,11 @@
              next_hitbox_id: HitboxId(0),
              next_tooltip_id: TooltipId::default(),
              tooltip_bounds: None,
@@ -2694,7 +3403,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              dirty_views: FxHashSet::default(),
              focus_listeners: SubscriberSet::new(),
              focus_lost_listeners: SubscriberSet::new(),
-@@ -1239,13 +1426,15 @@
+@@ -1239,13 +1436,15 @@
              modifiers,
              capslock,
              scale_factor,
@@ -2711,7 +3420,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              refreshing: false,
              activation_observers: SubscriberSet::new(),
              focus: None,
-@@ -1269,9 +1458,14 @@
+@@ -1269,9 +1468,14 @@
      }
  }
  
@@ -2727,7 +3436,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      pub default_prevented: bool,
  }
  
-@@ -1673,8 +1867,10 @@
+@@ -1673,8 +1877,10 @@
      }
  
      fn bounds_changed(&mut self, cx: &mut App) {
@@ -2740,7 +3449,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          self.display_id = self.platform_window.display().map(|display| display.id());
  
          self.refresh();
-@@ -1691,7 +1887,9 @@
+@@ -1691,7 +1897,9 @@
  
      /// Set the content size of the window.
      pub fn resize(&mut self, size: Size<Pixels>) {
@@ -2751,7 +3460,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Returns whether or not the window is currently fullscreen
-@@ -1744,7 +1942,9 @@
+@@ -1744,7 +1952,9 @@
  
      /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
      pub fn show_window_menu(&self, position: Point<Pixels>) {
@@ -2762,7 +3471,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      }
  
      /// Tells the compositor to take control of window movement (Wayland and X11)
-@@ -1816,6 +2016,41 @@
+@@ -1816,6 +2026,41 @@
          self.scale_factor
      }
  
@@ -2804,37 +3513,58 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// The size of an em for the base font of the application. Adjusting this value allows the
      /// UI to scale, just like zooming a web page.
      pub fn rem_size(&self) -> Pixels {
-@@ -2010,6 +2245,29 @@
+@@ -1912,6 +2157,7 @@
+     /// the contents of the new [`Scene`], use [`Self::present`].
+     #[profiling::function]
+     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
++        let started = std::time::Instant::now();
+         self.invalidate_entities();
+         cx.entities.clear_accessed();
+         debug_assert!(self.rendered_entity_stack.is_empty());
+@@ -1977,6 +2223,9 @@
+         self.invalidator.set_phase(DrawPhase::None);
+         self.needs_present.set(true);
+ 
++        if let Some(observer) = FRAME_OBSERVER.get() {
++            observer(self.handle.window_id(), started.elapsed());
++        }
+         ArenaClearNeeded
+     }
+ 
+@@ -2010,6 +2259,32 @@
          profiling::finish_frame!();
      }
  
 +    /// Flux patch (headless scenario frames): what the platform's frame callback does, without
 +    /// presenting — runs the next-frame callbacks and draws the window if it is dirty. The display
 +    /// link that drives frames stops for an occluded window, and a locked screen occludes all of
-+    /// them; Flux's scenarios then call this on a timer.
-+    pub fn headless_frame(&mut self, cx: &mut App) {
++    /// them; Flux's scenarios then call this on a timer. Returns whether the window was drawn (it
++    /// was dirty): the scenarios' frame log counts and times those.
++    pub fn headless_frame(&mut self, cx: &mut App) -> bool {
 +        let callbacks = self.next_frame_callbacks.take();
 +        for callback in callbacks {
 +            callback(self, cx);
 +        }
-+        if self.invalidator.is_dirty() {
++        let dirty = self.invalidator.is_dirty();
++        if dirty {
 +            let arena_clear_needed = self.draw(cx);
 +            arena_clear_needed.clear();
 +        }
 +        self.complete_frame();
++        dirty
 +    }
 +
 +    /// Flux patch (headless scenario screenshots): the window's current frame rendered offscreen —
 +    /// RGBA with premultiplied alpha, in device pixels — without the window server.
 +    pub fn render_to_image(&mut self, cx: &mut App) -> Option<image::RgbaImage> {
-+        self.headless_frame(cx);
++        let _ = self.headless_frame(cx);
 +        self.platform_window.render_to_image(&self.rendered_frame.scene)
 +    }
 +
      fn draw_roots(&mut self, cx: &mut App) {
          self.invalidator.set_phase(DrawPhase::Prepaint);
          self.tooltip_bounds.take();
-@@ -2052,14 +2310,22 @@
+@@ -2052,14 +2327,22 @@
              element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
              prompt_element = Some(element);
              self.prompt = Some(prompt);
@@ -2858,7 +3588,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          }
  
          self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
-@@ -2077,8 +2343,8 @@
+@@ -2077,8 +2360,8 @@
              prompt_element.paint(self, cx);
          } else if let Some(mut drag_element) = active_drag_element {
              drag_element.paint(self, cx);
@@ -2869,7 +3599,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          }
  
          #[cfg(any(feature = "inspector", debug_assertions))]
-@@ -2149,11 +2415,64 @@
+@@ -2149,11 +2432,64 @@
                  id: tooltip_request.id,
                  bounds: tooltip_bounds,
              });
@@ -2934,7 +3664,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
          assert_eq!(self.element_id_stack.len(), 0);
  
-@@ -2448,6 +2767,166 @@
+@@ -2448,6 +2784,166 @@
          result
      }
  
@@ -3101,7 +3831,7 @@ diff -ruN a/src/window.rs b/src/window.rs
      /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
      /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
      /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
-@@ -2783,8 +3262,10 @@
+@@ -2783,8 +3279,10 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3114,7 +3844,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          if !clipped_bounds.is_empty() {
              self.next_frame
                  .scene
-@@ -2812,13 +3293,17 @@
+@@ -2812,13 +3310,17 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3135,7 +3865,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  bounds: shadow_bounds.scale(scale_factor),
                  content_mask: content_mask.scale(scale_factor),
                  corner_radii: corner_radii.scale(scale_factor),
-@@ -2840,16 +3325,22 @@
+@@ -2840,16 +3342,22 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3162,7 +3892,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              border_style: quad.border_style,
          });
      }
-@@ -2861,9 +3352,20 @@
+@@ -2861,9 +3369,20 @@
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3184,7 +3914,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let color: Background = color.into();
          path.color = color.opacity(opacity);
          self.next_frame
-@@ -2888,11 +3390,11 @@
+@@ -2888,11 +3407,11 @@
          } else {
              style.thickness
          };
@@ -3199,7 +3929,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let element_opacity = self.element_opacity();
  
          self.next_frame.scene.insert_primitive(Underline {
-@@ -2901,7 +3403,7 @@
+@@ -2901,7 +3420,7 @@
              bounds: bounds.scale(scale_factor),
              content_mask: content_mask.scale(scale_factor),
              color: style.color.unwrap_or_default().opacity(element_opacity),
@@ -3208,7 +3938,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              wavy: if style.wavy { 1 } else { 0 },
          });
      }
-@@ -2919,11 +3421,11 @@
+@@ -2919,11 +3438,11 @@
  
          let scale_factor = self.scale_factor();
          let height = style.thickness;
@@ -3223,7 +3953,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let opacity = self.element_opacity();
  
          self.next_frame.scene.insert_primitive(Underline {
-@@ -2931,7 +3433,7 @@
+@@ -2931,7 +3450,7 @@
              pad: 0,
              bounds: bounds.scale(scale_factor),
              content_mask: content_mask.scale(scale_factor),
@@ -3232,7 +3962,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              color: style.color.unwrap_or_default().opacity(opacity),
              wavy: 0,
          });
-@@ -2981,11 +3483,11 @@
+@@ -2981,11 +3500,11 @@
                      Ok(Some((size, Cow::Owned(bytes))))
                  })?
                  .expect("Callback above only errors or returns Some");
@@ -3247,7 +3977,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              self.next_frame.scene.insert_primitive(MonochromeSprite {
                  order: 0,
                  pad: 0,
-@@ -3038,11 +3540,11 @@
+@@ -3038,11 +3557,11 @@
                  })?
                  .expect("Callback above only errors or returns Some");
  
@@ -3262,7 +3992,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              let opacity = self.element_opacity();
  
              self.next_frame.scene.insert_primitive(PolychromeSprite {
-@@ -3094,7 +3596,7 @@
+@@ -3094,7 +3613,7 @@
          else {
              return Ok(());
          };
@@ -3271,7 +4001,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let svg_bounds = Bounds {
              origin: bounds.center()
                  - Point::new(
-@@ -3110,13 +3612,15 @@
+@@ -3110,13 +3629,15 @@
          self.next_frame.scene.insert_primitive(MonochromeSprite {
              order: 0,
              pad: 0,
@@ -3291,7 +4021,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          });
  
          Ok(())
-@@ -3155,17 +3659,21 @@
+@@ -3155,17 +3676,21 @@
                  )))
              })?
              .expect("Callback above only returns Some");
@@ -3318,7 +4048,24 @@ diff -ruN a/src/window.rs b/src/window.rs
              content_mask,
              corner_radii,
              tile,
-@@ -3184,8 +3692,8 @@
+@@ -3176,20 +3701,34 @@
+ 
+     /// Paint a surface into the scene for the next frame at the current z-index.
+     ///
++    /// Flux patch (FluxGram part 4): with corner radii, as [`Window::paint_image`] — a video's
++    /// rounded corners, a round video message — and the element's opacity.
++    ///
+     /// This method should only be called as part of the paint phase of element drawing.
+     #[cfg(target_os = "macos")]
+-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
++    pub fn paint_surface(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++        image_buffer: CVPixelBuffer,
++    ) {
+         use crate::PaintSurface;
+ 
          self.invalidator.debug_assert_paint();
  
          let scale_factor = self.scale_factor();
@@ -3326,10 +4073,20 @@ diff -ruN a/src/window.rs b/src/window.rs
 -        let content_mask = self.content_mask().scale(scale_factor);
 +        let bounds = self.transform_bounds(bounds).scale(scale_factor);
 +        let content_mask = self.transformed_content_mask().scale(scale_factor);
++        let corner_radii = corner_radii
++            .map(|radius| self.transform_length(*radius))
++            .scale(scale_factor);
++        let opacity = self.element_opacity();
          self.next_frame.scene.insert_primitive(PaintSurface {
              order: 0,
              bounds,
-@@ -3305,7 +3813,12 @@
+             content_mask,
++            corner_radii,
++            opacity,
+             image_buffer,
+         });
+     }
+@@ -3305,7 +3844,12 @@
      pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
          self.invalidator.debug_assert_prepaint();
  
@@ -3343,7 +4100,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          let mut id = self.next_hitbox_id;
          self.next_hitbox_id = self.next_hitbox_id.next();
          let hitbox = Hitbox {
-@@ -3579,7 +4092,8 @@
+@@ -3579,7 +4123,8 @@
      /// Dispatch a mouse or keyboard event on the window.
      #[profiling::function]
      pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
@@ -3353,7 +4110,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          // Handlers may set this to false by calling `stop_propagation`.
          cx.propagate_event = true;
          // Handlers may set this to true by calling `prevent_default`.
-@@ -3615,8 +4129,16 @@
+@@ -3615,8 +4160,16 @@
              PlatformInput::ScrollWheel(scroll_wheel) => {
                  self.mouse_position = scroll_wheel.position;
                  self.modifiers = scroll_wheel.modifiers;
@@ -3370,7 +4127,7 @@ diff -ruN a/src/window.rs b/src/window.rs
              // Translate dragging and dropping of external files from the operating system
              // to internal drag and drop events.
              PlatformInput::FileDrop(file_drop) => match file_drop {
-@@ -3668,6 +4190,10 @@
+@@ -3668,6 +4221,10 @@
              self.dispatch_key_event(any_key_event, cx);
          }
  
@@ -3381,7 +4138,7 @@ diff -ruN a/src/window.rs b/src/window.rs
          DispatchEventResult {
              propagate: cx.propagate_event,
              default_prevented: self.default_prevented,
-@@ -4128,7 +4654,10 @@
+@@ -4128,7 +4685,10 @@
          self.on_next_frame(|window, cx| {
              if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                  if let Some(bounds) = input_handler.selected_bounds(window, cx) {
@@ -3393,7 +4150,7 @@ diff -ruN a/src/window.rs b/src/window.rs
                  }
                  window.platform_window.set_input_handler(input_handler);
              }
-@@ -5099,5 +5628,81 @@
+@@ -5099,5 +5659,81 @@
          border_widths: (1.).into(),
          border_color: border_color.into(),
          border_style,

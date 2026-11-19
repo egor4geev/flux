@@ -1011,6 +1011,9 @@ impl Render for TerminalPanel {
         div()
             .track_focus(&self.focus_handle)
             .relative()
+            // The island's width: as a cached view (`Workspace::render_bottom_tool`) it is
+            // laid out on its own.
+            .w_full()
             .h(px(height))
             .flex()
             .flex_col()

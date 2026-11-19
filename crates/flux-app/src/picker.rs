@@ -32,13 +32,13 @@ use crate::ui::{self, RADIUS_MD};
 /// Height of a list row.
 pub const ROW_HEIGHT: f32 = 34.;
 /// How many rows are visible without scrolling.
-const MAX_VISIBLE_ROWS: usize = 10;
+pub(crate) const MAX_VISIBLE_ROWS: usize = 10;
 pub const PICKER_WIDTH: f32 = 640.;
 /// Header with the query and footer with hints.
-const HEADER_HEIGHT: f32 = 50.;
-const FOOTER_HEIGHT: f32 = 36.;
+pub(crate) const HEADER_HEIGHT: f32 = 50.;
+pub(crate) const FOOTER_HEIGHT: f32 = 36.;
 /// Inset of the rows from the panel edges, and of the list from the header and footer.
-const LIST_INSET: f32 = 6.;
+pub(crate) const LIST_INSET: f32 = 6.;
 /// The height of the message shown instead of an empty list.
 const EMPTY_HEIGHT: f32 = ROW_HEIGHT * 2.;
 /// A new height of the list this soon after the query changed is still the typing's (a search

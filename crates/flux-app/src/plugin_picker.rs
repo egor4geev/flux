@@ -12,7 +12,7 @@
 //! the way. The answer goes when the popup's entity is released, so no way of closing it is missed.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use flux_plugin::api::events::Event;
@@ -42,6 +42,9 @@ const QUERY_DELAY: Duration = Duration::from_millis(150);
 const MENU_MIN_WIDTH: f32 = crate::context_menu::MENU_MIN_WIDTH;
 const MENU_MAX_WIDTH: f32 = 440.;
 const MENU_ROW_HEIGHT: f32 = 30.;
+/// An item's avatar (API 0.5) in a searchable picker's row and in a menu's.
+const AVATAR_SIZE: f32 = 22.;
+const MENU_AVATAR_SIZE: f32 = 18.;
 /// A searchable picker under an element (a board's dropdown) is a dropdown, not the palette.
 const DROPDOWN_WIDTH: f32 = 440.;
 /// The width of a character of the interface font at the list's size, for a menu's width.
@@ -50,6 +53,13 @@ const CHAR_WIDTH: f32 = 7.5;
 const ROW_CHROME: f32 = 56.;
 /// Between the anchor (a status bar item, an element) and the popup.
 const ANCHOR_GAP: f32 = 6.;
+/// A popup keeps this far from the window's edges (the status bar under the last element).
+const WINDOW_MARGIN: f32 = 36.;
+
+/// A dropdown opens above its element when it doesn't fit below and there is more room above.
+fn opens_above(needed: f32, below: f32, above: f32) -> bool {
+    needed > below && above > below
+}
 
 /// Where the plugins' status bar items were drawn last, per window: a picker opens above one.
 /// Written at every frame through the cell (changing a global itself would wake its observers).
@@ -104,7 +114,8 @@ pub(crate) fn open(
     if workspace.modal_is::<Picker<PluginPicker>>() {
         workspace.dismiss_modal(window, cx);
     }
-    let anchor = anchor_point(workspace, plugin, &spec.anchor, window, cx);
+    let needed = needed_height(spec);
+    let anchor = anchor_point(workspace, plugin, &spec.anchor, needed, window, cx);
     let delegate = PluginPicker::new(workspace.plugins.downgrade(), plugin, id, spec);
     workspace.toggle_modal(window, cx, |window, cx| Picker::new(delegate, window, cx));
     let opened = workspace
@@ -129,6 +140,7 @@ pub(crate) fn open(
             anchor_later(
                 plugin.to_string(),
                 spec.anchor.clone(),
+                needed,
                 picker.entity_id(),
                 ANCHOR_FRAMES,
                 window,
@@ -145,9 +157,11 @@ const ANCHOR_FRAMES: usize = 4;
 /// Places the open picker `picker` under its anchor once a frame has drawn the anchor, and shows
 /// it — at the window's top when the anchor never came; gpui runs a next frame's callbacks before
 /// drawing it, so the first try may come too early.
+#[allow(clippy::too_many_arguments)]
 fn anchor_later(
     plugin: String,
     anchor: PickerAnchor,
+    needed: f32,
     picker: gpui::EntityId,
     tries: usize,
     window: &mut Window,
@@ -160,9 +174,9 @@ fn anchor_later(
         else {
             return;
         };
-        let place = anchor_point(workspace, &plugin, &anchor, window, cx);
+        let place = anchor_point(workspace, &plugin, &anchor, needed, window, cx);
         if place.is_none() && tries > 1 {
-            return anchor_later(plugin, anchor, picker, tries - 1, window, cx);
+            return anchor_later(plugin, anchor, needed, picker, tries - 1, window, cx);
         }
         if let Some((point, corner)) = place {
             workspace.anchor_modal_at(point, corner);
@@ -231,11 +245,34 @@ pub(crate) fn plugin_stopped(
     }
 }
 
-/// Where a picker opens: none — under the title bar.
+/// About how tall a picker of these items opens: a dropdown under an element that doesn't fit
+/// below it opens above.
+fn needed_height(spec: &PickerSpec) -> f32 {
+    let groups = spec
+        .items
+        .iter()
+        .filter_map(|item| item.group.as_deref())
+        .collect::<HashSet<_>>()
+        .len();
+    let rows = (spec.items.len() + groups).max(1);
+    match spec.searchable {
+        true => {
+            crate::picker::HEADER_HEIGHT
+                + rows.min(crate::picker::MAX_VISIBLE_ROWS) as f32 * crate::picker::ROW_HEIGHT
+                + 2. * crate::picker::LIST_INSET
+                + crate::picker::FOOTER_HEIGHT
+        }
+        false => rows as f32 * MENU_ROW_HEIGHT + 2. * crate::picker::LIST_INSET,
+    }
+}
+
+/// Where a picker opens: none — under the title bar. Under an element near the window's bottom
+/// (a button at the bottom of the left island) a picker that wouldn't fit below opens above it.
 fn anchor_point(
     workspace: &Workspace,
     plugin: &str,
     anchor: &PickerAnchor,
+    needed: f32,
     window: &Window,
     cx: &App,
 ) -> Option<(Point<Pixels>, Corner)> {
@@ -257,10 +294,19 @@ fn anchor_point(
                 .iter()
                 .find(|known| known.plugin == plugin && known.id == *tool)?;
             let bounds = tool.view.read(cx).element_bounds(element)?;
-            Some((
-                point(bounds.left(), bounds.bottom() + px(ANCHOR_GAP)),
-                Corner::TopLeft,
-            ))
+            let height = f32::from(window.viewport_size().height);
+            let below = height - f32::from(bounds.bottom()) - ANCHOR_GAP - WINDOW_MARGIN;
+            let above = f32::from(bounds.top()) - ANCHOR_GAP - WINDOW_MARGIN;
+            Some(match opens_above(needed, below, above) {
+                true => (
+                    point(bounds.left(), bounds.top() - px(ANCHOR_GAP)),
+                    Corner::BottomLeft,
+                ),
+                false => (
+                    point(bounds.left(), bounds.bottom() + px(ANCHOR_GAP)),
+                    Corner::TopLeft,
+                ),
+            })
         }
     }
 }
@@ -353,13 +399,34 @@ impl PluginPicker {
         item: &PickerItem,
         positions: &[usize],
         selected: bool,
-        cx: &App,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
     ) -> AnyElement {
         let ui = Theme::ui(cx);
         let item_icon = item
             .icon
             .as_deref()
             .and_then(|name| plugin_icon(&self.plugin, name, &ui));
+        // A person's or a chat's picture in place of the icon (API 0.5), as a list row's.
+        let avatar = item.avatar.as_ref().map(|avatar| {
+            let size = if self.searchable {
+                AVATAR_SIZE
+            } else {
+                MENU_AVATAR_SIZE
+            };
+            crate::plugin_conversation::render_avatar(
+                avatar,
+                size,
+                &self.plugin,
+                cx.entity_id(),
+                window,
+                cx,
+            )
+        });
+        let item_icon = match avatar {
+            Some(_) => None,
+            None => item_icon,
+        };
         div()
             .w_full()
             .min_w_0()
@@ -367,6 +434,7 @@ impl PluginPicker {
             .items_center()
             .gap_2()
             .whitespace_nowrap()
+            .children(avatar)
             .children(item_icon.map(|item_icon| item_icon.render(ui.text_muted)))
             .child(div().min_w_0().flex_shrink().truncate().child(label_text(
                 &item.label,
@@ -444,7 +512,7 @@ impl PickerDelegate for PluginPicker {
         &mut self,
         index: usize,
         selected: bool,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> AnyElement {
         let ui = Theme::ui(cx);
@@ -457,7 +525,7 @@ impl PickerDelegate for PluginPicker {
                 .child(ui::section_label(heading.clone(), ui).truncate())
                 .into_any_element(),
             Some(Row::Item { index, positions }) => match self.items.get(*index) {
-                Some(item) => self.render_item(item, positions, selected, cx),
+                Some(item) => self.render_item(item, positions, selected, window, cx),
                 None => div().into_any_element(),
             },
             None => div().into_any_element(),
@@ -512,7 +580,11 @@ impl PickerDelegate for PluginPicker {
                         .badge
                         .as_deref()
                         .map_or(0, |badge| badge.chars().count() + 3)
-                    + if item.icon.is_some() { 3 } else { 0 };
+                    + if item.icon.is_some() || item.avatar.is_some() {
+                        3
+                    } else {
+                        0
+                    };
                 let heading = item
                     .group
                     .as_deref()
@@ -663,6 +735,7 @@ mod tests {
             detail: None,
             badge: None,
             group: group.map(str::to_string),
+            avatar: None,
         }
     }
 
@@ -673,6 +746,16 @@ mod tests {
                 Row::Item { index, .. } => index.to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_dropdown_near_the_bottom_opens_above() {
+        // The left island's last button: 80 px below it, 700 above.
+        assert!(opens_above(300., 80., 700.));
+        // Room below: under the element, as a dropdown.
+        assert!(!opens_above(300., 400., 700.));
+        // Neither fits: the larger side.
+        assert!(!opens_above(900., 500., 400.));
     }
 
     #[test]

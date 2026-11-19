@@ -96,8 +96,15 @@ impl Element for Surface {
             SurfaceSource::Surface(surface) => {
                 let size = crate::size(surface.get_width().into(), surface.get_height().into());
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
-                // TODO: Add support for corner_radii
-                window.paint_surface(new_bounds, surface.clone());
+                // Flux patch (FluxGram part 4): the corner radii of the element's style, as
+                // `img` rounds its picture.
+                let mut style = Style::default();
+                style.refine(&self.style);
+                let corner_radii = style
+                    .corner_radii
+                    .to_pixels(window.rem_size())
+                    .clamp_radii_for_quad_size(new_bounds.size);
+                window.paint_surface(new_bounds, corner_radii, surface.clone());
             }
             #[allow(unreachable_patterns)]
             _ => {}

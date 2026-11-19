@@ -84,7 +84,8 @@ impl Picker {
         self
     }
 
-    /// Under an element of one of the plugin's tool windows.
+    /// Under an element of one of the plugin's tool windows; a conversation's field,
+    /// "<conversation>/field", has it above the field (API 0.5, part 5).
     pub fn under(mut self, window: &str, element: &str) -> Self {
         self.0.anchor = PickerAnchor::Element((window.to_string(), element.to_string()));
         self
@@ -114,6 +115,7 @@ pub fn item(key: &str, label: &str) -> Item {
         detail: None,
         badge: None,
         group: None,
+        avatar: None,
     })
 }
 
@@ -145,6 +147,12 @@ impl Item {
     /// The heading of the item's group: "Today", "In Progress".
     pub fn group(mut self, group: &str) -> Self {
         self.0.group = Some(group.to_string());
+        self
+    }
+
+    /// A person's or a chat's picture in place of the icon (API 0.5).
+    pub fn avatar(mut self, avatar: crate::host::ui::AvatarSpec) -> Self {
+        self.0.avatar = Some(avatar);
         self
     }
 }

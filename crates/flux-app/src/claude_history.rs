@@ -592,6 +592,16 @@ fn store_path() -> Option<PathBuf> {
     )
 }
 
+/// Where the looks of the plugins' answered steps are kept (`crate::plugin_tools`): next to the
+/// open sessions' file.
+pub(crate) fn plugin_steps_path() -> Option<PathBuf> {
+    // Tests never touch the user's files.
+    if cfg!(test) {
+        return None;
+    }
+    store_path().map(|file| file.with_file_name("claude-plugin-steps.json"))
+}
+
 fn console_path() -> Option<PathBuf> {
     file_path_for(
         "claude-console.json",

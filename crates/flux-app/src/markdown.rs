@@ -1217,6 +1217,17 @@ pub fn render_selectable(
     render_blocks(blocks, color, theme, Some(id.into()), marks, Some(select))
 }
 
+/// As [`render`], the texts selectable with the mouse as in [`render_selectable`], in the plain
+/// look: a code block of a plugin's conversation.
+pub fn render_with_selection(
+    blocks: &[Block],
+    color: Hsla,
+    theme: &Theme,
+    select: &Collect,
+) -> AnyElement {
+    render_blocks(blocks, color, theme, None, None, Some(select))
+}
+
 /// The texts the blocks draw, in the order they are drawn (tables row by row, code blocks as their
 /// lines): what a search counts its matches in, so [`Marks`] mark the same ones.
 pub fn block_texts(blocks: &[Block]) -> Vec<String> {
@@ -1428,7 +1439,7 @@ fn render_blocks(
                         marks,
                         select,
                     ),
-                    None => code_block(code, theme),
+                    None => code_block(code, theme, select),
                 },
                 Block::Rule => ui::divider(ui).into_any_element(),
                 Block::Table(table) => {
@@ -1750,7 +1761,7 @@ pub(crate) fn styled_parts(
     (text, runs)
 }
 
-fn code_block(code: &CodeBlock, theme: &Theme) -> AnyElement {
+fn code_block(code: &CodeBlock, theme: &Theme, select: Option<&Collect>) -> AnyElement {
     let ui = theme.ui;
     div()
         .px_2()
@@ -1758,7 +1769,7 @@ fn code_block(code: &CodeBlock, theme: &Theme) -> AnyElement {
         .rounded(px(RADIUS_SM))
         .bg(UiColors::tint(ui.foreground, 0.04))
         .font_family(theme::code_font())
-        .child(code_text(code, theme, None, None))
+        .child(code_text(code, theme, None, select))
         .into_any_element()
 }
 

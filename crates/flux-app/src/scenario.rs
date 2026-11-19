@@ -14,7 +14,8 @@
 //!   - `action:notifications_panel::Toggle` — dispatch an action (one without data) by name on the
 //!     focused element, as the command palette does;
 //!   - `ui:<plugin>/<window>/<element>` — a click on an element of a plugin's tool window (the
-//!     event goes to the plugin as a click would send it: the mouse can't be fed);
+//!     event goes to the plugin as a click would send it: the mouse can't be fed); a tab of a
+//!     window with tabs (API 0.5) — `ui:<plugin>/<window>/<key>/<element>`;
 //!     `ui-submit:<plugin>/<window>/<element>=<text>` — ↵ in its text field with the text;
 //!   - `shot:name` — print `SHOT name` and wait for the window to be captured from outside;
 //!   - `open-project:/path` — open a project as a recent project on the start screen opens it
@@ -29,6 +30,13 @@
 //!   - `click:x,y` — a left click at a point of the Flux window opened last, in points from its top
 //!     left corner (a shot's pixels halved): mouse events posted to Flux's own event queue, so
 //!     the window server and the background mode don't stand in the way (part 10.5);
+//!     `right-click:x,y` — the same with the right button: a context menu (FluxGram part 5) —
+//!     gpui's events to the scenario's window (AppKit's synthesized events carry no button);
+//!     `shift-click:x,y` — a left click with ⇧ held, the same way (selecting a run of messages);
+//!     `press:x,y` and `release:x,y` — the left button only goes down, or only up, there: a click
+//!     held for a moment with `wait:` between them, as a hand clicks — a link of a text (gpui's
+//!     `InteractiveText`) takes the release only after a frame drawn since the press (FluxGram
+//!     part 5);
 //!   - `drag-files:x,y=/a,/b` — files from Finder dragged into the window to `x, y` (window pixels,
 //!     as `click:`), and held there: gpui's `FileDropEvent::Entered` and `Pending`;
 //!     `drop-files:x,y` — dropped there: the mouse up that `FileDropEvent::Submit` becomes, without
@@ -37,6 +45,11 @@
 //!   - `pinch:x,y=0.5` — a pinch on the trackpad at `x, y` (window points, as `click:`) that makes
 //!     the picture 50 % larger (`-0.5` — half as large): gpui's `PinchEvent`s of a gesture, its
 //!     magnification in steps a frame apart.
+//!   - `scroll:x,y=-600*40` — the wheel at `x, y` (window points, as `click:`): 40 events of 600
+//!     pixels each (negative — towards the start, up), a frame apart, as a fast trackpad flick
+//!     (FluxGram part 1: the conversation's scrolling is measured with it);
+//!   - `mark:name` — a line `MARK name` in the output and in the frame log (`FLUX_SCENARIO_FRAMES`):
+//!     the phases of a measurement (idle, scrolling) split the log.
 //!
 //!   `FLUX_SCENARIO_PASTEBOARD=<name>` (gpui, Flux's patch) — the clipboard is the macOS pasteboard
 //!   of that name instead of the general one: a scenario copies and pastes without touching the
@@ -62,7 +75,12 @@
 //! - `FLUX_SCENARIO_HEADLESS=1` (the harness sets it when the screen is locked) — Flux draws the
 //!   frames itself on a timer and saves each `shot:` as `<FLUX_SCENARIO_OUT>/<name>-<window id>.png`,
 //!   rendered offscreen ([`headless`]): a locked screen stops gpui's display link and the window
-//!   server won't capture windows.
+//!   server won't capture windows. A window is drawn only when something changed in it, as with the
+//!   display link.
+//! - `FLUX_SCENARIO_FRAMES=<file>` — every frame a window draws (the display link's or the headless
+//!   timer's) goes there as a line `<ms since start>\t<window>\t<draw µs>`, and `mark:` steps add
+//!   `MARK <name>` lines: frames drawn while idle and the time a frame takes to lay out and paint,
+//!   measured (FluxGram part 1; gpui's `observe_frames`, Flux's patch).
 //!
 //! File picker dialogs (Cmd+O, "Save As") are system panels, and the auto-responder doesn't replace
 //! them. The screenshot harness is `scripts/ui-scenario.sh`.
@@ -326,6 +344,13 @@ pub fn run(window: AnyWindowHandle, cx: &mut App) {
     if background() {
         let_the_mouse_through();
     }
+    if std::env::var_os("FLUX_SCENARIO_FRAMES").is_some() {
+        // Every drawn frame, whoever asked for it: the display link of a window on screen, the
+        // headless timer.
+        gpui::observe_frames(|window, took| {
+            frame_log(&format!("{}\t{}", window.as_u64(), took.as_micros()))
+        });
+    }
     if headless() {
         pump_frames(cx);
     }
@@ -387,6 +412,28 @@ fn pump_frames(cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// A line of the frame log (`FLUX_SCENARIO_FRAMES`), after the milliseconds since the first one.
+fn frame_log(line: &str) {
+    use std::io::Write;
+    static LOG: Mutex<Option<(std::fs::File, std::time::Instant)>> = Mutex::new(None);
+    let Some(path) = std::env::var_os("FLUX_SCENARIO_FRAMES") else {
+        return;
+    };
+    let mut log = LOG.lock().unwrap();
+    if log.is_none() {
+        match std::fs::File::create(&path) {
+            Ok(file) => *log = Some((file, std::time::Instant::now())),
+            Err(err) => {
+                eprintln!("flux: scenario: the frame log: {err}");
+                return;
+            }
+        }
+    }
+    if let Some((file, start)) = log.as_mut() {
+        let _ = writeln!(file, "{}\t{line}", start.elapsed().as_millis());
+    }
 }
 
 /// Headless: a moment later, every window rendered offscreen into
@@ -543,6 +590,22 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
         );
         return STEP_PAUSE;
     }
+    if let Some(point) = step.strip_prefix("right-click:") {
+        return right_click(
+            point,
+            gpui::MouseButton::Right,
+            Modifiers::default(),
+            window,
+            cx,
+        );
+    }
+    if let Some(point) = step.strip_prefix("shift-click:") {
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        return right_click(point, gpui::MouseButton::Left, shift, window, cx);
+    }
     if let Some(point) = step.strip_prefix("click:") {
         let point = point
             .split_once(',')
@@ -563,12 +626,22 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
     if let Some(pinch) = step.strip_prefix("pinch:") {
         return pinch_at(pinch, window, cx);
     }
+    if let Some(scroll) = step.strip_prefix("scroll:") {
+        return scroll_at(scroll, window, cx);
+    }
+    if let Some(name) = step.strip_prefix("mark:") {
+        println!("MARK {name}");
+        frame_log(&format!("MARK {name}"));
+        return STEP_PAUSE;
+    }
     if step == "app-terminate" {
         request_terminate();
         println!("TERMINATE requested");
         return STEP_PAUSE;
     }
     if let Some(target) = step.strip_prefix("ui:") {
+        // The frame log shows what the click brought: the frames after it until the next mark.
+        frame_log(&format!("MARK ui:{target}"));
         return plugin_ui(target, None, window, cx);
     }
     if let Some(target) = step.strip_prefix("ui-submit:") {
@@ -578,6 +651,8 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
     if let Some(points) = step
         .strip_prefix("move:")
         .or_else(|| step.strip_prefix("drag:"))
+        .or_else(|| step.strip_prefix("press:"))
+        .or_else(|| step.strip_prefix("release:"))
     {
         const LEFT_MOUSE_DOWN: usize = 1;
         const LEFT_MOUSE_UP: usize = 2;
@@ -586,6 +661,8 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
         let numbers: Vec<f64> = points.split(',').filter_map(|n| n.parse().ok()).collect();
         let events: Vec<(usize, f64, f64)> = match numbers[..] {
             [x, y] if step.starts_with("move:") => vec![(MOUSE_MOVED, x, y)],
+            [x, y] if step.starts_with("press:") => vec![(LEFT_MOUSE_DOWN, x, y)],
+            [x, y] if step.starts_with("release:") => vec![(LEFT_MOUSE_UP, x, y)],
             [x1, y1, x2, y2] => {
                 // The drag in steps, as a hand moves it.
                 let steps = 8;
@@ -706,6 +783,105 @@ fn drop_files(point: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Durati
     STEP_PAUSE
 }
 
+/// `right-click:x,y`: the mouse moves to `x, y` (window points, as `click:`) and its right button
+/// goes down and up there, as gpui's events to the scenario's window. Not through AppKit's queue
+/// as `click:`: an `NSEvent` made by `mouseEventWithType:` has no button number, which gpui reads
+/// the button from — a right mouse down came as the left button's (a click, the hover bar), never
+/// a menu. `shift-click:` comes the same way with the left button and ⇧.
+fn right_click(
+    step: &str,
+    button: gpui::MouseButton,
+    modifiers: Modifiers,
+    window: AnyWindowHandle,
+    cx: &mut AsyncApp,
+) -> Duration {
+    use gpui::{MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
+    let Some(point) = window_point(step) else {
+        println!("BAD STEP right-click:{step}: x,y");
+        return STEP_PAUSE;
+    };
+    let sent = window.update(cx, |_, window, cx| {
+        let position = point * (1. / window.ui_scale());
+        window.dispatch_event(
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+            }),
+            cx,
+        );
+    });
+    println!(
+        "RIGHT-CLICK {step} -> {}",
+        if sent.is_ok() { "sent" } else { "no window" }
+    );
+    STEP_PAUSE
+}
+
+/// `scroll:x,y=-600*40`: the wheel at `x, y` — that many events of that many pixels, a frame
+/// apart (negative: up, towards the start), as a fast flick on the trackpad.
+fn scroll_at(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration {
+    use gpui::{PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase};
+    let (point, amount) = step.split_once('=').unwrap_or((step, ""));
+    let (delta, count) = amount.split_once('*').unwrap_or((amount, "1"));
+    let (Some(point), Ok(delta), Ok(count)) = (
+        window_point(point),
+        delta.parse::<f32>(),
+        count.parse::<u32>(),
+    ) else {
+        println!("BAD STEP scroll:{step}: x,y=-600*40");
+        return STEP_PAUSE;
+    };
+    let step = step.to_string();
+    cx.spawn(async move |cx| {
+        for index in 0..count {
+            let phase = match index {
+                0 => TouchPhase::Started,
+                index if index + 1 == count => TouchPhase::Ended,
+                _ => TouchPhase::Moved,
+            };
+            let sent = window.update(cx, |_, window, cx| {
+                let event = ScrollWheelEvent {
+                    position: point * (1. / window.ui_scale()),
+                    // gpui's wheel: a positive delta scrolls towards the start.
+                    delta: ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-delta))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: phase,
+                };
+                window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+            });
+            if sent.is_err() {
+                println!("SCROLL {step} -> no window");
+                return;
+            }
+            cx.background_executor().timer(HEADLESS_FRAME).await;
+        }
+        // A list doesn't stop the wheel's propagation: the frame log tells whether it scrolled.
+        println!("SCROLL {step} -> sent");
+    })
+    .detach();
+    STEP_PAUSE + HEADLESS_FRAME * count * 2
+}
+
 /// `pinch:x,y=0.5`: a pinch at `x, y` that magnifies by 0.5 in all — its start, the magnification
 /// in steps of equal ratio a frame apart (the picture redraws between them, as under the
 /// fingers), its end.
@@ -778,19 +954,32 @@ fn plugin_ui(
         Some(text) => UiEvent::Submitted(text),
         None => UiEvent::Clicked,
     };
-    let input = UiInput {
-        window: tool.to_string(),
-        element: element.to_string(),
-        event,
-    };
     let sent = window
         .downcast::<crate::workspace::Workspace>()
         .and_then(|workspace| {
             workspace
                 .update(cx, |workspace, _, cx| {
-                    workspace
-                        .plugins
-                        .update(cx, |store, _| store.send_to(plugin, Event::Ui(input)))
+                    workspace.plugins.update(cx, |store, _| {
+                        // A window with tabs (API 0.5): `<plugin>/<window>/<key>/<element>` names
+                        // an element of the tab `<window>/<key>`.
+                        let tabbed = store.plugin(plugin).is_some_and(|state| {
+                            state
+                                .entry
+                                .manifest
+                                .tool_window(tool)
+                                .is_some_and(|spec| spec.tabs)
+                        });
+                        let (window, element) = match element.split_once('/') {
+                            Some((key, element)) if tabbed => (format!("{tool}/{key}"), element),
+                            _ => (tool.to_string(), element),
+                        };
+                        let input = UiInput {
+                            window,
+                            element: element.to_string(),
+                            event,
+                        };
+                        store.send_to(plugin, Event::Ui(input))
+                    })
                 })
                 .ok()
         })

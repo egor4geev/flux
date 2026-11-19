@@ -319,6 +319,12 @@ impl ContextMenu {
         place(position, view)
     }
 
+    /// The height of a menu of `entries` plain entries (no separators, no title): an owner that
+    /// opens it above a button places it by it.
+    pub fn height_of(entries: usize) -> f32 {
+        entries as f32 * ITEM_HEIGHT + 2. * MENU_PADDING + 2.
+    }
+
     /// [`Self::overlay`] for an owner that draws it in every frame, open or not —
     /// `ContextMenu::slot("tree-menu", self.menu.as_ref().map(|open| (&open.menu, open.position)))`:
     /// the menu it dropped (closed, or replaced by another one) fades out toward its click, taking

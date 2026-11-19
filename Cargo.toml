@@ -5,7 +5,7 @@ members = ["crates/*"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 
@@ -15,6 +15,7 @@ flux-core = { path = "crates/flux-core" }
 flux-fs = { path = "crates/flux-fs" }
 flux-git = { path = "crates/flux-git" }
 flux-lsp = { path = "crates/flux-lsp" }
+flux-media = { path = "crates/flux-media" }
 flux-platform = { path = "crates/flux-platform" }
 flux-plugin = { path = "crates/flux-plugin" }
 flux-syntax = { path = "crates/flux-syntax" }
@@ -58,6 +59,11 @@ opt-level = 3
 [profile.dev.package.tree-sitter-typescript]
 opt-level = 3
 [profile.dev.package.tree-sitter-yaml]
+opt-level = 3
+
+# Voice messages (flux-media): the time stretching and the decoding pipeline — unoptimized, a debug
+# build plays 2× with ~7 % of a core instead of 0.5 %.
+[profile.dev.package.flux-media]
 opt-level = 3
 
 # Search (flux-search): the regular expression engine, substring search, and fuzzy search. In a

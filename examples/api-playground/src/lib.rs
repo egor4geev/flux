@@ -6,7 +6,13 @@
 //! pickers, the settings page, branches, links, Claude, contexts, the time, badges, a window in the
 //! editor) are in [`api03`].
 
+/// The API 0.5's two more places of a window: a block of the Settings page, a dialog.
+mod accounts;
 mod api03;
+/// The API 0.5's sections: the plugin's service, the file dialog.
+mod api05;
+/// The field's panel of emoji, stickers and GIFs (API 0.5, FluxGram part 4): a window of its own.
+mod panel;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -57,6 +63,9 @@ enum Section {
     Time,
     Widgets,
     EditorWindows,
+    Service,
+    Files,
+    Chats,
 }
 
 impl Section {
@@ -83,6 +92,9 @@ impl Section {
             Section::Time => "time",
             Section::Widgets => "widgets",
             Section::EditorWindows => "board",
+            Section::Service => "service",
+            Section::Files => "files",
+            Section::Chats => "chats",
         }
     }
 
@@ -108,12 +120,24 @@ impl Section {
             Section::Contexts => "Contexts",
             Section::Time => "Local Time",
             Section::Widgets => "Badges and Fields",
+            Section::Service => "The Plugin's Service",
+            Section::Files => "File Dialog",
+            Section::Chats => "Chats",
             Section::EditorWindows => "A Window in the Editor",
         }
     }
 
     fn about(self) -> &'static str {
         match self {
+            Section::Service => {
+                "One instance of the plugin for the whole app: ping it, or count with every window \
+                 at once — open a second window to see the counter shared."
+            }
+            Section::Files => "The system's dialog: the paths of the chosen files.",
+            Section::Chats => {
+                "Counts on buttons, a chat's header and a profile's, a picker of people with \
+                 their pictures."
+            }
             Section::Network => {
                 "Requests to the hosts the manifest allows: api.github.com and localhost."
             }
@@ -148,7 +172,9 @@ impl Section {
                 "A new branch and a checkout the way Flux does them; the commit message's template."
             }
             Section::Links => "PLAY-12 as a link in code, commit messages and Claude's chat.",
-            Section::Claude => "A Claude Code session with a task attached: to discuss, or to plan.",
+            Section::Claude => {
+                "A Claude Code session with a task attached: to discuss, or to plan."
+            }
             Section::Contexts => "The tabs of a task: save them under a key, open another's.",
             Section::Time => "The user's time zone and local time.",
             Section::Widgets => "Badges in every tone; a field of several lines (⌘↵ sends it).",
@@ -207,11 +233,16 @@ struct Playground {
     clock: Option<(u64, u32)>,
     /// The sections of API 0.3.
     v3: api03::State,
+    v5: api05::State,
+    /// The fake accounts of the Settings page and their sign-in dialog.
+    accounts: accounts::State,
+    /// The window of the field's panel.
+    panel: panel::State,
 }
 
 impl Plugin for Playground {
     fn new() -> Self {
-        Playground {
+        let playground = Playground {
             shown: false,
             results: HashMap::new(),
             notes: HashMap::new(),
@@ -232,7 +263,13 @@ impl Plugin for Playground {
             secret_question: None,
             clock: None,
             v3: api03::State::default(),
-        }
+            v5: api05::State::default(),
+            accounts: accounts::State::default(),
+            panel: panel::State::default(),
+        };
+        // The Settings page's block has its view before the page is opened.
+        playground.accounts.render_accounts();
+        playground
     }
 
     fn run_command(&mut self, command: &str, context: &CommandContext) {
@@ -244,11 +281,21 @@ impl Plugin for Playground {
             "stop-clock" if self.clock.is_some() => self.toggle_clock(),
             "settings-check" => self.settings_check(context),
             "open-board" => ui::show(api03::BOARD),
+            "open-panel" => ui::show(panel::PANEL),
             _ => {}
         }
     }
 
     fn on_event(&mut self, event: Event) {
+        let Some(event) = self.accounts.handle(event) else {
+            return;
+        };
+        let Some(event) = self.handle_05(event) else {
+            return;
+        };
+        let Some(event) = self.handle_panel(event) else {
+            return;
+        };
         let Some(event) = self.handle_03(event) else {
             return;
         };
@@ -421,7 +468,10 @@ impl Playground {
             "problems-warn" => self.warn_here(),
             "problems-clear" => {
                 diagnostics::clear();
-                self.set(Section::Problems, tr("The playground's problems are cleared."));
+                self.set(
+                    Section::Problems,
+                    tr("The playground's problems are cleared."),
+                );
             }
             "secrets-save" => {
                 self.secret_question = Some(
@@ -457,6 +507,12 @@ impl Playground {
                     Err(err) => failed(&err),
                 };
                 self.set(Section::System, text);
+            }
+            _ if element.starts_with("service-")
+                || element.starts_with("files-")
+                || element.starts_with("chats-") =>
+            {
+                self.clicked_05(element)
             }
             _ => self.clicked_03(element),
         }
@@ -545,7 +601,11 @@ impl Playground {
             tr("bytes"),
         );
         if !stream.messages.is_empty() {
-            text.push_str(&format!("\n\n{}: {}", tr("events"), stream.messages.join(", ")));
+            text.push_str(&format!(
+                "\n\n{}: {}",
+                tr("events"),
+                stream.messages.join(", ")
+            ));
         }
         match &stream.done {
             Some(Ok(())) => text.push_str(&format!("\n\n**{}**", tr("Done."))),
@@ -757,7 +817,10 @@ impl Playground {
             return;
         };
         let text = match terminal::run_line(shell, "echo $FLUX_PLAYGROUND") {
-            Ok(()) => trf("Typed `echo $FLUX_PLAYGROUND` into terminal {0}.", &[&shell]),
+            Ok(()) => trf(
+                "Typed `echo $FLUX_PLAYGROUND` into terminal {0}.",
+                &[&shell],
+            ),
             Err(err) => failed(&err),
         };
         self.set(Section::Terminal, text);
@@ -813,7 +876,10 @@ impl Playground {
             repositories
                 .iter()
                 .map(|repo| {
-                    let head = repo.head.as_deref().map_or("—", |head| &head[..head.len().min(8)]);
+                    let head = repo
+                        .head
+                        .as_deref()
+                        .map_or("—", |head| &head[..head.len().min(8)]);
                     let mut line = format!(
                         "- `{}` · {}: **{}** · HEAD `{head}`",
                         repo.root,
@@ -854,7 +920,12 @@ impl Playground {
         let text = if changes.is_empty() {
             tr("No changes.")
         } else {
-            format!("{}: {}\n\n{}", tr("Changes"), changes.len(), lines.join("\n"))
+            format!(
+                "{}: {}\n\n{}",
+                tr("Changes"),
+                changes.len(),
+                lines.join("\n")
+            )
         };
         self.set(Section::Git, text);
     }
@@ -865,7 +936,9 @@ impl Playground {
             return;
         };
         let text = match git::diff(&path) {
-            Ok(diff) if diff.trim().is_empty() => trf("{0}: no changes against HEAD.", &[&relative(&path)]),
+            Ok(diff) if diff.trim().is_empty() => {
+                trf("{0}: no changes against HEAD.", &[&relative(&path)])
+            }
             Ok(diff) => format!(
                 "{}\n\n```diff\n{}\n```",
                 relative(&path),
@@ -881,7 +954,10 @@ impl Playground {
     fn list_problems(&mut self) {
         let files = diagnostics::all();
         let count = |severity: diagnostics::Severity, problems: &[Diagnostic]| {
-            problems.iter().filter(|problem| problem.severity == severity).count()
+            problems
+                .iter()
+                .filter(|problem| problem.severity == severity)
+                .count()
         };
         let mut errors = 0;
         let mut warnings = 0;
@@ -994,7 +1070,9 @@ impl Playground {
             return;
         };
         status::item(&format!("⏱ {ticks} · {} UTC", utc_now()))
-            .tooltip(&tr("API Playground: a timer every second; click to stop it"))
+            .tooltip(&tr(
+                "API Playground: a timer every second; click to stop it",
+            ))
             .command("stop-clock")
             .show(CLOCK);
     }
@@ -1026,7 +1104,10 @@ impl Playground {
         let document = match &context.editor {
             Some(document) => format!(
                 "{} ({}, id {})",
-                document.path.as_deref().map_or_else(|| tr("Untitled"), relative),
+                document
+                    .path
+                    .as_deref()
+                    .map_or_else(|| tr("Untitled"), relative),
                 document.language,
                 document.id
             ),
@@ -1076,7 +1157,11 @@ impl Playground {
         }
         let b = |id: &str, label: &str| -> Element { button(id, &tr(label)).into() };
         let server_label = if self.port.is_some() { "Stop" } else { "Start" };
-        let clock_label = if self.clock.is_some() { "Stop Clock" } else { "Start Clock" };
+        let clock_label = if self.clock.is_some() {
+            "Stop Clock"
+        } else {
+            "Start Clock"
+        };
         let sections = [
             (
                 Section::Network,
@@ -1088,7 +1173,10 @@ impl Playground {
             ),
             (
                 Section::Server,
-                vec![b("server-toggle", server_label), b("server-open", "Open in Browser")],
+                vec![
+                    b("server-toggle", server_label),
+                    b("server-open", "Open in Browser"),
+                ],
             ),
             (
                 Section::Programs,
@@ -1108,7 +1196,10 @@ impl Playground {
             ),
             (
                 Section::Review,
-                vec![b("review-propose", "Propose Header"), b("review-withdraw", "Withdraw")],
+                vec![
+                    b("review-propose", "Propose Header"),
+                    b("review-withdraw", "Withdraw"),
+                ],
             ),
             (
                 Section::Git,
@@ -1152,7 +1243,8 @@ impl Playground {
         let sections = sections
             .into_iter()
             .map(|(section, buttons)| (section, buttons, Vec::new()))
-            .chain(self.sections_03());
+            .chain(self.sections_03())
+            .chain(self.sections_05());
         for (index, (section, buttons, extra)) in sections.enumerate() {
             if index > 0 {
                 children.push(divider(&format!("divider-{index}")));
@@ -1215,7 +1307,9 @@ fn header_comment(path: &str) -> String {
     let extension = path.rsplit('.').next().unwrap_or_default();
     let text = "Proposed by the Flux API Playground.";
     match extension {
-        "py" | "toml" | "yaml" | "yml" | "sh" | "bash" | "zsh" | "rb" | "conf" => format!("# {text}"),
+        "py" | "toml" | "yaml" | "yml" | "sh" | "bash" | "zsh" | "rb" | "conf" => {
+            format!("# {text}")
+        }
         "md" | "html" | "xml" | "svg" => format!("<!-- {text} -->"),
         "css" => format!("/* {text} */"),
         _ => format!("// {text}"),

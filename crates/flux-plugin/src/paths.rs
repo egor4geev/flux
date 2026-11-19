@@ -1,5 +1,6 @@
 //! Where plugins live on disk. `FLUX_PLUGINS_HOME` puts everything into one folder instead (tests,
-//! UI scenarios): `plugins/`, `plugin-data/`, `cache/`, `logs/` and the secrets inside it.
+//! UI scenarios): `plugins/`, `plugin-data/`, `helpers/`, `cache/`, `logs/` and the secrets inside
+//! it.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -43,6 +44,12 @@ pub fn plugins_dir() -> PathBuf {
 /// The plugin's own folder (storage, its files): `plugin-data/<id>/`.
 pub fn data_dir(id: &str) -> PathBuf {
     home().join("plugin-data").join(id)
+}
+
+/// The plugins' own programs (API 0.5, `crate::helpers`): `helpers/<id>/<sha256>/`, apart from
+/// the plugin's folder, which an update replaces.
+pub fn helpers_dir() -> PathBuf {
+    home().join("helpers")
 }
 
 /// The plugins' secrets (`crate::secrets`): `secrets.bin`, its key and its lock, in

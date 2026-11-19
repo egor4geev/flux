@@ -9,8 +9,8 @@
 //! to restart it. The limit is on the plugin's own time: what a call waits for inside the API (a
 //! response, a program, the window — `HostState::waited`) is given back by the epoch's callback.
 //! Components are compiled by Cranelift once and cached in `paths::cache_dir()`. A component built
-//! for an older API (0.2) is linked and called through its own bindings ([`crate::compat`]); the
-//! manifest's `api` must name the version the component imports.
+//! for an older API (0.2, 0.3 and 0.4) is linked and called through its own bindings
+//! ([`crate::compat`]); the manifest's `api` must name the version the component imports.
 //!
 //! The sandbox is WASI 0.2: the project root (as the manifest's `project` permission says), the
 //! folders outside the project its `folders` permission lists and the plugin's data folder, each at
@@ -41,7 +41,7 @@ use crate::api::bindings::Plugin;
 use crate::api::claude::SessionSpec;
 use crate::api::contexts::ContextRef;
 use crate::api::diagnostics::{Diagnostic, FileDiagnostics};
-use crate::api::dialogs::{Form, Question, TextQuestion};
+use crate::api::dialogs::{FilePick, Form, Question, TextQuestion};
 use crate::api::editors::TextEdit;
 use crate::api::events::Event;
 use crate::api::git::{Branch, Change, CommitTemplate, Repository};
@@ -52,8 +52,9 @@ use crate::api::review::Proposal;
 use crate::api::settings::SettingStatus;
 use crate::api::status_bar::StatusItem;
 use crate::api::terminal::TerminalOptions;
+use crate::api::tools::{Confirmation, ToolOutput};
 use crate::api::types::{CommandContext, EditorInfo, Range};
-use crate::api::ui::View;
+use crate::api::ui::{ConversationChange, View};
 use crate::host::{HostState, LogSignal, LogStream};
 use crate::log::{Level, PluginLog};
 use crate::manifest::{FolderAccess, ProjectAccess};
@@ -67,9 +68,21 @@ pub const MEMORY_LIMIT: usize = 512 << 20;
 /// How often the engine's epoch advances: the precision of the time limit.
 const TICK: Duration = Duration::from_millis(10);
 
+/// Which instance of a plugin it is (API 0.5): a window's, or the plugin's service — one for the
+/// whole app (`service = true` in the manifest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceRole {
+    /// The instance of a window: the window's id, unique in the process.
+    Window(u64),
+    /// The plugin's service: no window, no project.
+    Service,
+}
+
 /// What an instance starts with.
 pub struct InstanceConfig {
     pub entry: Arc<PluginEntry>,
+    /// A window's instance or the service (API 0.5).
+    pub role: InstanceRole,
     /// The window's project root: the plugin searches it, and reads or writes its files as its
     /// permissions say.
     pub project_root: Option<PathBuf>,
@@ -88,6 +101,8 @@ pub struct Instance {
     calls: Sender<Call>,
     /// Set when the instance is stopped: a search in progress gives up.
     cancel: Arc<AtomicBool>,
+    /// Disconnected when the plugin's thread has ended ([`Instance::stop_and_wait`]).
+    ended: std::sync::Mutex<Receiver<()>>,
 }
 
 /// A call posted to the plugin's thread.
@@ -109,12 +124,18 @@ impl Instance {
         let cancel = Arc::new(AtomicBool::new(false));
         let messages = config.messages.clone();
         let events = EventSender(calls.clone());
-        let spawned = std::thread::Builder::new()
-            .name(format!("plugin {id}"))
-            .spawn({
-                let cancel = cancel.clone();
-                move || run(config, inbox, events, cancel)
-            });
+        let (alive, ended) = mpsc::channel::<()>();
+        let name = match config.role {
+            InstanceRole::Window(_) => format!("plugin {id}"),
+            InstanceRole::Service => format!("plugin {id} service"),
+        };
+        let spawned = std::thread::Builder::new().name(name).spawn({
+            let cancel = cancel.clone();
+            move || {
+                run(config, inbox, events, cancel);
+                drop(alive);
+            }
+        });
         if let Err(err) = spawned {
             let _ = messages.unbounded_send(PluginMessage {
                 plugin: id.clone(),
@@ -124,7 +145,12 @@ impl Instance {
                 },
             });
         }
-        Instance { id, calls, cancel }
+        Instance {
+            id,
+            calls,
+            cancel,
+            ended: std::sync::Mutex::new(ended),
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -157,6 +183,19 @@ impl Instance {
     /// are dropped, and a stale `Started` or `Stopped` never comes — a new instance of the same
     /// plugin can start right away.
     pub fn stop(self) {}
+
+    /// Stops the instance as [`Instance::stop`] does and waits up to `timeout` for `deactivate`
+    /// to return and the thread to end (Flux quits: a service closes its connections and
+    /// databases); true when it has.
+    pub fn stop_and_wait(self, timeout: Duration) -> bool {
+        self.cancel.store(true, Ordering::Relaxed);
+        let _ = self.calls.send(Call::Stop);
+        let ended = self.ended.lock().unwrap();
+        matches!(
+            ended.recv_timeout(timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        )
+    }
 }
 
 impl Drop for Instance {
@@ -278,6 +317,61 @@ pub enum HostCall {
         window: String,
         title: String,
     },
+    /// `ui.update-conversation` (API 0.5): changes of a `conversation` element, in order.
+    UpdateConversation {
+        window: String,
+        element: String,
+        changes: Vec<ConversationChange>,
+    },
+    /// `ui.open-tab` (API 0.5): opens the tab `<window>/<key>` (checked: a window with tabs) or
+    /// brings it forward.
+    OpenTab {
+        window: String,
+        key: String,
+        title: String,
+        focus: bool,
+    },
+    /// `ui.set-badge` (API 0.5): the launchpad icon's count, the tab's dot; none — no mark.
+    SetBadge {
+        window: String,
+        badge: Option<String>,
+    },
+    /// `ui.set-restorable` (API 0.5): whether the tab `<window>/<key>` comes back with the project
+    /// and is kept in a context.
+    SetRestorable {
+        window: String,
+        restorable: bool,
+    },
+    /// `ui.focus` (API 0.5): the keyboard to a text field of the window's view.
+    FocusElement {
+        window: String,
+        element: String,
+    },
+    /// `dialogs.pick-files` (API 0.5): the system's file dialog; the paths go back as
+    /// `Event::FilesPicked(id, …)`.
+    PickFiles {
+        id: u64,
+        options: FilePick,
+    },
+    /// `tools.respond` (API 0.5): the answer to a call of one of the plugin's tools (the window
+    /// drops one to a call that is gone).
+    ToolRespond {
+        call: u64,
+        output: ToolOutput,
+    },
+    /// `tools.confirm` (API 0.5): the card of a `write` tool's call in Claude's chat; the choice
+    /// goes back as `Event::ToolConfirmed(call, …)`.
+    ToolConfirm {
+        call: u64,
+        card: Box<Confirmation>,
+    },
+    /// `process.helper` (API 0.5) has been downloading the plugin's program `helper` for over a
+    /// second: (bytes so far, all bytes — 0 when unknown); none — the download ended. The window
+    /// shows it.
+    HelperProgress {
+        helper: String,
+        progress: Option<(u64, u64)>,
+    },
     /// A call about documents: the plugin's thread waits for the reply.
     Editor {
         call: EditorCall,
@@ -332,6 +426,10 @@ pub enum WindowCall {
     OpenUrl(String),
     /// `system.copy-text`: no reply.
     CopyText(String),
+    /// `system.open-file` (`reveal` false) and `system.show-file` (API 0.5): an absolute path
+    /// without "..", there (checked); Flux opens it only when it is in the plugin's data folder or
+    /// the user gave it to the plugin. No reply.
+    OpenFile { path: String, reveal: bool },
     /// `system.open-settings`: Settings on the plugin's page; no reply.
     OpenSettings,
     /// `git.branches` (the work tree's root) → `Branches`.
@@ -624,6 +722,13 @@ fn run(
     let messages = config.messages.clone();
     let log = config.log.clone();
     let stopping = cancel.clone();
+    // A plugin with a service (API 0.5): the instance takes messages from the moment it starts,
+    // and leaves when the thread ends.
+    let membership = config
+        .entry
+        .manifest
+        .service
+        .then(|| crate::services::join(&id, config.role, &events));
     // Once the window has let the instance go, it hears nothing more from it.
     let send = |kind| {
         if !stopping.load(Ordering::Relaxed) {
@@ -645,6 +750,9 @@ fn run(
         }
     };
     send(MessageKind::Started);
+    if let Some(membership) = &membership {
+        membership.started();
+    }
     let mut queue = VecDeque::new();
     loop {
         if queue.is_empty() {
@@ -664,7 +772,10 @@ fn run(
             Call::Command(command, context) => {
                 runner.call(|plugin, store| plugin.run_command(store, &command, &context))
             }
-            Call::Event(event) => runner.call(|plugin, store| plugin.on_event(store, &event)),
+            Call::Event(event) => {
+                runner.store.data_mut().host.track(&event);
+                runner.call(|plugin, store| plugin.on_event(store, &event))
+            }
             Call::Settings(settings) => {
                 runner.store.data_mut().host.settings = settings;
                 Ok(())
@@ -672,12 +783,18 @@ fn run(
             Call::Root(root) => runner.set_root(root).map(|restarted| {
                 if restarted {
                     send(MessageKind::Started);
+                    if let Some(membership) = &membership {
+                        membership.restarted();
+                    }
                 }
             }),
             Call::Stop => break,
         };
         if let Err(stop) = result {
             log.write(Level::Error, &format!("Stopped: {}", stop.error));
+            // The service leaves before anyone hears it stopped: a message sent after that
+            // fails instead of going to a queue nobody reads.
+            drop(membership);
             send(MessageKind::Stopped {
                 error: stop.error,
                 details: stop.details,
@@ -723,6 +840,8 @@ enum Exports {
     /// Built for 0.2: called through its bindings, with the values converted
     /// ([`crate::compat`]).
     V0_2(crate::compat::bindings::Plugin),
+    /// Built for 0.3 or 0.4 ([`crate::compat::v03`]).
+    V0_3(crate::compat::v03::bindings::Plugin),
 }
 
 impl Exports {
@@ -730,6 +849,7 @@ impl Exports {
         match self {
             Exports::Current(plugin) => plugin.call_activate(store),
             Exports::V0_2(plugin) => plugin.call_activate(store),
+            Exports::V0_3(plugin) => plugin.call_activate(store),
         }
     }
 
@@ -737,6 +857,7 @@ impl Exports {
         match self {
             Exports::Current(plugin) => plugin.call_deactivate(store),
             Exports::V0_2(plugin) => plugin.call_deactivate(store),
+            Exports::V0_3(plugin) => plugin.call_deactivate(store),
         }
     }
 
@@ -751,6 +872,11 @@ impl Exports {
             Exports::V0_2(plugin) => {
                 plugin.call_run_command(store, command, &crate::compat::command_context(context))
             }
+            Exports::V0_3(plugin) => plugin.call_run_command(
+                store,
+                command,
+                &crate::compat::v03::command_context(context),
+            ),
         }
     }
 
@@ -760,6 +886,11 @@ impl Exports {
             Exports::V0_2(plugin) => match crate::compat::event(event) {
                 Some(event) => plugin.call_on_event(store, &event),
                 // A 0.3 event: the plugin can't have asked for it.
+                None => Ok(()),
+            },
+            Exports::V0_3(plugin) => match crate::compat::v03::event(event) {
+                Some(event) => plugin.call_on_event(store, &event),
+                // A 0.5 event: the plugin can't have asked for it.
                 None => Ok(()),
             },
         }
@@ -780,6 +911,7 @@ struct Runner {
 /// What a store is made from: kept to make a new one when the project root changes.
 struct RunnerConfig {
     entry: Arc<PluginEntry>,
+    role: InstanceRole,
     language: String,
     messages: UnboundedSender<PluginMessage>,
     events: EventSender,
@@ -799,6 +931,7 @@ impl Runner {
         let stderr = LogStream::new(Level::Warn, config.log.clone(), signal.clone());
         let runner_config = Arc::new(RunnerConfig {
             entry: config.entry.clone(),
+            role: config.role,
             language: config.language,
             messages: config.messages,
             events,
@@ -867,11 +1000,21 @@ impl Runner {
             ));
         }
         start_clock(&mut self.store, self.config.entry.id());
-        let plugin = if api == crate::compat::API {
-            crate::compat::bindings::Plugin::instantiate(&mut self.store, component, &shared.linker)
-                .map(Exports::V0_2)
-        } else {
-            Plugin::instantiate(&mut self.store, component, &shared.linker).map(Exports::Current)
+        let plugin = match crate::wit_version(api) {
+            crate::compat::API => crate::compat::bindings::Plugin::instantiate(
+                &mut self.store,
+                component,
+                &shared.linker,
+            )
+            .map(Exports::V0_2),
+            crate::compat::v03::API => crate::compat::v03::bindings::Plugin::instantiate(
+                &mut self.store,
+                component,
+                &shared.linker,
+            )
+            .map(Exports::V0_3),
+            _ => Plugin::instantiate(&mut self.store, component, &shared.linker)
+                .map(Exports::Current),
         };
         let plugin = plugin.map_err(|err| self.stop(&err, "Couldn't load"))?;
         self.plugin = Some(plugin);
@@ -1032,13 +1175,17 @@ fn new_store(
     let host = HostState {
         id: id.into(),
         entry: config.entry.clone(),
+        role: config.role,
         language: config.language.clone(),
         root,
         settings,
         messages: config.messages.clone(),
         log: config.log.clone(),
         signal: signal.clone(),
-        next_id: 0,
+        next_id: match config.role {
+            InstanceRole::Window(_) => 0,
+            InstanceRole::Service => crate::host::SERVICE_IDS,
+        },
         storage: None,
         data_dir,
         cancel: config.cancel.clone(),
@@ -1048,6 +1195,8 @@ fn new_store(
         server: Default::default(),
         processes: Default::default(),
         timers: Default::default(),
+        tool_calls: Default::default(),
+        helpers: Default::default(),
     };
     // A plugin that runs programs needs the login shell's environment: it is read in the
     // background now rather than when the first program starts.

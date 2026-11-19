@@ -6,10 +6,14 @@
 mod api03;
 /// Plugins built for the API 0.2 (part 10.3).
 mod compat;
+/// Plugins built for the API 0.3 and 0.4 (FluxGram part 1).
+mod compat03;
 /// Requests and the plugin's server (part 8.2, agent A).
 mod net;
 /// Programs, timers, secrets, folders, the time limit (part 8.2, agent F).
 mod process;
+/// The service, helpers and Claude's tools (API 0.5, FluxGram part 1).
+mod service;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -188,6 +192,7 @@ fn start_in(
     let (messages, receiver) = unbounded();
     let log = PluginLog::memory();
     let instance = Instance::start(InstanceConfig {
+        role: crate::runtime::InstanceRole::Window(1),
         entry: std::sync::Arc::new(entry),
         project_root: root,
         language: language.into(),

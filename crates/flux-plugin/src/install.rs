@@ -127,6 +127,8 @@ pub fn uninstall(entry: &PluginEntry) -> Result<(), String> {
             }
             std::fs::remove_dir_all(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
             let _ = crate::secrets::delete_all(&crate::secrets::service(entry.id()));
+            // Its own programs (API 0.5) are kept apart from its folder.
+            crate::helpers::remove_all(entry.id());
             Ok(())
         }
     }

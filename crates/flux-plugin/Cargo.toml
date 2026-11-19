@@ -25,6 +25,9 @@ toml = "1"
 # The plugins' WebSocket connections to their server (`server`): frames over a socket Flux
 # accepts and upgrades itself; `handshake` only for the accept key (SHA-1).
 tungstenite = "0.30"
+# The plugins' helpers (API 0.5): a `.gz` file is unpacked after its checksum (already in Flux's
+# tree, through ureq's gzip).
+flate2 = "1.1"
 # The plugins' requests (`http`): a synchronous client (no async runtime), TLS by rustls with ring
 # (both already in Flux's tree, through gpui) checked by the system's certificates (the platform
 # verifier: Security.framework on macOS, so a company's root certificates work); gzip bodies.

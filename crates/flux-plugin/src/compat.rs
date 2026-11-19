@@ -9,6 +9,11 @@
 //!   current ones: `notifications` (an action's argument) and `ui` (a multi-line field, a badge).
 //! - The exports are called through the 0.2 bindings: `run-command`'s context loses what 0.3
 //!   added, and an event 0.2 doesn't know isn't delivered.
+//!
+//! Plugins built for 0.3 and 0.4 (`wit/v0.3`) are answered the same way by [`v03`].
+
+/// Plugins built for the API 0.3 and 0.4.
+pub(crate) mod v03;
 
 use wasmtime::component::{HasSelf, Linker};
 
@@ -74,7 +79,7 @@ pub(crate) fn add_to_linker(linker: &mut Linker<State>) -> wasmtime::Result<()> 
     );
     v2::notifications::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
     v2::ui::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
-    Ok(())
+    v03::add_to_linker(linker)
 }
 
 /// The API version a component was built for, by the names of its imports
@@ -195,12 +200,15 @@ fn from_v2_kind(kind: v2::ui::ElementKind) -> ui::ElementKind {
             tooltip: button.tooltip,
             primary: button.primary,
             enabled: button.enabled,
+            busy: false,
+            badge: None,
         }),
         Kind::TextField(field) => ui::ElementKind::TextField(ui::TextFieldSpec {
             text: field.text,
             placeholder: field.placeholder,
             code: field.code,
             multiline: false,
+            secret: false,
         }),
         Kind::Toggle(toggle) => ui::ElementKind::Toggle(ui::ToggleSpec {
             label: toggle.label,
@@ -225,10 +233,15 @@ fn from_v2_kind(kind: v2::ui::ElementKind) -> ui::ElementKind {
                     subtitle: None,
                     tags: Vec::new(),
                     actions: Vec::new(),
+                    avatar: None,
+                    badge_tone: None,
+                    label_icons: Vec::new(),
+                    mention: false,
                 })
                 .collect(),
             empty_text: tree.empty_text,
             cards: false,
+            two_line: false,
         }),
         Kind::Divider => ui::ElementKind::Divider,
         Kind::Spacer => ui::ElementKind::Spacer,
@@ -318,13 +331,22 @@ pub(crate) fn event(event: &Event) -> Option<v2::events::Event> {
         }
         Event::GitChanged => Old::GitChanged,
         Event::DiagnosticsChanged(paths) => Old::DiagnosticsChanged(paths.clone()),
-        // 0.3: what a 0.2 plugin can't have asked for.
+        // 0.3 and 0.5: what a 0.2 plugin can't have asked for.
         Event::FormAnswered(_)
         | Event::PickerQuery(_)
         | Event::PickerChosen(_)
         | Event::LinkActivated(_)
         | Event::LinkHovered(_)
-        | Event::GitDone(_) => return None,
+        | Event::GitDone(_)
+        | Event::TabClosed(_)
+        | Event::FilesPicked(_)
+        | Event::ServiceMessage(_)
+        | Event::WindowOpened(_)
+        | Event::WindowClosed(_)
+        | Event::ServiceStarted
+        | Event::ToolCalled(_)
+        | Event::ToolConfirmed(_)
+        | Event::ToolCancelled(_) => return None,
     })
 }
 
@@ -362,7 +384,42 @@ fn ui_input(input: &UiInput) -> Option<v2::events::UiInput> {
             UiEvent::Selected(key) => Old::Selected(key.clone()),
             UiEvent::Activated(key) => Old::Activated(key.clone()),
             UiEvent::Expanded(expanded) => Old::Expanded(expanded.clone()),
-            UiEvent::RowAction(_) => return None,
+            // 0.3 and 0.5: a row's button, a conversation — a 0.2 plugin has none.
+            UiEvent::RowAction(_)
+            | UiEvent::LoadOlder
+            | UiEvent::LoadNewer
+            | UiEvent::Visible(_)
+            | UiEvent::MessageAction(_)
+            | UiEvent::MessageActionQuoted(_)
+            | UiEvent::PartClicked(_)
+            | UiEvent::LinkClicked(_)
+            | UiEvent::QuoteClicked(_)
+            | UiEvent::Composed(_)
+            | UiEvent::ComposerAction(_)
+            | UiEvent::DraftChanged(_)
+            | UiEvent::ReplyCancelled
+            | UiEvent::Edited(_)
+            | UiEvent::EditCancelled
+            | UiEvent::EditLast
+            | UiEvent::Find
+            | UiEvent::FindNext
+            | UiEvent::FindPrevious
+            | UiEvent::Cancelled
+            | UiEvent::MediaPlayed(_)
+            | UiEvent::PanelOpened(_)
+            | UiEvent::PanelSearched(_)
+            | UiEvent::PanelChosen(_)
+            | UiEvent::PanelVisible(_)
+            | UiEvent::PanelLoadMore(_)
+            | UiEvent::PinnedClicked(_)
+            | UiEvent::PinnedAction(_)
+            | UiEvent::ComposedWith(_)
+            | UiEvent::Suggest(_)
+            | UiEvent::KeyboardPressed(_)
+            | UiEvent::SelectionAction(_)
+            | UiEvent::ForwardCancelled
+            | UiEvent::PollVoted(_)
+            | UiEvent::ReactionToggled(_) => return None,
         },
     })
 }
@@ -519,6 +576,7 @@ mod tests {
                 placeholder: Some("Find".into()),
                 code: true,
                 multiline: false,
+                secret: false,
             })
         );
         match &view.elements[2].kind {

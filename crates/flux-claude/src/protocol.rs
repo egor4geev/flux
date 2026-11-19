@@ -669,11 +669,15 @@ fn parse_message(value: &Value) -> Message {
         synthetic: message["model"] == "<synthetic>",
         replay: value["isReplay"].as_bool().unwrap_or(false),
         is_meta: value["isSynthetic"].as_bool().unwrap_or(false),
+        // CLI 2.1.292 also lists calls that ran, with their `permission_decision` only.
         non_executed: value["tool_result_meta"]
             .as_array()
             .map(|meta| {
                 meta.iter()
-                    .map(|item| (text(&item["id"]), text(&item["non_execution_kind"])))
+                    .filter_map(|item| {
+                        let kind = item["non_execution_kind"].as_str()?;
+                        (!kind.is_empty()).then(|| (text(&item["id"]), kind.to_string()))
+                    })
                     .collect()
             })
             .unwrap_or_default(),

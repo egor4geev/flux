@@ -55,7 +55,8 @@ Claude at once and sends nothing until that changes.
 
 Plugins run as WebAssembly: they can't crash Flux and reach only what you allowed when you installed
 them. The Marketplace brings languages, color themes and file icons in one click — and integrations
-such as [Yandex Tracker](https://github.com/egor4geev/flux-plugins/tree/main/plugins/flux.yandex).
+such as [Yandex Tracker](https://github.com/egor4geev/flux-plugins/tree/main/plugins/flux.yandex) and
+[FluxGram](https://github.com/egor4geev/flux-plugins/tree/main/plugins/flux.fluxgram) — Telegram chats in the editor, with Claude at hand.
 Write your own in Rust: [Writing plugins](docs/plugins.md).
 
 ### A terminal built in
