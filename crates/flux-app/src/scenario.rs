@@ -58,7 +58,9 @@
 //!     `…:plan-ask`, `…:keep:<text>`, `hub:interrupt:<n>`, `hub:mode:<n>:ask|edits|plan|bypass`,
 //!     `hub:new:<project folder>:<prompt>`, `hub:diff:<n>[:<turn>]`,
 //!     `hub:check-rollback:<n>[:<turn>]`, `hub:rollback:<n>[:<turn>]`, `hub:limits`,
-//!     `hub:region[:again]`, `hub:projects`, `hub:awake:off|always|power`, `hub:system`. `<n>` —
+//!     `hub:region[:again]`, `hub:projects`, `hub:awake:off|always|power`, `hub:system`,
+//!     `hub:action:<n>:<plugin>/<action>` (the plugin's action at the session in the console, as
+//!     its menu runs it — «Continue in Telegram»). `<n>` —
 //!     the n-th session of `hub:sessions` (from 1) or an id; `+` in a text is a space.
 //!     `FLUX_HUB_LOG=<file>` — every event the hub posts goes there as a line.
 //!
@@ -1103,6 +1105,12 @@ fn hub_step(step: &str, cx: &mut AsyncApp) -> Duration {
         },
     };
     let rest = arg(2);
+    if name == "action" {
+        let (plugin, action) = rest.split_once('/').unwrap_or((rest, ""));
+        crate::claude_hub::run_action(plugin, id, action.to_string());
+        println!("HUB {step} -> sent");
+        return STEP_PAUSE;
+    }
     let turn = rest.parse::<u32>().ok();
     let call = match name.as_str() {
         "sessions" => RemoteCall::Sessions,
