@@ -3,7 +3,7 @@
 id = "flux.api-playground"
 name = "API Playground"
 version = "0.1.0"
-api = "0.5"
+api = "0.6"
 authors = ["Egor Ageev"]
 description = "Every capability of the plugin API behind a button: requests, a local server, programs, terminals, proposed edits, Git, problems, secrets, timers, context menus; forms, pickers, the settings page, branches, links, Claude sessions, contexts, a window in the editor."
 repository = "https://github.com/egor4geev/flux"

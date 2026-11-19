@@ -7095,6 +7095,18 @@ pub(crate) fn open_window(
     bounds: WindowBounds,
     cx: &mut App,
 ) -> Option<WindowHandle<Workspace>> {
+    open_window_with(root, files, bounds, true, cx)
+}
+
+/// [`open_window`]; `focus` — it becomes the key window (otherwise it opens without taking the
+/// keyboard, behind the window the user works in).
+fn open_window_with(
+    root: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    bounds: WindowBounds,
+    focus: bool,
+    cx: &mut App,
+) -> Option<WindowHandle<Workspace>> {
     // A custom title bar on a glass window frame: the system title bar is transparent, the traffic
     // lights are centered in the title bar (at the interface scale), and the desktop behind the
     // window is blurred.
@@ -7109,6 +7121,7 @@ pub(crate) fn open_window(
         }),
         window_background: WindowBackgroundAppearance::Blurred,
         window_min_size: Some(size(px(720.), px(480.))),
+        focus,
         ..Default::default()
     };
     #[cfg(feature = "scenario")]
@@ -7120,9 +7133,12 @@ pub(crate) fn open_window(
         cx.new(|cx| Workspace::new(root, files, window, cx))
     }) {
         Ok(handle) => {
-            // A scenario's steps go to the window opened last.
+            // A scenario's steps go to the window opened last (one opened in the background
+            // isn't the user's).
             #[cfg(feature = "scenario")]
-            crate::scenario::window_opened(handle.into());
+            if focus {
+                crate::scenario::window_opened(handle.into());
+            }
             Some(handle)
         }
         Err(error) => {
@@ -7143,6 +7159,18 @@ pub(crate) fn open_project_window(
     let saved = project_state::load(&root).and_then(|state| state.bounds);
     let bounds = window_bounds(saved, near, cx);
     open_window(Some(root), files, bounds, cx)
+}
+
+/// A project's window opened in the background (remote work, API 0.6: a plugin starts a session
+/// in a project no window has): where it was last, not the key window, the app not activated —
+/// the user's app keeps the keyboard and their Space stays.
+pub(crate) fn open_project_window_in_background(
+    root: PathBuf,
+    cx: &mut App,
+) -> Option<WindowHandle<Workspace>> {
+    let saved = project_state::load(&root).and_then(|state| state.bounds);
+    let bounds = window_bounds(saved, None, cx);
+    open_window_with(Some(root), Vec::new(), bounds, false, cx)
 }
 
 /// The windows Flux starts with: the project of the command line (with its files), or, launched

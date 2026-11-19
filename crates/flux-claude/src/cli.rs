@@ -320,7 +320,8 @@ impl LaunchOptions {
                 args.extend(["--resume-session-at".into(), at.clone()]);
             }
         }
-        if let Some(id) = &self.session_id {
+        // A new session's own id; a resumed one is named by `--resume` (the CLI refuses both).
+        if let Some(id) = self.session_id.as_ref().filter(|_| self.resume.is_none()) {
             args.extend(["--session-id".into(), id.clone()]);
         }
         // Bypass permissions can be chosen in the chat at any time: the CLI switches to it only

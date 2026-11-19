@@ -292,12 +292,7 @@ impl ClaudeChat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A file that is as it was before already (rolled back, a new file gone) has nothing to
-        // lose and nothing to put back.
-        let files: Vec<FileRestore> = files
-            .into_iter()
-            .filter(|file| std::fs::read_to_string(&file.path).ok() != file.before)
-            .collect();
+        let files = to_restore(files);
         if files.is_empty() {
             cx.emit(ClaudeChatEvent::Notify(Notification::info(tr(
                 "The files are as they were before Claude's edits",
@@ -322,14 +317,7 @@ impl ClaudeChat {
             ))
             .details(list.trim_end().to_string());
         for file in &files {
-            let disk = std::fs::read_to_string(&file.path).ok();
-            let changed = match (&disk, &file.after) {
-                // The file Claude's edit created is gone already: nothing to lose.
-                (None, _) => false,
-                (Some(disk), Some(after)) => disk != after,
-                (Some(_), None) => true,
-            };
-            if changed {
+            if changed_since(file) {
                 dialog = dialog.point(
                     IconName::Warning,
                     trf(
@@ -348,10 +336,7 @@ impl ClaudeChat {
             if answer.await != Some(0) {
                 return;
             }
-            let jobs: Vec<(PathBuf, Option<Arc<str>>)> = files
-                .iter()
-                .map(|file| (file.path.clone(), file.before.as_deref().map(Arc::from)))
-                .collect();
+            let jobs = restore_jobs(&files);
             let errors = cx
                 .background_spawn(async move { crate::commit_panel::restore_originals(&jobs) })
                 .await;
@@ -377,6 +362,38 @@ impl ClaudeChat {
         })
         .detach();
     }
+}
+
+/// The files a rollback puts back: a file that is as it was before already (rolled back, a new
+/// file gone) has nothing to lose and nothing to put back. The chat asks about them first; the hub
+/// of remote work checks ([`changed_since`]) and rolls back without a dialog — its plugin has asked
+/// the user (API 0.6).
+pub(crate) fn to_restore(files: Vec<FileRestore>) -> Vec<FileRestore> {
+    files
+        .into_iter()
+        .filter(|file| std::fs::read_to_string(&file.path).ok() != file.before)
+        .collect()
+}
+
+/// Whether the file changed on disk after Claude's last edit (by the user, a later turn): putting
+/// it back loses that too.
+pub(crate) fn changed_since(file: &FileRestore) -> bool {
+    let disk = std::fs::read_to_string(&file.path).ok();
+    match (&disk, &file.after) {
+        // The file Claude's edit created is gone already: nothing to lose.
+        (None, _) => false,
+        (Some(disk), Some(after)) => disk != after,
+        (Some(_), None) => true,
+    }
+}
+
+/// What [`crate::commit_panel::restore_originals`] writes back: each file's text before Claude;
+/// `None` — Claude created it (to the Trash).
+pub(crate) fn restore_jobs(files: &[FileRestore]) -> Vec<(PathBuf, Option<Arc<str>>)> {
+    files
+        .iter()
+        .map(|file| (file.path.clone(), file.before.as_deref().map(Arc::from)))
+        .collect()
 }
 
 /// The name and input of the tool call `id` under `entry` (subagents' calls too).

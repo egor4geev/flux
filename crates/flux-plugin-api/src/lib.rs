@@ -22,7 +22,7 @@
 //! ```
 //!
 //! [`host`] has every interface of the API as generated from
-//! `crates/flux-plugin/wit/v0.5/flux-plugin.wit` (the reference); the rest are shortcuts for the common cases: [`view`] builds a tool window's
+//! `crates/flux-plugin/wit/v0.6/flux-plugin.wit` (the reference); the rest are shortcuts for the common cases: [`view`] builds a tool window's
 //! content, [`notify`] and [`dialog`] talk to the user, [`editor`] reads the documents,
 //! [`storage`] keeps the plugin's data, [`log`] writes its log, [`tr`] / [`trf`] translate and
 //! [`setting`] reads its settings; [`CommandContext`] says what a command acts on.
@@ -44,7 +44,13 @@
 //! between it and the windows' instances; [`process::helper`] — the plugin's own program, which
 //! Flux downloads and checks; [`tools`] — tools for Claude (`[[tools]]`), their answers and the
 //! cards of the ones that change something; [`dialog::pick_files`] — the system's file dialog;
-//! [`conversation`] — a chat fed by changes; pictures, avatars and QR codes in [`view`]. Guide:
+//! [`conversation`] — a chat fed by changes; pictures, avatars and QR codes in [`view`].
+//!
+//! API 0.6: [`remote`] — every Claude session of Flux for remote work (the `claude-remote`
+//! permission): the sessions and their events, writing, answering, interrupting, the mode, a new
+//! session in any project, a turn's diff and its rollback, the limits, the country check, the
+//! computer's sleep and screen lock; [`tasks`] — the user's tasks between plugins: a tracker gives
+//! them (`task-source = true`), another plugin asks (the `tasks` permission). Guide:
 //! `docs/plugins.md`.
 
 pub mod claude;
@@ -56,6 +62,7 @@ pub mod http;
 pub mod links;
 pub mod picker;
 pub mod process;
+pub mod remote;
 pub mod review;
 pub mod secrets;
 pub mod server;
@@ -63,6 +70,7 @@ pub mod service;
 pub mod settings;
 pub mod status;
 pub mod system;
+pub mod tasks;
 pub mod terminal;
 pub mod timers;
 pub mod tools;
@@ -74,11 +82,11 @@ mod url;
 
 pub use text::{offset, slice};
 
-/// The bindings generated from `crates/flux-plugin/wit/v0.5/flux-plugin.wit`.
+/// The bindings generated from `crates/flux-plugin/wit/v0.6/flux-plugin.wit`.
 #[allow(clippy::too_many_arguments)]
 pub mod bindings {
     wit_bindgen::generate!({
-        path: "../flux-plugin/wit/v0.5",
+        path: "../flux-plugin/wit/v0.6",
         world: "plugin",
         pub_export_macro: true,
         export_macro_name: "export_plugin",
@@ -94,9 +102,9 @@ pub mod bindings {
 /// `host::ui::set_view`…).
 pub mod host {
     pub use crate::bindings::flux::plugin::{
-        claude, commands, contexts, diagnostics, dialogs, editors, events, git, http, i18n, links,
-        log, notifications, picker, process, project, review, secrets, server, service, settings,
-        status_bar, storage, system, terminal, timers, tools, types, ui,
+        claude, claude_remote, commands, contexts, diagnostics, dialogs, editors, events, git,
+        http, i18n, links, log, notifications, picker, process, project, review, secrets, server,
+        service, settings, status_bar, storage, system, tasks, terminal, timers, tools, types, ui,
     };
 }
 

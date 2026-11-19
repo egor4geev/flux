@@ -8,10 +8,14 @@ mod api03;
 mod compat;
 /// Plugins built for the API 0.3 and 0.4 (FluxGram part 1).
 mod compat03;
+/// Plugins built for the API 0.5 (the bot, part 1).
+mod compat05;
 /// Requests and the plugin's server (part 8.2, agent A).
 mod net;
 /// Programs, timers, secrets, folders, the time limit (part 8.2, agent F).
 mod process;
+/// Claude for remote work and tasks between plugins (API 0.6, the bot's part 1).
+mod remote;
 /// The service, helpers and Claude's tools (API 0.5, FluxGram part 1).
 mod service;
 

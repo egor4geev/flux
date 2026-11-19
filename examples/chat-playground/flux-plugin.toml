@@ -5,7 +5,7 @@
 id = "flux.chat-playground"
 name = "Chat Playground"
 version = "0.1.0"
-api = "0.5"
+api = "0.6"
 authors = ["Egor Ageev"]
 description = "A chat-like mock of the conversation, pictures, avatars and QR codes of the plugin API."
 repository = "https://github.com/egor4geev/flux"

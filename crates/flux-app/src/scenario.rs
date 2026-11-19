@@ -50,6 +50,17 @@
 //!     (FluxGram part 1: the conversation's scrolling is measured with it);
 //!   - `mark:name` — a line `MARK name` in the output and in the frame log (`FLUX_SCENARIO_FRAMES`):
 //!     the phases of a measurement (idle, scrolling) split the log.
+//!   - `hub:<call>` — a call of Claude for remote work (API 0.6, [`crate::claude_hub`]) as a plugin
+//!     makes it; the reply is printed as `HUB <call> <reply>` (one that takes a while — the limits'
+//!     probe, a rollback, a new session's window — when it comes): `hub:sessions`,
+//!     `hub:transcript:<n>:<count>`, `hub:send:<n>:<text>`, `hub:answer:<n>:allow[:<choice>]`,
+//!     `…:deny[:<text>]`, `…:1,2/3` (the options of each question, from 1), `…:plan-edits`,
+//!     `…:plan-ask`, `…:keep:<text>`, `hub:interrupt:<n>`, `hub:mode:<n>:ask|edits|plan|bypass`,
+//!     `hub:new:<project folder>:<prompt>`, `hub:diff:<n>[:<turn>]`,
+//!     `hub:check-rollback:<n>[:<turn>]`, `hub:rollback:<n>[:<turn>]`, `hub:limits`,
+//!     `hub:region[:again]`, `hub:projects`, `hub:awake:off|always|power`, `hub:system`. `<n>` —
+//!     the n-th session of `hub:sessions` (from 1) or an id; `+` in a text is a space.
+//!     `FLUX_HUB_LOG=<file>` — every event the hub posts goes there as a line.
 //!
 //!   `FLUX_SCENARIO_PASTEBOARD=<name>` (gpui, Flux's patch) — the clipboard is the macOS pasteboard
 //!   of that name instead of the general one: a scenario copies and pastes without touching the
@@ -639,6 +650,9 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
         println!("TERMINATE requested");
         return STEP_PAUSE;
     }
+    if let Some(call) = step.strip_prefix("hub:") {
+        return hub_step(call, cx);
+    }
     if let Some(target) = step.strip_prefix("ui:") {
         // The frame log shows what the click brought: the frames after it until the next mark.
         frame_log(&format!("MARK ui:{target}"));
@@ -1041,4 +1055,170 @@ fn auto_prompt(
         cx.spawn(async move |cx| capture_later(name, cx)).detach();
     }
     prompt
+}
+
+/// A `hub:` step: the call as a plugin makes it; the reply printed as `HUB <call> <reply>` — at
+/// once, or when it comes (within half a minute).
+fn hub_step(step: &str, cx: &mut AsyncApp) -> Duration {
+    use flux_plugin::claude_remote::{
+        AwakeMode, NewSession, RemoteAnswer, RemoteCall, RemoteMode, RemoteReply, RequestKind,
+    };
+    let words = |text: &str| text.replace('+', " ");
+    let parts: Vec<&str> = step.splitn(3, ':').collect();
+    let name = parts[0].to_string();
+    let arg = |index: usize| parts.get(index).copied().unwrap_or("");
+    // The n-th session of `hub:sessions`, or an id; with its request.
+    let session = |n: &str,
+                   cx: &mut AsyncApp|
+     -> Option<(String, Option<flux_plugin::claude_remote::RemoteRequest>)> {
+        let replies = cx
+            .update(|cx| crate::claude_hub::scenario_call(RemoteCall::Sessions, cx))
+            .ok()?;
+        let Ok(RemoteReply::Sessions(sessions)) = replies.try_recv() else {
+            return None;
+        };
+        match n.parse::<usize>() {
+            Ok(index) => sessions
+                .get(index.checked_sub(1)?)
+                .map(|session| (session.id.clone(), session.request.clone())),
+            Err(_) => Some((
+                n.to_string(),
+                sessions
+                    .iter()
+                    .find(|session| session.id == n)
+                    .and_then(|session| session.request.clone()),
+            )),
+        }
+    };
+    let (id, request) = match name.as_str() {
+        "sessions" | "limits" | "region" | "projects" | "awake" | "system" | "new" => {
+            (String::new(), None)
+        }
+        _ => match session(arg(1), cx) {
+            Some(found) => found,
+            None => {
+                println!("HUB {step} -> no such session");
+                return STEP_PAUSE;
+            }
+        },
+    };
+    let rest = arg(2);
+    let turn = rest.parse::<u32>().ok();
+    let call = match name.as_str() {
+        "sessions" => RemoteCall::Sessions,
+        "transcript" => RemoteCall::Transcript {
+            session: id,
+            count: rest.parse().unwrap_or(10),
+        },
+        "send" => RemoteCall::Send {
+            session: id,
+            text: words(rest),
+            images: Vec::new(),
+        },
+        "interrupt" => RemoteCall::Interrupt { session: id },
+        "mode" => RemoteCall::SetMode {
+            session: id,
+            mode: match rest {
+                "ask" => RemoteMode::Ask,
+                "edits" => RemoteMode::AcceptEdits,
+                "plan" => RemoteMode::Plan,
+                "bypass" => RemoteMode::Bypass,
+                _ => RemoteMode::Other,
+            },
+        },
+        "answer" => {
+            let Some(request) = request else {
+                println!("HUB {step} -> no request");
+                return STEP_PAUSE;
+            };
+            let (kind, text) = rest.split_once(':').unwrap_or((rest, ""));
+            let answer = match kind {
+                "allow" => RemoteAnswer::Allow {
+                    choice: (!text.is_empty()).then(|| text.to_string()),
+                },
+                "deny" => RemoteAnswer::Deny {
+                    message: words(text),
+                },
+                "plan-edits" => RemoteAnswer::ApprovePlan { accept_edits: true },
+                "plan-ask" => RemoteAnswer::ApprovePlan {
+                    accept_edits: false,
+                },
+                "keep" => RemoteAnswer::KeepPlanning(words(text)),
+                numbers => {
+                    let RequestKind::Questions(questions) = &request.kind else {
+                        println!("HUB {step} -> not questions");
+                        return STEP_PAUSE;
+                    };
+                    RemoteAnswer::Answers(
+                        numbers
+                            .split('/')
+                            .zip(questions)
+                            .map(|(picked, question)| {
+                                picked
+                                    .split(',')
+                                    .filter_map(|n| n.parse::<usize>().ok()?.checked_sub(1))
+                                    .filter_map(|n| question.options.get(n))
+                                    .map(|(label, _)| label.clone())
+                                    .collect()
+                            })
+                            .collect(),
+                    )
+                }
+            };
+            RemoteCall::Answer {
+                session: id,
+                request: request.id,
+                answer,
+            }
+        }
+        "new" => {
+            let (project, prompt) = step["new:".len()..]
+                .rsplit_once(':')
+                .unwrap_or((&step["new:".len()..], ""));
+            RemoteCall::NewSession(NewSession {
+                project: project.to_string(),
+                title: None,
+                prompt: (!prompt.is_empty()).then(|| words(prompt)),
+                attachments: Vec::new(),
+                images: Vec::new(),
+                mode: RemoteMode::Ask,
+            })
+        }
+        "diff" => RemoteCall::TurnDiff { session: id, turn },
+        "check-rollback" => RemoteCall::CheckRollback { session: id, turn },
+        "rollback" => RemoteCall::Rollback { session: id, turn },
+        "limits" => RemoteCall::Limits,
+        "region" => RemoteCall::Region {
+            again: arg(1) == "again",
+        },
+        "projects" => RemoteCall::Projects,
+        "awake" => RemoteCall::SetAwake(match arg(1) {
+            "always" => AwakeMode::Always,
+            "power" => AwakeMode::OnPower,
+            _ => AwakeMode::Off,
+        }),
+        "system" => RemoteCall::System,
+        _ => {
+            println!("HUB {step} -> unknown call");
+            return STEP_PAUSE;
+        }
+    };
+    let Ok(replies) = cx.update(|cx| crate::claude_hub::scenario_call(call, cx)) else {
+        return STEP_PAUSE;
+    };
+    let step = step.to_string();
+    cx.spawn(async move |cx| {
+        for _ in 0..300 {
+            if let Ok(reply) = replies.try_recv() {
+                println!("HUB {step} {reply:?}");
+                return;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+        }
+        println!("HUB {step} -> no reply");
+    })
+    .detach();
+    STEP_PAUSE
 }

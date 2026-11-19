@@ -576,6 +576,12 @@ impl PluginStore {
         self.center = Some(center);
     }
 
+    /// The window's number among the plugins' instances (`InstanceRole::Window`, the id
+    /// `service.windows` gives): the hub of remote work names a session's window by it.
+    pub(crate) fn window_id(&self) -> u64 {
+        self.window_id
+    }
+
     /// All the plugins: bundled first, then by name.
     pub fn plugins(&self) -> &[PluginState] {
         &self.plugins
@@ -2324,6 +2330,7 @@ impl PluginStore {
             HostCall::HelperProgress { helper, progress } => {
                 crate::plugin_services::helper_progress(self, &plugin, &helper, progress, cx)
             }
+            HostCall::Claude { call, reply } => crate::claude_hub::handle(&plugin, call, reply, cx),
             call @ (HostCall::Ask { .. }
             | HostCall::AskText { .. }
             | HostCall::AskForm { .. }

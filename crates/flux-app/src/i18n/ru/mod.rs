@@ -16,6 +16,7 @@ mod claude_composer;
 mod claude_console;
 mod claude_console_core;
 mod claude_history;
+mod claude_hub;
 mod claude_session;
 mod claude_tabs;
 mod claude_transcript;
@@ -65,6 +66,7 @@ mod plugin_links;
 mod plugin_manager;
 mod plugin_menus;
 mod plugin_picker;
+mod plugin_remote;
 mod plugin_review;
 mod plugin_tabs;
 mod plugin_view;
@@ -148,10 +150,12 @@ pub(super) const STRINGS: &[&[(&str, &str)]] = &[
     claude_cards::STRINGS,
     claude_session::STRINGS,
     claude_history::STRINGS,
+    claude_hub::STRINGS,
     claude_changes::STRINGS,
     claude_actions::STRINGS,
     code_actions::STRINGS,
     plugin_api::STRINGS,
+    plugin_remote::STRINGS,
     plugin_menus::STRINGS,
     plugin_review::STRINGS,
     plugin_tabs::STRINGS,
@@ -227,10 +231,12 @@ pub(super) const PLURALS: &[&[(&str, [&str; 3])]] = &[
     claude_cards::PLURALS,
     claude_session::PLURALS,
     claude_history::PLURALS,
+    claude_hub::PLURALS,
     claude_changes::PLURALS,
     claude_actions::PLURALS,
     code_actions::PLURALS,
     plugin_api::PLURALS,
+    plugin_remote::PLURALS,
     plugin_menus::PLURALS,
     plugin_review::PLURALS,
     plugin_tabs::PLURALS,

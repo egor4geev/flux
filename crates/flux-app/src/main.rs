@@ -19,6 +19,9 @@ mod claude_composer;
 mod claude_console;
 mod claude_diff;
 mod claude_history;
+mod claude_hub;
+#[cfg(feature = "scenario")]
+mod claude_hub_fake;
 mod claude_search;
 mod claude_select;
 mod claude_session;
@@ -109,6 +112,7 @@ mod plugin_updates;
 mod plugin_view;
 mod plugins;
 mod popup;
+mod power;
 mod project_popup;
 mod project_search;
 mod project_state;
@@ -277,6 +281,7 @@ fn main() {
         plugin_dialog::init(cx);
         claude::init(cx);
         region_guard::init(cx);
+        claude_hub::init(cx);
         region_status::init(cx);
         system_shortcuts::init(cx);
         claude_console::init(cx);

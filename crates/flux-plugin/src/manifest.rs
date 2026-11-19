@@ -130,6 +130,24 @@ pub struct Manifest {
     pub helpers: Vec<HelperSpec>,
     /// Tools for Claude, in Flux's MCP server (API 0.5).
     pub tools: Vec<ClaudeToolSpec>,
+    /// Actions at a session in the pult (API 0.6, `[[claude-actions]]`): «Продолжить в Telegram».
+    /// The choice comes to the plugin's watching instances as `claude-action`.
+    pub claude_actions: Vec<ClaudeActionSpec>,
+    /// The plugin gives Flux the user's tasks (API 0.6, `task-source = true`): other plugins ask
+    /// for them with `tasks.find`, the query comes to it as `task-query`.
+    pub task_source: bool,
+}
+
+/// An action at a Claude session in the pult (API 0.6, `[[claude-actions]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ClaudeActionSpec {
+    /// Lowercase letters, digits and dashes: "telegram".
+    pub id: String,
+    /// For people (translated by the plugin's locales): "Continue in Telegram".
+    pub title: String,
+    /// A named icon, as in tool windows; none — the plugin's.
+    pub icon: Option<String>,
 }
 
 /// One of the plugin's own programs (API 0.5, `[[helpers]]`): Flux downloads the file of the
@@ -223,6 +241,12 @@ pub struct Permissions {
     /// Claude Code sessions the plugin opens with its own context and requests (API 0.3): they
     /// run with the rights the user gave Claude Code.
     pub claude: bool,
+    /// Every Claude session of Flux, for remote work (API 0.6, `claude-remote`): the plugin reads
+    /// them, writes to them, answers Claude's questions and permissions, rolls turns back. The
+    /// install question warns about it.
+    pub claude_remote: bool,
+    /// The user's tasks other plugins give Flux (API 0.6, `tasks`): `tasks.find`.
+    pub tasks: bool,
 }
 
 impl Permissions {
@@ -235,6 +259,8 @@ impl Permissions {
             && !self.terminal
             && self.folders.is_empty()
             && !self.claude
+            && !self.claude_remote
+            && !self.tasks
     }
 
     /// Whether a request may go to `host`: a name or an IP address, without the port (IPv6 with
@@ -946,6 +972,12 @@ struct RawManifest {
     /// API 0.5.
     #[serde(default)]
     tools: Vec<ClaudeToolSpec>,
+    /// API 0.6.
+    #[serde(default)]
+    claude_actions: Vec<ClaudeActionSpec>,
+    /// API 0.6.
+    #[serde(default)]
+    task_source: bool,
 }
 
 #[derive(Deserialize)]
@@ -1103,6 +1135,12 @@ struct RawPermissions {
     folders: Vec<FolderPermission>,
     #[serde(default)]
     claude: bool,
+    /// API 0.6.
+    #[serde(default)]
+    claude_remote: bool,
+    /// API 0.6.
+    #[serde(default)]
+    tasks: bool,
 }
 
 impl RawPermissions {
@@ -1155,6 +1193,8 @@ impl RawPermissions {
             terminal: self.terminal,
             folders: self.folders,
             claude: self.claude,
+            claude_remote: self.claude_remote,
+            tasks: self.tasks,
         })
     }
 }
@@ -1286,6 +1326,7 @@ impl RawManifest {
             }
         }
         check_api_05(&self)?;
+        check_api_06(&self)?;
         let permissions = self.permissions.check()?;
         let settings = self
             .settings
@@ -1339,6 +1380,8 @@ impl RawManifest {
             service: self.service,
             helpers: self.helpers,
             tools: self.tools,
+            claude_actions: self.claude_actions,
+            task_source: self.task_source,
         })
     }
 }
@@ -1443,6 +1486,69 @@ fn check_api_05(raw: &RawManifest) -> Result<(), ManifestError> {
         }
         if let Some(schema) = &tool.schema {
             check_relative("tools", schema)?;
+        }
+    }
+    Ok(())
+}
+
+/// The keys of API 0.6: Claude for remote work (`claude-remote`), tasks between plugins (`tasks`,
+/// `task-source`) and the actions at a session in the pult (`[[claude-actions]]`) need `api =
+/// "0.6"` or later; the actions are checked (ids, titles, icons).
+fn check_api_06(raw: &RawManifest) -> Result<(), ManifestError> {
+    let error = |message: String| Err(ManifestError(message));
+    let needs = |what: &str| {
+        Err(ManifestError(format!(
+            "{what} needs api = \"0.6\" or later"
+        )))
+    };
+    let new = api_at_least(&raw.api, 0, 6);
+    if raw.permissions.claude_remote && !new {
+        return needs("the permission claude-remote");
+    }
+    if raw.permissions.tasks && !new {
+        return needs("the permission tasks");
+    }
+    if raw.task_source && !new {
+        return needs("task-source");
+    }
+    if !raw.claude_actions.is_empty() && !new {
+        return needs("[[claude-actions]]");
+    }
+    if !raw.claude_actions.is_empty() && !raw.permissions.claude_remote {
+        return error(
+            "[[claude-actions]]: the choice comes to the plugin through claude-remote — add \
+             claude-remote = true to [permissions]"
+                .into(),
+        );
+    }
+    unique(
+        "claude action",
+        raw.claude_actions.iter().map(|a| a.id.as_str()),
+    )?;
+    for action in &raw.claude_actions {
+        let id_ok = action
+            .id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !id_ok {
+            return error(format!(
+                "claude action \"{}\": lowercase letters, digits and dashes",
+                action.id
+            ));
+        }
+        if action.title.trim().is_empty() {
+            return error(format!(
+                "claude action \"{}\": the title is empty",
+                action.id
+            ));
+        }
+        if let Some(icon) = &action.icon
+            && icon.trim().is_empty()
+        {
+            return error(format!(
+                "claude action \"{}\": the icon is empty",
+                action.id
+            ));
         }
     }
     Ok(())
@@ -2710,5 +2816,94 @@ location = "dialog"
                 "{location}: {err}"
             );
         }
+    }
+
+    /// A plugin of API 0.6 for remote work: the permissions, an action at a session in the
+    /// pult, tasks it gives.
+    const REMOTE: &str = r#"
+id = "test.bot"
+name = "Bot"
+version = "0.1.0"
+api = "0.6"
+wasm = "plugin.wasm"
+service = true
+task-source = true
+
+[permissions]
+claude-remote = true
+tasks = true
+
+[[claude-actions]]
+id = "telegram"
+title = "Continue in Telegram"
+icon = "send"
+"#;
+
+    #[test]
+    fn api_06_reads_remote_work_and_tasks() {
+        let manifest = Manifest::parse(REMOTE).unwrap();
+        assert!(manifest.permissions.claude_remote && manifest.permissions.tasks);
+        assert!(!manifest.permissions.is_empty());
+        assert!(manifest.task_source);
+        assert_eq!(
+            manifest.claude_actions,
+            vec![ClaudeActionSpec {
+                id: "telegram".into(),
+                title: "Continue in Telegram".into(),
+                icon: Some("send".into()),
+            }]
+        );
+        let plain = Manifest::parse(&REMOTE.replace("task-source = true\n", "")).unwrap();
+        assert!(!plain.task_source);
+    }
+
+    #[test]
+    fn remote_work_and_tasks_need_api_06() {
+        let old = REMOTE.replace("api = \"0.6\"", "api = \"0.5\"");
+        let err = Manifest::parse(&old).unwrap_err().0;
+        assert!(err.contains("0.6"), "{err}");
+        for (key, cut) in [
+            ("claude-remote", "claude-remote = true\n"),
+            ("tasks", "tasks = true\n"),
+            ("task-source", "task-source = true\n"),
+        ] {
+            // Each key alone needs 0.6.
+            let mut text = old.clone();
+            for (_, other) in [
+                ("claude-remote", "claude-remote = true\n"),
+                ("tasks", "tasks = true\n"),
+                ("task-source", "task-source = true\n"),
+            ] {
+                if other != cut {
+                    text = text.replace(other, "");
+                }
+            }
+            let text = text.replace(
+                "\n[[claude-actions]]\nid = \"telegram\"\ntitle = \"Continue in Telegram\"\nicon = \
+                 \"send\"\n",
+                "",
+            );
+            let err = Manifest::parse(&text).unwrap_err().0;
+            assert!(err.contains(key) && err.contains("0.6"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn claude_actions_are_checked() {
+        let error = |text: &str| Manifest::parse(text).unwrap_err().0;
+        let twice = format!("{REMOTE}\n[[claude-actions]]\nid = \"telegram\"\ntitle = \"Again\"\n");
+        assert_eq!(error(&twice), "two of claude action \"telegram\"");
+        let bad_id = REMOTE.replace("id = \"telegram\"", "id = \"Telegram!\"");
+        assert_eq!(
+            error(&bad_id),
+            "claude action \"Telegram!\": lowercase letters, digits and dashes"
+        );
+        let no_title = REMOTE.replace("title = \"Continue in Telegram\"", "title = \" \"");
+        assert_eq!(
+            error(&no_title),
+            "claude action \"telegram\": the title is empty"
+        );
+        let no_permission = REMOTE.replace("claude-remote = true\n", "");
+        assert!(error(&no_permission).contains("claude-remote = true"));
     }
 }

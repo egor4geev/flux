@@ -55,6 +55,7 @@ impl HostState {
             | HostCall::SetSetting { .. }
             | HostCall::SetSettingStatus { .. }
             | HostCall::HelperProgress { .. }
+            | HostCall::Claude { .. }
             | HostCall::Window {
                 call: WindowCall::OpenUrl(_) | WindowCall::CopyText(_) | WindowCall::OpenFile { .. },
                 ..
