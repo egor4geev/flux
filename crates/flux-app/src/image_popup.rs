@@ -16,6 +16,8 @@
 //! ([`ImagePopup::set_video_path`]). Only the video in sight has a player: going to another item
 //! lets its decoder go. A strip of thumbnails under the picture goes to any of them; the toolbar
 //! saves the item in sight (Save As…), shows it in Finder (Explorer), opens it in the system's app.
+//! The item coming into sight goes out as [`MediaShown`]: a gallery asks its plugin for the full
+//! size of a picture the user arrows to (FluxGram part 5).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -177,7 +179,10 @@ pub fn show_media(
     }
     workspace.update(cx, |workspace, cx| {
         workspace.toggle_viewer(window, cx, |_, cx| ImagePopup::with_media(items, index, cx));
-        workspace.modal_view::<ImagePopup>()
+        // Over a dialog (a profile's gallery) it is the window above it.
+        workspace
+            .over_view::<ImagePopup>()
+            .or_else(|| workspace.modal_view::<ImagePopup>())
     })
 }
 
@@ -203,6 +208,11 @@ pub struct ImagePopup {
 }
 
 impl EventEmitter<DismissEvent> for ImagePopup {}
+
+/// The item at this place came into sight: ← / →, the strip.
+pub struct MediaShown(pub usize);
+
+impl EventEmitter<MediaShown> for ImagePopup {}
 
 impl Focusable for ImagePopup {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -522,6 +532,7 @@ impl ImagePopup {
         for index in index.saturating_sub(1)..=index + 1 {
             self.view(index, cx);
         }
+        cx.emit(MediaShown(index));
         cx.notify();
     }
 

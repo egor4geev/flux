@@ -410,7 +410,16 @@ fn ui_input(input: &UiInput) -> Option<v2::events::UiInput> {
             | UiEvent::PanelSearched(_)
             | UiEvent::PanelChosen(_)
             | UiEvent::PanelVisible(_)
-            | UiEvent::PanelLoadMore(_) => return None,
+            | UiEvent::PanelLoadMore(_)
+            | UiEvent::PinnedClicked(_)
+            | UiEvent::PinnedAction(_)
+            | UiEvent::ComposedWith(_)
+            | UiEvent::Suggest(_)
+            | UiEvent::KeyboardPressed(_)
+            | UiEvent::SelectionAction(_)
+            | UiEvent::ForwardCancelled
+            | UiEvent::PollVoted(_)
+            | UiEvent::ReactionToggled(_) => return None,
         },
     })
 }

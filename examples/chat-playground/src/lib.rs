@@ -29,18 +29,76 @@
 //! (`message-action-quoted`, the log says `quoted`); a click on a picture without its full size
 //! opens the viewer at once and the full size comes a moment later; "Backend · team" is marked
 //! with "@" while it has unread messages.
+//!
+//! FluxGram part 5 (API 0.5): the field shows its Markdown as it is typed; "@" suggests the
+//! chat's members (one without a username goes in as a link to the person) and "/" a bot's
+//! commands (`suggest` → `suggestions`); a right click on Send offers Send Without Sound (the log
+//! says `composed-with: silent`). Every eleventh incoming message has its views at the foot and
+//! its topic's label over the text, and buttons under it (a press: the log says `keyboard`).
+//! A message's menu has Select: the bar's Forward puts the selected messages' bar over the field
+//! (`forwarding`; ↵ — the log says `forwarded`), its Delete removes them from the feed. The
+//! conversation owns its links (`own-links`): every click comes as `link-clicked` (the log says
+//! `link`), a web one then opens in the browser; a text link shows its address on hover.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use flux_plugin_api::conversation::{
-    self as chat, Composed, Delivery, History, ImageShape, Message, Part, clear, code, composer,
-    draft, editing, file, link_preview, newer, notice, older, placeholder, put, quote, reply_to,
-    reveal, rich, sticker, unread_from,
+    self as chat, Composed, Delivery, History, ImageShape, Message, MessageQuote, Part, Suggestion,
+    clear, code, composer, draft, editing, file, forwarding, link_preview, newer, notice, older,
+    placeholder, poll_option, poll_spec, put, quote, remove, reply_to, reveal, rich, sticker,
+    suggestions, unread_from,
 };
 use flux_plugin_api::host::ui;
 use flux_plugin_api::view::*;
 use flux_plugin_api::{Event, Plugin, UiEvent, log, register_plugin, storage, timers};
+
+/// The field's suggestions for `text` after `trigger` (part 5): the members whose name starts
+/// with it for "@", the commands for "/".
+fn suggested(trigger: &str, text: &str) -> Vec<Suggestion> {
+    let query = text.to_lowercase();
+    let members = [
+        ("anna", "Anna Smirnova", Some("anna"), 6),
+        ("dima", "Dima Kim", Some("dimakim"), 4),
+        ("olga", "Ольга Петрова", None, 2),
+    ];
+    let commands = [
+        ("start", "Start the bot"),
+        ("week", "The week ahead"),
+        ("help", "What the bot can do"),
+    ];
+    match trigger {
+        "@" => members
+            .iter()
+            .filter(|(_, name, username, _)| {
+                name.to_lowercase().starts_with(&query)
+                    || username.is_some_and(|username| username.starts_with(&query))
+            })
+            .enumerate()
+            .map(|(index, (key, name, username, color))| {
+                let insert = match username {
+                    Some(username) => format!("@{username} "),
+                    None => format!("[{name}](tg://user?id={}) ", 100 + index),
+                };
+                let initial: String = name.chars().take(1).collect();
+                let item = Suggestion::new(key, name, &insert)
+                    .avatar(AvatarSpec::initials(&initial, *color));
+                match username {
+                    Some(username) => item.detail(&format!("@{username}")),
+                    None => item,
+                }
+            })
+            .collect(),
+        "/" => commands
+            .iter()
+            .filter(|(name, _)| name.starts_with(&query))
+            .map(|(name, about)| {
+                Suggestion::new(name, &format!("/{name}"), &format!("/{name} ")).detail(about)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 const CHATS: &str = "chats";
 const CHAT: &str = "chat";
@@ -195,6 +253,8 @@ struct Playground {
     downloaded: HashSet<(u64, u64)>,
     /// The part of a message the quote over a chat's field quotes (a reply to a selection).
     quoted: HashMap<String, String>,
+    /// The messages to forward over a chat's field (part 5), by the chat.
+    forwarding: HashMap<String, Vec<String>>,
     /// The chat whose profile is open, and how many pictures its gallery holds.
     profile: Option<(String, usize)>,
 }
@@ -551,15 +611,23 @@ impl Playground {
         let feed = conversation(
             FEED,
             chat::spec()
-                .composer(composer("Message…").attachments().formatting().action(
-                    "claude",
-                    "Reply with Claude",
-                    Some("claude"),
-                ))
+                .composer(
+                    composer("Message…")
+                        .attachments()
+                        .formatting()
+                        .action("claude", "Reply with Claude", Some("claude"))
+                        .triggers(["@", "/"])
+                        .send_option("silent", "Send Without Sound"),
+                )
                 .empty_text("No messages yet")
                 .message_action("reply", "Reply", Some("arrow-left"))
                 .message_action("edit", "Edit", Some("pencil"))
-                .message_action("claude", "Reply with Claude", Some("claude")),
+                .message_action("claude", "Reply with Claude", Some("claude"))
+                .selection_action("forward", "Forward", true)
+                .selection_action("delete", "Delete", false)
+                .own_links()
+                // The reactions the user may put (part 5): ☺ on the hover bar, the chips toggle.
+                .reactions(["👍", "❤", "🔥", "🎉", "😁", "🤔", "😢", "👏", "🙏", "👌"]),
         );
         set_view(&chat.tab, column("root", [header, feed]));
     }
@@ -619,10 +687,64 @@ impl Playground {
                 let text = format!("{} — rewritten by Claude", composed.text.trim());
                 chat::update(&tab, FEED, vec![draft(&text)]);
             }
-            (FEED, UiEvent::Composed(composed)) => self.send(key, composed),
+            // Selecting messages (part 5): Forward puts their bar over the field, Delete removes
+            // them.
+            (FEED, UiEvent::SelectionAction((action, messages))) if action == "forward" => {
+                let quote = MessageQuote {
+                    message: None,
+                    author: format!("Forwarding {} messages", messages.len()),
+                    color: 0,
+                    text: messages.join(", "),
+                };
+                self.forwarding.insert(key.to_string(), messages);
+                chat::update(&tab, FEED, vec![forwarding(Some(quote))]);
+            }
+            (FEED, UiEvent::SelectionAction((_, messages))) => {
+                chat::update(&tab, FEED, vec![remove(messages)]);
+            }
+            (FEED, UiEvent::ForwardCancelled) => {
+                self.forwarding.remove(key);
+                log::info("forward-cancelled")
+            }
+            (FEED, UiEvent::Composed(composed)) => {
+                if let Some(messages) = self.forwarding.remove(key) {
+                    log::info(&format!("forwarded: {}", messages.join(", ")));
+                }
+                if !composed.text.trim().is_empty() || !composed.files.is_empty() {
+                    self.send(key, composed)
+                }
+            }
+            (FEED, UiEvent::ComposedWith((option, composed))) => {
+                log::info(&format!("composed-with: {option}"));
+                self.send(key, composed)
+            }
+            // A button under a message (part 5).
+            (FEED, UiEvent::KeyboardPressed((message, button))) => {
+                log::info(&format!("keyboard: {message}/{button}"));
+            }
+            // A vote, a reaction (part 5): a real chat would send them and put the message again.
+            (FEED, UiEvent::PollVoted((message, part, options))) => {
+                log::info(&format!("poll-voted: {message}/{part} {options:?}"));
+            }
+            (FEED, UiEvent::ReactionToggled((message, emoji))) => {
+                log::info(&format!("reaction-toggled: {message} {emoji}"));
+            }
+            // The field's suggestions (part 5): the members for "@", the bot's commands for "/".
+            (FEED, UiEvent::Suggest((trigger, text))) => {
+                let items = suggested(&trigger, &text);
+                chat::update(&tab, FEED, vec![suggestions(&text, items)]);
+            }
             // A voice message or a round one played for the first time (part 4): it is heard.
             (FEED, UiEvent::MediaPlayed((message, part))) => {
                 log::info(&format!("media-played: {message}/{part}"));
+            }
+            // Every link comes here (`own-links`): a web one opens in the browser, as a plugin
+            // that asks first would after its question.
+            (FEED, UiEvent::LinkClicked((message, link))) => {
+                log::info(&format!("link: {message} {link}"));
+                if link.starts_with("https://") || link.starts_with("http://") {
+                    let _ = flux_plugin_api::system::open_url(&link);
+                }
             }
             // A video's picture: the plugin would play it.
             (FEED, UiEvent::PartClicked((message, part)))
@@ -968,6 +1090,21 @@ impl Playground {
         if matches!(message.parts.first(), Some(Part::Notice(_))) {
             return message.actions(Vec::<String>::new());
         }
+        // Part 5: views, a forum topic's label, buttons under the message.
+        if !message.outgoing && index % 11 == 3 {
+            message = message
+                .views(1_200 + index as u32 * 37)
+                .topic("Design", (index % 7) as u8)
+                .keyboard_row(vec![
+                    chat::keyboard_button("yes", "Yes", chat::KeyboardKind::Action),
+                    chat::keyboard_button("no", "No", chat::KeyboardKind::Action),
+                ])
+                .keyboard_row(vec![chat::keyboard_button(
+                    "docs",
+                    "Open the docs",
+                    chat::KeyboardKind::Link,
+                )]);
+        }
         match message.outgoing {
             true => message.actions(["reply", "edit", "claude"]),
             false => message.actions(["reply", "claude"]),
@@ -1078,6 +1215,30 @@ impl Playground {
                         .play(),
                 ))
             }
+            // Polls (part 5): one to vote in, a quiz answered with its explanation.
+            15 => message.part(chat::poll(poll_spec(
+                vec![rich("Where do we meet on Friday?")],
+                "Anonymous poll",
+                vec![
+                    poll_option(vec![rich("The office")], 0),
+                    poll_option(vec![rich("The café by the river")], 0),
+                    poll_option(vec![rich("Online")], 0),
+                ],
+                "7 votes",
+            ))),
+            16 => message.part(chat::poll(
+                poll_spec(
+                    vec![rich("Which keeps an idle editor at 0 % CPU?")],
+                    "Quiz",
+                    vec![
+                        poll_option(vec![rich("Redrawing every frame")], 25).chosen(),
+                        poll_option(vec![rich("Frames only for what plays")], 75).correct(),
+                    ],
+                    "4 answers",
+                )
+                .answered()
+                .explanation(vec![rich("Nothing on screen changes — nothing is drawn.")]),
+            )),
             _ => message.text(&format!(
                 "Message {index}: {}",
                 [

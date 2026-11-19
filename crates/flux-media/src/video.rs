@@ -1,9 +1,10 @@
 //! A video's player: the system's (hardware) decoder plays the file — on macOS AVFoundation
-//! (`AVPlayer` with an `AVPlayerItemVideoOutput`, [`macos`]), its frames `CVPixelBuffer`s that
-//! gpui's `surface` draws without a copy; on Windows Media Foundation (`IMFMediaEngine`,
-//! `windows.rs` — not built yet: `open` says `Unsupported`), its frames as pixels. The sound goes
-//! out through the system's player; unmuted, it takes the sound ([`crate::sound`]). A dropped
-//! player lets its decoder go — the app drops the players of videos off screen.
+//! (`AVPlayer` with an `AVPlayerItemVideoOutput`, `macos.rs`), its frames `CVPixelBuffer`s that
+//! gpui's `surface` draws without a copy; on Windows Media Foundation (`IMFMediaEngine` with a
+//! Direct3D 11 device, `windows.rs`), its frames read back as BGRA pixels by a thread of the
+//! player's own. The sound goes out through the system's player; unmuted, it takes the sound
+//! ([`crate::sound`]). A dropped player lets its decoder go — the app drops the players of videos
+//! off screen.
 //!
 //! On macOS a player is driven on the main thread (AVFoundation's player is main-thread-only):
 //! `open` there fails elsewhere, and a call from another thread goes to the main queue. Its
@@ -16,6 +17,10 @@
 //! buffer is `420f` (biplanar Y′CbCr 4:2:0, full range) — the one format gpui's Metal surface
 //! draws. Keep the last frame and draw it every render: `frame` gives a new one only when there
 //! is one.
+//!
+//! Drawing a frame (Windows): `Frame::Pixels` — BGRA, the order gpui's `RenderImage` keeps — moved
+//! into an image without a copy (`image::RgbaImage::from_raw(width, height, bgra)`); each frame is
+//! a new image, the old one dropped from the atlases (`cx.drop_image`).
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -23,7 +28,6 @@ mod macos;
 mod windows;
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
@@ -50,11 +54,12 @@ pub enum Frame {
     /// macOS: the decoder's buffer, drawn by gpui's `surface` without a copy.
     #[cfg(target_os = "macos")]
     Surface(core_video::pixel_buffer::CVPixelBuffer),
-    /// Elsewhere: the frame's pixels — BGRA, rows top to bottom.
+    /// Elsewhere: the frame's pixels — BGRA, rows top to bottom, `width * 4` bytes a row; the
+    /// app moves them into the image it draws.
     Pixels {
         width: u32,
         height: u32,
-        bgra: Arc<[u8]>,
+        bgra: Vec<u8>,
     },
 }
 
@@ -153,16 +158,10 @@ impl VideoPlayer {
     }
 }
 
-/// No video backend on this system.
+/// No video backend on this system: nothing plays, `open` says `Unsupported`.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-mod unsupported {
-    pub(super) use super::windows_stub::Player;
-}
-
-/// A backend that plays nothing: Windows until its backend is built, other systems.
-#[cfg(not(target_os = "macos"))]
 #[allow(dead_code)]
-mod windows_stub {
+mod unsupported {
     use std::path::Path;
     use std::time::Duration;
 

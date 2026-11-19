@@ -7,14 +7,19 @@
 //! Only the rows on screen (and a little around them) are drawn: the grid is laid out as rows of
 //! known heights, and the scroll offset picks the ones in sight. Each square is drawn as the
 //! conversation's pictures are (`plugin_conversation::render_picture`: the preview, the progress,
-//! the label, the ▶). A click on a picture whose full size is there (`full`; not a video's, `play`)
-//! opens it in Flux's media viewer with the gallery's full pictures and videos around it; any other
-//! click — a square with only its small picture (`path`), one not downloaded — is
-//! `activated(key)`. A video (`video`, FluxGram part 4) has its length in the corner and opens in
-//! the viewer, where it plays; one not downloaded opens at once on its poster with a spinner, goes
-//! to the plugin as `activated(key)`, and plays when the gallery comes again with its file. The squares on screen go to the plugin as `visible(first, last)` (their keys),
-//! at most every [`VISIBLE_EVERY`] while scrolling and once more when it settles; within a screen
-//! of the end, `load-older` while `more` is `more` (once per state of it).
+//! the label, the ▶). A click on a picture (not a video's, `play`) opens it at once in Flux's
+//! media viewer with the gallery's pictures and videos around it (FluxGram part 5, as the feed's
+//! pictures): its full size (`full`) when it is there; else the square's own picture (`path`, or
+//! the clicked one's preview made large and blurred) with a spinner, and `activated(key)` goes to
+//! the plugin, which downloads the full size — the gallery coming again with the item's `full`
+//! swaps the viewer to it. A picture the user arrows to in the viewer does the same when it comes
+//! into sight. A video (`video`, FluxGram part 4) has its length in the corner and opens in the
+//! viewer, where it plays; one not downloaded opens at once on its poster with a spinner, goes to
+//! the plugin as `activated(key)`, and plays when the gallery comes again with its file. A `play`
+//! picture's click is `activated(key)`. The squares on screen go to the plugin as
+//! `visible(first, last)` (their keys), at most every [`VISIBLE_EVERY`] while scrolling and once
+//! more when it settles; within a screen of the end, `load-older` while `more` is `more` (once per
+//! state of it).
 //!
 //! Nothing here asks for frames by itself: an idle gallery draws nothing.
 
@@ -26,11 +31,12 @@ use std::time::{Duration, Instant};
 use flux_plugin::api::events::UiEvent;
 use flux_plugin::api::ui::{GalleryItem, GallerySpec, History};
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, EventEmitter, Pixels, Render, ScrollHandle,
-    SharedString, Task, WeakEntity, Window, div, prelude::*, px,
+    AnyElement, App, Bounds, ClickEvent, Context, Entity, EventEmitter, Pixels, Render,
+    ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window, div, prelude::*, px,
 };
 
-use crate::image_popup::{ImagePopup, MediaItem, VideoItem};
+use crate::image_popup::{ImagePopup, MediaItem, MediaShown, VideoItem};
+use crate::image_view::ImageSource;
 use crate::theme::Theme;
 use crate::ui;
 
@@ -157,8 +163,28 @@ pub struct Gallery {
     visible_timer: Option<Task<()>>,
     /// `load-older` went out in this state of `more`.
     asked_older: bool,
-    /// The viewer opened on a video not downloaded yet: its key and place there.
-    viewer: Option<(gpui::WeakEntity<ImagePopup>, String, usize)>,
+    /// The media viewer the gallery opened, while it is open.
+    viewer: Option<Viewer>,
+}
+
+/// The media viewer a click opened: the gallery's item at each of its places, and what it shows
+/// of each.
+struct Viewer {
+    popup: WeakEntity<ImagePopup>,
+    items: Vec<(String, Shows)>,
+    _shown: Subscription,
+}
+
+/// What the viewer shows of an item.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Shows {
+    /// The full size, a video's file: nothing to wait for.
+    Full,
+    /// A picture's square (`path` — its own small picture; else its preview blurred): its full
+    /// size is asked for (`asked`) once it is in sight, with a spinner until it comes.
+    Small { path: bool, asked: bool },
+    /// A video not downloaded: its poster, its file asked for once it is in sight.
+    Poster { asked: bool },
 }
 
 impl EventEmitter<GalleryEvent> for Gallery {}
@@ -197,31 +223,77 @@ impl Gallery {
         cx.notify();
     }
 
-    /// The viewer waiting for a video's file gets it.
+    /// The gallery came again: the viewer's pictures waiting for their full size get it (their
+    /// squares' pictures while it is still on the way), a video waiting for its file plays.
     fn update_viewer(&mut self, cx: &mut Context<Self>) {
-        let Some((popup, key, index)) = &self.viewer else {
+        let Some(viewer) = &mut self.viewer else {
             return;
         };
-        let Some(popup) = popup.upgrade() else {
+        let Some(popup) = viewer.popup.upgrade() else {
             self.viewer = None;
             return;
         };
-        let path = self
-            .spec
-            .items
-            .iter()
-            .find(|item| item.key == *key)
-            .and_then(|item| item.video.as_ref()?.path.as_ref())
-            .map(PathBuf::from)
-            .filter(|path| crate::plugin_images::allowed(&self.plugin, path, cx));
-        if let Some(path) = path {
-            let index = *index;
-            popup.update(cx, |popup, cx| {
-                popup.set_video_path(index, path, cx);
-                popup.set_loading(index, false, cx);
-            });
-            self.viewer = None;
+        let plugin = self.plugin.clone();
+        let allowed = |path: Option<&String>, cx: &mut App| {
+            let path = PathBuf::from(path?);
+            (crate::plugin_images::allowed(&plugin, &path, cx) && path.exists()).then_some(path)
+        };
+        for (index, (key, shows)) in viewer.items.iter_mut().enumerate() {
+            if *shows == Shows::Full {
+                continue;
+            }
+            let Some(item) = self.spec.items.iter().find(|item| item.key == *key) else {
+                continue;
+            };
+            match (*shows, &item.video) {
+                (Shows::Poster { .. }, Some(video)) => {
+                    if let Some(path) = allowed(video.path.as_ref(), cx) {
+                        popup.update(cx, |popup, cx| {
+                            popup.set_video_path(index, path, cx);
+                            popup.set_loading(index, false, cx);
+                        });
+                        *shows = Shows::Full;
+                    }
+                }
+                (Shows::Small { path: shown, asked }, None) => {
+                    if let Some(full) = allowed(item.image.full.as_ref(), cx) {
+                        popup.update(cx, |popup, cx| {
+                            popup.replace_picture(index, ImageSource::File(full), cx);
+                            popup.set_loading(index, false, cx);
+                        });
+                        *shows = Shows::Full;
+                    } else if !shown && let Some(path) = allowed(item.image.path.as_ref(), cx) {
+                        popup.update(cx, |popup, cx| {
+                            popup.replace_picture(index, ImageSource::File(path), cx)
+                        });
+                        *shows = Shows::Small { path: true, asked };
+                    }
+                }
+                _ => {}
+            }
         }
+    }
+
+    /// An item came into sight in the viewer: one whose full size (a video's file) isn't there
+    /// is asked for once, with a spinner over it until it comes.
+    fn viewer_shown(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(viewer) = &mut self.viewer else {
+            return;
+        };
+        let Some(popup) = viewer.popup.upgrade() else {
+            self.viewer = None;
+            return;
+        };
+        let Some((key, shows)) = viewer.items.get_mut(index) else {
+            return;
+        };
+        match shows {
+            Shows::Small { asked, .. } | Shows::Poster { asked } if !*asked => *asked = true,
+            _ => return,
+        }
+        let key = key.clone();
+        popup.update(cx, |popup, cx| popup.set_loading(index, true, cx));
+        self.emit(UiEvent::Activated(key), cx);
     }
 
     fn emit(&self, event: UiEvent, cx: &mut Context<Self>) {
@@ -280,9 +352,11 @@ impl Gallery {
         }
     }
 
-    /// A click on a square: the media viewer for a picture whose full size is there and for a
-    /// video (one not downloaded — on its poster, and the plugin downloads it), the plugin
-    /// otherwise (it downloads the picture).
+    /// A click on a square: the media viewer at once, with the gallery's pictures and videos
+    /// around it — a picture on its full size, else on its square's picture (the clicked one on
+    /// its preview, made large and blurred, when it has nothing more) while the plugin downloads
+    /// the full size (`activated`); a video on its file, else on its poster while the plugin
+    /// downloads it. A `play` picture goes to the plugin.
     fn click(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let allowed = |path: Option<&String>, cx: &mut App| {
             let path = PathBuf::from(path?);
@@ -290,49 +364,133 @@ impl Gallery {
                 .then_some(path)
         };
         let mut items = Vec::new();
+        let mut places = Vec::new();
         let mut shown = None;
+        let mut preview = None;
         for (ix, item) in self.spec.items.iter().enumerate() {
-            let media = match &item.video {
+            let (media, shows) = match &item.video {
                 Some(video) => {
                     let path = allowed(video.path.as_ref(), cx);
                     if path.is_none() && ix != index {
                         continue;
                     }
-                    MediaItem::Video(VideoItem {
+                    let shows = match path {
+                        Some(_) => Shows::Full,
+                        None => Shows::Poster { asked: false },
+                    };
+                    let media = MediaItem::Video(VideoItem {
                         path,
-                        poster: allowed(item.image.path.as_ref(), cx)
-                            .map(crate::image_view::ImageSource::File),
+                        poster: allowed(item.image.path.as_ref(), cx).map(ImageSource::File),
                         duration: video.duration,
                         gif: video.kind == flux_plugin::api::ui::VideoKind::Gif,
-                    })
+                    });
+                    (media, shows)
                 }
                 None if item.image.play => continue,
-                None => match allowed(item.image.full.as_ref(), cx) {
-                    Some(path) => MediaItem::Picture(crate::image_view::ImageSource::File(path)),
-                    None => continue,
-                },
+                None => {
+                    let full = allowed(item.image.full.as_ref(), cx);
+                    let path = allowed(item.image.path.as_ref(), cx);
+                    match (full, path, &item.image.preview) {
+                        (Some(full), _, _) => {
+                            (MediaItem::Picture(ImageSource::File(full)), Shows::Full)
+                        }
+                        (None, Some(path), _) => (
+                            MediaItem::Picture(ImageSource::File(path)),
+                            Shows::Small {
+                                path: true,
+                                asked: false,
+                            },
+                        ),
+                        // Only the preview: the clicked one's is made large and blurred.
+                        (None, None, Some(bytes)) if ix == index => {
+                            let image = &item.image;
+                            preview = Some((bytes.clone(), image.width, image.height));
+                            let source = crate::image_popup::conversation_picture(
+                                items.len(),
+                                "image/jpeg",
+                                bytes.as_slice().into(),
+                            );
+                            (
+                                MediaItem::Picture(source),
+                                Shows::Small {
+                                    path: false,
+                                    asked: false,
+                                },
+                            )
+                        }
+                        _ => continue,
+                    }
+                }
             };
             if ix == index {
                 shown = Some(items.len());
             }
             items.push(media);
+            places.push((item.key.clone(), shows));
         }
         let Some(item) = self.spec.items.get(index) else {
             return;
         };
-        let key = item.key.clone();
         let Some(shown) = shown else {
-            return self.emit(UiEvent::Activated(key), cx);
+            return self.emit(UiEvent::Activated(item.key.clone()), cx);
         };
-        let waiting = matches!(&items[shown], MediaItem::Video(video) if video.path.is_none());
-        let popup = crate::image_popup::show_media(items, shown, window, cx);
-        if waiting {
-            self.emit(UiEvent::Activated(key.clone()), cx);
-            if let Some(popup) = popup {
-                popup.update(cx, |popup, cx| popup.set_loading(shown, true, cx));
-                self.viewer = Some((popup.downgrade(), key, shown));
+        let Some((bytes, width, height)) = preview else {
+            return self.open_viewer(items, places, shown, window, cx);
+        };
+        // Only the preview: made large and blurred off the window's thread, then the viewer opens.
+        let blurred = cx.background_executor().spawn(async move {
+            crate::plugin_conversation::blurred_preview(&bytes, width, height)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let blurred = blurred.await;
+            this.update_in(cx, |this, window, cx| {
+                if let Some(data) = blurred {
+                    items[shown] = MediaItem::Picture(crate::image_popup::conversation_picture(
+                        shown,
+                        "image/jpeg",
+                        data.into(),
+                    ));
+                }
+                this.open_viewer(items, places, shown, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Opens the media viewer on the `shown`th of `items` (the gallery's items at `places`); the
+    /// one in sight asks for its full size when it isn't there.
+    fn open_viewer(
+        &mut self,
+        items: Vec<MediaItem>,
+        places: Vec<(String, Shows)>,
+        shown: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(popup) = crate::image_popup::show_media(items, shown, window, cx) else {
+            // No viewer here: the plugin opens or downloads it as before.
+            self.viewer = None;
+            if let Some((key, shows)) = places.get(shown)
+                && *shows != Shows::Full
+            {
+                self.emit(UiEvent::Activated(key.clone()), cx);
             }
-        }
+            return;
+        };
+        self.viewer = Some(Viewer {
+            popup: popup.downgrade(),
+            items: places,
+            _shown: cx.subscribe(
+                &popup,
+                |this, _: Entity<ImagePopup>, event: &MediaShown, cx| {
+                    this.viewer_shown(event.0, cx)
+                },
+            ),
+        });
+        self.viewer_shown(shown, cx);
+        // The full size may have come while the preview was made.
+        self.update_viewer(cx);
     }
 
     fn render_square(

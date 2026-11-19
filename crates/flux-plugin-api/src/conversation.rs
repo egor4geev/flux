@@ -20,9 +20,11 @@
 use crate::host::ui::RowAction;
 pub use crate::host::ui::{
     AnimationSpec, AvatarSpec, CodeBlock, Composed, ComposerSpec, ConversationChange as Change,
-    ConversationSpec, Delivery, FileSpec, History, ImageShape, ImageSpec, LinkPreview, Message,
-    MessageAuthor, MessageEdit, MessagePart as Part, MessageQuote, PanelContent, PanelItem,
-    PanelSection, PanelTab, PlaceholderSpec, Reaction, RichSpan, VideoKind, VideoSpec, VoiceSpec,
+    ConversationSpec, Delivery, FileSpec, History, ImageShape, ImageSpec, KeyboardButton,
+    KeyboardKind, LinkPreview, Message, MessageAuthor, MessageEdit, MessagePart as Part,
+    MessageQuote, PanelContent, PanelItem, PanelSection, PanelTab, PinnedSpec, PlaceholderSpec,
+    PollOption, PollSpec, Reaction, ReplyKeyboard, RichSpan, Suggestion, TopicLabel, VideoKind,
+    VideoSpec, VoiceSpec,
 };
 
 /// Sends changes of the `element` conversation of `window`'s view, in order.
@@ -96,6 +98,34 @@ pub fn panel_put(tab: PanelTab, items: Vec<PanelItem>) -> Change {
     Change::PanelPut((tab, items))
 }
 
+/// The bar of the chat's pinned message over the feed (API 0.5, part 5); `None` — no bar. Build
+/// it with [`pinned_spec`]; a click on it comes as `UiEvent::PinnedClicked(message)`, one on its
+/// action as `UiEvent::PinnedAction((message, id))`.
+pub fn pinned(spec: Option<PinnedSpec>) -> Change {
+    Change::Pinned(spec)
+}
+
+/// The field's suggestions (API 0.5, part 5) for `text` — what `UiEvent::Suggest((trigger,
+/// text))` asked: the list over the field; an answer for another text than the one at the caret
+/// now is dropped; empty — the list closes. Build the items with [`Suggestion::new`].
+pub fn suggestions(text: &str, items: Vec<Suggestion>) -> Change {
+    Change::Suggestions((text.to_string(), items))
+}
+
+/// The bot's keyboard over the field (API 0.5, part 5); `None` — no keyboard (and no ⌨). Build it
+/// with [`reply_keyboard_spec`]; a press comes as `UiEvent::KeyboardPressed(("", id))`.
+pub fn reply_keyboard(keyboard: Option<ReplyKeyboard>) -> Change {
+    Change::ReplyKeyboard(keyboard)
+}
+
+/// The messages to forward, over the field (API 0.5, part 5): a bar like the reply's quote — its
+/// `author` the title ("Forwarding 3 messages"), its `text` the line ("Anna, Boris: Hi…"); `None`
+/// — no bar. Its × comes as `UiEvent::ForwardCancelled`; ↵ as `UiEvent::Composed` (the field may
+/// be empty). Putting it clears the quote being answered, and a quote clears it.
+pub fn forwarding(quote: Option<MessageQuote>) -> Change {
+    Change::Forwarding(quote)
+}
+
 // --- Messages ---
 
 impl Message {
@@ -115,6 +145,10 @@ impl Message {
             parts: Vec::new(),
             reactions: Vec::new(),
             actions: None,
+            views: None,
+            topic: None,
+            sponsored: None,
+            keyboard: Vec::new(),
         }
     }
 
@@ -178,6 +212,38 @@ impl Message {
         self
     }
 
+    /// How many have seen it (API 0.5, part 5): a channel's post — an eye and "1.2K" at its foot.
+    pub fn views(mut self, views: u32) -> Self {
+        self.views = Some(views);
+        self
+    }
+
+    /// The forum topic it belongs to (API 0.5, part 5): its name in one of the seven avatar
+    /// colors, over the text.
+    pub fn topic(mut self, title: &str, color: u8) -> Self {
+        self.topic = Some(TopicLabel {
+            title: title.to_string(),
+            color,
+        });
+        self
+    }
+
+    /// An advertisement (API 0.5, part 5): `label` ("Ad") at its foot in place of the time; the
+    /// sponsor goes as its [`Message::author`].
+    pub fn sponsored(mut self, label: &str) -> Self {
+        self.sponsored = Some(label.to_string());
+        self
+    }
+
+    /// A row of buttons under the message (API 0.5, part 5), sharing the row's width; a press
+    /// comes as `UiEvent::KeyboardPressed((message, id))`. Build them with [`keyboard_button`].
+    pub fn keyboard_row(mut self, buttons: Vec<KeyboardButton>) -> Self {
+        if !buttons.is_empty() {
+            self.keyboard.push(buttons);
+        }
+        self
+    }
+
     /// The quote of this message for a reply to it: its author (or `me` for the user's own) and
     /// its text in one line, or what it is.
     pub fn quote(&self, me: &str) -> MessageQuote {
@@ -206,6 +272,11 @@ impl Message {
                 Part::File(file) => file.name.clone(),
                 Part::Link(link) => link.url.clone(),
                 Part::Placeholder(placeholder) => placeholder.text.clone(),
+                Part::Poll(poll) => poll
+                    .question
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect(),
             })
             .unwrap_or_default();
         MessageQuote {
@@ -266,7 +337,9 @@ impl RichSpan {
         self.highlight = true;
         self
     }
-    /// A link: web ones open in the browser, others come as `UiEvent::LinkClicked`.
+    /// A link: web ones open in the browser, others come as `UiEvent::LinkClicked` — every one
+    /// with the conversation's [`ConversationSpec::own_links`]. A web link whose text isn't its
+    /// address shows the address in a tooltip on hover.
     pub fn link(mut self, target: &str) -> Self {
         self.link = Some(target.to_string());
         self
@@ -333,6 +406,80 @@ pub fn placeholder(icon: Option<&str>, text: &str) -> Part {
 /// A line of the chat itself, in the middle: "Anna joined the group".
 pub fn notice(text: &str) -> Part {
     Part::Notice(vec![rich(text)])
+}
+
+/// A poll (API 0.5, part 5): build it with [`poll_spec`]; a vote comes as
+/// `UiEvent::PollVoted((message, part, options))`.
+pub fn poll(spec: PollSpec) -> Part {
+    Part::Poll(spec)
+}
+
+/// A poll: its question, the dim line under it ("Anonymous poll", "Quiz"), its options (build
+/// them with [`poll_option`]) and the line under them ("12 votes"); not answered, one choice —
+/// set the rest with the builder's methods.
+pub fn poll_spec(
+    question: Vec<RichSpan>,
+    kind: &str,
+    options: Vec<PollOption>,
+    footer: &str,
+) -> PollSpec {
+    PollSpec {
+        question,
+        kind: kind.to_string(),
+        options,
+        multiple: false,
+        answered: false,
+        closed: false,
+        footer: footer.to_string(),
+        explanation: None,
+    }
+}
+
+impl PollSpec {
+    /// Several options may be chosen: checkboxes and Vote.
+    pub fn multiple(mut self) -> Self {
+        self.multiple = true;
+        self
+    }
+    /// The results show: the user voted, or the poll is closed.
+    pub fn answered(mut self) -> Self {
+        self.answered = true;
+        self
+    }
+    /// Closed: no voting (the results show).
+    pub fn closed(mut self) -> Self {
+        self.closed = true;
+        self.answered = true;
+        self
+    }
+    /// A quiz's explanation, behind 💡 once answered.
+    pub fn explanation(mut self, spans: Vec<RichSpan>) -> Self {
+        self.explanation = Some(spans);
+        self
+    }
+}
+
+/// An option of a poll: its text and its share of the votes (0–100).
+pub fn poll_option(text: Vec<RichSpan>, percent: u8) -> PollOption {
+    PollOption {
+        text,
+        percent: percent.min(100),
+        chosen: false,
+        correct: false,
+    }
+}
+
+impl PollOption {
+    /// The user chose it.
+    pub fn chosen(mut self) -> Self {
+        self.chosen = true;
+        self
+    }
+    /// A quiz's right answer.
+    pub fn correct(mut self) -> Self {
+        self.correct = true;
+        self
+    }
 }
 
 /// A link's preview: the site, the title, the text, a picture.
@@ -552,6 +699,78 @@ impl AvatarSpec {
     }
 }
 
+// --- Buttons under a message (API 0.5, part 5) ---
+
+/// A button under a message: `id` names it in `UiEvent::KeyboardPressed`; `kind` gives its mark
+/// — none for an action the plugin answers, ↗ for a page, ↪ for a text put into the field.
+pub fn keyboard_button(id: &str, text: &str, kind: KeyboardKind) -> KeyboardButton {
+    KeyboardButton {
+        id: id.to_string(),
+        text: text.to_string(),
+        kind,
+    }
+}
+
+/// A bot's keyboard over the field: its rows of buttons (their `kind` is `Action`), shown at once
+/// (`open`) or behind the field's ⌨ button.
+pub fn reply_keyboard_spec(rows: Vec<Vec<KeyboardButton>>, open: bool) -> ReplyKeyboard {
+    ReplyKeyboard {
+        rows,
+        placeholder: None,
+        open,
+    }
+}
+
+impl ReplyKeyboard {
+    /// The field's placeholder while the keyboard is there ("Choose a city").
+    pub fn placeholder(mut self, placeholder: &str) -> Self {
+        self.placeholder = Some(placeholder.to_string());
+        self
+    }
+}
+
+// --- The pinned message's bar (API 0.5, part 5) ---
+
+/// The bar of the pinned message `message`: its title ("Pinned message"), its line, which of the
+/// `count` pinned messages it is (`position`, 0 — the newest).
+pub fn pinned_spec(
+    message: &str,
+    title: &str,
+    text: &str,
+    position: u32,
+    count: u32,
+) -> PinnedSpec {
+    PinnedSpec {
+        message: message.to_string(),
+        title: title.to_string(),
+        text: text.to_string(),
+        image: None,
+        position,
+        count,
+        actions: Vec::new(),
+    }
+}
+
+impl PinnedSpec {
+    /// The small picture before the text: the message's photo, a video's poster.
+    pub fn image(mut self, image: ImageSpec) -> Self {
+        self.image = Some(image);
+        self
+    }
+    /// An icon button at the bar's right end ("Unpin", ×); a press comes as
+    /// `UiEvent::PinnedAction((message, id))`.
+    pub fn action(mut self, id: &str, tooltip: &str, icon: &str) -> Self {
+        self.actions.push(RowAction {
+            id: id.to_string(),
+            label: None,
+            icon: Some(icon.to_string()),
+            tooltip: Some(tooltip.to_string()),
+            primary: false,
+        });
+        self
+    }
+}
+
 // --- The field ---
 
 /// The message field: its placeholder; files, buttons by the builder's methods.
@@ -562,6 +781,8 @@ pub fn composer(placeholder: &str) -> ComposerSpec {
         actions: Vec::new(),
         formatting: false,
         panel: Vec::new(),
+        triggers: Vec::new(),
+        send_options: Vec::new(),
     }
 }
 
@@ -589,6 +810,43 @@ impl ComposerSpec {
         self.panel = tabs.into_iter().collect();
         self
     }
+    /// The characters that ask for suggestions (API 0.5, part 5): "@" at a word's start, "/" at
+    /// the field's start. Typing one comes as `UiEvent::Suggest((trigger, text))`; answer with
+    /// [`suggestions`].
+    pub fn triggers<'a>(mut self, triggers: impl IntoIterator<Item = &'a str>) -> Self {
+        self.triggers = triggers.into_iter().map(str::to_string).collect();
+        self
+    }
+    /// Another way to send (API 0.5, part 5), in the Send button's menu (a right click on it):
+    /// "Send Without Sound"; a choice sends the field and comes as
+    /// `UiEvent::ComposedWith((id, composed))`.
+    pub fn send_option(mut self, id: &str, label: &str) -> Self {
+        self.send_options.push(row_action(id, label, None));
+        self
+    }
+}
+
+impl Suggestion {
+    /// An item of the field's suggestions (API 0.5, part 5): `key` names it, `title` shows it,
+    /// `insert` replaces the trigger and the text typed after it ("@anna ", "/start ").
+    pub fn new(key: &str, title: &str, insert: &str) -> Self {
+        Suggestion {
+            key: key.to_string(),
+            avatar: None,
+            title: title.to_string(),
+            detail: None,
+            insert: insert.to_string(),
+        }
+    }
+    pub fn avatar(mut self, avatar: AvatarSpec) -> Self {
+        self.avatar = Some(avatar);
+        self
+    }
+    /// Dim after the title: "@anna", "Start the bot".
+    pub fn detail(mut self, detail: &str) -> Self {
+        self.detail = Some(detail.to_string());
+        self
+    }
 }
 
 /// A conversation's spec: reading only, no actions; add them with the builder's methods.
@@ -597,6 +855,11 @@ pub fn spec() -> ConversationSpec {
         composer: None,
         empty_text: None,
         message_actions: Vec::new(),
+        field_button: None,
+        selection_actions: Vec::new(),
+        field_note: None,
+        own_links: false,
+        reactions: Vec::new(),
     }
 }
 
@@ -615,6 +878,43 @@ impl ConversationSpec {
     /// selected, as `UiEvent::MessageActionQuoted((message, id, text, offset))`.
     pub fn message_action(mut self, id: &str, label: &str, icon: Option<&str>) -> Self {
         self.message_actions.push(row_action(id, label, icon));
+        self
+    }
+    /// A button in place of the field (API 0.5, part 5), where the user can't write: "Join",
+    /// "Mute"; a press comes as `UiEvent::ComposerAction((id, composed))` with an empty
+    /// `composed`.
+    pub fn field_button(mut self, id: &str, label: &str) -> Self {
+        self.field_button = Some(row_action(id, label, None));
+        self
+    }
+    /// A line in place of the field where the user can't write (API 0.5, part 5): "You can't
+    /// write in this chat"; shown when there is neither the field nor a [`Self::field_button`].
+    pub fn field_note(mut self, text: &str) -> Self {
+        self.field_note = Some(text.to_string());
+        self
+    }
+    /// The plugin opens every link of the feed (API 0.5, part 5): web links and link previews
+    /// come as `UiEvent::LinkClicked` too, so it can ask first or open its own pages
+    /// ([`crate::system::open_url`] opens one in the browser). Without it, web links open in the
+    /// browser at once.
+    pub fn own_links(mut self) -> Self {
+        self.own_links = true;
+        self
+    }
+    /// An action on selected messages (API 0.5, part 5): "Forward", "Delete" — the first one with
+    /// `primary` is the accent button. With one, the message menu's "Select" starts selecting;
+    /// a choice comes as `UiEvent::SelectionAction((id, messages))`, in the feed's order.
+    pub fn selection_action(mut self, id: &str, label: &str, primary: bool) -> Self {
+        let mut action = row_action(id, label, None);
+        action.primary = primary;
+        self.selection_actions.push(action);
+        self
+    }
+    /// The reactions the user may put (API 0.5, part 5), emoji in order: a ☺ on the message's
+    /// hover bar opens them; a click on one of them under a message toggles the user's own. Both
+    /// come as `UiEvent::ReactionToggled((message, emoji))`.
+    pub fn reactions(mut self, emoji: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.reactions = emoji.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -644,6 +944,15 @@ mod tests {
         assert_eq!(quote.text, "Hello");
         assert_eq!(quote.author, "Anna");
         assert_eq!(quote.message.as_deref(), Some("m1"));
+        let post = Message::new("m3", 9, 0)
+            .views(1_200)
+            .topic("Design", 3)
+            .sponsored("Ad")
+            .keyboard_row(vec![keyboard_button("open", "Open", KeyboardKind::Link)])
+            .keyboard_row(Vec::new());
+        assert_eq!(post.views, Some(1_200));
+        assert_eq!(post.topic.as_ref().map(|topic| topic.color), Some(3));
+        assert_eq!(post.keyboard.len(), 1);
         let mine = Message::new("m2", 8, 0).outgoing(Delivery::Sending);
         assert_eq!(mine.quote("You").author, "You");
         assert!(matches!(remove(["m1"]), Change::Remove(ids) if ids == ["m1"]));

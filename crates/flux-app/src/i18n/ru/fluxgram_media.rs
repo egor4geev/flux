@@ -24,6 +24,11 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Volume", "Громкость"),
     ("Speed", "Скорость"),
     ("Full Screen", "Во весь экран"),
+    // Part 5: the bar of what plays — who, what it is, ⏮ ⏭.
+    ("voice message", "голосовое сообщение"),
+    ("video message", "видеосообщение"),
+    ("Play Previous", "Предыдущее"),
+    ("Play Next", "Следующее"),
 ];
 
 pub(super) const PLURALS: &[(&str, [&str; 3])] = &[];

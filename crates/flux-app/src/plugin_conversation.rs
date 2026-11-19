@@ -33,12 +33,32 @@
 //!
 //! Part 4 (API 0.5): voice messages, videos and animated stickers are [`media`]'s — players by
 //! `flux-media`, frames asked for only while something plays on screen; the field's panel of
-//! emoji, stickers and GIFs is [`panel`]'s.
+//! emoji, stickers and GIFs is [`panel`]'s. Part 5: the bar of the chat's pinned message over the
+//! feed is [`pinned`]'s; the field shows its Markdown as it is typed ([`markup`]); its
+//! suggestions — members for "@", bots' commands for "/" — are [`suggest`]'s; a right click on
+//! Send lists the field's other ways to send (`send-options`, as `composed-with`) in a menu above
+//! it; a plugin's picker under "<conversation>/field" opens above the field. A channel's
+//! post shows its views at the foot, a forum's message its topic over the text, an advertisement
+//! its label in place of the time; the buttons under a message, the button in place of the field
+//! ("Join", "Mute") and a bot's keyboard over the field (its ⌨ in the field) are [`keyboard`]'s.
+//! Selecting messages — "Select" in a message's menu, the circles, the bar in place of the field
+//! with the plugin's `selection-actions` and Copy — is [`selecting`]'s; the messages to forward
+//! (`forwarding`) have their bar over the field, like a quote, and ↵ sends them with no text.
+//! A poll — voting, its results, a quiz's explanation — is [`poll`]'s; the reactions the user may
+//! put (a ☺ on the hover bar opens their row, a chip under a message toggles its own) are
+//! [`reactions`]'s.
 //!
 //! Nothing here asks for frames by itself: an idle conversation draws nothing.
 
+mod keyboard;
+mod markup;
 mod media;
 mod panel;
+mod pinned;
+mod poll;
+mod reactions;
+mod selecting;
+mod suggest;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -68,7 +88,7 @@ use crate::icons::{IconName, icon, plugin_icon};
 use crate::image_popup::{ImagePopup, MediaItem, VideoItem};
 use crate::image_view::ImageSource;
 use crate::markdown::{self, Block, CodeBlock};
-use crate::prompt_input::{PromptInput, PromptInputEvent};
+use crate::prompt_input::{self, PromptInput, PromptInputEvent};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui;
 
@@ -93,8 +113,17 @@ actions!(
         FormatLink,
         /// ⇧F10 in the field: its menu, from the keyboard.
         ShowFieldMenu,
+        /// ⌘A while selecting messages (part 5): every loaded one.
+        SelectAllMessages,
     ]
 );
+
+/// "Select" in a message's menu (part 5): selecting messages starts with it.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = plugin_conversation, no_json)]
+struct SelectMessage {
+    message: String,
+}
 
 /// A plugin's action of a message, from its menu: with the selected part of the message's text
 /// and where it starts, when the menu opened over a selection in it.
@@ -104,6 +133,13 @@ struct ChooseAction {
     message: String,
     action: String,
     quote: Option<(String, u32)>,
+}
+
+/// One of the field's other ways to send (API 0.5, part 5), from the Send button's menu.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = plugin_conversation, no_json)]
+struct SendWith {
+    option: String,
 }
 
 /// Copy Text of a message's menu: the selected part of its text, when the menu opened over one.
@@ -148,6 +184,7 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("escape", CancelEdit, field),
             KeyBinding::new("cmd-c", CopySelection, Some(CONTEXT)),
             KeyBinding::new("escape", ClearSelection, Some(CONTEXT)),
+            KeyBinding::new("cmd-a", SelectAllMessages, Some(CONTEXT)),
             // The field's formatting: in the field they win over the window's keys (⌘K Commit,
             // ⇧⌘P the palette); without formatting the action passes them on.
             KeyBinding::new("cmd-b", FormatBold, field),
@@ -247,6 +284,9 @@ struct Code {
 pub struct Conversation {
     plugin: SharedString,
     spec: ConversationSpec,
+    /// The title of the view's header (a chat's name): who a one-to-one chat's messages without
+    /// an author are from.
+    title: Option<SharedString>,
     /// The messages by id.
     messages: HashMap<String, Message>,
     /// The ids in the feed's order (by `order`, then by id).
@@ -302,6 +342,24 @@ pub struct Conversation {
     media: media::Media,
     /// The field's panel of emoji, stickers and GIFs (part 4).
     panel: panel::Panel,
+    /// The bar of the pinned message over the feed (part 5).
+    pinned: Option<flux_plugin::api::ui::PinnedSpec>,
+    /// The field's suggestions for "@" and "/" (part 5).
+    suggest: suggest::Suggest,
+    /// A bot's keyboard over the field (part 5), and whether it shows (the field's ⌨).
+    reply_keyboard: Option<flux_plugin::api::ui::ReplyKeyboard>,
+    keyboard_open: bool,
+    /// The messages selected while selecting them (part 5): the selection's bar in place of the
+    /// field.
+    selecting: Option<selecting::Selecting>,
+    /// The messages to forward (part 5): their bar over the field, ↵ sends even with no text.
+    forwarding: Option<MessageQuote>,
+    /// What the user checked in the polls and the quizzes' explanations opened (part 5).
+    polls: poll::Polls,
+    /// The row of reactions open over a message's ☺ (part 5).
+    reacting: Option<reactions::Reacting>,
+    /// Where Send was drawn last: its menu opens above it (part 5).
+    send_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -321,8 +379,15 @@ impl Conversation {
             .as_ref()
             .map(|composer| composer.placeholder.clone())
             .unwrap_or_default();
-        let input = cx.new(|cx| PromptInput::new(placeholder, cx).max_rows(8).takes_files());
-        let subscriptions = vec![cx.subscribe(&input, Self::on_input)];
+        let input = cx.new(|cx| {
+            let mut input = PromptInput::new(placeholder, cx).max_rows(8).takes_files();
+            input.set_styling(styling(&spec), cx);
+            input
+        });
+        let subscriptions = vec![
+            cx.subscribe(&input, Self::on_input),
+            cx.on_release(|this, cx| this.media.release_all(cx)),
+        ];
         let list = ListState::new(0, ListAlignment::Bottom, px(OVERDRAW));
         let media = media::Media::new(plugin.clone());
         Self {
@@ -361,9 +426,29 @@ impl Conversation {
             menu: None,
             media,
             panel: panel::Panel::new(),
+            pinned: None,
+            suggest: Default::default(),
+            reply_keyboard: None,
+            keyboard_open: false,
+            selecting: None,
+            forwarding: None,
+            polls: poll::Polls::default(),
+            reacting: None,
+            send_bounds: Rc::default(),
+            title: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Where the field was drawn last (part 5): a plugin's picker opens above it.
+    pub fn field_bounds(&self) -> Rc<std::cell::Cell<Option<Bounds<Pixels>>>> {
+        self.field_bounds.clone()
+    }
+
+    /// The title of the view's header, as the view is set.
+    pub fn set_title(&mut self, title: Option<SharedString>) {
+        self.title = title;
     }
 
     /// The element's spec in the window's new view: the field, the actions.
@@ -371,15 +456,41 @@ impl Conversation {
         if self.spec == *spec {
             return;
         }
-        let placeholder = spec
-            .composer
-            .as_ref()
-            .map(|composer| composer.placeholder.clone())
-            .unwrap_or_default();
-        self.input
-            .update(cx, |input, _| input.set_placeholder(placeholder));
+        let placeholder = keyboard::field_placeholder(
+            spec.composer
+                .as_ref()
+                .map(|composer| composer.placeholder.as_str()),
+            self.reply_keyboard.as_ref(),
+        );
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(placeholder);
+            input.set_styling(styling(spec), cx);
+        });
         self.spec = spec.clone();
         cx.notify();
+    }
+
+    /// A bot's keyboard over the field came, or went (part 5): a new one shows as the bot asks
+    /// (`open`), the same one again keeps the user's ⌨; its placeholder takes the field's.
+    fn set_reply_keyboard(
+        &mut self,
+        keyboard: Option<flux_plugin::api::ui::ReplyKeyboard>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reply_keyboard == keyboard {
+            return;
+        }
+        self.keyboard_open = keyboard.as_ref().is_some_and(|keyboard| keyboard.open);
+        self.reply_keyboard = keyboard;
+        let placeholder = keyboard::field_placeholder(
+            self.spec
+                .composer
+                .as_ref()
+                .map(|composer| composer.placeholder.as_str()),
+            self.reply_keyboard.as_ref(),
+        );
+        self.input
+            .update(cx, |input, _| input.set_placeholder(placeholder));
     }
 
     fn emit(&self, event: UiEvent, cx: &mut Context<Self>) {
@@ -428,6 +539,7 @@ impl Conversation {
                     self.code.clear();
                     self.open_spoilers.clear();
                     self.selection = None;
+                    self.selecting = None;
                     self.list.reset(0);
                     self.filled = false;
                     self.visible_sent = None;
@@ -456,15 +568,32 @@ impl Conversation {
                 }
                 ConversationChange::Reveal(id) => self.reveal(&id),
                 ConversationChange::ReplyTo(quote) => {
-                    // Replying leaves an edit, as the messengers do.
+                    // Replying leaves an edit, as the messengers do, and a forwarding (part 5).
                     if quote.is_some() {
                         if self.editing.is_some() {
                             self.leave_editing(cx);
                             self.emit(UiEvent::EditCancelled, cx);
                         }
+                        if self.forwarding.take().is_some() {
+                            self.emit(UiEvent::ForwardCancelled, cx);
+                        }
                         self.take_keyboard = true;
                     }
                     self.reply_to = quote;
+                }
+                // Forwarding (part 5) leaves the quote being answered and an edit.
+                ConversationChange::Forwarding(quote) => {
+                    if quote.is_some() {
+                        if self.editing.is_some() {
+                            self.leave_editing(cx);
+                            self.emit(UiEvent::EditCancelled, cx);
+                        }
+                        if self.reply_to.take().is_some() {
+                            self.emit(UiEvent::ReplyCancelled, cx);
+                        }
+                        self.take_keyboard = true;
+                    }
+                    self.forwarding = quote;
                 }
                 ConversationChange::Draft(text) => {
                     self.plugin_draft = Some(text.clone());
@@ -490,6 +619,13 @@ impl Conversation {
                 }
                 ConversationChange::Panel(content) => self.panel.set_content(content),
                 ConversationChange::PanelPut((tab, items)) => self.panel.put(tab, items),
+                ConversationChange::Pinned(spec) => self.pinned = spec,
+                ConversationChange::Suggestions((text, items)) => {
+                    self.set_suggestions(text, items, cx)
+                }
+                ConversationChange::ReplyKeyboard(keyboard) => {
+                    self.set_reply_keyboard(keyboard, cx)
+                }
             }
         }
         // The first fill opens at the "New messages" line.
@@ -518,6 +654,14 @@ impl Conversation {
     /// Adds a message, or replaces the one with its id.
     fn put(&mut self, message: Message) {
         let id = message.id.clone();
+        // A poll that came answered keeps nothing checked (part 5).
+        if message
+            .parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::Poll(poll) if poll.answered))
+        {
+            self.polls.forget(&id);
+        }
         if let Some(old) = self.messages.get(&id) {
             if *old == message {
                 return;
@@ -565,6 +709,10 @@ impl Conversation {
         };
         self.order.remove(ix);
         self.messages.remove(id);
+        self.polls.forget(id);
+        if let Some(selecting) = self.selecting.as_mut() {
+            selecting.forget(id);
+        }
         if self
             .selection
             .as_ref()
@@ -579,6 +727,17 @@ impl Conversation {
         }
         if ix < self.order.len() {
             self.remeasure(ix);
+        }
+    }
+
+    /// Lays every message out again (the column changed: selecting messages); the scroll stays
+    /// where it is.
+    fn remeasure_all(&self) {
+        let top = self.list.logical_scroll_top();
+        let count = self.list.item_count();
+        self.list.splice(0..count, count);
+        if top.item_ix < count {
+            self.list.scroll_to(top);
         }
     }
 
@@ -694,6 +853,13 @@ impl Conversation {
         event: &PromptInputEvent,
         cx: &mut Context<Self>,
     ) {
+        // The word at the caret may ask for suggestions (part 5).
+        if matches!(
+            event,
+            PromptInputEvent::Changed | PromptInputEvent::SelectionChanged
+        ) {
+            self.update_suggestions(cx);
+        }
         match event {
             PromptInputEvent::Changed => {
                 let text = self.input.read(cx).text();
@@ -794,9 +960,9 @@ impl Conversation {
     }
 
     /// What is in the field now.
-    fn composed(&self, cx: &App) -> Composed {
+    fn composed(&mut self, cx: &mut Context<Self>) -> Composed {
         Composed {
-            text: self.input.read(cx).text(),
+            text: self.input.update(cx, |input, _| input.text_to_send()),
             files: self
                 .attachments
                 .iter()
@@ -812,18 +978,39 @@ impl Conversation {
     fn send(&mut self, _: &Send, _: &mut Window, cx: &mut Context<Self>) {
         // Editing: the message's new text goes out, and the field is back to a new message.
         if let Some(edit) = self.editing.clone() {
-            let text = self.input.read(cx).text();
+            let text = self.input.update(cx, |input, _| input.text_to_send());
             self.leave_editing(cx);
             self.emit(UiEvent::Edited((edit.message, text)), cx);
             return;
         }
+        self.send_composed(None, cx);
+    }
+
+    /// One of the field's other ways to send (part 5): as ↵, the option's id with it.
+    fn send_with(&mut self, action: &SendWith, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_none() {
+            self.send_composed(Some(action.option.clone()), cx);
+        }
+    }
+
+    /// The field goes out — `composed`, or `composed-with` the option — and is empty again.
+    fn send_composed(&mut self, option: Option<String>, cx: &mut Context<Self>) {
         let composed = self.composed(cx);
-        if composed.text.trim().is_empty() && composed.files.is_empty() {
+        // Messages to forward go with an empty field too (part 5).
+        if composed.text.trim().is_empty() && composed.files.is_empty() && self.forwarding.is_none()
+        {
             return;
         }
-        self.emit(UiEvent::Composed(composed), cx);
+        self.emit(
+            match option {
+                Some(option) => UiEvent::ComposedWith((option, composed)),
+                None => UiEvent::Composed(composed),
+            },
+            cx,
+        );
         self.attachments.clear();
         self.reply_to = None;
+        self.forwarding = None;
         self.draft_timer = None;
         self.plugin_draft = Some(String::new());
         self.input.update(cx, |input, cx| input.set_text("", cx));
@@ -844,11 +1031,10 @@ impl Conversation {
         }
     }
 
+    /// A link of a message (its text, its preview): a web one opens in the browser — unless the
+    /// plugin opens every link (`own-links`) —, any other goes to the plugin.
     fn click_link(&mut self, message: &str, link: &str, cx: &mut Context<Self>) {
-        let web = ["http://", "https://", "mailto:"]
-            .iter()
-            .any(|scheme| link.to_ascii_lowercase().starts_with(scheme));
-        if web {
+        if is_web_link(link) && !self.spec.own_links {
             crate::plugin_links::open_url(link, cx);
         } else {
             self.emit(
@@ -862,7 +1048,8 @@ impl Conversation {
     /// isn't there yet opens at once on what is there — its file, else its preview made as large
     /// as the picture and blurred — with a spinner, and the plugin downloads the full size
     /// (`part-clicked`): the viewer swaps to it when the message comes with it
-    /// ([`Self::update_viewer`]). A video's (`play`) goes to the plugin: it plays it.
+    /// ([`Self::update_viewer`]). A video's (`play`) goes to the plugin: it plays it, and so does
+    /// an advertisement's picture (part 5): it opens the sponsor's page.
     fn click_picture(
         &mut self,
         message: &str,
@@ -870,6 +1057,13 @@ impl Conversation {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .messages
+            .get(message)
+            .is_some_and(|message| message.sponsored.is_some())
+        {
+            return self.emit(UiEvent::PartClicked((message.to_string(), part as u32)), cx);
+        }
         let mut pictures = Vec::new();
         let mut clicked = None;
         let mut preview = None;
@@ -1058,11 +1252,13 @@ impl Conversation {
         // A selection in this message: Copy Text copies it, an action quotes it.
         let quote = self.selected_quote(&message);
         let selected = self.selected_text(&message);
+        // An advertisement's picture (part 5) isn't the user's to open or keep.
         let part = part
             .filter(|part| self.part_path(&message, *part).is_some())
             .or_else(|| {
                 (0..found.parts.len()).find(|part| self.part_path(&message, *part).is_some())
-            });
+            })
+            .filter(|_| found.sponsored.is_none());
         let actions: Vec<RowAction> = self
             .spec
             .message_actions
@@ -1070,6 +1266,7 @@ impl Conversation {
             .filter(|action| offers(found, action))
             .cloned()
             .collect();
+        let selectable = !self.spec.selection_actions.is_empty() && selecting::selectable(found);
         window.focus(&self.focus_handle);
         let menu = cx.new(|cx| {
             let mut menu = ContextMenu::new(window, cx);
@@ -1096,6 +1293,15 @@ impl Conversation {
                     selected,
                 },
             );
+            // Selecting messages (part 5), where the plugin has actions for them.
+            if selectable {
+                menu = menu.separator().entry(
+                    tr("Select"),
+                    SelectMessage {
+                        message: message.clone(),
+                    },
+                );
+            }
             if let Some(part) = part {
                 menu = menu
                     .separator()
@@ -1207,6 +1413,15 @@ impl Conversation {
             }
             None => self.emit(UiEvent::MessageAction((message, action)), cx),
         }
+    }
+
+    fn select_message(
+        &mut self,
+        action: &SelectMessage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_selecting(&action.message, window, cx);
     }
 
     fn copy_text(&mut self, action: &CopyText, _: &mut Window, cx: &mut Context<Self>) {
@@ -1342,6 +1557,8 @@ impl Conversation {
     fn clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
         if self.selection.take().is_some() {
             cx.notify();
+        } else if self.selecting.is_some() {
+            self.end_selecting(cx);
         } else {
             cx.propagate();
         }
@@ -1445,6 +1662,45 @@ impl Conversation {
                     .separator()
                     .entry(tr("Link…"), FormatLink)
             })
+        });
+        self.show_menu(menu, position, window, cx);
+    }
+
+    /// The Send button's menu (part 5): the field's other ways to send; none while it edits.
+    fn open_send_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The keyboard stays with the field, with a menu or without one.
+        window.focus(&self.input.focus_handle(cx));
+        let options = match &self.spec.composer {
+            Some(composer) if self.editing.is_none() && !composer.send_options.is_empty() => {
+                composer.send_options.clone()
+            }
+            _ => return,
+        };
+        let count = options.len();
+        let menu = cx.new(|cx| {
+            options
+                .iter()
+                .fold(ContextMenu::new(window, cx), |menu, option| {
+                    menu.entry(
+                        option.label.clone().unwrap_or_else(|| option.id.clone()),
+                        SendWith {
+                            option: option.id.clone(),
+                        },
+                    )
+                })
+        });
+        // Above Send, its right edge at the button's (part 5), as a button's menu; at the click
+        // before the button is drawn.
+        let position = self.send_bounds.get().map_or(position, |send| {
+            gpui::point(
+                send.right() - px(crate::context_menu::MENU_MIN_WIDTH),
+                send.top() - px(crate::popup::POPUP_GAP + ContextMenu::height_of(count)),
+            )
         });
         self.show_menu(menu, position, window, cx);
     }
@@ -1593,9 +1849,11 @@ impl Conversation {
         };
         let now = local_seconds(unix_now());
         let local = local_seconds(message.date);
-        let new_day = previous.is_none_or(|previous| {
-            local_seconds(previous.date).div_euclid(86_400) != local.div_euclid(86_400)
-        });
+        // An advertisement (part 5) follows the last post without a day's line of its own.
+        let new_day = message.sponsored.is_none()
+            && previous.is_none_or(|previous| {
+                local_seconds(previous.date).div_euclid(86_400) != local.div_euclid(86_400)
+            });
         let unread_line = self.unread_from.as_deref() == Some(id.as_str());
         let first_of_run = new_day || unread_line || previous.is_none_or(|p| !same_run(p, message));
         let last_of_run = next.is_none_or(|next| {
@@ -1611,9 +1869,15 @@ impl Conversation {
         if marked.is_some() {
             window.request_animation_frame();
         }
+        // Selecting (part 5): the circle at the row's left edge takes room from the column.
+        let selecting = self.selecting.is_some();
         let look = Look {
             ui,
-            column,
+            column: if selecting {
+                column - selecting::CHECK_SPACE
+            } else {
+                column
+            },
             first_of_run,
             last_of_run,
             marked,
@@ -1632,26 +1896,37 @@ impl Conversation {
             self.render_message(message, &codes, &look, &select, window, cx)
         };
         let sight = self.sight.clone();
+        let gap = if first_of_run { MESSAGE_GAP } else { RUN_GAP };
+        // While selecting, the gap above goes into the row (no line of a day or of new messages
+        // there): the tints of messages selected one after another make one band.
+        let gap_in_row = selecting && !new_day && !unread_line;
         div()
             .id(SharedString::from(format!("fg-item-{id}")))
             .w_full()
             .flex()
             .flex_col()
             .items_center()
-            .pt(px(if first_of_run { MESSAGE_GAP } else { RUN_GAP }))
+            .when(!gap_in_row, |item| item.pt(px(gap)))
             .when(ix + 1 == self.order.len(), |item| item.pb(px(MESSAGE_GAP)))
             .when(new_day, |item| item.child(day_divider(local, now, ui)))
             .when(unread_line, |item| item.child(unread_divider(column, ui)))
-            .child(
-                div()
-                    .w(px(column))
+            .child({
+                let body = div()
+                    .w(px(look.column))
                     .on_children_prepainted(move |children, _, _| {
                         if let Some(bounds) = children.first() {
                             sight.borrow_mut().drawn.push((ix, *bounds));
                         }
                     })
-                    .child(body),
-            )
+                    .child(body)
+                    .into_any_element();
+                if selecting {
+                    let top = if gap_in_row { gap } else { 0. };
+                    self.render_selectable_row(&id, column, top, body, ui, cx)
+                } else {
+                    body
+                }
+            })
             .into_any_element()
     }
 
@@ -1693,10 +1968,10 @@ impl Conversation {
         let mut content: Vec<AnyElement> = Vec::new();
         // The author's name on the first of a run, in a group.
         if !message.outgoing
-            && look.first_of_run
+            && (look.first_of_run || message.sponsored.is_some())
             && !sticker_only
             && let Some(author) = &message.author
-            && author.avatar.is_some()
+            && (author.avatar.is_some() || message.sponsored.is_some())
         {
             content.push(
                 div()
@@ -1705,6 +1980,30 @@ impl Conversation {
                     .text_color(theme::avatar_color(author.color))
                     .truncate()
                     .child(author.name.clone())
+                    .into_any_element(),
+            );
+        }
+        // The forum topic it belongs to (part 5): its name in its color, on a faint pill of it
+        // — readable on the accent bubble too.
+        if let Some(topic) = &message.topic
+            && !sticker_only
+        {
+            let color = theme::avatar_color(topic.color);
+            content.push(
+                div()
+                    .flex()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .px(px(6.))
+                            .rounded(px(ui::RADIUS_XS))
+                            .bg(UiColors::tint(color, 0.16))
+                            .text_size(px(theme::TEXT_SM))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(color)
+                            .truncate()
+                            .child(topic.title.clone()),
+                    )
                     .into_any_element(),
             );
         }
@@ -1802,11 +2101,12 @@ impl Conversation {
                         .into_any_element()
                 }
                 MessagePart::Notice(spans) => render_notice(spans, ui),
+                MessagePart::Poll(spec) => self.render_poll(&id, index, spec, ui, cx),
             };
             content.push(element);
         }
         if !message.reactions.is_empty() {
-            content.push(render_reactions(message, ui));
+            content.push(self.render_reaction_chips(message, ui, cx));
         }
         let meta = render_meta(message, sticker_only, ui);
         let tail = look.last_of_run;
@@ -1817,11 +2117,19 @@ impl Conversation {
                 px(BUBBLE_RADIUS)
             }
         };
+        let sponsor_color = message
+            .sponsored
+            .as_ref()
+            .and(message.author.as_ref())
+            .map(|author| theme::avatar_color(author.color));
         let (background, border) = if message.outgoing {
             (
                 UiColors::tint(ui.accent, 0.2),
                 UiColors::tint(ui.accent, 0.22),
             )
+        } else if let Some(color) = sponsor_color {
+            // An advertisement (part 5): tinted in the sponsor's color, as Telegram's apps do.
+            (UiColors::tint(color, 0.08), UiColors::tint(color, 0.3))
         } else {
             (
                 UiColors::tint(ui.foreground, 0.05),
@@ -1829,6 +2137,7 @@ impl Conversation {
             )
         };
         let (menu_id, select_id) = (id.clone(), id.clone());
+        let bubble_width = natural_width(message, inner, ui, window) + 2. * BUBBLE_PADDING_X + 2.;
         let bubble = if sticker_only {
             div()
                 .flex()
@@ -1841,9 +2150,7 @@ impl Conversation {
             div()
                 // A definite width — the content's own, up to the bubble's — so wrapped text is
                 // laid out at the width it is drawn at.
-                .w(px(natural_width(message, inner, ui, window)
-                    + 2. * BUBBLE_PADDING_X
-                    + 2.))
+                .w(px(bubble_width))
                 .min_w_0()
                 .px(px(BUBBLE_PADDING_X))
                 .pt(px(BUBBLE_PADDING_Y))
@@ -1882,7 +2189,25 @@ impl Conversation {
                 this.open_menu(menu_id.clone(), None, event.position, window, cx)
             }),
         );
-        let hover_bar = self.render_hover_bar(&id, ui, cx);
+        // The buttons under it (part 5), as wide as the bubble.
+        let bubble = if message.keyboard.is_empty() {
+            bubble.into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .when(message.outgoing, |column| column.items_end())
+                .child(bubble)
+                .child(self.render_keyboard(&id, &message.keyboard, bubble_width, ui, cx))
+                .into_any_element()
+        };
+        // Not while selecting messages (part 5): a click selects.
+        let hover_bar = self
+            .selecting
+            .is_none()
+            .then(|| self.render_hover_bar(&id, ui, cx))
+            .flatten();
         let row = div().w_full().flex().items_end().group("fg-message");
         if message.outgoing {
             row.justify_end()
@@ -1891,16 +2216,20 @@ impl Conversation {
                 .into_any_element()
         } else {
             let avatar = match author_avatar.flatten() {
+                // By the bubble's foot, over the buttons under it (part 5).
                 Some(avatar) if look.last_of_run => Some(
-                    render_avatar(
-                        &avatar,
-                        AVATAR_SIZE,
-                        &self.plugin,
-                        cx.entity_id(),
-                        window,
-                        cx,
-                    )
-                    .into_any_element(),
+                    div()
+                        .flex_none()
+                        .mb(px(keyboard::height(message.keyboard.len())))
+                        .child(render_avatar(
+                            &avatar,
+                            AVATAR_SIZE,
+                            &self.plugin,
+                            cx.entity_id(),
+                            window,
+                            cx,
+                        ))
+                        .into_any_element(),
                 ),
                 Some(_) => Some(div().flex_none().w(px(AVATAR_SIZE)).into_any_element()),
                 None => None,
@@ -1927,7 +2256,9 @@ impl Conversation {
             .iter()
             .filter(|action| action.icon.is_some() && offers(message, action))
             .collect();
-        if actions.is_empty() {
+        // The ☺ of the reactions the user may put (part 5), first.
+        let react = self.render_react_button(message, ui, cx);
+        if actions.is_empty() && react.is_none() {
             return None;
         }
         Some(
@@ -1940,6 +2271,7 @@ impl Conversation {
                 .group_hover("fg-message", |style| style.opacity(1.))
                 // A press here keeps the selection: the action quotes it.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(react)
                 .children(actions.into_iter().map(|action| {
                     let name = action.icon.clone().unwrap_or_default();
                     let glyph = plugin_icon(&self.plugin, &name, &ui);
@@ -2005,6 +2337,7 @@ impl Conversation {
         let open = self.open_spoilers.contains(&(message.to_string(), part));
         let (text, runs, links, spoilers) = rich_runs(spans, open, ui);
         let (index, runs) = select.text(&text, runs, Joint::Line, None);
+        let addresses = shown_addresses(&text, &links);
         let mut clickable: Vec<std::ops::Range<usize>> = Vec::new();
         let mut targets: Vec<Option<String>> = Vec::new();
         for (range, link) in links {
@@ -2048,6 +2381,11 @@ impl Conversation {
                         }
                     })
                     .ok();
+                })
+                // A text link's address, on hover (part 5): where it really goes.
+                .tooltip(move |index, _, cx| {
+                    let (_, url) = addresses.iter().find(|(range, _)| range.contains(&index))?;
+                    Some(crate::plugin_links::url_tooltip(url, cx))
                 }),
             )
             .into_any_element();
@@ -2278,11 +2616,36 @@ impl Conversation {
         let ui = Theme::ui(cx);
         let focused = self.input.focus_handle(cx).is_focused(window);
         let editing = self.editing.is_some();
-        // Over the field: the message being edited, or the quote being answered.
+        // Over the field: the message being edited, the quote being answered, or the messages to
+        // forward (part 5).
         let bar = match (&self.editing, &self.reply_to) {
+            (None, None) => self.forwarding.as_ref().map(|forward| {
+                field_bar(
+                    IconName::Forward,
+                    quote_block(forward, ui.accent_text, ui),
+                    ui::icon_button("fg-forward-cancel", IconName::Close, ui).on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.forwarding = None;
+                            this.emit(UiEvent::ForwardCancelled, cx);
+                            cx.notify();
+                        }),
+                    ),
+                    ui,
+                )
+            }),
             (Some(edit), _) => Some(field_bar(
                 IconName::Pencil,
-                quote_lines(tr("Editing").into(), &edit.text, ui.accent_text, ui),
+                quote_lines(
+                    tr("Editing").into(),
+                    // As the field shows it: the formatting's marks left out.
+                    &if self.formatting() {
+                        markup::shown(&edit.text)
+                    } else {
+                        edit.text.clone()
+                    },
+                    ui.accent_text,
+                    ui,
+                ),
                 ui::icon_button("fg-edit-cancel", IconName::Close, ui).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| {
                         this.leave_editing(cx);
@@ -2303,7 +2666,6 @@ impl Conversation {
                 )),
                 ui,
             )),
-            (None, None) => None,
         };
         // A picture file's chip shows its thumbnail, decoded off the window's thread.
         let thumbnail_side = (CHIP_THUMBNAIL * window.scale_factor()).ceil() as u32;
@@ -2367,6 +2729,25 @@ impl Conversation {
         // The ☺ button of the field's panel (part 4), with the panel while it is open.
         let panel_button = (!composer.panel.is_empty())
             .then(|| self.render_panel_button(&composer.panel, window, cx));
+        // The ⌨ of a bot's keyboard (part 5): shows and hides it.
+        let keyboard_button =
+            keyboard::reply_keyboard_shows(self.reply_keyboard.as_ref(), self.keyboard_open)
+                .1
+                .then(|| {
+                    ui::toggle_button("fg-keyboard", IconName::Keyboard, self.keyboard_open, ui)
+                        .tooltip(ui::tooltip(
+                            if self.keyboard_open {
+                                tr("Hide the Bot's Keyboard")
+                            } else {
+                                tr("Show the Bot's Keyboard")
+                            },
+                            None,
+                        ))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.keyboard_open = !this.keyboard_open;
+                            cx.notify();
+                        }))
+                });
         let actions = composer.actions.iter().map(|action| {
             let action_id = action.id.clone();
             let label = action.label.clone().unwrap_or_default();
@@ -2385,7 +2766,8 @@ impl Conversation {
                 .rounded(px(ui::RADIUS_SM))
                 .text_size(px(theme::TEXT_SM))
                 .hover(|style| style.bg(ui.hover))
-                .children(glyph.map(|glyph| glyph.render(ui.claude)))
+                // The neutral tone of the field's other buttons (part 5).
+                .children(glyph.map(|glyph| glyph.render(ui.text_muted)))
                 .child(label)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     let composed = this.composed(cx);
@@ -2445,6 +2827,21 @@ impl Conversation {
                         }))
                         .on_action(cx.listener(Self::format_link))
                         .on_action(cx.listener(Self::show_field_menu))
+                        // The suggestions' list (part 5) while it shows.
+                        .on_action(cx.listener(|this, _: &prompt_input::MenuNext, _, cx| {
+                            this.move_suggestion(1, cx)
+                        }))
+                        .on_action(cx.listener(|this, _: &prompt_input::MenuPrevious, _, cx| {
+                            this.move_suggestion(-1, cx)
+                        }))
+                        .on_action(
+                            cx.listener(|this, _: &prompt_input::MenuAccept, window, cx| {
+                                this.accept_suggestion(None, window, cx)
+                            }),
+                        )
+                        .on_action(cx.listener(|this, _: &prompt_input::MenuDismiss, _, cx| {
+                            this.dismiss_suggestions(cx)
+                        }))
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -2490,8 +2887,15 @@ impl Conversation {
                                         .child(self.input.clone()),
                                 )
                                 .children(actions)
+                                .children(keyboard_button)
                                 .children(panel_button)
-                                .child(
+                                .child({
+                                    let send_bounds = self.send_bounds.clone();
+                                    div()
+                                        .on_children_prepainted(move |children, _, _| {
+                                            send_bounds.set(children.first().copied())
+                                        })
+                                        .child(
                                     div()
                                         .id("fg-send")
                                         .flex_none()
@@ -2511,18 +2915,35 @@ impl Conversation {
                                             },
                                             ui.on_accent,
                                         ))
-                                        .tooltip(ui::tooltip(
-                                            if editing { tr("Save") } else { tr("Send") },
-                                            None,
-                                        ))
+                                        // Not over Send's own menu (part 5).
+                                        .when(self.menu.is_none(), |button| {
+                                            button.tooltip(ui::tooltip(
+                                                if editing { tr("Save") } else { tr("Send") },
+                                                None,
+                                            ))
+                                        })
                                         .on_click(cx.listener(
                                             |this, _: &ClickEvent, window, cx| {
                                                 this.send(&Send, window, cx)
                                             },
-                                        )),
-                                ),
+                                        ))
+                                        // The other ways to send (part 5), not the field's
+                                        // menu.
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(
+                                                |this, event: &MouseDownEvent, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.open_send_menu(event.position, window, cx)
+                                                },
+                                            ),
+                                        ),
+                                        )
+                                }),
                         ),
                 )
+                // The suggestions over the field (part 5).
+                .children(self.render_suggestions(window, cx))
                 // The panel over the feed (part 4): outside the field's keys — ↵ in its search
                 // isn't Send.
                 .children(self.render_panel(window, cx))
@@ -2614,11 +3035,22 @@ impl Render for Conversation {
         if std::mem::take(&mut self.take_keyboard) && window_active(window) {
             window.focus(&self.input.focus_handle(cx));
         }
-        let composer = self.render_composer(window, cx);
+        // A button in place of the field (part 5): "Join", "Mute", or a line where the user can't
+        // write; the selection's bar in place of any of them while selecting messages.
+        let composer = match self.spec.field_button.clone() {
+            _ if self.selecting.is_some() => Some(self.render_selection_bar(ui, cx)),
+            Some(button) => Some(self.render_field_button(&button, ui, cx)),
+            // Reading only: the plugin's line in its place ("You can't write in this chat").
+            None => self
+                .render_composer(window, cx)
+                .or_else(|| self.render_field_note(ui)),
+        };
         // What plays (part 4): the players of what was on screen in the last frame start, the
-        // others go; a voice message's bar under the window's header, over the feed.
+        // others go; the bar of what plays with sound under the window's header, over the feed.
         self.media.begin_frame(self.shown, window, cx);
-        let playing = self.media.render_playing_bar(window, cx);
+        let playing = self.render_playing_bar(cx);
+        // The pinned message's bar (part 5) over it.
+        let pinned = self.render_pinned_bar(window, cx);
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -2626,9 +3058,12 @@ impl Render for Conversation {
             .flex()
             .flex_col()
             .on_action(cx.listener(Self::choose_action))
+            .on_action(cx.listener(Self::send_with))
             .on_action(cx.listener(Self::copy_text))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::clear_selection))
+            .on_action(cx.listener(Self::select_message))
+            .on_action(cx.listener(Self::select_all_messages))
             // A press elsewhere (one on a message's text starts a new selection) clears it.
             .on_mouse_down(
                 MouseButton::Left,
@@ -2652,6 +3087,8 @@ impl Render for Conversation {
                     || keys.modifiers.control
                     || keys.modifiers.function
                     || this.spec.composer.is_none()
+                    || this.spec.field_button.is_some()
+                    || this.selecting.is_some()
                     || !this.focus_handle.is_focused(window)
                 {
                     return;
@@ -2665,9 +3102,19 @@ impl Render for Conversation {
             .on_action(cx.listener(Self::open_part))
             .on_action(cx.listener(Self::reveal_part))
             .on_action(cx.listener(Self::save_part_as))
+            .children(pinned)
             .children(playing)
             .child(feed)
+            // A bot's keyboard (part 5) between the feed and the field; not while selecting.
+            .children(
+                self.selecting
+                    .is_none()
+                    .then(|| self.render_reply_keyboard(ui, cx))
+                    .flatten(),
+            )
             .children(composer)
+            // The row of reactions over a message's ☺ (part 5).
+            .children(self.render_reactions_row(window, cx))
             .child(ContextMenu::slot(
                 "fg-message-menu",
                 self.menu.as_ref().map(|open| (&open.menu, open.position)),
@@ -2695,7 +3142,11 @@ fn natural_width(message: &Message, inner: f32, ui: UiColors, window: &mut Windo
             .fold(0., f32::max)
     };
     let mut width: f32 = 64.;
-    if let Some(author) = &message.author {
+    if let Some(author) = message
+        .author
+        .as_ref()
+        .filter(|author| author.avatar.is_some() || message.sponsored.is_some())
+    {
         let mut name = font(theme::UI_FONT);
         name.weight = FontWeight::SEMIBOLD;
         width = width.max(shaped_width(&author.name, name, theme::TEXT_SM, window));
@@ -2710,8 +3161,44 @@ fn natural_width(message: &Message, inner: f32, ui: UiColors, window: &mut Windo
     if message.reply.is_some() {
         width = width.max(180.);
     }
-    // The time, "edited" and the mark.
-    width = width.max(if message.edited { 100. } else { 56. });
+    // The time, "edited" and the mark; a post's views; an advertisement's label.
+    let mut foot: f32 = if message.edited { 100. } else { 56. };
+    if let Some(views) = message.views {
+        foot += 18. + regular(&short_count(views), 10.5, window);
+        if let Some(author) = message
+            .author
+            .as_ref()
+            .filter(|author| author.avatar.is_none())
+        {
+            foot += 8. + regular(&author.name, 10.5, window).min(180.);
+        }
+    }
+    if let Some(label) = &message.sponsored {
+        foot = 8. + regular(label, 10.5, window);
+    }
+    width = width.max(foot);
+    if let Some(topic) = &message.topic {
+        let mut medium = font(theme::UI_FONT);
+        medium.weight = FontWeight::MEDIUM;
+        width = width.max(shaped_width(&topic.title, medium, theme::TEXT_SM, window) + 12.);
+    }
+    if !message.keyboard.is_empty() {
+        let mut medium = font(theme::UI_FONT);
+        medium.weight = FontWeight::MEDIUM;
+        let texts: Vec<Vec<f32>> = message
+            .keyboard
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|button| {
+                        shaped_width(&button.text, medium.clone(), theme::TEXT_SM, window)
+                    })
+                    .collect()
+            })
+            .collect();
+        // The keyboard is as wide as the bubble: its width less the bubble's padding.
+        width = width.max(keyboard::needed_width(&texts) - 2. * BUBBLE_PADDING_X - 2.);
+    }
     width = width.max(message.reactions.len() as f32 * 52.);
     let mut pictures = 0;
     for part in &message.parts {
@@ -2744,6 +3231,7 @@ fn natural_width(message: &Message, inner: f32, ui: UiColors, window: &mut Windo
             }
             // ▶, a waveform worth looking at, the length.
             MessagePart::Voice(_) => inner.min(280.),
+            MessagePart::Poll(_) => inner.min(poll::WIDTH),
             MessagePart::Video(spec) => match spec.kind {
                 VideoKind::Round => media::ROUND_SIDE,
                 VideoKind::Video | VideoKind::Gif => {
@@ -3056,6 +3544,14 @@ fn field_bar(
 }
 
 /// A file the field shows as a picture (its chip has a thumbnail): PNG, JPEG, WebP, GIF.
+/// The field's styling: its Markdown as it is typed when the field has formatting (part 5).
+fn styling(spec: &ConversationSpec) -> Option<prompt_input::Styling> {
+    spec.composer
+        .as_ref()
+        .is_some_and(|composer| composer.formatting)
+        .then_some(markup::markup as prompt_input::Styling)
+}
+
 fn is_picture(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -3094,39 +3590,6 @@ fn render_notice(spans: &[RichSpan], ui: UiColors) -> AnyElement {
         .into_any_element()
 }
 
-fn render_reactions(message: &Message, ui: UiColors) -> AnyElement {
-    div()
-        .flex()
-        .flex_wrap()
-        .gap(px(4.))
-        .children(message.reactions.iter().map(|reaction| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .px(px(7.))
-                .py(px(1.))
-                .rounded(px(10.))
-                .text_size(px(theme::TEXT_SM))
-                .map(|pill| {
-                    if reaction.chosen {
-                        pill.bg(UiColors::tint(ui.accent, 0.25))
-                            .border_1()
-                            .border_color(UiColors::tint(ui.accent, 0.6))
-                            .text_color(ui.accent_text)
-                    } else {
-                        pill.bg(UiColors::tint(ui.foreground, 0.063))
-                            .border_1()
-                            .border_color(gpui::transparent_black())
-                            .text_color(ui.text_muted)
-                    }
-                })
-                .child(reaction.emoji.clone())
-                .child(reaction.count.to_string())
-        }))
-        .into_any_element()
-}
-
 /// The time, "edited" and the delivery mark at a bubble's foot (under a sticker, on a pill).
 fn render_meta(message: &Message, under_sticker: bool, ui: UiColors) -> AnyElement {
     let minutes = local_seconds(message.date).rem_euclid(86_400) / 60;
@@ -3149,10 +3612,27 @@ fn render_meta(message: &Message, under_sticker: bool, ui: UiColors) -> AnyEleme
                 .rounded(px(8.))
                 .bg(UiColors::tint(ui.shadow, 0.35))
                 .text_color(ui.text_muted)
-        })
-        .when(message.edited, |meta| meta.child(tr("edited")))
-        .child(clock)
-        .children(mark.map(|mark| mark.size(px(12.))));
+        });
+    // A channel's post signed by its author (part 5): the name, dim, before the views.
+    let signature = message
+        .views
+        .and(message.author.as_ref())
+        .filter(|author| author.avatar.is_none())
+        .map(|author| author.name.clone());
+    // An advertisement (part 5): its label in place of the time and the marks.
+    let meta = match &message.sponsored {
+        Some(label) => meta.child(label.clone()),
+        None => meta
+            .children(signature.map(|name| div().max_w(px(180.)).mr(px(4.)).truncate().child(name)))
+            // A channel's post (part 5): the eye and how many have seen it.
+            .when_some(message.views, |meta, views| {
+                meta.child(icon(IconName::Eye, ui.dim).size(px(12.)))
+                    .child(div().mr(px(4.)).child(short_count(views)))
+            })
+            .when(message.edited, |meta| meta.child(tr("edited")))
+            .child(clock)
+            .children(mark.map(|mark| mark.size(px(12.)))),
+    };
     // At the bubble's right; under an incoming sticker, at its left.
     div()
         .flex()
@@ -3165,6 +3645,23 @@ fn render_meta(message: &Message, under_sticker: bool, ui: UiColors) -> AnyEleme
         })
         .child(meta)
         .into_any_element()
+}
+
+/// A post's views as Telegram's apps write them: "950", "1.2K", "12K", "1.5M".
+fn short_count(count: u32) -> String {
+    let short = |value: f64, unit: &str| {
+        let text = if value < 10. {
+            format!("{:.1}", (value * 10.).floor() / 10.)
+        } else {
+            format!("{}", value.floor())
+        };
+        format!("{}{unit}", text.trim_end_matches(".0"))
+    };
+    match count {
+        0..1_000 => count.to_string(),
+        1_000..1_000_000 => short(f64::from(count) / 1e3, "K"),
+        _ => short(f64::from(count) / 1e6, "M"),
+    }
 }
 
 /// A day's line between days: "Today", "Yesterday", "17 November", with the year when not this
@@ -3252,6 +3749,49 @@ fn month_day(month: u32, day: u32) -> String {
         _ => "December {0}",
     };
     trf(template, &[&day])
+}
+
+/// `http`, `https` and `mailto`: the links Flux opens in the browser by itself.
+fn is_web_link(link: &str) -> bool {
+    ["http://", "https://", "mailto:"].iter().any(|scheme| {
+        link.get(..scheme.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    })
+}
+
+/// The web links of a text whose text isn't their address (text links): their ranges — a link's
+/// runs of different styles joined — and addresses, for the tooltip. "example.com" for
+/// `https://www.example.com/` is the address; "Read more" isn't.
+fn shown_addresses(
+    text: &str,
+    links: &[(std::ops::Range<usize>, String)],
+) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut joined: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for (range, link) in links {
+        match joined.last_mut() {
+            Some((last, last_link)) if last.end == range.start && last_link == link => {
+                last.end = range.end
+            }
+            _ => joined.push((range.clone(), link.clone())),
+        }
+    }
+    joined.retain(|(range, link)| {
+        is_web_link(link) && bare_address(&text[range.clone()]) != bare_address(link)
+    });
+    joined
+}
+
+/// An address as it is read: without the scheme, `www.` and a closing `/`, in lower case.
+fn bare_address(address: &str) -> String {
+    let mut address = address.trim().to_lowercase();
+    for scheme in ["https://", "http://", "mailto:"] {
+        if let Some(rest) = address.strip_prefix(scheme) {
+            address = rest.to_string();
+            break;
+        }
+    }
+    let address = address.strip_prefix("www.").unwrap_or(&address);
+    address.trim_end_matches('/').to_string()
 }
 
 /// The text runs of rich spans: the text, its runs, the highlights (matches), the links and the
@@ -3412,6 +3952,16 @@ enum Mark {
 }
 
 impl Mark {
+    fn kind(self) -> markup::Kind {
+        match self {
+            Mark::Bold => markup::Kind::Bold,
+            Mark::Italic => markup::Kind::Italic,
+            Mark::Strikethrough => markup::Kind::Strikethrough,
+            Mark::Spoiler => markup::Kind::Spoiler,
+            Mark::Monospace => markup::Kind::Code,
+        }
+    }
+
     fn marks(self) -> &'static str {
         match self {
             Mark::Bold => "**",
@@ -3432,64 +3982,197 @@ struct FieldEdit {
     selected: std::ops::Range<usize>,
 }
 
-/// `mark` put around the characters `selected` of `text` (the white space at their ends left
-/// outside), or taken away when they are between such marks already; with nothing selected, the
-/// marks around the caret. Monospace over several lines makes a block: ``` on lines of their own.
-/// What was selected stays selected, between the marks.
+/// `mark` on the characters `selected` of `text` as the field shows them (its marks hidden):
+/// taken off when all of it has it already — a span reaching past the selection keeps the rest —
+/// otherwise put on all of it, joining the spans of the mark it touches. The white space at the
+/// selection's ends stays outside (`**word **` isn't bold to Markdown). With nothing selected: an
+/// empty pair at the caret for what is typed next (the field drops it when the caret leaves), or
+/// the caret's empty pair taken away. Monospace over several lines makes a block, ``` on lines of
+/// their own; code holds no other marks. What was selected stays selected.
 fn format_marks(text: &str, selected: std::ops::Range<usize>, mark: Mark) -> FieldEdit {
     let chars: Vec<char> = text.chars().collect();
-    let (mut start, mut end) = (
-        selected.start.min(chars.len()),
-        selected.end.min(chars.len()),
-    );
-    // `**word **` isn't bold to Markdown: the marks hug the text.
-    if chars[start..end].iter().any(|c| !c.is_whitespace()) {
-        while chars[start].is_whitespace() {
-            start += 1;
-        }
-        while chars[end - 1].is_whitespace() {
-            end -= 1;
-        }
-    }
-    let inner: String = chars[start..end].iter().collect();
-    let length = end - start;
-    if mark == Mark::Monospace && inner.contains('\n') {
-        let before = if start > 0 && chars[start - 1] != '\n' {
-            "\n"
-        } else {
-            ""
-        };
-        let after = if end < chars.len() && chars[end] != '\n' {
-            "\n"
-        } else {
-            ""
-        };
-        let open = format!("{before}```\n");
-        let from = start + open.chars().count();
-        return FieldEdit {
-            range: start..end,
-            text: format!("{open}{inner}\n```{after}"),
-            selected: from..from + length,
-        };
-    }
-    let marks: Vec<char> = mark.marks().chars().collect();
-    let width = marks.len();
-    if start >= width
-        && end + width <= chars.len()
-        && chars[start - width..start] == marks[..]
-        && chars[end..end + width] == marks[..]
-    {
-        return FieldEdit {
-            range: start - width..end + width,
-            text: inner,
-            selected: start - width..end - width,
-        };
-    }
+    let n = chars.len();
+    let parsed = markup::parse(text);
+    let kind = mark.kind();
     let marks = mark.marks();
+    let mut hidden = vec![false; n];
+    for (_, span) in &parsed.spans {
+        for at in span.open.clone().chain(span.close.clone()) {
+            hidden[at] = true;
+        }
+    }
+    let (from, to) = (selected.start.min(n), selected.end.min(n));
+    // The shown characters selected, from the first not blank one to the last.
+    let shown: Vec<usize> = (from..to)
+        .filter(|&at| !hidden[at] && !chars[at].is_whitespace())
+        .collect();
+    let (Some(&start), Some(&last)) = (shown.first(), shown.last()) else {
+        let blank = parsed
+            .spans
+            .iter()
+            .find(|(of, span)| *of == kind && span.open.end == from && span.close.start == from);
+        if let Some((_, span)) = blank {
+            let at = span.open.start;
+            return FieldEdit {
+                range: at..span.close.end,
+                text: String::new(),
+                selected: at..at,
+            };
+        }
+        // In a span of the mark, what is typed next goes without it: the caret steps out at the
+        // span's ends; in the middle the span parts there (code isn't parted, the caret leaves).
+        let around = parsed
+            .spans
+            .iter()
+            .find(|(of, span)| *of == kind && span.open.end <= from && from <= span.close.start);
+        if let Some((_, span)) = around {
+            let caret = if from == span.open.end {
+                Some(span.open.start)
+            } else if from == span.close.start || kind == markup::Kind::Code {
+                Some(span.close.end)
+            } else {
+                None
+            };
+            if let Some(caret) = caret {
+                return FieldEdit {
+                    range: from..from,
+                    text: String::new(),
+                    selected: caret..caret,
+                };
+            }
+            let caret = from + marks.chars().count();
+            return FieldEdit {
+                range: from..from,
+                text: format!("{marks}{marks}"),
+                selected: caret..caret,
+            };
+        }
+        let caret = from + marks.chars().count();
+        return FieldEdit {
+            range: from..from,
+            text: format!("{marks}{marks}"),
+            selected: caret..caret,
+        };
+    };
+    let end = last + 1;
+    let is_shown = |at: usize| !hidden[at] && !chars[at].is_whitespace();
+    let touched: Vec<&prompt_input::Span> = parsed
+        .spans
+        .iter()
+        .filter(|(of, span)| {
+            *of == kind
+                && shown
+                    .iter()
+                    .any(|&at| span.open.end <= at && at < span.close.start)
+        })
+        .map(|(_, span)| span)
+        .collect();
+    // The characters that go, and what comes in before the selection and after it.
+    let mut cut = vec![false; n];
+    let cut_marks = |cut: &mut Vec<bool>, marks: std::ops::Range<usize>| {
+        marks.for_each(|at| cut[at] = true);
+    };
+    let mut before: Option<(usize, String)> = None;
+    let mut after: Option<(usize, String)> = None;
+    if shown.iter().all(|&at| kind.of(parsed.each[at])) {
+        // Taken off. A span's text left before the selection keeps its opening mark and is
+        // closed at the selection; the text after it, likewise.
+        for span in &touched {
+            if kind == markup::Kind::Code {
+                cut_marks(&mut cut, span.open.clone());
+                cut_marks(&mut cut, span.close.clone());
+                // A block's own line breaks go with its fences.
+                if span.open.len() >= 3 && chars.get(span.open.end) == Some(&'\n') {
+                    cut[span.open.end] = true;
+                }
+                if span.close.len() >= 3 && chars[..span.close.start].last() == Some(&'\n') {
+                    cut[span.close.start - 1] = true;
+                }
+                continue;
+            }
+            if (span.open.end..start).any(is_shown) {
+                before = Some((start, marks.to_string()));
+            } else {
+                cut_marks(&mut cut, span.open.clone());
+            }
+            if (end..span.close.start).any(is_shown) {
+                after = Some((end, marks.to_string()));
+            } else {
+                cut_marks(&mut cut, span.close.clone());
+            }
+        }
+    } else {
+        // Put on all of it: one span over the selection and the spans of the mark it touches.
+        let a = touched
+            .iter()
+            .map(|span| span.open.start)
+            .fold(start, usize::min);
+        let b = touched
+            .iter()
+            .map(|span| span.close.end)
+            .fold(end, usize::max);
+        for (of, span) in &parsed.spans {
+            // Code holds no other marks.
+            let inner = kind == markup::Kind::Code && a <= span.open.start && span.close.end <= b;
+            if inner || (*of == kind && touched.contains(&span)) {
+                cut_marks(&mut cut, span.open.clone());
+                cut_marks(&mut cut, span.close.clone());
+            }
+        }
+        let (open, close) = if kind == markup::Kind::Code && chars[start..end].contains(&'\n') {
+            let before = if a > 0 && chars[a - 1] != '\n' {
+                "\n"
+            } else {
+                ""
+            };
+            let after = if b < n && chars[b] != '\n' { "\n" } else { "" };
+            (format!("{before}```\n"), format!("\n```{after}"))
+        } else {
+            (marks.to_string(), marks.to_string())
+        };
+        before = Some((a, open));
+        after = Some((b, close));
+    }
+    // The stretch that changes, its new text, and where the selection lands in it.
+    let first_cut = cut.iter().position(|&gone| gone).unwrap_or(start);
+    let last_cut = cut.iter().rposition(|&gone| gone).map_or(end, |at| at + 1);
+    let lo = before
+        .as_ref()
+        .map_or(start, |(at, _)| *at)
+        .min(first_cut)
+        .min(start);
+    let hi = after
+        .as_ref()
+        .map_or(end, |(at, _)| *at)
+        .max(last_cut)
+        .max(end);
+    let mut out = String::new();
+    let mut position = lo;
+    let mut selected = start..end;
+    for at in lo..=hi {
+        if let Some((_, text)) = before.as_ref().filter(|(place, _)| *place == at) {
+            out.push_str(text);
+            position += text.chars().count();
+        }
+        if at == start {
+            selected.start = position;
+        }
+        if at == end {
+            selected.end = position;
+        }
+        if let Some((_, text)) = after.as_ref().filter(|(place, _)| *place == at) {
+            out.push_str(text);
+            position += text.chars().count();
+        }
+        if at < hi && !cut[at] {
+            out.push(chars[at]);
+            position += 1;
+        }
+    }
     FieldEdit {
-        range: start..end,
-        text: format!("{marks}{inner}{marks}"),
-        selected: start + width..end + width,
+        range: lo..hi,
+        text: out,
+        selected,
     }
 }
 
@@ -3670,7 +4353,7 @@ fn dirs_downloads() -> PathBuf {
 /// A picture's tiny preview (a JPEG of a few dozen pixels) made as large as the picture
 /// (`width` × `height`, at most [`PREVIEW_SIDE`] across; the preview's shape when unknown) and
 /// blurred, as a JPEG: what the viewer shows until the full size comes.
-fn blurred_preview(preview: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+pub(crate) fn blurred_preview(preview: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     use image::imageops::FilterType;
     let small = image::load_from_memory(preview).ok()?;
     let (width, height) = match (width, height) {
@@ -3732,6 +4415,17 @@ mod tests {
     }
 
     #[test]
+    fn views_read_as_short_counts() {
+        assert_eq!(short_count(0), "0");
+        assert_eq!(short_count(950), "950");
+        assert_eq!(short_count(1_000), "1K");
+        assert_eq!(short_count(1_249), "1.2K");
+        assert_eq!(short_count(12_345), "12K");
+        assert_eq!(short_count(999_999), "999K");
+        assert_eq!(short_count(1_500_000), "1.5M");
+    }
+
+    #[test]
     fn days_and_sizes_read_as_people_write_them() {
         assert_eq!(civil_date(0), (1970, 1, 1));
         assert_eq!(civil_date(20_774), (2026, 11, 17));
@@ -3769,6 +4463,29 @@ mod tests {
         assert_eq!(runs.len(), 3);
         assert_eq!(links, vec![(4..8, "https://example.com".to_string())]);
         assert_eq!(spoilers, vec![8..15]);
+    }
+
+    #[test]
+    fn text_links_show_their_address_and_addresses_do_not() {
+        let text = "Read more, example.com, Bold link, @anna";
+        let links = vec![
+            (0..9, "https://evil.example/".to_string()),
+            (11..22, "https://www.example.com/".to_string()),
+            (24..28, "https://site.org".to_string()),
+            (28..33, "https://site.org".to_string()),
+            (35..40, "fluxgram:mention/anna".to_string()),
+        ];
+        assert_eq!(
+            shown_addresses(text, &links),
+            vec![
+                (0..9, "https://evil.example/".to_string()),
+                (24..33, "https://site.org".to_string()),
+            ]
+        );
+        assert!(is_web_link("HTTPS://example.com"));
+        assert!(is_web_link("mailto:anna@example.com"));
+        assert!(!is_web_link("tg://resolve?domain=anna"));
+        assert!(!is_web_link("fluxgram:user/101"));
     }
 
     fn point(text: usize, byte: usize) -> claude_select::Point {
@@ -3817,10 +4534,47 @@ mod tests {
             format_marks("make it **bold**", 10..14, Mark::Bold),
             edit(8..16, "bold", 8..12)
         );
-        // At the caret, and around the words only.
+        // The field hides the marks: a bold word selected takes them with it.
+        assert_eq!(
+            format_marks("make it **bold**", 8..16, Mark::Bold),
+            edit(8..16, "bold", 8..12)
+        );
+        // A part of a span: the rest keeps the mark.
+        assert_eq!(
+            format_marks("**abcd**", 3..5, Mark::Bold),
+            edit(3..5, "**bc**", 5..7)
+        );
+        // Over a span and past it: one span.
+        assert_eq!(
+            format_marks("**ab**cd", 3..7, Mark::Bold),
+            edit(0..7, "**abc**", 3..5)
+        );
+        // At the caret, and around the words only; the caret's empty pair goes again.
         assert_eq!(
             format_marks("ab", 1..1, Mark::Italic),
             edit(1..1, "____", 3..3)
+        );
+        assert_eq!(
+            format_marks("x ****", 4..4, Mark::Bold),
+            edit(2..6, "", 2..2)
+        );
+        // In a bold word with nothing selected: out of it at its end, parted in its middle.
+        assert_eq!(
+            format_marks("**ab**", 4..4, Mark::Bold),
+            edit(4..4, "", 6..6)
+        );
+        assert_eq!(
+            format_marks("**ab**", 3..3, Mark::Bold),
+            edit(3..3, "****", 5..5)
+        );
+        // Code off: inline, and a block with its fences' line breaks.
+        assert_eq!(
+            format_marks("run `ls`", 4..8, Mark::Monospace),
+            edit(4..8, "ls", 4..6)
+        );
+        assert_eq!(
+            format_marks("```\na\n```", 0..9, Mark::Monospace),
+            edit(0..9, "a", 0..1)
         );
         assert_eq!(
             format_marks("a word ", 2..7, Mark::Strikethrough),

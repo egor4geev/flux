@@ -3,12 +3,19 @@
 //!
 //! - A voice message: ▶ / ⏸ in an accent circle (a ring of the download around it, × while it
 //!   downloads), the waveform from the message's data (the played part in the accent; a click or
-//!   a drag seeks, playing or not), where it is and its length, the speed (1× → 1.5× → 2×, kept
-//!   for the whole app); an accent dot while `unheard`. ▶ on one not downloaded asks the plugin
-//!   (`part-clicked`) and plays it when the message is put again with its file. While one plays:
-//!   a bar over the feed (who, ⏸, the speed, ×; a click reveals the message) and a line in the
-//!   status bar ([`crate::now_playing`]); at its end the next voice message below plays. Its first
-//!   play since it was put goes to the plugin as `media-played`.
+//!   a drag seeks, playing or not), where it is and its length; an accent dot while `unheard`.
+//!   ▶ on one not downloaded asks the plugin (`part-clicked`) and plays it when the message is
+//!   put again with its file. Its first play since it was put goes to the plugin as
+//!   `media-played`.
+//! - What plays with sound — a voice message or a round one clicked — has the bar over the feed
+//!   (part 5), the one place of its controls: ⏮ ⏸/▶ ⏭ (the voice and round messages of the feed
+//!   before and after it), who and what it is, where it is of its length and a thin line of
+//!   progress along the bar's bottom, the speed (1× → 1.5× → 2×) and the volume (a slider under
+//!   its icon) — both kept for the whole app ([`crate::now_playing`]) — and × that stops it; a
+//!   click on the text reveals the message. It stays while paused; at the end the next voice or
+//!   round message below plays, and the bar goes after the last one. The status bar's line
+//!   follows the same state. One conversation plays at a time: another one starting takes the
+//!   bar.
 //! - A GIF and a round message with `autoplay`: play by themselves, looped, without sound, while
 //!   on screen in the active window — [`MAX_VIDEOS`] at a time, the others show their poster. A
 //!   round one clicked plays with sound from the start, larger, with a ring of progress; a click
@@ -81,8 +88,13 @@ const VOICE_TICK_UNSEEN: Duration = Duration::from_secs(1);
 const CROWD: usize = 3;
 /// The shortest step of the frames' timer: a broken file's rate can't spin it.
 const MIN_TICK: Duration = Duration::from_millis(16);
-/// The playing bar over the feed.
-const BAR_HEIGHT: f32 = 34.;
+/// The playing bar over the feed, its buttons and its line of progress.
+const BAR_HEIGHT: f32 = 36.;
+const BAR_BUTTON: f32 = 26.;
+const BAR_LINE: f32 = 2.;
+/// The volume's slider under its icon.
+const VOLUME_WIDTH: f32 = 120.;
+const VOLUME_KNOB: f32 = 12.;
 
 /// What a media element asked for as it was drawn: what plays while it is on screen.
 #[derive(Clone, Debug, PartialEq)]
@@ -169,7 +181,7 @@ impl Video {
                 width,
                 height,
                 bgra,
-            } => match image::RgbaImage::from_raw(width, height, bgra.to_vec()) {
+            } => match image::RgbaImage::from_raw(width, height, bgra) {
                 Some(buffer) => {
                     Shown::Image(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
                 }
@@ -302,10 +314,16 @@ struct WaitingViewer {
     index: usize,
 }
 
-/// What plays now, for the status bar's line ([`crate::now_playing`]).
+/// What plays with sound now (or is paused): the bar's and the status bar's line
+/// ([`crate::now_playing`]).
 pub(crate) struct NowPlaying {
+    pub message: String,
+    pub part: usize,
     pub who: SharedString,
+    /// A round video message (else a voice message).
+    pub round: bool,
     pub position: Duration,
+    pub duration: Duration,
     pub playing: bool,
 }
 
@@ -344,6 +362,11 @@ pub(super) struct Media {
     ticker: Option<(Duration, Task<()>)>,
     /// The voice message's second shown last (the status bar's line).
     second: Option<u64>,
+    /// The volume's slider is open under its icon in the bar; the icon's and the slider's bounds
+    /// (the slider follows a drag).
+    volume_open: bool,
+    volume_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    volume_track: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl Media {
@@ -369,6 +392,9 @@ impl Media {
             _listen: None,
             ticker: None,
             second: None,
+            volume_open: false,
+            volume_anchor: Rc::default(),
+            volume_track: Rc::default(),
         }
     }
 
@@ -388,6 +414,17 @@ impl Media {
         self.voice
             .as_ref()
             .filter(|voice| voice.message == message && voice.part == part)
+    }
+
+    /// The conversation goes (its tab closed while something plays): the players stop, their
+    /// last frames leave the windows' atlases.
+    pub(super) fn release_all(&mut self, cx: &mut App) {
+        for (_, video) in self.videos.drain() {
+            video.release(cx);
+        }
+        for (_, playing) in self.animations.drain() {
+            playing.release(cx);
+        }
     }
 
     /// A frame begins (the conversation is drawn): whether it is in sight; the players of what
@@ -450,13 +487,14 @@ impl Media {
                 keep.insert(key, want);
             }
         }
-        // What isn't wanted any more goes (a video's decoder with it).
+        // What isn't wanted any more goes (a video's decoder with it) — not the round message
+        // with sound: it plays on out of sight (the bar's ⏭ may start one far up the feed).
         let gone: Vec<String> = self
             .videos
             .iter()
             .filter(|(key, video)| match keep.get(*key) {
                 Some(Want::Video { loud, .. }) => *loud != video.loud,
-                _ => true,
+                _ => !(video.loud && Some(*key) == loud_key.as_ref()),
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -504,7 +542,12 @@ impl Media {
             muted: !loud,
             looped: !loud,
         };
+        let (speed, volume) = (crate::now_playing::speed(cx), crate::now_playing::gain(cx));
         let opened = VideoPlayer::open(path, options).and_then(|player| {
+            if loud {
+                player.set_speed(speed);
+                player.set_volume(volume);
+            }
             player.play()?;
             Ok(player)
         });
@@ -645,7 +688,6 @@ impl Media {
         let downloaded = self.allowed(spec.path.as_deref(), cx).is_some();
         let downloading = !downloaded && spec.progress.is_some();
         let failed = self.failed.get(&(message.to_string(), part)).cloned();
-        let speed = crate::now_playing::speed(cx);
 
         let glyph = if downloading {
             icon(IconName::Close, ui.on_accent)
@@ -756,7 +798,6 @@ impl Media {
             (Some(position), None) => format!("{} / {}", clock(position), clock(duration)),
             (None, None) => clock(length),
         };
-        let speed_message = message.to_string();
         let details = div()
             .flex()
             .items_center()
@@ -769,22 +810,6 @@ impl Media {
                 ui.text_muted
             })
             .child(div().whitespace_nowrap().child(time))
-            .when(current.is_some(), |details| {
-                details.child(
-                    speed_pill(
-                        SharedString::from(format!("fg-voice-speed-{message}-{part}")),
-                        speed,
-                        ui,
-                    )
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(
-                        move |this, _: &ClickEvent, _, cx| {
-                            let _ = &speed_message;
-                            this.cycle_speed(cx)
-                        },
-                    )),
-                )
-            })
             .when(spec.unheard, |details| {
                 details.child(div().size(px(6.)).rounded_full().bg(ui.accent))
             });
@@ -1136,121 +1161,6 @@ impl Media {
         .absolute()
         .inset_0()
     }
-
-    /// The bar over the feed while a voice message (or a round one with sound) of this
-    /// conversation plays; none — nothing plays.
-    pub(super) fn render_playing_bar(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Conversation>,
-    ) -> Option<AnyElement> {
-        let _ = window;
-        let voice = self.voice.as_ref()?;
-        let ui = Theme::ui(cx);
-        let playing = voice.player.state() == Playback::Playing;
-        let (position, duration) = (voice.player.position(), voice.player.duration());
-        let fraction = (position.as_secs_f32() / duration.as_secs_f32().max(0.001)).clamp(0., 1.);
-        let speed = crate::now_playing::speed(cx);
-        let message = voice.message.clone();
-        let toggle = div()
-            .id("fg-playing-toggle")
-            .flex_none()
-            .size(px(24.))
-            .rounded(px(crate::ui::RADIUS_SM))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .hover(|style| style.bg(ui.hover))
-            .child(match playing {
-                true => pause_glyph(12., ui.accent_text).into_any_element(),
-                false => play_glyph(24., ui.accent_text),
-            })
-            .tooltip(crate::ui::tooltip(
-                if playing { tr("Pause") } else { tr("Play") },
-                None,
-            ))
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                cx.stop_propagation();
-                this.toggle_now_playing(cx)
-            }));
-        let line = div()
-            .flex_1()
-            .min_w(px(40.))
-            .h(px(3.))
-            .rounded(px(1.5))
-            .bg(ui.divider)
-            .child(
-                div()
-                    .h_full()
-                    .rounded(px(1.5))
-                    .bg(ui.accent)
-                    .w(relative(fraction)),
-            );
-        Some(
-            div()
-                .id("fg-playing")
-                .flex_none()
-                .h(px(BAR_HEIGHT))
-                .px(px(12.))
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .border_b_1()
-                .border_color(ui.divider)
-                .text_size(px(theme::TEXT_SM))
-                .cursor_pointer()
-                .child(toggle)
-                .child(
-                    div()
-                        .flex_none()
-                        .max_w(px(220.))
-                        .truncate()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(ui.foreground)
-                        .child(voice.who.clone()),
-                )
-                // In a one-to-one chat the message has no author: its name is the kind already.
-                .when(voice.who.as_ref() != tr("Voice message"), |bar| {
-                    bar.child(
-                        div()
-                            .flex_none()
-                            .text_color(ui.text_muted)
-                            .child(tr("Voice message")),
-                    )
-                })
-                .child(line)
-                .child(
-                    div()
-                        .flex_none()
-                        .whitespace_nowrap()
-                        .text_color(ui.text_muted)
-                        .child(format!("{} / {}", clock(position), clock(duration))),
-                )
-                .child(
-                    speed_pill("fg-playing-speed", speed, ui).on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.cycle_speed(cx)
-                        },
-                    )),
-                )
-                .child(
-                    crate::ui::icon_button("fg-playing-stop", IconName::Close, ui)
-                        .tooltip(crate::ui::tooltip(tr("Stop"), None))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.stop_voice(cx)
-                        })),
-                )
-                // A click on the bar shows the message.
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.reveal(&message);
-                    cx.notify();
-                }))
-                .into_any_element(),
-        )
-    }
 }
 
 impl Conversation {
@@ -1316,6 +1226,7 @@ impl Conversation {
             }
         };
         player.set_speed(crate::now_playing::speed(cx));
+        player.set_volume(crate::now_playing::gain(cx));
         let changes = self.media.listen(cx);
         player.on_change(move || {
             changes.unbounded_send(()).ok();
@@ -1337,16 +1248,22 @@ impl Conversation {
         self.media_changed(cx);
     }
 
-    /// The voice message's author, as the bar and the status line name it.
+    /// The author of what plays, as the bar and the status line name it: in a one-to-one chat
+    /// (no author on the message) the chat's name.
     fn who(&self, message: &str) -> SharedString {
+        let unnamed = || {
+            self.title
+                .clone()
+                .unwrap_or_else(|| tr("Voice message").into())
+        };
         match self.messages.get(message) {
             Some(found) if found.outgoing => tr("You").into(),
             Some(found) => found
                 .author
                 .as_ref()
                 .map(|author| SharedString::from(author.name.clone()))
-                .unwrap_or_else(|| tr("Voice message").into()),
-            None => tr("Voice message").into(),
+                .unwrap_or_else(unnamed),
+            None => unnamed(),
         }
     }
 
@@ -1390,54 +1307,114 @@ impl Conversation {
         }
     }
 
-    /// The speed button: 1× → 1.5× → 2× → 1×, for every voice message from now on.
+    /// The bar's speed: 1× → 1.5× → 2× → 1×, for every voice and round message from now on.
     fn cycle_speed(&mut self, cx: &mut Context<Self>) {
-        let speed = crate::now_playing::speed(cx);
-        let next = SPEEDS
-            .iter()
-            .position(|known| (known - speed).abs() < 0.01)
-            .map_or(SPEEDS[0], |at| SPEEDS[(at + 1) % SPEEDS.len()]);
+        let next = next_speed(crate::now_playing::speed(cx));
         crate::now_playing::set_speed(next, cx);
         if let Some(voice) = &self.media.voice {
             voice.player.set_speed(next);
         }
+        if let Some(video) = self.loud_video() {
+            video.player.set_speed(next);
+        }
         cx.notify();
     }
 
-    /// × of the playing bar: the voice message stops, the bar and the status line go.
-    fn stop_voice(&mut self, cx: &mut Context<Self>) {
+    /// The bar's volume slider: 0.0–1.0, for every voice and round message from now on.
+    fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        crate::now_playing::set_volume(volume, cx);
+        let gain = crate::now_playing::gain(cx);
+        if let Some(voice) = &self.media.voice {
+            voice.player.set_volume(gain);
+        }
+        if let Some(video) = self.loud_video() {
+            video.player.set_volume(gain);
+        }
+        cx.notify();
+    }
+
+    /// The round message playing with sound: its player.
+    fn loud_video(&self) -> Option<&Video> {
+        let (message, part) = self.media.loud.as_ref()?;
+        self.media.videos.get(&format!("{message}/{part}"))
+    }
+
+    /// × of the bar (or another conversation took the sound): the voice message stops, the round
+    /// one goes back to its small loop, the bar and the status line go.
+    pub(crate) fn stop_sound(&mut self, cx: &mut Context<Self>) {
         self.media.voice = None;
+        self.media.wanted = None;
+        self.media.volume_open = false;
+        self.quiet_round(cx);
         crate::now_playing::clear(cx.entity_id(), cx);
         self.media_changed(cx);
     }
 
-    /// The voice message after `message`'s `part` in the feed plays — downloaded, or asked for.
-    fn play_next_voice(&mut self, message: &str, part: usize, cx: &mut Context<Self>) {
-        let Some(start) = self.position(message) else {
+    /// The voice and round messages of the feed, top to bottom: what ⏮ ⏭ and the end of one go
+    /// through.
+    fn sound_parts(&self) -> Vec<(String, usize)> {
+        let mut parts = Vec::new();
+        for id in &self.order {
+            for (index, part) in self.messages[id].parts.iter().enumerate() {
+                let sound = match part {
+                    MessagePart::Voice(_) => true,
+                    MessagePart::Video(spec) => spec.kind == VideoKind::Round,
+                    _ => false,
+                };
+                if sound {
+                    parts.push((id.clone(), index));
+                }
+            }
+        }
+        parts
+    }
+
+    /// ⏮ / ⏭ of the bar: the voice or round message before or after the one that plays.
+    fn skip_sound(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(now) = self.now_playing() else {
             return;
         };
-        let next = self.order[start..]
-            .iter()
-            .enumerate()
-            .find_map(|(offset, id)| {
-                self.messages[id]
-                    .parts
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| offset > 0 || *index > part)
-                    .find_map(|(index, found)| match found {
-                        MessagePart::Voice(spec) => Some((id.clone(), index, spec.path.clone())),
-                        _ => None,
-                    })
-            });
-        let Some((next, index, path)) = next else {
+        let parts = self.sound_parts();
+        if let Some((message, part)) = step_in(&parts, (&now.message, now.part), forward) {
+            let (message, part) = (message.clone(), *part);
+            self.play_sound_at(&message, part, cx);
+        }
+    }
+
+    /// At the end of `message`'s `part`: the voice or round message below it plays.
+    fn play_next(&mut self, message: &str, part: usize, cx: &mut Context<Self>) {
+        let parts = self.sound_parts();
+        if let Some((next, index)) = step_in(&parts, (message, part), true) {
+            let (next, index) = (next.clone(), *index);
+            self.play_sound_at(&next, index, cx);
+        }
+    }
+
+    /// A voice or round message plays from its start — downloaded, or asked for (it plays when
+    /// its message is put again with the file).
+    fn play_sound_at(&mut self, message: &str, part: usize, cx: &mut Context<Self>) {
+        let Some(found) = self
+            .messages
+            .get(message)
+            .and_then(|found| found.parts.get(part))
+            .cloned()
+        else {
             return;
         };
-        match self.media.allowed(path.as_deref(), cx) {
-            Some(path) => self.start_voice(&next, index, &path, None, true, cx),
-            None => {
-                self.media.wanted = Some((next.clone(), index));
-                self.emit(UiEvent::PartClicked((next, index as u32)), cx);
+        let path = match &found {
+            MessagePart::Voice(spec) => spec.path.clone(),
+            MessagePart::Video(spec) => spec.path.clone(),
+            _ => return,
+        };
+        match (self.media.allowed(path.as_deref(), cx), found) {
+            (Some(path), MessagePart::Voice(_)) => {
+                self.start_voice(message, part, &path, None, true, cx)
+            }
+            (Some(_), _) => self.play_round(message, part, cx),
+            (None, _) => {
+                self.media.wanted = Some((message.to_string(), part));
+                self.emit(UiEvent::PartClicked((message.to_string(), part as u32)), cx);
+                cx.notify();
             }
         }
     }
@@ -1512,12 +1489,10 @@ impl Conversation {
         self.play_round(message, part, cx);
     }
 
-    /// A round message plays with sound from its start, larger.
+    /// A round message plays with sound from its start, larger; the bar is its.
     fn play_round(&mut self, message: &str, part: usize, cx: &mut Context<Self>) {
-        // The voice message pauses (one sound at a time — the player's sound would too).
-        if let Some(voice) = &self.media.voice {
-            voice.player.pause();
-        }
+        // The voice message stops: one sound at a time, one in the bar.
+        self.media.voice = None;
         self.quiet_round(cx);
         self.media.wanted = None;
         let key = format!("{message}/{part}");
@@ -1539,6 +1514,7 @@ impl Conversation {
         if let Some(path) = path {
             self.media.open_video(&key, &path, true, cx);
         }
+        crate::now_playing::set(cx.entity().downgrade(), cx);
         let pair = (message.to_string(), part);
         if self.media.played.insert(pair.clone()) {
             self.emit(UiEvent::MediaPlayed((pair.0, pair.1 as u32)), cx);
@@ -1699,8 +1675,7 @@ impl Conversation {
         {
             let (message, part) = (voice.message.clone(), voice.part);
             self.media.voice = None;
-            crate::now_playing::clear(cx.entity_id(), cx);
-            self.play_next_voice(&message, part, cx);
+            self.play_next(&message, part, cx);
         }
         if let Some((message, part)) = self.media.loud.clone()
             && let Some(video) = self.media.videos.get(&format!("{message}/{part}"))
@@ -1714,6 +1689,15 @@ impl Conversation {
             if state == Playback::Ended || taken {
                 self.quiet_round(cx);
             }
+            if state == Playback::Ended {
+                self.play_next(&message, part, cx);
+            }
+        }
+        // Nothing left to play with sound (the last one ended, × or another sound): the bar
+        // and the status line go.
+        if self.media.voice.is_none() && self.media.loud.is_none() {
+            self.media.volume_open = false;
+            crate::now_playing::clear(cx.entity_id(), cx);
         }
         // A video that failed while playing: its poster and a word on it instead.
         let failed: Vec<(String, String)> = self
@@ -1802,18 +1786,56 @@ impl Conversation {
 
     // --- What plays, for the status bar ---
 
-    /// The voice message playing or paused here: who, where.
+    /// What plays here with sound, or is paused: the round message with sound, else the voice
+    /// message.
     pub(crate) fn now_playing(&self) -> Option<NowPlaying> {
+        if let Some((message, part)) = &self.media.loud {
+            let video = self.loud_video();
+            let length = match self.messages.get(message).and_then(|m| m.parts.get(*part)) {
+                Some(MessagePart::Video(spec)) => Duration::from_secs(spec.duration.into()),
+                _ => Duration::ZERO,
+            };
+            return Some(NowPlaying {
+                message: message.clone(),
+                part: *part,
+                who: self.who(message),
+                round: true,
+                position: video.map_or(Duration::ZERO, |video| video.player.position()),
+                duration: video
+                    .map(|video| video.player.duration())
+                    .filter(|duration| !duration.is_zero())
+                    .unwrap_or(length),
+                // Opening (no player yet) counts as playing: it starts at once.
+                playing: video.is_none_or(|video| video.player.state() == Playback::Playing),
+            });
+        }
         let voice = self.media.voice.as_ref()?;
         Some(NowPlaying {
+            message: voice.message.clone(),
+            part: voice.part,
             who: voice.who.clone(),
+            round: false,
             position: voice.player.position(),
+            duration: voice.player.duration(),
             playing: voice.player.state() == Playback::Playing,
         })
     }
 
     /// ⏸ / ▶ of the bar and of the status bar's line.
     pub(crate) fn toggle_now_playing(&mut self, cx: &mut Context<Self>) {
+        if let Some(video) = self.loud_video() {
+            match video.player.state() {
+                Playback::Playing => {
+                    video.player.pause();
+                    self.media.loud_paused = true;
+                }
+                _ => {
+                    video.player.play().ok();
+                    self.media.loud_paused = false;
+                }
+            }
+            return self.media_changed(cx);
+        }
         let Some(voice) = &self.media.voice else {
             return;
         };
@@ -1823,6 +1845,329 @@ impl Conversation {
         }
         self.media_changed(cx);
     }
+
+    /// The bar over the feed while a voice message or a round one with sound plays here (or is
+    /// paused); none — nothing does.
+    pub(super) fn render_playing_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let now = self.now_playing()?;
+        let ui = Theme::ui(cx);
+        let fraction =
+            (now.position.as_secs_f32() / now.duration.as_secs_f32().max(0.001)).clamp(0., 1.);
+        let speed = crate::now_playing::speed(cx);
+        let volume = crate::now_playing::volume(cx);
+        let parts = self.sound_parts();
+        let at = (now.message.as_str(), now.part);
+        let (before, after) = (
+            step_in(&parts, at, false).is_some(),
+            step_in(&parts, at, true).is_some(),
+        );
+        let skip = |id: &'static str, glyph: IconName, enabled: bool, forward: bool| {
+            let tip = if forward {
+                tr("Play Next")
+            } else {
+                tr("Play Previous")
+            };
+            div()
+                .id(id)
+                .flex_none()
+                .size(px(BAR_BUTTON))
+                .rounded(px(crate::ui::RADIUS_SM))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(glyph, ui.text_muted).size(px(13.)))
+                .when(!enabled, |button| button.opacity(0.35))
+                .when(enabled, |button| {
+                    button
+                        .cursor_pointer()
+                        .hover(|style| style.bg(ui.hover))
+                        .tooltip(crate::ui::tooltip(tip, None))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.skip_sound(forward, cx)
+                        }))
+                })
+        };
+        let toggle = div()
+            .id("fg-playing-toggle")
+            .flex_none()
+            .size(px(BAR_BUTTON))
+            .rounded(px(crate::ui::RADIUS_SM))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(ui.hover))
+            .child(match now.playing {
+                true => pause_glyph(12., ui.accent_text).into_any_element(),
+                false => play_glyph(26., ui.accent_text),
+            })
+            .tooltip(crate::ui::tooltip(
+                if now.playing { tr("Pause") } else { tr("Play") },
+                None,
+            ))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.toggle_now_playing(cx)
+            }));
+        let kind = match now.round {
+            true => tr("video message"),
+            false => tr("voice message"),
+        };
+        let reveal = now.message.clone();
+        let title = div()
+            .id("fg-playing-title")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(220.))
+                    .truncate()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(ui.foreground)
+                    .child(now.who.clone()),
+            )
+            // Without a name (no header): the kind is the name already.
+            .when(now.who.as_ref() != tr("Voice message"), |title| {
+                title
+                    .child(div().flex_none().text_color(ui.text_muted).child("·"))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(ui.text_muted)
+                            .child(kind),
+                    )
+            })
+            // A click on the text shows the message.
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.reveal(&reveal);
+                cx.notify();
+            }));
+        let anchor = self.media.volume_anchor.clone();
+        let volume_button = div()
+            .relative()
+            .flex_none()
+            .child(
+                crate::ui::icon_button(
+                    "fg-playing-volume",
+                    match volume <= 0. {
+                        true => IconName::VolumeOff,
+                        false => IconName::Volume,
+                    },
+                    ui,
+                )
+                .when(!self.media.volume_open, |button| {
+                    button.tooltip(crate::ui::tooltip(tr("Volume"), None))
+                })
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.media.volume_open = !this.media.volume_open;
+                    cx.notify();
+                })),
+            )
+            .child(
+                canvas(
+                    move |bounds, _, _| anchor.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            );
+        let progress = div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .h(px(BAR_LINE))
+            .child(div().h_full().bg(ui.accent).w(relative(fraction)));
+        Some(
+            div()
+                .id("fg-playing")
+                .relative()
+                .flex_none()
+                .h(px(BAR_HEIGHT))
+                .pl(px(8.))
+                .pr(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .border_b_1()
+                .border_color(ui.divider)
+                .text_size(px(theme::TEXT_SM))
+                .child(skip("fg-playing-back", IconName::SkipBack, before, false))
+                .child(toggle)
+                .child(skip("fg-playing-next", IconName::SkipForward, after, true))
+                .child(div().w(px(6.)))
+                .child(title)
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(6.))
+                        .whitespace_nowrap()
+                        .text_color(ui.text_muted)
+                        .child(format!("{} / {}", clock(now.position), clock(now.duration))),
+                )
+                .child(
+                    speed_pill("fg-playing-speed", speed, ui)
+                        .tooltip(crate::ui::tooltip(tr("Speed"), None))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.cycle_speed(cx)
+                        })),
+                )
+                .child(volume_button)
+                .child(
+                    crate::ui::icon_button("fg-playing-stop", IconName::Close, ui)
+                        .tooltip(crate::ui::tooltip(tr("Stop"), None))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.stop_sound(cx)
+                        })),
+                )
+                .child(progress)
+                .children(self.render_volume(volume, cx))
+                .into_any_element(),
+        )
+    }
+
+    /// The volume's slider under its icon in the bar, while open: a click or a drag along it sets
+    /// the volume; a click elsewhere closes it.
+    fn render_volume(&self, volume: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.media.volume_open {
+            return None;
+        }
+        let anchor = self.media.volume_anchor.get()?;
+        let ui = Theme::ui(cx);
+        let track = self.media.volume_track.clone();
+        let (down_track, move_track) = (track.clone(), track.clone());
+        let (accent, rail, knob_border) = (ui.accent, ui.divider, ui.elevated_border);
+        let slider = div()
+            .id("fg-volume-slider")
+            .w(px(VOLUME_WIDTH))
+            .h(px(VOLUME_KNOB + 8.))
+            .cursor_pointer()
+            .child(
+                canvas(
+                    move |bounds, _, _| track.set(Some(bounds)),
+                    move |bounds, _, window, _| {
+                        // The rail inset by half the knob: the knob's middle is the value.
+                        let half = px(VOLUME_KNOB / 2.);
+                        let left = bounds.origin.x + half;
+                        let width = bounds.size.width - half * 2.;
+                        let middle = bounds.origin.y + bounds.size.height / 2.;
+                        let rail_bounds =
+                            Bounds::new(point(left, middle - px(2.)), size(width, px(4.)));
+                        window.paint_quad(fill(rail_bounds, rail).corner_radii(px(2.)));
+                        let done =
+                            Bounds::new(point(left, middle - px(2.)), size(width * volume, px(4.)));
+                        window.paint_quad(fill(done, accent).corner_radii(px(2.)));
+                        let knob = Bounds::new(
+                            point(left + width * volume - half, middle - half),
+                            size(half * 2., half * 2.),
+                        );
+                        window.paint_quad(
+                            fill(knob, gpui::white())
+                                .corner_radii(half)
+                                .border_widths(px(1.))
+                                .border_color(knob_border),
+                        );
+                    },
+                )
+                .size_full(),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(at) = knob_at(down_track.get(), event.position.x) {
+                        this.set_volume(at, cx);
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                if event.pressed_button == Some(MouseButton::Left)
+                    && let Some(at) = knob_at(move_track.get(), event.position.x)
+                {
+                    this.set_volume(at, cx);
+                }
+            }));
+        let panel = crate::popup::panel(ui)
+            .px(px(10.))
+            .py(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                // The icon's own click toggles it.
+                if !anchor.contains(&event.position) {
+                    this.media.volume_open = false;
+                    cx.notify();
+                }
+            }))
+            .child(slider)
+            .child(
+                div()
+                    .w(px(30.))
+                    .text_size(px(theme::TEXT_XS))
+                    .text_color(ui.text_muted)
+                    .child(format!("{}%", (volume * 100.).round() as u32)),
+            );
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(gpui::Corner::TopRight)
+                    .position(point(
+                        anchor.right(),
+                        anchor.bottom() + px(crate::popup::POPUP_GAP),
+                    ))
+                    .snap_to_window_with_margin(px(crate::popup::WINDOW_MARGIN))
+                    .child(div().occlude().child(panel)),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+}
+
+/// The speed after `speed`: 1× → 1.5× → 2× → 1× (one not among them → 1×).
+fn next_speed(speed: f32) -> f32 {
+    SPEEDS
+        .iter()
+        .position(|known| (known - speed).abs() < 0.01)
+        .map_or(SPEEDS[0], |at| SPEEDS[(at + 1) % SPEEDS.len()])
+}
+
+/// The part before or after `at` among `parts` (the feed's voice and round messages, top to
+/// bottom); none — `at` is the first or the last, or not there.
+fn step_in<'a>(
+    parts: &'a [(String, usize)],
+    at: (&str, usize),
+    forward: bool,
+) -> Option<&'a (String, usize)> {
+    let index = parts
+        .iter()
+        .position(|(message, part)| message == at.0 && *part == at.1)?;
+    match forward {
+        true => parts.get(index + 1),
+        false => index.checked_sub(1).and_then(|before| parts.get(before)),
+    }
+}
+
+/// Where a click at `x` falls on the volume's slider: its knob's middle, a share of the rail.
+fn knob_at(bounds: Option<Bounds<Pixels>>, x: Pixels) -> Option<f32> {
+    let bounds = bounds?;
+    let half = px(VOLUME_KNOB / 2.);
+    let width = f32::from(bounds.size.width - half * 2.);
+    (width > 0.).then(|| (f32::from(x - bounds.origin.x - half) / width).clamp(0., 1.))
 }
 
 /// Where a click at `x` falls on a waveform: a share of its width.
@@ -2011,6 +2356,50 @@ mod tests {
         assert_eq!(resample(&[5, 10], 4), vec![5, 5, 10, 10]);
         // Out of range values are clamped.
         assert_eq!(resample(&[40], 1), vec![31]);
+    }
+
+    #[test]
+    fn the_speed_goes_round() {
+        assert_eq!(next_speed(1.), 1.5);
+        assert_eq!(next_speed(1.5), 2.);
+        assert_eq!(next_speed(2.), 1.);
+        // Not one of them (a newer app's setting): back to 1×.
+        assert_eq!(next_speed(1.25), 1.);
+    }
+
+    #[test]
+    fn previous_and_next_go_through_the_feeds_sounds() {
+        let parts: Vec<(String, usize)> = vec![
+            ("m1".into(), 0),
+            ("m2".into(), 0),
+            ("m2".into(), 2),
+            ("m5".into(), 0),
+        ];
+        let at = |forward| step_in(&parts, ("m2", 0), forward).cloned();
+        assert_eq!(at(true), Some(("m2".into(), 2)));
+        assert_eq!(at(false), Some(("m1".into(), 0)));
+        // The first has none before it, the last none after it.
+        assert_eq!(step_in(&parts, ("m1", 0), false), None);
+        assert_eq!(step_in(&parts, ("m5", 0), true), None);
+        // One gone from the feed (deleted) has neither.
+        assert_eq!(step_in(&parts, ("m3", 0), true), None);
+        assert_eq!(step_in(&[], ("m1", 0), true), None);
+    }
+
+    #[test]
+    fn the_volume_knob_follows_the_pointer_within_its_rail() {
+        let bounds = Some(Bounds::new(
+            point(px(100.), px(0.)),
+            size(px(120.), px(20.)),
+        ));
+        let half = VOLUME_KNOB / 2.;
+        assert_eq!(knob_at(bounds, px(100. + half)), Some(0.));
+        assert_eq!(knob_at(bounds, px(220. - half)), Some(1.));
+        assert_eq!(knob_at(bounds, px(160.)), Some(0.5));
+        // Past the ends: clamped; not laid out yet: nothing.
+        assert_eq!(knob_at(bounds, px(40.)), Some(0.));
+        assert_eq!(knob_at(bounds, px(400.)), Some(1.));
+        assert_eq!(knob_at(None, px(160.)), None);
     }
 
     #[test]

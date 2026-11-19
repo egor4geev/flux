@@ -54,6 +54,14 @@ pub struct VideoView {
 impl VideoView {
     /// Opens the file and plays it with sound (a GIF looped).
     pub fn new(path: PathBuf, looped: bool, cx: &mut Context<Self>) -> Self {
+        // The last frame drawn from pixels leaves the windows' atlases with the view (the viewer
+        // closed, another item in sight).
+        cx.on_release(|view, cx| {
+            if let Some(Shown::Image(image)) = view.frame.take() {
+                cx.drop_image(image, None);
+            }
+        })
+        .detach();
         let mut view = VideoView {
             path,
             player: None,
@@ -99,8 +107,16 @@ impl VideoView {
         view
     }
 
-    /// The player changed (played, paused, the end, another sound): the frames' timer follows.
+    /// The player changed (played, paused, the end, another sound, a failure): the frames'
+    /// timer follows.
     fn changed(&mut self, cx: &mut Context<Self>) {
+        // A failure found once the file is read (Windows: a format without a decoder here).
+        if let Some(error) = self.player.as_ref().and_then(VideoPlayer::error)
+            && self.error.is_none()
+        {
+            log::warn!("video {}: {error}", self.path.display());
+            self.error = Some(tr("This video can't be played here").into());
+        }
         let playing = self
             .player
             .as_ref()
@@ -141,7 +157,7 @@ impl VideoView {
                 width,
                 height,
                 bgra,
-            } => match image::RgbaImage::from_raw(width, height, bgra.to_vec()) {
+            } => match image::RgbaImage::from_raw(width, height, bgra) {
                 Some(buffer) => {
                     Shown::Image(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
                 }
@@ -448,8 +464,8 @@ impl Render for VideoView {
 
 impl Drop for VideoView {
     fn drop(&mut self) {
-        // The player stops and lets its decoder go with it; the picture of a frame stays in the
-        // atlases until the window drops it with the popup.
+        // The player stops and lets its decoder go with it; the picture of a frame leaves the
+        // atlases as the view is released (`new`).
         self.player = None;
     }
 }

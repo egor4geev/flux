@@ -1,10 +1,11 @@
 //! The sound device's side: the system's default output (cpal — CoreAudio, WASAPI) at its own
 //! rate and format, fed from a short queue the player's thread keeps filled. The device's thread
-//! only copies samples out (the voice's one channel into every channel), fades in at a start and
-//! out at a stop so neither clicks, and says how far the voice has played.
+//! only copies samples out (the voice's one channel into every channel) at the player's volume,
+//! fades in at a start and out at a stop (and glides to a new volume) so nothing clicks, and says
+//! how far the voice has played.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -29,6 +30,8 @@ struct Queue {
     chunks: VecDeque<Chunk>,
     queued: usize,
     gain: f32,
+    /// The volume the samples go out at now: it glides to the player's in a fade's time.
+    level: f32,
     /// Fading out to a stop.
     stopping: bool,
 }
@@ -44,6 +47,8 @@ pub(crate) struct Shared {
     starved: AtomicBool,
     /// The device failed or went away.
     failed: AtomicBool,
+    /// The player's volume, 0.0–1.0 (f32 bits).
+    volume: AtomicU32,
 }
 
 impl Shared {
@@ -93,6 +98,12 @@ impl Shared {
         self.position.store(position.to_bits(), Ordering::Relaxed);
     }
 
+    /// The volume from now on, 0.0–1.0: the sound glides to it.
+    pub fn set_volume(&self, volume: f32) {
+        self.volume
+            .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
     /// Fades out; `stopped` says when it is silent.
     pub fn stop(&self) {
         self.queue.lock().unwrap().stopping = true;
@@ -105,6 +116,7 @@ impl Shared {
             return;
         };
         let queue = &mut *queue;
+        let volume = f32::from_bits(self.volume.load(Ordering::Relaxed));
         let mut position = None;
         loop {
             let target = if queue.stopping { 0.0 } else { 1.0 };
@@ -127,7 +139,12 @@ impl Shared {
             } else {
                 (queue.gain - 1.0 / FADE).max(0.0)
             };
-            if !write(sample * queue.gain) {
+            queue.level = if volume > queue.level {
+                (queue.level + 1.0 / FADE).min(volume)
+            } else {
+                (queue.level - 1.0 / FADE).max(volume)
+            };
+            if !write(sample * queue.gain * queue.level) {
                 break;
             }
         }
@@ -159,20 +176,26 @@ pub(crate) fn available() -> Result<(), MediaError> {
 }
 
 impl Output {
-    /// Opens the default output at its own rate; it plays what is pushed once started.
-    pub fn open(position: f64) -> Result<Self, MediaError> {
+    /// Opens the default output at its own rate and `volume`; it plays what is pushed once
+    /// started.
+    pub fn open(position: f64, volume: f32) -> Result<Self, MediaError> {
         let device = cpal::default_host()
             .default_output_device()
             .ok_or_else(|| MediaError::Device("no sound output".into()))?;
         let config = device
             .default_output_config()
             .map_err(|error| MediaError::Device(error.to_string()))?;
+        let volume = volume.clamp(0.0, 1.0);
         let shared = Arc::new(Shared {
-            queue: Mutex::new(Queue::default()),
+            queue: Mutex::new(Queue {
+                level: volume,
+                ..Queue::default()
+            }),
             position: AtomicU64::new(position.to_bits()),
             stopped: AtomicBool::new(false),
             starved: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            volume: AtomicU32::new(volume.to_bits()),
         });
         let rate = config.sample_rate();
         let stream = match config.sample_format() {

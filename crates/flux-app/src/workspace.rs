@@ -222,8 +222,9 @@ pub struct Workspace {
     modal: Option<Modal>,
     /// The overlay window that just closed, fading out without input (`crate::motion`).
     leaving_modal: Option<crate::motion::Leaving<Modal>>,
-    /// A plugin's form or text question over Settings (a sign-in from the plugin's page): the one
-    /// overlay window allowed above another, with a backdrop of its own; closing it gives Settings
+    /// A plugin's form or text question over Settings (a sign-in from the plugin's page), the
+    /// media viewer over a dialog (a plugin's profile gallery, FluxGram part 5): the one overlay
+    /// window allowed above another, with a backdrop of its own; closing it gives what is under it
     /// the focus back.
     over: Option<Modal>,
     /// [`Self::over`] that just closed, fading out.
@@ -3883,24 +3884,42 @@ impl Workspace {
         }
     }
 
-    fn render_bottom_tool(&self, tool: BottomTool) -> Option<AnyElement> {
-        match tool {
-            BottomTool::Git => self
-                .git_window
-                .as_ref()
-                .map(|handle| handle.window.clone().into_any_element()),
-            BottomTool::Terminal => Some(self.terminal_panel.clone().into_any_element()),
-        }
+    /// A tool window of the island under the editor: a cached view, as the left island's
+    /// (`render_left_tool`) — a frame of something playing in a tab (FluxGram part 5: a sticker,
+    /// a GIF) doesn't lay the terminals or the Git window out again; their own changes notify
+    /// them. Its root is the panel's (`h(height)`, the island's width), `cached` — the island's
+    /// height; none while it glides or fades, which the cache wouldn't see.
+    fn render_bottom_tool(&self, tool: BottomTool, cached: Option<f32>) -> Option<AnyElement> {
+        let view: AnyView = match tool {
+            BottomTool::Git => self.git_window.as_ref()?.window.clone().into(),
+            BottomTool::Terminal => self.terminal_panel.clone().into(),
+        };
+        Some(match cached {
+            Some(height) => view
+                .cached(StyleRefinement::default().w_full().h(px(height)))
+                .into_any_element(),
+            None => view.into_any_element(),
+        })
     }
 
-    /// A tool window of the island on the right.
-    fn render_right_tool(&self, tool: RightTool, cx: &App) -> AnyElement {
-        match tool {
-            RightTool::Notifications => self.notifications_panel.clone().into_any_element(),
-            RightTool::Plugin(key) => match self.plugin_tool_view(key, cx) {
-                Some(view) => view.into_any_element(),
-                None => div().into_any_element(),
-            },
+    /// A tool window of the island on the right: a cached view as the bottom island's; its root
+    /// is the panel's (`w(right width)`, full height); `cached` — not while it glides or fades.
+    fn render_right_tool(&self, tool: RightTool, cached: bool, cx: &App) -> AnyElement {
+        let view: Option<AnyView> = match tool {
+            RightTool::Notifications => Some(self.notifications_panel.clone().into()),
+            RightTool::Plugin(key) => self.plugin_tool_view(key, cx).map(AnyView::from),
+        };
+        match view {
+            Some(view) if cached => view
+                .cached(
+                    StyleRefinement::default()
+                        .flex_none()
+                        .w(px(self.right_width.get()))
+                        .h_full(),
+                )
+                .into_any_element(),
+            Some(view) => view.into_any_element(),
+            None => div().into_any_element(),
         }
     }
 
@@ -4708,8 +4727,12 @@ impl Workspace {
             return self.dismiss_modal(window, cx);
         }
         // Behind a dialog, the window's shortcuts don't open popups (as behind a modal dialog of
-        // JetBrains IDEs); a dialog may give way to the next dialog of a flow.
+        // JetBrains IDEs); a dialog may give way to the next dialog of a flow. A viewer opens over
+        // the dialog: its pictures (a plugin's gallery in it).
         if kind != ModalKind::Dialog && self.dialog_open() {
+            if kind == ModalKind::Viewer {
+                self.open_over(kind, window, cx, build);
+            }
             return;
         }
         // Project search is also an overlay window: it gives way without restoring focus.
@@ -4838,6 +4861,18 @@ impl Workspace {
         if !crate::settings_view::is_open(self) {
             return self.toggle_dialog(window, cx, build);
         }
+        self.open_over(ModalKind::Dialog, window, cx, build);
+    }
+
+    /// Opens `V` over the overlay window that is open ([`Self::over`]): a dialog over Settings, a
+    /// viewer over a dialog.
+    fn open_over<V: ManagedView>(
+        &mut self,
+        kind: ModalKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+    ) {
         if let Some(over) = self.over.take() {
             self.leave_over(over, cx);
         }
@@ -4853,7 +4888,7 @@ impl Workspace {
         window.focus(&focus_handle);
         self.over = Some(Modal {
             view: view.into(),
-            kind: ModalKind::Dialog,
+            kind,
             focus_handle,
             previous_focus,
             anchor: None,
@@ -4863,7 +4898,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The dialog over Settings, when it is a `V` (a plugin's dialog window, API 0.5).
+    /// The window over the overlay window, when it is a `V`: a plugin's dialog over Settings (API
+    /// 0.5), the media viewer over a dialog.
     pub(crate) fn over_view<V: 'static>(&self) -> Option<Entity<V>> {
         self.over
             .as_ref()
@@ -5058,7 +5094,17 @@ impl Workspace {
             return layers;
         }
         let open = self.over.is_some();
-        let backdrop = ui::modal_backdrop(ui)
+        // A viewer's veil is deeper than a dialog's backdrop.
+        let viewer = self
+            .over
+            .as_ref()
+            .or(self.leaving_over.as_ref().map(|leaving| &leaving.value))
+            .is_some_and(|over| over.kind == ModalKind::Viewer);
+        let backdrop = match viewer {
+            true => crate::image_popup::veil(ui),
+            false => ui::modal_backdrop(ui),
+        };
+        let backdrop = backdrop
             .id("over-backdrop")
             .absolute()
             .top(px(TITLE_BAR_HEIGHT))
@@ -5082,12 +5128,16 @@ impl Workspace {
             let over = &leaving.value;
             let view = div()
                 .id(("over-leaving", over.view.entity_id().as_u64()))
+                .when(over.kind == ModalKind::Viewer, |view| view.size_full())
                 .child(over.view.clone());
             let view = crate::motion::leaving_style(view, progress, Self::modal_origin(over));
             layers.push(Self::place_modal(over, crate::motion::inert(view)));
         }
         if let Some(over) = &self.over {
-            let view = div().occlude().child(over.view.clone());
+            let view = div()
+                .occlude()
+                .when(over.kind == ModalKind::Viewer, |view| view.size_full())
+                .child(over.view.clone());
             let view = crate::motion::Appear::dialog()
                 .apply(("over", over.view.entity_id().as_u64()), view);
             layers.push(Self::place_modal(over, view));
@@ -6640,10 +6690,14 @@ impl Render for Workspace {
             .bottom_glide
             .frame(bottom_tool, window)
             .and_then(|frame| {
-                let tool = self.render_bottom_tool(frame.tool)?;
-                let replaced = frame
-                    .replaced
-                    .and_then(|(old, progress)| Some((self.render_bottom_tool(old)?, progress)));
+                let max =
+                    f32::from(window.viewport_size().height) * ui::BottomIslandHeight::MAX_SHARE;
+                let height = self.bottom_height.get_within(max);
+                let animating = frame.open < 1. || frame.replaced.is_some();
+                let tool = self.render_bottom_tool(frame.tool, (!animating).then_some(height))?;
+                let replaced = frame.replaced.and_then(|(old, progress)| {
+                    Some((self.render_bottom_tool(old, None)?, progress))
+                });
                 let island = ui::island(ui, style)
                     .flex_none()
                     .when(flat, |island| island.border_t_1().border_color(line))
@@ -6657,9 +6711,7 @@ impl Render for Workspace {
                             this.move_to_editor(window, cx)
                         },
                     ));
-                let max =
-                    f32::from(window.viewport_size().height) * ui::BottomIslandHeight::MAX_SHARE;
-                let full = self.bottom_height.get_within(max) + border;
+                let full = height + border;
                 let slot = island_slot(Side::Bottom, frame.open, full, gap, island, tool, replaced);
                 Some(if frame.leaving {
                     crate::motion::inert(slot).into_any_element()
@@ -6682,10 +6734,11 @@ impl Render for Workspace {
             .right_glide
             .frame(self.right_tool, window)
             .map(|frame| {
-                let tool = self.render_right_tool(frame.tool, cx);
+                let animating = frame.open < 1. || frame.replaced.is_some();
+                let tool = self.render_right_tool(frame.tool, !animating, cx);
                 let replaced = frame
                     .replaced
-                    .map(|(old, progress)| (self.render_right_tool(old, cx), progress));
+                    .map(|(old, progress)| (self.render_right_tool(old, false, cx), progress));
                 let island = ui::island(ui, style)
                     .flex_none()
                     .h_full()

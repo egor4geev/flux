@@ -1,8 +1,10 @@
-//! What plays with sound across Flux (FluxGram part 4): the voice message of a plugin's
-//! conversation, wherever its window is — a line in every window's status bar (an icon, who,
-//! where it is; a click pauses it or goes on) — and the voice messages' speed, kept for the whole
-//! app. The conversation holds the player; the app keeps only a weak handle to it, so a closed
-//! conversation takes its line with it.
+//! What plays with sound across Flux (FluxGram parts 4–5): the voice message or the round video
+//! message of a plugin's conversation, wherever its window is — a line in every window's status
+//! bar (an icon, who, where it is; a click pauses it or goes on) — and the speed and the volume
+//! of voice and round messages, kept for the whole app. The conversation holds the player and
+//! draws its bar over the feed; the app keeps only a weak handle to it, so a closed conversation
+//! takes its line with it. One conversation plays at a time: another one starting stops it (its
+//! bar goes).
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, EntityId, Global, SharedString, WeakEntity, div,
@@ -20,15 +22,29 @@ use crate::workspace::Workspace;
 struct Playing {
     /// The conversation whose voice message plays (or is paused).
     conversation: Option<WeakEntity<Conversation>>,
-    /// The voice messages' speed (1×, 1.5×, 2×); 0 — not chosen yet (1×).
+    /// The voice and round messages' speed (1×, 1.5×, 2×); 0 — not chosen yet (1×).
     speed: f32,
+    /// Their volume, the slider's place 0.0–1.0; none — not moved yet (1.0).
+    volume: Option<f32>,
 }
 
 impl Global for Playing {}
 
-/// The conversation's voice message plays now: the status bar's line is its.
+/// The conversation's voice or round message plays now: the status bar's line is its; another
+/// conversation that played stops (its bar goes).
 pub fn set(conversation: WeakEntity<Conversation>, cx: &mut App) {
-    cx.default_global::<Playing>().conversation = Some(conversation);
+    let id = conversation.entity_id();
+    let before = cx
+        .default_global::<Playing>()
+        .conversation
+        .replace(conversation);
+    if let Some(before) = before
+        && before.entity_id() != id
+    {
+        before
+            .update(cx, |conversation, cx| conversation.stop_sound(cx))
+            .ok();
+    }
     cx.refresh_windows();
 }
 
@@ -55,7 +71,7 @@ pub fn refresh(cx: &mut App) {
     }
 }
 
-/// The voice messages' speed.
+/// The voice and round messages' speed.
 pub fn speed(cx: &App) -> f32 {
     cx.try_global::<Playing>()
         .map(|playing| playing.speed)
@@ -67,8 +83,31 @@ pub fn set_speed(speed: f32, cx: &mut App) {
     cx.default_global::<Playing>().speed = speed;
 }
 
-/// The status bar's line while a voice message plays anywhere: ⏸ (▶ when paused), who and where
-/// it is; a click pauses it or goes on.
+/// The voice and round messages' volume: the slider's place, 0.0–1.0.
+pub fn volume(cx: &App) -> f32 {
+    cx.try_global::<Playing>()
+        .and_then(|playing| playing.volume)
+        .unwrap_or(1.)
+}
+
+pub fn set_volume(volume: f32, cx: &mut App) {
+    cx.default_global::<Playing>().volume = Some(volume.clamp(0., 1.));
+}
+
+/// The volume as the players take it (the samples' scale): [`loudness`] of the slider's place.
+pub fn gain(cx: &App) -> f32 {
+    loudness(volume(cx))
+}
+
+/// The ear hears loudness about as the square of the samples' scale: the slider's middle sounds
+/// half as loud, not nearly as loud as its end.
+fn loudness(volume: f32) -> f32 {
+    let volume = volume.clamp(0., 1.);
+    volume * volume
+}
+
+/// The status bar's line while a voice or round message plays anywhere: ⏸ (▶ when paused), who
+/// and where it is; a click pauses it or goes on.
 pub fn status_item(cx: &mut Context<Workspace>) -> Option<AnyElement> {
     let weak = cx.try_global::<Playing>()?.conversation.clone()?;
     let conversation = weak.upgrade()?;
@@ -118,4 +157,19 @@ pub fn status_item(cx: &mut Context<Workspace>) -> Option<AnyElement> {
             )
             .into_any_element(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_volume_slider_is_heard_evenly() {
+        assert_eq!(loudness(1.), 1.);
+        assert_eq!(loudness(0.), 0.);
+        assert_eq!(loudness(0.5), 0.25);
+        // Out of range: clamped.
+        assert_eq!(loudness(1.5), 1.);
+        assert_eq!(loudness(-0.2), 0.);
+    }
 }

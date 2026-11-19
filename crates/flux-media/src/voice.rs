@@ -1,6 +1,7 @@
 //! A voice message's player: an OGG/Opus file demuxed (`ogg`) and decoded (libopus) a little
-//! ahead of the sound device, out through the system's sound (cpal: CoreAudio, WASAPI); a speed
-//! above 1× stretches the time, not the pitch (WSOLA tuned for speech, [`stretch`]). The device is
+//! ahead of the sound device, out through the system's sound (cpal: CoreAudio, WASAPI) at its
+//! volume; a speed above 1× stretches the time, not the pitch (WSOLA tuned for speech,
+//! [`stretch`]). The device is
 //! open only while it plays; playing takes the sound ([`crate::sound`]), and another sound taking
 //! over pauses it.
 //!
@@ -49,6 +50,8 @@ struct Shared {
 struct Control {
     state: Playback,
     speed: f32,
+    /// 0.0–1.0, the samples' scale.
+    volume: f32,
     /// Where it is, in the voice's samples at 48 kHz, while nothing plays it.
     position: f64,
     /// The playing thread's number: a newer one (or none playing) tells it to stop.
@@ -70,6 +73,7 @@ impl VoicePlayer {
                 control: Mutex::new(Control {
                     state: Playback::Paused,
                     speed: 1.0,
+                    volume: 1.0,
                     position: 0.0,
                     run: 0,
                     device: None,
@@ -138,6 +142,19 @@ impl VoicePlayer {
 
     pub fn speed(&self) -> f32 {
         self.shared.control.lock().unwrap().speed
+    }
+
+    /// 0.0 (silent) – 1.0 (as recorded), the samples' scale: playing, the sound glides to it.
+    pub fn set_volume(&self, volume: f32) {
+        let mut control = self.shared.control.lock().unwrap();
+        control.volume = volume.clamp(0.0, 1.0);
+        if let Some(device) = &control.device {
+            device.set_volume(control.volume);
+        }
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.shared.control.lock().unwrap().volume
     }
 
     /// Where it is, at the speed's scale: 0:12 of 0:42 whatever the speed.
@@ -246,7 +263,8 @@ impl Shared {
     fn run(&self, run: u64, start: f64) -> Result<Stop, MediaError> {
         let mut source = Source::open(&self.path, self.info)?;
         source.seek(start as u64)?;
-        let output = Output::open(start)?;
+        let volume = self.control.lock().unwrap().volume;
+        let output = Output::open(start, volume)?;
         let mut resampler = Resampler::new(RATE as u32, output.rate);
         let ahead = (AHEAD.as_secs_f64() * f64::from(output.rate)) as usize;
         let mut stretch = Stretch::new(self.control.lock().unwrap().speed);
@@ -260,6 +278,8 @@ impl Shared {
             if control.run != run {
                 return Ok(Stop::Told);
             }
+            // The volume may have changed while the device opened.
+            output.shared.set_volume(control.volume);
             control.device = Some(output.shared.clone());
         }
         let stop = loop {

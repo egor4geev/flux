@@ -84,7 +84,8 @@ impl Picker {
         self
     }
 
-    /// Under an element of one of the plugin's tool windows.
+    /// Under an element of one of the plugin's tool windows; a conversation's field,
+    /// "<conversation>/field", has it above the field (API 0.5, part 5).
     pub fn under(mut self, window: &str, element: &str) -> Self {
         self.0.anchor = PickerAnchor::Element((window.to_string(), element.to_string()));
         self

@@ -379,12 +379,17 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
+                    // Flux patch: the atlas frees the space of removed tiles once the frames that
+                    // may sample them have completed (`MetalAtlas::frame_committed`).
+                    let frame = self.sprite_atlas.frame_committed();
+                    let sprite_atlas = self.sprite_atlas.clone();
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
                     let block = ConcreteBlock::new(move |_| {
                         if let Some(instance_buffer) = instance_buffer.take() {
                             instance_buffer_pool.lock().release(instance_buffer);
                         }
+                        sprite_atlas.frame_completed(frame);
                     });
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);

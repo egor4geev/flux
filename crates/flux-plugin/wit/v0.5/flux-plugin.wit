@@ -707,7 +707,9 @@ interface ui {
         /// Marked as a match: a search in the chat.
         highlight: bool,
         /// A link: `http`, `https` and `mailto` open in the browser; any other (a mention, the
-        /// plugin's own) comes as `link-clicked`.
+        /// plugin's own) comes as `link-clicked` — every one with the conversation's `own-links`.
+        /// A web link whose text isn't its address (a text link) shows the address in a tooltip
+        /// on hover.
         link: option<string>,
     }
 
@@ -749,6 +751,37 @@ interface ui {
         text: string,
     }
 
+    /// An option of a poll (0.5, part 5).
+    record poll-option {
+        text: list<rich-span>,
+        /// Its share of the votes, 0–100: shown once the poll is `answered`.
+        percent: u8,
+        /// The user chose it.
+        chosen: bool,
+        /// A quiz's right answer, once answered or closed: marked right; the user's wrong choice —
+        /// marked wrong.
+        correct: bool,
+    }
+
+    /// A poll (0.5, part 5): the question and its options — to vote while not answered (one, or
+    /// several and Vote when `multiple`), their shares after.
+    record poll-spec {
+        question: list<rich-span>,
+        /// The dim line under the question: "Anonymous poll", "Quiz", "Final results".
+        kind: string,
+        options: list<poll-option>,
+        /// Several options may be chosen: checkboxes and a Vote button.
+        multiple: bool,
+        /// The results show: the user voted, or the poll is closed.
+        answered: bool,
+        /// Closed: no voting.
+        closed: bool,
+        /// The line under the options: "12 votes".
+        footer: string,
+        /// A quiz's explanation, shown after answering behind a light bulb.
+        explanation: option<list<rich-span>>,
+    }
+
     /// A part of a message (0.5), top to bottom; pictures in a row make a grid (an album).
     variant message-part {
         text(list<rich-span>),
@@ -770,6 +803,11 @@ interface ui {
         placeholder(placeholder-spec),
         /// A line of the chat itself, in the middle without a bubble: "Anna joined the group".
         notice(list<rich-span>),
+        /// A poll (0.5, part 5): while it isn't `answered`, a click on an option votes — or, when
+        /// `multiple`, checks it, and Vote under the options sends the checked ones; a vote comes
+        /// as `poll-voted`. Answered: each option with its share and a bar of it; a quiz's
+        /// explanation behind 💡.
+        poll(poll-spec),
     }
 
     /// Who wrote a message (0.5).
@@ -799,6 +837,31 @@ interface ui {
         sent,
         read,
         failed,
+    }
+
+    /// A button under a message (0.5, part 5): a bot's keyboard, an advertisement's button.
+    record keyboard-button {
+        /// Names it in `keyboard-pressed`.
+        id: string,
+        text: string,
+        kind: keyboard-kind,
+    }
+
+    /// What a button under a message does (0.5, part 5), shown by a mark in its corner.
+    enum keyboard-kind {
+        /// The plugin answers it (a bot's callback): no mark.
+        action,
+        /// Opens a page: ↗.
+        link,
+        /// Puts a text into the field (a bot's inline query): ↪.
+        field,
+    }
+
+    /// A forum topic's label (0.5, part 5).
+    record topic-label {
+        title: string,
+        /// One of the avatar colors (0–6).
+        color: u8,
     }
 
     /// A reaction under a message (0.5).
@@ -837,6 +900,20 @@ interface ui {
         /// The conversation's `message-actions` this message offers (0.5), by id: Edit only on the
         /// user's own messages that can still be edited. None — every one.
         actions: option<list<string>>,
+        /// How many have seen it (0.5, part 5): a channel's post — an eye and "1.2K" at its foot;
+        /// its `author` without an avatar (the post's signature) goes there too, dim, before them.
+        views: option<u32>,
+        /// The forum topic it belongs to (0.5, part 5), in a group whose topics show as one feed:
+        /// the topic's name in its color, a small line over the text.
+        topic: option<topic-label>,
+        /// An advertisement (0.5, part 5): this label ("Ad") at its foot in place of the time and
+        /// the delivery marks, the bubble tinted in its `author`'s color — the sponsor, named over
+        /// the text — and no day's line over it. A click on its picture comes as `part-clicked`
+        /// (the sponsor's page), the viewer doesn't open.
+        sponsored: option<string>,
+        /// Buttons under the message (0.5, part 5), rows of them: the buttons of a row share its
+        /// width. A press comes as `keyboard-pressed`.
+        keyboard: list<list<keyboard-button>>,
     }
 
     /// Whether there is more of a conversation's history in a direction (0.5).
@@ -862,7 +939,10 @@ interface ui {
         /// Windows Ctrl in place of ⌘. Each wraps the selection in Markdown marks — `**bold**`,
         /// `__italic__`, `~~strikethrough~~`, `||spoiler||`, `` `monospace` `` (```` ``` ```` on
         /// lines of their own around a selection of several lines), `[text](address)` — or puts
-        /// them around the caret. The field sends the text with the marks (`composed`, `edited`):
+        /// them around the caret. The field shows the formatting as it is typed (part 5): the
+        /// text between closed marks bold, italic, struck through, on the spoiler's veil, in the
+        /// code font, a link's text as a link — the marks themselves stay, faint (an unclosed
+        /// mark is plain text). The field sends the text with the marks (`composed`, `edited`):
         /// the plugin parses them. The keys work only in the field; without formatting they do
         /// what they do elsewhere.
         formatting: bool,
@@ -871,6 +951,30 @@ interface ui {
         /// the plugin's (`panel` changes) and a click sends one (`panel-chosen`). Empty — no
         /// panel.
         panel: list<panel-tab>,
+        /// The characters that ask for suggestions (0.5, part 5): "@" at a word's start anywhere,
+        /// "/" only at the field's very start. Typing one comes as `suggest`, the plugin answers
+        /// with `suggestions`. Empty — none.
+        triggers: list<string>,
+        /// Other ways to send (0.5, part 5): the Send button's menu (a right click on it) lists
+        /// them — "Send Without Sound". A choice sends the field as ↵ does and comes as
+        /// `composed-with`. Empty — no menu.
+        send-options: list<row-action>,
+    }
+
+    /// An item of the field's suggestions (0.5, part 5): a member for "@", a bot's command for "/".
+    /// The list opens over the field by the caret; ↑ ↓ choose, ↵ or ⇥ puts the chosen one, Esc
+    /// closes it, a click puts one.
+    record suggestion {
+        /// Names it: the list keeps the selection on it while the list changes.
+        key: string,
+        avatar: option<avatar-spec>,
+        /// "Anna Smirnova", "/start".
+        title: string,
+        /// Dim after the title: "@anna", "Start the bot".
+        detail: option<string>,
+        /// What replaces the trigger and the text typed after it: "@anna ", "/start ",
+        /// "[Anna](tg://user?id=42) " — a mention of someone without a username, as a Markdown link.
+        insert: string,
     }
 
     /// A tab of the field's panel (0.5, part 4).
@@ -929,6 +1033,34 @@ interface ui {
         /// "Reply with Claude". Copy Text, Open, Save As… are Flux's own. A choice comes as
         /// `message-action`.
         message-actions: list<row-action>,
+        /// A button in place of the field (0.5, part 5), where the user can't write: "Join" a
+        /// channel, "Mute" one; a full-width flat button under the feed (its `label`; the field,
+        /// if any, isn't shown). A press comes as `composer-action(id, …)` with an empty
+        /// `composed`.
+        field-button: option<row-action>,
+        /// Actions on selected messages (0.5, part 5): "Forward", "Delete". Flux's own "Select" in
+        /// a message's menu (shown when this list isn't empty) starts selecting — a click on a
+        /// message selects or clears it, a ⇧-click selects the run up to it, ⌘A every loaded
+        /// one; Esc or the bar's × ends. A bar in place of the field shows the count, these
+        /// actions and Flux's own "Copy" (the selected messages' texts, each under its author and
+        /// time). A choice comes as `selection-action(id, the messages in the feed's order)` and
+        /// ends the selection. Notices and advertisements (`sponsored`) can't be selected.
+        /// Empty — no selecting.
+        selection-actions: list<row-action>,
+        /// A line in place of the field where the user can't write (0.5, part 5): "You can't
+        /// write in this chat", dim, in the middle. Shown when there is neither the field nor
+        /// `field-button`; the bar of selected messages takes its place as it takes theirs.
+        field-note: option<string>,
+        /// The plugin opens every link of the feed (0.5, part 5): web links (`http`, `https`,
+        /// `mailto`) come as `link-clicked` too, a link preview's as well — Flux doesn't open
+        /// them — so the plugin can ask first or open its own pages (`system.open-url` opens one
+        /// in the browser). False — web links open in the browser at once.
+        own-links: bool,
+        /// The reactions the user may put (0.5, part 5), emoji in order: the message's hover bar
+        /// gets a ☺ that opens them in a row by the message (all of them in a scrolling grid
+        /// when there are more than fit); a reaction under a message that is in this list toggles
+        /// the user's own. Both come as `reaction-toggled`. Empty — reactions are only shown.
+        reactions: list<string>,
     }
 
     /// A header (0.5): a picture, a title and a line under it — a chat's header over its feed, a
@@ -958,16 +1090,53 @@ interface ui {
     /// Pictures in a grid of squares (0.5), as a chat's photos and videos by month: takes the
     /// remaining height and scrolls by itself (in a dialog, the dialog is then as tall as it may
     /// be); only the squares on screen are drawn, each from its `path` (a small picture will do).
-    /// A click on a picture whose full size is there (`full`, not `play`) opens it in Flux's
-    /// picture viewer, the gallery's full pictures around it; any other click comes as
-    /// `activated(key)` (the plugin downloads the full size, or opens a video). The squares on
-    /// screen come as `visible(first, last)` (their keys), the end near — as `load-older` while
-    /// `more` is `more`.
+    /// A click on a picture (not `play`) opens it at once in Flux's picture viewer, the gallery's
+    /// pictures around it: its `full` when it is there; else what the square has (`path`, else
+    /// `preview` blurred) with a spinner, and `activated(key)` comes so the plugin downloads the
+    /// full size — the gallery put again with the item's `full` swaps the open viewer to it. The
+    /// same for a picture the user arrows to in the viewer. A click on a `play` picture comes as
+    /// `activated(key)` (the plugin opens it). The squares on screen come as `visible(first,
+    /// last)` (their keys), the end near — as `load-older` while `more` is `more`.
     record gallery-spec {
         items: list<gallery-item>,
         more: history,
         /// Shown in the middle when there are no items.
         empty-text: option<string>,
+    }
+
+    /// The bar of a chat's pinned message over the feed (0.5, part 5): a line on its left cut
+    /// into `count` pieces (the one at `position` lit; at most four shown, the rest scroll), the
+    /// title in the accent ("Pinned message", "Pinned message #2"), the message's line under it,
+    /// its picture before the text. A click on the bar comes as `pinned-clicked(message)`: the
+    /// plugin reveals the message (`reveal`, or after loading its history) and shows the next
+    /// older pinned one, from the oldest back to the newest. A click on an action comes as
+    /// `pinned-action`.
+    record pinned-spec {
+        /// The pinned message's id.
+        message: string,
+        title: string,
+        /// One line: the text, or what it is ("Photo").
+        text: string,
+        /// A small picture before the text: the message's photo, a video's poster.
+        image: option<image-spec>,
+        /// Which of the pinned messages it is (0 — the newest) and how many there are.
+        position: u32,
+        count: u32,
+        /// Icon buttons at the bar's right end: "Unpin" (×).
+        actions: list<row-action>,
+    }
+
+    /// A bot's keyboard over the field (0.5, part 5): rows of buttons in place of typing; a ⌨
+    /// button in the field shows and hides it. A press comes as `keyboard-pressed("", button)`.
+    /// The buttons of a row share its width; a tall keyboard scrolls (it takes at most two
+    /// fifths of the conversation's height). No rows — no keyboard and no ⌨, only the
+    /// placeholder (a bot asking for a reply).
+    record reply-keyboard {
+        rows: list<list<keyboard-button>>,
+        /// The field's placeholder while the keyboard is there.
+        placeholder: option<string>,
+        /// Shown at once; false — behind the ⌨ button.
+        open: bool,
     }
 
     /// A change of a conversation (0.5): the plugin sends what changed, never the whole feed.
@@ -1002,6 +1171,21 @@ interface ui {
         /// Replaces items of a panel's tab by their keys, wherever they are (0.5, part 4): a
         /// sticker downloaded, its animation rendered.
         panel-put(tuple<panel-tab, list<panel-item>>),
+        /// The bar of the chat's pinned message over the feed (0.5, part 5); none — no bar.
+        pinned(option<pinned-spec>),
+        /// The field's suggestions (0.5, part 5): (the text it answers — what `suggest` asked,
+        /// the items). The list over the field; an answer for another text than the one at the
+        /// caret now is dropped; empty — the list closes.
+        suggestions(tuple<string, list<suggestion>>),
+        /// The bot's keyboard over the field (0.5, part 5); none — no keyboard (and no ⌨).
+        reply-keyboard(option<reply-keyboard>),
+        /// Messages to forward, over the field (0.5, part 5): a bar like the quote being answered,
+        /// with the forward icon — its `author` the title ("Forwarding 3 messages"), its `text`
+        /// the line ("Anna, Boris: Hi…"); its × comes as `forward-cancelled`. ↵ sends as usual
+        /// (`composed`, the field may be empty): the plugin sends the text first, then forwards.
+        /// A quote being answered and a forwarding don't go together: putting one clears the
+        /// other. None — no bar.
+        forwarding(option<message-quote>),
     }
 
     /// The message the field edits (0.5).
@@ -1529,7 +1713,8 @@ interface picker {
         /// Under an element of one of the plugin's tool windows: (window, element). A property of
         /// a `properties` list is named "<list>/<property id>" (0.3), a row of a tree
         /// "<tree>/<row key>" (0.5): a menu of a row's button opens under the row (under the
-        /// list while the row isn't drawn).
+        /// list while the row isn't drawn). A conversation's field is "<conversation>/field"
+        /// (0.5, part 5): the picker opens above the field, as its suggestions do.
         element(tuple<string, string>),
     }
 
@@ -1764,12 +1949,16 @@ interface events {
         /// A part of a message was clicked (0.5) that Flux can't open by itself: a file or a
         /// picture not downloaded, a placeholder — (the message, the part's index).
         part-clicked(tuple<string, u32>),
-        /// A link that isn't a web one was clicked (0.5): (the message, the link).
+        /// A link that isn't a web one was clicked (0.5) — any link, a link preview's too, with
+        /// the conversation's `own-links`: (the message, the link).
         link-clicked(tuple<string, string>),
         /// A quote whose message isn't loaded was clicked (0.5): (the message, the quoted one).
         quote-clicked(tuple<string, string>),
         /// The field was sent (0.5): ↵ or Send; the field is empty again.
         composed(composed),
+        /// The field was sent by one of its `send-options` (0.5, part 5): (the option's id, what
+        /// was sent); the field is empty again, as after `composed`.
+        composed-with(tuple<string, composed>),
         /// A button of the field was pressed (0.5): (its id, what is in the field — it stays).
         composer-action(tuple<string, composed>),
         /// The field's text changed (0.5): for "typing…" and the draft. One event for a burst.
@@ -1813,6 +2002,32 @@ interface events {
         panel-visible(tuple<panel-tab, string, string>),
         /// The panel's tab scrolled near its end while its `more` is `more` (0.5, part 4).
         panel-load-more(panel-tab),
+        /// The bar of the pinned message was clicked (0.5, part 5): its message — the plugin
+        /// reveals it and shows the next older pinned one (`pinned`).
+        pinned-clicked(string),
+        /// An action of the pinned message's bar was pressed (0.5, part 5): (the message, the
+        /// action's id).
+        pinned-action(tuple<string, string>),
+        /// The field asks for suggestions (0.5, part 5): (the trigger, the text typed after it up
+        /// to the caret) — when a trigger of `composer-spec.triggers` is typed, then once per
+        /// burst of typing; the plugin answers with `suggestions` for that text. A space, a line
+        /// break or the caret leaving the word closes the list.
+        suggest(tuple<string, string>),
+        /// A button under a message was pressed (0.5, part 5): (the message, the button's id); one
+        /// of the bot's keyboard over the field (`reply-keyboard`): ("", the button's id).
+        keyboard-pressed(tuple<string, string>),
+        /// An action on the selected messages was chosen (0.5, part 5): (the action's id of
+        /// `selection-actions`, the messages in the feed's order); the selection has ended.
+        selection-action(tuple<string, list<string>>),
+        /// The forwarding bar over the field was closed (0.5, part 5): its ×.
+        forward-cancelled,
+        /// A vote in a poll (0.5, part 5): (the message, the part's index, the chosen options'
+        /// indices, in order). The plugin sends the poll again, answered.
+        poll-voted(tuple<string, u32, list<u32>>),
+        /// A reaction was chosen in the ☺ row, or a reaction of `reactions` under a message was
+        /// clicked (0.5, part 5): (the message, the emoji) — the plugin puts the user's own, or
+        /// takes it back when it is `chosen`.
+        reaction-toggled(tuple<string, string>),
     }
 
     record ui-input {

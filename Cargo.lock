@@ -2194,6 +2194,8 @@ dependencies = [
  "objc2-quartz-core",
  "ogg",
  "opus",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

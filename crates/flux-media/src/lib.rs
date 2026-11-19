@@ -32,8 +32,10 @@ pub enum MediaError {
     Format(String),
     /// The sound device: none, or it failed.
     Device(String),
-    /// This system can't play it: HEVC on a Windows without the system's extension, a platform
-    /// without a video backend.
+    /// This system can't play it: a Windows without Media Foundation (an N edition without its
+    /// media features, a server), a platform without a video backend. A format without a decoder
+    /// here (HEVC on a Windows without the system's extension) is found once the file is read: a
+    /// video's `error`.
     Unsupported(String),
 }
 

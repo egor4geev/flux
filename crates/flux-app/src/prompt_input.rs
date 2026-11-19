@@ -10,6 +10,15 @@
 //!
 //! The geometry of the drawn rows ([`Geometry`]) is plain data built from gpui's shaped lines each
 //! frame: the caret, the mouse, the selection and ↑/↓ use it, and the tests check it without gpui.
+//!
+//! The parent may style the text as it is typed ([`PromptInput::set_styling`]: a plugin
+//! conversation's Markdown — bold, italic, code, links): the stretches are computed again only
+//! when the text changed, and the rows are shaped with them, so the caret, the selection, the
+//! mouse and the wrapping follow the styled text. The styling's marks (`**`, `[`, `](address)`)
+//! are hidden, as the messengers' fields show formatting ([`conceal`]): the document stays the
+//! Markdown, the rows are shaped from the shown characters (a hidden mark takes no room), the
+//! motions, ⌫ ⌦, the mouse, copy and paste work on what is shown, and the caret never stops
+//! between marks. Claude's field has none.
 
 use std::ops::Range as Utf16Range;
 use std::path::PathBuf;
@@ -20,15 +29,22 @@ use flux_core::{Document, EditKind, Range, Rope, Selection, Transaction, edit};
 use gpui::{
     App, AvailableSpace, Bounds, ClipboardEntry, ClipboardItem, ContentMask, Context, CursorStyle,
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, Hsla, Image, InspectorElementId, IntoElement, KeyBinding,
-    KeyContext, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels, Point,
-    Render, ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, UTF16Selection,
-    UnderlineStyle, Window, WrappedLine, actions, div, fill, font, point, prelude::*, px, relative,
-    size,
+    Focusable, GlobalElementId, Image, InspectorElementId, IntoElement, KeyBinding, KeyContext,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, Size, StrikethroughStyle, Style, TextAlign, TextRun,
+    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, font, point,
+    prelude::*, px, relative, size,
 };
 
+use std::rc::Rc;
+
 use crate::motion;
-use crate::theme::{self, Theme};
+use crate::theme::{self, Theme, UiColors};
+
+mod conceal;
+
+use conceal::Concealed;
+pub use conceal::Span;
 
 /// The message's font size and line height (the interface font).
 pub const TEXT_SIZE: f32 = 13.;
@@ -162,6 +178,116 @@ pub enum PromptInputEvent {
     UpWhenEmpty,
 }
 
+/// How a stretch of the field's text looks: the parent's styling of what is typed
+/// ([`PromptInput::set_styling`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Look {
+    pub bold: bool,
+    pub italic: bool,
+    pub strikethrough: bool,
+    /// The code font, on a faint background.
+    pub code: bool,
+    /// A link's text: the accent, underlined.
+    pub link: bool,
+    /// On the spoiler's veil (lighter than the feed's: the text stays readable).
+    pub spoiler: bool,
+}
+
+/// The parent's markup of the text: the looks of its stretches — character ranges in order, not
+/// overlapping; the rest is plain — and its spans, whose marks the field hides.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Markup {
+    pub looks: Vec<(std::ops::Range<usize>, Look)>,
+    pub spans: Vec<Span>,
+}
+
+/// The parent's styling: the markup of the text.
+pub type Styling = fn(&str) -> Markup;
+
+/// A stretch of the text (characters or drawn columns) and how it looks.
+type Stretch = (std::ops::Range<usize>, Look);
+
+/// The text drawn last, styled: made again only when the text changed.
+struct Stretches {
+    text: String,
+    /// Its logical lines as drawn.
+    lines: Vec<DrawnLine>,
+    /// Its marks hidden.
+    concealed: Concealed,
+}
+
+/// A logical line as drawn: its shown characters and their looks.
+#[derive(Debug, PartialEq)]
+struct DrawnLine {
+    /// The shown characters: no hidden marks, tabs as spaces, no line break.
+    display: String,
+    /// The drawn column of each position of the line (`0..=` its length); empty when nothing in
+    /// the line is hidden.
+    columns: Vec<usize>,
+    /// The looks' stretches, in drawn columns.
+    looks: Vec<(std::ops::Range<usize>, Look)>,
+}
+
+impl Stretches {
+    /// The lines of `text` with `markup`: its marks left out, its looks cut at the line breaks.
+    fn new(text: &Rope, markup: Markup) -> Self {
+        let concealed = Concealed::new(text, markup.spans);
+        let looks = markup.looks;
+        let mut lines = Vec::with_capacity(text.len_lines());
+        let mut next = 0;
+        for index in 0..text.len_lines() {
+            let start = text.line_to_char(index);
+            let line = text.line(index);
+            let len = display_len(&line);
+            let end = start + len;
+            let mut display = String::with_capacity(line.len_bytes());
+            let mut columns = Vec::with_capacity(len + 1);
+            let mut shown = 0;
+            for (offset, c) in line.chars().take(len).enumerate() {
+                columns.push(shown);
+                if concealed.hides() && concealed.is_hidden(start + offset) {
+                    continue;
+                }
+                display.push(if c == '\t' { ' ' } else { c });
+                shown += 1;
+            }
+            columns.push(shown);
+            if shown == len {
+                columns.clear();
+            }
+            while looks.get(next).is_some_and(|(range, _)| range.end <= start) {
+                next += 1;
+            }
+            let column = |pos: usize| {
+                if columns.is_empty() {
+                    pos
+                } else {
+                    columns[pos]
+                }
+            };
+            let line_looks = looks[next..]
+                .iter()
+                .take_while(|(range, _)| range.start < end)
+                .filter_map(|(range, look)| {
+                    let from = column(range.start.max(start) - start);
+                    let to = column(range.end.min(end) - start);
+                    (from < to).then_some((from..to, *look))
+                })
+                .collect();
+            lines.push(DrawnLine {
+                display,
+                columns,
+                looks: line_looks,
+            });
+        }
+        Stretches {
+            text: text.to_string(),
+            lines,
+            concealed,
+        }
+    }
+}
+
 pub struct PromptInput {
     document: Document,
     focus_handle: FocusHandle,
@@ -189,6 +315,9 @@ pub struct PromptInput {
     /// Files on the clipboard go to the parent ([`PromptInputEvent::FilesPasted`]), not their names
     /// as text.
     takes_files: bool,
+    /// The parent's styling of the text, and its stretches for the text drawn last.
+    styling: Option<Styling>,
+    styled: Option<Rc<Stretches>>,
 }
 
 struct PromptLayout {
@@ -217,7 +346,82 @@ impl PromptInput {
             height_glide: None,
             drawn_height: px(0.),
             takes_files: false,
+            styling: None,
+            styled: None,
         }
+    }
+
+    /// Styles the text as it is typed (none — plain): the parent's Markdown, say. The stretches
+    /// are made again (functions can't be told apart).
+    pub fn set_styling(&mut self, styling: Option<Styling>, cx: &mut Context<Self>) {
+        if self.styling.is_none() && styling.is_none() {
+            return;
+        }
+        self.styling = styling;
+        self.styled = None;
+        cx.notify();
+    }
+
+    /// The stretches of the text as it is now: made again only when the text changed.
+    fn restyle(&mut self) {
+        let Some(styling) = self.styling else {
+            self.styled = None;
+            return;
+        };
+        let text = self.document.text();
+        if self
+            .styled
+            .as_ref()
+            .is_some_and(|styled| *text == styled.text.as_str())
+        {
+            return;
+        }
+        let markup = styling(&text.to_string());
+        self.styled = Some(Rc::new(Stretches::new(text, markup)));
+    }
+
+    /// The styling as it is now, when it hides marks: the edits and the motions work on what is
+    /// shown with it.
+    fn concealed(&mut self) -> Option<Rc<Stretches>> {
+        self.restyle();
+        self.styled
+            .clone()
+            .filter(|styled| styled.concealed.hides())
+    }
+
+    /// Where the caret rests at the place of `pos` (the marks hidden as drawn last).
+    fn snap(&self, pos: usize) -> usize {
+        match &self.styled {
+            Some(styled) if styled.concealed.hides() => styled
+                .concealed
+                .snap(pos)
+                .min(self.document.text().len_chars()),
+            _ => pos,
+        }
+    }
+
+    /// An empty pair the formatting put at the caret goes when the caret leaves it with nothing
+    /// typed in it.
+    fn drop_blank_spans(&mut self, cx: &mut Context<Self>) {
+        let Some(styled) = self.concealed() else {
+            return;
+        };
+        let changes = styled.concealed.blank_spans(self.cursor());
+        if !changes.is_empty() {
+            let tx = Transaction::change(self.document.text(), changes);
+            self.apply(tx, EditKind::Other, cx);
+        }
+    }
+
+    /// Where the character at `index` is drawn, in the window (the frame drawn last): the parent's
+    /// list for a word opens by its first character.
+    pub fn bounds_of(&self, index: usize) -> Option<Bounds<Pixels>> {
+        let layout = self.layout.as_ref()?;
+        let caret = layout.geometry.caret(index);
+        Some(Bounds::new(
+            layout.origin + caret,
+            size(px(1.), layout.geometry.line_height),
+        ))
     }
 
     /// The field grows up to `rows` rows, then scrolls.
@@ -242,6 +446,23 @@ impl PromptInput {
 
     pub fn text(&self) -> String {
         self.document.text().to_string()
+    }
+
+    /// The text to send (FluxGram part 5): the field's text without the empty pairs the
+    /// formatting keys put at the caret — ⌘B, then ↵ with nothing typed, sends no `****`.
+    pub fn text_to_send(&mut self) -> String {
+        let text = self.document.text().clone();
+        let Some(styled) = self.concealed() else {
+            return text.to_string();
+        };
+        let mut out = String::new();
+        let mut last = 0;
+        for (start, end, _) in styled.concealed.blank_spans(usize::MAX) {
+            out.push_str(&text.slice(last..start).to_string());
+            last = end;
+        }
+        out.push_str(&text.slice(last..).to_string());
+        out
     }
 
     pub fn is_empty(&self) -> bool {
@@ -317,9 +538,58 @@ impl PromptInput {
     /// Types `text` at the caret (over the selection).
     pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = normalize(text);
-        self.edit(EditKind::Other, cx, |rope, sel| {
-            edit::insert_text(rope, sel, &text)
-        });
+        self.type_text(&text, EditKind::Other, cx);
+    }
+
+    /// Types `text` at the caret, over the selection: where the field hides marks, those the
+    /// selection crosses stay balanced ([`Concealed::delete`]).
+    fn type_text(&mut self, text: &str, kind: EditKind, cx: &mut Context<Self>) {
+        let primary = self.document.selection().primary();
+        if !primary.is_empty()
+            && let Some(styled) = self.concealed()
+        {
+            let (changes, caret) =
+                styled
+                    .concealed
+                    .delete(primary.from(), primary.to(), text, primary.from());
+            let tx = Transaction::change(self.document.text(), changes)
+                .with_selection(Selection::point(caret));
+            return self.apply(tx, kind, cx);
+        }
+        self.edit(kind, cx, |rope, sel| edit::insert_text(rope, sel, text));
+    }
+
+    /// ⌫ ⌦ ⌥⌫ where the field hides marks: the selection, or the shown character (or word) before
+    /// or after the caret — never a mark alone; the marks stay balanced and a span left empty
+    /// loses them. False when nothing is hidden: the core's deletion does.
+    fn delete_shown(&mut self, dir: Direction, word: bool, cx: &mut Context<Self>) -> bool {
+        let Some(styled) = self.concealed() else {
+            return false;
+        };
+        let concealed = &styled.concealed;
+        let primary = self.document.selection().primary();
+        let (from, to, caret) = if primary.is_empty() {
+            let place = concealed.place(primary.head);
+            let at = Range::point(place);
+            let target = if word {
+                movement::move_word(&concealed.shown, at, dir, false).head
+            } else {
+                movement::move_horizontally(&concealed.shown, at, dir, false).head
+            };
+            if target == place {
+                return true;
+            }
+            let (a, b) = (place.min(target), place.max(target));
+            let from = concealed.position_of(a);
+            (from, concealed.position_of(b - 1) + 1, primary.head)
+        } else {
+            (primary.from(), primary.to(), primary.from())
+        };
+        let (changes, caret) = concealed.delete(from, to, "", caret);
+        let tx = Transaction::change(self.document.text(), changes)
+            .with_selection(Selection::point(caret));
+        self.apply(tx, EditKind::Delete, cx);
+        true
     }
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
@@ -350,18 +620,25 @@ impl PromptInput {
         cx.notify();
     }
 
+    /// A motion of the core; where the field hides marks, on the shown text.
     fn motion(&mut self, cx: &mut Context<Self>, f: impl Fn(&Rope, Range) -> Range) {
         self.goal_x = None;
+        let concealed = self.concealed();
         let text = self.document.text().clone();
         let selection = self
             .document
             .selection()
-            .transform(|range| f(&text, *range));
+            .transform(|range| match &concealed {
+                Some(styled) => styled.concealed.moved(*range, &f),
+                None => f(&text, *range),
+            });
         self.set_selection(selection, cx);
+        self.drop_blank_spans(cx);
     }
 
     /// ↑/↓: the row above or below as drawn, keeping the x the caret had on the first press.
     fn vertical(&mut self, rows: isize, extend: bool, cx: &mut Context<Self>) {
+        self.restyle();
         let Some(layout) = self.layout.as_ref() else {
             return;
         };
@@ -375,13 +652,14 @@ impl PromptInput {
             primary.to()
         };
         let goal = self.goal_x.unwrap_or_else(|| layout.geometry.caret(from).x);
-        let target = layout.geometry.vertical(from, goal, rows);
+        let target = self.snap(layout.geometry.vertical(from, goal, rows));
         let range = if extend {
             primary.put_cursor(target, true)
         } else {
             Range::point(target)
         };
         self.set_selection(Selection::from_range(range), cx);
+        self.drop_blank_spans(cx);
         self.goal_x = Some(goal);
     }
 
@@ -424,28 +702,43 @@ impl PromptInput {
         }
     }
 
-    fn selected_text(&self) -> Option<String> {
+    /// The selection for the clipboard. Where the field hides marks: the shown text, and the
+    /// Markdown that keeps its formatting as the item's metadata — a field with a styling pastes
+    /// that back.
+    fn clipboard_item(&mut self) -> Option<ClipboardItem> {
         let range = self.document.selection().primary();
-        (!range.is_empty()).then(|| {
-            self.document
-                .text()
-                .slice(range.from()..range.to())
-                .to_string()
+        if range.is_empty() {
+            return None;
+        }
+        let (from, to) = (range.from(), range.to());
+        let Some(styled) = self.concealed() else {
+            let text = self.document.text().slice(from..to).to_string();
+            return Some(ClipboardItem::new_string(text));
+        };
+        let plain = styled.concealed.shown_text(from, to);
+        let markdown = styled.concealed.markdown(self.document.text(), from, to);
+        Some(if plain == markdown {
+            ClipboardItem::new_string(plain)
+        } else {
+            let metadata = serde_json::json!({ MARKDOWN: markdown }).to_string();
+            ClipboardItem::new_string_with_metadata(plain, metadata)
         })
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.selected_text() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some(item) = self.clipboard_item() {
+            cx.write_to_clipboard(item);
         }
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.selected_text() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.edit(EditKind::Other, cx, |rope, sel| {
-                edit::insert_text(rope, sel, "")
-            });
+        if let Some(item) = self.clipboard_item() {
+            cx.write_to_clipboard(item);
+            if !self.delete_shown(Direction::Backward, false, cx) {
+                self.edit(EditKind::Other, cx, |rope, sel| {
+                    edit::insert_text(rope, sel, "")
+                });
+            }
         }
     }
 
@@ -461,11 +754,15 @@ impl PromptInput {
             return cx.emit(PromptInputEvent::FilesPasted(paths.to_vec()));
         }
         if let Some(text) = item.text() {
-            let text = normalize(&text);
+            // Copied from a field that hides marks: its Markdown, where this one is styled too.
+            let markdown = self
+                .styling
+                .and_then(|_| item.metadata())
+                .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+                .and_then(|metadata| Some(metadata.get(MARKDOWN)?.as_str()?.to_string()));
+            let text = normalize(markdown.as_deref().unwrap_or(&text));
             self.glide_height();
-            return self.edit(EditKind::Other, cx, |rope, sel| {
-                edit::insert_text(rope, sel, &text)
-            });
+            return self.type_text(&text, EditKind::Other, cx);
         }
         for entry in item.into_entries() {
             if let ClipboardEntry::Image(image) = entry {
@@ -494,16 +791,24 @@ impl PromptInput {
         } else {
             from
         };
-        let tx = Transaction::change(text, [(from, range.to(), None)])
+        let to = range.to();
+        if let Some(styled) = self.concealed() {
+            let (changes, caret) = styled.concealed.delete(from, to, "", from);
+            let tx = Transaction::change(self.document.text(), changes)
+                .with_selection(Selection::point(caret));
+            return self.apply(tx, EditKind::Delete, cx);
+        }
+        let tx = Transaction::change(self.document.text(), [(from, to, None)])
             .with_selection(Selection::point(from));
         self.apply(tx, EditKind::Delete, cx);
     }
 
     // --- Mouse ---
 
+    /// The position for a point in the window: where the caret rests at the place drawn there.
     fn position_for_mouse(&self, position: Point<Pixels>) -> usize {
         match &self.layout {
-            Some(layout) => layout.geometry.index_at(position - layout.origin),
+            Some(layout) => self.snap(layout.geometry.index_at(position - layout.origin)),
             None => self.document.text().len_chars(),
         }
     }
@@ -516,10 +821,19 @@ impl PromptInput {
     ) {
         window.focus(&self.focus_handle);
         self.goal_x = None;
+        let concealed = self.concealed();
         let pos = self.position_for_mouse(event.position);
         let text = self.document.text();
         let selection = match event.click_count {
-            2 => Selection::from_range(movement::word_range_at(text, pos)),
+            // The word as shown: its marks with it.
+            2 => match &concealed {
+                Some(styled) => {
+                    let concealed = &styled.concealed;
+                    let word = movement::word_range_at(&concealed.shown, concealed.place(pos));
+                    Selection::single(concealed.rest(word.anchor), concealed.rest(word.head))
+                }
+                None => Selection::from_range(movement::word_range_at(text, pos)),
+            },
             3.. => {
                 // The paragraph: the whole line, its break included.
                 let line = text.char_to_line(pos);
@@ -538,6 +852,7 @@ impl PromptInput {
         };
         self.selecting = true;
         self.set_selection(selection, cx);
+        self.drop_blank_spans(cx);
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -596,6 +911,9 @@ impl PromptInput {
         context
     }
 }
+
+/// The clipboard metadata's key for the Markdown of a copy from a field that hides marks.
+const MARKDOWN: &str = "markdown";
 
 /// Text for the field: line breaks become `\n`.
 pub fn normalize(text: &str) -> String {
@@ -668,7 +986,7 @@ impl EntityInputHandler for PromptInput {
                 )
                 .with_selection(Selection::point(end))
             }
-            None => edit::insert_text(self.document.text(), self.document.selection(), &new_text),
+            None => return self.type_text(&new_text, EditKind::Insert, cx),
         };
         self.apply(tx, EditKind::Insert, cx);
     }
@@ -756,6 +1074,7 @@ impl Render for PromptInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use Direction::{Backward, Forward};
         let ui = Theme::ui(cx);
+        self.restyle();
         div()
             .key_context(self.key_context())
             .track_focus(&self.focus_handle)
@@ -829,19 +1148,23 @@ impl Render for PromptInput {
                     cx.emit(PromptInputEvent::BackspaceAtStart);
                     return;
                 }
-                this.edit(EditKind::Delete, cx, edit::delete_backward)
+                if !this.delete_shown(Backward, false, cx) {
+                    this.edit(EditKind::Delete, cx, edit::delete_backward)
+                }
             }))
             .on_action(cx.listener(|this, _: &Delete, _, cx| {
-                this.edit(EditKind::Delete, cx, edit::delete_forward)
+                if !this.delete_shown(Forward, false, cx) {
+                    this.edit(EditKind::Delete, cx, edit::delete_forward)
+                }
             }))
             .on_action(cx.listener(|this, _: &DeleteWordBackward, _, cx| {
-                this.edit(EditKind::Other, cx, edit::delete_word_backward)
+                if !this.delete_shown(Backward, true, cx) {
+                    this.edit(EditKind::Other, cx, edit::delete_word_backward)
+                }
             }))
             .on_action(cx.listener(Self::delete_to_line_start))
             .on_action(cx.listener(|this, _: &InsertNewline, _, cx| {
-                this.edit(EditKind::Insert, cx, |rope, sel| {
-                    edit::insert_text(rope, sel, "\n")
-                })
+                this.type_text("\n", EditKind::Insert, cx)
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
             .on_action(cx.listener(Self::copy))
@@ -1007,11 +1330,121 @@ fn display_text(line: &str) -> String {
     line.trim_end_matches(['\n', '\r']).replace('\t', " ")
 }
 
+/// The number of characters a logical line draws (without its line break).
+fn display_len(line: &flux_core::RopeSlice) -> usize {
+    let mut len = line.len_chars();
+    while len > 0 && matches!(line.char(len - 1), '\n' | '\r') {
+        len -= 1;
+    }
+    len
+}
+
+/// The runs of a logical line's drawn text: its stretches' looks, and the IME composition
+/// (`marked`, in the line's characters) underlined. `offsets` are the text's character → byte
+/// offsets.
+fn line_runs(
+    display: &str,
+    offsets: &[usize],
+    looks: &[(std::ops::Range<usize>, Look)],
+    marked: Option<std::ops::Range<usize>>,
+    ui: &UiColors,
+) -> Vec<TextRun> {
+    let chars = offsets.len() - 1;
+    // Where a run may change: the stretches' ends and the composition's.
+    let mut cuts = vec![0, chars];
+    for (range, _) in looks {
+        cuts.extend([range.start.min(chars), range.end.min(chars)]);
+    }
+    if let Some(marked) = &marked {
+        cuts.extend([marked.start.min(chars), marked.end.min(chars)]);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut runs = Vec::with_capacity(cuts.len());
+    let mut next = 0;
+    for pair in cuts.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        while looks.get(next).is_some_and(|(range, _)| range.end <= from) {
+            next += 1;
+        }
+        let look = looks
+            .get(next)
+            .filter(|(range, _)| range.start <= from)
+            .map(|(_, look)| *look)
+            .unwrap_or_default();
+        let underline = marked
+            .as_ref()
+            .is_some_and(|marked| marked.start <= from && to <= marked.end);
+        runs.push(styled_run(offsets[to] - offsets[from], look, underline, ui));
+    }
+    if runs.is_empty() {
+        runs.push(styled_run(display.len(), Look::default(), false, ui));
+    }
+    runs
+}
+
+/// A run of `len` bytes that looks so.
+fn styled_run(len: usize, look: Look, underline: bool, ui: &UiColors) -> TextRun {
+    let mut run_font = font(if look.code {
+        theme::code_font()
+    } else {
+        theme::UI_FONT
+    });
+    if look.bold {
+        run_font.weight = gpui::FontWeight::SEMIBOLD;
+    }
+    if look.italic {
+        run_font.style = gpui::FontStyle::Italic;
+    }
+    let color = if look.link {
+        ui.accent_text
+    } else {
+        ui.foreground
+    };
+    TextRun {
+        len,
+        font: run_font,
+        color,
+        background_color: if look.spoiler {
+            Some(UiColors::tint(ui.text_muted, 0.25))
+        } else if look.code {
+            Some(UiColors::tint(ui.foreground, 0.08))
+        } else {
+            None
+        },
+        underline: (underline || look.link).then_some(UnderlineStyle {
+            thickness: px(1.),
+            color: Some(color),
+            wavy: false,
+        }),
+        strikethrough: look.strikethrough.then_some(StrikethroughStyle {
+            thickness: px(1.),
+            color: Some(color),
+        }),
+    }
+}
+
 /// Character → byte offsets of `text`, one more than characters.
 fn char_to_byte(text: &str) -> Vec<usize> {
     let mut offsets: Vec<usize> = text.char_indices().map(|(byte, _)| byte).collect();
     offsets.push(text.len());
     offsets
+}
+
+/// A logical line as drawn: the styling's line (its marks left out), or the plain text's.
+fn drawn<'a>(
+    text: &Rope,
+    index: usize,
+    styled: Option<&'a Stretches>,
+    plain: &'a mut String,
+) -> (&'a str, &'a [usize], &'a [Stretch]) {
+    match styled.and_then(|styled| styled.lines.get(index)) {
+        Some(line) => (&line.display, &line.columns, &line.looks),
+        None => {
+            *plain = display_text(&text.line(index).to_string());
+            (plain.as_str(), &[], &[])
+        }
+    }
 }
 
 /// A logical line shaped for the frame.
@@ -1021,13 +1454,15 @@ struct ShapedLine {
     top: Pixels,
 }
 
-/// Shapes the text for `wrap_width`: the lines to paint and the rows' geometry.
+/// Shapes the text for `wrap_width`: the lines to paint and the rows' geometry. `styled` — the
+/// parent's stretches for this text.
 #[allow(clippy::too_many_arguments)]
 fn shape(
     text: &Rope,
+    styled: Option<&Stretches>,
     marked: Option<&std::ops::Range<usize>>,
     wrap_width: Pixels,
-    color: Hsla,
+    ui: &UiColors,
     font_size: Pixels,
     line_height: Pixels,
     window: &mut Window,
@@ -1036,43 +1471,32 @@ fn shape(
     let mut lines = Vec::new();
     let mut rows = Vec::new();
     let line_count = text.len_lines();
+    let mut plain = String::new();
     for index in 0..line_count {
         let start = text.line_to_char(index);
-        let display = display_text(&text.line(index).to_string());
-        let offsets = char_to_byte(&display);
-        let run = |len: usize, underline: bool| TextRun {
-            len,
-            font: font(theme::UI_FONT),
-            color,
-            background_color: None,
-            underline: underline.then_some(UnderlineStyle {
-                thickness: px(1.),
-                color: Some(color),
-                wavy: false,
-            }),
-            strikethrough: None,
+        let (display, columns, looks) = drawn(text, index, styled, &mut plain);
+        let offsets = char_to_byte(display);
+        let chars = offsets.len() - 1;
+        // The line's positions: its drawn columns, and back (a hidden mark's positions draw at
+        // the shown character after it).
+        let len = columns.len().checked_sub(1).unwrap_or(chars);
+        let column = |pos: usize| columns.get(pos).copied().unwrap_or(pos.min(chars));
+        let position = |column: usize| match columns {
+            [] => column,
+            columns => columns.partition_point(|&at| at < column),
         };
         // The IME composition is underlined.
-        let runs: Vec<TextRun> = match marked {
-            Some(marked) if !display.is_empty() => {
-                let chars = offsets.len() - 1;
-                let from = marked.start.saturating_sub(start).min(chars);
-                let to = marked.end.saturating_sub(start).min(chars);
-                let (a, b) = (offsets[from], offsets[to]);
-                [
-                    run(a, false),
-                    run(b - a, true),
-                    run(display.len() - b, false),
-                ]
-                .into_iter()
-                .filter(|run| run.len > 0)
-                .collect()
-            }
-            _ => vec![run(display.len(), false)],
-        };
+        let marked = marked
+            .filter(|_| !display.is_empty())
+            .map(|marked| {
+                column(marked.start.saturating_sub(start).min(len))
+                    ..column(marked.end.saturating_sub(start).min(len))
+            })
+            .filter(|marked| !marked.is_empty());
+        let runs = line_runs(display, &offsets, looks, marked, ui);
         let wrapped = text_system
             .shape_text(
-                display.clone().into(),
+                display.to_string().into(),
                 font_size,
                 &runs,
                 Some(wrap_width),
@@ -1096,11 +1520,14 @@ fn shape(
         }
         let byte_to_char = |byte: usize| offsets.partition_point(|&offset| offset < byte);
         for (row, &row_start) in starts.iter().enumerate() {
-            let row_end = starts.get(row + 1).copied().unwrap_or(display.len());
-            let (first, last) = (byte_to_char(row_start), byte_to_char(row_end));
+            let first = position(byte_to_char(row_start));
+            let last = match starts.get(row + 1) {
+                Some(&next) => position(byte_to_char(next)),
+                None => len,
+            };
             let origin = unwrapped.x_for_index(row_start);
             let xs = (first..=last)
-                .map(|column| unwrapped.x_for_index(offsets[column]) - origin)
+                .map(|pos| unwrapped.x_for_index(offsets[column(pos)]) - origin)
                 .collect();
             let wraps = row + 1 < starts.len();
             rows.push(Row {
@@ -1116,22 +1543,28 @@ fn shape(
     (lines, Geometry { rows, line_height })
 }
 
-/// The number of rows the text takes at `wrap_width` (the field's height).
-fn count_rows(text: &Rope, wrap_width: Pixels, window: &mut Window) -> usize {
+/// The number of rows the text takes at `wrap_width` (the field's height), styled as drawn.
+fn count_rows(
+    text: &Rope,
+    styled: Option<&Stretches>,
+    wrap_width: Pixels,
+    ui: &UiColors,
+    window: &mut Window,
+) -> usize {
     let text_system = window.text_system().clone();
     let mut rows = 0;
+    let mut plain = String::new();
     for index in 0..text.len_lines() {
-        let display = display_text(&text.line(index).to_string());
-        let runs = [TextRun {
-            len: display.len(),
-            font: font(theme::UI_FONT),
-            color: gpui::black(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        }];
+        let (display, _, looks) = drawn(text, index, styled, &mut plain);
+        let runs = line_runs(display, &char_to_byte(display), looks, None, ui);
         let wrapped = text_system
-            .shape_text(display.into(), px(TEXT_SIZE), &runs, Some(wrap_width), None)
+            .shape_text(
+                display.to_string().into(),
+                px(TEXT_SIZE),
+                &runs,
+                Some(wrap_width),
+                None,
+            )
             .ok()
             .and_then(|lines| lines.into_iter().next());
         rows += wrapped.map_or(1, |line| line.wrap_boundaries().len() + 1);
@@ -1197,16 +1630,24 @@ impl Element for PromptElement {
                 AvailableSpace::Definite(width) => Some(width),
                 _ => None,
             });
-            let (text, max_rows, glide) = {
+            let (text, styled, max_rows, glide) = {
                 let input = input.read(cx);
                 (
                     input.document.text().clone(),
+                    input.styled.clone(),
                     input.max_rows,
                     input.height_glide,
                 )
             };
+            let ui = Theme::ui(cx);
             let rows = match width {
-                Some(width) => count_rows(&text, width - px(CURSOR_WIDTH), window),
+                Some(width) => count_rows(
+                    &text,
+                    styled.as_deref(),
+                    width - px(CURSOR_WIDTH),
+                    &ui,
+                    window,
+                ),
                 None => text.len_lines(),
             };
             let height = px(LINE_HEIGHT) * rows.clamp(1, max_rows) as f32;
@@ -1230,6 +1671,7 @@ impl Element for PromptElement {
         let ui = Theme::ui(cx);
         let input = self.input.read(cx);
         let text = input.document.text().clone();
+        let styled = input.styled.clone();
         let primary = input.document.selection().primary();
         let marked = input.marked_range.clone();
         let focused = input.focus_handle.is_focused(window);
@@ -1242,9 +1684,10 @@ impl Element for PromptElement {
 
         let (lines, geometry) = shape(
             &text,
+            styled.as_deref(),
             marked.as_ref(),
             wrap_width,
-            ui.foreground,
+            &ui,
             font_size,
             line_height,
             window,
@@ -1343,7 +1786,26 @@ impl Element for PromptElement {
         );
         let line_height = state.geometry.line_height;
         let origin = state.origin;
+        // Lines out of view aren't drawn.
+        let shown: Vec<&ShapedLine> = state
+            .lines
+            .iter()
+            .filter(|line| {
+                let top = origin.y + line.top;
+                let rows = line.wrapped.wrap_boundaries().len() + 1;
+                top <= bounds.bottom() && top + line_height * (rows as f32) >= bounds.top()
+            })
+            .collect();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            // The styled text's backgrounds (code, a spoiler's veil) under the selection.
+            if state.placeholder.is_none() {
+                for line in &shown {
+                    let at = point(origin.x, origin.y + line.top);
+                    line.wrapped
+                        .paint_background(at, line_height, TextAlign::Left, None, window, cx)
+                        .ok();
+                }
+            }
             for quad in state.selection.drain(..) {
                 window.paint_quad(quad);
             }
@@ -1361,23 +1823,10 @@ impl Element for PromptElement {
                         .ok();
                 }
                 None => {
-                    for line in &state.lines {
-                        let top = origin.y + line.top;
-                        // Lines out of view aren't drawn.
-                        let rows = line.wrapped.wrap_boundaries().len() + 1;
-                        if top > bounds.bottom() || top + line_height * (rows as f32) < bounds.top()
-                        {
-                            continue;
-                        }
+                    for line in &shown {
+                        let at = point(origin.x, origin.y + line.top);
                         line.wrapped
-                            .paint(
-                                point(origin.x, top),
-                                line_height,
-                                TextAlign::Left,
-                                None,
-                                window,
-                                cx,
-                            )
+                            .paint(at, line_height, TextAlign::Left, None, window, cx)
                             .ok();
                     }
                 }
@@ -1428,6 +1877,36 @@ mod tests {
             ],
             line_height: px(20.),
         }
+    }
+
+    #[test]
+    fn styled_lines_leave_the_marks_out() {
+        let bold = Look {
+            bold: true,
+            ..Look::default()
+        };
+        // The bold span's marks hidden, its looks cut at the line break, in drawn columns.
+        let text = Rope::from_str("**one\ntwo** x\n");
+        let markup = Markup {
+            looks: vec![(2..9, bold)],
+            spans: vec![Span {
+                open: 0..2,
+                close: 9..11,
+            }],
+        };
+        let line = |display: &str, columns: Vec<usize>, looks| DrawnLine {
+            display: display.to_string(),
+            columns,
+            looks,
+        };
+        assert_eq!(
+            Stretches::new(&text, markup).lines,
+            vec![
+                line("one", vec![0, 0, 0, 1, 2, 3], vec![(0..3, bold)]),
+                line("two x", vec![0, 1, 2, 3, 3, 3, 4, 5], vec![(0..3, bold)]),
+                line("", vec![], vec![]),
+            ]
+        );
     }
 
     #[test]

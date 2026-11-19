@@ -314,6 +314,9 @@ pub struct PluginView {
     /// Conversations by element id (API 0.5): their messages come by `update_conversation`; each
     /// is a view of its own, its events passed on as the window's.
     conversations: HashMap<String, (Entity<Conversation>, Subscription)>,
+    /// Where each conversation's field was drawn last (part 5): a picker the plugin opens under
+    /// "<conversation>/field" stands above it.
+    conversation_fields: HashMap<String, Rc<std::cell::Cell<Option<Bounds<Pixels>>>>>,
     /// Galleries by element id (API 0.5): views of their own, drawing only the squares on screen.
     galleries: HashMap<String, (Entity<Gallery>, Subscription)>,
     /// The view has a gallery: in a dialog, the dialog is as tall as it may be and the gallery
@@ -459,6 +462,7 @@ impl PluginView {
             active_tree: None,
             markdown: HashMap::new(),
             conversations: HashMap::new(),
+            conversation_fields: HashMap::new(),
             galleries: HashMap::new(),
             holds_gallery: false,
             toggled: HashMap::new(),
@@ -519,6 +523,15 @@ impl PluginView {
         if !self.visible {
             return None;
         }
+        // A conversation's field (part 5).
+        if let Some(field) = element
+            .strip_suffix("/field")
+            .and_then(|conversation| self.conversation_fields.get(conversation))
+        {
+            let bounds = field.get()?;
+            let area = self.content_bounds.get()?;
+            return in_sight(bounds, area).then_some(bounds);
+        }
         let drawn = self.element_bounds.borrow();
         let bounds = drawn.get(element).copied().or_else(|| {
             let (list, _) = element.split_once('/')?;
@@ -564,6 +577,15 @@ impl PluginView {
             .iter()
             .any(|element| matches!(element.kind, ElementKind::Gallery(_)));
         let fields_before: HashSet<String> = self.fields.keys().cloned().collect();
+        // The view's header names a one-to-one chat: who its messages without an author are from
+        // (the bar of what plays says so).
+        let title: Option<SharedString> =
+            view.elements
+                .iter()
+                .find_map(|element| match &element.kind {
+                    ElementKind::Header(spec) => Some(spec.title.clone().into()),
+                    _ => None,
+                });
         // Each tree's place among the view's trees: a board's column.
         let mut column = 0;
         let mut present = HashSet::new();
@@ -601,7 +623,9 @@ impl PluginView {
                     first_tree.get_or_insert_with(|| element.id.clone());
                 }
                 ElementKind::Markdown(source) => self.sync_markdown(&element.id, source, cx),
-                ElementKind::Conversation(spec) => self.sync_conversation(&element.id, spec, cx),
+                ElementKind::Conversation(spec) => {
+                    self.sync_conversation(&element.id, spec, title.clone(), cx)
+                }
                 ElementKind::Gallery(spec) => self.sync_gallery(&element.id, spec, cx),
                 _ => {}
             }
@@ -628,6 +652,8 @@ impl PluginView {
         self.trees.retain(|id, _| present.contains(id));
         self.markdown.retain(|id, _| present.contains(id));
         self.conversations.retain(|id, _| present.contains(id));
+        self.conversation_fields
+            .retain(|id, _| present.contains(id));
         self.galleries.retain(|id, _| present.contains(id));
         if !self
             .active_tree
@@ -912,14 +938,30 @@ impl PluginView {
         );
     }
 
-    /// A `conversation` element of the view: made the first time, its spec passed on later.
-    fn sync_conversation(&mut self, id: &str, spec: &ConversationSpec, cx: &mut Context<Self>) {
+    /// A `conversation` element of the view: made the first time, its spec (and the view's
+    /// header's title) passed on later.
+    fn sync_conversation(
+        &mut self,
+        id: &str,
+        spec: &ConversationSpec,
+        title: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some((conversation, _)) = self.conversations.get(id) {
-            conversation.update(cx, |conversation, cx| conversation.set_spec(spec, cx));
+            conversation.update(cx, |conversation, cx| {
+                conversation.set_spec(spec, cx);
+                conversation.set_title(title);
+            });
             return;
         }
         let plugin = self.plugin.clone();
-        let conversation = cx.new(|cx| Conversation::new(plugin, spec.clone(), cx));
+        let conversation = cx.new(|cx| {
+            let mut conversation = Conversation::new(plugin, spec.clone(), cx);
+            conversation.set_title(title);
+            conversation
+        });
+        self.conversation_fields
+            .insert(id.to_string(), conversation.read(cx).field_bounds());
         let element = id.to_string();
         let subscription = cx.subscribe(
             &conversation,

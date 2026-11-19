@@ -251,6 +251,41 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
     circle for a square with `rounded_full`. Blade's surfaces and Windows' (an empty
     `draw_surfaces`) are untouched.
 
+- **The atlas frees removed images** (2026-11-19, FluxGram part 5,
+  `crates/flux-app/src/plugin_conversation/media.rs`): every frame of an animated sticker is a new
+  image, and the player drops the one before (`App::drop_image`). gpui 0.2.2's atlas never freed a
+  removed image's tile: it counted its texture's images down and released the texture once all of
+  them were removed, keeping the removed keys meanwhile. Playing stickers took a new 1024² texture
+  every dozen frames, a dozen a second; a texture that also took a lasting image (an avatar, an
+  emoji) was never released and its frames' space stayed dead — GPU memory grew by a texture with
+  each lasting image drawn while stickers played — and `tiles_by_key` kept an entry for every
+  frame.
+  - `src/platform/mac/metal_atlas.rs`, `src/platform/windows/directx_atlas.rs`: a texture's space
+    is etagere's `AtlasAllocator`, which tracks each tile (the `BucketedAtlasAllocator` frees a
+    tile's space only with every tile of its bucket, and a bucket takes at most 4095 tiles in its
+    life). `remove` drops the key at once (drawn again, the image gets a new tile) and lists the
+    tile as removed; its space goes back to the allocator (`free_tile`) once no frame can sample
+    it, and a texture left without tiles is released.
+  - When no frame samples a removed tile (macOS): the window's scene drawn before the removal may
+    be presented again until the window draws a new one, and the renderer doesn't wait for the GPU
+    — a frame may still run while the CPU writes the next one's tiles (`replace_region`). A removed
+    tile's last frame is set when the window next asks the atlas for a tile (only its paint does):
+    the last frame committed by then. `MetalRenderer::draw` numbers the frames it commits
+    (`MetalAtlas::frame_committed`), the command buffer's completion handler reports the GPU's
+    progress (`frame_completed`; one queue completes in order), and the tiles whose last frame has
+    completed are freed as a frame is committed and before a new tile is allocated.
+    `render_to_image` waits for its frame and isn't counted.
+  - Windows: Direct3D 11's immediate context keeps the order of uploads and draws, so a removed
+    tile is freed as the window begins to draw again (the next `get_or_insert_with`).
+    `handle_device_lost` forgets the removed tiles with the textures.
+  - `src/app.rs`: `App::drop_image` without `current_window` skipped a window being updated — out
+    of `App::windows` while it draws or handles an event — so an image dropped then (Flux's players
+    let go of what went out of sight while the conversation renders) stayed in that window's atlas
+    for good. Such a window now drops it once the update is over (`App::defer`).
+  - `FLUX_LOG=gpui::platform::mac::metal_atlas=debug`: a line for every texture created or
+    released, with the atlas's textures, their megabytes, the removed tiles not freed yet and the
+    number of the last frame committed.
+
 ## Moving to a newer gpui
 
 1. Copy the new crate from `~/.cargo/registry/src/*/gpui-<version>/` (`src/`, `build.rs`,
@@ -275,4 +310,6 @@ workspace's `Cargo.toml`. Every change is marked in the code with a `Flux patch`
    Flux still pastes as text elsewhere. A pinch over a picture, in its tab and in the popup, at
    100 % and 125 %, zooms around the fingers (on Windows with a precision touchpad too). In a
    FluxGram chat a round video message plays as a circle with smooth edges and a video's corners
-   are rounded, at 100 % and 125 %.
+   are rounded, at 100 % and 125 %. A chat with animated stickers playing for minutes: the
+   stickers, avatars and pictures stay right, nothing flickers, and Flux's memory in Activity
+   Monitor stays flat.

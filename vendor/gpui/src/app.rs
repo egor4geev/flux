@@ -2101,6 +2101,9 @@ impl App {
     ///
     /// If the current window is being updated, it will be removed from `App.windows`, you can use `current_window` to specify the current window.
     /// This is a no-op if the image is not in the sprite atlas.
+    ///
+    /// Flux patch: without `current_window`, the windows being updated lose the image too, once
+    /// their update is over.
     pub fn drop_image(&mut self, image: Arc<RenderImage>, current_window: Option<&mut Window>) {
         // remove the texture from all other windows
         for window in self.windows.values_mut().flatten() {
@@ -2109,7 +2112,22 @@ impl App {
 
         // remove the texture from the current window
         if let Some(window) = current_window {
-            _ = window.drop_image(image);
+            _ = window.drop_image(image.clone());
+        }
+
+        // Flux patch: a window being updated — drawn, or handling an event — is out of
+        // `self.windows` for the update; gpui 0.2.2 left the image in its atlas for good unless it
+        // was passed as `current_window` (Flux's players drop their frames while the window draws).
+        // Such a window lets the image go once the update is over; removing it twice does nothing.
+        if !self.window_update_stack.is_empty() {
+            let windows = self.window_update_stack.clone();
+            self.defer(move |cx| {
+                for id in windows {
+                    if let Some(Some(window)) = cx.windows.get_mut(id) {
+                        _ = window.drop_image(image.clone());
+                    }
+                }
+            });
         }
     }
 

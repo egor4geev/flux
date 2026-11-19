@@ -30,6 +30,13 @@
 //!   - `click:x,y` — a left click at a point of the Flux window opened last, in points from its top
 //!     left corner (a shot's pixels halved): mouse events posted to Flux's own event queue, so
 //!     the window server and the background mode don't stand in the way (part 10.5);
+//!     `right-click:x,y` — the same with the right button: a context menu (FluxGram part 5) —
+//!     gpui's events to the scenario's window (AppKit's synthesized events carry no button);
+//!     `shift-click:x,y` — a left click with ⇧ held, the same way (selecting a run of messages);
+//!     `press:x,y` and `release:x,y` — the left button only goes down, or only up, there: a click
+//!     held for a moment with `wait:` between them, as a hand clicks — a link of a text (gpui's
+//!     `InteractiveText`) takes the release only after a frame drawn since the press (FluxGram
+//!     part 5);
 //!   - `drag-files:x,y=/a,/b` — files from Finder dragged into the window to `x, y` (window pixels,
 //!     as `click:`), and held there: gpui's `FileDropEvent::Entered` and `Pending`;
 //!     `drop-files:x,y` — dropped there: the mouse up that `FileDropEvent::Submit` becomes, without
@@ -583,6 +590,22 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
         );
         return STEP_PAUSE;
     }
+    if let Some(point) = step.strip_prefix("right-click:") {
+        return right_click(
+            point,
+            gpui::MouseButton::Right,
+            Modifiers::default(),
+            window,
+            cx,
+        );
+    }
+    if let Some(point) = step.strip_prefix("shift-click:") {
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        return right_click(point, gpui::MouseButton::Left, shift, window, cx);
+    }
     if let Some(point) = step.strip_prefix("click:") {
         let point = point
             .split_once(',')
@@ -628,6 +651,8 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
     if let Some(points) = step
         .strip_prefix("move:")
         .or_else(|| step.strip_prefix("drag:"))
+        .or_else(|| step.strip_prefix("press:"))
+        .or_else(|| step.strip_prefix("release:"))
     {
         const LEFT_MOUSE_DOWN: usize = 1;
         const LEFT_MOUSE_UP: usize = 2;
@@ -636,6 +661,8 @@ fn run_step(step: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Duration 
         let numbers: Vec<f64> = points.split(',').filter_map(|n| n.parse().ok()).collect();
         let events: Vec<(usize, f64, f64)> = match numbers[..] {
             [x, y] if step.starts_with("move:") => vec![(MOUSE_MOVED, x, y)],
+            [x, y] if step.starts_with("press:") => vec![(LEFT_MOUSE_DOWN, x, y)],
+            [x, y] if step.starts_with("release:") => vec![(LEFT_MOUSE_UP, x, y)],
             [x1, y1, x2, y2] => {
                 // The drag in steps, as a hand moves it.
                 let steps = 8;
@@ -752,6 +779,60 @@ fn drop_files(point: &str, window: AnyWindowHandle, cx: &mut AsyncApp) -> Durati
     println!(
         "DROP-FILES {point} -> {}",
         if dispatched { "dropped" } else { "no window" }
+    );
+    STEP_PAUSE
+}
+
+/// `right-click:x,y`: the mouse moves to `x, y` (window points, as `click:`) and its right button
+/// goes down and up there, as gpui's events to the scenario's window. Not through AppKit's queue
+/// as `click:`: an `NSEvent` made by `mouseEventWithType:` has no button number, which gpui reads
+/// the button from — a right mouse down came as the left button's (a click, the hover bar), never
+/// a menu. `shift-click:` comes the same way with the left button and ⇧.
+fn right_click(
+    step: &str,
+    button: gpui::MouseButton,
+    modifiers: Modifiers,
+    window: AnyWindowHandle,
+    cx: &mut AsyncApp,
+) -> Duration {
+    use gpui::{MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
+    let Some(point) = window_point(step) else {
+        println!("BAD STEP right-click:{step}: x,y");
+        return STEP_PAUSE;
+    };
+    let sent = window.update(cx, |_, window, cx| {
+        let position = point * (1. / window.ui_scale());
+        window.dispatch_event(
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+            }),
+            cx,
+        );
+    });
+    println!(
+        "RIGHT-CLICK {step} -> {}",
+        if sent.is_ok() { "sent" } else { "no window" }
     );
     STEP_PAUSE
 }
