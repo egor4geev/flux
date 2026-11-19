@@ -106,6 +106,7 @@ mod plugin_review;
 mod plugin_services;
 mod plugin_settings;
 mod plugin_suggestions;
+mod plugin_tasks;
 mod plugin_terminals;
 mod plugin_tools;
 mod plugin_updates;

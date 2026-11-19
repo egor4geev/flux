@@ -7,12 +7,12 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
         "Читать и писать во все сессии Claude и отвечать на его запросы за вас",
     ),
     (
-        "Read your tasks from other plugins",
-        "Читать ваши задачи из других плагинов",
+        "Read your tasks from other plugins and run their actions",
+        "Читать ваши задачи из других плагинов и запускать их действия",
     ),
     (
-        "Give your tasks to other plugins that ask",
-        "Отдавать ваши задачи другим плагинам по запросу",
+        "Give your tasks to other plugins that ask, and run its actions on them",
+        "Отдавать ваши задачи другим плагинам по запросу и выполнять для них свои действия",
     ),
     (
         "Add to the sessions in the Claude console: {0}",

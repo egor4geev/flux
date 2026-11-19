@@ -39,6 +39,7 @@ use gpui::{
 };
 
 use crate::claude::{ClaudeStore, ClaudeStoreEvent, CliState, ConsoleItem};
+use crate::claude_console::SessionRef;
 use crate::claude_session::{Attachment, ClaudeSession, SessionDraft, SessionEvent};
 use crate::claude_transcript::Item;
 use crate::plugins::{PluginStore, PluginStoreEvent};
@@ -323,8 +324,17 @@ impl ClaudeHub {
             return;
         };
         match event {
-            // Streamed text, a step's progress: paced.
-            SessionEvent::Changed => return self.stream(key, cx),
+            // Streamed text, a step's progress: paced. The permission mode has no event of its own
+            // (Flux's menu, an approved plan, the CLI's word after a plugin's `set-mode` all come as a
+            // redraw): a new one goes at once.
+            SessionEvent::Changed => {
+                self.stream(key, cx);
+                let mode = remote_mode(session.read(cx).model().info.permission_mode);
+                let posted = self.posted.get(&id).map(|(_, posted)| posted.mode);
+                if posted.is_none_or(|posted| posted == mode) {
+                    return;
+                }
+            }
             SessionEvent::PendingAdded(request) => {
                 // What Claude wrote before it asks goes first.
                 self.flush(key, cx);
@@ -793,6 +803,8 @@ impl ClaudeHub {
                 RemoteReply::Done
             }),
             RemoteCall::SetMode { session, mode } => self.set_mode(&session, mode, cx),
+            RemoteCall::Rename { session, title } => self.rename(&session, &title, cx),
+            RemoteCall::Close { session } => self.close(&session, cx),
             RemoteCall::NewSession(new) => return self.new_session(new, reply, cx),
             RemoteCall::TurnDiff { session, turn } => self.turn_diff(&session, turn, cx),
             RemoteCall::CheckRollback { session, turn } => self.check_rollback(&session, turn, cx),
@@ -909,6 +921,38 @@ impl ClaudeHub {
             permission_mode(mode).ok_or_else(|| "This mode isn't set remotely".to_string())?;
         let session = self.live_or_resume(id, cx)?;
         session.update(cx, |session, cx| session.set_permission_mode(mode, cx));
+        Ok(RemoteReply::Done)
+    }
+
+    /// The user's title for the session (an unloaded one resumes for it): Claude Code keeps it, and
+    /// its word comes back as the session's title.
+    fn rename(
+        &mut self,
+        id: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<RemoteReply, String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("The title is empty".into());
+        }
+        let session = self.live_or_resume(id, cx)?;
+        session.update(cx, |session, cx| session.rename(title.to_string(), cx));
+        Ok(RemoteReply::Done)
+    }
+
+    /// As the console's Close: a live session ends, and the session leaves «Сейчас» for the history
+    /// (the store's list changes: the plugins hear it gone).
+    fn close(&mut self, id: &str, cx: &mut Context<Self>) -> Result<RemoteReply, String> {
+        let (store, target) = match self.find(id, cx) {
+            Some(Found::Live(session)) => {
+                let store = self.store_of(session.entity_id()).ok_or_else(no_session)?;
+                (store, SessionRef::Live(session))
+            }
+            Some(Found::Unloaded(saved, store)) => (store, SessionRef::Saved(saved)),
+            None => return Err(no_session()),
+        };
+        store.update(cx, |store, cx| store.close_from_console(&target, cx));
         Ok(RemoteReply::Done)
     }
 

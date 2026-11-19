@@ -3,7 +3,8 @@
 //! no window: documents, the project, tool windows, questions, pickers, terminals, proposals,
 //! Git, problems, links, Claude, contexts, commands and the status bar fail or do nothing there,
 //! with a line in the plugin's log. Its notifications, the `status` lines of its settings page,
-//! its settings, and opening a link or copying text go on to the app ([`HostState::call`]).
+//! its settings, opening a link or copying text, Claude for remote work and the window a task's
+//! action runs in go on to the app ([`HostState::call`]).
 
 use crate::api::bindings::flux::plugin::service;
 use crate::api::events::Event;
@@ -56,6 +57,7 @@ impl HostState {
             | HostCall::SetSettingStatus { .. }
             | HostCall::HelperProgress { .. }
             | HostCall::Claude { .. }
+            | HostCall::ProjectWindow { .. }
             | HostCall::Window {
                 call: WindowCall::OpenUrl(_) | WindowCall::CopyText(_) | WindowCall::OpenFile { .. },
                 ..
@@ -146,8 +148,8 @@ fn window_reply(call: &WindowCall) -> Option<WindowReply> {
         | WindowCall::ShowTerminal { .. }
         | WindowCall::Propose { .. }
         | WindowCall::SetLinkPatterns(_)
-        | WindowCall::NewClaudeSession(_)
         | WindowCall::SwitchContext { .. } => WindowReply::Done(failed()),
+        WindowCall::NewClaudeSession(_) => WindowReply::Session(failed()),
         WindowCall::OpenTerminal(_) => WindowReply::Opened(failed()),
         WindowCall::Repositories => WindowReply::Repositories(Vec::new()),
         WindowCall::GitStatus => WindowReply::Changes(Vec::new()),

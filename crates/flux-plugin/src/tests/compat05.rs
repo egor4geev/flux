@@ -12,7 +12,9 @@ use crate::api::events::Event;
 use crate::api::tasks::{Query, TaskQuery};
 use crate::api::tools::ToolCall;
 use crate::registry::PluginEntry;
-use crate::runtime::{HostCall, Instance, InstanceConfig, InstanceRole, MessageKind};
+use crate::runtime::{
+    HostCall, Instance, InstanceConfig, InstanceRole, MessageKind, WindowCall, WindowReply,
+};
 
 /// The probe of the API 0.5.
 const PROBE_05: &[u8] = include_bytes!("../../tests/fixtures/probe-0.5.wasm");
@@ -70,6 +72,31 @@ fn a_plugin_built_for_0_5_runs_and_hears_only_what_it_knows() {
         }
         other => panic!("expected a form, got {other:?}"),
     }
+}
+
+#[test]
+fn a_0_5_plugins_new_claude_session_drops_its_id() {
+    let entry = plugin_folder(
+        "test.v05-claude",
+        "0.5",
+        PROBE_05,
+        "project = \"none\"\nclaude = true",
+        &["v3:claude"],
+        "",
+    );
+    let mut probe = start(entry, None, Map::new());
+    probe.instance.run_command("v3:claude", palette());
+    match probe.next() {
+        MessageKind::Call(HostCall::Window {
+            call: WindowCall::NewClaudeSession(spec),
+            reply,
+        }) => {
+            assert_eq!(spec.title.as_deref(), Some("TRACK-1"));
+            reply.send(WindowReply::Session(Ok("s-1".into()))).unwrap();
+        }
+        other => panic!("expected a new session, got {other:?}"),
+    }
+    assert_eq!(probe.notification(), "claude: ok");
 }
 
 #[test]

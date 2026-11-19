@@ -14,19 +14,28 @@
 //!
 //! The plugin gives a few made-up tasks too (`task-source = true`): the service answers the
 //! queries, and the window asks for them (`tasks::mine`, `search`, `get`) as another plugin would.
+//! Each task has two Claude actions, as a tracker's settings would have them: «Take to Work» (the
+//! task's branch first) and «Plan» (plan mode). The island runs one in the chosen project as a bot
+//! would (`tasks::get`, then `tasks::run` — from the service, the asker); the source's side is the
+//! plugin's instance in the project's window, which Flux opens in the background when none has
+//! it: it does what a tracker does, asking nothing — the branch with Git's quiet calls (left alone
+//! when local changes are in the way, with a note), then Claude with the task — and answers with
+//! `tasks::started`. «Silent» is an action the source never answers: the asker's timeout.
 //! Its action in the Claude console («Show in the Plugin's Console») opens the session's tab and
 //! shows the island.
 
 use std::collections::{BTreeMap, HashMap};
 
-use flux_plugin_api::host::ui;
+use flux_plugin_api::host::{project, ui};
 use flux_plugin_api::remote::{
     self, Awake, Mode, Project, RegionState, Request, RequestKind, Response, Session, SessionState,
     SystemEvent, SystemState, TurnSummary, UsageLimits,
 };
-use flux_plugin_api::tasks::{self, Query, Task};
+use flux_plugin_api::tasks::{self, Query, Task, TaskQuery, TaskRun, TaskStarted};
 use flux_plugin_api::view::{self, *};
-use flux_plugin_api::{CommandContext, Event, Plugin, UiEvent, register_plugin, service, tr, trf};
+use flux_plugin_api::{
+    CommandContext, Event, Plugin, UiEvent, claude, git, register_plugin, service, tr, trf,
+};
 use serde::{Deserialize, Serialize};
 
 /// The tool window on the left island.
@@ -54,6 +63,8 @@ struct Shared {
     notes: Vec<String>,
     /// The session the console's action asked to show, with a count: a window shows it once.
     show: Option<(u32, String)>,
+    /// How the last action run on a task went.
+    run: Option<String>,
     /// Why watching failed.
     error: Option<String>,
 }
@@ -72,6 +83,26 @@ enum ToService {
     /// Send me what you know.
     Hello,
     SetAwake(Awake),
+    /// Run an action on a task in a project, as a bot would.
+    Run {
+        key: String,
+        action: String,
+        project: String,
+    },
+}
+
+/// The action that takes a task to work: its branch first.
+const WORK: &str = "work";
+/// The action that plans a task: plan mode.
+const PLAN: &str = "plan";
+/// An action the source never answers (not among the tasks' actions): the asker's timeout.
+const SILENT: &str = "silent";
+
+/// A run of one of the plugin's actions in this window, waiting for its branch.
+struct PendingRun {
+    query: u64,
+    run: TaskRun,
+    branch: String,
 }
 
 /// The made-up tasks the plugin gives.
@@ -103,6 +134,8 @@ struct RemotePlayground {
     new_tab: bool,
     /// Its last call's result.
     new_result: String,
+    /// The runs of the plugin's actions waiting for their branch, by the Git operation's id.
+    runs: HashMap<u64, PendingRun>,
 }
 
 impl Plugin for RemotePlayground {
@@ -260,6 +293,11 @@ impl RemotePlayground {
                         Ok(()) => self.shared.awake = Some(awake),
                         Err(err) => self.note(err),
                     },
+                    Some(ToService::Run {
+                        key,
+                        action,
+                        project,
+                    }) => self.run_action(&key, &action, &project),
                     None => return,
                 }
             }
@@ -279,10 +317,34 @@ impl RemotePlayground {
             .find(|known| known.id == session)
             .map_or_else(|| session.to_string(), |known| title(known))
     }
+
+    /// Runs an action on a task as a bot would: the task with its source and actions, then the
+    /// run — which waits for the source's instance in the project's window.
+    fn run_action(&mut self, key: &str, action: &str, project: &str) {
+        let result = tasks::get(key)
+            .and_then(|task| task.ok_or_else(|| trf("No task {0}", &[&key])))
+            .and_then(|task| tasks::run(&task, action, project));
+        let line = match result {
+            Ok(started) => {
+                let mut line = trf(
+                    "«{0}» on {1}: session {2}",
+                    &[&action, &key, &started.session],
+                );
+                for note in &started.notes {
+                    line.push_str(&format!(" · {note}"));
+                }
+                line
+            }
+            Err(err) => trf("«{0}» on {1} failed: {2}", &[&action, &key, &err]),
+        };
+        // The log too: a check reads it.
+        println!("run: {line}");
+        self.shared.run = Some(line);
+    }
 }
 
 /// The plugin's tasks for a query: all for `mine`, the matching ones for a search, one with its
-/// text for `get`.
+/// text and actions for `get`.
 fn made_up_tasks(query: &Query) -> Vec<Task> {
     let all = TASKS
         .iter()
@@ -305,9 +367,106 @@ fn made_up_tasks(query: &Query) -> Vec<Task> {
                     tr("A made-up task of the playground.")
                 );
                 task.markdown(&text)
+                    .action(tasks::action(WORK, &tr("Take to Work")).start())
+                    .action(tasks::action(PLAN, &tr("Plan")).plan())
             })
             .collect(),
+        // In a window: `run_query`.
+        Query::Run(_) => Vec::new(),
     }
+}
+
+/// The branch of a task the plugin's «Take to Work» checks out: "PLAY-1-playground".
+fn branch_of(key: &str) -> String {
+    format!("{key}-playground")
+}
+
+// --- A window: the source's side of a run ---
+
+impl RemotePlayground {
+    /// A query for the plugin's tasks in a window: a run does the action here; the rest are
+    /// answered at once (the service answers them too, when it is the one asked).
+    fn task_query(&mut self, query: TaskQuery) {
+        let Query::Run(run) = query.query else {
+            return tasks::respond(query.id, Ok(made_up_tasks(&query.query)));
+        };
+        let known = TASKS
+            .iter()
+            .any(|(key, ..)| key.eq_ignore_ascii_case(&run.key));
+        match run.action.as_str() {
+            _ if !known => tasks::started(query.id, Err(trf("No task {0}", &[&run.key]))),
+            // Nobody answers: the asker gives up after a minute.
+            SILENT => println!("run: {} stays unanswered", run.key),
+            WORK => self.take_to_work(query.id, run),
+            PLAN => start_claude(query.id, &run, Vec::new()),
+            other => tasks::started(query.id, Err(trf("No action «{0}»", &[&other]))),
+        }
+    }
+
+    /// «Take to Work»: the task's branch — checked out when it is there, made from the current
+    /// one when not — quietly; Claude when Git is done (`git_done`).
+    fn take_to_work(&mut self, query: u64, run: TaskRun) {
+        let branch = branch_of(&run.key);
+        // The window's project is the run's, as Flux names it (`/tmp` is `/private/tmp`).
+        let root = project::root().unwrap_or_else(|| run.project.clone());
+        let Some(repo) = git::repository_of(&root) else {
+            let note = tr("No Git repository: no branch for the task.");
+            return start_claude(query, &run, vec![note]);
+        };
+        if repo.branch.as_deref() == Some(branch.as_str()) {
+            return start_claude(query, &run, Vec::new());
+        }
+        let exists = git::branches(&repo.root)
+            .unwrap_or_default()
+            .iter()
+            .any(|known| !known.remote && known.name == branch);
+        let operation = match exists {
+            true => git::checkout_quietly(&repo.root, &branch),
+            false => git::new_branch_quietly(&repo.root, &branch, None),
+        };
+        self.runs
+            .insert(operation, PendingRun { query, run, branch });
+    }
+
+    /// A Git operation ended: a run that waited for it goes on — on the current branch, with a
+    /// note, when the task's couldn't be checked out.
+    fn git_done(&mut self, operation: u64, result: Result<(), String>) {
+        let Some(pending) = self.runs.remove(&operation) else {
+            return;
+        };
+        let notes = match result {
+            Ok(()) => Vec::new(),
+            Err(why) => vec![trf(
+                "The branch {0} wasn't checked out: {1}. Claude works on the current one.",
+                &[&pending.branch, &why],
+            )],
+        };
+        start_claude(pending.query, &pending.run, notes);
+    }
+}
+
+/// Claude with the task, as the action says — then `started` with the session's id.
+fn start_claude(query: u64, run: &TaskRun, notes: Vec<String>) {
+    let (title, status) = TASKS
+        .iter()
+        .find(|(key, ..)| key.eq_ignore_ascii_case(&run.key))
+        .map(|(_, title, status)| (tr(title), tr(status)))
+        .unwrap_or_default();
+    let text = format!("# {title}\n\n{status}");
+    let mut session = claude::session()
+        .title(&format!("{}: {title}", run.key))
+        .attach(&run.key, &text)
+        .send();
+    session = match run.action.as_str() {
+        PLAN => session
+            .prompt(&tr(
+                "Study the task and the code it concerns, then propose a plan.",
+            ))
+            .plan_mode(),
+        _ => session.prompt(&tr("Take the task to work: do it.")),
+    };
+    let result = session.start().map(|id| TaskStarted { session: id, notes });
+    tasks::started(query, result);
 }
 
 // --- A window: shows and calls ---
@@ -332,6 +491,8 @@ impl RemotePlayground {
             Event::ServiceStarted => {
                 let _ = service::send_json(&ToService::Hello);
             }
+            Event::TaskQuery(query) => self.task_query(query),
+            Event::GitDone((operation, result)) => self.git_done(operation, result),
             Event::ServiceMessage((None, text)) => {
                 let Some(shared) = service::parse::<Shared>(&text) else {
                     return;
@@ -348,15 +509,7 @@ impl RemotePlayground {
             }
             Event::ToolWindowShown(window) if window == WINDOW => {
                 self.shown = true;
-                if self.projects.is_empty() {
-                    match remote::projects() {
-                        Ok(projects) => {
-                            self.project = projects.first().map(|p| p.path.clone());
-                            self.projects = projects;
-                        }
-                        Err(err) => self.result = trf("Failed: {0}", &[&err]),
-                    }
-                }
+                self.load_projects();
                 self.render();
             }
             Event::ToolWindowHidden(window) if window == WINDOW => self.shown = false,
@@ -419,6 +572,20 @@ impl RemotePlayground {
                 self.render_tab(&session);
             }
             _ => {}
+        }
+    }
+
+    /// The projects Flux knows, once: the new session's and the run's choice.
+    fn load_projects(&mut self) {
+        if !self.projects.is_empty() {
+            return;
+        }
+        match remote::projects() {
+            Ok(projects) => {
+                self.project = projects.first().map(|p| p.path.clone());
+                self.projects = projects;
+            }
+            Err(err) => self.result = trf("Failed: {0}", &[&err]),
         }
     }
 
@@ -489,6 +656,32 @@ impl RemotePlayground {
                     Err(err) => self.result = trf("Failed: {0}", &[&err]),
                 }
             }
+            "run-work" | "run-plan" | "run-silent" => {
+                self.load_projects();
+                let action = match element {
+                    "run-work" => WORK,
+                    "run-plan" => PLAN,
+                    _ => SILENT,
+                };
+                let key = self.query.trim().to_uppercase();
+                let key = match key.is_empty() {
+                    true => TASKS[0].0.to_string(),
+                    false => key,
+                };
+                let Some(project) = self.project.clone() else {
+                    self.result = tr("Choose a project");
+                    return;
+                };
+                let run = ToService::Run {
+                    key,
+                    action: action.into(),
+                    project,
+                };
+                self.result = match service::send_json(&run) {
+                    Ok(()) => tr("Runs: the service waits for the source"),
+                    Err(err) => trf("Failed: {0}", &[&err]),
+                };
+            }
             "new-session" => {
                 let Some(project) = self.project.clone() else {
                     self.new_result = tr("Choose a project");
@@ -513,6 +706,7 @@ impl RemotePlayground {
             }
             other => {
                 if let Some(index) = other.strip_prefix("project-") {
+                    self.load_projects();
                     let index: usize = index.parse().unwrap_or_default();
                     self.project = self.projects.get(index).map(|p| p.path.clone());
                 }
@@ -788,6 +982,20 @@ impl RemotePlayground {
                 button("tasks-get", &tr("Get")).into(),
             ],
         ));
+        // A task's action (the key in the field; none — the first task) in a project.
+        elements.push(label("run-title", &tr("Run the task's action in")));
+        elements.push(row("run-projects", self.project_buttons()));
+        elements.push(row(
+            "run",
+            [
+                button("run-work", &tr("Take to Work")).into(),
+                button("run-plan", &tr("Plan")).into(),
+                button("run-silent", &tr("Silent")).into(),
+            ],
+        ));
+        if let Some(run) = &shared.run {
+            elements.push(text("run-result", [span(run).tone(Tone::Dim)]));
+        }
         if !self.tasks.is_empty() {
             let lines: Vec<String> = self
                 .tasks
@@ -827,9 +1035,9 @@ impl RemotePlayground {
         tree.into_element("sessions")
     }
 
-    fn new_session(&self) -> Vec<Element> {
-        let projects = self
-            .projects
+    /// A button per project Flux knows; the chosen one stands out.
+    fn project_buttons(&self) -> Vec<Element> {
+        self.projects
             .iter()
             .enumerate()
             .map(|(index, project)| -> Element {
@@ -838,11 +1046,15 @@ impl RemotePlayground {
                     button = button.primary();
                 }
                 button.into()
-            });
+            })
+            .collect()
+    }
+
+    fn new_session(&self) -> Vec<Element> {
         vec![
             header("new-title", &tr("New session")).into(),
             label("projects-title", &tr("Project")),
-            row("projects", projects),
+            row("projects", self.project_buttons()),
             text_field("prompt", &self.prompt, Some(&tr("The first message"))),
             row(
                 "start",

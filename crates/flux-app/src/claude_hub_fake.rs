@@ -211,6 +211,27 @@ pub(crate) fn handle(plugin: &str, call: RemoteCall, reply: Sender<RemoteReply>,
                 RemoteReply::Done
             }
         }
+        RemoteCall::Rename { session, title } => {
+            if !known(&session) {
+                RemoteReply::Failed("No such session".into())
+            } else {
+                update(&session, |session| session.title = title.trim().to_string());
+                RemoteReply::Done
+            }
+        }
+        RemoteCall::Close { session } => {
+            if !known(&session) {
+                RemoteReply::Failed("No such session".into())
+            } else {
+                fake()
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .retain(|known| known.id != session);
+                broadcast(RemoteEvent::SessionGone(session));
+                RemoteReply::Done
+            }
+        }
         RemoteCall::NewSession(spec) => {
             let id = {
                 let mut fake = fake().lock().unwrap();

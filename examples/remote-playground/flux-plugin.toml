@@ -6,18 +6,21 @@ name = "Remote Playground"
 version = "0.1.0"
 api = "0.6"
 authors = ["Egor Ageev"]
-description = "Every Claude session of Flux in one window, with a button for every call of the remote-work API; tasks between plugins."
+description = "Every Claude session of Flux in one window, with a button for every call of the remote-work API; tasks between plugins and their actions."
 repository = "https://github.com/egor4geev/flux"
 icon = "icons/remote.svg"
 wasm = "target/wasm32-wasip2/release/flux_remote_playground.wasm"
 # The service watches the sessions for the whole app, as a bot would, and passes them to the
-# windows; it also gives a few made-up tasks to whoever asks.
+# windows; it also gives a few made-up tasks to whoever asks. A task's action runs in the
+# project's window: its branch (Git, quietly) and Claude with the task.
 service = true
 task-source = true
 
 [permissions]
 claude-remote = true
 tasks = true
+project = "write"
+claude = true
 
 [[commands]]
 id = "open"

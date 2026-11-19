@@ -360,7 +360,7 @@ fn permission_lines(permissions: &Permissions) -> Vec<PermissionLine> {
     if permissions.tasks {
         lines.push(line(
             IconName::Checklist,
-            tr("Read your tasks from other plugins").to_string(),
+            tr("Read your tasks from other plugins and run their actions").to_string(),
             false,
         ));
     }
@@ -414,7 +414,8 @@ fn manifest_lines(manifest: &Manifest, translate: &dyn Fn(&str) -> String) -> Ve
     if manifest.task_source {
         lines.push(PermissionLine {
             icon: IconName::Checklist,
-            text: tr("Give your tasks to other plugins that ask").to_string(),
+            text: tr("Give your tasks to other plugins that ask, and run its actions on them")
+                .to_string(),
             broad: false,
         });
     }

@@ -21,7 +21,8 @@
 // the user could do with it at the computer, for a plugin that brings the sessions to the user
 // elsewhere (`claude-remote`); the computer's screen lock, sleep and power, and keeping it awake;
 // actions of a plugin at a session in the pult (`[[claude-actions]]`); tasks between plugins — a
-// tracker gives them, a bot asks (`tasks`).
+// tracker gives them and runs its Claude actions on them, a bot asks (`tasks`); the id of a session
+// `claude.new-session` opens; Git's new branch and checkout that ask nothing (`git`).
 //
 // Plugins built for 0.2, 0.3 and 0.5 (and 0.4, which kept the 0.3 interfaces) keep working: Flux
 // answers their calls (`wit/v0.2`, `wit/v0.3`, `wit/v0.5`) with the same code, and doesn't send
@@ -1605,6 +1606,15 @@ interface git {
     /// Checks out a branch (a remote one — as a new local branch tracking it), as the Branches
     /// popup does. How it ended comes as `git-done`.
     checkout: func(root: string, branch: string) -> u64;
+    /// As `new-branch`, but asks nothing (0.6): when local changes or untracked files are in the
+    /// way, it fails (`git-done` with why — a sentence for the user, in Flux's language) and
+    /// nothing changes: no branch is made, nothing is stashed. For work with nobody at the
+    /// computer (a task's action run from the phone).
+    new-branch-quietly: func(root: string, name: string, start: option<string>) -> u64;
+    /// As `checkout`, asking nothing (0.6, see `new-branch-quietly`): plain `git checkout` —
+    /// changes that don't conflict come along; conflicting ones make it fail: "Local changes are
+    /// in the way of checking out 'TRACK-142-fix'".
+    checkout-quietly: func(root: string, branch: string) -> u64;
     /// Sets or removes (none) the plugin's commit message template.
     set-commit-template: func(template: option<commit-template>);
 }
@@ -1795,9 +1805,10 @@ interface claude {
         plan-mode: bool,
     }
 
-    /// Opens a new session in the Claude window (or its tab, where the user keeps it). Fails when
-    /// Claude Code is turned off or not installed.
-    new-session: func(spec: session-spec) -> result<_, string>;
+    /// Opens a new session in the Claude window (or its tab, where the user keeps it): its id —
+    /// the CLI's session id (0.6), the one `claude-remote` names it by. Fails when Claude Code is
+    /// turned off or not installed.
+    new-session: func(spec: session-spec) -> result<string, string>;
 }
 
 /// Contexts, as Tasks & Contexts in JetBrains: the window's open tabs — documents, Claude chats,
@@ -2179,6 +2190,13 @@ interface claude-remote {
     interrupt: func(session: string) -> result<_, string>;
     /// Changes the permission mode; `other` fails.
     set-mode: func(session: string, mode: mode) -> result<_, string>;
+    /// Renames the session — its tab and the pult's row (`claude-session` brings the new title once
+    /// Claude Code has it); an unloaded one resumes for it.
+    rename: func(session: string, title: string) -> result<_, string>;
+    /// Closes the session as the Claude console's Close does: a live one ends (its process stops,
+    /// its chat goes), and it leaves «Now» for the history («Recent») — `claude-session-gone`
+    /// follows. Not archived; the user can resume it from the history.
+    close: func(session: string) -> result<_, string>;
     /// Opens a new session: its id.
     new-session: func(spec: new-session-spec) -> result<string, string>;
     /// The unified diff of a turn (none — the last one).
@@ -2201,7 +2219,25 @@ interface claude-remote {
 /// true` in its manifest — and another plugin asks Flux for them (`find`, the `tasks`
 /// permission). A query comes to the source as `task-query`; its `respond` goes back to the one who
 /// asked. The source's service gets it when it has one, else its instance in a window.
+///
+/// The source's Claude actions on a task (a tracker's «Take to Work», the user's own ones) come
+/// with the task (`get`), and another plugin runs one with `run`: the query goes to the source's
+/// instance in the project's window — the work is the window's: Git, the tabs, Claude's chat — and
+/// the source answers with `started`.
 interface tasks {
+    /// One of the source's Claude actions on a task, as its settings have them (a tracker's «Take
+    /// to Work», the user's own ones): another plugin runs it with `run`.
+    record task-action {
+        /// Names the action in `run`: the source's own.
+        id: string,
+        /// As the user named it: "Take to Work".
+        title: string,
+        /// Claude starts in plan mode.
+        plan: bool,
+        /// The task is taken to work first: its status, its branch, its tabs, its timer.
+        start: bool,
+    }
+
     record task {
         /// "TRACK-142".
         key: string,
@@ -2211,6 +2247,33 @@ interface tasks {
         url: option<string>,
         /// The task's text and comments for Claude: Markdown; empty in lists (`get` fills it).
         markdown: string,
+        /// The source's Claude actions on the task: `get` fills them, lists leave them empty.
+        actions: list<task-action>,
+        /// The plugin that gave the task — Flux fills it in, whatever the source says: `run` goes
+        /// there.
+        source: string,
+    }
+
+    /// One of a source's actions on a task, in a project (`run`).
+    record task-run {
+        /// The task's `source`.
+        source: string,
+        /// The task's key.
+        key: string,
+        /// The action's id.
+        action: string,
+        /// The project's folder, absolute: the action runs in its window, which Flux opens in the
+        /// background when none has it.
+        project: string,
+    }
+
+    /// What an action did (`run`).
+    record task-started {
+        /// The Claude session the action opened: `claude.new-session`'s id.
+        session: string,
+        /// What went otherwise than at the computer, a sentence each in the user's language: "The
+        /// branch TRACK-142-fix wasn't checked out: local changes are in the way."
+        notes: list<string>,
     }
 
     variant query {
@@ -2218,20 +2281,33 @@ interface tasks {
         mine,
         /// A search by the user's words.
         search(string),
-        /// One task by its key, with its text and comments.
+        /// One task by its key, with its text, its comments and its actions.
         get(string),
+        /// Do one of the source's actions (another plugin's `run`). It comes to the source's
+        /// instance in the project's window, and the answer is `started`, not `respond`. Nobody is
+        /// at the computer: ask nothing (no questions, forms, pickers; Git's `…-quietly` calls),
+        /// and tell in `notes` what was left out.
+        run(task-run),
     }
 
     record task-query {
-        /// Names the query in `respond`.
+        /// Names the query in `respond` or `started`.
         id: u64,
         query: query,
     }
 
-    /// Asks the sources (every one, merged in their order); fails when none answers in 10 seconds.
+    /// Asks the sources (every one, merged in their order); fails when none answers in 10 seconds,
+    /// with "No plugin gives tasks" when no source runs (an asker may skip its tasks then), and with
+    /// a source's own sentence when it is the only one and it fails ("Sign in…").
+    /// A `run` goes by `run`.
     find: func(query: query) -> result<list<task>, string>;
     /// A source's answer to `task-query`.
     respond: func(id: u64, tasks: result<list<task>, string>);
+    /// Runs a source's action on a task and waits for it, up to a minute (`tasks` permission):
+    /// the session it opened. The project's window opens in the background when none has it.
+    run: func(run: task-run) -> result<task-started, string>;
+    /// A source's answer to a `run` query.
+    started: func(id: u64, %result: result<task-started, string>);
 }
 
 /// What happens in the window, the answers to the plugin's questions, and the news of its
@@ -2434,7 +2510,8 @@ interface events {
         /// A link wants a tooltip: (the request for `links.describe`, the pattern's id, the text).
         link-hovered(tuple<u64, string, string>),
         /// `git.new-branch` or `git.checkout` ended: done, or why not (the user declined, git
-        /// failed — Flux has told the user).
+        /// failed — Flux has told the user); a `…-quietly` one's why is a sentence for the user,
+        /// and Flux has told nobody when local changes were in the way.
         git-done(tuple<u64, result<_, string>>),
         /// The tab `<window>/<key>` of a window with tabs was closed (0.5): by the user, by
         /// `hide`, with the window. `tool-window-hidden` comes when it only goes out of sight.
@@ -2487,7 +2564,8 @@ interface events {
         /// The user chose the plugin's action at a session in the pult (0.6, `[[claude-actions]]`):
         /// (the session, the action's id) — to the plugin's watching instances.
         claude-action(tuple<string, string>),
-        /// Another plugin asks for tasks (0.6, `task-source = true`): answer with `tasks.respond`.
+        /// Another plugin asks for tasks (0.6, `task-source = true`): answer with `tasks.respond`;
+        /// a `run` — with `tasks.started`.
         task-query(task-query),
     }
 }

@@ -56,6 +56,7 @@
 //!     `hub:transcript:<n>:<count>`, `hub:send:<n>:<text>`, `hub:answer:<n>:allow[:<choice>]`,
 //!     `…:deny[:<text>]`, `…:1,2/3` (the options of each question, from 1), `…:plan-edits`,
 //!     `…:plan-ask`, `…:keep:<text>`, `hub:interrupt:<n>`, `hub:mode:<n>:ask|edits|plan|bypass`,
+//!     `hub:rename:<n>:<title>`, `hub:close:<n>`,
 //!     `hub:new:<project folder>:<prompt>`, `hub:diff:<n>[:<turn>]`,
 //!     `hub:check-rollback:<n>[:<turn>]`, `hub:rollback:<n>[:<turn>]`, `hub:limits`,
 //!     `hub:region[:again]`, `hub:projects`, `hub:awake:off|always|power`, `hub:system`,
@@ -1124,6 +1125,11 @@ fn hub_step(step: &str, cx: &mut AsyncApp) -> Duration {
             images: Vec::new(),
         },
         "interrupt" => RemoteCall::Interrupt { session: id },
+        "rename" => RemoteCall::Rename {
+            session: id,
+            title: words(rest),
+        },
+        "close" => RemoteCall::Close { session: id },
         "mode" => RemoteCall::SetMode {
             session: id,
             mode: match rest {

@@ -139,6 +139,17 @@ impl wit::Host for State {
         })
     }
 
+    fn rename(&mut self, session: String, title: String) -> Result<(), String> {
+        if title.trim().is_empty() {
+            return Err("claude-remote.rename: the title is empty".into());
+        }
+        self.host.remote_done(RemoteCall::Rename { session, title })
+    }
+
+    fn close(&mut self, session: String) -> Result<(), String> {
+        self.host.remote_done(RemoteCall::Close { session })
+    }
+
     fn new_session(&mut self, spec: wit::NewSessionSpec) -> Result<String, String> {
         if spec.mode == wit::Mode::Other {
             return Err("claude-remote.new-session: the mode `other` can't be set".into());

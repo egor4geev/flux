@@ -2331,6 +2331,9 @@ impl PluginStore {
                 crate::plugin_services::helper_progress(self, &plugin, &helper, progress, cx)
             }
             HostCall::Claude { call, reply } => crate::claude_hub::handle(&plugin, call, reply, cx),
+            HostCall::ProjectWindow { project, reply } => {
+                crate::plugin_tasks::project_window(&project, reply, cx)
+            }
             call @ (HostCall::Ask { .. }
             | HostCall::AskText { .. }
             | HostCall::AskForm { .. }

@@ -1,9 +1,11 @@
 //! Plugins built for the API 0.3 and 0.4 (`wit/v0.3`; 0.4 changed only the manifest): Flux runs
 //! them with the code of the current version (0.6), as [`super`] does for 0.2.
 //!
-//! - Every interface but `ui` is answered by the current implementations under the 0.3 names:
-//!   0.5 only added functions to `dialogs` (`pick-files`) and `process` (`helper`), 0.6 changed
-//!   none, and a 0.3 plugin simply doesn't import what was added.
+//! - Every interface but `ui`, `picker` and `claude` is answered by the current implementations
+//!   under the 0.3 names: 0.5 only added functions to `dialogs` (`pick-files`) and `process`
+//!   (`helper`), 0.6 to `git` (the quiet new branch and checkout), and a 0.3 plugin simply
+//!   doesn't import what was added. `claude.new-session` returns the session's id since 0.6: its
+//!   0.3 implementation drops it.
 //! - `ui` has a 0.3 implementation that converts and goes on to the current one: a tree row and a
 //!   tree grew (an avatar, a badge's tone, icons after the label, two lines), and so did the
 //!   elements (a picture, an avatar, a QR code, a conversation) and a button (a count). So does
@@ -24,7 +26,8 @@ use crate::api::types::{CommandContext, CommandSource, EditorInfo, Position, Ran
 use crate::api::ui;
 use crate::runtime::State;
 
-/// The bindings of the API 0.3: the exports of a 0.3 component, and `ui`, which needs converting.
+/// The bindings of the API 0.3: the exports of a 0.3 component, and the interfaces that need
+/// converting (`ui`, `picker`, `claude`).
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
         path: "wit/v0.3",
@@ -74,12 +77,34 @@ pub(crate) fn add_to_linker(linker: &mut Linker<State>) -> wasmtime::Result<()> 
         timers = "timers",
         system = "system",
         links = "links",
-        claude = "claude",
         contexts = "contexts",
     );
     v3::ui::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
     v3::picker::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
+    v3::claude::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
     Ok(())
+}
+
+// --- `claude`: a new session without its id ---
+
+impl v3::claude::Host for State {
+    fn new_session(&mut self, spec: v3::claude::SessionSpec) -> Result<(), String> {
+        let spec = current::claude::SessionSpec {
+            title: spec.title,
+            attachments: spec
+                .attachments
+                .into_iter()
+                .map(|attachment| current::claude::Attachment {
+                    label: attachment.label,
+                    markdown: attachment.markdown,
+                })
+                .collect(),
+            prompt: spec.prompt,
+            send: spec.send,
+            plan_mode: spec.plan_mode,
+        };
+        current::claude::Host::new_session(self, spec).map(drop)
+    }
 }
 
 // --- `picker`: 0.3 items, without an avatar ---

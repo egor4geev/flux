@@ -176,6 +176,15 @@ fn palette() -> crate::api::types::CommandContext {
     }
 }
 
+/// The context of a command run by a notification's action that carries `argument`.
+fn with_argument(argument: &str) -> crate::api::types::CommandContext {
+    crate::api::types::CommandContext {
+        source: crate::api::types::CommandSource::Notification,
+        argument: Some(argument.into()),
+        ..palette()
+    }
+}
+
 /// A running probe and its messages.
 struct Probe {
     instance: Instance,
@@ -193,10 +202,31 @@ fn start_in(
     settings: Map<String, Value>,
     language: &str,
 ) -> Probe {
+    start_with(
+        entry,
+        crate::runtime::InstanceRole::Window(1),
+        root,
+        settings,
+        language,
+    )
+}
+
+/// The probe as a window's instance (its id) or as the service.
+fn start_as(entry: PluginEntry, role: crate::runtime::InstanceRole) -> Probe {
+    start_with(entry, role, None, Map::new(), "en")
+}
+
+fn start_with(
+    entry: PluginEntry,
+    role: crate::runtime::InstanceRole,
+    root: Option<PathBuf>,
+    settings: Map<String, Value>,
+    language: &str,
+) -> Probe {
     let (messages, receiver) = unbounded();
     let log = PluginLog::memory();
     let instance = Instance::start(InstanceConfig {
-        role: crate::runtime::InstanceRole::Window(1),
+        role,
         entry: std::sync::Arc::new(entry),
         project_root: root,
         language: language.into(),

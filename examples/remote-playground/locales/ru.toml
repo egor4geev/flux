@@ -2,7 +2,7 @@
 
 # The manifest.
 "Remote Playground" = "Песочница удалённой работы"
-"Every Claude session of Flux in one window, with a button for every call of the remote-work API; tasks between plugins." = "Все сессии Claude во Flux в одном окне и кнопка для каждого вызова API удалённой работы; задачи между плагинами."
+"Every Claude session of Flux in one window, with a button for every call of the remote-work API; tasks between plugins and their actions." = "Все сессии Claude во Flux в одном окне и кнопка для каждого вызова API удалённой работы; задачи между плагинами и их действия."
 "Playground" = "Песочница"
 "Open Remote Playground" = "Открыть песочницу удалённой работы"
 "Remote" = "Удалённо"
@@ -129,3 +129,17 @@
 "The mode is set" = "Режим изменён"
 "The turn is rolled back" = "Ход откачен"
 "Answered" = "Ответ отправлен"
+
+# A task's actions (the bot's part 3).
+"Take to Work" = "В работу"
+"Silent" = "Без ответа"
+"Run the task's action in" = "Действие с задачей в проекте"
+"Runs: the service waits for the source" = "Выполняется: служба ждёт источник"
+"No task {0}" = "Нет задачи {0}"
+"No action «{0}»" = "Нет действия «{0}»"
+"«{0}» on {1}: session {2}" = "«{0}» для {1}: сессия {2}"
+"«{0}» on {1} failed: {2}" = "«{0}» для {1} не удалось: {2}"
+"No Git repository: no branch for the task." = "Нет репозитория Git: ветки для задачи нет."
+"The branch {0} wasn't checked out: {1}. Claude works on the current one." = "Ветка {0} не выбрана: {1}. Claude работает в текущей."
+"Study the task and the code it concerns, then propose a plan." = "Изучи задачу и код, которого она касается, и предложи план."
+"Take the task to work: do it." = "Возьми задачу в работу: сделай её."

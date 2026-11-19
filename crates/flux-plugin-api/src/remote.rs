@@ -104,6 +104,18 @@ pub fn set_mode(session: &str, mode: Mode) -> Result<(), String> {
     raw::set_mode(session, mode)
 }
 
+/// Renames the session — its tab and the pult's row in Flux; `Event::ClaudeSession` brings the new
+/// title once Claude Code has it. An unloaded session resumes for it.
+pub fn rename(session: &str, title: &str) -> Result<(), String> {
+    raw::rename(session, title)
+}
+
+/// Closes the session as the Claude console's Close does: a live one ends, and it leaves «Now» for
+/// the history («Recent»), where the user can resume it; `Event::ClaudeSessionGone` follows.
+pub fn close(session: &str) -> Result<(), String> {
+    raw::close(session)
+}
+
 /// The unified diff of a turn; none — the last one.
 pub fn turn_diff(session: &str, turn: Option<u32>) -> Result<String, String> {
     raw::turn_diff(session, turn)

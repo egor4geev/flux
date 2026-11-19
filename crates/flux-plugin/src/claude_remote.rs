@@ -298,6 +298,11 @@ pub enum RemoteCall {
     Interrupt { session: String },
     /// → `Done`; `Other` fails.
     SetMode { session: String, mode: RemoteMode },
+    /// The session's new title (an unloaded one resumes for it) → `Done`.
+    Rename { session: String, title: String },
+    /// As the console's Close: a live session ends, and it leaves «Сейчас» for the history →
+    /// `Done`.
+    Close { session: String },
     /// → `Session` (the new session's id).
     NewSession(NewSession),
     /// The unified diff of a turn (none — the last one) → `Text`.

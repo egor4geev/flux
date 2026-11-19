@@ -45,7 +45,7 @@ impl Plugin for Probe {
             return svc::run(command, context);
         }
         if let Some(command) = command.strip_prefix("remote:") {
-            return remote::run(command);
+            return remote::run(command, context);
         }
         match command {
             "context" => {

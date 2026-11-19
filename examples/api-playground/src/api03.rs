@@ -711,8 +711,8 @@ impl Playground {
             session.prompt(&tr("What would you change first?"))
         };
         let text = match session.start() {
-            Ok(()) if plan => tr("A session in plan mode: the task and the request went at once."),
-            Ok(()) => tr("A session with the task attached; the request waits in the field."),
+            Ok(_) if plan => tr("A session in plan mode: the task and the request went at once."),
+            Ok(_) => tr("A session with the task attached; the request waits in the field."),
             Err(err) => failed(&err),
         };
         self.set(Section::Claude, text);

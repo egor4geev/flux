@@ -50,8 +50,9 @@
 //! permission): the sessions and their events, writing, answering, interrupting, the mode, a new
 //! session in any project, a turn's diff and its rollback, the limits, the country check, the
 //! computer's sleep and screen lock; [`tasks`] — the user's tasks between plugins: a tracker gives
-//! them (`task-source = true`), another plugin asks (the `tasks` permission). Guide:
-//! `docs/plugins.md`.
+//! them (`task-source = true`) with its Claude actions on them, another plugin asks (the `tasks`
+//! permission) and runs an action; [`claude`]'s session gives its id; [`git`]'s new branch and
+//! checkout that ask nothing. Guide: `docs/plugins.md`.
 
 pub mod claude;
 pub mod contexts;

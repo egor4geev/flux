@@ -9,10 +9,16 @@
 //!   notification; the screen lock's distributed notifications (`com.apple.screenIsLocked` /
 //!   `…Unlocked`); the system power notifications of IOKit — going to sleep is acknowledged about
 //!   two seconds late ([`SLEEP_HOLD`]), so a plugin's last request goes out.
-//! - Windows: the thread execution state of the app's main thread (`SetThreadExecutionState`) and
-//!   the power source read when asked (`GetSystemPowerStatus`); no lock, sleep or adapter events
-//!   yet — they need a window's messages (`WTSRegisterSessionNotification`,
-//!   `WM_POWERBROADCAST`).
+//! - Windows: the thread execution state of the app's main thread (`SetThreadExecutionState`); the
+//!   power source read when asked (`GetSystemPowerStatus`); the events come as the messages of a
+//!   hidden top-level window of Flux's own, on a thread of its own with its message loop — a
+//!   message-only window gets no broadcasts: the session's lock and unlock
+//!   (`WTSRegisterSessionNotification` → `WM_WTSSESSION_CHANGE`), going to sleep and waking
+//!   (`WM_POWERBROADCAST`: `PBT_APMSUSPEND`; `PBT_APMRESUMEAUTOMATIC` and `PBT_APMRESUMESUSPEND`,
+//!   one wake for both; `RegisterSuspendResumeNotification` for the systems that sleep in modern
+//!   standby), the adapter (`RegisterPowerSettingNotification` of `GUID_ACDC_POWER_SOURCE`). The
+//!   lock at start is the session's (`WTSQuerySessionInformationW`; unlocked when it can't be
+//!   told). Windows doesn't wait for apps before sleeping: the event goes, nothing is held.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -341,20 +347,198 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+    use std::cell::Cell;
+    use std::sync::Mutex;
+
     use futures::channel::mpsc::UnboundedSender;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Power::{
-        ES_CONTINUOUS, ES_SYSTEM_REQUIRED, GetSystemPowerStatus, SYSTEM_POWER_STATUS,
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED, GetSystemPowerStatus, POWERBROADCAST_SETTING,
+        RegisterPowerSettingNotification, RegisterSuspendResumeNotification, SYSTEM_POWER_STATUS,
         SetThreadExecutionState,
     };
+    use windows_sys::Win32::System::RemoteDesktop::{
+        NOTIFY_FOR_THIS_SESSION, WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+        WTS_SESSIONSTATE_LOCK, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW,
+        WTSRegisterSessionNotification, WTSSessionInfoEx,
+    };
+    use windows_sys::Win32::System::SystemServices::GUID_ACDC_POWER_SOURCE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DispatchMessageW,
+        GetMessageW, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
+        PBT_POWERSETTINGCHANGE, RegisterClassW, TranslateMessage, WM_POWERBROADCAST,
+        WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    };
 
-    use super::Signal;
+    use super::{Signal, SystemEvent};
 
-    /// No lock, sleep or adapter events yet (they need a window's messages); the screen counts as
-    /// unlocked.
-    pub(super) fn watch(_: UnboundedSender<Signal>) -> bool {
-        false
+    /// Where the system's signals go.
+    static SIGNALS: Mutex<Option<UnboundedSender<Signal>>> = Mutex::new(None);
+
+    thread_local! {
+        /// A wake was told since the last sleep: Windows sends both resumes of one wake (the
+        /// automatic one, then the user's).
+        static WOKE: Cell<bool> = const { Cell::new(false) };
+        /// A sleep was told and no wake since: the registration and the broadcast to top-level
+        /// windows may both bring it.
+        static ASLEEP: Cell<bool> = const { Cell::new(false) };
     }
 
+    fn send(event: SystemEvent) {
+        if let Some(signals) = SIGNALS.lock().unwrap().as_ref() {
+            let _ = signals.unbounded_send(Signal::Event(event));
+        }
+    }
+
+    /// Starts the window that hears the system, on a thread of its own; whether the screen is
+    /// locked now.
+    pub(super) fn watch(signals: UnboundedSender<Signal>) -> bool {
+        *SIGNALS.lock().unwrap() = Some(signals);
+        let spawned = std::thread::Builder::new()
+            .name("power events".into())
+            .spawn(listen);
+        if let Err(err) = spawned {
+            log::warn!("power: no lock, sleep or power events: {err}");
+        }
+        screen_locked()
+    }
+
+    /// The hidden window and its message loop, for as long as Flux runs.
+    fn listen() {
+        let class: Vec<u16> = "FluxPowerEvents\0".encode_utf16().collect();
+        // SAFETY: a window class of this module and its window, made and served on this thread;
+        // the strings outlive the calls; the registrations live as long as the window (the app).
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null());
+            let window_class = WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance,
+                lpszClassName: class.as_ptr(),
+                ..std::mem::zeroed()
+            };
+            RegisterClassW(&window_class);
+            // Top-level (not message-only, which gets no broadcasts), never shown, never active.
+            let window = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class.as_ptr(),
+                class.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null(),
+            );
+            if window.is_null() {
+                log::warn!("power: no window for the system's events");
+                return;
+            }
+            if WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) == 0 {
+                log::warn!("power: no lock events");
+            }
+            RegisterSuspendResumeNotification(window, DEVICE_NOTIFY_WINDOW_HANDLE);
+            RegisterPowerSettingNotification(
+                window,
+                &GUID_ACDC_POWER_SOURCE,
+                DEVICE_NOTIFY_WINDOW_HANDLE,
+            );
+            let mut message: MSG = std::mem::zeroed();
+            while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    /// The window's messages: the lock, the sleep and the wake, the power source.
+    unsafe extern "system" fn window_proc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_WTSSESSION_CHANGE => match wparam as u32 {
+                WTS_SESSION_LOCK => send(SystemEvent::ScreenLocked),
+                WTS_SESSION_UNLOCK => send(SystemEvent::ScreenUnlocked),
+                _ => {}
+            },
+            WM_POWERBROADCAST => {
+                match wparam as u32 {
+                    // Windows doesn't wait: the event goes at once.
+                    PBT_APMSUSPEND => {
+                        if !ASLEEP.replace(true) {
+                            WOKE.set(false);
+                            send(SystemEvent::WillSleep);
+                        }
+                    }
+                    PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
+                        ASLEEP.set(false);
+                        if !WOKE.replace(true) {
+                            send(SystemEvent::DidWake);
+                        }
+                    }
+                    PBT_POWERSETTINGCHANGE if lparam != 0 => {
+                        // SAFETY: the system's setting for this message, valid during it.
+                        let setting = unsafe { &*(lparam as *const POWERBROADCAST_SETTING) };
+                        if same_guid(&setting.PowerSetting, &GUID_ACDC_POWER_SOURCE)
+                            && setting.DataLength as usize >= std::mem::size_of::<u32>()
+                        {
+                            // `SYSTEM_POWER_CONDITION`: 0 — the adapter, 1 — the battery, 2 — a
+                            // short-term source (a UPS).
+                            // SAFETY: `DataLength` bytes follow the header; read unaligned.
+                            let source = unsafe {
+                                std::ptr::read_unaligned(setting.Data.as_ptr() as *const u32)
+                            };
+                            send(SystemEvent::Power(source == 0));
+                        }
+                    }
+                    _ => {}
+                }
+                return 1;
+            }
+            _ => {}
+        }
+        // SAFETY: the window's own message, passed on as it came.
+        unsafe { DefWindowProcW(window, message, wparam, lparam) }
+    }
+
+    fn same_guid(a: &windows_sys::core::GUID, b: &windows_sys::core::GUID) -> bool {
+        (a.data1, a.data2, a.data3, a.data4) == (b.data1, b.data2, b.data3, b.data4)
+    }
+
+    /// Whether the session is locked now; unlocked when it can't be told.
+    fn screen_locked() -> bool {
+        let mut buffer: windows_sys::core::PWSTR = std::ptr::null_mut();
+        let mut bytes = 0u32;
+        // SAFETY: the system allocates the buffer (freed below) and says its size.
+        unsafe {
+            let read = WTSQuerySessionInformationW(
+                WTS_CURRENT_SERVER_HANDLE,
+                WTS_CURRENT_SESSION,
+                WTSSessionInfoEx,
+                &mut buffer,
+                &mut bytes,
+            ) != 0;
+            if !read || buffer.is_null() {
+                return false;
+            }
+            let locked = bytes as usize >= std::mem::size_of::<WTSINFOEXW>() && {
+                let info = &*(buffer as *const WTSINFOEXW);
+                info.Level == 1
+                    && info.Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK as i32
+            };
+            WTSFreeMemory(buffer.cast());
+            locked
+        }
+    }
+
+    /// Windows doesn't wait for apps before sleeping: nothing to acknowledge.
     pub(super) fn allow_sleep(_: isize) {}
 
     /// On the power adapter: `ACLineStatus` 1 (a desktop without a battery says so too).

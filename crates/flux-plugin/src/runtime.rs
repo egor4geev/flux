@@ -392,6 +392,15 @@ pub enum HostCall {
         call: crate::claude_remote::RemoteCall,
         reply: Sender<crate::claude_remote::RemoteReply>,
     },
+    /// `tasks.run` (API 0.6; the permission checked): the window of a project (its folder) —
+    /// opened in the background when none has it — once it is ready for a task's action (its
+    /// repositories found, Claude's check done). The reply is the window's id among the plugins'
+    /// instances ([`InstanceRole::Window`]), or why there is none: a plain sentence. From a
+    /// window's instance and from the service alike; the plugin's thread waits.
+    ProjectWindow {
+        project: String,
+        reply: Sender<Result<u64, String>>,
+    },
 }
 
 /// The calls the window does the work of. Ids of terminals are the window's (it opens them); ids
@@ -443,17 +452,21 @@ pub enum WindowCall {
     GitBranches(String),
     /// `git.new-branch` (`project = "write"` checked): no reply; how it ended goes back as
     /// `Event::GitDone(id, …)` — after Flux's own questions (Smart Checkout) and messages.
+    /// `quiet` — `new-branch-quietly` (API 0.6): nothing is asked; local changes in the way make
+    /// it fail, and nothing changes.
     GitNewBranch {
         id: u64,
         root: String,
         name: String,
         start: Option<String>,
+        quiet: bool,
     },
-    /// `git.checkout`: as `GitNewBranch`.
+    /// `git.checkout`: as `GitNewBranch` (`quiet` — `checkout-quietly`).
     GitCheckout {
         id: u64,
         root: String,
         branch: String,
+        quiet: bool,
     },
     /// `git.set-commit-template`: no reply.
     SetCommitTemplate(Option<CommitTemplate>),
@@ -464,7 +477,7 @@ pub enum WindowCall {
         request: u64,
         markdown: Option<String>,
     },
-    /// `claude.new-session` (the `claude` permission checked) → `Done`.
+    /// `claude.new-session` (the `claude` permission checked) → `Session`.
     NewClaudeSession(SessionSpec),
     /// `contexts.switch` → `Done`. The keys are the plugin's own: the window keeps them apart
     /// from other plugins' and the user's.
@@ -487,6 +500,8 @@ pub enum WindowReply {
     Text(Result<String, String>),
     Diagnostics(Vec<FileDiagnostics>),
     Branches(Result<Vec<Branch>, String>),
+    /// A new Claude session's id (the CLI's).
+    Session(Result<String, String>),
 }
 
 /// Posts events into a plugin's own queue: the API's background work (a started request, the
@@ -1233,11 +1248,9 @@ fn new_store(
         tool_calls: Default::default(),
         helpers: Default::default(),
         watching: None,
-        task_source: config
-            .entry
-            .manifest
-            .task_source
-            .then(|| crate::host::tasks::join(id, config.role, &config.events)),
+        task_source: config.entry.manifest.task_source.then(|| {
+            crate::host::tasks::join(id, &config.entry.manifest.name, config.role, &config.events)
+        }),
     };
     // A plugin that runs programs needs the login shell's environment: it is read in the
     // background now rather than when the first program starts.

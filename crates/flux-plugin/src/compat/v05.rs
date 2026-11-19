@@ -1,9 +1,11 @@
 //! Plugins built for the API 0.5 (`wit/v0.5`): Flux runs them with the code of the current
 //! version (0.6), as [`super`] does for 0.2 and [`super::v03`] for 0.3.
 //!
-//! - 0.6 left every interface of 0.5 as it was and added two (`claude-remote`, `tasks`): all of
-//!   them are answered by the current implementations under the 0.5 names, and the 0.5 bindings
-//!   take the current types for them (`with`) — no conversions.
+//! - 0.6 added two interfaces (`claude-remote`, `tasks`) and functions to `git` (the quiet new
+//!   branch and checkout), which a 0.5 plugin simply doesn't import: every interface of 0.5 is
+//!   answered by the current implementations under the 0.5 names, and the 0.5 bindings take the
+//!   current types for them (`with`) — no conversions. Only `claude.new-session` changed its
+//!   result (0.6 returns the session's id): its 0.5 implementation drops the id.
 //! - Only `events` changed: 0.6 added Claude's sessions, the computer's state, the pult's actions
 //!   and the tasks' queries. The exports are called through the 0.5 bindings, and such an event
 //!   isn't delivered — a 0.5 plugin can't have asked for it (it can't watch, it can't be a source
@@ -15,8 +17,8 @@ use crate::api::bindings::flux::plugin as current;
 use crate::api::events::{Event, UiEvent, UiInput};
 use crate::runtime::State;
 
-/// The bindings of the API 0.5: the exports of a 0.5 component and its `events`; the rest are the
-/// current interfaces, which 0.6 didn't change.
+/// The bindings of the API 0.5: the exports of a 0.5 component, its `events` and `claude`; the
+/// rest are the current interfaces, whose functions 0.6 didn't change.
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
         path: "wit/v0.5",
@@ -46,7 +48,6 @@ pub(crate) mod bindings {
             "flux:plugin/system@0.5.0": crate::api::bindings::flux::plugin::system,
             "flux:plugin/picker@0.5.0": crate::api::bindings::flux::plugin::picker,
             "flux:plugin/links@0.5.0": crate::api::bindings::flux::plugin::links,
-            "flux:plugin/claude@0.5.0": crate::api::bindings::flux::plugin::claude,
             "flux:plugin/contexts@0.5.0": crate::api::bindings::flux::plugin::contexts,
             "flux:plugin/service@0.5.0": crate::api::bindings::flux::plugin::service,
             "flux:plugin/tools@0.5.0": crate::api::bindings::flux::plugin::tools,
@@ -98,12 +99,36 @@ pub(crate) fn add_to_linker(linker: &mut Linker<State>) -> wasmtime::Result<()> 
         system = "system",
         picker = "picker",
         links = "links",
-        claude = "claude",
         contexts = "contexts",
         service = "service",
         tools = "tools",
     );
-    Ok(())
+    v5::claude::add_to_linker::<State, HasSelf<State>>(linker, |state| state)
+}
+
+// --- `claude`: a new session without its id ---
+
+impl v5::claude::Host for State {
+    fn new_session(&mut self, spec: v5::claude::SessionSpec) -> Result<(), String> {
+        current::claude::Host::new_session(self, from_v5_session(spec)).map(drop)
+    }
+}
+
+fn from_v5_session(spec: v5::claude::SessionSpec) -> current::claude::SessionSpec {
+    current::claude::SessionSpec {
+        title: spec.title,
+        attachments: spec
+            .attachments
+            .into_iter()
+            .map(|attachment| current::claude::Attachment {
+                label: attachment.label,
+                markdown: attachment.markdown,
+            })
+            .collect(),
+        prompt: spec.prompt,
+        send: spec.send,
+        plan_mode: spec.plan_mode,
+    }
 }
 
 /// An event for a 0.5 plugin; none for one 0.5 doesn't know (0.6's: Claude's sessions, the

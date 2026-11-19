@@ -278,6 +278,11 @@ class Host:
             self.write({"type": "system", "subtype": "status", "status": None,
                         "permissionMode": request.get("mode")})
             return self.reply(request_id, {"mode": request.get("mode")})
+        if subtype == "rename_session":
+            # As the CLI does: the new title comes back as a system message.
+            self.write({"type": "system", "subtype": "session_title_changed",
+                        "title": request.get("title", "")})
+            return self.reply(request_id, {})
         self.reply(request_id, canned.get(subtype, {}))
 
     def reply(self, request_id, response):
