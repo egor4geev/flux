@@ -3,7 +3,9 @@
 //! and "Plan with Claude" (plan mode, the request sent at once). The session gets the plugin's
 //! title; the attachments go with the first message (each in a tag named by its label, before the
 //! text — [`crate::claude_session::attachments_text`]). The chat opens where new sessions do, in
-//! an editor tab. The `claude` permission is checked by `flux-plugin`.
+//! an editor tab. The plugin gets the session's id (API 0.6): the CLI's, given before the process
+//! starts — the one remote work names it by, so a task's action run from the phone answers with
+//! it. The `claude` permission is checked by `flux-plugin`.
 
 use flux_claude::{PermissionMode, UserInput};
 use flux_plugin::api::claude::SessionSpec;
@@ -13,15 +15,15 @@ use crate::claude::{self, CliState};
 use crate::claude_session::{Attachment, SessionDraft, with_attachments};
 use crate::workspace::Workspace;
 
-/// Opens a new Claude session for a plugin. An error says why Claude can't take it (turned off,
-/// not installed, signed out); the Claude console then shows the user how to fix it.
+/// Opens a new Claude session for a plugin: its id. An error says why Claude can't take it
+/// (turned off, not installed, signed out); the Claude console then shows the user how to fix it.
 pub(crate) fn new_session(
     workspace: &mut Workspace,
     plugin: &str,
     spec: &SessionSpec,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let _ = plugin;
     if !claude::enabled(cx) {
         return Err("Claude Code is turned off in Settings → Claude Code".into());
@@ -56,6 +58,8 @@ pub(crate) fn new_session(
         .filter(|prompt| !prompt.trim().is_empty());
     session.update(cx, |session, cx| {
         if let Some(title) = title {
+            // At once, before the CLI confirms it: remote work names the session by it.
+            session.set_title_hint(title.clone());
             session.rename(title, cx);
         }
         if spec.send {
@@ -78,7 +82,8 @@ pub(crate) fn new_session(
             });
         }
     });
-    Ok(())
+    let id = session.read(cx).cli_id().unwrap_or_default().to_string();
+    Ok(id)
 }
 
 /// Why a session can't start: what the plugin hears.

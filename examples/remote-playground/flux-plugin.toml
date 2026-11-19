@@ -1,0 +1,48 @@
+# The Remote Playground: the manual check of the plugin API 0.6 — Claude for remote work and tasks
+# between plugins (docs/plugins.md) — with no messenger: what a bot would do, behind buttons.
+# Not bundled into Flux — install the folder: Settings → Plugins → ⚙ → Install Plugin from Disk….
+id = "flux.remote-playground"
+name = "Remote Playground"
+version = "0.1.0"
+api = "0.6"
+authors = ["Egor Ageev"]
+description = "Every Claude session of Flux in one window, with a button for every call of the remote-work API; tasks between plugins and their actions."
+repository = "https://github.com/egor4geev/flux"
+icon = "icons/remote.svg"
+wasm = "target/wasm32-wasip2/release/flux_remote_playground.wasm"
+# The service watches the sessions for the whole app, as a bot would, and passes them to the
+# windows; it also gives a few made-up tasks to whoever asks. A task's action runs in the
+# project's window: its branch (Git, quietly) and Claude with the task.
+service = true
+task-source = true
+
+[permissions]
+claude-remote = true
+tasks = true
+project = "write"
+claude = true
+
+[[commands]]
+id = "open"
+title = "Open Remote Playground"
+category = "Playground"
+
+[[tool-windows]]
+id = "remote"
+title = "Remote"
+icon = "icons/remote.svg"
+location = "left"
+
+# A session per tab among the editor's tabs: its request, mode, field, turn and events.
+[[tool-windows]]
+id = "session"
+title = "Session"
+icon = "icons/remote.svg"
+location = "editor"
+tabs = true
+
+# An action at a session in the Claude console: the choice comes to the service as
+# `claude-action`, and the windows show the session.
+[[claude-actions]]
+id = "show"
+title = "Show in the Plugin's Console"

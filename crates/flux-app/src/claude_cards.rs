@@ -376,7 +376,7 @@ fn rows(pending: &Pending, cwd: &Path) -> Vec<Row> {
 
 /// A "don't ask again" suggestion of the CLI (a `PermissionUpdate`) as a row: "Allow, and don't
 /// ask again for `touch:*` in this project". `None` — a kind the card doesn't offer.
-fn suggestion_label(suggestion: &Value, cwd: &Path, edit: bool) -> Option<String> {
+pub(crate) fn suggestion_label(suggestion: &Value, cwd: &Path, edit: bool) -> Option<String> {
     let place = |destination: &str| -> String {
         match destination {
             "session" => tr("in this session").into(),
@@ -480,7 +480,7 @@ fn rule_path(path: &str, cwd: &Path) -> String {
 }
 
 /// A path for a label: relative to the project, or with `~` for the home folder.
-fn short_path(path: &str, cwd: &Path) -> String {
+pub(crate) fn short_path(path: &str, cwd: &Path) -> String {
     if let Ok(relative) = Path::new(path).strip_prefix(cwd)
         && !cwd.as_os_str().is_empty()
     {
@@ -534,7 +534,7 @@ pub(crate) fn question_answers(
 
 /// The deny answer for what the user wrote: their words go to Claude, which goes on; nothing
 /// written — the turn stops, as Esc in the CLI.
-fn deny(feedback: &str) -> Answer {
+pub(crate) fn deny(feedback: &str) -> Answer {
     let feedback = feedback.trim();
     if feedback.is_empty() {
         Answer::Deny {
@@ -549,7 +549,7 @@ fn deny(feedback: &str) -> Answer {
     }
 }
 
-fn keep_planning(feedback: &str) -> Answer {
+pub(crate) fn keep_planning(feedback: &str) -> Answer {
     let feedback = feedback.trim();
     if feedback.is_empty() {
         Answer::KeepPlanning(KEEP_PLANNING.to_string())
@@ -1161,12 +1161,7 @@ fn render_header(
 ) -> AnyElement {
     let (icon_name, title, detail): (IconName, String, Option<String>) = match &pending.kind {
         PendingKind::Edit(proposal) => {
-            let name = file_name(&proposal.path);
-            let title = match (pending.tool.as_str(), &proposal.original) {
-                ("Write", None) => trf("Create {0}", &[&name]),
-                ("Write", Some(_)) => trf("Overwrite {0}", &[&name]),
-                _ => trf("Edit {0}", &[&name]),
-            };
+            let title = request_title(pending);
             let folder = proposal
                 .path
                 .parent()
@@ -1272,6 +1267,24 @@ fn render_header(
         .into_any_element()
 }
 
+/// A permission or an edit card's title: «Run a command?», «Edit main.rs» (also what the hub of
+/// remote work tells a plugin, API 0.6).
+pub(crate) fn request_title(pending: &Pending) -> String {
+    match &pending.kind {
+        PendingKind::Edit(proposal) => {
+            let name = file_name(&proposal.path);
+            match (pending.tool.as_str(), &proposal.original) {
+                ("Write", None) => trf("Create {0}", &[&name]),
+                ("Write", Some(_)) => trf("Overwrite {0}", &[&name]),
+                _ => trf("Edit {0}", &[&name]),
+            }
+        }
+        PendingKind::Plan { .. } => tr("Claude's plan").into(),
+        PendingKind::Questions(_) => tr("Claude asks").into(),
+        PendingKind::Tool => tool_title(pending).1,
+    }
+}
+
 /// What a tool card asks: its icon and the question.
 fn tool_title(pending: &Pending) -> (IconName, String) {
     let tool = pending.tool.as_str();
@@ -1289,11 +1302,12 @@ fn tool_title(pending: &Pending) -> (IconName, String) {
     }
 }
 
-/// The details of a tool card: the command, the URL, the path; why it asks.
-fn render_tool_details(pending: &Pending, cwd: &Path, ui: UiColors) -> Option<AnyElement> {
+/// What a tool card shows of the call: the code (the command, the URL, the path) and a note (the
+/// command's description, the fetch's prompt) — the hub of remote work sends the code too.
+pub(crate) fn tool_details(pending: &Pending, cwd: &Path) -> (Option<String>, Option<String>) {
     let input = &pending.input;
     let text = |key: &str| input[key].as_str().map(str::to_string);
-    let (code, note): (Option<String>, Option<String>) = match pending.tool.as_str() {
+    match pending.tool.as_str() {
         "Bash" => (text("command"), text("description")),
         "WebFetch" => (text("url"), text("prompt")),
         "WebSearch" => (text("query"), None),
@@ -1314,7 +1328,12 @@ fn render_tool_details(pending: &Pending, cwd: &Path, ui: UiColors) -> Option<An
                 pending.description.clone(),
             )
         }
-    };
+    }
+}
+
+/// The details of a tool card: the command, the URL, the path; why it asks.
+fn render_tool_details(pending: &Pending, cwd: &Path, ui: UiColors) -> Option<AnyElement> {
+    let (code, note) = tool_details(pending, cwd);
     // Why it asks (a path outside the project…), and the path it is about.
     let reason = pending.reason.clone().filter(|reason| !reason.is_empty());
     let path = pending

@@ -1,6 +1,6 @@
 //! Plugins without UI (stage 8, ADR-029): WebAssembly components of the `flux:plugin` world
-//! (`wit/v0.5/flux-plugin.wit`; plugins built for 0.2 — `wit/v0.2`, for 0.3 and 0.4 —
-//! `wit/v0.3`, [`compat`]) run by wasmtime, each on its own thread.
+//! (`wit/v0.6/flux-plugin.wit`; plugins built for 0.2 — `wit/v0.2`, for 0.3 and 0.4 —
+//! `wit/v0.3`, for 0.5 — `wit/v0.5`, [`compat`]) run by wasmtime, each on its own thread.
 //!
 //! - [`manifest`] — `flux-plugin.toml`: who the plugin is, its permissions and what it adds
 //!   (commands, tool windows, status bar items, settings; with 8.3 — languages, grammars, language
@@ -16,6 +16,9 @@
 //! - [`services`] — the plugins' services (API 0.5): messages between a plugin's instance for the
 //!   whole app and its windows' instances, thread to thread.
 //! - [`helpers`] — the plugins' own programs (API 0.5): downloaded, checked, kept.
+//! - [`claude_remote`] — Claude for remote work (API 0.6): the calls a plugin makes on every
+//!   Claude session of Flux, as plain values for the app, and the events the app posts to the
+//!   instances that watch.
 //! - [`secrets`] — the plugins' secrets, kept by Flux encrypted.
 //! - [`api`] — the types of the WIT interfaces, shared with the window.
 //! - [`log`], [`locales`], [`dev`], [`paths`] — the plugin's log, its translations, building a
@@ -23,6 +26,7 @@
 
 pub mod api;
 pub mod catalog;
+pub mod claude_remote;
 pub(crate) mod compat;
 pub mod dev;
 pub mod helpers;
@@ -46,13 +50,14 @@ pub use host::login_env;
 /// SDK, the template). API 0.4 added keys of the manifest only — a language's `injections` and
 /// `file-patterns` — so its components are built with the 0.3 interfaces (`flux:plugin@0.3.0`,
 /// [`wit_version`]); 0.5 (FluxGram) added the service, helpers, pictures, the conversation, tabs,
-/// the file dialog and Claude's tools.
-pub const API_VERSION: &str = "0.5";
+/// the file dialog and Claude's tools; 0.6 (the bot) — Claude for remote work, the computer's
+/// sleep and screen lock, the actions at a session in the pult, tasks between plugins.
+pub const API_VERSION: &str = "0.6";
 
 /// The versions this Flux runs, oldest first: a plugin built for an older one keeps working (its
-/// calls are answered through `wit/v0.2`), and a plugin without code (a language, a theme) names
-/// any of them.
-pub const SUPPORTED_API_VERSIONS: &[&str] = &["0.2", "0.3", "0.4", API_VERSION];
+/// calls are answered through `wit/v0.2`, `wit/v0.3`, `wit/v0.5`), and a plugin without code (a
+/// language, a theme) names any of them.
+pub const SUPPORTED_API_VERSIONS: &[&str] = &["0.2", "0.3", "0.4", "0.5", API_VERSION];
 
 /// This Flux runs plugins built for `api`.
 pub fn supports_api(api: &str) -> bool {

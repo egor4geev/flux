@@ -938,7 +938,7 @@ impl Item {
 
 /// A step that folds into a group: thinking, and the tools that only look around (read, search,
 /// fetch) or keep notes (tasks), the skills and other tools' calls.
-fn is_minor(kind: &EntryKind) -> bool {
+pub(crate) fn is_minor(kind: &EntryKind) -> bool {
     match kind {
         EntryKind::Thinking { .. } => true,
         EntryKind::Tool(tool) => matches!(
@@ -4241,7 +4241,7 @@ fn exit_code(tool: &ToolEntry) -> Option<i32> {
 }
 
 /// What a group of steps did, in short: "Thought for 6 s · read 2 files · searched 3 times".
-fn group_summary(entries: &[&Entry]) -> String {
+pub(crate) fn group_summary(entries: &[&Entry]) -> String {
     let mut thought: Option<Duration> = None;
     let mut thinking = false;
     let mut streaming = false;

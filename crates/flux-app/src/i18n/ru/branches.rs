@@ -231,6 +231,15 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("Abort Cherry-Pick", "Прервать cherry-pick"),
     ("Continue Revert", "Продолжить revert"),
     ("Abort Revert", "Прервать revert"),
+    // A plugin's quiet checkout (nobody at the computer): why it didn't go.
+    (
+        "Local changes are in the way of checking out '{0}'",
+        "Локальные изменения мешают перейти на «{0}»",
+    ),
+    (
+        "Untracked files are in the way of checking out '{0}'",
+        "Неотслеживаемые файлы мешают перейти на «{0}»",
+    ),
 ];
 
 pub(super) const PLURALS: &[(&str, [&str; 3])] = &[];

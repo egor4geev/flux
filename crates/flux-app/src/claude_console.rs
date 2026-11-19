@@ -49,6 +49,15 @@ use crate::ui::{self, RADIUS_MD, RADIUS_SM};
 
 const CONTEXT: &str = "ClaudeConsole";
 
+/// A plugin's action at the selected session (API 0.6, its `[[claude-actions]]`): «Продолжить в
+/// Telegram». Only that plugin hears the choice ([`crate::claude_hub::run_action`]).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = claude_console, no_json)]
+pub struct PluginAction {
+    pub plugin: String,
+    pub action: String,
+}
+
 actions!(
     claude_console,
     [
@@ -443,6 +452,48 @@ impl ClaudeConsole {
         }
     }
 
+    fn plugin_action(&mut self, action: &PluginAction, _: &mut Window, cx: &mut Context<Self>) {
+        let id = self
+            .selected_row(cx)
+            .and_then(|row| session_id(&row.item, cx));
+        if let Some(id) = id {
+            crate::claude_hub::run_action(&action.plugin, id, action.action.clone());
+        }
+    }
+
+    /// The actions the window's running plugins add at a session (API 0.6): their titles in the
+    /// interface language.
+    fn plugin_actions(&self, cx: &App) -> Vec<(SharedString, PluginAction)> {
+        let Some(plugins) = self
+            .store
+            .read(cx)
+            .plugins()
+            .and_then(|plugins| plugins.upgrade())
+        else {
+            return Vec::new();
+        };
+        let plugins = plugins.read(cx);
+        let mut actions = Vec::new();
+        for plugin in plugins.plugins() {
+            if !matches!(
+                plugin.status,
+                crate::plugins::PluginStatus::Running | crate::plugins::PluginStatus::Starting
+            ) {
+                continue;
+            }
+            for action in &plugin.entry.manifest.claude_actions {
+                actions.push((
+                    SharedString::from(plugin.tr(&action.title).to_string()),
+                    PluginAction {
+                        plugin: plugin.id().to_string(),
+                        action: action.id.clone(),
+                    },
+                ));
+            }
+        }
+        actions
+    }
+
     fn stop_selected(&mut self, _: &StopSelected, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(SessionRef::Live(session)) = self.selected_row(cx).map(|row| row.item) {
             cx.emit(ClaudeConsoleEvent::Stop(session));
@@ -665,9 +716,14 @@ impl ClaudeConsole {
             SessionRef::Live(session) => (session.read(cx).model().is_working(), false),
             SessionRef::Saved(saved) => (false, store.is_archived(&saved.id)),
         };
+        // A plugin's actions need the session's id.
+        let actions = match session_id(&row.item, cx) {
+            Some(_) => self.plugin_actions(cx),
+            None => Vec::new(),
+        };
         window.focus(&self.focus_handle);
         let menu = cx.new(|cx| {
-            ContextMenu::new(window, cx)
+            let mut menu = ContextMenu::new(window, cx)
                 .entry_if(ready, tr("Open"), OpenSelected)
                 .entry(tr("Rename…"), RenameSelected)
                 .entry_if(ready, tr("Open in Terminal"), OpenSelectedInTerminal)
@@ -681,7 +737,14 @@ impl ClaudeConsole {
                         tr("Archive")
                     },
                     ArchiveSelected,
-                )
+                );
+            if !actions.is_empty() {
+                menu = menu.separator();
+                for (label, action) in actions {
+                    menu = menu.entry(label, action);
+                }
+            }
+            menu
         });
         self.show_menu(menu, position, window, cx);
     }
@@ -2330,6 +2393,7 @@ impl Render for ClaudeConsole {
             .on_action(cx.listener(Self::rename_selected))
             .on_action(cx.listener(Self::open_selected_in_terminal))
             .on_action(cx.listener(Self::stop_selected))
+            .on_action(cx.listener(Self::plugin_action))
             .on_action(cx.listener(Self::close_selected))
             .on_action(cx.listener(Self::archive_selected))
             .on_action(cx.listener(Self::show_menu_action))
@@ -2347,6 +2411,14 @@ impl Render for ClaudeConsole {
             .child(body)
             .children(limits)
             .children(menu)
+    }
+}
+
+/// The CLI's id of a session of the console (a new one's before its first turn too).
+fn session_id(item: &SessionRef, cx: &App) -> Option<String> {
+    match item {
+        SessionRef::Live(session) => session.read(cx).cli_id().map(str::to_string),
+        SessionRef::Saved(saved) => Some(saved.id.clone()),
     }
 }
 

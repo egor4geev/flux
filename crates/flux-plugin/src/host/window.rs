@@ -1,5 +1,5 @@
 //! The interfaces whose work the window does: terminals, proposals, Git, the problems, the browser
-//! and the clipboard (and `editors.close`, in `host`). Each call becomes a [`WindowCall`]; the
+//! and the clipboard, Claude's sessions, contexts (and `editors.close`, in `host`). Each call becomes a [`WindowCall`]; the
 //! plugin's thread waits for the window's [`WindowReply`] to the calls that return something (the
 //! wait doesn't count toward its time limit) and doesn't wait for the others. Permissions are
 //! checked here, before the window hears of the call.
@@ -212,12 +212,36 @@ impl git::Host for State {
             root,
             name,
             start,
+            quiet: false,
         })
     }
 
     fn checkout(&mut self, root: String, branch: String) -> u64 {
-        self.host
-            .git_operation(|id| WindowCall::GitCheckout { id, root, branch })
+        self.host.git_operation(|id| WindowCall::GitCheckout {
+            id,
+            root,
+            branch,
+            quiet: false,
+        })
+    }
+
+    fn new_branch_quietly(&mut self, root: String, name: String, start: Option<String>) -> u64 {
+        self.host.git_operation(|id| WindowCall::GitNewBranch {
+            id,
+            root,
+            name,
+            start,
+            quiet: true,
+        })
+    }
+
+    fn checkout_quietly(&mut self, root: String, branch: String) -> u64 {
+        self.host.git_operation(|id| WindowCall::GitCheckout {
+            id,
+            root,
+            branch,
+            quiet: true,
+        })
     }
 
     fn set_commit_template(&mut self, template: Option<git::CommitTemplate>) {
@@ -381,9 +405,12 @@ impl links::Host for State {
 }
 
 impl claude::Host for State {
-    fn new_session(&mut self, spec: claude::SessionSpec) -> Result<(), String> {
+    fn new_session(&mut self, spec: claude::SessionSpec) -> Result<String, String> {
         self.host.require_claude()?;
-        self.host.window_done(WindowCall::NewClaudeSession(spec))
+        match self.host.window(WindowCall::NewClaudeSession(spec)) {
+            Some(WindowReply::Session(result)) => result,
+            _ => Err(no_answer()),
+        }
     }
 }
 

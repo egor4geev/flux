@@ -3,7 +3,9 @@
 //! asks when they'd be in the way; Flux's own messages), the end going back as `git-done`; and the
 //! plugin's commit message template — it fills an empty message in the commit window (and is
 //! withdrawn when unedited, as `MERGE_MSG`), and a message generated with Claude starts with its
-//! prefix. Permissions are checked by `flux-plugin`.
+//! prefix. Permissions are checked by `flux-plugin`. The quiet new branch and checkout (API 0.6,
+//! the bot's part 3 — a task's action run from the phone) are the same flows asking nothing:
+//! changes in the way end them with why ([`crate::branch_dialogs::Done`]), and nothing changes.
 //!
 //! The repository is the one whose work tree holds `root` (a path of `git.repositories`); the
 //! branches are read anew for every call (the store reads its own lazily, for the popup).
@@ -43,19 +45,28 @@ pub(crate) fn branches(
     .detach();
 }
 
+/// A plugin's Git operation: its id (`git-done` names it), and whether it asks nothing
+/// (`…-quietly`, API 0.6).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Operation {
+    pub id: u64,
+    pub quiet: bool,
+}
+
 /// `git.new-branch`: creates `name` from `start` (none — HEAD) and checks it out; `git-done` says
 /// how it ended.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn new_branch(
     workspace: &mut Workspace,
     plugin: &str,
-    id: u64,
+    operation: Operation,
     root: &str,
     name: &str,
     start: Option<&str>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let id = operation.id;
     let repo = match repo_at(workspace, root, cx) {
         Ok(repo) => repo,
         Err(err) => return git_done(workspace, plugin, id, Err(err), cx),
@@ -63,7 +74,7 @@ pub(crate) fn new_branch(
     if let Err(reason) = flux_git::check_branch_name(name) {
         return git_done(workspace, plugin, id, Err(reason.to_string()), cx);
     }
-    let done = waiting(workspace, plugin, id, cx);
+    let done = waiting(workspace, plugin, operation, cx);
     let read = read_refs(workspace, repo, cx);
     let (name, start) = (name.to_string(), start.map(str::to_string));
     cx.spawn_in(window, async move |this, cx| {
@@ -93,7 +104,7 @@ pub(crate) fn new_branch(
 pub(crate) fn checkout(
     workspace: &mut Workspace,
     plugin: &str,
-    id: u64,
+    operation: Operation,
     root: &str,
     branch: &str,
     window: &mut Window,
@@ -101,9 +112,9 @@ pub(crate) fn checkout(
 ) {
     let repo = match repo_at(workspace, root, cx) {
         Ok(repo) => repo,
-        Err(err) => return git_done(workspace, plugin, id, Err(err), cx),
+        Err(err) => return git_done(workspace, plugin, operation.id, Err(err), cx),
     };
-    let done = waiting(workspace, plugin, id, cx);
+    let done = waiting(workspace, plugin, operation, cx);
     let read = read_refs(workspace, repo, cx);
     let branch = branch.to_string();
     cx.spawn_in(window, async move |this, cx| {
@@ -214,7 +225,13 @@ impl Waiting {
     }
 }
 
-fn waiting(workspace: &Workspace, plugin: &str, id: u64, cx: &mut Context<Workspace>) -> Waiting {
+fn waiting(
+    workspace: &Workspace,
+    plugin: &str,
+    operation: Operation,
+    cx: &mut Context<Workspace>,
+) -> Waiting {
+    let Operation { id, quiet } = operation;
     let (sender, receiver) = oneshot::channel::<Result<(), String>>();
     let plugins = workspace.plugins.downgrade();
     let plugin = plugin.to_string();
@@ -230,7 +247,7 @@ fn waiting(workspace: &Workspace, plugin: &str, id: u64, cx: &mut Context<Worksp
     })
     .detach();
     Waiting {
-        done: Done::new(sender),
+        done: Done::new(sender, quiet),
     }
 }
 

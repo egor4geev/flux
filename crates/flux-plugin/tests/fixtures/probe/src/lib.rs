@@ -10,6 +10,8 @@ mod api03;
 mod net;
 /// Commands `proc:…`: programs, timers, secrets, folders, the time limit (part 8.2).
 mod processes;
+/// Commands `remote:…`: Claude for remote work and tasks (API 0.6).
+mod remote;
 /// Commands `svc:…`: the service, helpers, Claude's tools (API 0.5).
 mod svc;
 
@@ -41,6 +43,9 @@ impl Plugin for Probe {
         }
         if let Some(command) = command.strip_prefix("svc:") {
             return svc::run(command, context);
+        }
+        if let Some(command) = command.strip_prefix("remote:") {
+            return remote::run(command, context);
         }
         match command {
             "context" => {
@@ -135,6 +140,7 @@ impl Plugin for Probe {
             || processes::on_event(&event)
             || api03::on_event(&event)
             || svc::on_event(&event)
+            || remote::on_event(&event)
         {
             return;
         }

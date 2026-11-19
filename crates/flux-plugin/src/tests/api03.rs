@@ -40,6 +40,9 @@ const COMMANDS: &[&str] = &[
     "v3:utc-offset",
     "v3:time-zone",
     "v3:open-settings",
+    "remote:new-branch-quietly",
+    "remote:checkout-quietly",
+    "remote:claude",
 ];
 
 /// A status bar item and a status line for the probe's calls.
@@ -240,6 +243,7 @@ fn branches_and_checkouts_need_write_access() {
                 root: at,
                 name,
                 start,
+                quiet: false,
             },
             _,
         ) => {
@@ -257,10 +261,49 @@ fn branches_and_checkouts_need_write_access() {
     assert_eq!(writer.notification(), format!("git-done {id}: Ok(())"));
     writer.command("v3:checkout");
     match writer.window_call() {
-        (WindowCall::GitCheckout { branch, .. }, _) => assert_eq!(branch, "main"),
+        (
+            WindowCall::GitCheckout {
+                branch,
+                quiet: false,
+                ..
+            },
+            _,
+        ) => assert_eq!(branch, "main"),
         (other, _) => panic!("expected GitCheckout, got {other:?}"),
     }
     assert!(writer.notification().starts_with("checkout: "));
+    // API 0.6: the same, asking nothing.
+    writer
+        .instance
+        .run_command("remote:new-branch-quietly", super::with_argument(&root));
+    match writer.window_call() {
+        (
+            WindowCall::GitNewBranch {
+                root: at,
+                name,
+                quiet: true,
+                ..
+            },
+            _,
+        ) => assert_eq!((at.as_str(), name.as_str()), (root.as_str(), "TRACK-1-fix")),
+        (other, _) => panic!("expected a quiet GitNewBranch, got {other:?}"),
+    }
+    assert!(writer.notification().starts_with("quiet new-branch: "));
+    writer
+        .instance
+        .run_command("remote:checkout-quietly", super::with_argument(&root));
+    match writer.window_call() {
+        (
+            WindowCall::GitCheckout {
+                branch,
+                quiet: true,
+                ..
+            },
+            _,
+        ) => assert_eq!(branch, "main"),
+        (other, _) => panic!("expected a quiet GitCheckout, got {other:?}"),
+    }
+    assert!(writer.notification().starts_with("quiet checkout: "));
 
     writer.command("v3:branches");
     match writer.window_call() {
@@ -385,11 +428,25 @@ fn links_claude_and_contexts() {
                     plan_mode: true,
                 }
             );
-            reply.send(WindowReply::Done(Ok(()))).unwrap();
+            reply
+                .send(WindowReply::Session(Ok("0b6c…".into())))
+                .unwrap();
         }
         (other, _) => panic!("expected NewClaudeSession, got {other:?}"),
     }
     assert_eq!(claude.notification(), "claude: ok");
+    // API 0.6: the new session's id.
+    claude.command("remote:claude");
+    match claude.window_call() {
+        (WindowCall::NewClaudeSession(spec), reply) => {
+            assert_eq!(spec.prompt.as_deref(), Some("Hi"));
+            reply
+                .send(WindowReply::Session(Ok("5f3a-1".into())))
+                .unwrap();
+        }
+        (other, _) => panic!("expected NewClaudeSession, got {other:?}"),
+    }
+    assert_eq!(claude.notification(), "claude session: 5f3a-1");
     // Contexts are the project's: without it, no.
     let title = claude.run("v3:contexts-switch");
     assert!(

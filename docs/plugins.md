@@ -14,17 +14,19 @@ A plugin without code can add languages, their grammars and language servers: [L
 color themes: [Themes](themes.md); sets of file icons: [File icon sets](icon-themes.md).
 
 > [!NOTE]
-> The plugin API is version **0.5**. A manifest names the version it is built for; Flux keeps
-> running plugins built for **0.4**, **0.3** and **0.2**, the version the [catalog](catalog.md) opened
-> with ([From 0.4 to 0.5](#from-04-to-05), [From 0.3 to 0.4](#from-03-to-04), [From 0.2 to 0.3](#from-02-to-03)).
+> The plugin API is version **0.6**. A manifest names the version it is built for; Flux keeps
+> running plugins built for **0.5**, **0.4**, **0.3** and **0.2**, the version the
+> [catalog](catalog.md) opened with ([From 0.5 to 0.6](#from-05-to-06), [From 0.4 to 0.5](#from-04-to-05),
+> [From 0.3 to 0.4](#from-03-to-04), [From 0.2 to 0.3](#from-02-to-03)).
 
 ## How plugins run
 
 A plugin is a **WebAssembly component** of the `flux:plugin` world, run by
 [wasmtime](https://wasmtime.dev) inside Flux. The API is described in WIT —
-[`crates/flux-plugin/wit/v0.5/flux-plugin.wit`](../crates/flux-plugin/wit/v0.5/flux-plugin.wit) is
-the reference (`wit/v0.3` and `wit/v0.2` — the previous interfaces, which Flux still runs; API 0.4
-kept the 0.3 interfaces and added keys of the manifest only); this guide summarizes it.
+[`crates/flux-plugin/wit/v0.6/flux-plugin.wit`](../crates/flux-plugin/wit/v0.6/flux-plugin.wit) is
+the reference (`wit/v0.5`, `wit/v0.3` and `wit/v0.2` — the previous interfaces, which Flux still
+runs; API 0.4 kept the 0.3 interfaces and added keys of the manifest only); this guide summarizes
+it.
 Plugins are written in Rust with the SDK ([`crates/flux-plugin-api`](../crates/flux-plugin-api)) and
 built for the `wasm32-wasip2` target.
 
@@ -168,6 +170,7 @@ The SDK's shortcuts:
 | `status::{set, hide, item}` | The plugin's status bar items. |
 | `view::*` | A tool window's content ([Tool windows](#tool-windows)). |
 | `view::{open_tab, set_badge}`, `conversation::{update, put…}` | API 0.5: a window's tabs, its mark, a conversation ([Windows on the left, tabs, badges](#windows-on-the-left-tabs-badges), [The conversation](#the-conversation)). |
+| `remote::{watch, sessions, send, allow, rename, close, new_session…}`, `tasks::{mine, search, get, run, respond, started}` | API 0.6: every Claude session for remote work, tasks between plugins ([Claude for remote work](#claude-for-remote-work), [Tasks between plugins](#tasks-between-plugins)). |
 | `CommandContext` — `path`, `selection`, `selected_text`, `from_menu` | What a command acts on. |
 | `http::{get, post, request…}`, `http::EventStream` | Requests to web services ([The network](#the-network)). |
 | `server::{listen, respond_html, start_events, ws_send_text…}` | The plugin's server on 127.0.0.1 ([A local server](#a-local-server)). |
@@ -242,12 +245,13 @@ default = "Hello!"
 | `id` | required | Lowercase letters and digits, words joined by `.` or `-`: `someone.hello-world`. The plugin's key everywhere: its folder, settings, notification group, secrets. |
 | `name` | required | Shown in the manager, the palette's chips, Settings. |
 | `version` | required | The plugin's version. |
-| `api` | required | The plugin API it is built for: `"0.5"`. Flux runs 0.5, 0.4, 0.3 and 0.2 ([From 0.4 to 0.5](#from-04-to-05), [From 0.3 to 0.4](#from-03-to-04), [From 0.2 to 0.3](#from-02-to-03)); a plugin with code names the version of the SDK it was built with — Flux checks it against the component (a 0.4 plugin's component imports the 0.3 interfaces). |
+| `api` | required | The plugin API it is built for: `"0.6"`. Flux runs 0.6, 0.5, 0.4, 0.3 and 0.2 ([From 0.5 to 0.6](#from-05-to-06), [From 0.4 to 0.5](#from-04-to-05), [From 0.3 to 0.4](#from-03-to-04), [From 0.2 to 0.3](#from-02-to-03)); a plugin with code names the version of the SDK it was built with — Flux checks it against the component (a 0.4 plugin's component imports the 0.3 interfaces). |
 | `authors` | `[]` | |
 | `description` | `""` | Shown in the manager. |
 | `repository` | — | A link for the manager. |
 | `icon` | — | A monochrome SVG in the folder, for the manager. |
 | `wasm` | — | The component, relative to the folder. A plugin without it has no code: it starts at once and only declares. |
+| `task-source` | `false` | API 0.6: the plugin gives the user's tasks to other plugins and runs its Claude actions on them for them ([Tasks between plugins](#tasks-between-plugins)); the install question says so. |
 
 ### Permissions
 
@@ -265,6 +269,8 @@ missing permission. Ask for what the plugin needs, no more: the user decides by 
 | `terminal` | `false` | Terminal tabs ([Terminals](#terminals)): open them with a command or the user's shell, type into them. A shell runs whatever is typed into it, so this is as strong as any program — but the user sees every tab. |
 | `folders` | `[]` | Folders outside the project in the plugin's file system, at their real paths: `[{ path = "~/.config/gh", access = "read" }]`. `~` is the home folder ([`system.home-dir`](#secrets-timers-and-the-system)); `access` is `"read"` (the default) or `"write"`. A folder that doesn't exist is skipped. |
 | `claude` | `false` | Claude Code sessions the plugin opens with its own context and requests ([Claude sessions](#claude-sessions)). A session runs with the rights the user gave Claude Code — it can edit files and run commands — so the install question warns about it. |
+| `claude-remote` | `false` | API 0.6: every Claude session of Flux, for remote work ([Claude for remote work](#claude-for-remote-work)): the plugin reads them, writes to them, answers Claude's questions and permissions for the user, rolls turns back, keeps the computer awake. The install question warns about it. |
+| `tasks` | `false` | API 0.6: the user's tasks other plugins give ([Tasks between plugins](#tasks-between-plugins)): `tasks::mine`, `search`, `get`, and `run` — a source's action on a task. |
 
 **`[notifications]`** — `display`: how the plugin's notifications show until the user changes it in
 Settings → Notifications: `"balloon"` (a card that goes away, the default), `"sticky"` (a card that
@@ -640,6 +646,13 @@ branch tracking it). Local changes come along, Smart Checkout asks when they'd b
 messages are Flux's own; how it ended comes as `git-done`: done, or why not — the user declined, git
 failed (Flux has told the user).
 
+With nobody at the computer (0.6: a task's action run from the phone) a plugin asks nothing:
+`new_branch_quietly(root, name, start)` and `checkout_quietly(root, branch)` are the same, but
+plain `git checkout` — changes that don't conflict come along; when local changes or untracked
+files are in the way, `git-done` fails with why, a sentence for the user ("Local changes are in
+the way of checking out 'TRACK-142-fix'"), and nothing changes: no branch is made, nothing is
+stashed.
+
 While a task of the plugin's is active, `commit_template(text, prefix)` fills the commit window's
 empty message — and replaces the previous template's text the user didn't change; a message
 generated with Claude starts with `prefix`. `clear_commit_template()` — the task is over.
@@ -874,8 +887,10 @@ claude::session()
 ```
 
 An attachment is a chip in the field — its label — and its Markdown goes with the first message.
-Without `send` the prompt waits in the field. `start` fails when Claude Code is turned off, not
-installed or not signed in: the error says which, and the Claude window shows how to fix it.
+Without `send` the prompt waits in the field. `start` returns the session's id (0.6) — the CLI's,
+the one [remote work](#claude-for-remote-work) names it by — and fails when Claude Code is turned
+off, not installed or not signed in: the error says which, and the Claude window shows how to fix
+it.
 
 ### Contexts
 
@@ -978,6 +993,8 @@ plugin with the `project` permission is also restarted when the window's project
 | `window-opened(window)`, `window-closed(window)` | 0.5, in the service: the plugin's instance in a window started or stopped. |
 | `service-started` | 0.5, in a window's instance: the service started (again) and knows nothing of the window yet. |
 | `tool-called(call)`, `tool-confirmed((id, choice))`, `tool-cancelled(id)` | 0.5: Claude called one of the plugin's tools; the user answered its card; the call is gone (interrupted, the session closed). |
+| `claude-session`, `claude-text`, `claude-request`, `claude-turn-ended`, … `system-changed`, `claude-action` | 0.6, to the instances that watch: what happens in Claude's sessions and to the computer ([Claude for remote work](#claude-for-remote-work)). |
+| `task-query(query)` | 0.6, in a source of tasks: another plugin asks; answer with `tasks.respond` ([Tasks between plugins](#tasks-between-plugins)). |
 
 ## Signing in to a web service
 
@@ -1068,6 +1085,170 @@ Yandex Tracker and Calendar — is built of these pieces:
    prompt and a mode.
 7. **News** — polling with `timers::every`; notifications whose actions carry the task's key
    (`Notice::action_with`, `context.argument()`).
+8. **Away from the computer** (API 0.6) — `task-source = true`: the user's tasks for a bot
+   ([Tasks between plugins](#tasks-between-plugins)), the actions of item 6 as the task's
+   `actions`, and a run of one in the project's window: item 3 asking nothing (the defaults of its
+   form, Git's quiet calls), then item 6 — answered with `tasks::started`.
+
+## From 0.5 to 0.6
+
+API 0.6 (`wit/v0.6`) is what a bot in a messenger needs to bring Flux's Claude to the user away
+from the computer: every Claude session, the computer's sleep and screen lock, an action in the
+Claude console, and the tasks of a tracker's plugin with its Claude actions on them. A session
+`claude::session()…start()` opens gives its id, and Git's new branch and checkout have quiet
+versions that ask nothing ([Git](#git)). A manifest that uses its keys says
+`api = "0.6"`; plugins built for 0.2–0.5 keep working as they are — Flux answers their calls
+through their own interfaces and never sends them 0.6's events. The SDK builds 0.6: a plugin built
+with it names `api = "0.6"`. The Remote Playground (`examples/remote-playground`) tries every call
+below with no messenger.
+
+### Claude for remote work
+
+```toml
+service = true
+
+[permissions]
+claude-remote = true
+```
+
+With `claude-remote` the plugin sees every Claude session of Flux — live in any window, and the
+unloaded ones of the console — and can do what the user does at the computer (`remote::…`; the
+calls work in the windows' instances and in the service alike):
+
+| Call | What it does |
+|------|--------------|
+| `watch()`, `unwatch()` | Start or stop the events below for this instance. Watch in the service: one for the whole app. |
+| `sessions()` | Every session: its id (the CLI's session id — it holds across unloading and restarts), project, title, state (`starting`, `working`, `waiting`, `idle`, `unloaded`), the line of what it does now, mode, window, when it last did something, the request it waits on, and whether its finished turn is unseen. |
+| `transcript(session, count)` | The last messages of the conversation: for a topic's start. |
+| `send(session, text)`, `send_with_images(…)` | A message, with pictures from the plugin's data folder; an unloaded session resumes. |
+| `allow`, `allow_with(choice)`, `deny`, `answer(response)` | The answer to a request: a permission once or with one of its choices («for this session», «always for this rule»), refused with a message; Claude's questions (`Response::Answers`, the chosen labels in the questions' order); the plan — approved accepting edits or asking (`ApprovePlan(bool)`), or more planning with feedback (`KeepPlanning`). An answer to a request that is gone (answered at the computer) fails. |
+| `interrupt(session)`, `set_mode(session, mode)` | Stop the turn; change the mode (`Ask`, `AcceptEdits`, `Plan`, `Bypass` — a plugin that offers «No checks» warns the user first). |
+| `rename(session, title)`, `close(session)` | Rename the session (its tab and the pult's row; an unloaded one resumes); close it as the Claude console's Close does — a live one ends, and it leaves «Now» for the history, where the user can resume it. |
+| `new_session(project)…start()` | A new session in a project Flux knows (`projects()`): its window opens in the background when none has it; with `.prompt(…)`, `.attach(…)`, `.image(…)`, `.mode(…)`, `.title(…)`; returns the id. May take a few seconds. |
+| `turn_diff(session, turn)` | A turn's changes as a unified diff (none — the last turn). |
+| `check_rollback(session, turn)`, `rollback(session, turn)` | What rolling the turn back would return — the files, the ones changed since Claude's edit, the ones it created (they go to the Trash) — and the rollback itself, without Flux's dialog: the plugin asks the user with the check first. |
+| `limits()` | The subscription's usage: the 5-hour and 7-day windows (percent, when they reset), whether a limit is reached; Flux asks Claude when no session runs. |
+| `region(check_again)` | The country check: Claude allowed, checking, or blocked (the country and Flux's sentence); `true` checks again after the user changed the network. |
+| `projects()` | The recent projects and the open ones. |
+| `set_awake(mode)`, `system_status()` | Keep the computer awake — `Always` or `OnPower` (on the adapter) — while Flux runs; closing a laptop's lid still puts it to sleep. The screen lock and the adapter now. |
+
+What happens comes to the instances that watch:
+
+| Event | |
+|-------|-|
+| `claude-session(session)` | A session appeared or changed: state, title, mode, activity, request, `unseen`. |
+| `claude-session-gone(id)` | It left the console: closed, archived. |
+| `claude-text(update)` | Claude's message as it is written: the whole text so far, about four times a second at most, then `done`; `message` names it within the session. |
+| `claude-steps((session, steps))` | A group of steps grew or ended: «Read 4 files · searched env_override». |
+| `claude-request((session, request))` | A question to answer: a permission (title, tool, subject, an edit's diff, the choices), Claude's questions with options, the plan. |
+| `claude-resolved((session, request))` | It went: answered at the computer or by a plugin, or withdrawn. |
+| `claude-turn-ended((session, summary))` | A turn ended: its number, the files with +/−, whether it failed, Claude's last message, how long it took. |
+| `claude-failed((session, error))` | The session's process failed. |
+| `claude-limits(limits)`, `claude-region(state)` | The usage, the country check changed. |
+| `system-changed(event)` | The screen locked or unlocked, the computer goes to sleep (Flux holds it about two seconds, so a message goes out) or woke, the power source changed. |
+| `claude-action((session, action))` | The user chose the plugin's action at a session in the console (below). |
+
+A bot's flow, in short:
+
+```rust
+fn activate(&mut self) {
+    if service::is_service() {
+        let _ = remote::watch();
+    }
+}
+
+fn on_event(&mut self, event: Event) {
+    match event {
+        Event::ClaudeText(update) => self.draft(&update.session, &update.text, update.done),
+        Event::ClaudeRequest((session, request)) => self.ask_user(&session, &request),
+        Event::ClaudeTurnEnded((session, summary)) => {
+            let diff = remote::turn_diff(&session, Some(summary.turn)).unwrap_or_default();
+            self.report(&session, &summary, &diff);
+        }
+        Event::SystemChanged(SystemEvent::WillSleep) => self.say("The Mac goes to sleep"),
+        _ => {}
+    }
+}
+
+// The user's answer from the messenger:
+remote::allow_with(&session, &request.id, "session")?;
+// A new chat:
+let id = remote::new_session(&project).prompt(&text).mode(Mode::Plan).start()?;
+```
+
+**`[[claude-actions]]`** — an action at a session in the Claude console: «Continue in Telegram».
+`id` (lowercase letters, digits, dashes), `title` (translated by the plugin's locales), `icon` (a
+named icon; none — the plugin's). The choice comes to the plugin's watching instances as
+`claude-action`; it needs `claude-remote`.
+
+### Tasks between plugins
+
+A tracker's plugin gives Flux the user's tasks with `task-source = true`: a query comes to its
+service (or, without one, to its instance in a window) as `task-query`, and it answers with
+`tasks::respond(id, …)`. Another plugin with the `tasks` permission asks — `tasks::mine()`,
+`search(words)`, `get(key)` (with the task's text and comments for Claude, and the source's
+actions) — and Flux waits for every source up to ten seconds and merges what they gave, each task
+marked with its `source`: the plugin that gave it, whatever the source said. A query never comes
+back to the instance that asked.
+
+**The source's Claude actions.** A task of `get` carries the tracker's actions as its settings
+have them — «Take to Work», the user's own ones: `tasks::action(id, title)`, `.plan()` (Claude
+starts in plan mode), `.start()` (the task is taken to work first: its status, its branch, its
+tabs, its timer); lists leave them out. Another plugin runs one with `tasks::run(&task, action,
+project)` — the folder of a project Flux knows (`remote::projects()`) — and waits up to a minute.
+Flux opens the project's window in the background when none has it, waits until it is ready (its
+repositories found, Claude's check done) and the source's instance there has started, and sends it
+the query `Query::Run(run)`: the work is the window's — Git, the tabs, Claude's chat — so it never
+goes to the source's service. The source does what the action does at the computer and answers
+with `tasks::started(id, …)`: the Claude session it opened (`claude::session()…start()`'s id,
+`tasks::opened(id)`) and `.note(…)`s — a sentence each, in the user's language, of what went
+otherwise than at the computer.
+
+**Ask nothing in a run**: nobody is at the computer. No questions, forms or pickers; Git's
+`new_branch_quietly` and `checkout_quietly`. When local changes keep the task's branch from being
+checked out, leave the branch alone, start Claude on the current one and say so in a note — the
+bot tells the user. A run's errors are plain sentences: "Yandex Tracker didn't answer in a
+minute", "No window could open /path"; the source's own `Err` reaches the asker as it is.
+
+```rust
+// The tracker:
+Event::TaskQuery(query) => {
+    let found = match query.query {
+        Query::Mine => self.mine(),
+        Query::Search(words) => self.search(&words),
+        // With the text, the comments and the actions.
+        Query::Get(key) => self.task(&key).map(|task| {
+            vec![task
+                .action(tasks::action("work", &tr("Take to Work")).start())
+                .action(tasks::action("plan", &tr("Plan")).plan())]
+        }),
+        // In the project's window: the status, then the branch — quietly.
+        Query::Run(run) => {
+            self.runs.insert(git::new_branch_quietly(&root, &branch, None), (query.id, run));
+            return;
+        }
+    };
+    tasks::respond(query.id, found);
+}
+Event::GitDone((op, result)) => {
+    let Some((id, run)) = self.runs.remove(&op) else { return };
+    let mut notes = Vec::new();
+    if let Err(why) = result {
+        notes.push(trf("The branch {0} wasn't checked out: {1}", &[&branch, &why]));
+    }
+    let session = claude::session().title(&title).attach(&run.key, &text).prompt(&prompt).send().start();
+    tasks::started(id, session.map(|session| TaskStarted { session, notes }));
+}
+// The bot:
+for task in tasks::mine()? { /* task.key, task.title, task.status, task.url, task.source */ }
+let task = tasks::get("TRACK-142")?.ok_or("no such task")?;
+let started = tasks::run(&task, &task.actions[0].id, &project)?;
+// started.session — the new session's id (its events come as any session's); started.notes.
+```
+
+The Remote Playground (`examples/remote-playground`) is both sides: its made-up tasks have «Take
+to Work» and «Plan», the island runs one in a chosen project from the plugin's service, and the
+plugin's instance in the project's window makes the branch quietly and opens Claude.
 
 ## From 0.4 to 0.5
 

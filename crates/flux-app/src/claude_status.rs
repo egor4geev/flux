@@ -552,6 +552,17 @@ pub fn phrase(model: &Session, finished: Option<Instant>) -> Phrase {
     }
 }
 
+/// What a session does now in one line, as the console's row says it but without its clock (the
+/// hub of remote work, API 0.6: the line changes only when the work does); empty when nothing
+/// runs.
+pub(crate) fn activity(model: &Session) -> String {
+    match glance(model).state {
+        GlanceState::Working => doing(model),
+        GlanceState::Waiting | GlanceState::Starting => phrase(model, None).text,
+        GlanceState::Idle | GlanceState::Failed | GlanceState::Stopped => String::new(),
+    }
+}
+
 /// What a working session does: its newest running call, else what it streams.
 fn doing(model: &Session) -> String {
     let running = model
