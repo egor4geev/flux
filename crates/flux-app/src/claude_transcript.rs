@@ -785,7 +785,10 @@ fn request_tick(chat: &WeakEntity<ClaudeChat>, pending: &Rc<Cell<bool>>, cx: &mu
 /// a group. A lone minor step is its own item: a group of one thought would be «Thought» opening
 /// to another «Thought» (the author, after 10.2).
 ///
-/// A plugin's tools' steps (API 0.5) group apart: `owner` names the plugin of a step.
+/// A plugin's tools' steps (API 0.5) group apart: `owner` names the plugin of a step. Claude's
+/// thoughts between a plugin's steps stay in its group — Claude thinks between the calls, and
+/// «FluxGram · 5 steps» would otherwise never form (FluxGram part 6); one after its last step
+/// (more may come) stays while nothing else follows it.
 pub(crate) fn items(entries: &[Entry], owner: &dyn Fn(&Entry) -> Option<Arc<str>>) -> Vec<Item> {
     /// The group being gathered: its first and past-the-last entries, how many it shows, whose
     /// steps they are (a plugin's, or Claude's own).
@@ -811,6 +814,21 @@ pub(crate) fn items(entries: &[Entry], owner: &dyn Fn(&Entry) -> Option<Arc<str>
             continue;
         }
         if is_minor(&entry.kind) {
+            // A thought within a plugin's steps: the next shown step decides.
+            let thought = matches!(entry.kind, EntryKind::Thinking { .. });
+            if let Some(open) = group
+                .as_mut()
+                .filter(|open| thought && open.owner.is_some())
+            {
+                let next = entries[index + 1..].iter().find(|entry| {
+                    !is_hidden(&entry.kind) && !matches!(entry.kind, EntryKind::Thinking { .. })
+                });
+                if next.is_none_or(|next| is_minor(&next.kind) && owner(next) == open.owner) {
+                    open.end = index + 1;
+                    open.shown += 1;
+                    continue;
+                }
+            }
             let owner = owner(entry);
             group = Some(match group {
                 Some(open) if open.owner == owner => Open {
@@ -2324,8 +2342,15 @@ impl Renderer<'_> {
                 .size(px(13.))
                 .into_any_element()
         };
+        // A plugin's group counts its steps, not Claude's thoughts between them.
         let title = match plugin {
-            Some(plugin) => crate::plugin_tools::group_title(&plugin.plugin_name, shown.len()),
+            Some(plugin) => {
+                let steps = shown
+                    .iter()
+                    .filter(|entry| matches!(entry.kind, EntryKind::Tool(_)))
+                    .count();
+                crate::plugin_tools::group_title(&plugin.plugin_name, steps)
+            }
             None => group_summary(&shown),
         };
         let chat = self.chat.clone();
@@ -5898,6 +5923,79 @@ mod tests {
         );
         let shown: Vec<&Entry> = entries[..3].iter().collect();
         assert_eq!(group_summary(&shown), "Read 1 file");
+    }
+
+    #[test]
+    fn thoughts_between_a_plugin_s_steps_stay_in_its_group() {
+        let step = |id: EntryId, name: &str| Entry {
+            id,
+            kind: EntryKind::Tool(Box::new(tool(name, json!({}), None))),
+        };
+        let thought = |id: EntryId| Entry {
+            id,
+            kind: EntryKind::Thinking {
+                text: "Let me read more.".into(),
+                tokens: 12,
+                streaming: false,
+                duration: None,
+                started: std::time::Instant::now(),
+            },
+        };
+        let text = Entry {
+            id: 9,
+            kind: EntryKind::Text {
+                text: "Here it is.".into(),
+                streaming: false,
+            },
+        };
+        let plugin = |entry: &Entry| match &entry.kind {
+            EntryKind::Tool(tool) if tool.name.starts_with("mcp__flux__fluxgram_") => {
+                Some(Arc::from("flux.fluxgram"))
+            }
+            _ => None,
+        };
+        // A thought first, three steps with thoughts between them, a thought before the answer.
+        let entries = vec![
+            thought(1),
+            step(2, "mcp__flux__fluxgram_chats"),
+            thought(3),
+            step(4, "mcp__flux__fluxgram_read_chat"),
+            thought(5),
+            step(6, "mcp__flux__fluxgram_read_chat"),
+            thought(7),
+            text.clone(),
+        ];
+        assert_eq!(
+            items(&entries, &plugin),
+            [
+                Item::Entry(0),
+                Item::Group { start: 1, end: 6 },
+                Item::Entry(6),
+                Item::Entry(7),
+            ]
+        );
+        // While Claude works, a thought after the last step stays in the group: the next call
+        // may well come.
+        assert_eq!(
+            items(&entries[..7], &plugin),
+            [Item::Entry(0), Item::Group { start: 1, end: 7 }]
+        );
+        // Another tool between them breaks the group, as before; Claude's own groups don't take
+        // a plugin's thoughts.
+        let entries = vec![
+            step(1, "mcp__flux__fluxgram_chats"),
+            thought(2),
+            step(3, "Read"),
+            step(4, "mcp__flux__fluxgram_read_chat"),
+        ];
+        assert_eq!(
+            items(&entries, &plugin),
+            [
+                Item::Entry(0),
+                Item::Group { start: 1, end: 3 },
+                Item::Entry(3)
+            ]
+        );
     }
 
     #[test]
