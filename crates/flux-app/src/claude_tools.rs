@@ -78,12 +78,12 @@ pub fn specs() -> Vec<ToolSpec> {
     };
     vec![
         ToolSpec {
-            name: "get_diagnostics",
-            title: "Get Diagnostics",
+            name: "get_diagnostics".into(),
+            title: "Get Diagnostics".into(),
             description: "The problems (errors, warnings) Flux's language servers report. Without \
                 `path`: every file with problems Flux knows of (the open files and those the servers \
                 checked); with `path`: that file, checked by its language server if it isn't yet. \
-                Faster than a build to check code you changed.",
+                Faster than a build to check code you changed.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -93,10 +93,10 @@ pub fn specs() -> Vec<ToolSpec> {
             read_only: true,
         },
         ToolSpec {
-            name: "open_file",
-            title: "Open File",
+            name: "open_file".into(),
+            title: "Open File".into(),
             description: "Opens a file in the user's Flux editor, at a line or selecting a range. \
-                Use it to show the user the code you are talking about.",
+                Use it to show the user the code you are talking about.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -111,42 +111,42 @@ pub fn specs() -> Vec<ToolSpec> {
             read_only: true,
         },
         ToolSpec {
-            name: "get_open_files",
-            title: "Get Open Files",
+            name: "get_open_files".into(),
+            title: "Get Open Files".into(),
             description: "The files open in the user's Flux editor, the active one first: whether \
-                they have unsaved changes, the caret and the selection.",
+                they have unsaved changes, the caret and the selection.".into(),
             input_schema: json!({ "type": "object", "properties": {} }),
             read_only: true,
         },
         ToolSpec {
-            name: "find_definition",
-            title: "Find Definition",
+            name: "find_definition".into(),
+            title: "Find Definition".into(),
             description: "Where a symbol is defined, from the language server: precise where grep \
-                guesses (same names, re-exports, generated code, dependencies).",
+                guesses (same names, re-exports, generated code, dependencies).".into(),
             input_schema: position("to look up"),
             read_only: true,
         },
         ToolSpec {
-            name: "find_usages",
-            title: "Find Usages",
+            name: "find_usages".into(),
+            title: "Find Usages".into(),
             description: "Every place a symbol is used in the project, from the language server \
-                (the declaration itself is not listed).",
+                (the declaration itself is not listed).".into(),
             input_schema: position("to find"),
             read_only: true,
         },
         ToolSpec {
-            name: "symbol_info",
-            title: "Symbol Info",
+            name: "symbol_info".into(),
+            title: "Symbol Info".into(),
             description: "The type, the signature and the documentation of a symbol, from the \
-                language server.",
+                language server.".into(),
             input_schema: position("to describe"),
             read_only: true,
         },
         ToolSpec {
-            name: "search_symbols",
-            title: "Search Symbols",
+            name: "search_symbols".into(),
+            title: "Search Symbols".into(),
             description: "Types, functions and other symbols of the project whose names match a \
-                query, from the running language servers.",
+                query, from the running language servers.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": { "query": { "type": "string" } },

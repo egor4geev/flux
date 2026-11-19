@@ -915,6 +915,71 @@ pub fn primary_button(
         .child(label.into())
 }
 
+/// The design system's spinner: a dot pulsing while work goes on (a setting's "Checking…", a busy
+/// button); a still one with the animations off. `id` keys its animation.
+pub fn pulse_dot(id: impl Into<ElementId>, size: f32, color: Hsla) -> AnyElement {
+    use gpui::{Animation, AnimationExt as _};
+    let dot = div()
+        .flex_none()
+        .size(px(size))
+        .rounded(px(size / 2.))
+        .bg(color);
+    if !motion::enabled() {
+        return dot.opacity(0.65).into_any_element();
+    }
+    dot.with_animation(
+        id,
+        Animation::new(std::time::Duration::from_millis(900)).repeat(),
+        |dot, delta| dot.opacity(0.3 + 0.7 * (1. - (2. * delta - 1.).abs())),
+    )
+    .into_any_element()
+}
+
+/// A button at work after its press (a sign-in's Next while the server answers): the spinner in
+/// place of its icon, its label, and no hover or press — the caller adds no `on_click`. `primary`
+/// — the accent button; without a label, an icon button's square.
+pub fn busy_button(
+    id: impl Into<ElementId>,
+    label: Option<SharedString>,
+    primary: bool,
+    ui: UiColors,
+) -> Stateful<Div> {
+    let id = id.into();
+    let spinner = pulse_dot(
+        ElementId::NamedChild(Box::new(id.clone()), "busy".into()),
+        7.,
+        if primary { ui.accent_text } else { ui.accent },
+    );
+    let frame = div()
+        .id(id)
+        .flex_none()
+        .h(px(ICON_BUTTON_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_1p5()
+        .rounded(px(RADIUS_SM))
+        .text_size(px(theme::TEXT_SM));
+    let frame = match &label {
+        None => frame.w(px(ICON_BUTTON_SIZE)),
+        Some(_) if primary => frame
+            .pl(px(10.))
+            .pr(px(12.))
+            .border_1()
+            .border_color(UiColors::tint(ui.accent, 0.55))
+            .bg(UiColors::tint(ui.accent, 0.24))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(ui.accent_text),
+        Some(_) => frame
+            .pl(px(9.))
+            .pr(px(10.))
+            .border_1()
+            .border_color(ui.input_border)
+            .text_color(ui.foreground),
+    };
+    frame.child(spinner).children(label)
+}
+
 /// Shortcut keys: "⇧⌘F" → ⇧ ⌘ F, "⌘K ⌘S" → two groups. Modifiers get one key each; the rest of a
 /// group is a single key. A label written in macOS symbols reads the system's way on Windows
 /// ("Ctrl+Shift+F" → Ctrl Shift F, [`keymap::label`]).

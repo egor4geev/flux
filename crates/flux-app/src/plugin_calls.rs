@@ -95,6 +95,21 @@ pub(crate) fn window_call(
             .plugins
             .update(cx, |store, cx| store.clear_diagnostics(plugin, cx)),
         WindowCall::OpenUrl(url) => open_url(url, cx),
+        // API 0.5: a file of the plugin's data folder, or one the user gave it.
+        WindowCall::OpenFile { path, reveal } => {
+            let path = std::path::Path::new(path);
+            if crate::plugin_images::allowed(plugin, path, cx) {
+                match reveal {
+                    true => crate::plugin_conversation::reveal_path(path, cx),
+                    false => crate::plugin_conversation::open_with_system(path, cx),
+                }
+            } else {
+                log::warn!(
+                    "plugin {plugin}: {} is neither in its data folder nor given to it, not opened",
+                    path.display()
+                );
+            }
+        }
         WindowCall::CopyText(text) => {
             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
         }

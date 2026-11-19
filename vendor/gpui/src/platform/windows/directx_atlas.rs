@@ -1,5 +1,5 @@
 use collections::FxHashMap;
-use etagere::BucketedAtlasAllocator;
+use etagere::AtlasAllocator;
 use parking_lot::Mutex;
 use windows::Win32::Graphics::{
     Direct3D11::{
@@ -22,14 +22,22 @@ struct DirectXAtlasState {
     monochrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     polychrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    /// Flux patch: tiles removed whose space isn't free yet: the window's scene drawn before the
+    /// removal may be presented again until the window draws a new one. Freed as the window
+    /// begins to draw (`get_or_insert_with`); the frames drawn with them were submitted before,
+    /// and Direct3D 11's immediate context keeps the order: an upload into their space comes
+    /// after them.
+    removed_tiles: Vec<AtlasTile>,
 }
 
 struct DirectXAtlasTexture {
     id: AtlasTextureId,
     bytes_per_pixel: u32,
-    allocator: BucketedAtlasAllocator,
+    allocator: AtlasAllocator,
     texture: ID3D11Texture2D,
     view: [Option<ID3D11ShaderResourceView>; 1],
+    /// Flux patch: the tiles allocated and not freed yet — a removed tile counts until its space
+    /// is freed.
     live_atlas_keys: u32,
 }
 
@@ -41,6 +49,7 @@ impl DirectXAtlas {
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             tiles_by_key: Default::default(),
+            removed_tiles: Vec::new(),
         }))
     }
 
@@ -64,6 +73,7 @@ impl DirectXAtlas {
         lock.monochrome_textures = AtlasTextureList::default();
         lock.polychrome_textures = AtlasTextureList::default();
         lock.tiles_by_key.clear();
+        lock.removed_tiles.clear();
     }
 }
 
@@ -76,6 +86,10 @@ impl PlatformAtlas for DirectXAtlas {
         >,
     ) -> anyhow::Result<Option<AtlasTile>> {
         let mut lock = self.0.lock();
+        // Flux patch: the window draws a new scene, without the tiles removed before.
+        while let Some(tile) = lock.removed_tiles.pop() {
+            lock.free_tile(&tile);
+        }
         if let Some(tile) = lock.tiles_by_key.get(key) {
             Ok(Some(tile.clone()))
         } else {
@@ -92,35 +106,39 @@ impl PlatformAtlas for DirectXAtlas {
         }
     }
 
+    /// Flux patch: the tile's space is freed as the window begins to draw again
+    /// (`DirectXAtlasState::removed_tiles`), and a texture left without tiles is released. gpui
+    /// 0.2.2 never freed a tile: a texture was released only once every one of its tiles had
+    /// been removed, so the frames of an animation, each a new image, filled one texture after
+    /// another, and a texture also holding a picture still shown was never released.
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
-
-        let Some(id) = lock.tiles_by_key.remove(key).map(|tile| tile.texture_id) else {
-            return;
-        };
-
-        let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
-        };
-
-        let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
-            return;
-        };
-
-        if let Some(mut texture) = texture_slot.take() {
-            texture.decrement_ref_count();
-            if texture.is_unreferenced() {
-                textures.free_list.push(texture.id.index as usize);
-                lock.tiles_by_key.remove(key);
-            } else {
-                *texture_slot = Some(texture);
-            }
+        if let Some(tile) = lock.tiles_by_key.remove(key) {
+            lock.removed_tiles.push(tile);
         }
     }
 }
 
 impl DirectXAtlasState {
+    /// Flux patch: gives a tile's space back to its texture's allocator; a texture left without
+    /// tiles is released (its slot taken by the next new texture).
+    fn free_tile(&mut self, tile: &AtlasTile) {
+        let id = tile.texture_id;
+        let textures = match id.kind {
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+        };
+        let Some(Some(texture)) = textures.textures.get_mut(id.index as usize) else {
+            return;
+        };
+        texture.allocator.deallocate(tile.tile_id.into());
+        texture.live_atlas_keys -= 1;
+        if texture.live_atlas_keys == 0 {
+            textures.textures[id.index as usize] = None;
+            textures.free_list.push(id.index as usize);
+        }
+    }
+
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -219,7 +237,10 @@ impl DirectXAtlasState {
                 kind,
             },
             bytes_per_pixel,
-            allocator: etagere::BucketedAtlasAllocator::new(size.into()),
+            // Flux patch: an allocator tracking each tile, so the space of one removed is free
+            // again at once (`free_tile`); gpui 0.2.2's bucketed one frees a tile's space only
+            // with every tile of its bucket, and a bucket takes at most 4095 tiles in its life.
+            allocator: AtlasAllocator::new(size.into()),
             texture,
             view,
             live_atlas_keys: 0,
@@ -281,14 +302,6 @@ impl DirectXAtlasTexture {
                 0,
             );
         }
-    }
-
-    fn decrement_ref_count(&mut self) {
-        self.live_atlas_keys -= 1;
-    }
-
-    fn is_unreferenced(&mut self) -> bool {
-        self.live_atlas_keys == 0
     }
 }
 

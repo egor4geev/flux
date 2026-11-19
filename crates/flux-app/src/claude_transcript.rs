@@ -46,6 +46,7 @@ use crate::i18n::{tr, trf, trn};
 use crate::icons::{IconName, IconSource, file_icon, icon, source_icon};
 use crate::markdown::{self, Block, Marks};
 use crate::motion::{self, Appear, Curve, TransitionExt};
+use crate::plugin_tools::SessionTools;
 use crate::region_guard::{self, Verdict};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::{self, RADIUS_MD, RADIUS_SM};
@@ -564,8 +565,9 @@ pub fn sync(
     let mut pictures = Vec::new();
     let (fingerprints, user_sent, reveal) = {
         let model = session.read(cx).model();
+        let tools = session.read(cx).plugin_tools();
         let entries = scope_entries(model, state.scope);
-        let items = items(entries);
+        let items = items(entries, &|entry| plugin_of(entry, tools));
         state.item_of = item_index(entries, &items);
         // The entry to reveal opens the group that holds it before the items are measured.
         let reveal = state.reveal.take().and_then(|id| {
@@ -782,12 +784,19 @@ fn request_tick(chat: &WeakEntity<ClaudeChat>, pending: &Rc<Cell<bool>>, cx: &mu
 /// group. Hidden entries (thinking without text, an empty text) belong to no item and don't break
 /// a group. A lone minor step is its own item: a group of one thought would be «Thought» opening
 /// to another «Thought» (the author, after 10.2).
-pub(crate) fn items(entries: &[Entry]) -> Vec<Item> {
-    /// The group being gathered: its first and past-the-last entries, how many it shows.
+///
+/// A plugin's tools' steps (API 0.5) group apart: `owner` names the plugin of a step. Claude's
+/// thoughts between a plugin's steps stay in its group — Claude thinks between the calls, and
+/// «FluxGram · 5 steps» would otherwise never form (FluxGram part 6); one after its last step
+/// (more may come) stays while nothing else follows it.
+pub(crate) fn items(entries: &[Entry], owner: &dyn Fn(&Entry) -> Option<Arc<str>>) -> Vec<Item> {
+    /// The group being gathered: its first and past-the-last entries, how many it shows, whose
+    /// steps they are (a plugin's, or Claude's own).
     struct Open {
         start: usize,
         end: usize,
         shown: usize,
+        owner: Option<Arc<str>>,
     }
     fn close(open: Open, items: &mut Vec<Item>) {
         items.push(match open.shown {
@@ -805,17 +814,39 @@ pub(crate) fn items(entries: &[Entry]) -> Vec<Item> {
             continue;
         }
         if is_minor(&entry.kind) {
+            // A thought within a plugin's steps: the next shown step decides.
+            let thought = matches!(entry.kind, EntryKind::Thinking { .. });
+            if let Some(open) = group
+                .as_mut()
+                .filter(|open| thought && open.owner.is_some())
+            {
+                let next = entries[index + 1..].iter().find(|entry| {
+                    !is_hidden(&entry.kind) && !matches!(entry.kind, EntryKind::Thinking { .. })
+                });
+                if next.is_none_or(|next| is_minor(&next.kind) && owner(next) == open.owner) {
+                    open.end = index + 1;
+                    open.shown += 1;
+                    continue;
+                }
+            }
+            let owner = owner(entry);
             group = Some(match group {
-                Some(open) => Open {
+                Some(open) if open.owner == owner => Open {
                     end: index + 1,
                     shown: open.shown + 1,
                     ..open
                 },
-                None => Open {
-                    start: index,
-                    end: index + 1,
-                    shown: 1,
-                },
+                other => {
+                    if let Some(open) = other {
+                        close(open, &mut items);
+                    }
+                    Open {
+                        start: index,
+                        end: index + 1,
+                        shown: 1,
+                        owner,
+                    }
+                }
             });
             continue;
         }
@@ -828,6 +859,14 @@ pub(crate) fn items(entries: &[Entry]) -> Vec<Item> {
         close(open, &mut items);
     }
     items
+}
+
+/// The plugin whose tool a step called (API 0.5), if it is one.
+fn plugin_of(entry: &Entry, tools: &SessionTools) -> Option<Arc<str>> {
+    match &entry.kind {
+        EntryKind::Tool(tool) => tools.of_step(&tool.name).map(|tool| tool.plugin.clone()),
+        _ => None,
+    }
 }
 
 /// Which item shows each entry; a subagent's entries (at any depth) go by their Agent call's.
@@ -1294,6 +1333,7 @@ fn item_element(
         chat: chat.clone(),
         session: &session,
         model,
+        plugin_tools: session.read(cx).plugin_tools(),
         root: &model.info.cwd,
         tasks: &model.tasks,
         agent: agent.is_some(),
@@ -1369,6 +1409,8 @@ struct Renderer<'a> {
     chat: WeakEntity<ClaudeChat>,
     session: &'a Entity<ClaudeSession>,
     model: &'a Session,
+    /// The window's plugins' tools in the session: their steps' titles, icons and answers.
+    plugin_tools: &'a SessionTools,
     root: &'a Path,
     /// Claude's task list: a task update names its task.
     tasks: &'a [flux_claude::TaskItem],
@@ -2284,12 +2326,32 @@ impl Renderer<'_> {
             .filter(|entry| tool_state(entry) == Some(ToolState::Failed))
             .count();
         let open = self.state.group_open(id, live || waiting);
+        // A plugin's steps: its icon and name, how many.
+        let plugin = shown.first().and_then(|entry| match &entry.kind {
+            EntryKind::Tool(tool) => self.plugin_tools.of_step(&tool.name),
+            _ => None,
+        });
         let leading = if live {
             pulse(("claude-group-pulse", id), ui).into_any_element()
+        } else if plugin.is_some() {
+            source_icon(&plugin_icon(plugin), ui.dim)
+                .size(px(13.))
+                .into_any_element()
         } else {
             icon(IconName::Sparkle, ui.dim)
                 .size(px(13.))
                 .into_any_element()
+        };
+        // A plugin's group counts its steps, not Claude's thoughts between them.
+        let title = match plugin {
+            Some(plugin) => {
+                let steps = shown
+                    .iter()
+                    .filter(|entry| matches!(entry.kind, EntryKind::Tool(_)))
+                    .count();
+                crate::plugin_tools::group_title(&plugin.plugin_name, steps)
+            }
+            None => group_summary(&shown),
         };
         let chat = self.chat.clone();
         let header = div()
@@ -2313,13 +2375,7 @@ impl Renderer<'_> {
                     .justify_center()
                     .child(leading),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(group_summary(&shown)),
-            )
+            .child(div().flex_1().min_w_0().truncate().child(title))
             .when(failed > 0, |row| {
                 row.child(
                     div()
@@ -2875,13 +2931,20 @@ impl Renderer<'_> {
     /// detail, a note at the end; a click opens its details.
     fn tool(&self, id: EntryId, tool: &ToolEntry, depth: usize) -> AnyElement {
         let ui = self.ui;
-        let summary = tool_summary(tool, self.root, self.tasks);
+        let plugin = self.plugin_tools.of_step(&tool.name);
+        let summary = match plugin {
+            Some(plugin) => {
+                plugin_summary(plugin, self.plugin_tools.output(&tool.tool_use_id).as_ref())
+            }
+            None => tool_summary(tool, self.root, self.tasks),
+        };
         let running = matches!(tool.state, ToolState::Streaming | ToolState::Running);
         let details = self.details(id, tool, depth);
         let expanded = details.is_some() && self.state.expanded(id, false);
         let mark = state_mark(tool.state, ui);
         // A file's row has the file type's icon (in the row's quiet color).
         let icon_source = match &tool.call {
+            _ if plugin.is_some() => plugin_icon(plugin),
             ToolCall::Read { path, .. } => path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -3022,6 +3085,22 @@ impl Renderer<'_> {
     /// What a tool call has to show besides its row (a card's body, a row's details).
     fn details_body(&self, id: EntryId, tool: &ToolEntry, depth: usize) -> Option<AnyElement> {
         let ui = self.ui;
+        // A plugin's step opens to its excerpts (what Claude read), else to what Claude got.
+        if self.plugin_tools.of_step(&tool.name).is_some() {
+            let excerpt = self
+                .plugin_tools
+                .output(&tool.tool_use_id)
+                .and_then(|output| output.excerpt.clone());
+            return match excerpt {
+                Some(blocks) if tool.state != ToolState::Failed => Some(
+                    div()
+                        .text_size(px(theme::TEXT_SM))
+                        .child(markdown::render(&blocks, ui.text_muted, self.theme))
+                        .into_any_element(),
+                ),
+                _ => self.result_body(id, tool),
+            };
+        }
         let structured = tool
             .result
             .as_ref()
@@ -5277,6 +5356,32 @@ pub(crate) fn tool_summary(
     }
 }
 
+/// A plugin's step (API 0.5): the plugin's line once it answered (its tool's title until then),
+/// its detail dim on the right.
+fn plugin_summary(
+    plugin: &crate::plugin_tools::PluginTool,
+    output: Option<&crate::plugin_tools::StepOutput>,
+) -> ToolSummary {
+    ToolSummary {
+        icon: IconName::Plug,
+        title: output
+            .and_then(|output| output.summary.clone())
+            .map_or_else(|| plugin.title.clone(), SharedString::from),
+        detail: String::new(),
+        code: false,
+        meta: output.and_then(|output| output.detail.clone()),
+        line: None,
+    }
+}
+
+/// A plugin's icon for its steps; none — the plug.
+fn plugin_icon(plugin: Option<&crate::plugin_tools::PluginTool>) -> IconSource {
+    match plugin.and_then(|plugin| plugin.icon.clone()) {
+        Some(path) => IconSource::Asset(path),
+        None => IconSource::Builtin(IconName::Plug),
+    }
+}
+
 /// A tool's name as the activity line says it ("Running Bash…").
 fn tool_display_name(name: &str) -> String {
     match name {
@@ -5808,7 +5913,7 @@ mod tests {
         ];
         // A lone step (the last read) is its own item, not a group of one.
         assert_eq!(
-            items(&entries),
+            items(&entries, &|_| None),
             [
                 Item::Group { start: 0, end: 3 },
                 Item::Entry(3),
@@ -5818,6 +5923,79 @@ mod tests {
         );
         let shown: Vec<&Entry> = entries[..3].iter().collect();
         assert_eq!(group_summary(&shown), "Read 1 file");
+    }
+
+    #[test]
+    fn thoughts_between_a_plugin_s_steps_stay_in_its_group() {
+        let step = |id: EntryId, name: &str| Entry {
+            id,
+            kind: EntryKind::Tool(Box::new(tool(name, json!({}), None))),
+        };
+        let thought = |id: EntryId| Entry {
+            id,
+            kind: EntryKind::Thinking {
+                text: "Let me read more.".into(),
+                tokens: 12,
+                streaming: false,
+                duration: None,
+                started: std::time::Instant::now(),
+            },
+        };
+        let text = Entry {
+            id: 9,
+            kind: EntryKind::Text {
+                text: "Here it is.".into(),
+                streaming: false,
+            },
+        };
+        let plugin = |entry: &Entry| match &entry.kind {
+            EntryKind::Tool(tool) if tool.name.starts_with("mcp__flux__fluxgram_") => {
+                Some(Arc::from("flux.fluxgram"))
+            }
+            _ => None,
+        };
+        // A thought first, three steps with thoughts between them, a thought before the answer.
+        let entries = vec![
+            thought(1),
+            step(2, "mcp__flux__fluxgram_chats"),
+            thought(3),
+            step(4, "mcp__flux__fluxgram_read_chat"),
+            thought(5),
+            step(6, "mcp__flux__fluxgram_read_chat"),
+            thought(7),
+            text.clone(),
+        ];
+        assert_eq!(
+            items(&entries, &plugin),
+            [
+                Item::Entry(0),
+                Item::Group { start: 1, end: 6 },
+                Item::Entry(6),
+                Item::Entry(7),
+            ]
+        );
+        // While Claude works, a thought after the last step stays in the group: the next call
+        // may well come.
+        assert_eq!(
+            items(&entries[..7], &plugin),
+            [Item::Entry(0), Item::Group { start: 1, end: 7 }]
+        );
+        // Another tool between them breaks the group, as before; Claude's own groups don't take
+        // a plugin's thoughts.
+        let entries = vec![
+            step(1, "mcp__flux__fluxgram_chats"),
+            thought(2),
+            step(3, "Read"),
+            step(4, "mcp__flux__fluxgram_read_chat"),
+        ];
+        assert_eq!(
+            items(&entries, &plugin),
+            [
+                Item::Entry(0),
+                Item::Group { start: 1, end: 3 },
+                Item::Entry(3)
+            ]
+        );
     }
 
     #[test]

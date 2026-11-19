@@ -10,7 +10,7 @@
 //! ```
 
 pub use crate::host::system::{
-    copy_text, home_dir, open_settings, open_url, time_zone, utc_offset,
+    copy_text, home_dir, open_file, open_settings, open_url, show_file, time_zone, utc_offset,
 };
 
 /// Now, in seconds since 1970-01-01 UTC.

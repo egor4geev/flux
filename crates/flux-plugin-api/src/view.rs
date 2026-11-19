@@ -19,11 +19,11 @@
 //! views by it. To start an element afresh — Expand All applying the rows' `expanded` again —
 //! give it a new id.
 
+pub use crate::host::ui::{AvatarSpec, ImageShape, ImageSpec, ToggleStyle, Tone};
 use crate::host::ui::{
-    BadgeSpec, ButtonSpec, Element as RawElement, ElementKind, Property, RowAction, Span,
-    TextFieldSpec, ToggleSpec, TreeRow, TreeSpec, View,
+    BadgeSpec, ButtonSpec, ConversationSpec, Element as RawElement, ElementKind, Property,
+    RowAction, Span, TextFieldSpec, ToggleSpec, TreeRow, TreeSpec, View,
 };
-pub use crate::host::ui::{ToggleStyle, Tone};
 
 /// An element with its children, before flattening.
 pub struct Element {
@@ -59,9 +59,34 @@ impl Element {
     }
 }
 
-/// Shows `root` as the content of the tool window `window` (`[[tool-windows]]` of the manifest).
+/// Shows `root` as the content of the tool window `window` (`[[tool-windows]]` of the manifest),
+/// or of a tab `<window>/<key>` of a window with tabs.
 pub fn set_view(window: &str, root: Element) {
     crate::host::ui::set_view(window, &root.into_view());
+}
+
+/// Puts the keyboard in the text field `element` of the window's view (API 0.5): a search bar
+/// opened by ⌘F (`UiEvent::Find`); Esc in it comes as `UiEvent::Cancelled`. The field may come
+/// in the view set just before.
+pub fn focus(window: &str, element: &str) {
+    crate::host::ui::focus(window, element)
+}
+
+/// Opens the tab `key` of a window declared with `tabs = true` (API 0.5), titled `title`, or
+/// brings it forward (retitled); `focus` — it takes the keyboard. Returns the tab's window name,
+/// `<window>/<key>`, for [`set_view`], [`set_badge`], `ui::set_title`, `ui::hide` and the
+/// conversation's updates; the events name the tab by it, and `Event::TabClosed` tells when it
+/// is closed. Flux keeps the tab with the project: the plugin fills it again from its key when
+/// it comes into sight (`Event::ToolWindowShown`).
+pub fn open_tab(window: &str, key: &str, title: &str, focus: bool) -> String {
+    crate::host::ui::open_tab(window, key, title, focus)
+}
+
+/// The window's mark (API 0.5): on the launchpad icon of a window of the left or the right
+/// island, a count ("4"); on a tab, a dot after the title. `None` takes it away; it goes when the
+/// plugin stops, too.
+pub fn set_badge(window: &str, badge: Option<&str>) {
+    crate::host::ui::set_badge(window, badge);
 }
 
 /// Appends the element and its subtree; returns its index.
@@ -121,6 +146,8 @@ pub fn button(id: &str, label: &str) -> Button {
             tooltip: None,
             primary: false,
             enabled: true,
+            busy: false,
+            badge: None,
         },
     }
 }
@@ -135,6 +162,8 @@ pub fn icon_button(id: &str, icon: &str, tooltip: &str) -> Element {
             tooltip: Some(tooltip.to_string()),
             primary: false,
             enabled: true,
+            busy: false,
+            badge: None,
         },
     }
     .into()
@@ -170,6 +199,19 @@ impl Button {
         self.spec.enabled = enabled;
         self
     }
+
+    /// Work is in progress after its press (API 0.5): a spinner in place of the icon, and the
+    /// button doesn't press — Next while the server answers.
+    pub fn busy(mut self, busy: bool) -> Self {
+        self.spec.busy = busy;
+        self
+    }
+
+    /// A count after the label, in a small pill (API 0.5): an account's unread messages.
+    pub fn badge(mut self, badge: &str) -> Self {
+        self.spec.badge = Some(badge.to_string());
+        self
+    }
 }
 
 impl From<Button> for Element {
@@ -187,6 +229,22 @@ pub fn text_field(id: &str, text: &str, placeholder: Option<&str>) -> Element {
             placeholder: placeholder.map(str::to_string),
             code: false,
             multiline: false,
+            secret: false,
+        }),
+    )
+}
+
+/// A password field (API 0.5): the text shows as dots and isn't copied; changes come as
+/// `changed`, ↵ as `submitted`.
+pub fn password_field(id: &str, text: &str, placeholder: Option<&str>) -> Element {
+    Element::new(
+        id,
+        ElementKind::TextField(TextFieldSpec {
+            text: text.to_string(),
+            placeholder: placeholder.map(str::to_string),
+            code: false,
+            multiline: false,
+            secret: true,
         }),
     )
 }
@@ -201,6 +259,7 @@ pub fn multiline_field(id: &str, text: &str, placeholder: Option<&str>) -> Eleme
             placeholder: placeholder.map(str::to_string),
             code: false,
             multiline: true,
+            secret: false,
         }),
     )
 }
@@ -311,12 +370,14 @@ impl SpanStyle for Span {
     }
 }
 
-/// The rows of a tree or a list — or of cards, as a board's column (`Tree::cards`).
+/// The rows of a tree or a list — or of cards, as a board's column (`Tree::cards`), or of two
+/// lines, as a list of chats (`Tree::two_line`, API 0.5).
 #[derive(Default)]
 pub struct Tree {
     rows: Vec<TreeRow>,
     empty_text: Option<String>,
     cards: bool,
+    two_line: bool,
 }
 
 impl Tree {
@@ -335,6 +396,13 @@ impl Tree {
     /// line, the subtitle under them (two lines at most), then the detail.
     pub fn cards(mut self) -> Self {
         self.cards = true;
+        self
+    }
+
+    /// Rows of two lines (API 0.5), as a list of chats: the avatar or the icon on the left; the
+    /// label and the detail on the first line, the subtitle and the badge on the second.
+    pub fn two_line(mut self) -> Self {
+        self.two_line = true;
         self
     }
 
@@ -360,6 +428,10 @@ impl Tree {
             subtitle: row.subtitle,
             tags: row.tags,
             actions: row.actions,
+            avatar: row.avatar,
+            badge_tone: row.badge_tone,
+            label_icons: row.label_icons,
+            mention: row.mention,
         });
         (self.rows.len() - 1) as u32
     }
@@ -379,6 +451,7 @@ impl Tree {
                 rows: self.rows,
                 empty_text: self.empty_text,
                 cards: self.cards,
+                two_line: self.two_line,
             }),
         )
     }
@@ -395,6 +468,10 @@ pub struct RowSpec {
     subtitle: Option<Vec<Span>>,
     tags: Vec<BadgeSpec>,
     actions: Vec<RowAction>,
+    avatar: Option<AvatarSpec>,
+    badge_tone: Option<Tone>,
+    label_icons: Vec<String>,
+    mention: bool,
 }
 
 impl RowSpec {
@@ -415,6 +492,10 @@ impl RowSpec {
             subtitle: None,
             tags: Vec::new(),
             actions: Vec::new(),
+            avatar: None,
+            badge_tone: None,
+            label_icons: Vec::new(),
+            mention: false,
         }
     }
 
@@ -433,6 +514,31 @@ impl RowSpec {
     /// A count on the right.
     pub fn badge(mut self, badge: &str) -> Self {
         self.badge = Some(badge.to_string());
+        self
+    }
+
+    /// The badge's color (API 0.5): `Tone::Accent` — unread, `Tone::Muted` — muted.
+    pub fn badge_tone(mut self, tone: Tone) -> Self {
+        self.badge_tone = Some(tone);
+        self
+    }
+
+    /// A person's or a chat's picture in place of the icon (API 0.5).
+    pub fn avatar(mut self, avatar: AvatarSpec) -> Self {
+        self.avatar = Some(avatar);
+        self
+    }
+
+    /// A small named icon right after the label (API 0.5): pinned, muted.
+    pub fn label_icon(mut self, icon: &str) -> Self {
+        self.label_icons.push(icon.to_string());
+        self
+    }
+
+    /// An accent "@" before the badge (API 0.5): the user is mentioned in a message of the chat
+    /// not read yet.
+    pub fn mention(mut self) -> Self {
+        self.mention = true;
         self
     }
 
@@ -478,6 +584,15 @@ impl RowSpec {
         });
         self
     }
+
+    /// The tooltip of the row's button `id` added by [`Self::action`]: an icon button's name
+    /// ("Pin"), shown on hover. Nothing happens when the row has no such button.
+    pub fn action_tooltip(mut self, id: &str, tooltip: &str) -> Self {
+        if let Some(action) = self.actions.iter_mut().find(|action| action.id == id) {
+            action.tooltip = Some(tooltip.to_string());
+        }
+        self
+    }
 }
 
 /// A property of [`properties`] (API 0.3): a label and its value.
@@ -502,6 +617,122 @@ pub fn editable_property(id: &str, label: &str, value: Vec<Span>) -> Property {
 /// Properties in two aligned columns (API 0.3): a task's fields.
 pub fn properties(id: &str, properties: Vec<Property>) -> Element {
     Element::new(id, ElementKind::Properties(properties))
+}
+
+/// A picture (API 0.5), as wide as the column lets it, up to its own size; a click comes as
+/// `UiEvent::Clicked`. Build the spec with [`crate::conversation::picture`].
+pub fn image(id: &str, spec: ImageSpec) -> Element {
+    Element::new(id, ElementKind::Image(spec))
+}
+
+/// A person's or a chat's picture (API 0.5), the size of a header's:
+/// `avatar("chat-avatar", AvatarSpec::initials("АС", 6))`.
+pub fn avatar(id: &str, spec: AvatarSpec) -> Element {
+    Element::new(id, ElementKind::Avatar(spec))
+}
+
+/// A QR code of `text` (API 0.5): dark on light whatever the theme, for a phone's camera.
+pub fn qr(id: &str, text: &str) -> Element {
+    Element::new(id, ElementKind::Qr(text.to_string()))
+}
+
+/// A message feed with a field (API 0.5); it takes the remaining height. Its messages come by
+/// [`crate::conversation::update`], not with the view: a new view keeps them by the id.
+pub fn conversation(id: &str, spec: ConversationSpec) -> Element {
+    Element::new(id, ElementKind::Conversation(spec))
+}
+
+/// A header (API 0.5): a picture, a title, a line under it; a click comes as `clicked` —
+/// `header("chat-header", "Anna").avatar(…).subtitle([span("online").tone(Tone::Accent)])`.
+pub fn header(id: &str, title: &str) -> Header {
+    Header {
+        id: id.to_string(),
+        spec: crate::host::ui::HeaderSpec {
+            avatar: None,
+            title: title.to_string(),
+            subtitle: Vec::new(),
+            large: false,
+        },
+    }
+}
+
+/// A header being built; it becomes an [`Element`] with `.into()`.
+pub struct Header {
+    id: String,
+    spec: crate::host::ui::HeaderSpec,
+}
+
+impl Header {
+    pub fn avatar(mut self, avatar: AvatarSpec) -> Self {
+        self.spec.avatar = Some(avatar);
+        self
+    }
+
+    /// The line under the title.
+    pub fn subtitle(mut self, spans: impl IntoIterator<Item = Span>) -> Self {
+        self.spec.subtitle = spans.into_iter().collect();
+        self
+    }
+
+    /// A profile's: a large picture over the centered title and line.
+    pub fn large(mut self) -> Self {
+        self.spec.large = true;
+        self
+    }
+}
+
+impl From<Header> for Element {
+    fn from(header: Header) -> Element {
+        Element::new(&header.id, ElementKind::Header(header.spec))
+    }
+}
+
+/// Pictures in a grid of squares by groups (API 0.5): a chat's photos and videos by month. It
+/// takes the remaining height; `more` — whether scrolling near the end asks for more
+/// (`load-older`).
+pub fn gallery(
+    id: &str,
+    items: Vec<crate::host::ui::GalleryItem>,
+    more: crate::host::ui::History,
+    empty_text: Option<&str>,
+) -> Element {
+    Element::new(
+        id,
+        ElementKind::Gallery(crate::host::ui::GallerySpec {
+            items,
+            more,
+            empty_text: empty_text.map(str::to_string),
+        }),
+    )
+}
+
+/// A picture of a gallery, named by `key` in the events, under the heading `group`.
+pub fn gallery_item(
+    key: &str,
+    image: ImageSpec,
+    group: Option<&str>,
+) -> crate::host::ui::GalleryItem {
+    crate::host::ui::GalleryItem {
+        key: key.to_string(),
+        image,
+        group: group.map(str::to_string),
+        video: None,
+    }
+}
+
+/// A video of a gallery (API 0.5, part 4): its poster in the square, its length in the corner; a
+/// click opens it in Flux's media viewer.
+pub fn gallery_video(
+    key: &str,
+    video: crate::host::ui::VideoSpec,
+    group: Option<&str>,
+) -> crate::host::ui::GalleryItem {
+    crate::host::ui::GalleryItem {
+        key: key.to_string(),
+        image: video.poster.clone(),
+        group: group.map(str::to_string),
+        video: Some(video),
+    }
 }
 
 #[cfg(test)]
@@ -534,5 +765,26 @@ mod tests {
         };
         assert_eq!(spec.rows[1].parent, Some(0));
         assert!(spec.rows[0].expanded);
+    }
+
+    #[test]
+    fn a_row_actions_tooltip_names_its_button() {
+        let mut tree = Tree::new();
+        tree.add(
+            RowSpec::new("chat", "Backend")
+                .action("pin", None, Some("star"), false)
+                .action("close", None, Some("close"), false)
+                .action_tooltip("pin", "Pin")
+                .action_tooltip("missing", "Nothing"),
+        );
+        let ElementKind::Tree(spec) = tree.into_element("chats").kind else {
+            panic!("not a tree");
+        };
+        let tooltips: Vec<Option<&str>> = spec.rows[0]
+            .actions
+            .iter()
+            .map(|action| action.tooltip.as_deref())
+            .collect();
+        assert_eq!(tooltips, [Some("Pin"), None]);
     }
 }

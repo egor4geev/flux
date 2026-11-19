@@ -49,7 +49,8 @@ use crate::plugin_view::PluginView;
 use crate::plugins::{self, PluginStore, PluginStoreEvent, ToolKey};
 use crate::project_search::{self, ProjectSearch, ProjectSearchEvent};
 use crate::project_state::{
-    self, LeftIsland, OpenProjects, ProjectState, RightIsland, SavedBounds, SavedTab,
+    self, LeftIsland, OpenProjects, ProjectState, RightIsland, SavedBounds, SavedPluginTab,
+    SavedTab, SavedWindow,
 };
 use crate::settings::OpenProjectIn;
 use crate::start_screen::{self, StartScreen};
@@ -221,8 +222,9 @@ pub struct Workspace {
     modal: Option<Modal>,
     /// The overlay window that just closed, fading out without input (`crate::motion`).
     leaving_modal: Option<crate::motion::Leaving<Modal>>,
-    /// A plugin's form or text question over Settings (a sign-in from the plugin's page): the one
-    /// overlay window allowed above another, with a backdrop of its own; closing it gives Settings
+    /// A plugin's form or text question over Settings (a sign-in from the plugin's page), the
+    /// media viewer over a dialog (a plugin's profile gallery, FluxGram part 5): the one overlay
+    /// window allowed above another, with a backdrop of its own; closing it gives what is under it
     /// the focus back.
     over: Option<Modal>,
     /// [`Self::over`] that just closed, fading out.
@@ -257,6 +259,17 @@ pub struct Workspace {
     /// What the left island showed before the console took it (the tree, the commit window):
     /// hiding the console brings it back.
     left_before_console: (bool, bool),
+    /// A plugin's window of the left island (`location = "left"`, API 0.5) in place of the tree or
+    /// the commit window; the console comes over it and goes back to it.
+    left_plugin: Option<ToolKey>,
+    /// What the left island showed before the plugin's window took it (the tree, the commit
+    /// window): hiding the window brings it back.
+    left_before_plugin: (bool, bool),
+    /// The plugin's window the project's state had on the left (plugin, window): shown once the
+    /// plugins are found.
+    pending_left: Option<(SharedString, SharedString)>,
+    /// The plugin's window of the left island its plugin was last told is shown.
+    left_in_sight: Option<ToolKey>,
     /// Recent projects for the start screen, most recent first.
     recent: Vec<PathBuf>,
     /// Language servers of the project; recreated with the root.
@@ -338,6 +351,7 @@ struct LayoutKey {
     tabs: Vec<EntityId>,
     active: usize,
     islands: [bool; 5],
+    left: Option<ToolKey>,
     right: Option<RightTool>,
 }
 
@@ -348,10 +362,12 @@ pub(crate) enum RightTool {
     Plugin(ToolKey),
 }
 
-/// What the left island shows: the Claude console, the commit window or the tree.
+/// What the left island shows: the Claude console, a plugin's window (API 0.5), the commit window
+/// or the tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LeftTool {
     Console,
+    Plugin(ToolKey),
     Commit,
     Tree,
 }
@@ -803,6 +819,8 @@ impl Workspace {
             store.set_notification_center(notification_center.downgrade());
             store.set_window_parts(git.clone(), lsp.clone(), cx);
         });
+        // The plugins' tools for Claude join the window's sessions (API 0.5).
+        claude.update(cx, |store, _| store.set_plugins(plugins.downgrade()));
         if let Some(tree) = &file_tree {
             tree.panel
                 .update(cx, |panel, _| panel.set_plugins(plugins.clone()));
@@ -904,6 +922,10 @@ impl Workspace {
             tree_before_commit: false,
             console_open: false,
             left_before_console: (true, false),
+            left_plugin: None,
+            left_before_plugin: (true, false),
+            pending_left: None,
+            left_in_sight: None,
             recent,
             lsp,
             terminal_panel,
@@ -983,6 +1005,8 @@ impl Workspace {
         self.commit_panel = None;
         self.commit_open = false;
         self.console_open = false;
+        self.left_plugin = None;
+        self.pending_left = None;
         // The Git window and its tabs in the editor area belong to the old hub.
         self.git_window = None;
         self.git_open = false;
@@ -1167,11 +1191,13 @@ impl Workspace {
         };
         self.restore_layout(&state, window, cx);
         if state.tabs.is_empty() {
+            self.restore_plugin_tabs(&state.plugin_tabs, window, cx);
             if !files.is_empty() {
                 self.open_paths(files, source, window, cx);
             }
             return;
         }
+        let plugin_tabs = state.plugin_tabs;
         self.restoring = true;
         self.loading += 1;
         let tabs = state.tabs;
@@ -1196,6 +1222,7 @@ impl Workspace {
                 this.loading -= 1;
                 this.restoring = false;
                 this.restore_tabs(&tabs, active, results, window, cx);
+                this.restore_plugin_tabs(&plugin_tabs, window, cx);
                 if !files.is_empty() {
                     this.open_paths(files, source, window, cx);
                 }
@@ -1225,6 +1252,14 @@ impl Workspace {
                 self.left_before_console = (self.tree_open, false);
                 self.tree_open = false;
                 self.console_open = true;
+            }
+            // A plugin's window comes once the plugins are found; the island waits empty.
+            LeftIsland::Plugin => {
+                if let Some(saved) = &state.left_plugin {
+                    let saved = (saved.plugin.clone().into(), saved.window.clone().into());
+                    self.pending_left = Some(saved);
+                }
+                self.tree_open = false;
             }
             LeftIsland::Commit | LeftIsland::Claude | LeftIsland::Hidden => self.tree_open = false,
         }
@@ -1317,11 +1352,83 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The tabs of plugins' windows with tabs (API 0.5) as the project's state kept them, at their
+    /// places among the documents' tabs; the one that was active comes forward. Each is empty
+    /// until its plugin fills it as it comes into sight (or says why it can't).
+    fn restore_plugin_tabs(
+        &mut self,
+        saved: &[SavedPluginTab],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if saved.is_empty() {
+            return;
+        }
+        let was_empty = self.tabs.is_empty();
+        let mut saved: Vec<&SavedPluginTab> = saved.iter().collect();
+        saved.sort_by_key(|tab| tab.index);
+        let mut activate = None;
+        for tab in saved {
+            let key = self.plugins.update(cx, |store, cx| {
+                store.restore_tab(&tab.window.plugin, &tab.window.window, &tab.title, cx)
+            });
+            let Some(key) = key.filter(|key| self.index_of_plugin_tab(*key).is_none()) else {
+                continue;
+            };
+            let Some(view) = self.plugin_tool_view(key, cx) else {
+                continue;
+            };
+            let at = tab.index.min(self.tabs.len());
+            if !was_empty && at <= self.active {
+                self.active += 1;
+            }
+            self.tabs.insert(
+                at,
+                Tab {
+                    item: TabItem::Plugin(key, view),
+                    _subscriptions: Vec::new(),
+                },
+            );
+            if tab.active {
+                activate = Some(key);
+            }
+        }
+        let index = activate
+            .and_then(|key| self.index_of_plugin_tab(key))
+            .or_else(|| was_empty.then_some(0));
+        if let Some(index) = index.filter(|index| *index < self.tabs.len()) {
+            self.notice = None;
+            self.activate(index, window, cx);
+        }
+        cx.notify();
+    }
+
     /// The project's state as the window shows it now.
     fn capture_state(&self, cx: &App) -> ProjectState {
         let mut tabs = Vec::new();
         let mut active = None;
+        let mut plugin_tabs = Vec::new();
         for (index, tab) in self.tabs.iter().enumerate() {
+            // A tab of a plugin's window with tabs: its plugin, its name and its title.
+            if let Some(key) = tab.item.plugin_tool() {
+                let store = self.plugins.read(cx);
+                // Not a tab the plugin keeps out (API 0.5: a hidden chat's).
+                if let Some(tool) = store
+                    .tool_window(key)
+                    .filter(|tool| tool.tab_of.is_some() && store.restorable(tool))
+                {
+                    plugin_tabs.push(SavedPluginTab {
+                        window: SavedWindow {
+                            plugin: tool.plugin.to_string(),
+                            window: tool.id.to_string(),
+                        },
+                        title: tool.title.to_string(),
+                        index: tabs.len() + plugin_tabs.len(),
+                        active: index == self.active,
+                    });
+                }
+                continue;
+            }
             // A picture's file comes back as a picture.
             if let Some(path) = tab.item.image().and_then(|view| view.read(cx).path()) {
                 if index == self.active {
@@ -1360,8 +1467,17 @@ impl Workspace {
                 scroll: (editor.scroll.y / theme::LINE_HEIGHT).max(0.),
             });
         }
+        let left_plugin = self.left_plugin.and_then(|key| {
+            let tool = self.plugins.read(cx).tool_window(key)?;
+            Some(SavedWindow {
+                plugin: tool.plugin.to_string(),
+                window: tool.id.to_string(),
+            })
+        });
         let left = if self.console_open {
             LeftIsland::Claude
+        } else if left_plugin.is_some() {
+            LeftIsland::Plugin
         } else if self.commit_open {
             LeftIsland::Commit
         } else if self.tree_open {
@@ -1377,6 +1493,8 @@ impl Workspace {
             tabs,
             active,
             left,
+            left_plugin: left_plugin.filter(|_| left == LeftIsland::Plugin),
+            plugin_tabs,
             terminal: self.terminal_open && !self.git_open,
             right,
             bounds: self.window_bounds.map(SavedBounds::from_window),
@@ -1506,6 +1624,7 @@ impl Workspace {
                 self.terminal_open,
                 self.git_open,
             ],
+            left: self.left_plugin,
             right: self.right_tool,
         }
     }
@@ -1737,14 +1856,20 @@ impl Workspace {
                 .update(cx, |store, cx| store.mark_seen(session, cx));
         }
         // A plugin's tab is drawn only while it is the active one: its elements' places (a picker
-        // under one) count then.
+        // under one) count then. A tab of a window with tabs is in sight then too (API 0.5).
+        let mut in_sight = Vec::new();
         for (position, tab) in self.tabs.iter().enumerate() {
-            if let TabItem::Plugin(_, view) = &tab.item {
+            if let TabItem::Plugin(key, view) = &tab.item {
                 let shown = position == index;
                 if view.read(cx).is_visible() != shown {
                     view.update(cx, |view, cx| view.set_visible(shown, cx));
                 }
+                in_sight.push((*key, shown));
             }
+        }
+        if !in_sight.is_empty() {
+            self.plugins
+                .update(cx, |store, _| store.tabs_in_sight(&in_sight));
         }
         // Into view, gliding (`TabStrip::reveal`).
         self.tab_strip.reveal(index);
@@ -1974,12 +2099,15 @@ impl Workspace {
             return;
         }
         let tab = self.tabs.remove(index);
-        // A plugin's window closed with its tab: the plugin hears `tool-window-hidden`.
+        // A plugin's window closed with its tab: the plugin hears `tool-window-hidden` — and, for
+        // a tab of a window with tabs, `tab-closed` (API 0.5).
         if let TabItem::Plugin(key, view) = &tab.item {
             view.update(cx, |view, cx| view.set_visible(false, cx));
             let key = *key;
-            self.plugins
-                .update(cx, |store, _| store.tool_window_visibility(key, false));
+            self.plugins.update(cx, |store, cx| {
+                store.tool_window_visibility(key, false);
+                store.tab_closed(key, cx);
+            });
         }
         drop(tab);
         if self.tabs.is_empty() {
@@ -2925,6 +3053,9 @@ impl Workspace {
             self.console_open = false;
             self.tree_open = self.left_before_console.0;
         }
+        if self.left_plugin.take().is_some() {
+            self.tree_open = self.left_before_plugin.0 && self.file_tree.is_some();
+        }
         if !self.commit_open {
             self.tree_before_commit = self.tree_open;
             self.tree_open = false;
@@ -3357,6 +3488,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (openable, left) = self
+            .plugins
+            .read(cx)
+            .tool_window(key)
+            .map_or((false, false), |tool| (tool.openable(), tool.on_left()));
+        // A window with tabs is opened by its plugin only.
+        if !openable {
+            return;
+        }
+        if left {
+            return if self.left_tool() == Some(LeftTool::Plugin(key)) {
+                self.hide_left_plugin(window, cx)
+            } else {
+                self.show_left_plugin(key, true, window, cx)
+            };
+        }
         if self.plugin_tool_in_editor(key, cx) {
             return self.show_plugin_tab(key, window, cx);
         }
@@ -3369,6 +3516,120 @@ impl Workspace {
     /// Whether a plugin's tool window is shown: its launchpad icon is highlighted.
     pub(crate) fn plugin_tool_open(&self, key: ToolKey) -> bool {
         self.right_tool == Some(RightTool::Plugin(key))
+            || self.left_tool() == Some(LeftTool::Plugin(key))
+    }
+
+    /// Whether a plugin's tool window is a dialog (API 0.5).
+    fn plugin_tool_in_dialog(&self, key: ToolKey, cx: &App) -> bool {
+        self.plugins
+            .read(cx)
+            .tool_window(key)
+            .is_some_and(|tool| tool.in_dialog())
+    }
+
+    /// Whether a plugin's tool window lives in the island on the left (API 0.5).
+    fn plugin_tool_on_left(&self, key: ToolKey, cx: &App) -> bool {
+        self.plugins
+            .read(cx)
+            .tool_window(key)
+            .is_some_and(|tool| tool.on_left())
+    }
+
+    /// A plugin's window in the island on the left (API 0.5), in place of the tree or the
+    /// commit window — and of the console, which goes; `focus` — with the keyboard (a restored one
+    /// leaves it in the editor).
+    fn show_left_plugin(
+        &mut self,
+        key: ToolKey,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.plugin_tool_view(key, cx) else {
+            return;
+        };
+        self.pending_left = None;
+        if self.console_open {
+            let (tree, commit) = self.left_before_console;
+            self.console_open = false;
+            self.tree_open = tree && self.file_tree.is_some();
+            self.commit_open = commit && self.commit_panel.is_some();
+        }
+        if self.left_plugin.is_none() {
+            self.left_before_plugin = (self.tree_open, self.commit_open);
+        }
+        self.tree_open = false;
+        self.commit_open = false;
+        self.left_plugin = Some(key);
+        if focus {
+            window.focus(&view.focus_handle(cx));
+        }
+        cx.notify();
+    }
+
+    /// The plugin's window of the left island goes; the tree or the commit window it replaced
+    /// comes back, and the keyboard, if it was there, goes to the editor.
+    fn hide_left_plugin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.left_plugin.is_none() {
+            return;
+        }
+        let focused = self.left_plugin_focused(window, cx);
+        self.left_plugin = None;
+        let (tree, commit) = self.left_before_plugin;
+        self.tree_open = tree && self.file_tree.is_some();
+        self.commit_open = commit && self.commit_panel.is_some();
+        if focused || window.focused(cx).is_none() {
+            self.focus_active(window, cx);
+        }
+        self.revealed = None;
+        self.reveal_active(cx);
+        cx.notify();
+    }
+
+    /// The keyboard is in the plugin's window of the left island.
+    fn left_plugin_focused(&self, window: &Window, cx: &App) -> bool {
+        self.left_plugin
+            .and_then(|key| self.plugin_tool_view(key, cx))
+            .is_some_and(|view| view.read(cx).contains_focus(window, cx))
+    }
+
+    /// The plugin of the left island's window hears when it comes into sight and when it goes
+    /// (its icon, the console over it, the tree in its place): checked as the window draws.
+    fn sync_left_in_sight(&mut self, cx: &mut Context<Self>) {
+        let shown = match self.left_tool() {
+            Some(LeftTool::Plugin(key)) => Some(key),
+            _ => None,
+        };
+        if shown == self.left_in_sight {
+            return;
+        }
+        for (key, visible) in [(self.left_in_sight, false), (shown, true)] {
+            let Some(key) = key else {
+                continue;
+            };
+            if let Some(view) = self.plugin_tool_view(key, cx) {
+                view.update(cx, |view, cx| view.set_visible(visible, cx));
+            }
+            self.plugins
+                .update(cx, |store, _| store.tool_window_visibility(key, visible));
+        }
+        self.left_in_sight = shown;
+    }
+
+    /// `ui.open-tab` (API 0.5): the tab opens or comes forward; without `focus` the keyboard stays
+    /// where it is (the list the tab was opened from).
+    fn open_plugin_tab(
+        &mut self,
+        key: ToolKey,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keep = if focus { None } else { window.focused(cx) };
+        self.show_plugin_tab(key, window, cx);
+        if let Some(handle) = keep {
+            window.focus(&handle);
+        }
     }
 
     fn plugin_tool_view(
@@ -3399,6 +3660,35 @@ impl Workspace {
                     self.right_tool = None;
                     self.focus_active(window, cx);
                 }
+                if let Some(key) = self.left_plugin
+                    && self.plugin_tool_view(key, cx).is_none()
+                {
+                    self.hide_left_plugin(window, cx);
+                }
+                // And its dialog (API 0.5).
+                if let Some(key) = crate::plugin_dialog::shown(self, cx)
+                    && self.plugin_tool_view(key, cx).is_none()
+                {
+                    crate::plugin_dialog::hide(self, key, window, cx);
+                }
+                // The window the project's state had on the left, once the plugins are found.
+                if self.plugins.read(cx).scanned()
+                    && let Some((plugin, id)) = self.pending_left.take()
+                    && self.left_tool().is_none()
+                {
+                    let key = self
+                        .plugins
+                        .read(cx)
+                        .tool_windows()
+                        .iter()
+                        .find(|tool| tool.plugin == plugin && tool.id == id && tool.on_left())
+                        .map(|tool| tool.key);
+                    // Hiding it brings the tree; a window that is gone leaves the tree.
+                    self.tree_open = self.file_tree.is_some();
+                    if let Some(key) = key {
+                        self.show_left_plugin(key, false, window, cx);
+                    }
+                }
                 // And its tabs in the editor (turned off, uninstalled, a window gone from the
                 // manifest of a plugin under development).
                 let gone: Vec<ToolKey> = self
@@ -3411,6 +3701,26 @@ impl Workspace {
                     self.hide_plugin_tab(key, window, cx);
                 }
                 cx.notify();
+            }
+            // A dialog (API 0.5): over everything, Settings too.
+            PluginStoreEvent::ShowToolWindow(key) if self.plugin_tool_in_dialog(*key, cx) => {
+                crate::plugin_dialog::show(self, *key, window, cx)
+            }
+            PluginStoreEvent::HideToolWindow(key) if self.plugin_tool_in_dialog(*key, cx) => {
+                crate::plugin_dialog::hide(self, *key, window, cx)
+            }
+            PluginStoreEvent::ShowToolWindow(key) if self.plugin_tool_on_left(*key, cx) => {
+                if self.left_tool() != Some(LeftTool::Plugin(*key)) {
+                    self.show_left_plugin(*key, true, window, cx);
+                }
+            }
+            PluginStoreEvent::HideToolWindow(key) if self.plugin_tool_on_left(*key, cx) => {
+                if self.left_plugin == Some(*key) {
+                    self.hide_left_plugin(window, cx);
+                }
+            }
+            PluginStoreEvent::OpenTab { key, focus } => {
+                self.open_plugin_tab(*key, *focus, window, cx)
             }
             PluginStoreEvent::ShowToolWindow(key) => {
                 if self.plugin_tool_in_editor(*key, cx) {
@@ -3504,10 +3814,13 @@ impl Workspace {
         self.file_tree.as_ref().map(|tree| tree.panel.clone())
     }
 
-    /// What the left island shows: the console over the commit window over the tree.
+    /// What the left island shows: the console over a plugin's window over the commit window over
+    /// the tree.
     fn left_tool(&self) -> Option<LeftTool> {
         if self.console_open {
             Some(LeftTool::Console)
+        } else if let Some(key) = self.left_plugin {
+            Some(LeftTool::Plugin(key))
         } else if self.commit_open && self.commit_panel.is_some() {
             Some(LeftTool::Commit)
         } else {
@@ -3517,8 +3830,10 @@ impl Workspace {
 
     /// A tool of the left island. The tree is a cached view (see the editor's tab in `render`):
     /// its root style is the panel's own (`FileTreePanel::render`) — but not while it glides or
-    /// fades, which the cache wouldn't see.
-    fn render_left_tool(&self, tool: LeftTool, cached: bool) -> Option<AnyElement> {
+    /// fades, which the cache wouldn't see. A plugin's window is one too: a frame of something
+    /// playing in the tab beside it (FluxGram part 4: a GIF, a sticker) doesn't lay out its list
+    /// again (2026-11-18: ~40 % of such a frame).
+    fn render_left_tool(&self, tool: LeftTool, cached: bool, cx: &App) -> Option<AnyElement> {
         match tool {
             LeftTool::Console => Some(
                 div()
@@ -3528,6 +3843,17 @@ impl Workspace {
                     .child(self.claude_console.clone())
                     .into_any_element(),
             ),
+            // A plugin's window takes the island's width (the tree's and the commit window's); its
+            // root fills it (`PluginView::render`, the left island's chrome).
+            LeftTool::Plugin(key) => self.plugin_tool_view(key, cx).map(|view| {
+                let island = div().flex_none().w(px(self.left_width.get())).h_full();
+                if !cached {
+                    return island.child(view).into_any_element();
+                }
+                island
+                    .child(AnyView::from(view).cached(StyleRefinement::default().size_full()))
+                    .into_any_element()
+            }),
             LeftTool::Commit => self
                 .commit_panel
                 .as_ref()
@@ -3558,24 +3884,42 @@ impl Workspace {
         }
     }
 
-    fn render_bottom_tool(&self, tool: BottomTool) -> Option<AnyElement> {
-        match tool {
-            BottomTool::Git => self
-                .git_window
-                .as_ref()
-                .map(|handle| handle.window.clone().into_any_element()),
-            BottomTool::Terminal => Some(self.terminal_panel.clone().into_any_element()),
-        }
+    /// A tool window of the island under the editor: a cached view, as the left island's
+    /// (`render_left_tool`) — a frame of something playing in a tab (FluxGram part 5: a sticker,
+    /// a GIF) doesn't lay the terminals or the Git window out again; their own changes notify
+    /// them. Its root is the panel's (`h(height)`, the island's width), `cached` — the island's
+    /// height; none while it glides or fades, which the cache wouldn't see.
+    fn render_bottom_tool(&self, tool: BottomTool, cached: Option<f32>) -> Option<AnyElement> {
+        let view: AnyView = match tool {
+            BottomTool::Git => self.git_window.as_ref()?.window.clone().into(),
+            BottomTool::Terminal => self.terminal_panel.clone().into(),
+        };
+        Some(match cached {
+            Some(height) => view
+                .cached(StyleRefinement::default().w_full().h(px(height)))
+                .into_any_element(),
+            None => view.into_any_element(),
+        })
     }
 
-    /// A tool window of the island on the right.
-    fn render_right_tool(&self, tool: RightTool, cx: &App) -> AnyElement {
-        match tool {
-            RightTool::Notifications => self.notifications_panel.clone().into_any_element(),
-            RightTool::Plugin(key) => match self.plugin_tool_view(key, cx) {
-                Some(view) => view.into_any_element(),
-                None => div().into_any_element(),
-            },
+    /// A tool window of the island on the right: a cached view as the bottom island's; its root
+    /// is the panel's (`w(right width)`, full height); `cached` — not while it glides or fades.
+    fn render_right_tool(&self, tool: RightTool, cached: bool, cx: &App) -> AnyElement {
+        let view: Option<AnyView> = match tool {
+            RightTool::Notifications => Some(self.notifications_panel.clone().into()),
+            RightTool::Plugin(key) => self.plugin_tool_view(key, cx).map(AnyView::from),
+        };
+        match view {
+            Some(view) if cached => view
+                .cached(
+                    StyleRefinement::default()
+                        .flex_none()
+                        .w(px(self.right_width.get()))
+                        .h_full(),
+                )
+                .into_any_element(),
+            Some(view) => view.into_any_element(),
+            None => div().into_any_element(),
         }
     }
 
@@ -3613,14 +3957,16 @@ impl Workspace {
         // The commit window gives its place back to the tree, and its focus with it: a hidden panel
         // that keeps focus would take the keys away — gpui finds no path from it to the window, and
         // ⌘0, ⌘K and the rest go nowhere.
-        if self.commit_open || self.console_open {
+        if self.commit_open || self.console_open || self.left_plugin.is_some() {
             let commit_focused = self
                 .commit_panel
                 .as_ref()
                 .is_some_and(|handle| handle.panel.read(cx).contains_focus(window, cx))
-                || self.claude_console.read(cx).contains_focus(window, cx);
+                || self.claude_console.read(cx).contains_focus(window, cx)
+                || self.left_plugin_focused(window, cx);
             self.commit_open = false;
             self.console_open = false;
+            self.left_plugin = None;
             self.tree_open = true;
             if commit_focused {
                 window.focus(&panel.focus_handle(cx));
@@ -3657,6 +4003,7 @@ impl Workspace {
         }
         self.commit_open = false;
         self.console_open = false;
+        self.left_plugin = None;
         if !self.tree_open {
             self.tree_open = true;
             self.revealed = None;
@@ -4321,6 +4668,7 @@ impl Workspace {
                     // The commit window gives its place to the tree, which shows the directory.
                     self.commit_open = false;
                     self.console_open = false;
+                    self.left_plugin = None;
                     self.tree_open = true;
                     self.revealed = None;
                     panel.update(cx, |panel, cx| panel.reveal(path, cx));
@@ -4379,8 +4727,12 @@ impl Workspace {
             return self.dismiss_modal(window, cx);
         }
         // Behind a dialog, the window's shortcuts don't open popups (as behind a modal dialog of
-        // JetBrains IDEs); a dialog may give way to the next dialog of a flow.
+        // JetBrains IDEs); a dialog may give way to the next dialog of a flow. A viewer opens over
+        // the dialog: its pictures (a plugin's gallery in it).
         if kind != ModalKind::Dialog && self.dialog_open() {
+            if kind == ModalKind::Viewer {
+                self.open_over(kind, window, cx, build);
+            }
             return;
         }
         // Project search is also an overlay window: it gives way without restoring focus.
@@ -4395,12 +4747,12 @@ impl Workspace {
             }
         }
         if let Some(over) = self.over.take() {
-            self.leave_over(over);
+            self.leave_over(over, cx);
         }
         let previous_focus = match self.modal.take() {
             Some(modal) => {
                 let previous_focus = modal.previous_focus.clone();
-                self.leave(modal);
+                self.leave(modal, cx);
                 previous_focus
             }
             None => window.focused(cx),
@@ -4483,7 +4835,7 @@ impl Workspace {
                 None => self.focus_active(window, cx),
             }
         }
-        self.leave(modal);
+        self.leave(modal, cx);
         // A plugin's question that waited for the overlay window comes now.
         cx.defer_in(window, |this, window, cx| {
             plugins::ask_pending(this, window, cx)
@@ -4509,8 +4861,20 @@ impl Workspace {
         if !crate::settings_view::is_open(self) {
             return self.toggle_dialog(window, cx, build);
         }
+        self.open_over(ModalKind::Dialog, window, cx, build);
+    }
+
+    /// Opens `V` over the overlay window that is open ([`Self::over`]): a dialog over Settings, a
+    /// viewer over a dialog.
+    fn open_over<V: ManagedView>(
+        &mut self,
+        kind: ModalKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+    ) {
         if let Some(over) = self.over.take() {
-            self.leave_over(over);
+            self.leave_over(over, cx);
         }
         let previous_focus = window.focused(cx);
         let view = cx.new(|cx| build(window, cx));
@@ -4524,7 +4888,7 @@ impl Workspace {
         window.focus(&focus_handle);
         self.over = Some(Modal {
             view: view.into(),
-            kind: ModalKind::Dialog,
+            kind,
             focus_handle,
             previous_focus,
             anchor: None,
@@ -4534,9 +4898,17 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The window over the overlay window, when it is a `V`: a plugin's dialog over Settings (API
+    /// 0.5), the media viewer over a dialog.
+    pub(crate) fn over_view<V: 'static>(&self) -> Option<Entity<V>> {
+        self.over
+            .as_ref()
+            .and_then(|over| over.view.clone().downcast::<V>().ok())
+    }
+
     /// Closes the dialog over Settings: they get the focus back, and a plugin's question that
     /// waited comes next.
-    fn dismiss_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn dismiss_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(over) = self.over.take() else {
             return;
         };
@@ -4550,7 +4922,7 @@ impl Workspace {
                 None => self.focus_active(window, cx),
             }
         }
-        self.leave_over(over);
+        self.leave_over(over, cx);
         cx.defer_in(window, |this, window, cx| {
             plugins::ask_pending(this, window, cx)
         });
@@ -4558,16 +4930,38 @@ impl Workspace {
     }
 
     /// [`Self::leave`] for the dialog over Settings.
-    fn leave_over(&mut self, mut over: Modal) {
+    fn leave_over(&mut self, mut over: Modal, cx: &mut Context<Self>) {
         over._subscriptions.clear();
+        self.closed(&over, cx);
         self.leaving_over = crate::motion::enabled().then(|| crate::motion::Leaving::new(over));
     }
 
     /// A closed overlay window fades out (`crate::motion`): drawn without input — its
     /// subscriptions go now, so it can't close the next one — until its exit ends.
-    fn leave(&mut self, mut modal: Modal) {
+    fn leave(&mut self, mut modal: Modal, cx: &mut Context<Self>) {
         modal._subscriptions.clear();
+        self.closed(&modal, cx);
         self.leaving_modal = crate::motion::enabled().then(|| crate::motion::Leaving::new(modal));
+    }
+
+    /// An overlay window has just closed, however it went: the plugins hear that their windows
+    /// in it are out of sight — a plugin's dialog, the blocks of a plugin's Settings page (API
+    /// 0.5).
+    fn closed(&mut self, modal: &Modal, cx: &mut Context<Self>) {
+        if let Ok(dialog) = modal
+            .view
+            .clone()
+            .downcast::<crate::plugin_dialog::PluginDialog>()
+        {
+            dialog.update(cx, |dialog, cx| dialog.closed(cx));
+        }
+        if let Ok(settings) = modal
+            .view
+            .clone()
+            .downcast::<crate::settings_view::SettingsView>()
+        {
+            settings.update(cx, |settings, cx| settings.closed(cx));
+        }
     }
 
     fn render_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -4700,7 +5094,17 @@ impl Workspace {
             return layers;
         }
         let open = self.over.is_some();
-        let backdrop = ui::modal_backdrop(ui)
+        // A viewer's veil is deeper than a dialog's backdrop.
+        let viewer = self
+            .over
+            .as_ref()
+            .or(self.leaving_over.as_ref().map(|leaving| &leaving.value))
+            .is_some_and(|over| over.kind == ModalKind::Viewer);
+        let backdrop = match viewer {
+            true => crate::image_popup::veil(ui),
+            false => ui::modal_backdrop(ui),
+        };
+        let backdrop = backdrop
             .id("over-backdrop")
             .absolute()
             .top(px(TITLE_BAR_HEIGHT))
@@ -4724,12 +5128,16 @@ impl Workspace {
             let over = &leaving.value;
             let view = div()
                 .id(("over-leaving", over.view.entity_id().as_u64()))
+                .when(over.kind == ModalKind::Viewer, |view| view.size_full())
                 .child(over.view.clone());
             let view = crate::motion::leaving_style(view, progress, Self::modal_origin(over));
             layers.push(Self::place_modal(over, crate::motion::inert(view)));
         }
         if let Some(over) = &self.over {
-            let view = div().occlude().child(over.view.clone());
+            let view = div()
+                .occlude()
+                .when(over.kind == ModalKind::Viewer, |view| view.size_full())
+                .child(over.view.clone());
             let view = crate::motion::Appear::dialog()
                 .apply(("over", over.view.entity_id().as_u64()), view);
             layers.push(Self::place_modal(over, view));
@@ -5672,12 +6080,12 @@ impl Workspace {
         let ui = Theme::ui(cx);
         let active = index == self.active;
         let title = view.read(cx).title();
-        let icon_path = self
-            .plugins
-            .read(cx)
-            .tool_window(key)
+        let tool = self.plugins.read(cx).tool_window(key);
+        let icon_path = tool
             .and_then(|tool| tool.icon.clone())
             .unwrap_or_else(|| IconName::Puzzle.path().into());
+        // The plugin's mark (`ui.set-badge`, API 0.5): an accent dot after the title.
+        let dot = tool.and_then(|tool| tool.badge.as_ref()).map(|_| ui.accent);
         tab_shell(view.entity_id(), active, ui)
             .on_mouse_down(
                 MouseButton::Left,
@@ -5704,7 +6112,7 @@ impl Workspace {
             .child(close_button(
                 TabItem::Plugin(key, view.clone()),
                 active,
-                None,
+                dot,
                 cx,
             ))
     }
@@ -5894,6 +6302,7 @@ impl Render for Workspace {
             self.layout = Some(layout);
             self.schedule_state_save(cx);
         }
+        self.sync_left_in_sight(cx);
         let ui = Theme::ui(cx);
         // The session actions of Claude are offered while a chat is current.
         let claude_chat = self.current_claude_chat(window, cx).is_some();
@@ -6257,10 +6666,10 @@ impl Render for Workspace {
         let left_tool = self.left_tool();
         let tree = self.left_glide.frame(left_tool, window).and_then(|frame| {
             let animating = frame.open < 1. || frame.replaced.is_some();
-            let tool = self.render_left_tool(frame.tool, !animating)?;
-            let replaced = frame
-                .replaced
-                .and_then(|(old, progress)| Some((self.render_left_tool(old, false)?, progress)));
+            let tool = self.render_left_tool(frame.tool, !animating, cx)?;
+            let replaced = frame.replaced.and_then(|(old, progress)| {
+                Some((self.render_left_tool(old, false, cx)?, progress))
+            });
             let island = ui::island(ui, style)
                 .flex_none()
                 .h_full()
@@ -6281,10 +6690,14 @@ impl Render for Workspace {
             .bottom_glide
             .frame(bottom_tool, window)
             .and_then(|frame| {
-                let tool = self.render_bottom_tool(frame.tool)?;
-                let replaced = frame
-                    .replaced
-                    .and_then(|(old, progress)| Some((self.render_bottom_tool(old)?, progress)));
+                let max =
+                    f32::from(window.viewport_size().height) * ui::BottomIslandHeight::MAX_SHARE;
+                let height = self.bottom_height.get_within(max);
+                let animating = frame.open < 1. || frame.replaced.is_some();
+                let tool = self.render_bottom_tool(frame.tool, (!animating).then_some(height))?;
+                let replaced = frame.replaced.and_then(|(old, progress)| {
+                    Some((self.render_bottom_tool(old, None)?, progress))
+                });
                 let island = ui::island(ui, style)
                     .flex_none()
                     .when(flat, |island| island.border_t_1().border_color(line))
@@ -6298,9 +6711,7 @@ impl Render for Workspace {
                             this.move_to_editor(window, cx)
                         },
                     ));
-                let max =
-                    f32::from(window.viewport_size().height) * ui::BottomIslandHeight::MAX_SHARE;
-                let full = self.bottom_height.get_within(max) + border;
+                let full = height + border;
                 let slot = island_slot(Side::Bottom, frame.open, full, gap, island, tool, replaced);
                 Some(if frame.leaving {
                     crate::motion::inert(slot).into_any_element()
@@ -6323,10 +6734,11 @@ impl Render for Workspace {
             .right_glide
             .frame(self.right_tool, window)
             .map(|frame| {
-                let tool = self.render_right_tool(frame.tool, cx);
+                let animating = frame.open < 1. || frame.replaced.is_some();
+                let tool = self.render_right_tool(frame.tool, !animating, cx);
                 let replaced = frame
                     .replaced
-                    .map(|(old, progress)| (self.render_right_tool(old, cx), progress));
+                    .map(|(old, progress)| (self.render_right_tool(old, false, cx), progress));
                 let island = ui::island(ui, style)
                     .flex_none()
                     .h_full()
@@ -6397,6 +6809,8 @@ impl Render for Workspace {
                         crate::motion::Appear::fade()
                             .apply("claude-status", div().flex_none().child(status))
                     }))
+                    // A voice message playing anywhere in Flux (FluxGram part 4): who, ⏸.
+                    .children(crate::now_playing::status_item(cx))
                     // An update of Flux on its way (part 10.8): the download, a restart to finish.
                     .children(crate::updates::status_item(cx).map(|update| {
                         crate::motion::Appear::fade()
@@ -7195,6 +7609,7 @@ fn close_button(
     // The color the dot keeps while it shrinks away.
     let dot_color = dot.unwrap_or(match item {
         TabItem::Terminal(_) => ui.warning,
+        TabItem::Plugin(..) => ui.accent,
         _ => ui.modified,
     });
     let hidden = dot.is_some() || !active;
@@ -7702,7 +8117,24 @@ impl Workspace {
                 } else {
                     format!("{title} · {body}")
                 };
-                let mut notification = Notification::info(claude::attention_title(&pending.kind))
+                // A plugin's card (API 0.5) names what it asks: "Reply in «Backend · team»".
+                let card_title = session
+                    .read(cx)
+                    .plugin_tools()
+                    .card(&pending.id)
+                    .map(|(_, card)| card.title.clone())
+                    .filter(|title| !title.trim().is_empty());
+                let (heading, body) = match card_title {
+                    Some(card_title) => {
+                        let body = match &pending.description {
+                            Some(description) => format!("{title} · {description}"),
+                            None => title.to_string(),
+                        };
+                        (SharedString::from(card_title), body)
+                    }
+                    None => (claude::attention_title(&pending.kind).into(), body),
+                };
+                let mut notification = Notification::info(heading)
                     .body(body)
                     .action(tr("Show"), claude::ShowSession(session.entity_id()))
                     .group(NotificationGroup::Claude);

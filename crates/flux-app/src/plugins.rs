@@ -33,7 +33,7 @@ use flux_core::Rope;
 use flux_core::text::{line_len, line_start};
 use flux_plugin::api::diagnostics::Diagnostic as ApiDiagnostic;
 use flux_plugin::api::dialogs::{
-    ButtonRole as ApiButtonRole, DialogLevel, Form, Question, TextQuestion,
+    ButtonRole as ApiButtonRole, DialogLevel, FilePick, Form, Question, TextQuestion,
 };
 use flux_plugin::api::editors::TextEdit;
 use flux_plugin::api::events::{Event, UiEvent};
@@ -50,7 +50,8 @@ use flux_plugin::log::{Level, PluginLog};
 use flux_plugin::manifest::{NotificationDisplay, ToolWindowLocation};
 use flux_plugin::registry::{PluginEntry, PluginSource, ScanError};
 use flux_plugin::runtime::{
-    EditorCall, EditorReply, HostCall, Instance, InstanceConfig, MessageKind, PluginMessage,
+    EditorCall, EditorReply, HostCall, Instance, InstanceConfig, InstanceRole, MessageKind,
+    PluginMessage,
 };
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
@@ -291,15 +292,54 @@ pub struct ToolWindow {
     pub title: SharedString,
     /// The icon's asset path ([`crate::icons::plugin_asset`]); none — the default icon.
     pub icon: Option<SharedString>,
-    /// The island on the right (a launchpad icon), or a tab among the editor's (API 0.3).
+    /// The island on the right (a launchpad icon), a tab among the editor's (API 0.3), or the
+    /// island on the left (API 0.5).
     pub location: ToolWindowLocation,
+    /// The window opens a tab per key (`tabs = true`, API 0.5): a kind of tab, never shown
+    /// itself — its tabs are windows of their own ([`Self::tab_of`]).
+    pub tabs: bool,
+    /// A tab of a window with tabs (API 0.5): that window's id; `id` is `<window>/<key>`. It
+    /// lives while its tab is open.
+    pub tab_of: Option<SharedString>,
+    /// The plugin's mark (`ui.set-badge`, API 0.5): a count on the launchpad icon, a dot on a
+    /// tab. Gone when the plugin stops.
+    pub badge: Option<SharedString>,
     pub view: Entity<PluginView>,
 }
 
 impl ToolWindow {
-    /// A window among the editor's tabs (`location = "editor"`).
+    /// A window among the editor's tabs (`location = "editor"`), or a tab of a window with tabs.
     pub fn in_editor(&self) -> bool {
         self.location == ToolWindowLocation::Editor
+    }
+
+    /// A window of the island on the left (`location = "left"`, API 0.5).
+    pub fn on_left(&self) -> bool {
+        self.location == ToolWindowLocation::Left
+    }
+
+    /// A window of the island on the right (`location = "island"`): an icon at the launchpad's
+    /// bottom.
+    pub fn on_right(&self) -> bool {
+        self.location == ToolWindowLocation::Island
+    }
+
+    /// A dialog (`location = "dialog"`, API 0.5): the plugin shows and hides it.
+    pub fn in_dialog(&self) -> bool {
+        self.location == ToolWindowLocation::Dialog
+    }
+
+    /// A block of the plugin's Settings page (`location = "settings"`, API 0.5): the page shows
+    /// it.
+    pub fn in_settings(&self) -> bool {
+        self.location == ToolWindowLocation::Settings
+    }
+
+    /// The user opens it — its launchpad icon, the palette, its keys: not a window with tabs
+    /// (the plugin opens those) nor one of its tabs, not a dialog (the plugin shows it) nor a
+    /// block of the Settings page (the page does).
+    pub fn openable(&self) -> bool {
+        !self.tabs && self.tab_of.is_none() && !self.in_dialog() && !self.in_settings()
     }
 }
 
@@ -344,6 +384,11 @@ pub enum PluginStoreEvent {
     /// A plugin asks to show or to hide its tool window.
     ShowToolWindow(ToolKey),
     HideToolWindow(ToolKey),
+    /// `ui.open-tab` (API 0.5): the tab opens, or comes forward; `focus` — it takes the keyboard.
+    OpenTab {
+        key: ToolKey,
+        focus: bool,
+    },
     /// A plugin stopped — turned off, reloaded, removed, or by itself: the window forgets its
     /// terminals (their tabs stay, the user's) and closes its proposals (part 8.2).
     PluginStopped(Arc<str>),
@@ -362,10 +407,15 @@ pub(crate) enum PendingQuestion {
         id: u64,
         form: Form,
     },
+    /// A plugin's dialog window (API 0.5) shown while a dialog or a popup of the user's is open.
+    Dialog(ToolKey),
 }
 
 /// The plugins of a window.
 pub struct PluginStore {
+    /// The window's id among the windows of the process (API 0.5): the plugins' service names
+    /// the window's instances by it.
+    window_id: u64,
     root: Option<PathBuf>,
     /// The width of the island on the right, shared by the tool windows.
     width: ui::RightIslandWidth,
@@ -384,7 +434,12 @@ pub struct PluginStore {
     placeholders: HashSet<ToolKey>,
     /// The tool windows on screen: a plugin that starts (again) hears that they are shown.
     visible_tools: HashSet<ToolKey>,
+    /// Tabs that don't come back with the project nor stay in a context (`ui.set-restorable`,
+    /// API 0.5): (plugin, `<window>/<key>`) — a hidden chat's.
+    unrestorable: HashSet<(SharedString, SharedString)>,
     _view_subscriptions: HashMap<ToolKey, Subscription>,
+    /// The plugins were found once: a restored tab of a plugin that is off or missing can say so.
+    scanned: bool,
     status_items: Vec<StatusItem>,
     /// Commands the plugins grayed out: (plugin, command).
     disabled_commands: HashSet<(Arc<str>, String)>,
@@ -459,7 +514,9 @@ impl PluginStore {
                 }
             }
         });
+        static NEXT_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let store = Self {
+            window_id: NEXT_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             root,
             width,
             plugins: Vec::new(),
@@ -470,7 +527,9 @@ impl PluginStore {
             next_tool: 0,
             placeholders: HashSet::new(),
             visible_tools: HashSet::new(),
+            unrestorable: HashSet::new(),
             _view_subscriptions: HashMap::new(),
+            scanned: false,
             status_items: Vec::new(),
             disabled_commands: HashSet::new(),
             setting_statuses: HashMap::new(),
@@ -501,7 +560,12 @@ impl PluginStore {
         // center: a build of a plugin under development shows its progress there.
         let this = cx.weak_entity();
         cx.defer(move |cx| {
-            this.update(cx, |store, cx| store.rescan(cx)).ok();
+            this.update(cx, |store, cx| {
+                store.rescan(cx);
+                store.scanned = true;
+                store.show_unavailable_tabs(cx);
+            })
+            .ok();
         });
         store
     }
@@ -538,6 +602,7 @@ impl PluginStore {
             }
         } else {
             self.stop(id, cx);
+            self.stop_service(id, cx);
             self.remove_contributions(id, cx);
             self.plugins[index].status = PluginStatus::Disabled;
             self.plugins[index]
@@ -628,6 +693,7 @@ impl PluginStore {
             }
         }
         self.stop(id, cx);
+        self.stop_service(id, cx);
         self.remove_contributions(id, cx);
         // A bundled or installed plugin with the same id comes back from under it.
         self.rescan(cx);
@@ -642,6 +708,9 @@ impl PluginStore {
             return;
         };
         let values = settings_values(&state.entry, cx);
+        if state.entry.manifest.service {
+            crate::plugin_services::settings_changed(id, values.clone(), cx);
+        }
         if let Some(instance) = self.instances.get(id) {
             instance.set_settings(values);
             instance.send_event(Event::SettingsChanged);
@@ -711,12 +780,16 @@ impl PluginStore {
         self.broadcast(Event::ActiveEditorChanged(info));
     }
 
-    /// The window showed or hid a plugin's tool window: the plugin hears of it.
+    /// The window showed or hid a plugin's tool window: the plugin hears of it, once per change.
+    /// A tab of a window with tabs is shown while it is the active tab (API 0.5).
     pub(crate) fn tool_window_visibility(&mut self, key: ToolKey, shown: bool) {
-        if shown {
-            self.visible_tools.insert(key);
+        let changed = if shown {
+            self.visible_tools.insert(key)
         } else {
-            self.visible_tools.remove(&key);
+            self.visible_tools.remove(&key)
+        };
+        if !changed {
+            return;
         }
         let Some(tool) = self.tool_window(key) else {
             return;
@@ -729,6 +802,25 @@ impl PluginStore {
         };
         let plugin = tool.plugin.clone();
         self.send_to(&plugin, event);
+    }
+
+    /// The editor area's active tab changed: the tabs of windows with tabs (API 0.5) come into
+    /// sight and go out of it (`tool-window-shown` / `-hidden`); other windows' tabs are shown
+    /// while open.
+    pub(crate) fn tabs_in_sight(&mut self, tabs: &[(ToolKey, bool)]) {
+        for &(key, shown) in tabs {
+            if self
+                .tool_window(key)
+                .is_some_and(|tool| tool.tab_of.is_some())
+            {
+                self.tool_window_visibility(key, shown);
+            }
+        }
+    }
+
+    /// The plugins have been found once (a window's state waits for its plugins' windows).
+    pub fn scanned(&self) -> bool {
+        self.scanned
     }
 
     /// The tool windows of the plugins that are on, in the launchpad's order.
@@ -779,10 +871,11 @@ impl PluginStore {
         commands
     }
 
-    /// The tool windows for the palette.
+    /// The tool windows for the palette (a window with tabs isn't there: the plugin opens them).
     pub fn palette_tool_windows(&self) -> Vec<PaletteToolWindow> {
         self.tool_windows
             .iter()
+            .filter(|tool| tool.openable())
             .filter_map(|tool| {
                 let state = self.plugin(&tool.plugin)?;
                 Some(PaletteToolWindow {
@@ -1155,6 +1248,7 @@ impl PluginStore {
             .collect();
         for id in &gone {
             self.stop(id, cx);
+            self.stop_service(id, cx);
             self.remove_contributions(id, cx);
             icons::unregister_plugin_files(id);
         }
@@ -1241,6 +1335,7 @@ impl PluginStore {
                 Follow::Start => self.start(&id, true, cx),
                 Follow::TurnOff => {
                     self.stop(&id, cx);
+                    self.stop_service(&id, cx);
                     self.remove_contributions(&id, cx);
                     if let Some(index) = self.index(&id) {
                         self.plugins[index].status = PluginStatus::Disabled;
@@ -1301,7 +1396,9 @@ impl PluginStore {
             self.dev_components
                 .insert(key.clone(), flux_plugin::dev::component_mtime(&entry));
         }
+        self.start_service(&entry, index, cx);
         let config = InstanceConfig {
+            role: InstanceRole::Window(self.window_id),
             project_root: self.root.clone(),
             language: crate::i18n::lang_code().to_string(),
             settings: settings_values(&entry, cx),
@@ -1335,6 +1432,16 @@ impl PluginStore {
     /// What a stopped plugin set in the window goes (API 0.3): its settings page's status lines,
     /// its commit message template.
     fn forget_window_state(&mut self, plugin: &str, cx: &mut Context<Self>) {
+        // The marks of its windows and tabs (a restarted plugin sets them again).
+        for tool in self
+            .tool_windows
+            .iter_mut()
+            .filter(|tool| tool.plugin == plugin)
+        {
+            if tool.badge.take().is_some() {
+                cx.notify();
+            }
+        }
         let before = self.setting_statuses.len();
         self.setting_statuses
             .retain(|(owner, _), _| &**owner != plugin);
@@ -1552,29 +1659,36 @@ impl PluginStore {
     }
 
     /// Makes the tool windows the manifest declares (keeping those that exist: a reload keeps an
-    /// open window open) and drops the ones it no longer has.
+    /// open window open) and drops the ones it no longer has. The open tabs of a window with tabs
+    /// stay while it has them.
     fn sync_tool_windows(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(index) = self.index(id) else {
             return;
         };
         let entry = self.plugins[index].entry.clone();
         let manifest = &entry.manifest;
-        // A window gone from the manifest, or moved between the island and the editor (a plugin
+        // A window gone from the manifest, or moved between the islands and the editor (a plugin
         // under development), goes; a moved one comes back as new.
         let gone: Vec<ToolKey> = self
             .tool_windows
             .iter()
             .filter(|tool| {
                 tool.plugin == id
-                    && manifest
-                        .tool_window(&tool.id)
-                        .is_none_or(|spec| spec.location != tool.location)
+                    && match &tool.tab_of {
+                        Some(window) => manifest.tool_window(window).is_none_or(|spec| {
+                            !spec.tabs || spec.location != ToolWindowLocation::Editor
+                        }),
+                        None => manifest.tool_window(&tool.id).is_none_or(|spec| {
+                            spec.location != tool.location || spec.tabs != tool.tabs
+                        }),
+                    }
             })
             .map(|tool| tool.key)
             .collect();
         for key in &gone {
             self._view_subscriptions.remove(key);
             self.placeholders.remove(key);
+            self.visible_tools.remove(key);
         }
         self.tool_windows.retain(|tool| !gone.contains(&tool.key));
         for spec in &manifest.tool_windows {
@@ -1583,6 +1697,12 @@ impl PluginStore {
                 .icon
                 .as_deref()
                 .map(|icon| icons::plugin_asset(id, icon));
+            // The tabs of a window with tabs wear its icon (restored ones didn't know it).
+            for tab in self.tool_windows.iter_mut().filter(|tool| {
+                tool.plugin == id && tool.tab_of.as_ref().is_some_and(|w| *w == spec.id)
+            }) {
+                tab.icon = icon.clone();
+            }
             if let Some(tool) = self
                 .tool_windows
                 .iter_mut()
@@ -1592,43 +1712,22 @@ impl PluginStore {
                 tool.icon = icon;
                 continue;
             }
-            let key = ToolKey(self.next_tool);
-            self.next_tool += 1;
-            let plugin: SharedString = id.to_string().into();
-            let window: SharedString = spec.id.clone().into();
-            let width = self.width.clone();
-            let chrome = match spec.location {
-                ToolWindowLocation::Island => Chrome::Island,
-                ToolWindowLocation::Editor => Chrome::Tab,
-            };
-            let view = cx.new(|cx| {
-                PluginView::new(
-                    plugin.clone(),
-                    window.clone(),
-                    title.clone(),
-                    width,
-                    chrome,
-                    cx,
-                )
-            });
-            let subscription = cx.subscribe(&view, move |this, _, event, cx| {
-                this.on_view_event(key, event, cx)
-            });
-            self._view_subscriptions.insert(key, subscription);
-            self.tool_windows.push(ToolWindow {
-                key,
-                plugin,
-                id: window,
+            self.add_tool_window(
+                id,
+                spec.id.clone().into(),
                 title,
                 icon,
-                location: spec.location,
-                view,
-            });
+                spec.location,
+                spec.tabs,
+                None,
+                cx,
+            );
         }
-        // The launchpad's order: the plugins' order, then the manifest's.
+        // The launchpad's order: the plugins' order, then the manifest's; a tab — its window's.
         let tools = std::mem::take(&mut self.tool_windows);
         let order = |tool: &ToolWindow| {
             let plugin = self.index(&tool.plugin).unwrap_or(usize::MAX);
+            let id = tool.tab_of.as_ref().unwrap_or(&tool.id);
             let window = self
                 .plugin(&tool.plugin)
                 .and_then(|state| {
@@ -1637,7 +1736,7 @@ impl PluginStore {
                         .manifest
                         .tool_windows
                         .iter()
-                        .position(|spec| spec.id == tool.id)
+                        .position(|spec| spec.id == *id)
                 })
                 .unwrap_or(usize::MAX);
             (plugin, window)
@@ -1646,6 +1745,236 @@ impl PluginStore {
             tools.into_iter().map(|tool| (order(&tool), tool)).collect();
         keyed.sort_by_key(|(order, _)| *order);
         self.tool_windows = keyed.into_iter().map(|(_, tool)| tool).collect();
+    }
+
+    /// Makes a tool window with its view; returns its key.
+    #[allow(clippy::too_many_arguments)]
+    fn add_tool_window(
+        &mut self,
+        plugin: &str,
+        window: SharedString,
+        title: SharedString,
+        icon: Option<SharedString>,
+        location: ToolWindowLocation,
+        tabs: bool,
+        tab_of: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> ToolKey {
+        let key = ToolKey(self.next_tool);
+        self.next_tool += 1;
+        let plugin: SharedString = plugin.to_string().into();
+        let width = self.width.clone();
+        let chrome = match location {
+            ToolWindowLocation::Island => Chrome::Island,
+            ToolWindowLocation::Left => Chrome::Left,
+            ToolWindowLocation::Editor => Chrome::Tab,
+            ToolWindowLocation::Dialog => Chrome::Dialog,
+            ToolWindowLocation::Settings => Chrome::Settings,
+        };
+        // API 0.5's events of a window (Esc in a field as `cancelled`) go to a plugin that knows
+        // them.
+        let hears_cancel = self
+            .plugins
+            .iter()
+            .find(|state| state.id() == plugin.as_ref())
+            .is_some_and(|state| {
+                !matches!(state.entry.manifest.api.as_str(), "0.2" | "0.3" | "0.4")
+            });
+        let view = cx.new(|cx| {
+            let mut view = PluginView::new(
+                plugin.clone(),
+                window.clone(),
+                title.clone(),
+                width,
+                chrome,
+                cx,
+            );
+            view.set_hears_cancel(hears_cancel);
+            view
+        });
+        let subscription = cx.subscribe(&view, move |this, _, event, cx| {
+            this.on_view_event(key, event, cx)
+        });
+        self._view_subscriptions.insert(key, subscription);
+        self.tool_windows.push(ToolWindow {
+            key,
+            plugin,
+            id: window,
+            title,
+            icon,
+            location,
+            tabs,
+            tab_of,
+            badge: None,
+            view,
+        });
+        key
+    }
+
+    /// The tab comes back with the project and stays in a context: not one the plugin keeps out
+    /// (`ui.set-restorable`, API 0.5).
+    pub fn restorable(&self, tool: &ToolWindow) -> bool {
+        !self
+            .unrestorable
+            .contains(&(tool.plugin.clone(), tool.id.clone()))
+    }
+
+    // --- Tabs of a window (API 0.5) ---
+
+    /// `ui.open-tab`: the tab `<window>/<key>` of a window with tabs, made (titled `title`, the
+    /// window's title when empty) or retitled; the window opens it, or brings it forward.
+    fn open_tab(
+        &mut self,
+        plugin: &str,
+        window: &str,
+        key: &str,
+        title: &str,
+        focus: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(parent) = self
+            .tool_windows
+            .iter()
+            .find(|tool| tool.plugin == plugin && tool.id == window && tool.tabs)
+        else {
+            return self.log(plugin, Level::Warn, &undeclared("tool window", window));
+        };
+        let title: SharedString = match title.trim() {
+            "" => parent.title.clone(),
+            title => title.to_string().into(),
+        };
+        let icon = parent.icon.clone();
+        let name = tab_name(window, key);
+        let tab = match self.tool_key(plugin, &name) {
+            Some(tab) => {
+                self.retitle(tab, title, cx);
+                tab
+            }
+            None => self.add_tool_window(
+                plugin,
+                name.into(),
+                title,
+                icon,
+                ToolWindowLocation::Editor,
+                false,
+                Some(window.to_string().into()),
+                cx,
+            ),
+        };
+        cx.emit(PluginStoreEvent::OpenTab { key: tab, focus });
+        cx.notify();
+    }
+
+    /// A tab the project's state kept (`<window>/<key>` of a plugin, with its title): its window
+    /// again, empty until the plugin fills it as it comes into sight — or saying the plugin is off
+    /// or missing. `None` — not a tab's name.
+    pub(crate) fn restore_tab(
+        &mut self,
+        plugin: &str,
+        name: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<ToolKey> {
+        let (window, key) = name.split_once('/')?;
+        if window.is_empty() || key.is_empty() {
+            return None;
+        }
+        if let Some(tab) = self.tool_key(plugin, name) {
+            return Some(tab);
+        }
+        let icon = self
+            .tool_windows
+            .iter()
+            .find(|tool| tool.plugin == plugin && tool.id == window)
+            .and_then(|tool| tool.icon.clone());
+        let tab = self.add_tool_window(
+            plugin,
+            name.to_string().into(),
+            title.to_string().into(),
+            icon,
+            ToolWindowLocation::Editor,
+            false,
+            Some(window.to_string().into()),
+            cx,
+        );
+        if self.scanned {
+            self.show_unavailable_tabs(cx);
+        }
+        Some(tab)
+    }
+
+    /// The tabs of plugins that are off or missing say so (a restored tab whose plugin didn't
+    /// start); a plugin that starts fills them.
+    fn show_unavailable_tabs(&mut self, cx: &mut Context<Self>) {
+        let waiting: Vec<(ToolKey, SharedString)> = self
+            .tool_windows
+            .iter()
+            .filter(|tool| tool.tab_of.is_some() && !self.placeholders.contains(&tool.key))
+            .filter(|tool| {
+                !self.instances.contains_key(tool.plugin.as_ref())
+                    && !self.building.contains(tool.plugin.as_ref())
+            })
+            .map(|tool| (tool.key, tool.plugin.clone()))
+            .collect();
+        for (key, plugin) in waiting {
+            let view = match self.plugin(&plugin) {
+                None => unavailable_view(trf("Plugin «{0}» isn't installed", &[&plugin]), None),
+                Some(state) => match &state.status {
+                    PluginStatus::Disabled => unavailable_view(
+                        trf("Plugin «{0}» is off", &[&state.name()]),
+                        Some(tr("Turn it on in Settings → Plugins").to_string()),
+                    ),
+                    PluginStatus::Unavailable(reason) => unavailable_view(
+                        trf("Plugin «{0}» can't run", &[&state.name()]),
+                        Some(reason.to_string()),
+                    ),
+                    // Starting, or stopped: its own placeholder comes.
+                    _ => continue,
+                },
+            };
+            if let Some(tool) = self.tool_window(key) {
+                tool.view.update(cx, |tool, cx| tool.set_view(view, cx));
+                self.placeholders.insert(key);
+            }
+        }
+    }
+
+    /// The window closed a tab of a window with tabs (the user, `ui.hide`, the plugin going): it
+    /// goes, and the plugin hears `tab-closed`.
+    pub(crate) fn tab_closed(&mut self, key: ToolKey, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .tool_windows
+            .iter()
+            .position(|tool| tool.key == key && tool.tab_of.is_some())
+        else {
+            return;
+        };
+        let tool = self.tool_windows.remove(index);
+        self._view_subscriptions.remove(&key);
+        self.placeholders.remove(&key);
+        self.visible_tools.remove(&key);
+        self.send_to(&tool.plugin, Event::TabClosed(tool.id.to_string()));
+        cx.notify();
+    }
+
+    /// The open tabs of a plugin's window with tabs.
+    fn tabs_of(&self, plugin: &str, window: &str) -> Vec<ToolKey> {
+        self.tool_windows
+            .iter()
+            .filter(|tool| {
+                tool.plugin == plugin && tool.tab_of.as_ref().is_some_and(|w| w == window)
+            })
+            .map(|tool| tool.key)
+            .collect()
+    }
+
+    /// A window's title, in its header or on its tab.
+    fn retitle(&mut self, key: ToolKey, title: SharedString, cx: &mut Context<Self>) {
+        if let Some(tool) = self.tool_windows.iter_mut().find(|tool| tool.key == key) {
+            tool.title = title.clone();
+            tool.view.update(cx, |view, cx| view.set_title(title, cx));
+        }
+        cx.notify();
     }
 
     fn on_view_event(&mut self, key: ToolKey, event: &PluginViewEvent, cx: &mut Context<Self>) {
@@ -1725,7 +2054,15 @@ impl PluginStore {
                 bind_plugin_keys(keys, action, &what, &log, cx);
             }
         }
-        for window in &manifest.tool_windows {
+        // A window with tabs has no keys: the plugin opens its tabs; nor has a dialog or a block
+        // of the Settings page (API 0.5).
+        for window in manifest.tool_windows.iter().filter(|window| {
+            !window.tabs
+                && !matches!(
+                    window.location,
+                    ToolWindowLocation::Dialog | ToolWindowLocation::Settings
+                )
+        }) {
             if let Some(keys) = &window.keys {
                 let action = ToggleToolWindow {
                     plugin: plugin.clone(),
@@ -1863,7 +2200,7 @@ impl PluginStore {
                     .iter()
                     .find(|tool| tool.plugin == *plugin && tool.id == window)
                 else {
-                    return self.log(&plugin, Level::Warn, &undeclared("tool window", &window));
+                    return self.unknown_window(&plugin, &window);
                 };
                 self.placeholders.remove(&tool.key);
                 tool.view.update(cx, |tool, cx| tool.set_view(view, cx));
@@ -1871,7 +2208,31 @@ impl PluginStore {
             HostCall::ShowToolWindow { window } | HostCall::HideToolWindow { window }
                 if self.tool_key(&plugin, &window).is_none() =>
             {
-                self.log(&plugin, Level::Warn, &undeclared("tool window", &window))
+                self.unknown_window(&plugin, &window)
+            }
+            // A window with tabs isn't shown itself: `ui.open-tab` opens its tabs; hiding it closes
+            // them all.
+            HostCall::ShowToolWindow { window } if self.is_tabbed(&plugin, &window) => self.log(
+                &plugin,
+                Level::Warn,
+                &format!("ui.show: \"{window}\" has tabs — ui.open-tab opens them"),
+            ),
+            HostCall::HideToolWindow { window } if self.is_tabbed(&plugin, &window) => {
+                for key in self.tabs_of(&plugin, &window) {
+                    cx.emit(PluginStoreEvent::HideToolWindow(key));
+                }
+            }
+            // A block of the Settings page is shown by the page (API 0.5).
+            HostCall::ShowToolWindow { window } | HostCall::HideToolWindow { window }
+                if self.in_settings(&plugin, &window) =>
+            {
+                self.log(
+                    &plugin,
+                    Level::Warn,
+                    &format!(
+                        "ui.show / ui.hide: \"{window}\" is a block of the plugin's settings page — the page shows it"
+                    ),
+                )
             }
             HostCall::ShowToolWindow { window } => {
                 if let Some(key) = self.tool_key(&plugin, &window) {
@@ -1888,37 +2249,119 @@ impl PluginStore {
                 let Some(state) = self.plugin(&plugin) else {
                     return;
                 };
+                // Empty: the manifest's title (a tab — its window's).
+                let declared = window
+                    .split_once('/')
+                    .map_or(&*window, |(tabbed, _)| tabbed);
                 let title: SharedString = match title.trim() {
                     "" => state
                         .entry
                         .manifest
                         .tool_windows
                         .iter()
-                        .find(|tool| tool.id == window)
+                        .find(|tool| tool.id == declared)
                         .map(|tool| state.tr(&tool.title).to_string())
                         .unwrap_or_default()
                         .into(),
                     title => title.to_string().into(),
                 };
-                if let Some(tool) = self
+                match self.tool_key(&plugin, &window) {
+                    Some(key) => self.retitle(key, title, cx),
+                    None => self.unknown_window(&plugin, &window),
+                }
+            }
+            HostCall::UpdateConversation {
+                window,
+                element,
+                changes,
+            } => {
+                let Some(tool) = self
+                    .tool_windows
+                    .iter()
+                    .find(|tool| tool.plugin == *plugin && tool.id == window)
+                else {
+                    return self.unknown_window(&plugin, &window);
+                };
+                tool.view.update(cx, |tool, cx| {
+                    tool.update_conversation(&element, changes, cx)
+                });
+            }
+            HostCall::OpenTab {
+                window,
+                key,
+                title,
+                focus,
+            } => self.open_tab(&plugin, &window, &key, &title, focus, cx),
+            HostCall::SetRestorable { window, restorable } => {
+                let tab = (SharedString::from(plugin.to_string()), SharedString::from(window));
+                match restorable {
+                    true => self.unrestorable.remove(&tab),
+                    false => self.unrestorable.insert(tab),
+                };
+            }
+            HostCall::SetBadge { window, badge } => {
+                let badge = badge
+                    .map(|badge| badge.trim().to_string())
+                    .filter(|badge| !badge.is_empty());
+                match self
                     .tool_windows
                     .iter_mut()
                     .find(|tool| tool.plugin == *plugin && tool.id == window)
                 {
-                    tool.title = title.clone();
-                    tool.view.update(cx, |view, cx| view.set_title(title, cx));
+                    Some(tool) => {
+                        tool.badge = badge.map(SharedString::from);
+                        cx.notify();
+                    }
+                    None => self.unknown_window(&plugin, &window),
                 }
-                cx.notify();
+            }
+            HostCall::ToolRespond { call, output } => {
+                crate::plugin_tools::respond(self, &plugin, call, output, cx)
+            }
+            HostCall::ToolConfirm { call, card } => {
+                crate::plugin_tools::confirm(self, &plugin, call, card, cx)
+            }
+            HostCall::HelperProgress { helper, progress } => {
+                crate::plugin_services::helper_progress(self, &plugin, &helper, progress, cx)
             }
             call @ (HostCall::Ask { .. }
             | HostCall::AskText { .. }
             | HostCall::AskForm { .. }
+            | HostCall::PickFiles { .. }
             | HostCall::OpenPicker { .. }
             | HostCall::UpdatePicker { .. }
             | HostCall::ClosePicker { .. }
+            | HostCall::FocusElement { .. }
             | HostCall::Editor { .. }
             | HostCall::Window { .. }) => cx.emit(PluginStoreEvent::Call { plugin, call }),
         }
+    }
+
+    /// A call about a window the store doesn't have: an undeclared one is the plugin's mistake;
+    /// a tab that isn't open (closed a moment ago) is nothing to warn about.
+    fn unknown_window(&self, plugin: &str, window: &str) {
+        match window.split_once('/') {
+            Some(_) => self.log(
+                plugin,
+                Level::Debug,
+                &format!("The tab \"{window}\" isn't open"),
+            ),
+            None => self.log(plugin, Level::Warn, &undeclared("tool window", window)),
+        }
+    }
+
+    /// The plugin's window is a block of its Settings page (`location = "settings"`).
+    fn in_settings(&self, plugin: &str, window: &str) -> bool {
+        self.tool_windows
+            .iter()
+            .any(|tool| tool.plugin == plugin && tool.id == window && tool.in_settings())
+    }
+
+    /// The plugin's window has tabs (`tabs = true`).
+    fn is_tabbed(&self, plugin: &str, window: &str) -> bool {
+        self.tool_windows
+            .iter()
+            .any(|tool| tool.plugin == plugin && tool.id == window && tool.tabs)
     }
 
     fn tool_key(&self, plugin: &str, window: &str) -> Option<ToolKey> {
@@ -1994,6 +2437,54 @@ impl PluginStore {
         }
     }
 
+    /// A line in the plugin's log, for the modules that carry out its calls.
+    pub(crate) fn log_line(&self, plugin: &str, level: Level, text: &str) {
+        self.log(plugin, level, text);
+    }
+
+    // --- The plugins' services (API 0.5, `crate::plugin_services`) ---
+
+    /// The window starts a plugin with `service = true`: its service starts with it, unless it
+    /// runs this version already.
+    fn start_service(&self, entry: &Arc<PluginEntry>, index: usize, cx: &mut Context<Self>) {
+        if entry.manifest.service {
+            let settings = settings_values(entry, cx);
+            let log = self.plugins[index].log.clone();
+            crate::plugin_services::window_started(entry, &log, settings, cx);
+        }
+    }
+
+    /// The plugin is turned off or removed: its service stops too.
+    fn stop_service(&self, id: &str, cx: &mut Context<Self>) {
+        crate::plugin_services::stop(id, cx);
+    }
+
+    /// A call of the plugin's service the window carries out: its notifications (the service
+    /// numbers them apart from the window's instance), its settings page's `status` lines, a
+    /// helper's download, opening a link, copying text.
+    pub(crate) fn service_call(
+        &mut self,
+        plugin: Arc<str>,
+        call: HostCall,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_store_call(plugin, call, cx);
+    }
+
+    /// A notification of the services' owner (a service stopped) in this window.
+    pub(crate) fn notify_for_service(
+        &mut self,
+        notification: Notification,
+        cx: &mut Context<Self>,
+    ) {
+        self.post(notification, cx);
+    }
+
+    /// The window's notification center, for the modules that show a plugin's progress.
+    pub(crate) fn notification_center(&self) -> Option<Entity<NotificationCenter>> {
+        self.center.as_ref().and_then(WeakEntity::upgrade)
+    }
+
     /// Delivers an event to every running plugin.
     fn broadcast(&self, event: Event) {
         for instance in self.instances.values() {
@@ -2058,10 +2549,19 @@ impl PluginStore {
     pub(crate) fn queue_question(&mut self, question: PendingQuestion) {
         self.pending_questions.push_back(question);
     }
+
+    /// A dialog window waits to be shown: its plugin hid it before its turn came.
+    pub(crate) fn forget_pending_dialog(&mut self, key: ToolKey) -> bool {
+        let before = self.pending_questions.len();
+        self.pending_questions.retain(
+            |question| !matches!(question, PendingQuestion::Dialog(waiting) if *waiting == key),
+        );
+        self.pending_questions.len() != before
+    }
 }
 
 /// The plugin's settings: the manifest's defaults with the user's values over them.
-fn settings_values(entry: &PluginEntry, cx: &App) -> Map<String, Value> {
+pub(crate) fn settings_values(entry: &PluginEntry, cx: &App) -> Map<String, Value> {
     // A secret, a button, a status line, a heading have no value (API 0.3).
     let mut values: Map<String, Value> = entry
         .manifest
@@ -2080,6 +2580,43 @@ fn settings_values(entry: &PluginEntry, cx: &App) -> Map<String, Value> {
         }
     }
     values
+}
+
+/// The name of a window's tab (API 0.5): `<window>/<key>`.
+pub(crate) fn tab_name(window: &str, key: &str) -> String {
+    format!("{window}/{key}")
+}
+
+/// A restored tab whose plugin can't fill it: why, and what to do.
+fn unavailable_view(title: String, detail: Option<String>) -> View {
+    let span = |text: String, tone: Tone, bold: bool| Span {
+        text,
+        tone,
+        bold,
+        code: false,
+        highlight: false,
+    };
+    let mut elements = vec![
+        Element {
+            id: "flux.unavailable".into(),
+            kind: ElementKind::Column,
+            children: vec![1],
+        },
+        Element {
+            id: "flux.unavailable.title".into(),
+            kind: ElementKind::Text(vec![span(title, Tone::Normal, true)]),
+            children: Vec::new(),
+        },
+    ];
+    if let Some(detail) = detail {
+        elements[0].children.push(2);
+        elements.push(Element {
+            id: "flux.unavailable.detail".into(),
+            kind: ElementKind::Text(vec![span(detail, Tone::Muted, false)]),
+            children: Vec::new(),
+        });
+    }
+    View { elements }
 }
 
 fn undeclared(what: &str, id: &str) -> String {
@@ -2178,6 +2715,8 @@ fn stopped_view(name: &str, error: &str) -> View {
                     tooltip: None,
                     primary: true,
                     enabled: true,
+                    busy: false,
+                    badge: None,
                 }),
                 children: Vec::new(),
             },
@@ -2322,7 +2861,11 @@ fn show_stop_details(
     let Some(name) = store.plugin(id).map(|state| state.name().to_string()) else {
         return;
     };
-    let Some((error, details)) = store.stop_reason(id) else {
+    // The window's instance, or the plugin's service (API 0.5).
+    let reason = store
+        .stop_reason(id)
+        .or_else(|| crate::plugin_services::stop_reason(id, cx));
+    let Some((error, details)) = reason else {
         // It runs again: nothing to tell.
         return;
     };
@@ -2373,6 +2916,7 @@ pub(crate) fn handle_call(
         HostCall::AskForm { id, form } => {
             crate::plugin_form::ask_form(workspace, plugin, *id, form, window, cx)
         }
+        HostCall::PickFiles { id, options } => pick_files(workspace, plugin, *id, options, cx),
         HostCall::OpenPicker { id, spec } => {
             crate::plugin_picker::open(workspace, plugin, *id, spec, window, cx)
         }
@@ -2382,6 +2926,35 @@ pub(crate) fn handle_call(
         HostCall::ClosePicker { id } => {
             crate::plugin_picker::close(workspace, plugin, *id, window, cx)
         }
+        // API 0.5: a search bar's field takes the keyboard.
+        HostCall::FocusElement {
+            window: tool,
+            element,
+        } => {
+            let view = workspace
+                .plugins
+                .read(cx)
+                .tool_windows()
+                .iter()
+                .find(|known| known.plugin == plugin && known.id == *tool)
+                .map(|known| known.view.clone());
+            match view {
+                Some(view) => {
+                    if !view.update(cx, |view, cx| view.focus_field(element, window, cx)) {
+                        workspace.plugins.read(cx).log(
+                            plugin,
+                            Level::Warn,
+                            &format!("ui.focus: \"{element}\" isn't a text field of \"{tool}\""),
+                        );
+                    }
+                }
+                None => workspace.plugins.read(cx).log(
+                    plugin,
+                    Level::Debug,
+                    &format!("ui.focus: the window \"{tool}\" isn't open"),
+                ),
+            }
+        }
         HostCall::Editor { call, reply } => editor_call(workspace, plugin, call, reply, window, cx),
         HostCall::Window { call, reply } => {
             crate::plugin_calls::window_call(workspace, plugin, call, reply, window, cx)
@@ -2389,6 +2962,42 @@ pub(crate) fn handle_call(
         // The store carries out the rest itself.
         _ => {}
     }
+}
+
+/// The system's file dialog for a plugin (API 0.5); the paths go back as `files-picked` — none
+/// when the user cancelled.
+fn pick_files(
+    workspace: &mut Workspace,
+    plugin: &str,
+    id: u64,
+    options: &FilePick,
+    cx: &mut Context<Workspace>,
+) {
+    let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+        files: !options.directories,
+        directories: options.directories,
+        multiple: options.multiple,
+        prompt: options.prompt.clone().map(SharedString::from),
+    });
+    let store = workspace.plugins.downgrade();
+    let plugin = plugin.to_string();
+    cx.spawn(async move |_, cx| {
+        let paths = match picked.await {
+            Ok(Ok(Some(paths))) => Some(
+                paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            _ => None,
+        };
+        store
+            .update(cx, |store, _| {
+                store.send_to(&plugin, Event::FilesPicked((id, paths)))
+            })
+            .ok();
+    })
+    .detach();
 }
 
 /// A plugin's question in a Flux dialog; the answer goes back as `dialog-answered`.
@@ -2508,6 +3117,7 @@ fn ask_queued(
         PendingQuestion::Form { plugin, id, form } => {
             crate::plugin_form::show_form(workspace, plugin, id, form, window, cx)
         }
+        PendingQuestion::Dialog(key) => crate::plugin_dialog::show(workspace, key, window, cx),
     }
 }
 

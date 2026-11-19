@@ -224,7 +224,7 @@ pub(crate) fn install_question(candidate: &Candidate) -> Dialog {
                 .to_string(),
         );
     }
-    let permissions = permission_lines(&manifest.permissions);
+    let permissions = manifest_lines(manifest, &|text| translated(entry, text).to_string());
     if permissions.is_empty() {
         paragraphs.push(tr("The plugin asks for no special permissions.").to_string());
     } else {
@@ -360,6 +360,75 @@ fn permission_lines(permissions: &Permissions) -> Vec<PermissionLine> {
         lines.push(line(IconName::Folder, text, whole));
     }
     lines
+}
+
+/// What a plugin may do, in plain words: its permissions, and what API 0.5 adds beyond them — its
+/// own programs, which Flux downloads and runs (a native program has the user's rights: drawn in
+/// the warning tone), its service, its tools for Claude. `translate` gives the plugin's strings
+/// (the tools' titles) in the interface language.
+fn manifest_lines(manifest: &Manifest, translate: &dyn Fn(&str) -> String) -> Vec<PermissionLine> {
+    let mut lines = permission_lines(&manifest.permissions);
+    let platform = flux_plugin::manifest::helper_platform();
+    for helper in &manifest.helpers {
+        let host = platform
+            .and_then(|platform| helper.platforms.get(platform))
+            .map(|file| url_host(&file.url).to_string())
+            .unwrap_or_default();
+        let text = if host.is_empty() {
+            trf("Download and run its own program {0}", &[&helper.name])
+        } else {
+            trf(
+                "Download and run its own program {0} ({1})",
+                &[&helper.name, &host],
+            )
+        };
+        lines.push(PermissionLine {
+            icon: IconName::Download,
+            text,
+            broad: true,
+        });
+    }
+    if manifest.service {
+        lines.push(PermissionLine {
+            icon: IconName::Clock,
+            text: tr("Keep working in the background while Flux is open").to_string(),
+            broad: false,
+        });
+    }
+    let titles = |write: bool| {
+        manifest
+            .tools
+            .iter()
+            .filter(|tool| tool.write == write)
+            .map(|tool| translate(&tool.title))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (reading, changing) = (titles(false), titles(true));
+    if !reading.is_empty() {
+        lines.push(PermissionLine {
+            icon: IconName::Claude,
+            text: trf("Give Claude tools: {0}", &[&reading]),
+            broad: false,
+        });
+    }
+    if !changing.is_empty() {
+        lines.push(PermissionLine {
+            icon: IconName::Claude,
+            text: trf(
+                "Give Claude tools that ask you before acting: {0}",
+                &[&changing],
+            ),
+            broad: false,
+        });
+    }
+    lines
+}
+
+/// "https://github.com/a/b" → "github.com".
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or_default()
 }
 
 /// A string of the plugin's manifest in the interface language.
@@ -1505,7 +1574,7 @@ impl PluginManager {
                     .into_any_element(),
             );
         }
-        if on && !plugin.manifest().settings.is_empty() {
+        if on && plugin.manifest().has_settings_page() {
             let id = plugin.id.clone();
             buttons.push(
                 ui::text_button("plugin-settings", tr("Settings"), false, ui)
@@ -1731,7 +1800,7 @@ impl PluginManager {
 /// What a plugin may do beyond the API, in plain words, and what the sandbox keeps from it: the
 /// Permissions tab of the Installed and of the Marketplace.
 pub(crate) fn permissions_view(manifest: &Manifest, ui: UiColors) -> Div {
-    let lines = permission_lines(&manifest.permissions);
+    let lines = manifest_lines(manifest, &|text| text.to_string());
     let list = if lines.is_empty() {
         vec![permission_row(
             IconName::CheckCircle,
@@ -2426,6 +2495,44 @@ mod tests {
             path: PathBuf::from("/tmp/hello"),
             kind,
         }
+    }
+
+    #[test]
+    fn the_service_helpers_and_tools_read_in_plain_words() {
+        let platform = flux_plugin::manifest::helper_platform().unwrap_or("macos-aarch64");
+        let manifest = Manifest::parse(&format!(
+            "id = \"someone.chat\"\nname = \"Chat\"\nversion = \"1.0.0\"\napi = \"0.5\"\n\
+             service = true\n\n[[helpers]]\nname = \"chat-helper\"\n\
+             [helpers.platforms.{platform}]\nurl = \"https://github.com/someone/chat/x.gz\"\n\
+             sha256 = \"{}\"\n\n[[tools]]\nname = \"read_chat\"\ntitle = \"Read a chat\"\n\
+             description = \"Reads.\"\n\n[[tools]]\nname = \"reply\"\ntitle = \"Reply\"\n\
+             description = \"Replies.\"\nwrite = true\n",
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let lines: Vec<(String, bool)> = manifest_lines(&manifest, &|text| text.to_string())
+            .into_iter()
+            .map(|line| (line.text, line.broad))
+            .collect();
+        let expected = |text: &str, broad| (text.to_string(), broad);
+        if flux_plugin::manifest::helper_platform().is_some() {
+            assert_eq!(
+                lines[0],
+                expected(
+                    "Download and run its own program chat-helper (github.com)",
+                    true
+                )
+            );
+        }
+        let rest = &lines[lines.len() - 3..];
+        assert_eq!(
+            rest,
+            [
+                expected("Keep working in the background while Flux is open", false),
+                expected("Give Claude tools: Read a chat", false),
+                expected("Give Claude tools that ask you before acting: Reply", false),
+            ]
+        );
     }
 
     const HELLO: &str = r#"

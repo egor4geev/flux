@@ -349,6 +349,23 @@ impl Theme {
 }
 
 /// The default dark theme, also the fallback.
+/// The seven avatar colors (API 0.5, a plugin's people and chats): the initials on them, a group's
+/// author names and quotes in them — the same color for the same person, on either theme.
+pub const AVATAR_COLORS: [u32; 7] = [
+    0xff9c5b, // orange
+    0xffc560, // amber
+    0xb48cff, // violet
+    0x4fd18b, // green
+    0x4fc9c0, // teal
+    0x5aa9ff, // blue
+    0xff7eb6, // pink
+];
+
+/// The avatar color `index` (a larger number wraps).
+pub fn avatar_color(index: u8) -> Hsla {
+    gpui::rgb(AVATAR_COLORS[index as usize % AVATAR_COLORS.len()]).into()
+}
+
 pub const FLUX_NIGHT: &str = "Flux Night";
 /// The default light theme.
 pub const FLUX_DAY: &str = "Flux Day";

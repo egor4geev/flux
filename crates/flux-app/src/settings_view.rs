@@ -858,6 +858,13 @@ impl SettingsView {
     /// Shows a section; the Plugins page and the plugins' pages are made when first shown. The
     /// Plugins page puts the focus into its search field, as JetBrains IDEs do.
     fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        // The plugin's page left: its blocks are out of sight (API 0.5).
+        if let Section::Plugin(id) = &self.section
+            && section != self.section
+            && let Some(page) = self.plugin_pages.get(id)
+        {
+            page.update(cx, |page, cx| page.set_in_sight(false, cx));
+        }
         match &section {
             Section::Plugins => {
                 let manager = self.manager(window, cx);
@@ -880,6 +887,9 @@ impl SettingsView {
                     let page =
                         cx.new(|cx| PluginSettingsPage::new(id.clone(), plugins, window, cx));
                     self.plugin_pages.insert(id, page);
+                }
+                if let Some(page) = self.plugin_pages.get(id) {
+                    page.update(cx, |page, cx| page.set_in_sight(true, cx));
                 }
                 window.focus(&self.focus_handle);
             }
@@ -927,6 +937,15 @@ impl SettingsView {
         }
     }
 
+    /// Settings closed: the plugin's page shown, its blocks are out of sight (API 0.5).
+    pub(crate) fn closed(&mut self, cx: &mut Context<Self>) {
+        if let Section::Plugin(id) = &self.section
+            && let Some(page) = self.plugin_pages.get(id)
+        {
+            page.update(cx, |page, cx| page.set_in_sight(false, cx));
+        }
+    }
+
     /// The Plugins page: made once, then kept with its search and selection.
     fn manager(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<PluginManager> {
         if let Some(manager) = &self.manager {
@@ -951,7 +970,7 @@ impl SettingsView {
             .read(cx)
             .plugins()
             .iter()
-            .filter(|plugin| !plugin.entry.manifest.settings.is_empty())
+            .filter(|plugin| plugin.entry.manifest.has_settings_page())
             .filter(|plugin| {
                 !matches!(
                     plugin.status,

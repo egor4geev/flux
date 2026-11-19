@@ -1,0 +1,27 @@
+[package]
+name = "flux-chat-playground"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "A chat-like mock of the Flux plugin API 0.5: a list of chats, a conversation with every kind of message, pictures, avatars, a QR code."
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+flux-plugin-api = { path = "../../crates/flux-plugin-api" }
+# The example draws its own pictures at activation: PNG files and the tiny JPEG previews.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Plugins are small: Flux compiles the component when it loads it.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# A plugin is a project of its own: `cargo build --release --target wasm32-wasip2`, or installed as
+# a plugin under development, Flux builds it.
+[workspace]

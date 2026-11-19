@@ -17,6 +17,19 @@ use std::time::Duration;
 use crate::host::process as raw;
 pub use crate::host::process::{Output, OutputChannel, ProcessOutput};
 
+/// The absolute path of one of the plugin's own programs (API 0.5), declared in the manifest's
+/// `[[helpers]]` by name: Flux downloads the file of this computer's platform and checks its
+/// SHA-256 the first time (the call waits; a long download shows its progress in the window), then
+/// reuses it. [`command`] runs this path without the `processes` permission:
+///
+/// ```ignore
+/// let helper = process::helper("fluxgram-helper")?;
+/// self.helper = Some(process::command(&helper).args(["--data", &storage::dir()]).spawn()?);
+/// ```
+pub fn helper(name: &str) -> Result<String, String> {
+    raw::helper(name)
+}
+
 /// A program to run: [`command`], then the methods add to it.
 #[derive(Debug, Clone)]
 pub struct Command {

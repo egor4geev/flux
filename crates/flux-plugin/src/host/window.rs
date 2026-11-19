@@ -82,7 +82,13 @@ impl HostState {
             picker::PickerAnchor::StatusItem(item) => {
                 manifest.status_items.iter().any(|known| known.id == *item)
             }
-            picker::PickerAnchor::Element((window, _)) => manifest.tool_window(window).is_some(),
+            // A tab of a window with tabs (API 0.5) is `<window>/<key>`.
+            picker::PickerAnchor::Element((window, _)) => match window.split_once('/') {
+                Some((tabbed, key)) => {
+                    !key.is_empty() && manifest.tool_window(tabbed).is_some_and(|spec| spec.tabs)
+                }
+                None => manifest.tool_window(window).is_some(),
+            },
         };
         if known {
             return anchor;
@@ -246,6 +252,21 @@ impl diagnostics::Host for State {
 }
 
 impl system::Host for State {
+    fn open_file(&mut self, path: String) -> Result<(), String> {
+        let path = file_to_open(path)?;
+        self.host.tell(WindowCall::OpenFile {
+            path,
+            reveal: false,
+        });
+        Ok(())
+    }
+
+    fn show_file(&mut self, path: String) -> Result<(), String> {
+        let path = file_to_open(path)?;
+        self.host.tell(WindowCall::OpenFile { path, reveal: true });
+        Ok(())
+    }
+
     fn open_url(&mut self, url: String) -> Result<(), String> {
         let scheme = url
             .split_once(':')
@@ -282,6 +303,23 @@ impl system::Host for State {
     fn open_settings(&mut self) {
         self.host.tell(WindowCall::OpenSettings);
     }
+}
+
+/// A file `system.open-file` and `show-file` may hand to Flux: an absolute path without "..",
+/// there. Whose it is (the plugin's data folder, a file the user gave the plugin) Flux checks.
+fn file_to_open(path: String) -> Result<String, String> {
+    let file = std::path::Path::new(&path);
+    if !file.is_absolute()
+        || file
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!("Not an absolute path without \"..\": {path}"));
+    }
+    if !file.exists() {
+        return Err(format!("No such file: {path}"));
+    }
+    Ok(path)
 }
 
 /// How far local time is ahead of UTC at `at` (seconds since 1970), by the system's rules.

@@ -837,12 +837,14 @@ fragment float4 path_sprite_fragment(
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  uint surface_id [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  uint surface_id [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -865,10 +867,13 @@ vertex SurfaceVertexOutput surface_vertex(
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      surface_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                 constant SurfaceBounds *surfaces
+                                 [[buffer(SurfaceInputIndex_Surfaces)]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
@@ -883,7 +888,14 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  // Flux patch (FluxGram part 4): rounded corners, antialiased as a sprite's, and the
+  // element's opacity.
+  SurfaceBounds surface = surfaces[input.surface_id];
+  float distance =
+      quad_sdf(input.position.xy, surface.bounds, surface.corner_radii);
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  color.a *= surface.opacity * saturate(0.5 - distance);
+  return color;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
