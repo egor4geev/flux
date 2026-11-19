@@ -14,9 +14,9 @@ A plugin without code can add languages, their grammars and language servers: [L
 color themes: [Themes](themes.md); sets of file icons: [File icon sets](icon-themes.md).
 
 > [!NOTE]
-> The plugin API is version **0.4**. A manifest names the version it is built for; Flux keeps
-> running plugins built for **0.3** and **0.2**, the version the [catalog](catalog.md) opened with
-> ([From 0.3 to 0.4](#from-03-to-04), [From 0.2 to 0.3](#from-02-to-03)).
+> The plugin API is version **0.5**. A manifest names the version it is built for; Flux keeps
+> running plugins built for **0.4**, **0.3** and **0.2**, the version the [catalog](catalog.md) opened
+> with ([From 0.4 to 0.5](#from-04-to-05), [From 0.3 to 0.4](#from-03-to-04), [From 0.2 to 0.3](#from-02-to-03)).
 
 ## How plugins run
 

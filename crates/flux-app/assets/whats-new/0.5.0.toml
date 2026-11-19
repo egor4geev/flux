@@ -1,0 +1,27 @@
+# What's New in Flux 0.5: FluxGram, Claude in the chats, plugin API 0.5 (format: 0.1.0.toml).
+version = "0.5.0"
+date = "2026-11-19"
+
+[[items]]
+icon = "puzzle"
+color = "blue"
+title = "FluxGram: your chats in Flux"
+text = "A plugin in the catalog brings your Telegram chats into the editor: several accounts, only the chats you add, photos, videos, voice messages, stickers, channels and bots. An unofficial client that works through the Telegram API."
+ru.title = "FluxGram: чаты во Flux"
+ru.text = "Плагин из каталога приносит чаты Telegram в редактор: несколько аккаунтов, только добавленные чаты, фото, видео, голосовые, стикеры, каналы и боты. Неофициальный клиент, работает через Telegram API."
+
+[[items]]
+icon = "claude"
+color = "orange"
+title = "Claude in the chats"
+text = "Turn on “Available to Claude” for a chat: Claude reads it back, searches it and proposes a reply on a card. The reply leaves only when you press Send."
+ru.title = "Claude в чатах"
+ru.text = "Включите у чата «Доступен Claude»: Claude дочитает переписку, найдёт нужное и предложит ответ на карточке. Ответ уйдёт, только когда вы нажмёте «Отправить»."
+
+[[items]]
+icon = "plug"
+color = "violet"
+title = "Plugins can do more"
+text = "Plugin API 0.5: a service for the whole app, a helper program, chats with media, a window on the left with tabs, and tools for Claude."
+ru.title = "Плагины умеют больше"
+ru.text = "API плагинов 0.5: служба на всё приложение, программа-помощник, переписка с медиа, окно слева с вкладками и инструменты для Claude."
