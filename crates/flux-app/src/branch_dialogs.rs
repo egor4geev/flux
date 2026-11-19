@@ -141,9 +141,14 @@ pub fn workspace_actions(root: Div, cx: &mut Context<Workspace>) -> Div {
 
 /// Who waits for a flow to end — a plugin's `git.new-branch` or `git.checkout` (API 0.3, part
 /// 10.3) — and hears once how it ended: done, declined or failed (the user has been told by then,
-/// as in the window's own flows). The window's own flows have nobody waiting.
+/// as in the window's own flows). The window's own flows have nobody waiting. A quiet one —
+/// `…-quietly` (API 0.6), nobody at the computer — asks nothing: local changes or untracked files
+/// in the way end the flow with why, a sentence for the user, and nothing changes.
 #[derive(Clone, Default)]
-pub(crate) struct Done(Option<Waiter>);
+pub(crate) struct Done {
+    waiter: Option<Waiter>,
+    quiet: bool,
+}
 
 /// The waiting side of a flow: told once, then gone.
 type Waiter = Rc<RefCell<Option<oneshot::Sender<Result<(), String>>>>>;
@@ -152,20 +157,46 @@ type Waiter = Rc<RefCell<Option<oneshot::Sender<Result<(), String>>>>>;
 pub(crate) const DECLINED: &str = "The user declined";
 
 impl Done {
-    pub(crate) fn new(sender: oneshot::Sender<Result<(), String>>) -> Self {
-        Done(Some(Rc::new(RefCell::new(Some(sender)))))
+    /// A plugin waits; `quiet` — the flow asks nothing.
+    pub(crate) fn new(sender: oneshot::Sender<Result<(), String>>, quiet: bool) -> Self {
+        Done {
+            waiter: Some(Rc::new(RefCell::new(Some(sender)))),
+            quiet,
+        }
     }
 
     /// Nobody waits: the window's own flows.
     fn none() -> Self {
-        Done(None)
+        Done::default()
     }
 
     pub(crate) fn finish(&self, result: Result<(), String>) {
-        let sender = self.0.as_ref().and_then(|cell| cell.borrow_mut().take());
+        let sender = self
+            .waiter
+            .as_ref()
+            .and_then(|cell| cell.borrow_mut().take());
         if let Some(sender) = sender {
             sender.send(result).ok();
         }
+    }
+}
+
+/// Why checking out `name` can't go without asking: local changes or untracked files in the way
+/// (a sentence for the user); none for another failure.
+fn in_the_way(error: &GitError, name: &str) -> Option<String> {
+    let blocked = flux_git::blocked_by(error)?;
+    if !blocked.local.is_empty() {
+        Some(trf(
+            "Local changes are in the way of checking out '{0}'",
+            &[&name],
+        ))
+    } else if !blocked.untracked.is_empty() {
+        Some(trf(
+            "Untracked files are in the way of checking out '{0}'",
+            &[&name],
+        ))
+    } else {
+        None
     }
 }
 
@@ -433,6 +464,12 @@ fn checkout_failed(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    // Nobody is at the computer: nothing is asked, and nothing changed.
+    if done.quiet
+        && let Some(why) = in_the_way(&error, target.name())
+    {
+        return done.finish(Err(why));
+    }
     if let Some(blocked) = flux_git::blocked_by(&error) {
         if !blocked.local.is_empty() && mode == CheckoutMode::Normal {
             return ask_smart_checkout(repo, target, blocked.local, then, done, window, cx);
@@ -591,8 +628,8 @@ fn checked_out(
 // --- For plugins (API 0.3, part 10.3) ---
 
 /// A plugin's `git.new-branch`: `name` from `start` (none — the current branch), checked out as
-/// New Branch… does it — local changes come along, Smart Checkout asks when they're in the way;
-/// `done` hears how it ended.
+/// New Branch… does it — local changes come along, Smart Checkout asks when they're in the way
+/// (a quiet `done`: the branch isn't made, and `done` hears why); `done` hears how it ended.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn new_branch_for_plugin(
     workspace: &mut Workspace,
@@ -614,8 +651,9 @@ pub(crate) fn new_branch_for_plugin(
 }
 
 /// A plugin's `git.checkout`: a local branch; a remote one ("origin/x") as the local branch of its
-/// name — the one there is, or a new one tracking it — with the branches popup's questions and
-/// messages; `done` hears how it ended. `refs` — the repository's branches, read just now.
+/// name — the one there is, or a new one tracking it — with the branches popup's questions (none
+/// for a quiet `done`) and messages; `done` hears how it ended. `refs` — the repository's
+/// branches, read just now.
 pub(crate) fn checkout_for_plugin(
     workspace: &mut Workspace,
     repo: usize,
@@ -891,17 +929,20 @@ fn create_branch(
                 notify(this, Notification::success(title), cx);
                 done.finish(Ok(()));
             }
-            Err(error)
-                if checkout
+            Err(error) => match in_the_way(&error, &name) {
+                // Nobody is at the computer: `checkout -b` changed nothing, and nothing is asked.
+                Some(why) if done.quiet && checkout => done.finish(Err(why)),
+                _ if checkout
                     && flux_git::blocked_by(&error)
                         .is_some_and(|blocked| !blocked.local.is_empty()) =>
-            {
-                create_then_checkout(this, repo, name, start, overwrite, done, window, cx)
-            }
-            Err(error) => {
-                notify_error(this, repo, tr("Branch not created"), &error, cx);
-                done.finish(Err(error.to_string()));
-            }
+                {
+                    create_then_checkout(this, repo, name, start, overwrite, done, window, cx)
+                }
+                _ => {
+                    notify_error(this, repo, tr("Branch not created"), &error, cx);
+                    done.finish(Err(error.to_string()));
+                }
+            },
         })
         .ok();
     })
@@ -1759,6 +1800,82 @@ impl GitStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plugin's quiet checkout against real git: changes that conflict make `checkout -b` and
+    /// `checkout` fail with a sentence and change nothing; untracked files in the way the same;
+    /// changes that don't conflict come along.
+    #[test]
+    fn a_quiet_checkout_fails_on_changes_in_the_way_and_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("flux-quiet-checkout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("a.txt"), "one\nfeature\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "tracked on feature\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "feature"]);
+        git(&["checkout", "-q", "main"]);
+        let repo = flux_git::Repo::discover(&dir).unwrap();
+
+        // A change of a.txt conflicts with `feature`'s.
+        std::fs::write(dir.join("a.txt"), "one\nmine\n").unwrap();
+        let error = flux_git::branch::create_branch(&repo, "TRACK-1-fix", "feature", true, false)
+            .unwrap_err();
+        assert_eq!(
+            in_the_way(&error, "TRACK-1-fix").as_deref(),
+            Some("Local changes are in the way of checking out 'TRACK-1-fix'")
+        );
+        let error = flux_git::branch::checkout(&repo, "feature", false).unwrap_err();
+        assert_eq!(
+            in_the_way(&error, "feature").as_deref(),
+            Some("Local changes are in the way of checking out 'feature'")
+        );
+        // Nothing changed: no new branch, still on main, the change kept.
+        assert!(
+            !git(&["rev-parse", "--verify", "-q", "TRACK-1-fix"])
+                .status
+                .success()
+        );
+        let head = git(&["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "main");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "one\nmine\n"
+        );
+
+        // An untracked file `feature` tracks is in the way too.
+        git(&["checkout", "-q", "--", "a.txt"]);
+        std::fs::write(dir.join("new.txt"), "mine, untracked\n").unwrap();
+        let error = flux_git::branch::checkout(&repo, "feature", false).unwrap_err();
+        assert_eq!(
+            in_the_way(&error, "feature").as_deref(),
+            Some("Untracked files are in the way of checking out 'feature'")
+        );
+        std::fs::remove_file(dir.join("new.txt")).unwrap();
+
+        // A change that doesn't conflict comes along.
+        std::fs::write(dir.join("b.txt"), "b, mine\n").unwrap();
+        flux_git::branch::checkout(&repo, "feature", false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "b, mine\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn names(list: &[&str]) -> HashSet<String> {
         list.iter().map(|name| name.to_string()).collect()

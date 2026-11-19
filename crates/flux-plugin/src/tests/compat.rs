@@ -117,8 +117,8 @@ fn the_manifest_must_name_the_api_the_component_is_built_for() {
         error,
         "The component is built for plugin API 0.2, but flux-plugin.toml says api = \"0.3\""
     );
-    // A 0.5 component that says it is 0.2 (the probe's manifest says the current API — every
-    // other probe test runs that way).
+    // A component of the current API that says it is 0.2 (the probe's manifest says the current
+    // API — every other probe test runs that way).
     let Some(entry) = probe_manifest("test.v05-says-02", "project = \"none\"", &[], "") else {
         return;
     };
@@ -137,7 +137,10 @@ fn the_manifest_must_name_the_api_the_component_is_built_for() {
     let (error, _) = probe.stopped();
     assert_eq!(
         error,
-        "The component is built for plugin API 0.5, but flux-plugin.toml says api = \"0.2\""
+        format!(
+            "The component is built for plugin API {}, but flux-plugin.toml says api = \"0.2\"",
+            crate::API_VERSION
+        )
     );
 }
 
@@ -168,6 +171,7 @@ fn plugins_without_code_load_for_either_api_and_not_for_others() {
         ("0.3", true),
         ("0.4", true),
         ("0.5", true),
+        ("0.6", true),
         ("9.9", false),
     ] {
         let dir = temp_dir("declarative-api");
@@ -184,7 +188,7 @@ fn plugins_without_code_load_for_either_api_and_not_for_others() {
         } else {
             assert_eq!(
                 entry.problem.as_deref(),
-                Some("Built for plugin API 9.9; this Flux runs 0.2, 0.3, 0.4, 0.5")
+                Some("Built for plugin API 9.9; this Flux runs 0.2, 0.3, 0.4, 0.5, 0.6")
             );
         }
     }

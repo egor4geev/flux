@@ -1,16 +1,18 @@
 //! Plugins built for the API 0.3 and 0.4 (`wit/v0.3`; 0.4 changed only the manifest): Flux runs
-//! them with the code of the current version (0.5), as [`super`] does for 0.2.
+//! them with the code of the current version (0.6), as [`super`] does for 0.2.
 //!
-//! - Every interface but `ui` is answered by the current implementations under the 0.3 names:
-//!   0.5 only added functions to `dialogs` (`pick-files`) and `process` (`helper`), and a 0.3
-//!   plugin simply doesn't import them.
+//! - Every interface but `ui`, `picker` and `claude` is answered by the current implementations
+//!   under the 0.3 names: 0.5 only added functions to `dialogs` (`pick-files`) and `process`
+//!   (`helper`), 0.6 to `git` (the quiet new branch and checkout), and a 0.3 plugin simply
+//!   doesn't import what was added. `claude.new-session` returns the session's id since 0.6: its
+//!   0.3 implementation drops it.
 //! - `ui` has a 0.3 implementation that converts and goes on to the current one: a tree row and a
 //!   tree grew (an avatar, a badge's tone, icons after the label, two lines), and so did the
 //!   elements (a picture, an avatar, a QR code, a conversation) and a button (a count). So does
 //!   `picker`: its item grew an avatar.
 //! - The exports are called through the 0.3 bindings: an event or a window's input 0.3 doesn't
-//!   know (a tab closed, a service's message, Claude's tool call, a conversation's input) isn't
-//!   delivered — such a plugin can't have asked for it.
+//!   know (a tab closed, a service's message, Claude's tool call, a conversation's input, 0.6's
+//!   sessions and tasks) isn't delivered — such a plugin can't have asked for it.
 
 use wasmtime::component::{HasSelf, Linker};
 
@@ -24,7 +26,8 @@ use crate::api::types::{CommandContext, CommandSource, EditorInfo, Position, Ran
 use crate::api::ui;
 use crate::runtime::State;
 
-/// The bindings of the API 0.3: the exports of a 0.3 component, and `ui`, which needs converting.
+/// The bindings of the API 0.3: the exports of a 0.3 component, and the interfaces that need
+/// converting (`ui`, `picker`, `claude`).
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
         path: "wit/v0.3",
@@ -74,12 +77,34 @@ pub(crate) fn add_to_linker(linker: &mut Linker<State>) -> wasmtime::Result<()> 
         timers = "timers",
         system = "system",
         links = "links",
-        claude = "claude",
         contexts = "contexts",
     );
     v3::ui::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
     v3::picker::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
+    v3::claude::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
     Ok(())
+}
+
+// --- `claude`: a new session without its id ---
+
+impl v3::claude::Host for State {
+    fn new_session(&mut self, spec: v3::claude::SessionSpec) -> Result<(), String> {
+        let spec = current::claude::SessionSpec {
+            title: spec.title,
+            attachments: spec
+                .attachments
+                .into_iter()
+                .map(|attachment| current::claude::Attachment {
+                    label: attachment.label,
+                    markdown: attachment.markdown,
+                })
+                .collect(),
+            prompt: spec.prompt,
+            send: spec.send,
+            plan_mode: spec.plan_mode,
+        };
+        current::claude::Host::new_session(self, spec).map(drop)
+    }
 }
 
 // --- `picker`: 0.3 items, without an avatar ---
@@ -305,7 +330,8 @@ pub(crate) fn command_context(context: &CommandContext) -> v3::types::CommandCon
 }
 
 /// An event for a 0.3 plugin; none for one 0.3 doesn't know (0.5's: a tab closed, the file
-/// dialog's answer, the service's messages, Claude's tool calls).
+/// dialog's answer, the service's messages, Claude's tool calls; 0.6's: Claude's sessions, the
+/// computer's state, the tasks' queries).
 pub(crate) fn event(event: &Event) -> Option<v3::events::Event> {
     use v3::events::Event as Old;
     Some(match event {
@@ -348,7 +374,7 @@ pub(crate) fn event(event: &Event) -> Option<v3::events::Event> {
         Event::LinkActivated(link) => Old::LinkActivated(link.clone()),
         Event::LinkHovered(link) => Old::LinkHovered(link.clone()),
         Event::GitDone(done) => Old::GitDone(done.clone()),
-        // 0.5: what a 0.3 plugin can't have asked for.
+        // 0.5 and 0.6: what a 0.3 plugin can't have asked for.
         Event::TabClosed(_)
         | Event::FilesPicked(_)
         | Event::ServiceMessage(_)
@@ -357,7 +383,20 @@ pub(crate) fn event(event: &Event) -> Option<v3::events::Event> {
         | Event::ServiceStarted
         | Event::ToolCalled(_)
         | Event::ToolConfirmed(_)
-        | Event::ToolCancelled(_) => return None,
+        | Event::ToolCancelled(_)
+        | Event::ClaudeSession(_)
+        | Event::ClaudeSessionGone(_)
+        | Event::ClaudeText(_)
+        | Event::ClaudeSteps(_)
+        | Event::ClaudeRequest(_)
+        | Event::ClaudeResolved(_)
+        | Event::ClaudeTurnEnded(_)
+        | Event::ClaudeFailed(_)
+        | Event::ClaudeLimits(_)
+        | Event::ClaudeRegion(_)
+        | Event::SystemChanged(_)
+        | Event::ClaudeAction(_)
+        | Event::TaskQuery(_) => return None,
     })
 }
 

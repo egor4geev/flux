@@ -12,9 +12,13 @@ libc = "0.2.190"
 # Watching project files: FSEvents on macOS.
 notify = "8.2.0"
 # Moving to the Trash; on macOS, `NSFileManager trashItemAtURL` (without a permission request).
-# Windows: the shell's file operation is a COM object — initialized single-threaded, as the
-# windowed app's main thread already is.
+# Windows: the shell's file operation is a COM object — initialized single-threaded, on a thread of
+# its own (`ops::trash`).
 trash = { version = "5.2.9", default-features = false, features = ["coinit_apartmentthreaded"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+# The test of issue #21: a thread that runs COM multithreaded.
+windows-sys = { version = "0.61", features = ["Win32_System_Com"] }

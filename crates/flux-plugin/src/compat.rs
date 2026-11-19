@@ -10,10 +10,13 @@
 //! - The exports are called through the 0.2 bindings: `run-command`'s context loses what 0.3
 //!   added, and an event 0.2 doesn't know isn't delivered.
 //!
-//! Plugins built for 0.3 and 0.4 (`wit/v0.3`) are answered the same way by [`v03`].
+//! Plugins built for 0.3 and 0.4 (`wit/v0.3`) are answered the same way by [`v03`], for 0.5
+//! (`wit/v0.5`) by [`v05`].
 
 /// Plugins built for the API 0.3 and 0.4.
 pub(crate) mod v03;
+/// Plugins built for the API 0.5.
+pub(crate) mod v05;
 
 use wasmtime::component::{HasSelf, Linker};
 
@@ -79,7 +82,8 @@ pub(crate) fn add_to_linker(linker: &mut Linker<State>) -> wasmtime::Result<()> 
     );
     v2::notifications::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
     v2::ui::add_to_linker::<State, HasSelf<State>>(linker, |state| state)?;
-    v03::add_to_linker(linker)
+    v03::add_to_linker(linker)?;
+    v05::add_to_linker(linker)
 }
 
 /// The API version a component was built for, by the names of its imports
@@ -331,7 +335,7 @@ pub(crate) fn event(event: &Event) -> Option<v2::events::Event> {
         }
         Event::GitChanged => Old::GitChanged,
         Event::DiagnosticsChanged(paths) => Old::DiagnosticsChanged(paths.clone()),
-        // 0.3 and 0.5: what a 0.2 plugin can't have asked for.
+        // 0.3, 0.5 and 0.6: what a 0.2 plugin can't have asked for.
         Event::FormAnswered(_)
         | Event::PickerQuery(_)
         | Event::PickerChosen(_)
@@ -346,7 +350,20 @@ pub(crate) fn event(event: &Event) -> Option<v2::events::Event> {
         | Event::ServiceStarted
         | Event::ToolCalled(_)
         | Event::ToolConfirmed(_)
-        | Event::ToolCancelled(_) => return None,
+        | Event::ToolCancelled(_)
+        | Event::ClaudeSession(_)
+        | Event::ClaudeSessionGone(_)
+        | Event::ClaudeText(_)
+        | Event::ClaudeSteps(_)
+        | Event::ClaudeRequest(_)
+        | Event::ClaudeResolved(_)
+        | Event::ClaudeTurnEnded(_)
+        | Event::ClaudeFailed(_)
+        | Event::ClaudeLimits(_)
+        | Event::ClaudeRegion(_)
+        | Event::SystemChanged(_)
+        | Event::ClaudeAction(_)
+        | Event::TaskQuery(_) => return None,
     })
 }
 

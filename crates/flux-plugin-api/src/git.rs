@@ -3,7 +3,9 @@
 //! `Event::GitChanged`. With `project = "write"` (API 0.3) — a new branch and a checkout the way
 //! the Branches popup does them (local changes come along; Smart Checkout asks when they'd be in
 //! the way), their end as `Event::GitDone((id, result))`; and the commit window's template while
-//! a task of the plugin's is active.
+//! a task of the plugin's is active. With nobody at the computer (API 0.6: a task's action run
+//! from the phone) — [`new_branch_quietly`] and [`checkout_quietly`]: nothing is asked; local
+//! changes in the way make them fail, with why as a sentence for the user, and nothing changes.
 //!
 //! ```ignore
 //! let branch = git::repository_of(&path).and_then(|repo| repo.branch); // "feature/TRACKER-12"
@@ -14,8 +16,8 @@
 
 use crate::host::git as raw;
 pub use crate::host::git::{
-    Branch, Change, ChangeKind, CommitTemplate, Repository, branches, checkout, diff, new_branch,
-    repositories, status,
+    Branch, Change, ChangeKind, CommitTemplate, Repository, branches, checkout, checkout_quietly,
+    diff, new_branch, new_branch_quietly, repositories, status,
 };
 
 /// While a task of the plugin's is active: `text` fills an empty commit message (and replaces the

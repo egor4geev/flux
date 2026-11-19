@@ -123,19 +123,37 @@ pub(crate) fn window_call(
             root,
             name,
             start,
+            quiet,
         } => crate::plugin_git::new_branch(
             workspace,
             plugin,
-            *id,
+            crate::plugin_git::Operation {
+                id: *id,
+                quiet: *quiet,
+            },
             root,
             name,
             start.as_deref(),
             window,
             cx,
         ),
-        WindowCall::GitCheckout { id, root, branch } => {
-            crate::plugin_git::checkout(workspace, plugin, *id, root, branch, window, cx)
-        }
+        WindowCall::GitCheckout {
+            id,
+            root,
+            branch,
+            quiet,
+        } => crate::plugin_git::checkout(
+            workspace,
+            plugin,
+            crate::plugin_git::Operation {
+                id: *id,
+                quiet: *quiet,
+            },
+            root,
+            branch,
+            window,
+            cx,
+        ),
         WindowCall::SetCommitTemplate(template) => {
             crate::plugin_git::set_commit_template(workspace, plugin, template.clone(), cx)
         }
@@ -145,7 +163,7 @@ pub(crate) fn window_call(
         WindowCall::DescribeLink { request, markdown } => {
             crate::plugin_links::describe(plugin, *request, markdown.clone(), cx)
         }
-        WindowCall::NewClaudeSession(spec) => send(WindowReply::Done(
+        WindowCall::NewClaudeSession(spec) => send(WindowReply::Session(
             crate::plugin_claude::new_session(workspace, plugin, spec, window, cx),
         )),
         WindowCall::SwitchContext { save, load } => crate::task_contexts::switch_for_plugin(

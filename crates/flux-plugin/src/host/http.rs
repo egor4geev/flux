@@ -14,6 +14,10 @@
 //!
 //! Tests and UI scenarios send a plugin's requests to a fake service: `FLUX_PLUGIN_HTTP_OVERRIDE`
 //! ([`overridden`]). The plugin and the permission check see the URL it asked for.
+//!
+//! A request's line in the plugin's log has no query, and none of the plugin's secrets
+//! ([`Line::hiding`]): some services want a token in the URL's path (a Telegram bot's
+//! `…/bot<token>/getUpdates`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -88,7 +92,7 @@ impl http::Host for State {
     fn start(&mut self, request: http::Request) -> u64 {
         let id = self.host.next_id();
         let host = &mut self.host;
-        let line = Line::of(&request);
+        let line = Line::of(&request).hiding(&secret_values(&host.id));
         let prepared = match prepare(request, &host.entry.manifest.permissions) {
             Ok(prepared) => prepared,
             Err(err) => {
@@ -135,7 +139,7 @@ impl http::Host for State {
 impl State {
     fn fetch_now(&mut self, request: http::Request) -> Result<http::Response, http::HttpError> {
         let host = &mut self.host;
-        let line = Line::of(&request);
+        let line = Line::of(&request).hiding(&secret_values(&host.id));
         let started = Instant::now();
         let result = (|| {
             let prepared = prepare(request, &host.entry.manifest.permissions)?;
@@ -497,6 +501,14 @@ impl Stream {
     }
 }
 
+/// The plugin's secrets, which its log lines hide.
+fn secret_values(plugin: &str) -> Vec<String> {
+    crate::secrets::values(&crate::secrets::service(plugin))
+}
+
+/// What a hidden secret becomes in a log line.
+const HIDDEN: &str = "•••";
+
 /// The plugin's log line about a request: what was asked for (the URL without its query), then
 /// what came of it.
 struct Line {
@@ -530,6 +542,19 @@ impl Line {
             url,
             via,
         }
+    }
+
+    /// The line without the plugin's secrets: each one in the URL (as it is, or percent-encoded)
+    /// becomes «•••». Secrets shorter than six characters stay: they would hide ordinary words.
+    fn hiding(mut self, secrets: &[String]) -> Self {
+        for secret in secrets.iter().filter(|secret| secret.chars().count() >= 6) {
+            self.url = self.url.replace(secret.as_str(), HIDDEN);
+            let encoded: String = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect();
+            if encoded != *secret {
+                self.url = self.url.replace(&encoded, HIDDEN);
+            }
+        }
+        self
     }
 
     /// "GET https://api.example.com/v1/issues → 200 · 135 ms · 4.2 KB"; a stream that ended
@@ -793,6 +818,23 @@ mod tests {
         let line = Line::of(&request);
         assert_eq!(line.method, "GET");
         assert_eq!(line.url, "https://api.example.com/v1/issues");
+    }
+
+    #[test]
+    fn log_lines_hide_the_plugins_secrets() {
+        let request = http::Request {
+            method: "POST".into(),
+            url: "https://api.telegram.org/bot7000000001:AAH-secret_token/getUpdates".into(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: None,
+            follow_redirects: true,
+        };
+        let secrets = ["7000000001:AAH-secret_token".to_string(), "abc".to_string()];
+        let line = Line::of(&request).hiding(&secrets);
+        assert_eq!(line.url, "https://api.telegram.org/bot•••/getUpdates");
+        let short = Line::of(&request).hiding(&["bot".to_string()]);
+        assert!(short.url.contains("/bot7000000001"), "short secrets stay");
     }
 
     #[test]

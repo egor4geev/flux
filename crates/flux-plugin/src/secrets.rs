@@ -56,6 +56,22 @@ pub fn delete_all(service: &str) -> Result<(), String> {
     Place::current().delete_all(service)
 }
 
+/// The values of every secret of the service: a plugin's log hides them
+/// ([`crate::host::http`]: a token can be in a request's URL).
+pub fn values(service: &str) -> Vec<String> {
+    if service == META {
+        return Vec::new();
+    }
+    Place::current()
+        .change(|secrets| {
+            secrets
+                .get(service)
+                .map(|accounts| accounts.values().cloned().collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
 /// The store's own entry, which no plugin's service can be (Flux 0.3.0 marked there when it moved
 /// the keychain's secrets). Never read, written or removed as a secret.
 const META: &str = "flux";

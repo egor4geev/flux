@@ -280,8 +280,8 @@ const SHELLS: &[&str] = &[
 ];
 
 /// What the permissions let a plugin do, in plain words: the project's files, the network, the
-/// local server, programs, terminals, Claude Code sessions, folders outside the project — a line
-/// each.
+/// local server, programs, terminals, Claude Code sessions, every Claude session for remote work
+/// and the tasks of other plugins (API 0.6), folders outside the project — a line each.
 fn permission_lines(permissions: &Permissions) -> Vec<PermissionLine> {
     let line = |icon, text: String, broad| PermissionLine { icon, text, broad };
     let mut lines = Vec::new();
@@ -349,6 +349,21 @@ fn permission_lines(permissions: &Permissions) -> Vec<PermissionLine> {
             true,
         ));
     }
+    if permissions.claude_remote {
+        lines.push(line(
+            IconName::Claude,
+            tr("Read and write in every Claude session and answer Claude's requests for you")
+                .to_string(),
+            true,
+        ));
+    }
+    if permissions.tasks {
+        lines.push(line(
+            IconName::Checklist,
+            tr("Read your tasks from other plugins and run their actions").to_string(),
+            false,
+        ));
+    }
     for folder in &permissions.folders {
         let path = folder.path.trim_end_matches('/');
         let whole = matches!(path, "~" | "") || folder.path == "/";
@@ -362,9 +377,10 @@ fn permission_lines(permissions: &Permissions) -> Vec<PermissionLine> {
     lines
 }
 
-/// What a plugin may do, in plain words: its permissions, and what API 0.5 adds beyond them — its
-/// own programs, which Flux downloads and runs (a native program has the user's rights: drawn in
-/// the warning tone), its service, its tools for Claude. `translate` gives the plugin's strings
+/// What a plugin may do, in plain words: its permissions, and what API 0.5 and 0.6 add beyond
+/// them — its own programs, which Flux downloads and runs (a native program has the user's rights:
+/// drawn in the warning tone), its service, the tasks it gives, its actions in the pult, its tools
+/// for Claude. `translate` gives the plugin's strings
 /// (the tools' titles) in the interface language.
 fn manifest_lines(manifest: &Manifest, translate: &dyn Fn(&str) -> String) -> Vec<PermissionLine> {
     let mut lines = permission_lines(&manifest.permissions);
@@ -392,6 +408,27 @@ fn manifest_lines(manifest: &Manifest, translate: &dyn Fn(&str) -> String) -> Ve
         lines.push(PermissionLine {
             icon: IconName::Clock,
             text: tr("Keep working in the background while Flux is open").to_string(),
+            broad: false,
+        });
+    }
+    if manifest.task_source {
+        lines.push(PermissionLine {
+            icon: IconName::Checklist,
+            text: tr("Give your tasks to other plugins that ask, and run its actions on them")
+                .to_string(),
+            broad: false,
+        });
+    }
+    if !manifest.claude_actions.is_empty() {
+        let titles = manifest
+            .claude_actions
+            .iter()
+            .map(|action| translate(&action.title))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(PermissionLine {
+            icon: IconName::Claude,
+            text: trf("Add to the sessions in the Claude console: {0}", &[&titles]),
             broad: false,
         });
     }

@@ -1,9 +1,10 @@
 //! Claude Code sessions the plugin opens with its context (API 0.3, the manifest's `claude`
 //! permission): a task to discuss — attached, the field takes the keyboard — or to plan — plan
-//! mode, the request sent at once.
+//! mode, the request sent at once. `start` gives the session's id (API 0.6): the CLI's, the one
+//! remote work names it by (a task's action run from another plugin answers with it).
 //!
 //! ```ignore
-//! claude::session()
+//! let session = claude::session()
 //!     .title(&format!("{key}: {summary}"))
 //!     .attach(&key, &task_markdown)
 //!     .prompt(&tr("Study the task and the code, and propose a plan"))
@@ -63,9 +64,9 @@ impl Session {
         self
     }
 
-    /// Opens the session; fails when Claude Code is turned off or not installed, or the
-    /// manifest lacks `claude = true`.
-    pub fn start(&self) -> Result<(), String> {
+    /// Opens the session: its id (the CLI's session id); fails when Claude Code is turned off or
+    /// not installed, or the manifest lacks `claude = true`.
+    pub fn start(&self) -> Result<String, String> {
         raw::new_session(&self.0)
     }
 

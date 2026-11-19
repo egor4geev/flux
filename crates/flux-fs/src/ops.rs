@@ -163,7 +163,26 @@ pub fn copy_into(path: &Path, dir: &Path) -> io::Result<PathBuf> {
 /// Moves to the Trash. On macOS this uses `NSFileManager trashItemAtURL`: no permission prompt for
 /// controlling Finder and no sound (but "Put Back" in Finder may be unavailable; the file can be
 /// dragged out of the Trash with the mouse). A symlink itself is trashed, not what it points to.
+///
+/// On Windows the move runs on a thread of its own: the `trash` crate starts COM single-threaded on
+/// the thread it is called from and panics when that thread already runs COM multithreaded — a
+/// pool thread the notifications or the media used before (issue #21). A new thread has no COM
+/// yet; a panic there is an error, not a crash.
 pub fn trash(paths: &[PathBuf]) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let paths = paths.to_vec();
+        std::thread::Builder::new()
+            .name("trash".into())
+            .spawn(move || trash_here(&paths))?
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("Cannot move to Trash")))
+    }
+    #[cfg(not(windows))]
+    trash_here(paths)
+}
+
+fn trash_here(paths: &[PathBuf]) -> io::Result<()> {
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut context = trash::TrashContext::default();
     #[cfg(target_os = "macos")]
@@ -930,6 +949,22 @@ mod tests {
             root.join("flux-trash-dir"),
         ])
         .unwrap();
+        assert!(names(root).is_empty());
+    }
+
+    /// Issue #21: a thread that already runs COM multithreaded (a pool thread the notifications or
+    /// the media used) — the move still works (the CI runner's Recycle Bin).
+    #[cfg(windows)]
+    #[test]
+    fn trash_works_from_a_thread_that_runs_com_multithreaded() {
+        use windows_sys::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+        // SAFETY: COM for this test's thread, in the mode a pool thread may already have.
+        let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32) };
+        assert!(hr >= 0, "COM multithreaded: {hr:#x}");
+        let dir = temp();
+        let root = dir.path();
+        write(&root.join("flux-trash-test.txt"), "x");
+        trash(&[root.join("flux-trash-test.txt")]).unwrap();
         assert!(names(root).is_empty());
     }
 }

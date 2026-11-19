@@ -327,6 +327,11 @@ impl ClaudeStore {
         self.plugins = Some(plugins);
     }
 
+    /// The window's plugins (the hub of remote work names the window by their store's id).
+    pub(crate) fn plugins(&self) -> Option<&WeakEntity<PluginStore>> {
+        self.plugins.as_ref()
+    }
+
     pub fn is_ready(&self) -> bool {
         matches!(self.cli, CliState::Ready { .. })
     }
@@ -881,6 +886,56 @@ impl ClaudeStore {
         cx.emit(ClaudeStoreEvent::Changed);
         cx.notify();
         true
+    }
+
+    /// A session for remote work (API 0.6, [`crate::claude_hub`]): a new one in `mode`, or a
+    /// saved one resumed (an open one is returned as it is). Its chat joins the editor's tabs
+    /// without coming into sight — the user's tab and focus stay. `None` while `claude` isn't
+    /// ready.
+    pub(crate) fn remote_session(
+        &mut self,
+        saved: Option<&SavedSession>,
+        mode: Option<flux_claude::PermissionMode>,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ClaudeSession>> {
+        let session = match saved {
+            Some(saved) => {
+                if let Some(open) = self.open_session(&saved.id, cx) {
+                    return Some(open);
+                }
+                self.resumed_session(saved, cx)?
+            }
+            None => {
+                let CliState::Ready { cli, .. } = &self.cli else {
+                    return None;
+                };
+                let cli = cli.clone();
+                let mut options = self.launch_options(cx);
+                if mode.is_some() {
+                    options.permission_mode = mode;
+                }
+                let plugins = self.plugins.clone();
+                cx.new(|cx| ClaudeSession::new(cli, options, plugins, cx))
+            }
+        };
+        self.track(session.clone(), cx);
+        cx.emit(ClaudeStoreEvent::SessionRestored {
+            session: session.clone(),
+            place: SessionPlace::Editor,
+            active: false,
+        });
+        cx.emit(ClaudeStoreEvent::Changed);
+        cx.notify();
+        Some(session)
+    }
+
+    /// The live session with this CLI id — a new one's too, before its first turn
+    /// ([`ClaudeSession::cli_id`]).
+    pub(crate) fn live_session(&self, id: &str, cx: &App) -> Option<Entity<ClaudeSession>> {
+        self.sessions
+            .iter()
+            .find(|session| session.read(cx).cli_id() == Some(id))
+            .cloned()
     }
 
     /// The open session with this id.

@@ -80,7 +80,8 @@ pub fn run(command: &str) {
                 .prompt("Plan it")
                 .send()
                 .plan_mode()
-                .start(),
+                .start()
+                .map(drop),
         ),
         "contexts-switch" => report(
             "switch",
@@ -113,7 +114,11 @@ pub fn on_event(event: &Event) -> bool {
             let text = match values {
                 Some(values) => {
                     let values = Values::from(values.clone());
-                    format!("branch={} name={}", values.on("branch"), values.text("name"))
+                    format!(
+                        "branch={} name={}",
+                        values.on("branch"),
+                        values.text("name")
+                    )
                 }
                 None => "cancelled".into(),
             };

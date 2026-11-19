@@ -1,0 +1,2620 @@
+// The API between Flux and its plugins, version 0.6. A plugin is a WebAssembly component of the
+// `plugin` world (target `wasm32-wasip2`); Flux is the host. Every function a plugin imports is
+// answered by Flux; the functions it exports are called by Flux on the plugin's own thread, one
+// call at a time. Documentation: docs/plugins.md.
+//
+// What a plugin may do beyond its own folder, its notifications, questions and windows is listed
+// in the manifest's `[permissions]`: the project's files, the network, a server on this Mac,
+// programs, terminals, folders outside the project, Claude Code sessions, remote work with every
+// Claude session, the tasks other plugins give. The install question
+// shows them to the user; a call they don't allow fails with an error that names the missing
+// permission.
+//
+// 0.5 adds: the plugin's service — one instance for the whole app next to the one in each window,
+// and messages between them (`service`); the plugin's own programs, downloaded by Flux
+// (`process.helper`); pictures, avatars, QR codes and a conversation fed by changes (`ui`) —
+// with voice messages, videos, animated stickers and a panel of emoji, stickers and GIFs by its
+// field, played by Flux; tabs of one editor window (`ui.open-tab`) and windows on the left; the
+// system's file dialog (`dialogs.pick-files`); tools for Claude (`tools`).
+//
+// 0.6 adds: Claude for remote work — every Claude session of Flux, what happens in it and what
+// the user could do with it at the computer, for a plugin that brings the sessions to the user
+// elsewhere (`claude-remote`); the computer's screen lock, sleep and power, and keeping it awake;
+// actions of a plugin at a session in the pult (`[[claude-actions]]`); tasks between plugins — a
+// tracker gives them and runs its Claude actions on them, a bot asks (`tasks`); the id of a session
+// `claude.new-session` opens; Git's new branch and checkout that ask nothing (`git`).
+//
+// Plugins built for 0.2, 0.3 and 0.5 (and 0.4, which kept the 0.3 interfaces) keep working: Flux
+// answers their calls (`wit/v0.2`, `wit/v0.3`, `wit/v0.5`) with the same code, and doesn't send
+// them what their version doesn't know.
+
+package flux:plugin@0.6.0;
+
+/// Types shared by the interfaces.
+interface types {
+    /// A place in a document: a zero-based line and a zero-based column in characters (Unicode
+    /// scalar values), as Flux counts them.
+    record position {
+        line: u32,
+        column: u32,
+    }
+
+    /// A span of a document. A selection keeps its direction: the cursor is at `end`, which may
+    /// come before `start`.
+    record range {
+        start: position,
+        end: position,
+    }
+
+    /// An open document.
+    record editor-info {
+        /// Stable while the document is open.
+        id: u64,
+        /// The absolute path; none for a new unsaved document.
+        path: option<string>,
+        /// The language as the status bar shows it: "Rust", "Plain Text".
+        language: string,
+        /// Has unsaved changes.
+        modified: bool,
+    }
+
+    /// Where a command was run from.
+    enum command-source {
+        /// The command palette.
+        palette,
+        /// The command's keys.
+        keys,
+        /// The editor's context menu.
+        editor-menu,
+        /// The context menu of the project tree.
+        tree-menu,
+        /// The context menu of a tab.
+        tab-menu,
+        /// An action of one of the plugin's notifications.
+        notification,
+        /// One of the plugin's status bar items.
+        status-bar,
+        /// A button of the plugin's settings page (`type = "button"`).
+        settings,
+    }
+
+    /// What a command acts on, as it was when the command was run.
+    record command-context {
+        source: command-source,
+        /// The document: the active one (the editor's menu, the palette, keys), or the tab's (a
+        /// tab's menu); none when it isn't a document.
+        editor: option<editor-info>,
+        /// The document's selections, the primary one first; an empty range is a cursor.
+        selections: list<range>,
+        /// The files and folders the command acts on, absolute: the rows selected in the tree, the
+        /// tab's file, the document's file.
+        paths: list<string>,
+        /// What the notification's action or the settings button carries (its `argument`): which
+        /// task, which meeting.
+        argument: option<string>,
+    }
+}
+
+/// The plugin's log: Settings → Plugins → the plugin → Log, and a file on disk. What the plugin
+/// prints to stdout and stderr goes there too.
+interface log {
+    enum level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    write: func(level: level, message: string);
+}
+
+/// The interface language and the plugin's translations: `locales/<language>.toml` in the
+/// plugin's folder, English text = translation (as Flux's own tables).
+interface i18n {
+    /// The interface language: "en", "ru".
+    language: func() -> string;
+    /// The text in the interface language; the text itself when there is no translation.
+    translate: func(text: string) -> string;
+}
+
+/// The plugin's commands, declared in the manifest (`[[commands]]`). They run from the command
+/// palette, their keys, the context menus (`[[menus]]`), notification actions and status bar
+/// items, and come to `run-command`.
+interface commands {
+    /// Grays a command out in the palette and the menus (it stops running) or brings it back.
+    set-enabled: func(command: string, enabled: bool);
+}
+
+/// Notifications: the notification center (the Notifications window and the cards), in the
+/// plugin's group of Settings → Notifications.
+interface notifications {
+    enum notification-kind {
+        info,
+        success,
+        warning,
+        error,
+    }
+
+    /// A button of a notification: runs one of the plugin's commands.
+    record action {
+        label: string,
+        command: string,
+        /// Comes to `run-command` as the context's `argument`: which of several notifications the
+        /// button belongs to ("TRACK-142").
+        argument: option<string>,
+    }
+
+    record notification {
+        kind: notification-kind,
+        title: string,
+        body: option<string>,
+        actions: list<action>,
+        /// The card stays until closed (errors always do).
+        sticky: bool,
+    }
+
+    variant progress {
+        indeterminate,
+        /// 0.0–1.0.
+        fraction(f32),
+    }
+
+    /// Shows a notification; the id updates it later.
+    notify: func(notification: notification) -> u64;
+    /// Replaces the notification's content.
+    update: func(id: u64, notification: notification);
+    /// A task in progress: the card stays while there is progress; none — the task is over.
+    set-progress: func(id: u64, value: option<progress>);
+    /// The actions stop working (what they offered is over); the entry stays in the journal.
+    expire: func(id: u64);
+    /// Removes the notification from the journal and the corner.
+    remove: func(id: u64);
+}
+
+/// Questions in Flux dialogs. A question returns an id at once; the answer comes later as the
+/// `dialog-answered` or `text-answered` event.
+interface dialogs {
+    enum dialog-level {
+        info,
+        warning,
+        critical,
+    }
+
+    enum button-role {
+        /// The default (↵), on the right.
+        primary,
+        normal,
+        /// Destructive: never the default; ⌘D.
+        danger,
+        /// Esc.
+        cancel,
+    }
+
+    record dialog-button {
+        label: string,
+        role: button-role,
+    }
+
+    record question {
+        level: dialog-level,
+        title: string,
+        message: option<string>,
+        /// Monospace details under a disclosure, with Copy: command output, a stack trace.
+        details: option<string>,
+        /// Without buttons the dialog gets "OK".
+        buttons: list<dialog-button>,
+    }
+
+    /// A dialog with a text field.
+    record text-question {
+        title: string,
+        message: option<string>,
+        /// The initial text, selected.
+        text: string,
+        placeholder: option<string>,
+        /// The confirm button's label: "Create", "Rename".
+        confirm: string,
+    }
+
+    /// An option of a `choice` field.
+    record choice-option {
+        /// What the answer carries.
+        value: string,
+        title: string,
+    }
+
+    /// What a field of a form is.
+    variant field-kind {
+        /// A line of text: the initial text.
+        text(string),
+        /// Several lines (↵ — a new line, ⌘↵ — confirm): the initial text.
+        multiline(string),
+        /// One of the options, a dropdown; the value of the chosen one (none — the first).
+        choice(tuple<list<choice-option>, option<string>>),
+        /// A checkbox: on or off.
+        toggle(bool),
+        /// Text between the fields, not a field: a hint, a warning.
+        note(string),
+    }
+
+    record form-field {
+        /// The answer names the field by it.
+        key: string,
+        /// The label: on the left of a field, the text of a checkbox.
+        label: string,
+        kind: field-kind,
+        placeholder: option<string>,
+        /// The code font (a branch's name, a query).
+        code: bool,
+        /// The key of a `toggle` field: this one is enabled only while it is on ("Create branch" →
+        /// the branch's name).
+        enabled-by: option<string>,
+    }
+
+    /// A dialog with several fields: the Open Task dialog of JetBrains, a work log entry.
+    record form {
+        level: dialog-level,
+        title: string,
+        message: option<string>,
+        fields: list<form-field>,
+        /// The confirm button's label: "Start", "Log Time".
+        confirm: string,
+        /// A problem of the previous answer, in the error tone above the buttons: the plugin asks
+        /// again with the values the user gave and says what to fix.
+        error: option<string>,
+    }
+
+    /// What the system's file dialog asks for (0.5).
+    record file-pick {
+        /// The dialog's button: "Attach", "Choose"; none — the system's.
+        prompt: option<string>,
+        /// Several at once.
+        multiple: bool,
+        /// Folders instead of files.
+        directories: bool,
+    }
+
+    ask: func(question: question) -> u64;
+    ask-text: func(question: text-question) -> u64;
+    /// The answer comes as `form-answered`: every field's value by its key (the text, the chosen
+    /// option's value, "true" / "false"), or none — cancelled.
+    ask-form: func(form: form) -> u64;
+    /// The system's dialog to choose files or folders (0.5); the absolute paths come as
+    /// `files-picked`. The plugin passes them on (to its program, to a web service); it reads them
+    /// through the file system only where its permissions open the folder.
+    pick-files: func(options: file-pick) -> u64;
+}
+
+/// The window's documents.
+interface editors {
+    use types.{range, editor-info};
+
+    /// A span replaced with a text.
+    record text-edit {
+        range: range,
+        text: string,
+    }
+
+    /// The active tab's document; none when the active tab is not a document (a terminal, a log).
+    active: func() -> option<editor-info>;
+    /// The open documents, in tab order.
+    %list: func() -> list<editor-info>;
+    /// The document's text; none when it is closed.
+    text: func(editor: u64) -> option<string>;
+    /// The selections, the primary one first; an empty range is a cursor.
+    selections: func(editor: u64) -> list<range>;
+    /// Replaces the selections (the first one becomes primary) and scrolls to the primary one.
+    set-selections: func(editor: u64, selections: list<range>) -> result<_, string>;
+    /// Applies the edits as one undo step. The ranges are in the current text and don't overlap.
+    edit: func(editor: u64, edits: list<text-edit>) -> result<_, string>;
+    /// Opens a file in a tab (or goes to its tab) and selects the span, if given, in the middle
+    /// of the view. Returns the document.
+    open: func(path: string, selection: option<range>) -> result<u64, string>;
+    /// Starts saving the document; the `editor-saved` event says when it is on disk.
+    save: func(editor: u64) -> result<_, string>;
+    /// Closes the document's tab. A document with unsaved changes stays open (the changes are
+    /// the user's to decide about): the error says so.
+    close: func(editor: u64) -> result<_, string>;
+}
+
+/// The window's project.
+interface project {
+    /// A search query, as in Find in Files.
+    record query {
+        text: string,
+        case-sensitive: bool,
+        whole-word: bool,
+        regex: bool,
+    }
+
+    /// A line with matches.
+    record line-match {
+        /// Zero-based.
+        line: u32,
+        /// The line's text; a long line is a window around the first match.
+        text: string,
+        /// The column in characters where `text` starts in the real line.
+        column-offset: u32,
+        /// The matches: spans of columns in characters within `text`, [start, end).
+        ranges: list<tuple<u32, u32>>,
+    }
+
+    record file-matches {
+        /// Relative to the project root.
+        path: string,
+        lines: list<line-match>,
+    }
+
+    record search-result {
+        files: list<file-matches>,
+        /// Stopped at `max-matches`.
+        truncated: bool,
+    }
+
+    /// The project root (absolute); none in a window without a project.
+    root: func() -> option<string>;
+    /// Searches the project's files by the rules of Find in Files (.gitignore, no binary or huge
+    /// files). Blocks the plugin, not Flux. Needs the `project` permission.
+    search: func(query: query, max-matches: u32) -> result<search-result, string>;
+}
+
+/// The plugin's own data, kept between launches: a small key-value store and a folder.
+interface storage {
+    get: func(key: string) -> option<string>;
+    /// None removes the key.
+    set: func(key: string, value: option<string>);
+    /// The plugin's folder (absolute), readable and writable through the file system.
+    data-dir: func() -> string;
+}
+
+/// The plugin's settings, declared in the manifest (`[[settings]]`) and edited in Settings → the
+/// plugin. A change comes as the `settings-changed` event.
+///
+/// A `secret` setting (a token, a password) is kept with the plugin's secrets, not with the other
+/// settings: the plugin reads it with `secrets.get(<key>)`. A `button` runs one of the plugin's
+/// commands; a `status` is a line the plugin writes ("Signed in as …").
+interface settings {
+    use ui.{tone};
+
+    /// A `status` line of the settings page.
+    record setting-status {
+        text: string,
+        tone: tone,
+        /// Work is in progress: a spinner before the text ("Checking…").
+        busy: bool,
+    }
+
+    /// The value as JSON (`true`, `"text"`, `["a", "b"]`): the user's, or the manifest's default.
+    get: func(key: string) -> option<string>;
+    /// Writes a value as JSON — none: back to the default; the page shows it at once. The plugin
+    /// doesn't get `settings-changed` for its own write.
+    set: func(key: string, value: option<string>) -> result<_, string>;
+    /// Writes a `status` line; none — the manifest's text again.
+    set-status: func(key: string, status: option<setting-status>);
+}
+
+/// Status bar items declared in the manifest (`[[status-items]]`).
+interface status-bar {
+    record status-item {
+        text: string,
+        tooltip: option<string>,
+        /// The plugin's command a click runs.
+        command: option<string>,
+    }
+
+    /// Shows or updates the item; none hides it.
+    set: func(id: string, item: option<status-item>);
+}
+
+/// Tool windows declared in the manifest (`[[tool-windows]]`): the plugin describes their content
+/// with elements, and Flux draws them in its design system.
+///
+/// Icons are named: a built-in Flux icon ("refresh", "expand-all"), the icon of a file type by a
+/// file name ("file:main.rs"), or an SVG in the plugin's folder ("icons/todo.svg").
+///
+/// Pictures (0.5) are files the plugin names by absolute path: PNG, JPEG, WebP, GIF in its own
+/// folders — where it is installed, its data folder (`storage.data-dir`), where its program keeps
+/// downloads under it. Flux decodes them off the window's thread at the size they are shown and
+/// keeps the decoded ones within a memory budget; a picture that isn't there yet shows its
+/// placeholder.
+///
+/// A window declared with `tabs = true` (`location = "editor"`, 0.5) opens a tab per key: the tab
+/// is the window `<window>/<key>` ("chat/1234") for `set-view`, `set-title`, `set-badge`, `hide`
+/// and in the events.
+///
+/// Two more places of a window (0.5):
+/// - `location = "dialog"` — a dialog in the middle of the Flux window, over everything (the
+///   settings too): its title in the header, the plugin's view under it, as tall as the view (up
+///   to most of the window, then it scrolls). `show` opens it (and focuses its first text field),
+///   `hide` closes it; Esc and the header's × close it too — `tool-window-hidden` says so. A
+///   sign-in, a few steps of a setup.
+/// - `location = "settings"` — a block of the plugin's page in Settings, above the manifest's
+///   settings: its title as the heading, the view at its own height (no scrolling of its own).
+///   The instance of the Flux window the settings are open in draws it: `set-view` before the
+///   page is opened (at `activate`, on a change) — `tool-window-shown` says when it is on screen.
+///   A list the plugin keeps itself: the accounts with their buttons.
+interface ui {
+    /// The role of a text's color.
+    enum tone {
+        normal,
+        muted,
+        dim,
+        accent,
+        success,
+        warning,
+        error,
+    }
+
+    /// A piece of text in one style.
+    record span {
+        text: string,
+        tone: tone,
+        bold: bool,
+        /// The code font.
+        code: bool,
+        /// Marked as a match, like search results.
+        highlight: bool,
+    }
+
+    record button-spec {
+        label: option<string>,
+        icon: option<string>,
+        tooltip: option<string>,
+        /// The accent button.
+        primary: bool,
+        enabled: bool,
+        /// Work is in progress after its press (0.5): a spinner in place of the icon, the label
+        /// stays, the button doesn't press — a sign-in's Next while the server answers.
+        busy: bool,
+        /// A count after the label (0.5), in a small pill: the unread messages of an account; none
+        /// — no pill.
+        badge: option<string>,
+    }
+
+    record text-field-spec {
+        text: string,
+        placeholder: option<string>,
+        code: bool,
+        /// Several lines, growing with the text up to a limit: ↵ — a new line, ⌘↵ — `submitted`.
+        multiline: bool,
+        /// A password (0.5): the text shows as dots and isn't copied; a single line.
+        secret: bool,
+    }
+
+    /// A short colored label: a status, a priority, a count.
+    record badge-spec {
+        text: string,
+        tone: tone,
+        /// A ▾ after the text, and a click comes as `clicked`: a status that offers its transitions.
+        menu: bool,
+    }
+
+    enum toggle-style {
+        switch,
+        checkbox,
+    }
+
+    record toggle-spec {
+        label: string,
+        on: bool,
+        style: toggle-style,
+    }
+
+    /// A row of a tree (or of a flat list: rows without parents).
+    record tree-row {
+        /// Stable between views: the selection, the expansion and the events refer to it.
+        key: string,
+        /// The index of the parent row in `rows`; the parent comes first. None — the top level.
+        parent: option<u32>,
+        icon: option<string>,
+        label: list<span>,
+        /// Dim text after the label: a path, a line number. In a narrow row it gives way first.
+        detail: option<string>,
+        /// A count on the right.
+        badge: option<string>,
+        /// Expanded when first shown; the user's choice wins afterwards.
+        expanded: bool,
+        /// A second part of the row (0.3): in a list, after the label; on a card, under it — up to
+        /// two lines (a task's title under its key).
+        subtitle: option<list<span>>,
+        /// Small colored labels (0.3): on a card, a line of them under the subtitle; in a list,
+        /// after the label — tags, a deadline, story points.
+        tags: list<badge-spec>,
+        /// The row's buttons (0.3): on a card, at its foot on the right; in a list, at the row's
+        /// end while it is hovered or selected — in two-line rows over the row's end, taking no
+        /// room from the label. A press comes as `row-action` and neither selects nor opens the
+        /// row; a picker anchored to `element((window, "<tree>/<row key>"))` opens under the row.
+        actions: list<row-action>,
+        /// A person's or a chat's picture in place of the icon (0.5).
+        avatar: option<avatar-spec>,
+        /// The badge's color (0.5): `accent` — unread, `muted` — muted; none — as before.
+        badge-tone: option<tone>,
+        /// Small named icons right after the label (0.5): pinned, muted, Claude may read it.
+        label-icons: list<string>,
+        /// An accent "@" in a small circle before the badge (0.5): a chat where the user is
+        /// mentioned in a message not read yet. In two-line rows it goes on the second line, next
+        /// to the badge.
+        mention: bool,
+    }
+
+    /// The shape of a picture (0.5).
+    enum image-shape {
+        /// As it is, with the small radius of the design system.
+        rounded,
+        /// Square corners.
+        square,
+        /// A circle: an avatar, a round video message (cut from the picture's middle; alone in a
+        /// message it goes without the bubble, as a sticker).
+        circle,
+    }
+
+    /// A picture (0.5): a file, and what stands for it until the file is there.
+    record image-spec {
+        /// The picture to show, absolute; none — not there yet: `preview` blurred, or a dim box.
+        path: option<string>,
+        /// A larger one for the viewer, absolute. None — not there yet: a click on the picture
+        /// opens the viewer at once on what is there (`path`, else `preview` blurred) with a
+        /// spinner and comes as `part-clicked` (the plugin downloads it); the message put again
+        /// with it swaps the open viewer to it.
+        full: option<string>,
+        /// A tiny picture shown blurred until `path` is there: the bytes of a JPEG of a few dozen
+        /// pixels (up to 4 KB), carried right in the message.
+        preview: option<list<u8>>,
+        /// The picture's size in pixels: the room it takes before it loads. 0 — unknown: the
+        /// picture's own once it loads.
+        width: u32,
+        height: u32,
+        /// Being downloaded: 0.0–1.0 over the placeholder; none — not.
+        progress: option<f32>,
+        shape: image-shape,
+        /// A short text in a pill at the picture's top-left corner (0.5) — at the bottom of a
+        /// round one: a video's length "0:42", "GIF".
+        label: option<string>,
+        /// A ▶ in the middle (0.5): the picture stands for a video, a GIF, a round video message;
+        /// a click comes as `part-clicked` (the plugin plays or opens it).
+        play: bool,
+        /// An animation over the picture (0.5, part 4): a sticker's, an animated emoji's. The
+        /// picture stands for it until its first frame is ready, and in its place where it
+        /// doesn't play.
+        animation: option<animation-spec>,
+    }
+
+    /// An animation of frames (0.5, part 4): a sticker's, an animated emoji's, rendered once into
+    /// a file of Flux's frame format — FXA, `flux-media`'s `fxa` module: "FXA1", the size, the
+    /// frames' count and length, then each frame's BGRA pixels (straight alpha) compressed with
+    /// LZ4. Flux plays it only while it is on screen in the active window — a few at a time, the
+    /// others stay on their first frame — reading a frame ahead off the window's thread; in
+    /// memory only the frames in sight.
+    record animation-spec {
+        /// The FXA file, absolute (in the plugin's folders).
+        path: string,
+        /// Plays again from the start when it ends; false — once each time it comes into sight,
+        /// then stays on its last frame.
+        looped: bool,
+    }
+
+    /// A voice message (0.5, part 4): Flux plays it — ▶ / ⏸, the waveform (a click or a drag on it
+    /// seeks), the speed (1×, 1.5×, 2×, pitch kept); one sound at a time in Flux. While it plays —
+    /// a bar over the feed and a line in the status bar; when it ends, the next voice message
+    /// below in the feed plays.
+    record voice-spec {
+        /// The OGG/Opus file, absolute; none — not downloaded: ▶ comes as `part-clicked` (the
+        /// plugin downloads it; a click while `progress` is there cancels the download), and Flux
+        /// plays it when the message is put again with the file, if ▶ was the last thing pressed.
+        path: option<string>,
+        /// In seconds.
+        duration: u32,
+        /// The loudness over time, values 0–31, any count (Telegram's waveform: 5-bit samples);
+        /// empty — an even line.
+        waveform: list<u8>,
+        /// Being downloaded: 0.0–1.0, a ring around ▶; none — not.
+        progress: option<f32>,
+        /// Not listened to yet (someone else's message): an accent dot after the length. The
+        /// first play comes as `media-played`.
+        unheard: bool,
+    }
+
+    /// What a video is (0.5, part 4).
+    enum video-kind {
+        /// A video: ▶ on the poster; a click opens Flux's media viewer, where it plays with sound.
+        video,
+        /// A GIF (Telegram's are MP4 without sound): plays by itself, looped, without sound,
+        /// while on screen; a click opens it in the viewer.
+        gif,
+        /// A round video message: plays by itself without sound, looped, while on screen; a
+        /// click plays it with sound from the start, larger, with a ring of progress (a click
+        /// again pauses it; one sound at a time).
+        round,
+    }
+
+    /// A video of a message (0.5, part 4): Flux plays it with the system's (hardware) decoder,
+    /// only while it is on screen in the active window — a video off screen is paused and its
+    /// decoder let go.
+    record video-spec {
+        kind: video-kind,
+        /// The picture standing for it until it plays: the thumbnail once downloaded, else the
+        /// blurred `preview`; its size is the video's room (a round one's — the circle's side).
+        /// `progress` is the video file's download. The pill (the length, "GIF") and ▶ are
+        /// Flux's to draw: leave `label` and `play` empty.
+        poster: image-spec,
+        /// The MP4 file (H.264, HEVC), absolute; none — not downloaded: a click comes as
+        /// `part-clicked` (the plugin downloads it; again while `progress` is there — cancels).
+        /// A video's click opens the viewer at once on the poster with the progress; it plays
+        /// there when the message is put again with the file.
+        path: option<string>,
+        /// In seconds.
+        duration: u32,
+        /// GIF and round: plays by itself while on screen (the plugin's setting); false — ▶ on
+        /// the poster, a click plays it.
+        autoplay: bool,
+        /// A round message not watched yet (someone else's): an accent dot. Its first play with
+        /// sound comes as `media-played`.
+        unheard: bool,
+    }
+
+    /// A person or a chat (0.5): a picture, or the initials on a color.
+    record avatar-spec {
+        /// The picture, absolute; none — the initials.
+        image: option<string>,
+        /// One or two letters: "АС".
+        initials: string,
+        /// One of the design system's seven avatar colors (0–6; a larger number wraps): the same
+        /// for the same person.
+        color: u8,
+    }
+
+    /// A property of a `properties` list (0.3): a label and its value — a task's field.
+    record property {
+        /// Names it in `activated` and in a picker's anchor: `element((window, "<list>/<id>"))`
+        /// opens the picker under this property.
+        id: string,
+        label: string,
+        /// The value; empty — a dim dash.
+        value: list<span>,
+        /// The value can be changed: a ▾ after it, the row answers the mouse and a click comes as
+        /// `activated(id)` (the plugin opens a picker or a form).
+        editable: bool,
+    }
+
+    /// A button of a tree's row.
+    record row-action {
+        /// Names it in `row-action`.
+        id: string,
+        label: option<string>,
+        icon: option<string>,
+        tooltip: option<string>,
+        /// The accent button.
+        primary: bool,
+    }
+
+    record tree-spec {
+        rows: list<tree-row>,
+        /// Shown in the middle when there are no rows.
+        empty-text: option<string>,
+        /// The rows as cards (0.3), as on a board: the icon, the label and the badge on the
+        /// first line, the subtitle under them (two lines at most), then the detail. Keys,
+        /// selection and events are those of a list.
+        cards: bool,
+        /// Rows of two lines (0.5), as a list of chats: the avatar (or the icon) on the left; the
+        /// label and the detail (a time) on the first line, the subtitle (the last message) and
+        /// the badge on the second.
+        two-line: bool,
+    }
+
+    /// A piece of a message's text in one style (0.5).
+    record rich-span {
+        text: string,
+        bold: bool,
+        italic: bool,
+        underline: bool,
+        strikethrough: bool,
+        /// The code font.
+        code: bool,
+        /// Hidden under a veil until clicked.
+        spoiler: bool,
+        /// Marked as a match: a search in the chat.
+        highlight: bool,
+        /// A link: `http`, `https` and `mailto` open in the browser; any other (a mention, the
+        /// plugin's own) comes as `link-clicked` — every one with the conversation's `own-links`.
+        /// A web link whose text isn't its address (a text link) shows the address in a tooltip
+        /// on hover.
+        link: option<string>,
+    }
+
+    /// A code block of a message (0.5), highlighted as the language's files are.
+    record code-block {
+        text: string,
+        /// "rust", "python"; none — plain.
+        language: option<string>,
+    }
+
+    /// A file of a message (0.5).
+    record file-spec {
+        name: string,
+        /// In bytes.
+        size: u64,
+        /// The file on disk, absolute: a click opens it with the system's app, and the menu offers
+        /// Show in Finder (Explorer) and Save As…; none — not downloaded: a click comes as
+        /// `part-clicked` (the plugin downloads it).
+        path: option<string>,
+        /// Being downloaded or sent: 0.0–1.0.
+        progress: option<f32>,
+    }
+
+    /// A preview of a link of a message (0.5): the page's site, title, text and picture.
+    record link-preview {
+        url: string,
+        site: option<string>,
+        title: option<string>,
+        description: option<string>,
+        image: option<image-spec>,
+    }
+
+    /// What Flux shows as a dim line with an icon (0.5): what it can't show (yet) — a voice
+    /// message, a poll, a location.
+    record placeholder-spec {
+        /// A named icon.
+        icon: option<string>,
+        /// "Voice message · 0:42".
+        text: string,
+    }
+
+    /// An option of a poll (0.5, part 5).
+    record poll-option {
+        text: list<rich-span>,
+        /// Its share of the votes, 0–100: shown once the poll is `answered`.
+        percent: u8,
+        /// The user chose it.
+        chosen: bool,
+        /// A quiz's right answer, once answered or closed: marked right; the user's wrong choice —
+        /// marked wrong.
+        correct: bool,
+    }
+
+    /// A poll (0.5, part 5): the question and its options — to vote while not answered (one, or
+    /// several and Vote when `multiple`), their shares after.
+    record poll-spec {
+        question: list<rich-span>,
+        /// The dim line under the question: "Anonymous poll", "Quiz", "Final results".
+        kind: string,
+        options: list<poll-option>,
+        /// Several options may be chosen: checkboxes and a Vote button.
+        multiple: bool,
+        /// The results show: the user voted, or the poll is closed.
+        answered: bool,
+        /// Closed: no voting.
+        closed: bool,
+        /// The line under the options: "12 votes".
+        footer: string,
+        /// A quiz's explanation, shown after answering behind a light bulb.
+        explanation: option<list<rich-span>>,
+    }
+
+    /// A part of a message (0.5), top to bottom; pictures in a row make a grid (an album).
+    variant message-part {
+        text(list<rich-span>),
+        code(code-block),
+        /// A quote within the text.
+        quote(list<rich-span>),
+        /// A photo; a video's or a GIF's preview.
+        image(image-spec),
+        /// A sticker: a picture without the bubble, the time under it; an animated one has its
+        /// `animation`.
+        sticker(image-spec),
+        /// A voice message (0.5, part 4): ▶, the waveform, the length, the speed.
+        voice(voice-spec),
+        /// A video, a GIF, a round video message (0.5, part 4); a round one alone goes without
+        /// the bubble, as a sticker.
+        video(video-spec),
+        file(file-spec),
+        link(link-preview),
+        placeholder(placeholder-spec),
+        /// A line of the chat itself, in the middle without a bubble: "Anna joined the group".
+        notice(list<rich-span>),
+        /// A poll (0.5, part 5): while it isn't `answered`, a click on an option votes — or, when
+        /// `multiple`, checks it, and Vote under the options sends the checked ones; a vote comes
+        /// as `poll-voted`. Answered: each option with its share and a bar of it; a quiz's
+        /// explanation behind 💡.
+        poll(poll-spec),
+    }
+
+    /// Who wrote a message (0.5).
+    record message-author {
+        name: string,
+        /// The name's color: one of the avatar colors (0–6).
+        color: u8,
+        /// Beside the author's messages in a group; none — no picture (a one-to-one chat).
+        avatar: option<avatar-spec>,
+    }
+
+    /// A message quoted by a reply (0.5): in the message, and over the field while answering.
+    record message-quote {
+        /// The quoted message: a click scrolls to it when it is loaded, otherwise comes as
+        /// `quote-clicked`. None — it is gone.
+        message: option<string>,
+        author: string,
+        /// The author's color (0–6).
+        color: u8,
+        /// One line: the text, or what it is ("Photo", "Sticker").
+        text: string,
+    }
+
+    /// What became of an outgoing message (0.5): a clock, ✓, ✓✓, a red mark.
+    enum delivery {
+        sending,
+        sent,
+        read,
+        failed,
+    }
+
+    /// A button under a message (0.5, part 5): a bot's keyboard, an advertisement's button.
+    record keyboard-button {
+        /// Names it in `keyboard-pressed`.
+        id: string,
+        text: string,
+        kind: keyboard-kind,
+    }
+
+    /// What a button under a message does (0.5, part 5), shown by a mark in its corner.
+    enum keyboard-kind {
+        /// The plugin answers it (a bot's callback): no mark.
+        action,
+        /// Opens a page: ↗.
+        link,
+        /// Puts a text into the field (a bot's inline query): ↪.
+        field,
+    }
+
+    /// A forum topic's label (0.5, part 5).
+    record topic-label {
+        title: string,
+        /// One of the avatar colors (0–6).
+        color: u8,
+    }
+
+    /// A reaction under a message (0.5).
+    record reaction {
+        /// An emoji: "🔥".
+        emoji: string,
+        count: u32,
+        /// The user's own: marked.
+        chosen: bool,
+    }
+
+    /// A message of a conversation (0.5).
+    record message {
+        /// Stable: changes, events and quotes name the message by it.
+        id: string,
+        /// Where it stands: the messages are kept sorted by it — a page of history goes above, a
+        /// new message below.
+        order: u64,
+        /// Written by the user: on the right, in the accent bubble, without the author.
+        outgoing: bool,
+        /// Who wrote it; none — nobody to name (a one-to-one chat, the user's own).
+        author: option<message-author>,
+        /// When, in seconds since 1970-01-01 UTC: Flux shows the local time under the message and
+        /// a day's date between days.
+        date: s64,
+        /// Edited: a mark before the time.
+        edited: bool,
+        /// Of an outgoing message.
+        delivery: option<delivery>,
+        /// "Forwarded from Anna".
+        forwarded: option<string>,
+        /// The message it answers.
+        reply: option<message-quote>,
+        parts: list<message-part>,
+        reactions: list<reaction>,
+        /// The conversation's `message-actions` this message offers (0.5), by id: Edit only on the
+        /// user's own messages that can still be edited. None — every one.
+        actions: option<list<string>>,
+        /// How many have seen it (0.5, part 5): a channel's post — an eye and "1.2K" at its foot;
+        /// its `author` without an avatar (the post's signature) goes there too, dim, before them.
+        views: option<u32>,
+        /// The forum topic it belongs to (0.5, part 5), in a group whose topics show as one feed:
+        /// the topic's name in its color, a small line over the text.
+        topic: option<topic-label>,
+        /// An advertisement (0.5, part 5): this label ("Ad") at its foot in place of the time and
+        /// the delivery marks, the bubble tinted in its `author`'s color — the sponsor, named over
+        /// the text — and no day's line over it. A click on its picture comes as `part-clicked`
+        /// (the sponsor's page), the viewer doesn't open.
+        sponsored: option<string>,
+        /// Buttons under the message (0.5, part 5), rows of them: the buttons of a row share its
+        /// width. A press comes as `keyboard-pressed`.
+        keyboard: list<list<keyboard-button>>,
+    }
+
+    /// Whether there is more of a conversation's history in a direction (0.5).
+    enum history {
+        /// There is: scrolling near the end asks for it (`load-older`, `load-newer`).
+        more,
+        /// The plugin is loading it: a spinner there.
+        loading,
+        /// The start of the chat (older), the latest message (newer).
+        complete,
+    }
+
+    /// The message field under a conversation (0.5).
+    record composer-spec {
+        /// "Message…".
+        placeholder: string,
+        /// Files and pictures: the paperclip, dropping files, pasting files and pictures.
+        attachments: bool,
+        /// Buttons beside Send: "Reply with Claude"; a press comes as `composer-action`.
+        actions: list<row-action>,
+        /// Formatting (0.5): the field's menu offers Formatting — Bold (⌘B), Italic (⌘I),
+        /// Strikethrough (⇧⌘X), Spoiler (⇧⌘P), Monospace (⇧⌘M), Link… (⌘K, asks the address); on
+        /// Windows Ctrl in place of ⌘. Each wraps the selection in Markdown marks — `**bold**`,
+        /// `__italic__`, `~~strikethrough~~`, `||spoiler||`, `` `monospace` `` (```` ``` ```` on
+        /// lines of their own around a selection of several lines), `[text](address)` — or puts
+        /// them around the caret. The field shows the formatting as it is typed (part 5): the
+        /// text between closed marks bold, italic, struck through, on the spoiler's veil, in the
+        /// code font, a link's text as a link — the marks themselves stay, faint (an unclosed
+        /// mark is plain text). The field sends the text with the marks (`composed`, `edited`):
+        /// the plugin parses them. The keys work only in the field; without formatting they do
+        /// what they do elsewhere.
+        formatting: bool,
+        /// The tabs of the field's panel (0.5, part 4), in order: a ☺ button by the field opens
+        /// it over the feed. Emoji are Flux's own and go into the field; stickers and GIFs are
+        /// the plugin's (`panel` changes) and a click sends one (`panel-chosen`). Empty — no
+        /// panel.
+        panel: list<panel-tab>,
+        /// The characters that ask for suggestions (0.5, part 5): "@" at a word's start anywhere,
+        /// "/" only at the field's very start. Typing one comes as `suggest`, the plugin answers
+        /// with `suggestions`. Empty — none.
+        triggers: list<string>,
+        /// Other ways to send (0.5, part 5): the Send button's menu (a right click on it) lists
+        /// them — "Send Without Sound". A choice sends the field as ↵ does and comes as
+        /// `composed-with`. Empty — no menu.
+        send-options: list<row-action>,
+    }
+
+    /// An item of the field's suggestions (0.5, part 5): a member for "@", a bot's command for "/".
+    /// The list opens over the field by the caret; ↑ ↓ choose, ↵ or ⇥ puts the chosen one, Esc
+    /// closes it, a click puts one.
+    record suggestion {
+        /// Names it: the list keeps the selection on it while the list changes.
+        key: string,
+        avatar: option<avatar-spec>,
+        /// "Anna Smirnova", "/start".
+        title: string,
+        /// Dim after the title: "@anna", "Start the bot".
+        detail: option<string>,
+        /// What replaces the trigger and the text typed after it: "@anna ", "/start ",
+        /// "[Anna](tg://user?id=42) " — a mention of someone without a username, as a Markdown link.
+        insert: string,
+    }
+
+    /// A tab of the field's panel (0.5, part 4).
+    enum panel-tab {
+        /// Flux's own emoji: by category, the recent ones first, a search by their Russian and
+        /// English names, skin tones.
+        emoji,
+        /// The plugin's stickers: its sets, the recent and the favorite ones, a search.
+        stickers,
+        /// The plugin's GIFs: the saved ones, a search.
+        gifs,
+    }
+
+    /// An item of the panel (0.5, part 4): a sticker, a GIF.
+    record panel-item {
+        /// Names it in `panel-chosen` and `panel-visible`; `panel-put` replaces it by it.
+        key: string,
+        /// The picture: a sticker's (with its `animation`), a GIF's poster. Its size gives the
+        /// item's proportions (a sticker is fit into a square, a GIF keeps its own).
+        image: image-spec,
+        /// A GIF's MP4, absolute: plays looped without sound while on screen; none — the poster.
+        video: option<string>,
+        /// The emoji it stands for ("😂"): its tooltip, a sticker search's match.
+        emoji: option<string>,
+    }
+
+    /// A group of the panel's items under a heading (0.5, part 4): a sticker set, "Recent".
+    record panel-section {
+        /// Names it: the tab's strip of sections (by its `icon`) scrolls to it.
+        key: string,
+        title: string,
+        /// Its picture in the strip: a set's thumbnail; none — its first item's.
+        icon: option<image-spec>,
+        items: list<panel-item>,
+    }
+
+    /// What a tab of the panel shows (0.5, part 4): sections of items.
+    record panel-content {
+        tab: panel-tab,
+        /// The search it answers; empty — the tab's own content (sets, saved GIFs).
+        query: string,
+        sections: list<panel-section>,
+        /// More of it below (a search's next page): scrolling near the end comes as
+        /// `panel-load-more` while it is `more`; `loading` — a spinner at the end.
+        more: history,
+    }
+
+    /// A message feed with a field (0.5), as a chat. Its messages come by
+    /// `update-conversation`, not with the view: a new view keeps them (by the element's id).
+    record conversation-spec {
+        /// The field; none — reading only.
+        composer: option<composer-spec>,
+        /// Shown in the middle when there are no messages.
+        empty-text: option<string>,
+        /// Actions of every message: in its menu and on its hover bar (with an icon): "Reply",
+        /// "Reply with Claude". Copy Text, Open, Save As… are Flux's own. A choice comes as
+        /// `message-action`.
+        message-actions: list<row-action>,
+        /// A button in place of the field (0.5, part 5), where the user can't write: "Join" a
+        /// channel, "Mute" one; a full-width flat button under the feed (its `label`; the field,
+        /// if any, isn't shown). A press comes as `composer-action(id, …)` with an empty
+        /// `composed`.
+        field-button: option<row-action>,
+        /// Actions on selected messages (0.5, part 5): "Forward", "Delete". Flux's own "Select" in
+        /// a message's menu (shown when this list isn't empty) starts selecting — a click on a
+        /// message selects or clears it, a ⇧-click selects the run up to it, ⌘A every loaded
+        /// one; Esc or the bar's × ends. A bar in place of the field shows the count, these
+        /// actions and Flux's own "Copy" (the selected messages' texts, each under its author and
+        /// time). A choice comes as `selection-action(id, the messages in the feed's order)` and
+        /// ends the selection. Notices and advertisements (`sponsored`) can't be selected.
+        /// Empty — no selecting.
+        selection-actions: list<row-action>,
+        /// A line in place of the field where the user can't write (0.5, part 5): "You can't
+        /// write in this chat", dim, in the middle. Shown when there is neither the field nor
+        /// `field-button`; the bar of selected messages takes its place as it takes theirs.
+        field-note: option<string>,
+        /// The plugin opens every link of the feed (0.5, part 5): web links (`http`, `https`,
+        /// `mailto`) come as `link-clicked` too, a link preview's as well — Flux doesn't open
+        /// them — so the plugin can ask first or open its own pages (`system.open-url` opens one
+        /// in the browser). False — web links open in the browser at once.
+        own-links: bool,
+        /// The reactions the user may put (0.5, part 5), emoji in order: the message's hover bar
+        /// gets a ☺ that opens them in a row by the message (all of them in a scrolling grid
+        /// when there are more than fit); a reaction under a message that is in this list toggles
+        /// the user's own. Both come as `reaction-toggled`. Empty — reactions are only shown.
+        reactions: list<string>,
+    }
+
+    /// A header (0.5): a picture, a title and a line under it — a chat's header over its feed, a
+    /// profile's top. A click on it comes as `clicked`.
+    record header-spec {
+        avatar: option<avatar-spec>,
+        title: string,
+        /// The line under the title, in its tones: "online" (accent), "5 members" (dim).
+        subtitle: list<span>,
+        /// A profile's: a large picture over the centered title and line.
+        large: bool,
+    }
+
+    /// A picture of a gallery (0.5).
+    record gallery-item {
+        /// Names it in the events (`activated`, `visible`).
+        key: string,
+        image: image-spec,
+        /// The heading of the item's group ("November 2026"): a group starts where it changes.
+        group: option<string>,
+        /// The square stands for a video (0.5, part 4): its length in the corner; a click opens
+        /// it in Flux's media viewer among the gallery's pictures and videos (not downloaded — at
+        /// once on the poster, and `activated(key)` comes so the plugin downloads it).
+        video: option<video-spec>,
+    }
+
+    /// Pictures in a grid of squares (0.5), as a chat's photos and videos by month: takes the
+    /// remaining height and scrolls by itself (in a dialog, the dialog is then as tall as it may
+    /// be); only the squares on screen are drawn, each from its `path` (a small picture will do).
+    /// A click on a picture (not `play`) opens it at once in Flux's picture viewer, the gallery's
+    /// pictures around it: its `full` when it is there; else what the square has (`path`, else
+    /// `preview` blurred) with a spinner, and `activated(key)` comes so the plugin downloads the
+    /// full size — the gallery put again with the item's `full` swaps the open viewer to it. The
+    /// same for a picture the user arrows to in the viewer. A click on a `play` picture comes as
+    /// `activated(key)` (the plugin opens it). The squares on screen come as `visible(first,
+    /// last)` (their keys), the end near — as `load-older` while `more` is `more`.
+    record gallery-spec {
+        items: list<gallery-item>,
+        more: history,
+        /// Shown in the middle when there are no items.
+        empty-text: option<string>,
+    }
+
+    /// The bar of a chat's pinned message over the feed (0.5, part 5): a line on its left cut
+    /// into `count` pieces (the one at `position` lit; at most four shown, the rest scroll), the
+    /// title in the accent ("Pinned message", "Pinned message #2"), the message's line under it,
+    /// its picture before the text. A click on the bar comes as `pinned-clicked(message)`: the
+    /// plugin reveals the message (`reveal`, or after loading its history) and shows the next
+    /// older pinned one, from the oldest back to the newest. A click on an action comes as
+    /// `pinned-action`.
+    record pinned-spec {
+        /// The pinned message's id.
+        message: string,
+        title: string,
+        /// One line: the text, or what it is ("Photo").
+        text: string,
+        /// A small picture before the text: the message's photo, a video's poster.
+        image: option<image-spec>,
+        /// Which of the pinned messages it is (0 — the newest) and how many there are.
+        position: u32,
+        count: u32,
+        /// Icon buttons at the bar's right end: "Unpin" (×).
+        actions: list<row-action>,
+    }
+
+    /// A bot's keyboard over the field (0.5, part 5): rows of buttons in place of typing; a ⌨
+    /// button in the field shows and hides it. A press comes as `keyboard-pressed("", button)`.
+    /// The buttons of a row share its width; a tall keyboard scrolls (it takes at most two
+    /// fifths of the conversation's height). No rows — no keyboard and no ⌨, only the
+    /// placeholder (a bot asking for a reply).
+    record reply-keyboard {
+        rows: list<list<keyboard-button>>,
+        /// The field's placeholder while the keyboard is there.
+        placeholder: option<string>,
+        /// Shown at once; false — behind the ⌨ button.
+        open: bool,
+    }
+
+    /// A change of a conversation (0.5): the plugin sends what changed, never the whole feed.
+    variant conversation-change {
+        /// Adds messages, or replaces those with the same id; each goes where its `order` puts it.
+        /// A message added below the last one keeps the feed at the bottom if it was there.
+        put(list<message>),
+        /// Removes messages by id.
+        remove(list<string>),
+        /// Removes every message.
+        clear,
+        /// Whether there are older messages, or they are loading.
+        older(history),
+        /// Whether there are newer ones (after a jump back into the history), or they are loading.
+        newer(history),
+        /// The "New messages" line goes above this message; none — no line. The first fill of the
+        /// feed opens there.
+        unread-from(option<string>),
+        /// Scrolls to the message and marks it for a moment: a found message, a quote's original.
+        reveal(string),
+        /// The quote over the field: the message being answered; none — no answer.
+        reply-to(option<message-quote>),
+        /// Replaces the field's text: a draft, the text Claude proposed.
+        draft(string),
+        /// The field edits a message (0.5): the bar "Editing" with the message's text over the
+        /// field, which takes the text; ↵ — `edited`, Esc or the bar's × — `edit-cancelled`.
+        /// None — the field is back to a new message (its text cleared).
+        editing(option<message-edit>),
+        /// What a tab of the field's panel shows (0.5, part 4): replaces the tab's content (for
+        /// its `query`; an answer to an older search is dropped).
+        panel(panel-content),
+        /// Replaces items of a panel's tab by their keys, wherever they are (0.5, part 4): a
+        /// sticker downloaded, its animation rendered.
+        panel-put(tuple<panel-tab, list<panel-item>>),
+        /// The bar of the chat's pinned message over the feed (0.5, part 5); none — no bar.
+        pinned(option<pinned-spec>),
+        /// The field's suggestions (0.5, part 5): (the text it answers — what `suggest` asked,
+        /// the items). The list over the field; an answer for another text than the one at the
+        /// caret now is dropped; empty — the list closes.
+        suggestions(tuple<string, list<suggestion>>),
+        /// The bot's keyboard over the field (0.5, part 5); none — no keyboard (and no ⌨).
+        reply-keyboard(option<reply-keyboard>),
+        /// Messages to forward, over the field (0.5, part 5): a bar like the quote being answered,
+        /// with the forward icon — its `author` the title ("Forwarding 3 messages"), its `text`
+        /// the line ("Anna, Boris: Hi…"); its × comes as `forward-cancelled`. ↵ sends as usual
+        /// (`composed`, the field may be empty): the plugin sends the text first, then forwards.
+        /// A quote being answered and a forwarding don't go together: putting one clears the
+        /// other. None — no bar.
+        forwarding(option<message-quote>),
+    }
+
+    /// The message the field edits (0.5).
+    record message-edit {
+        /// The message's id.
+        message: string,
+        /// Its text, as the field takes it.
+        text: string,
+    }
+
+    /// What the field sends (0.5).
+    record composed {
+        text: string,
+        /// The attached files, absolute: chosen, dropped, pasted (a pasted picture is saved to a
+        /// file first).
+        files: list<string>,
+        /// The message answered (the quote over the field).
+        reply-to: option<string>,
+    }
+
+    variant element-kind {
+        /// Children top to bottom.
+        column,
+        /// Children left to right, centered vertically.
+        row,
+        /// The window's toolbar: buttons in a row under the title, as in JetBrains tool windows.
+        toolbar,
+        text(list<span>),
+        markdown(string),
+        button(button-spec),
+        text-field(text-field-spec),
+        toggle(toggle-spec),
+        /// Takes the remaining height and scrolls; only the visible rows are drawn.
+        tree(tree-spec),
+        divider,
+        /// Takes the free space of a row or a column.
+        spacer,
+        /// A progress bar: 0.0–1.0; none — indeterminate.
+        progress(option<f32>),
+        badge(badge-spec),
+        /// Properties in two aligned columns (0.3): the labels, dim, on the left; the values on the
+        /// right, editable ones with ▾.
+        properties(list<property>),
+        /// A picture (0.5), as wide as the column lets it, up to its own size; `clicked` comes
+        /// when it is clicked.
+        image(image-spec),
+        /// A person's or a chat's picture (0.5), the size of a header's.
+        avatar(avatar-spec),
+        /// A QR code of the text (0.5), dark on light whatever the theme, for a phone's camera: a
+        /// sign-in link. An empty text — the code isn't there yet: a placeholder of the same size
+        /// with a spinner.
+        qr(string),
+        /// A message feed with a field (0.5); takes the remaining height, as a tree does.
+        conversation(conversation-spec),
+        /// A header (0.5): a picture, a title, a line under it; a click comes as `clicked`.
+        header(header-spec),
+        /// Pictures in a grid by groups (0.5); takes the remaining height, as a tree does.
+        gallery(gallery-spec),
+    }
+
+    record element {
+        /// Events name the element by it, and the element keeps its state (the field's text, the
+        /// scroll, the expanded rows) between views by it.
+        id: string,
+        kind: element-kind,
+        /// Indices of the children in the view's elements (column, row, toolbar).
+        children: list<u32>,
+    }
+
+    /// A tool window's content: the elements, the first one is the root.
+    record view {
+        elements: list<element>,
+    }
+
+    /// Replaces the content of a tool window.
+    set-view: func(window: string, view: view);
+    /// Opens the tool window and focuses it; one in the editor (`location = "editor"`) opens as a
+    /// tab, or comes forward.
+    show: func(window: string);
+    /// Hides the tool window; one in the editor closes its tab.
+    hide: func(window: string);
+    /// Renames the tool window: its header, its tab ("Board: Backend"); the manifest's title
+    /// again with an empty one.
+    set-title: func(window: string, title: string);
+    /// Changes the messages and the state of a `conversation` element of the window's view (0.5),
+    /// in order; the view stays as it is.
+    update-conversation: func(window: string, element: string, changes: list<conversation-change>);
+    /// Opens the tab `<window>/<key>` of a window declared with `tabs = true` (0.5) with a title,
+    /// or brings it forward; `focus` — it takes the keyboard. Returns the tab's window name.
+    open-tab: func(window: string, key: string, title: string, focus: bool) -> string;
+    /// A mark of the window (0.5): on its launchpad icon a count ("4"), on its tab a dot; none —
+    /// no mark.
+    set-badge: func(window: string, badge: option<string>);
+    /// Whether the tab `<window>/<key>` comes back with the project after a restart, and is kept
+    /// in a context (0.5); a tab does by default. `false` — a tab nobody should find later: a
+    /// hidden chat's.
+    set-restorable: func(window: string, restorable: bool);
+    /// Puts the keyboard in a text field of the window's view (0.5): a search bar opened by ⌘F.
+    /// The field may come in the same call's `set-view`.
+    focus: func(window: string, element: string);
+}
+
+/// Requests to web services, as the manifest's `network` permission allows: a request goes only to
+/// the hosts it lists ("api.example.com"; "*.example.com" — the domain and its subdomains;
+/// "localhost"; "*" — any host), and so does every redirect. Flux makes the connection (HTTPS with
+/// the system's certificates) and keeps a line about every request in the plugin's log. Waiting
+/// for a response doesn't count toward the plugin's time limit.
+interface http {
+    record request {
+        /// "GET", "POST", "PROPFIND"…
+        method: string,
+        /// An absolute `http` or `https` URL.
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+        /// Gives up after this long: 30 s by default.
+        timeout-ms: option<u32>,
+        /// Follows redirects (up to 10), each to a host the manifest allows; without it a redirect
+        /// is the response.
+        follow-redirects: bool,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// The status and the headers of a started request (`start`), before its body.
+    record response-head {
+        request: u64,
+        status: u16,
+        headers: list<tuple<string, string>>,
+    }
+
+    variant http-error {
+        /// The manifest doesn't allow the host; the text names it.
+        denied(string),
+        /// Not a valid URL or request.
+        invalid(string),
+        /// No connection: the name isn't found, the connection is refused, TLS fails…
+        connection(string),
+        timed-out,
+        /// `cancel`, or the plugin stopped.
+        cancelled,
+        /// The body is larger than `fetch` takes (64 MB); `start` streams a body of any size.
+        too-large,
+    }
+
+    /// Makes a request and waits for the whole response. The plugin waits; Flux doesn't.
+    fetch: func(request: request) -> result<response, http-error>;
+
+    /// Starts a request in the background and returns its id at once. The response comes as
+    /// events: `http-response` (the status and the headers), `http-body` (chunks of the body as
+    /// they arrive: server-sent events, a download), then `http-done`; a request that fails
+    /// before the response gets only `http-done`. The plugin answers other calls meanwhile.
+    start: func(request: request) -> u64;
+    /// Stops a started request: `http-done` with `cancelled`.
+    cancel: func(request: u64);
+}
+
+/// The plugin's server on this Mac — on 127.0.0.1 only, as the manifest's `server` permission
+/// allows: for the sign-in of a web service (OAuth's redirect to `http://127.0.0.1:<port>/…`) and
+/// for programs that talk to the IDE over HTTP or WebSocket. Requests and WebSocket messages come
+/// as events.
+///
+/// Flux itself answers 403 to a request whose `Host` isn't the server's own (`127.0.0.1:<port>`,
+/// `localhost:<port>`): a web page can't reach the server through a name of its own.
+interface server {
+    record server-request {
+        /// Answer it with `respond` or `respond-stream`; one without an answer for 60 s gets 504.
+        id: u64,
+        method: string,
+        /// The path with the query: "/callback?code=…".
+        path: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    record server-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// A WebSocket connection opened: the upgrade is accepted (`ws-close` drops one the plugin
+    /// doesn't want, say without its token).
+    record ws-open {
+        connection: u64,
+        /// The path with the query.
+        path: string,
+        headers: list<tuple<string, string>>,
+    }
+
+    variant ws-message {
+        text(string),
+        binary(list<u8>),
+    }
+
+    /// Starts the plugin's server and returns its port: `port`, or a free one (none). A running
+    /// server is stopped first.
+    listen: func(port: option<u16>) -> result<u16, string>;
+    /// Stops the server and closes its connections.
+    stop: func();
+
+    /// Answers a request.
+    respond: func(request: u64, response: server-response);
+    /// Answers a request with a stream (server-sent events): the status and the headers now, the
+    /// body by `send-chunk`, the end by `end-stream`. A client that goes away comes as
+    /// `stream-closed`.
+    respond-stream: func(request: u64, status: u16, headers: list<tuple<string, string>>);
+    send-chunk: func(request: u64, chunk: list<u8>) -> result<_, string>;
+    end-stream: func(request: u64);
+
+    /// Sends a WebSocket message.
+    ws-send: func(connection: u64, message: ws-message) -> result<_, string>;
+    /// Closes a WebSocket connection.
+    ws-close: func(connection: u64);
+}
+
+/// Programs on this Mac, as the manifest's `processes` permission allows: the programs it lists by
+/// name ("git", "gh"), or any ("*"). They run with the user's rights and the environment of the
+/// user's login shell (its `PATH`), and end when the plugin stops.
+interface process {
+    record command {
+        /// A name looked up in `PATH` ("git") or an absolute path.
+        program: string,
+        args: list<string>,
+        /// The working folder: the project root by default.
+        cwd: option<string>,
+        /// Added to the environment.
+        env: list<tuple<string, string>>,
+    }
+
+    record output {
+        /// None — ended by a signal.
+        exit-code: option<s32>,
+        stdout: list<u8>,
+        stderr: list<u8>,
+    }
+
+    enum output-channel {
+        stdout,
+        stderr,
+    }
+
+    /// A piece of a started program's output.
+    record process-output {
+        process: u64,
+        channel: output-channel,
+        bytes: list<u8>,
+    }
+
+    /// Runs a program to its end and returns its output; `stdin` is its input. After `timeout-ms`
+    /// (60 s by default) the program is killed and the call fails. The plugin waits; Flux doesn't.
+    run: func(command: command, stdin: option<list<u8>>, timeout-ms: option<u32>) -> result<output, string>;
+
+    /// Starts a program and returns its id at once: its output comes as `process-output` events,
+    /// its end as `process-exited`.
+    spawn: func(command: command) -> result<u64, string>;
+    /// Writes to a started program's input.
+    write: func(process: u64, bytes: list<u8>) -> result<_, string>;
+    /// Closes its input: the end of input for the program.
+    close-stdin: func(process: u64);
+    /// Ends it: SIGTERM, then SIGKILL if it is still running 2 s later.
+    kill: func(process: u64);
+    /// The absolute path of one of the plugin's own programs (0.5), declared in the manifest's
+    /// `[[helpers]]` by name: Flux downloads the file of this computer's platform from the
+    /// manifest's address and checks its SHA-256 — when the plugin is installed or updated, or
+    /// now, and the call waits. `run` and `spawn` take this path without the `processes`
+    /// permission. Fails when the manifest has no file for this platform or the download fails.
+    helper: func(name: string) -> result<string, string>;
+}
+
+/// The window's terminals, as the manifest's `terminal` permission allows: the plugin opens a tab
+/// with a command (or the user's shell), types into it, and hears when the command ends. The tab is
+/// the user's like any other: they read it, type into it, close it.
+interface terminal {
+    enum terminal-location {
+        /// The terminal panel at the bottom.
+        panel,
+        /// A tab among the editor's tabs.
+        editor,
+    }
+
+    record terminal-options {
+        /// The tab's title: the command's name by default.
+        title: option<string>,
+        /// The program and its arguments; none — the user's shell. The tab of a command stays
+        /// after the command ends, with its exit code.
+        command: option<list<string>>,
+        /// The project root by default.
+        cwd: option<string>,
+        /// Added to the environment.
+        env: list<tuple<string, string>>,
+        location: terminal-location,
+        /// The terminal takes the keyboard; without it the keyboard stays where the user is.
+        focus: bool,
+    }
+
+    /// Opens a terminal tab and returns its id.
+    open: func(options: terminal-options) -> result<u64, string>;
+    /// Types text as if the user did; "\r" presses Enter.
+    send-text: func(terminal: u64, text: string) -> result<_, string>;
+    /// Brings the terminal's tab forward; `focus` — it takes the keyboard.
+    show: func(terminal: u64, focus: bool) -> result<_, string>;
+    /// Closes the tab: what runs in it ends.
+    close: func(terminal: u64);
+}
+
+/// Edits the user reviews: the plugin proposes a file's new text, and Flux shows a diff tab — the
+/// file as it is on the left, the proposal on the right (editable; hunks can be rejected one by
+/// one), Accept (⌘↵) and Reject on a banner — as Claude's edits. The answer comes as
+/// `proposal-answered`. Needs the `project` permission (the answer carries the file's text).
+interface review {
+    record proposal {
+        /// The file: relative to the project root or absolute (in the project or a folder the
+        /// manifest allows); it may not exist yet.
+        path: string,
+        /// The whole new text of the file.
+        text: string,
+        /// The tab's title: the file's name by default.
+        title: option<string>,
+        /// On Accept Flux writes the accepted text itself: into the open document as one undo
+        /// step, saved, or into the file. Without it only the plugin hears the answer.
+        apply: bool,
+        /// The tab takes the keyboard; without it the tab opens next to the active one and the
+        /// keyboard stays where the user is.
+        focus: bool,
+    }
+
+    variant proposal-outcome {
+        /// Accepted: the text as the user left it (the proposal, or what they changed in it).
+        accepted(string),
+        rejected,
+        /// The tab was closed without an answer, or the plugin withdrew the proposal.
+        closed,
+    }
+
+    /// Opens the proposal's tab and returns its id.
+    propose: func(proposal: proposal) -> result<u64, string>;
+    /// Closes the proposal's tab without an answer.
+    withdraw: func(proposal: u64);
+}
+
+/// The project's Git repositories. Needs the `project` permission; changing them (a branch, a
+/// checkout) needs `project = "write"`. A change of a status, a branch or a HEAD comes as the
+/// `git-changed` event.
+interface git {
+    record repository {
+        /// The root of the work tree, absolute.
+        root: string,
+        /// The current branch; none — a detached HEAD.
+        branch: option<string>,
+        /// The HEAD commit's hash; none before the first commit.
+        head: option<string>,
+        /// An operation in progress: "merge", "rebase", "cherry-pick", "revert"; none.
+        operation: option<string>,
+    }
+
+    enum change-kind {
+        added,
+        modified,
+        deleted,
+        renamed,
+        untracked,
+        conflicted,
+    }
+
+    record change {
+        /// Absolute.
+        path: string,
+        /// The path before a rename, absolute.
+        old-path: option<string>,
+        kind: change-kind,
+    }
+
+    /// The repositories of the project (a project may have several).
+    repositories: func() -> list<repository>;
+    /// The changes of the working copy against HEAD, in every repository.
+    status: func() -> list<change>;
+    /// A file's changes against HEAD as a unified diff (`git diff HEAD -- <file>`, the file as it
+    /// is on disk); empty when there are none. Relative paths are in the project.
+    diff: func(path: string) -> result<string, string>;
+
+    record branch {
+        /// "main", "feature/login"; a remote one with its remote: "origin/main".
+        name: string,
+        remote: bool,
+        /// The checked-out branch.
+        current: bool,
+    }
+
+    /// What the commit window offers while one of the plugin's tasks is active.
+    record commit-template {
+        /// Fills an empty message, and replaces the previous template's text when the user hasn't
+        /// changed it: "TRACK-142 Fix the sign-in".
+        text: string,
+        /// A message generated with Claude starts with it: "TRACK-142".
+        prefix: option<string>,
+    }
+
+    /// The branches of the repository whose work tree is `root`: the local ones, then the remote
+    /// ones.
+    branches: func(root: string) -> result<list<branch>, string>;
+    /// Creates a branch from `start` (a branch, a tag, a commit; none — HEAD) and checks it out,
+    /// the way the Branches popup does: local changes come along, and Smart Checkout asks when
+    /// they'd be in the way. Returns an id at once; how it ended comes as `git-done`.
+    new-branch: func(root: string, name: string, start: option<string>) -> u64;
+    /// Checks out a branch (a remote one — as a new local branch tracking it), as the Branches
+    /// popup does. How it ended comes as `git-done`.
+    checkout: func(root: string, branch: string) -> u64;
+    /// As `new-branch`, but asks nothing (0.6): when local changes or untracked files are in the
+    /// way, it fails (`git-done` with why — a sentence for the user, in Flux's language) and
+    /// nothing changes: no branch is made, nothing is stashed. For work with nobody at the
+    /// computer (a task's action run from the phone).
+    new-branch-quietly: func(root: string, name: string, start: option<string>) -> u64;
+    /// As `checkout`, asking nothing (0.6, see `new-branch-quietly`): plain `git checkout` —
+    /// changes that don't conflict come along; conflicting ones make it fail: "Local changes are
+    /// in the way of checking out 'TRACK-142-fix'".
+    checkout-quietly: func(root: string, branch: string) -> u64;
+    /// Sets or removes (none) the plugin's commit message template.
+    set-commit-template: func(template: option<commit-template>);
+}
+
+/// Problems in files: what the language servers report, and what plugins do — a linter publishes
+/// its own, and Flux shows them as the servers': underlines, F2, the counters of the status bar.
+/// Reading needs the `project` permission; publishing doesn't.
+interface diagnostics {
+    use types.{range};
+
+    enum severity {
+        error,
+        warning,
+        info,
+        hint,
+    }
+
+    record diagnostic {
+        range: range,
+        severity: severity,
+        message: string,
+        /// Who reports it: "rust-analyzer", "shellcheck". The plugin's name by default (publish).
+        source: option<string>,
+        /// The rule: "E0308", "SC2086".
+        code: option<string>,
+    }
+
+    record file-diagnostics {
+        /// Absolute.
+        path: string,
+        diagnostics: list<diagnostic>,
+    }
+
+    /// The problems Flux knows of: in a file (relative to the project root or absolute), or in
+    /// every file with problems (none).
+    get: func(path: option<string>) -> list<file-diagnostics>;
+    /// The plugin's own problems of a file, replacing those it published before; an empty list
+    /// clears them. Positions are in the file's text as it is now (the open document's).
+    publish: func(path: string, diagnostics: list<diagnostic>);
+    /// Clears every problem the plugin published.
+    clear: func();
+}
+
+/// The plugin's secrets — tokens, passwords — apart from its files: Flux keeps them encrypted in a
+/// file only the user can read. Only this plugin reads them, and they go when it is uninstalled.
+interface secrets {
+    get: func(key: string) -> option<string>;
+    /// None removes the secret.
+    set: func(key: string, value: option<string>) -> result<_, string>;
+}
+
+/// Timers: the `timer` event after a delay or periodically, while the plugin runs. A periodic
+/// timer's tick that still waits in the plugin's queue doesn't add another.
+interface timers {
+    /// One `timer` event after `ms` milliseconds; returns the timer's id.
+    after: func(ms: u32) -> u64;
+    /// A `timer` event every `ms` milliseconds (at least 100); returns the timer's id.
+    every: func(ms: u32) -> u64;
+    cancel: func(timer: u64);
+}
+
+/// What is outside the window: the browser, the clipboard, the user's home folder, the clock.
+interface system {
+    /// Opens a link in the default browser: `http`, `https` or `mailto`.
+    open-url: func(url: string) -> result<_, string>;
+    /// Puts text on the clipboard.
+    copy-text: func(text: string);
+    /// The user's home folder, absolute: where the folders the manifest allows ("~/.config/gh")
+    /// are.
+    home-dir: func() -> string;
+    /// How far the user's local time is ahead of UTC at an instant (seconds since 1970-01-01 UTC),
+    /// in seconds: 10800 in Moscow; summer time included.
+    utc-offset: func(at: s64) -> s32;
+    /// The user's time zone: "Europe/Moscow"; "UTC" when it isn't known.
+    time-zone: func() -> string;
+    /// Opens Settings on the plugin's page.
+    open-settings: func();
+    /// Opens a file with the system's app (0.5): a downloaded video, a document. Only a file of the
+    /// plugin's data folder, or one the user gave the plugin (chosen, dropped, pasted).
+    open-file: func(path: string) -> result<_, string>;
+    /// Shows a file in Finder (Explorer) (0.5), the same files as `open-file`.
+    show-file: func(path: string) -> result<_, string>;
+}
+
+/// A popup list to choose from, drawn by Flux as its own (Open Task, the branches, the palette):
+/// a search field over grouped items, or a short menu without one. The choice comes as
+/// `picker-chosen`.
+interface picker {
+    use ui.{span, avatar-spec};
+
+    record picker-item {
+        /// Names the item in `picker-chosen`.
+        key: string,
+        /// A named icon, as in tool windows.
+        icon: option<string>,
+        label: list<span>,
+        /// Dim text after the label.
+        detail: option<string>,
+        /// On the right: a status, a time.
+        badge: option<string>,
+        /// The heading of the item's group ("Today", "In Progress"); the items of a group come
+        /// together, in the order of their first item.
+        group: option<string>,
+        /// A person's or a chat's picture in place of the icon (0.5).
+        avatar: option<avatar-spec>,
+    }
+
+    variant picker-anchor {
+        /// Centered under the title bar, as the command palette.
+        window,
+        /// Above one of the plugin's status bar items (its id).
+        status-item(string),
+        /// Under an element of one of the plugin's tool windows: (window, element). A property of
+        /// a `properties` list is named "<list>/<property id>" (0.3), a row of a tree
+        /// "<tree>/<row key>" (0.5): a menu of a row's button opens under the row (under the
+        /// list while the row isn't drawn). A conversation's field is "<conversation>/field"
+        /// (0.5, part 5): the picker opens above the field, as its suggestions do.
+        element(tuple<string, string>),
+    }
+
+    record picker-spec {
+        /// The search field's placeholder: "Find a task by its key or words".
+        placeholder: string,
+        items: list<picker-item>,
+        /// A search field over the items; without it — a short menu (a status's transitions).
+        searchable: bool,
+        /// The plugin searches itself: every change of the query comes as `picker-query`, and the
+        /// plugin answers with `update`; otherwise Flux filters the items by the query.
+        live-query: bool,
+        /// Shown when there are no items.
+        empty-text: option<string>,
+        /// The plugin is still looking: a spinner in the field.
+        loading: bool,
+        anchor: picker-anchor,
+    }
+
+    /// Opens a picker (closing the plugin's previous one) and returns its id.
+    open: func(spec: picker-spec) -> u64;
+    /// Replaces the items of an open picker; `loading` — still looking.
+    update: func(picker: u64, items: list<picker-item>, loading: bool);
+    /// Closes it without a choice (`picker-chosen` with none).
+    close: func(picker: u64);
+}
+
+/// Links on text that names something of the plugin's — a task's key, `TRACK-142` — in the
+/// editor (⌘ + hover, ⌘-click), in commit messages (the commit window, the Git log), in Claude's
+/// chat and in the plugins' Markdown. A click comes as `link-activated`; a tooltip is asked for
+/// with `link-hovered`.
+interface links {
+    record link-pattern {
+        /// Names the pattern in the events.
+        id: string,
+        /// A regular expression (Rust `regex` syntax); the whole match is the link:
+        /// "\\b(?:TRACK|WEB)-\\d+\\b".
+        regex: string,
+        /// The plugin describes a link on hover (`link-hovered` → `describe`).
+        tooltip: bool,
+    }
+
+    /// Replaces the plugin's patterns; an empty list removes them. Fails on a regex that doesn't
+    /// compile, naming it.
+    set-patterns: func(patterns: list<link-pattern>) -> result<_, string>;
+    /// The answer to `link-hovered`: Markdown for the tooltip; none — no tooltip.
+    describe: func(request: u64, markdown: option<string>);
+}
+
+/// Claude Code sessions in Flux's chat, opened by the plugin with its context. Needs the manifest's
+/// `claude` permission: a session's requests run with the rights the user gave Claude Code.
+interface claude {
+    /// Something the session gets along with the first message: a chip in the field, its text in
+    /// the message.
+    record attachment {
+        /// The chip's text: "TRACK-142".
+        label: string,
+        /// What Claude reads: the task's text, its comments.
+        markdown: string,
+    }
+
+    record session-spec {
+        /// The session's title: "TRACK-142: Fix the sign-in".
+        title: option<string>,
+        attachments: list<attachment>,
+        /// The first message: put in the field, or sent (`send`).
+        prompt: option<string>,
+        /// Sends the prompt (with the attachments) at once; otherwise the field takes the keyboard.
+        send: bool,
+        /// Starts in plan mode: Claude studies and proposes a plan before editing.
+        plan-mode: bool,
+    }
+
+    /// Opens a new session in the Claude window (or its tab, where the user keeps it): its id —
+    /// the CLI's session id (0.6), the one `claude-remote` names it by. Fails when Claude Code is
+    /// turned off or not installed.
+    new-session: func(spec: session-spec) -> result<string, string>;
+}
+
+/// Contexts, as Tasks & Contexts in JetBrains: the window's open tabs — documents, Claude chats,
+/// terminals in the editor — kept under a key, so a task's tabs come back when the user returns to
+/// the task. The keys are the plugin's own; the user sees the contexts by title in
+/// Load Context.
+interface contexts {
+    record context-ref {
+        key: string,
+        /// "TRACK-142 Fix the sign-in".
+        title: string,
+    }
+
+    /// Saves the open tabs as `save` (when given), closes them — documents with unsaved changes and
+    /// running Claude sessions stay — and opens the tabs of `load` (when it was saved).
+    switch: func(save: option<context-ref>, load: option<string>) -> result<_, string>;
+    /// Forgets a saved context.
+    remove: func(key: string);
+}
+
+/// The plugin's service (0.5). With `service = true` in the manifest, Flux runs one more instance of
+/// the plugin for the whole app — the service — next to the instance in each window, from the
+/// first window that runs the plugin until the plugin is turned off or Flux quits. The service
+/// keeps what must be one: a connection, a database that can't be opened twice, a program; the
+/// windows' instances show things and talk to it by messages.
+///
+/// The service has no window: what is about one — documents, the project, tool windows,
+/// questions, pickers, terminals, proposals, Git, problems, links, Claude, contexts, commands,
+/// the status bar — fails or does nothing there, with a line in the log. Its notifications go to
+/// the window the user works in. Commands and Claude's tools go to the windows' instances.
+interface service {
+    /// This instance is the service.
+    is-service: func() -> bool;
+    /// Sends a message (JSON suits): from a window's instance — to the service (`window` is
+    /// ignored); from the service — to a window's instance (its id) or to every one (none). It
+    /// comes as `service-message`, in order. Fails when there is nobody to take it: the service
+    /// isn't running (yet: `service-started` says when it is), the window is gone.
+    send: func(window: option<u64>, message: string) -> result<_, string>;
+    /// For the service: the windows with a running instance of the plugin, by id.
+    windows: func() -> list<u64>;
+}
+
+/// Tools for Claude (0.5). The manifest's `[[tools]]` declares them (a name, a title, a description
+/// for Claude, a JSON schema of the arguments, whether the tool changes something), and Flux adds
+/// them to its own MCP server `flux`, in the Claude sessions of the window started while the
+/// plugin is on. A call comes to the window's instance as `tool-called`; the plugin answers with
+/// `respond`, at once or later.
+///
+/// A tool that changes something (`write = true`) asks the user first, in any of Claude's
+/// permission modes: the plugin shows its card in Claude's chat with `confirm` — what will be done,
+/// Confirm, perhaps Edit, Reject — and acts on the answer (`tool-confirmed`).
+interface tools {
+    record tool-call {
+        /// Names the call in `respond`, `confirm` and the events.
+        id: u64,
+        /// The tool's name, as in the manifest.
+        tool: string,
+        /// The arguments: a JSON object, as the tool's schema describes it.
+        arguments: string,
+    }
+
+    /// What a call gives Claude, and how its step looks in the chat.
+    record tool-output {
+        /// What Claude reads: text, Markdown, JSON.
+        text: string,
+        /// The call failed; `text` says why.
+        error: bool,
+        /// The step's line: "Backend · team — 50 messages"; none — the tool's title.
+        summary: option<string>,
+        /// Dim on the right of the line: "15–17 Nov".
+        detail: option<string>,
+        /// Markdown under the line when the step is open: the excerpts Claude read.
+        excerpt: option<string>,
+    }
+
+    /// The card of a `write` tool's call, in Claude's chat at the call's step.
+    record confirmation {
+        /// "Reply in «Backend · team»".
+        title: string,
+        /// Dim after the title: "to Peter".
+        subtitle: option<string>,
+        /// A quote over the text: (the author, the text) — the message answered.
+        quote: option<tuple<string, string>>,
+        /// What will be done: the message's text.
+        text: string,
+        /// The primary button (↵): "Send".
+        confirm: string,
+        /// A second button, none — no such: "Edit" (the plugin puts the text where the user edits
+        /// it).
+        edit: option<string>,
+        /// The last button (Esc): "Don't send".
+        reject: string,
+        /// Dim on the right of the buttons: "Edit puts the text into the chat's field".
+        hint: option<string>,
+    }
+
+    enum confirm-choice {
+        confirmed,
+        edit,
+        rejected,
+    }
+
+    /// Answers a call; an answer to a call that is gone (`tool-cancelled`) is dropped.
+    respond: func(call: u64, output: tool-output);
+    /// Shows the card of a call; the choice comes as `tool-confirmed`. Fails for a call that is
+    /// gone.
+    confirm: func(call: u64, card: confirmation) -> result<_, string>;
+}
+
+/// Claude for remote work (0.6): every Claude session of Flux — in every window, and the unloaded
+/// ones of the pult — and what the user could do with them at the computer: write, answer
+/// Claude's questions, permissions and plans, interrupt, change the mode, start a session in a
+/// project, look at a turn's changes and roll them back. For a plugin that brings Flux's sessions
+/// to the user elsewhere: a bot in a messenger. Needs the manifest's `claude-remote` permission —
+/// the install question warns that the plugin acts for the user in their sessions; Claude's
+/// permission modes apply as at the computer.
+///
+/// A session is named by the CLI's session id, which doesn't change while the session lives:
+/// unloaded, resumed, across Flux's restarts. What happens comes as the `claude-…` events and
+/// `system-changed` to the plugin's instances that `watch` — the service suits best, one for the
+/// whole app. The calls work in the windows' instances and in the service alike.
+interface claude-remote {
+    enum session-state {
+        /// The process is starting.
+        starting,
+        /// Claude works on a turn.
+        working,
+        /// A question waits for the user: a permission, Claude's questions, the plan.
+        waiting,
+        /// Nothing runs: the user's turn.
+        idle,
+        /// No process: a message resumes the session.
+        unloaded,
+    }
+
+    /// Claude's permission modes, as Flux names them.
+    enum mode {
+        /// «Ask»: before edits, commands that change things, the web.
+        ask,
+        /// «Accept edits»: edits and file commands in the project go through.
+        accept-edits,
+        /// «Plan»: Claude studies and proposes a plan; nothing changes before it is approved.
+        plan,
+        /// «No checks»: nothing is asked. A plugin that offers it warns the user first.
+        bypass,
+        /// Another mode of the CLI: shown, never set remotely.
+        other,
+    }
+
+    /// A tool call Claude asks to allow.
+    record permission-request {
+        /// The title as Flux's card has it: "Claude wants to run a command".
+        title: string,
+        /// The tool: "Bash", "Edit", "WebFetch", "mcp__…".
+        tool: string,
+        /// What the title is about: the command, the file, the URL.
+        subject: option<string>,
+        /// An edit's change: a unified diff, as short as the card's.
+        diff: option<string>,
+        /// The ways to allow beyond once, by (id, label): (…, "Allow for this session").
+        choices: list<tuple<string, string>>,
+    }
+
+    record question-option {
+        label: string,
+        description: string,
+    }
+
+    /// One of Claude's questions.
+    record question {
+        question: string,
+        /// A short label (up to 12 characters).
+        header: string,
+        options: list<question-option>,
+        multi-select: bool,
+    }
+
+    variant request-kind {
+        permission(permission-request),
+        /// Answered together.
+        questions(list<question>),
+        /// The plan, for approval: Markdown.
+        plan(string),
+    }
+
+    /// A question a session waits on.
+    record request {
+        /// The CLI's request id: the answer names it.
+        id: string,
+        kind: request-kind,
+    }
+
+    record session {
+        /// The CLI's session id.
+        id: string,
+        /// The project's folder, absolute.
+        project: string,
+        /// Claude's title or the user's; empty until there is one.
+        title: string,
+        state: session-state,
+        /// One line on what it does now, as the pult says it: "Reading 6 files…"; empty when
+        /// nothing runs.
+        activity: string,
+        mode: mode,
+        /// The window it is open in (as `service.windows` names it); none — unloaded.
+        window: option<u64>,
+        /// When it last did something: seconds since 1970-01-01 UTC.
+        updated: s64,
+        /// What it waits for the user to answer.
+        request: option<request>,
+        /// It finished a turn the user hasn't looked at yet: the pult's «Done».
+        unseen: bool,
+    }
+
+    /// The answer to a request.
+    variant response {
+        /// Allow: once (none), or with one of the request's `choices` (its id).
+        allow(option<string>),
+        /// Refuse; the text goes to Claude (empty — Flux's own).
+        deny(string),
+        /// The answers to the questions, in their order: the chosen labels, or the user's own text.
+        answers(list<list<string>>),
+        /// Approve the plan: then accept the edits (true), or ask for each.
+        approve-plan(bool),
+        /// Don't approve: Claude keeps planning with this feedback.
+        keep-planning(string),
+    }
+
+    /// A file a turn changed.
+    record turn-file {
+        /// Relative to the project when it is inside it; absolute otherwise.
+        path: string,
+        added: u32,
+        removed: u32,
+        created: bool,
+    }
+
+    /// What a turn did, at its end.
+    record turn-summary {
+        /// The turn's number in the session, from 1: `turn-diff` and the rollback name it.
+        turn: u32,
+        files: list<turn-file>,
+        /// The turn ended with an error: an API error, a limit, an interrupt.
+        failed: bool,
+        /// Claude's last message of the turn: Markdown.
+        text: string,
+        seconds: u32,
+    }
+
+    /// A group of Claude's steps, as the chat groups them: "Read 4 files · searched env_override".
+    record steps {
+        /// The group within the session: the same while it grows.
+        group: u64,
+        summary: string,
+        /// One line per step.
+        lines: list<string>,
+        /// The group ended: Claude wrote, asked or finished after it.
+        done: bool,
+    }
+
+    /// Claude's message as it is written.
+    record text-update {
+        session: string,
+        /// Names the message within the session.
+        message: u64,
+        /// The whole text so far: Markdown.
+        text: string,
+        /// Written to the end.
+        done: bool,
+    }
+
+    /// A message of the conversation.
+    record transcript-item {
+        /// The user's (true) or Claude's.
+        user: bool,
+        /// Markdown.
+        text: string,
+    }
+
+    /// What rolling a turn back would do.
+    record rollback-check {
+        /// The files that go back to what they were before the turn.
+        files: list<string>,
+        /// Of them, the ones changed on disk since Claude's last edit: that goes too.
+        changed-since: list<string>,
+        /// The files the turn created: they go to the Trash.
+        created: list<string>,
+    }
+
+    record usage-window {
+        /// 0–100.
+        percent: u8,
+        /// Seconds since 1970-01-01 UTC.
+        resets-at: s64,
+    }
+
+    /// The subscription's usage.
+    record usage-limits {
+        five-hour: option<usage-window>,
+        seven-day: option<usage-window>,
+        /// A limit is reached: Claude's requests fail until it resets.
+        rejected: bool,
+    }
+
+    /// The country check: Claude doesn't go from some countries.
+    variant region-state {
+        /// Claude goes: the country is allowed, or the check is off.
+        allowed,
+        /// The check runs: nothing new starts meanwhile.
+        checking,
+        /// Blocked: (the country's ISO code — empty when it couldn't be told, the sentence Flux
+        /// shows).
+        blocked(tuple<string, string>),
+    }
+
+    record system-state {
+        screen-locked: bool,
+        /// On the power adapter (a desktop is always).
+        on-power: bool,
+    }
+
+    enum system-event {
+        screen-locked,
+        screen-unlocked,
+        /// The computer goes to sleep: Flux holds it about two seconds, so a request goes out.
+        will-sleep,
+        did-wake,
+        on-power,
+        on-battery,
+    }
+
+    /// How the plugin wants the computer awake. Flux keeps it awake while any plugin asks;
+    /// closing a laptop's lid still puts it to sleep.
+    enum awake {
+        /// As the system decides.
+        off,
+        /// No sleep on its own while Flux runs.
+        always,
+        /// The same, only on the power adapter.
+        on-power,
+    }
+
+    record new-session-spec {
+        /// The project's folder, absolute: its window opens in the background when none has it.
+        project: string,
+        title: option<string>,
+        /// The first message, sent at once with the attachments and pictures; none — nothing is
+        /// sent.
+        prompt: option<string>,
+        /// Chips, by (label, Markdown Claude reads), as `claude.new-session`'s.
+        attachments: list<tuple<string, string>>,
+        /// Pictures: absolute paths in the plugin's data folder.
+        images: list<string>,
+        mode: mode,
+    }
+
+    /// A project Flux knows: a recent one, or one open in a window.
+    record project {
+        /// Absolute.
+        path: string,
+        /// The folder's name.
+        name: string,
+        /// A window has it open.
+        open: bool,
+    }
+
+    /// Starts (true) or stops the events for this instance.
+    watch: func(on: bool) -> result<_, string>;
+    /// Every session: live in any window, and the unloaded ones of the pults' «Now».
+    sessions: func() -> result<list<session>, string>;
+    /// The last `count` messages of a session.
+    transcript: func(session: string, count: u32) -> result<list<transcript-item>, string>;
+    /// A message to the session; an unloaded one resumes. Pictures: absolute paths in the plugin's
+    /// data folder.
+    send: func(session: string, text: string, images: list<string>) -> result<_, string>;
+    /// Answers a request; fails for one that is gone (answered at the computer meanwhile).
+    answer: func(session: string, request: string, response: response) -> result<_, string>;
+    /// Stops the turn.
+    interrupt: func(session: string) -> result<_, string>;
+    /// Changes the permission mode; `other` fails.
+    set-mode: func(session: string, mode: mode) -> result<_, string>;
+    /// Renames the session — its tab and the pult's row (`claude-session` brings the new title once
+    /// Claude Code has it); an unloaded one resumes for it.
+    rename: func(session: string, title: string) -> result<_, string>;
+    /// Closes the session as the Claude console's Close does: a live one ends (its process stops,
+    /// its chat goes), and it leaves «Now» for the history («Recent») — `claude-session-gone`
+    /// follows. Not archived; the user can resume it from the history.
+    close: func(session: string) -> result<_, string>;
+    /// Opens a new session: its id.
+    new-session: func(spec: new-session-spec) -> result<string, string>;
+    /// The unified diff of a turn (none — the last one).
+    turn-diff: func(session: string, turn: option<u32>) -> result<string, string>;
+    /// What rolling a turn back would do.
+    check-rollback: func(session: string, turn: option<u32>) -> result<rollback-check, string>;
+    /// Rolls a turn back without asking: the plugin has asked the user.
+    rollback: func(session: string, turn: option<u32>) -> result<_, string>;
+    /// The usage; Flux asks the CLI when no session runs.
+    limits: func() -> result<usage-limits, string>;
+    /// The country check; `check-again` — after the user changed the network.
+    region: func(check-again: bool) -> result<region-state, string>;
+    /// The recent projects and the open ones.
+    projects: func() -> result<list<project>, string>;
+    set-awake: func(mode: awake) -> result<_, string>;
+    system-status: func() -> result<system-state, string>;
+}
+
+/// Tasks between plugins (0.6): a tracker's plugin gives Flux the user's tasks — `task-source =
+/// true` in its manifest — and another plugin asks Flux for them (`find`, the `tasks`
+/// permission). A query comes to the source as `task-query`; its `respond` goes back to the one who
+/// asked. The source's service gets it when it has one, else its instance in a window.
+///
+/// The source's Claude actions on a task (a tracker's «Take to Work», the user's own ones) come
+/// with the task (`get`), and another plugin runs one with `run`: the query goes to the source's
+/// instance in the project's window — the work is the window's: Git, the tabs, Claude's chat — and
+/// the source answers with `started`.
+interface tasks {
+    /// One of the source's Claude actions on a task, as its settings have them (a tracker's «Take
+    /// to Work», the user's own ones): another plugin runs it with `run`.
+    record task-action {
+        /// Names the action in `run`: the source's own.
+        id: string,
+        /// As the user named it: "Take to Work".
+        title: string,
+        /// Claude starts in plan mode.
+        plan: bool,
+        /// The task is taken to work first: its status, its branch, its tabs, its timer.
+        start: bool,
+    }
+
+    record task {
+        /// "TRACK-142".
+        key: string,
+        title: string,
+        /// As the tracker names it: "In progress".
+        status: string,
+        url: option<string>,
+        /// The task's text and comments for Claude: Markdown; empty in lists (`get` fills it).
+        markdown: string,
+        /// The source's Claude actions on the task: `get` fills them, lists leave them empty.
+        actions: list<task-action>,
+        /// The plugin that gave the task — Flux fills it in, whatever the source says: `run` goes
+        /// there.
+        source: string,
+    }
+
+    /// One of a source's actions on a task, in a project (`run`).
+    record task-run {
+        /// The task's `source`.
+        source: string,
+        /// The task's key.
+        key: string,
+        /// The action's id.
+        action: string,
+        /// The project's folder, absolute: the action runs in its window, which Flux opens in the
+        /// background when none has it.
+        project: string,
+    }
+
+    /// What an action did (`run`).
+    record task-started {
+        /// The Claude session the action opened: `claude.new-session`'s id.
+        session: string,
+        /// What went otherwise than at the computer, a sentence each in the user's language: "The
+        /// branch TRACK-142-fix wasn't checked out: local changes are in the way."
+        notes: list<string>,
+    }
+
+    variant query {
+        /// The user's open tasks.
+        mine,
+        /// A search by the user's words.
+        search(string),
+        /// One task by its key, with its text, its comments and its actions.
+        get(string),
+        /// Do one of the source's actions (another plugin's `run`). It comes to the source's
+        /// instance in the project's window, and the answer is `started`, not `respond`. Nobody is
+        /// at the computer: ask nothing (no questions, forms, pickers; Git's `…-quietly` calls),
+        /// and tell in `notes` what was left out.
+        run(task-run),
+    }
+
+    record task-query {
+        /// Names the query in `respond` or `started`.
+        id: u64,
+        query: query,
+    }
+
+    /// Asks the sources (every one, merged in their order); fails when none answers in 10 seconds,
+    /// with "No plugin gives tasks" when no source runs (an asker may skip its tasks then), and with
+    /// a source's own sentence when it is the only one and it fails ("Sign in…").
+    /// A `run` goes by `run`.
+    find: func(query: query) -> result<list<task>, string>;
+    /// A source's answer to `task-query`.
+    respond: func(id: u64, tasks: result<list<task>, string>);
+    /// Runs a source's action on a task and waits for it, up to a minute (`tasks` permission):
+    /// the session it opened. The project's window opens in the background when none has it.
+    run: func(run: task-run) -> result<task-started, string>;
+    /// A source's answer to a `run` query.
+    started: func(id: u64, %result: result<task-started, string>);
+}
+
+/// What happens in the window, the answers to the plugin's questions, and the news of its
+/// background work: timers, requests, the server, programs, terminals, proposals.
+interface events {
+    use types.{editor-info};
+    use http.{response-head, http-error};
+    use server.{server-request, ws-open, ws-message};
+    use process.{process-output};
+    use review.{proposal-outcome};
+    use ui.{composed, panel-tab};
+    use tools.{tool-call, confirm-choice};
+    use claude-remote.{session, text-update, steps, request, turn-summary, usage-limits, region-state, system-event};
+    use tasks.{task-query};
+
+    variant ui-event {
+        /// A button was pressed.
+        clicked,
+        /// The text field's text changed.
+        changed(string),
+        /// ↵ in the text field.
+        submitted(string),
+        toggled(bool),
+        /// A row became selected: a click, the arrows.
+        selected(string),
+        /// A row was opened: ↵, a double click, a click on a row without children.
+        activated(string),
+        /// A row was expanded (true) or collapsed.
+        expanded(tuple<string, bool>),
+        /// A row's button was pressed (0.3): (the row's key, the action's id).
+        row-action(tuple<string, string>),
+        /// A conversation (0.5) scrolled near its oldest message while `older` is `more`: the
+        /// plugin loads a page (`older(loading)`, `put`, `older(more | complete)`).
+        load-older,
+        /// …near its newest one while `newer` is `more`.
+        load-newer,
+        /// The messages on screen changed (0.5): the first and the last, by id — to mark them read
+        /// and download what is seen first. One event for a burst of scrolling. Only while the
+        /// user can see them: the conversation is in sight in the active window — it comes again
+        /// when the window becomes active or the conversation comes into sight.
+        visible(tuple<string, string>),
+        /// A message's action was chosen (0.5): (the message, the action's id).
+        message-action(tuple<string, string>),
+        /// A message's action was chosen while part of its text was selected (0.5), in place of
+        /// `message-action`: (the message, the action's id, the selected text, where it starts in
+        /// the message's text — in UTF-16 code units). The message's text is that of its `text`,
+        /// `quote` and `code` parts in order (a part's spans joined, a code block's text as it
+        /// came), a line break between two parts, empty parts left out; the selected text is the
+        /// stretch of it that starts there — a reply quoting part of the message.
+        message-action-quoted(tuple<string, string, string, u32>),
+        /// A part of a message was clicked (0.5) that Flux can't open by itself: a file or a
+        /// picture not downloaded, a placeholder — (the message, the part's index).
+        part-clicked(tuple<string, u32>),
+        /// A link that isn't a web one was clicked (0.5) — any link, a link preview's too, with
+        /// the conversation's `own-links`: (the message, the link).
+        link-clicked(tuple<string, string>),
+        /// A quote whose message isn't loaded was clicked (0.5): (the message, the quoted one).
+        quote-clicked(tuple<string, string>),
+        /// The field was sent (0.5): ↵ or Send; the field is empty again.
+        composed(composed),
+        /// The field was sent by one of its `send-options` (0.5, part 5): (the option's id, what
+        /// was sent); the field is empty again, as after `composed`.
+        composed-with(tuple<string, composed>),
+        /// A button of the field was pressed (0.5): (its id, what is in the field — it stays).
+        composer-action(tuple<string, composed>),
+        /// The field's text changed (0.5): for "typing…" and the draft. One event for a burst.
+        draft-changed(string),
+        /// The quote over the field was closed (0.5).
+        reply-cancelled,
+        /// The edited message's new text (0.5): ↵ in the field while it edits (`editing`) — the
+        /// message's id and the text.
+        edited(tuple<string, string>),
+        /// The editing was left (0.5): Esc in the field, or the bar's ×.
+        edit-cancelled,
+        /// ↑ in the empty field (0.5), as in messengers: the plugin may answer with `editing` of
+        /// the user's last message it lets edit.
+        edit-last,
+        /// ⌘F (Ctrl+F) in the window (0.5): the plugin shows its search — a chat's. The element is
+        /// the window's root.
+        find,
+        /// ⌘G (F3) and ⇧⌘G (⇧F3) in the window (0.5): the next and the previous match of the
+        /// plugin's search.
+        find-next,
+        find-previous,
+        /// Esc in a text field (0.5): close what the field belongs to (a search bar). Sent for the
+        /// field's element in a tool window or a tab; in a dialog Esc closes the dialog.
+        cancelled,
+        /// A voice message, or a round one with sound, started playing for the first time since
+        /// it was put (0.5, part 4): (the message, the part's index) — the plugin marks it
+        /// listened to (`unheard`).
+        media-played(tuple<string, u32>),
+        /// A tab of the field's panel was opened (0.5, part 4): the plugin sends its content
+        /// (`panel`) — again on every opening, so it can be fresh.
+        panel-opened(panel-tab),
+        /// A search in a panel's tab (0.5, part 4): (the tab, the text); empty — the search was
+        /// cleared. One event for a burst of typing. The emoji tab searches by itself.
+        panel-searched(tuple<panel-tab, string>),
+        /// An item of the panel was chosen (0.5, part 4): (the tab, the item's key) — the plugin
+        /// sends it (a sticker, a GIF), answering the quote over the field if there is one. The
+        /// panel stays open.
+        panel-chosen(tuple<panel-tab, string>),
+        /// The panel's items on screen changed (0.5, part 4): (the tab, the first key, the last
+        /// key, in the order of the content) — to download what is seen. One event for a burst.
+        panel-visible(tuple<panel-tab, string, string>),
+        /// The panel's tab scrolled near its end while its `more` is `more` (0.5, part 4).
+        panel-load-more(panel-tab),
+        /// The bar of the pinned message was clicked (0.5, part 5): its message — the plugin
+        /// reveals it and shows the next older pinned one (`pinned`).
+        pinned-clicked(string),
+        /// An action of the pinned message's bar was pressed (0.5, part 5): (the message, the
+        /// action's id).
+        pinned-action(tuple<string, string>),
+        /// The field asks for suggestions (0.5, part 5): (the trigger, the text typed after it up
+        /// to the caret) — when a trigger of `composer-spec.triggers` is typed, then once per
+        /// burst of typing; the plugin answers with `suggestions` for that text. A space, a line
+        /// break or the caret leaving the word closes the list.
+        suggest(tuple<string, string>),
+        /// A button under a message was pressed (0.5, part 5): (the message, the button's id); one
+        /// of the bot's keyboard over the field (`reply-keyboard`): ("", the button's id).
+        keyboard-pressed(tuple<string, string>),
+        /// An action on the selected messages was chosen (0.5, part 5): (the action's id of
+        /// `selection-actions`, the messages in the feed's order); the selection has ended.
+        selection-action(tuple<string, list<string>>),
+        /// The forwarding bar over the field was closed (0.5, part 5): its ×.
+        forward-cancelled,
+        /// A vote in a poll (0.5, part 5): (the message, the part's index, the chosen options'
+        /// indices, in order). The plugin sends the poll again, answered.
+        poll-voted(tuple<string, u32, list<u32>>),
+        /// A reaction was chosen in the ☺ row, or a reaction of `reactions` under a message was
+        /// clicked (0.5, part 5): (the message, the emoji) — the plugin puts the user's own, or
+        /// takes it back when it is `chosen`.
+        reaction-toggled(tuple<string, string>),
+    }
+
+    record ui-input {
+        window: string,
+        element: string,
+        event: ui-event,
+    }
+
+    variant event {
+        /// The active tab changed: its document, or none.
+        active-editor-changed(option<editor-info>),
+        editor-opened(editor-info),
+        editor-closed(u64),
+        /// The text changed: typing, undo, a reload from disk. One event for a burst.
+        editor-changed(u64),
+        /// The selections or the cursor moved. One event for a burst.
+        selection-changed(u64),
+        /// The document was written to disk.
+        editor-saved(editor-info),
+        /// The window's project root changed.
+        project-changed(option<string>),
+        /// The plugin's settings changed: Settings → the plugin.
+        settings-changed,
+        tool-window-shown(string),
+        tool-window-hidden(string),
+        /// The answer to `dialogs.ask`: the index of the pressed button; none — dismissed.
+        dialog-answered(tuple<u64, option<u32>>),
+        /// The answer to `dialogs.ask-text`: the text; none — cancelled.
+        text-answered(tuple<u64, option<string>>),
+        ui(ui-input),
+        /// A timer fired.
+        timer(u64),
+        /// A started request's status and headers.
+        http-response(response-head),
+        /// A chunk of a started request's body.
+        http-body(tuple<u64, list<u8>>),
+        /// A started request ended: its whole body has come, or why not.
+        http-done(tuple<u64, result<_, http-error>>),
+        /// A request to the plugin's server.
+        server-request(server-request),
+        /// The client of a streamed answer went away (the request's id).
+        stream-closed(u64),
+        ws-opened(ws-open),
+        ws-message(tuple<u64, ws-message>),
+        ws-closed(u64),
+        /// Output of a started program.
+        process-output(process-output),
+        /// A started program ended: its exit code; none — a signal.
+        process-exited(tuple<u64, option<s32>>),
+        /// The command of a terminal ended (its tab stays): the exit code, when known.
+        terminal-exited(tuple<u64, option<s32>>),
+        /// A terminal's tab was closed.
+        terminal-closed(u64),
+        /// The answer to a proposal.
+        proposal-answered(tuple<u64, proposal-outcome>),
+        /// The status, a branch or a HEAD of a repository changed.
+        git-changed,
+        /// The problems of files changed: their paths, absolute.
+        diagnostics-changed(list<string>),
+        /// The answer to `dialogs.ask-form`: the values by the fields' keys; none — cancelled.
+        form-answered(tuple<u64, option<list<tuple<string, string>>>>),
+        /// The query of a `live-query` picker changed (a burst of typing — one event).
+        picker-query(tuple<u64, string>),
+        /// A picker closed: the chosen item's key; none — dismissed.
+        picker-chosen(tuple<u64, option<string>>),
+        /// A link was clicked: (the pattern's id, the text).
+        link-activated(tuple<string, string>),
+        /// A link wants a tooltip: (the request for `links.describe`, the pattern's id, the text).
+        link-hovered(tuple<u64, string, string>),
+        /// `git.new-branch` or `git.checkout` ended: done, or why not (the user declined, git
+        /// failed — Flux has told the user); a `…-quietly` one's why is a sentence for the user,
+        /// and Flux has told nobody when local changes were in the way.
+        git-done(tuple<u64, result<_, string>>),
+        /// The tab `<window>/<key>` of a window with tabs was closed (0.5): by the user, by
+        /// `hide`, with the window. `tool-window-hidden` comes when it only goes out of sight.
+        tab-closed(string),
+        /// The answer to `dialogs.pick-files` (0.5): the absolute paths; none — cancelled.
+        files-picked(tuple<u64, option<list<string>>>),
+        /// A message by `service.send` (0.5): in the service — from the window with this id; in a
+        /// window's instance — from the service (none).
+        service-message(tuple<option<u64>, string>),
+        /// In the service (0.5): the plugin's instance in a window started (the window's id).
+        window-opened(u64),
+        /// In the service (0.5): the plugin's instance in a window stopped — the window closed,
+        /// the plugin was reloaded there.
+        window-closed(u64),
+        /// In a window's instance (0.5): the service started — the first time, or again after a
+        /// stop — and knows nothing of the window yet.
+        service-started,
+        /// Claude called one of the plugin's tools (0.5).
+        tool-called(tool-call),
+        /// The user answered the card of a call (0.5).
+        tool-confirmed(tuple<u64, confirm-choice>),
+        /// A call is gone (0.5): Claude was interrupted, the session closed. Its card goes; an
+        /// answer is dropped.
+        tool-cancelled(u64),
+        /// A Claude session appeared or changed (0.6, `claude-remote.watch`): its state, title,
+        /// mode, activity, request.
+        claude-session(session),
+        /// A session left the pult (0.6): closed, archived — its id.
+        claude-session-gone(string),
+        /// Claude's message as it is written (0.6): the whole text so far, about four times a
+        /// second at most.
+        claude-text(text-update),
+        /// A group of steps grew or ended (0.6): (the session, the group).
+        claude-steps(tuple<string, steps>),
+        /// A question to answer (0.6): (the session, the request).
+        claude-request(tuple<string, request>),
+        /// The question went (0.6): answered at the computer or by a plugin, withdrawn by Claude —
+        /// (the session, the request's id).
+        claude-resolved(tuple<string, string>),
+        /// A turn ended (0.6): (the session, what it did).
+        claude-turn-ended(tuple<string, turn-summary>),
+        /// A session's process failed (0.6): (the session, the error).
+        claude-failed(tuple<string, string>),
+        /// The usage changed (0.6).
+        claude-limits(usage-limits),
+        /// The country check changed (0.6).
+        claude-region(region-state),
+        /// The screen lock, sleep or power changed (0.6, `claude-remote.watch`).
+        system-changed(system-event),
+        /// The user chose the plugin's action at a session in the pult (0.6, `[[claude-actions]]`):
+        /// (the session, the action's id) — to the plugin's watching instances.
+        claude-action(tuple<string, string>),
+        /// Another plugin asks for tasks (0.6, `task-source = true`): answer with `tasks.respond`;
+        /// a `run` — with `tasks.started`.
+        task-query(task-query),
+    }
+}
+
+/// A Flux plugin. Flux calls the exports on the plugin's own thread, one call at a time; a call
+/// longer than the time limit stops the plugin, and Flux tells the user. Waiting inside a call —
+/// for a response, a program, the window — doesn't count toward the limit.
+world plugin {
+    import types;
+    import log;
+    import i18n;
+    import commands;
+    import notifications;
+    import dialogs;
+    import editors;
+    import project;
+    import storage;
+    import settings;
+    import status-bar;
+    import ui;
+    import http;
+    import server;
+    import process;
+    import terminal;
+    import review;
+    import git;
+    import diagnostics;
+    import secrets;
+    import timers;
+    import system;
+    import picker;
+    import links;
+    import claude;
+    import contexts;
+    import service;
+    import tools;
+    import claude-remote;
+    import tasks;
+
+    use types.{command-context};
+    use events.{event};
+
+    /// The plugin was loaded: the window opened, or the user turned the plugin on; the service
+    /// (0.5): the first window runs the plugin.
+    export activate: func();
+    /// The plugin is about to be unloaded: turned off, reloaded, the window is closing; the
+    /// service: Flux quits, the plugin is turned off or reloaded.
+    export deactivate: func();
+    /// One of the plugin's commands was run: from where, and what it acts on.
+    export run-command: func(command: string, context: command-context);
+    export on-event: func(event: event);
+}

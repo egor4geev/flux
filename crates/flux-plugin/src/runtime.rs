@@ -9,7 +9,7 @@
 //! to restart it. The limit is on the plugin's own time: what a call waits for inside the API (a
 //! response, a program, the window — `HostState::waited`) is given back by the epoch's callback.
 //! Components are compiled by Cranelift once and cached in `paths::cache_dir()`. A component built
-//! for an older API (0.2, 0.3 and 0.4) is linked and called through its own bindings
+//! for an older API (0.2, 0.3 and 0.4, 0.5) is linked and called through its own bindings
 //! ([`crate::compat`]); the manifest's `api` must name the version the component imports.
 //!
 //! The sandbox is WASI 0.2: the project root (as the manifest's `project` permission says), the
@@ -385,6 +385,22 @@ pub enum HostCall {
         call: WindowCall,
         reply: Sender<WindowReply>,
     },
+    /// A call of `claude-remote` (API 0.6; the permission checked): the app carries it out for the
+    /// whole app ([`crate::claude_remote`]) — from a window's instance and from the service alike.
+    /// The plugin's thread waits for the reply.
+    Claude {
+        call: crate::claude_remote::RemoteCall,
+        reply: Sender<crate::claude_remote::RemoteReply>,
+    },
+    /// `tasks.run` (API 0.6; the permission checked): the window of a project (its folder) —
+    /// opened in the background when none has it — once it is ready for a task's action (its
+    /// repositories found, Claude's check done). The reply is the window's id among the plugins'
+    /// instances ([`InstanceRole::Window`]), or why there is none: a plain sentence. From a
+    /// window's instance and from the service alike; the plugin's thread waits.
+    ProjectWindow {
+        project: String,
+        reply: Sender<Result<u64, String>>,
+    },
 }
 
 /// The calls the window does the work of. Ids of terminals are the window's (it opens them); ids
@@ -436,17 +452,21 @@ pub enum WindowCall {
     GitBranches(String),
     /// `git.new-branch` (`project = "write"` checked): no reply; how it ended goes back as
     /// `Event::GitDone(id, …)` — after Flux's own questions (Smart Checkout) and messages.
+    /// `quiet` — `new-branch-quietly` (API 0.6): nothing is asked; local changes in the way make
+    /// it fail, and nothing changes.
     GitNewBranch {
         id: u64,
         root: String,
         name: String,
         start: Option<String>,
+        quiet: bool,
     },
-    /// `git.checkout`: as `GitNewBranch`.
+    /// `git.checkout`: as `GitNewBranch` (`quiet` — `checkout-quietly`).
     GitCheckout {
         id: u64,
         root: String,
         branch: String,
+        quiet: bool,
     },
     /// `git.set-commit-template`: no reply.
     SetCommitTemplate(Option<CommitTemplate>),
@@ -457,7 +477,7 @@ pub enum WindowCall {
         request: u64,
         markdown: Option<String>,
     },
-    /// `claude.new-session` (the `claude` permission checked) → `Done`.
+    /// `claude.new-session` (the `claude` permission checked) → `Session`.
     NewClaudeSession(SessionSpec),
     /// `contexts.switch` → `Done`. The keys are the plugin's own: the window keeps them apart
     /// from other plugins' and the user's.
@@ -480,6 +500,8 @@ pub enum WindowReply {
     Text(Result<String, String>),
     Diagnostics(Vec<FileDiagnostics>),
     Branches(Result<Vec<Branch>, String>),
+    /// A new Claude session's id (the CLI's).
+    Session(Result<String, String>),
 }
 
 /// Posts events into a plugin's own queue: the API's background work (a started request, the
@@ -807,7 +829,8 @@ fn run(
 
 /// Puts a call into the queue; a document's `editor-changed` or `selection-changed`, or a timer's
 /// tick, already waiting there makes a new one unnecessary; a picker's query waiting there is
-/// replaced by the newer one (the plugin searches for what the user typed last).
+/// replaced by the newer one (the plugin searches for what the user typed last), and so is a
+/// Claude message's text (API 0.6: each one is the whole text so far).
 fn enqueue(queue: &mut VecDeque<Call>, call: Call) {
     let waiting = |event: &Event| {
         queue.iter().any(|queued| match queued {
@@ -821,6 +844,16 @@ fn enqueue(queue: &mut VecDeque<Call>, call: Call) {
         && waiting(event)
     {
         return;
+    }
+    if let Call::Event(Event::ClaudeText(text)) = &call {
+        let older = queue.iter_mut().find(|queued| {
+            matches!(queued, Call::Event(Event::ClaudeText(queued))
+                if queued.session == text.session && queued.message == text.message)
+        });
+        if let Some(older) = older {
+            *older = call;
+            return;
+        }
     }
     if let Call::Event(Event::PickerQuery((picker, _))) = &call {
         let older = queue.iter_mut().find(|queued| {
@@ -842,6 +875,8 @@ enum Exports {
     V0_2(crate::compat::bindings::Plugin),
     /// Built for 0.3 or 0.4 ([`crate::compat::v03`]).
     V0_3(crate::compat::v03::bindings::Plugin),
+    /// Built for 0.5 ([`crate::compat::v05`]).
+    V0_5(crate::compat::v05::bindings::Plugin),
 }
 
 impl Exports {
@@ -850,6 +885,7 @@ impl Exports {
             Exports::Current(plugin) => plugin.call_activate(store),
             Exports::V0_2(plugin) => plugin.call_activate(store),
             Exports::V0_3(plugin) => plugin.call_activate(store),
+            Exports::V0_5(plugin) => plugin.call_activate(store),
         }
     }
 
@@ -858,6 +894,7 @@ impl Exports {
             Exports::Current(plugin) => plugin.call_deactivate(store),
             Exports::V0_2(plugin) => plugin.call_deactivate(store),
             Exports::V0_3(plugin) => plugin.call_deactivate(store),
+            Exports::V0_5(plugin) => plugin.call_deactivate(store),
         }
     }
 
@@ -877,6 +914,8 @@ impl Exports {
                 command,
                 &crate::compat::v03::command_context(context),
             ),
+            // 0.6 kept 0.5's context: the same type.
+            Exports::V0_5(plugin) => plugin.call_run_command(store, command, context),
         }
     }
 
@@ -890,7 +929,12 @@ impl Exports {
             },
             Exports::V0_3(plugin) => match crate::compat::v03::event(event) {
                 Some(event) => plugin.call_on_event(store, &event),
-                // A 0.5 event: the plugin can't have asked for it.
+                // A 0.5 or 0.6 event: the plugin can't have asked for it.
+                None => Ok(()),
+            },
+            Exports::V0_5(plugin) => match crate::compat::v05::event(event) {
+                Some(event) => plugin.call_on_event(store, &event),
+                // A 0.6 event: the plugin can't have asked for it.
                 None => Ok(()),
             },
         }
@@ -1013,6 +1057,12 @@ impl Runner {
                 &shared.linker,
             )
             .map(Exports::V0_3),
+            crate::compat::v05::API => crate::compat::v05::bindings::Plugin::instantiate(
+                &mut self.store,
+                component,
+                &shared.linker,
+            )
+            .map(Exports::V0_5),
             _ => Plugin::instantiate(&mut self.store, component, &shared.linker)
                 .map(Exports::Current),
         };
@@ -1197,6 +1247,10 @@ fn new_store(
         timers: Default::default(),
         tool_calls: Default::default(),
         helpers: Default::default(),
+        watching: None,
+        task_source: config.entry.manifest.task_source.then(|| {
+            crate::host::tasks::join(id, &config.entry.manifest.name, config.role, &config.events)
+        }),
     };
     // A plugin that runs programs needs the login shell's environment: it is read in the
     // background now rather than when the first program starts.

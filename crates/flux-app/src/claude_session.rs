@@ -242,10 +242,15 @@ impl ClaudeSession {
     /// `plugins` — the window's: the tools of those running join the server.
     pub fn new(
         cli: Cli,
-        options: LaunchOptions,
+        mut options: LaunchOptions,
         plugins: Option<WeakEntity<PluginStore>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // The CLI's id from the first moment (`--session-id`): the hub of remote work names the
+        // session by it before Claude says anything (API 0.6, [`Self::cli_id`]).
+        if options.resume.is_none() && options.session_id.is_none() {
+            options.session_id = Some(flux_claude::process::new_uuid());
+        }
         let mut session = Self::idle(cli, options, plugins);
         session.watch_region(cx);
         session.watch_plugins(cx);
@@ -589,6 +594,13 @@ impl ClaudeSession {
 
     pub fn session_id(&self) -> Option<&str> {
         self.model.info.session_id.as_deref()
+    }
+
+    /// The CLI's session id, also before the first turn: the one Flux gave a new session
+    /// (`--session-id`) until the CLI confirms it. [`Self::session_id`] stays `None` until then —
+    /// a session nothing was said in has no transcript to resume.
+    pub fn cli_id(&self) -> Option<&str> {
+        self.session_id().or(self.options.session_id.as_deref())
     }
 
     /// Sends the user's message; a session whose process exited starts again, resuming the

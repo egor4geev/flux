@@ -313,6 +313,10 @@ impl PluginServices {
             HostCall::SetSetting { key, value } => {
                 crate::settings::set_plugin_value(&plugin, &key, value, cx);
             }
+            HostCall::Claude { call, reply } => crate::claude_hub::handle(&plugin, call, reply, cx),
+            HostCall::ProjectWindow { project, reply } => {
+                crate::plugin_tasks::project_window(&project, reply, cx)
+            }
             call @ (HostCall::HelperProgress { .. } | HostCall::Window { .. }) => {
                 if let Some(store) = active_store(cx) {
                     store.update(cx, |store, cx| store.service_call(plugin, call, cx));

@@ -1,17 +1,20 @@
 //! The plugin API on Flux's side: the functions of the WIT interfaces a plugin calls, run on the
 //! plugin's thread. What needs the window becomes a [`HostCall`] message (documents and
-//! [`window`]'s interfaces wait for the window's reply); the rest — the log, translations, the
-//! project search, storage, settings, and the background work of [`http`], [`server`],
-//! [`process`], [`timers`], [`secrets`] — is answered right here. Calls that name something the
+//! [`window`]'s interfaces wait for the window's reply; so do [`claude_remote`]'s calls, which
+//! the app answers for the whole app); the rest — the log, translations, the project search,
+//! storage, settings, the background work of [`http`], [`server`], [`process`], [`timers`],
+//! [`secrets`], and the queries of [`tasks`] between plugins — is answered right here. Calls that name something the
 //! manifest doesn't declare (a command, a status bar item, a tool window) are skipped with a
 //! warning in the plugin's log: that's where the plugin's author looks. Calls the manifest's
 //! permissions don't allow fail with an error that names the permission.
 
+pub(crate) mod claude_remote;
 mod http;
 mod process;
 mod secrets;
 mod server;
 mod service;
+pub(crate) mod tasks;
 mod timers;
 mod tools;
 mod window;
@@ -99,6 +102,12 @@ pub(crate) struct HostState {
     /// The paths `process.helper` gave (API 0.5): `run` and `spawn` take exactly these without the
     /// `processes` permission.
     pub helpers: HashSet<String>,
+    /// The instance watches Claude's sessions (API 0.6, `claude-remote.watch`): its place among
+    /// the watchers, left when the store is gone.
+    pub watching: Option<crate::claude_remote::Watch>,
+    /// The instance answers queries for tasks (API 0.6, `task-source = true`): its place among
+    /// the sources.
+    pub task_source: Option<tasks::Source>,
 }
 
 /// The first id of the service's notifications (API 0.5): they go to the windows, whose stores
