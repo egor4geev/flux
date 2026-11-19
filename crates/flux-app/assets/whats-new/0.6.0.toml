@@ -1,0 +1,27 @@
+# What's New in Flux 0.6: Claude from your phone, plugin API 0.6 (format: 0.1.0.toml).
+version = "0.6.0"
+date = "2026-11-20"
+
+[[items]]
+icon = "puzzle"
+color = "blue"
+title = "Flux Remote: Claude from your phone"
+text = "A plugin in the catalog runs your Claude sessions through your own Telegram bot: a topic per session, answers as they are written, permissions and questions by buttons, tasks from your tracker, the turn's changes as a file and a rollback. No server — Flux talks to Telegram itself."
+ru.title = "Flux Remote: Claude с телефона"
+ru.text = "Плагин из каталога ведёт сессии Claude через ваш собственный бот в Telegram: тема на сессию, ответ по мере печати, разрешения и вопросы кнопками, задачи из трекера, изменения хода файлом и откат. Без сервера — Flux сам говорит с Telegram."
+
+[[items]]
+icon = "claude"
+color = "orange"
+title = "Continue in Telegram"
+text = "At a session in the Claude console: Continue in Telegram sends it to the bot. While the Mac is locked, every session's questions come to the phone, and Flux keeps the Mac awake while remote sessions work."
+ru.title = "Продолжить в Telegram"
+ru.text = "У сессии в пульте Claude: «Продолжить в Telegram» — и она уходит в бот. Пока мак заблокирован, вопросы всех сессий приходят на телефон, а пока удалённые сессии работают, Flux не даёт маку уснуть."
+
+[[items]]
+icon = "plug"
+color = "violet"
+title = "Plugins can do more"
+text = "Plugin API 0.6: Claude for remote work — every session of every window, its answers and questions, new sessions in any project — tasks shared between plugins with the tracker's own Claude actions, and the computer's lock and sleep."
+ru.title = "Плагины умеют больше"
+ru.text = "API плагинов 0.6: Claude для удалённой работы — все сессии всех окон, их ответы и вопросы, новые сессии в любом проекте, — задачи между плагинами со своими действиями Claude трекера, блокировка и сон компьютера."

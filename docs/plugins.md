@@ -170,7 +170,7 @@ The SDK's shortcuts:
 | `status::{set, hide, item}` | The plugin's status bar items. |
 | `view::*` | A tool window's content ([Tool windows](#tool-windows)). |
 | `view::{open_tab, set_badge}`, `conversation::{update, put…}` | API 0.5: a window's tabs, its mark, a conversation ([Windows on the left, tabs, badges](#windows-on-the-left-tabs-badges), [The conversation](#the-conversation)). |
-| `remote::{watch, sessions, send, allow, new_session…}`, `tasks::{mine, search, get, respond}` | API 0.6: every Claude session for remote work, tasks between plugins ([Claude for remote work](#claude-for-remote-work), [Tasks between plugins](#tasks-between-plugins)). |
+| `remote::{watch, sessions, send, allow, rename, close, new_session…}`, `tasks::{mine, search, get, run, respond, started}` | API 0.6: every Claude session for remote work, tasks between plugins ([Claude for remote work](#claude-for-remote-work), [Tasks between plugins](#tasks-between-plugins)). |
 | `CommandContext` — `path`, `selection`, `selected_text`, `from_menu` | What a command acts on. |
 | `http::{get, post, request…}`, `http::EventStream` | Requests to web services ([The network](#the-network)). |
 | `server::{listen, respond_html, start_events, ws_send_text…}` | The plugin's server on 127.0.0.1 ([A local server](#a-local-server)). |

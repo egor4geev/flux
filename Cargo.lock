@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "flux-app"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "block",
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "flux-claude"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "flux-platform",
@@ -2131,7 +2131,7 @@ dependencies = [
 
 [[package]]
 name = "flux-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ropey",
  "unicode-segmentation",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "flux-fs"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "flux-platform",
  "ignore",
@@ -2152,7 +2152,7 @@ dependencies = [
 
 [[package]]
 name = "flux-git"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "flux-platform",
  "imara-diff",
@@ -2163,7 +2163,7 @@ dependencies = [
 
 [[package]]
 name = "flux-lsp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "flux-core",
  "flux-platform",
@@ -2179,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "flux-media"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "block2",
  "core-foundation 0.10.0",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "flux-platform"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "flux-plugin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "flate2",
@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "flux-plugin-api"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2243,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "flux-search"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "flux-core",
  "flux-fs",
@@ -2258,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "flux-syntax"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "flux-core",
  "flux-platform",
@@ -2279,7 +2279,7 @@ dependencies = [
 
 [[package]]
 name = "flux-term"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "alacritty_terminal",
  "flux-platform",
@@ -2290,7 +2290,7 @@ dependencies = [
 
 [[package]]
 name = "flux-update"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "flux-platform",
