@@ -1616,7 +1616,7 @@ impl ClaudeConsole {
         if !crate::settings::claude(cx).show_limits {
             return None;
         }
-        let limits = self.store.read(cx).limits()?.clone();
+        let limits = claude::limits(cx)?.clone();
         let now = SystemTime::now();
         let rows: Vec<AnyElement> = [
             (tr("5 h"), limits.five_hour),

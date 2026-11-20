@@ -9124,8 +9124,7 @@ impl Workspace {
         let ui = Theme::ui(cx);
         let store = self.claude.read(cx);
         let activity = store.activity(cx);
-        let limits = store
-            .limits()
+        let limits = claude::limits(cx)
             .filter(|_| crate::settings::claude(cx).show_limits)
             .cloned();
         // The state as a key too: a new one fades in (`crate::motion`).
