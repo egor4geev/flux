@@ -175,6 +175,8 @@ fn main() {
     }
     // Flux's log and crash reports (part 10.6), before anything can print or panic.
     app_log::start();
+    #[cfg(unix)]
+    raise_open_files_limit();
     #[cfg(windows)]
     set_app_user_model_id();
     // A UI scenario doesn't touch the user's plugins, their data and logs (as it doesn't touch
@@ -355,6 +357,43 @@ fn set_app_user_model_id() {
     };
     if result < 0 {
         log::warn!("SetCurrentProcessExplicitAppUserModelID failed: {result:#x}");
+    }
+}
+
+/// macOS starts an app with room for 256 open files (`launchctl limit maxfiles`): a few projects'
+/// git, file watchers, language servers, plugins and Claude sessions ran out of it — "Too many open
+/// files" (0.6.2). Flux takes what the system lets a process have; the programs it starts inherit
+/// it.
+#[cfg(unix)]
+fn raise_open_files_limit() {
+    /// macOS refuses more than `OPEN_MAX` (`getrlimit(2)`: use `min(OPEN_MAX, rlim_max)`).
+    #[cfg(target_os = "macos")]
+    const OPEN_MAX: libc::rlim_t = 10_240;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: the call fills the struct it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let wanted = limit.rlim_max.min(OPEN_MAX);
+    #[cfg(not(target_os = "macos"))]
+    let wanted = limit.rlim_max;
+    if limit.rlim_cur >= wanted {
+        return;
+    }
+    let before = limit.rlim_cur;
+    limit.rlim_cur = wanted;
+    // SAFETY: as above; only the soft limit changes, within the hard one.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0 {
+        log::info!("open files: up to {wanted} (was {before})");
+    } else {
+        log::warn!(
+            "open files: staying at {before}: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 

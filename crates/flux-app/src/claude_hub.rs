@@ -38,7 +38,7 @@ use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EntityId, Global, Subscription, Task, WeakEntity,
 };
 
-use crate::claude::{ClaudeStore, ClaudeStoreEvent, CliState, ConsoleItem};
+use crate::claude::{self, ClaudeStore, ClaudeStoreEvent, CliState, ConsoleItem, LatestLimits};
 use crate::claude_console::SessionRef;
 use crate::claude_session::{Attachment, ClaudeSession, SessionDraft, SessionEvent};
 use crate::claude_transcript::Item;
@@ -49,7 +49,9 @@ use crate::workspace::Workspace;
 /// Claude's text and steps go out at most this often per session while they grow: about four a
 /// second.
 const TEXT_PACE: Duration = Duration::from_millis(250);
-/// The limits the CLI was asked for without a session are good this long.
+/// The newest limits answer a plugin as they are this long; older ones — the CLI is asked again:
+/// they change with no session of Flux running (Claude elsewhere, a window that reset), and a
+/// session reports them only when a share moves.
 const LIMITS_FRESH: Duration = Duration::from_secs(60);
 /// How long the probe of the limits waits for the CLI, and how often it asks again while the CLI
 /// hasn't fetched them yet (it answers `rate_limits: null` right after it starts).
@@ -74,8 +76,6 @@ pub(crate) struct ClaudeHub {
     posted: HashMap<String, (EntityId, RemoteSession)>,
     /// The limits last posted.
     limits: Option<Limits>,
-    /// The limits the probe got, and when.
-    probed: Option<(Instant, Limits)>,
     probe: Option<Task<()>>,
     probe_waiters: Vec<Sender<RemoteReply>>,
     /// New sessions waiting for their window's `claude` check (a window just opened).
@@ -83,6 +83,8 @@ pub(crate) struct ClaudeHub {
     /// The country check as last posted.
     region: Option<RegionState>,
     _region: Option<Subscription>,
+    /// New limits (a session of any window, the probe): the plugins hear them.
+    _limits: Subscription,
 }
 
 struct FollowedStore {
@@ -216,12 +218,12 @@ impl ClaudeHub {
             sessions: HashMap::new(),
             posted: HashMap::new(),
             limits: None,
-            probed: None,
             probe: None,
             probe_waiters: Vec::new(),
             pending_new: Vec::new(),
             region: None,
             _region: region,
+            _limits: cx.observe_global::<LatestLimits>(|hub, cx| hub.post_limits(cx)),
         }
     }
 
@@ -359,7 +361,6 @@ impl ClaudeHub {
                     });
                 }
             }
-            SessionEvent::Limits => self.post_limits(cx),
             SessionEvent::Exited => {
                 self.flush(key, cx);
                 if let Some(error) = exit_error(session.read(cx).model()) {
@@ -691,20 +692,13 @@ impl ClaudeHub {
     // --- Limits and the country check ---
 
     fn post_limits(&mut self, cx: &App) {
-        let Some(limits) = self.store_limits(cx) else {
+        let Some(limits) = claude::limits(cx).map(remote_limits) else {
             return;
         };
         if self.limits.as_ref() != Some(&limits) {
             self.limits = Some(limits.clone());
             post(RemoteEvent::Limits(limits));
         }
-    }
-
-    /// The newest limits a session of any window reported.
-    fn store_limits(&self, cx: &App) -> Option<Limits> {
-        self.live_stores()
-            .iter()
-            .find_map(|store| store.read(cx).limits().map(remote_limits))
     }
 
     fn post_region(&mut self, cx: &mut Context<Self>) {
@@ -715,16 +709,13 @@ impl ClaudeHub {
         }
     }
 
-    /// The limits: a session's, else the probe's of the last minute, else the CLI is asked.
+    /// The limits: the newest, when they came within a minute (a session's, the probe's), else the
+    /// CLI is asked.
     fn limits(&mut self, reply: Sender<RemoteReply>, cx: &mut Context<Self>) {
-        if let Some(limits) = self.store_limits(cx) {
-            let _ = reply.send(RemoteReply::Limits(limits));
-            return;
-        }
-        if let Some((at, limits)) = &self.probed
+        if let Some((at, limits)) = claude::latest_limits(cx)
             && at.elapsed() < LIMITS_FRESH
         {
-            let _ = reply.send(RemoteReply::Limits(limits.clone()));
+            let _ = reply.send(RemoteReply::Limits(remote_limits(limits)));
             return;
         }
         self.probe_waiters.push(reply);
@@ -759,16 +750,17 @@ impl ClaudeHub {
         });
     }
 
-    fn probed(&mut self, limits: Result<Limits, String>, cx: &mut Context<Self>) {
+    fn probed(&mut self, limits: Result<RateLimits, String>, cx: &mut Context<Self>) {
         self.probe = None;
-        if let Ok(limits) = &limits {
-            self.probed = Some((Instant::now(), limits.clone()));
-        }
         for reply in self.probe_waiters.drain(..) {
             let _ = reply.send(match &limits {
-                Ok(limits) => RemoteReply::Limits(limits.clone()),
+                Ok(limits) => RemoteReply::Limits(remote_limits(limits)),
                 Err(error) => RemoteReply::Failed(error.clone()),
             });
+        }
+        // The newest now: every window shows them.
+        if let Ok(limits) = limits {
+            claude::report_limits(limits, cx);
         }
         cx.notify();
     }
@@ -1651,7 +1643,7 @@ fn projects(cx: &App) -> Vec<RemoteProject> {
 
 /// Asks the CLI for the limits without a session: a short process in host mode — `initialize`,
 /// then `get_usage` (again while it says it has none yet) — and no model turn.
-async fn probe_limits(cli: Cli, cx: &mut AsyncApp) -> Result<Limits, String> {
+async fn probe_limits(cli: Cli, cx: &mut AsyncApp) -> Result<RateLimits, String> {
     let cwd = flux_platform::paths::home().unwrap_or_else(std::env::temp_dir);
     let options = LaunchOptions {
         cwd,
@@ -1672,7 +1664,7 @@ async fn probe_limits(cli: Cli, cx: &mut AsyncApp) -> Result<Limits, String> {
                 .await
                 .map_err(|_| "Claude Code stopped".to_string())??;
             if let Some(limits) = RateLimits::from_usage(&response) {
-                return Ok(remote_limits(&limits));
+                return Ok(limits);
             }
         }
         Err("Claude Code doesn't know the limits yet".to_string())

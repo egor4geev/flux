@@ -1,7 +1,8 @@
 //! Claude Code in the window (stage 9, wiki ADR-030): the hub of the window's Claude sessions.
-//! It finds `claude` and checks the sign-in, starts and closes sessions, keeps the latest
-//! subscription limits, and tells the window what needs it: a question for the user, an edit to
-//! show in a diff tab, files Claude changed, a session that finished or failed.
+//! It finds `claude` and checks the sign-in, starts and closes sessions, reports the subscription's
+//! limits (one value for all windows, [`LatestLimits`]), and tells the window what needs it: a
+//! question for the user, an edit to show in a diff tab, files Claude changed, a session that
+//! finished or failed.
 //!
 //! A session's chat lives in an editor tab ([`crate::claude_chat`]); the console in the left island
 //! ([`crate::claude_console`]) lists the sessions (part «Пульт Claude»). Closing a chat's tab doesn't
@@ -15,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
-    Action, App, AppContext, Context, Entity, EntityId, EventEmitter, KeyBinding, Subscription,
-    Task, WeakEntity, actions,
+    Action, App, AppContext, Context, Entity, EntityId, EventEmitter, Global, KeyBinding,
+    Subscription, Task, WeakEntity, actions,
 };
 
 use flux_claude::{
@@ -244,7 +245,9 @@ pub struct ClaudeStore {
     root: Option<PathBuf>,
     cli: CliState,
     sessions: Vec<Entity<ClaudeSession>>,
-    limits: Option<RateLimits>,
+    /// The subscription's limits changed (a session of any window reported them, the CLI was
+    /// asked): the window shows them.
+    _limits: Subscription,
     /// Sessions that worked since they were last idle: their idle is the end of the work.
     busy: HashSet<EntityId>,
     _check: Option<Task<()>>,
@@ -291,7 +294,10 @@ impl ClaudeStore {
             root,
             cli: CliState::Checking,
             sessions: Vec::new(),
-            limits: None,
+            _limits: cx.observe_global::<LatestLimits>(|_, cx| {
+                cx.emit(ClaudeStoreEvent::Changed);
+                cx.notify();
+            }),
             busy: HashSet::new(),
             _check: None,
             _sign_in: None,
@@ -693,11 +699,6 @@ impl ClaudeStore {
             }
             store.update(cx, |store, _| store._ticker = None).ok();
         }));
-    }
-
-    /// The newest subscription limits any session reported.
-    pub fn limits(&self) -> Option<&RateLimits> {
-        self.limits.as_ref()
     }
 
     /// The overall activity of the sessions.
@@ -1102,9 +1103,11 @@ impl ClaudeStore {
             SessionEvent::FilesChanged(paths) => {
                 cx.emit(ClaudeStoreEvent::FilesChanged(paths.clone()))
             }
+            // Every window shows them: each store follows `LatestLimits`.
             SessionEvent::Limits => {
-                self.limits = session.read(cx).model().limits.clone();
-                cx.emit(ClaudeStoreEvent::Changed);
+                if let Some(limits) = session.read(cx).model().limits.clone() {
+                    report_limits(limits, cx);
+                }
             }
             SessionEvent::Exited => {
                 self.busy.remove(&id);
@@ -1240,6 +1243,29 @@ pub fn mention(path: &str, lines: Option<(usize, usize)>) -> String {
         Some((first, last)) if first == last => format!("@{path}#L{first}"),
         Some((first, last)) => format!("@{path}#L{first}-{last}"),
     }
+}
+
+/// The subscription's limits, and when they came: one account behind every window, so the newest
+/// report wins — a session of any window, or the CLI asked by the hub of remote work
+/// ([`crate::claude_hub`]). A window where Claude last answered long ago shows them too.
+pub(crate) struct LatestLimits(Option<(Instant, RateLimits)>);
+
+impl Global for LatestLimits {}
+
+/// The subscription's newest limits.
+pub fn limits(cx: &App) -> Option<&RateLimits> {
+    latest_limits(cx).map(|(_, limits)| limits)
+}
+
+/// The subscription's newest limits and when they came.
+pub(crate) fn latest_limits(cx: &App) -> Option<(Instant, &RateLimits)> {
+    let (at, limits) = cx.try_global::<LatestLimits>()?.0.as_ref()?;
+    Some((*at, limits))
+}
+
+/// New limits: every window shows them, the plugins hear them.
+pub(crate) fn report_limits(limits: RateLimits, cx: &mut App) {
+    cx.set_global(LatestLimits(Some((Instant::now(), limits))));
 }
 
 /// How full a limit window is, for its color in the status bar.
