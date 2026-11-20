@@ -37,8 +37,8 @@ use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, AppContext as _, BoxShadow, ClipboardItem, Context, DismissEvent, Div, Entity,
     EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, PathPromptOptions, Render,
-    SharedString, Subscription, Task, WeakEntity, Window, actions, div, img, linear_color_stop,
-    linear_gradient, point, prelude::*, px, svg,
+    ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window, actions, div, img,
+    linear_color_stop, linear_gradient, point, prelude::*, px, svg,
 };
 
 use crate::appearance_settings::{AppearancePage, Page};
@@ -64,14 +64,15 @@ use crate::workspace::{Workspace, tilde};
 
 actions!(settings, [Toggle, Dismiss, About]);
 
-/// The window's size; a small Flux window gets a smaller one, with a margin around it.
+/// The window's size; a small Flux window gets a smaller one, with a margin around it. The height
+/// fits the sidebar's 20 rows; more scroll.
 const WIDTH: f32 = 880.;
-const HEIGHT: f32 = 600.;
+const HEIGHT: f32 = 700.;
 /// The margin between Settings and the sides of a small window (the height — `ui::dialog_height`).
 const WINDOW_MARGIN: f32 = 16.;
 const SIDEBAR_WIDTH: f32 = 180.;
 /// The sidebar's rows: their height, the gap between them and the sidebar's padding — the selection
-/// glides to the place they make.
+/// glides to the place they make. The rows never shrink: when they don't fit, the sidebar scrolls.
 const SIDEBAR_ROW_HEIGHT: f32 = 30.;
 const SIDEBAR_ROW_GAP: f32 = 2.;
 const SIDEBAR_PADDING: f32 = 8.;
@@ -327,6 +328,12 @@ fn about(_: &About, cx: &mut App) {
 pub struct SettingsView {
     focus_handle: FocusHandle,
     section: Section,
+    /// The sidebar, when its rows don't fit (a small window, many plugins' pages): the row chosen
+    /// comes into view.
+    sidebar_scroll: ScrollHandle,
+    /// The sidebar's row to bring into view once the sidebar is laid out: before its first frame
+    /// the scroll doesn't know its size and drops the request.
+    reveal: Option<usize>,
     /// The window's language servers: restarted after an install or update, stopped on delete.
     store: WeakEntity<LspStore>,
     /// The window's plugins: the manager and the plugins' pages follow them.
@@ -486,6 +493,8 @@ impl SettingsView {
         let mut view = Self {
             focus_handle: cx.focus_handle(),
             section: Section::Theme,
+            sidebar_scroll: ScrollHandle::new(),
+            reveal: None,
             store: handles.lsp,
             plugins: handles.plugins,
             workspace: handles.workspace,
@@ -931,10 +940,10 @@ impl SettingsView {
                 }
             }
         }
-        if self.section != section {
-            self.section = section;
-            cx.notify();
-        }
+        self.section = section;
+        // The row comes into view (About from the menu, a plugin's page from the Plugins page).
+        self.reveal = self.sidebar_row(cx);
+        cx.notify();
     }
 
     /// Settings closed: the plugin's page shown, its blocks are out of sight (API 0.5).
@@ -981,9 +990,34 @@ impl SettingsView {
             .collect()
     }
 
+    /// The open section's row among the sidebar's: the Appearance heading, its pages, the
+    /// built-in sections, the plugins' pages, About.
+    fn sidebar_row(&self, cx: &App) -> Option<usize> {
+        let plugin_pages = self.plugin_pages_listed(cx);
+        let first_plugin = 1 + Section::APPEARANCE.len() + Section::BUILT_IN.len();
+        Section::APPEARANCE
+            .iter()
+            .position(|section| *section == self.section)
+            .map(|index| 1 + index)
+            .or_else(|| {
+                let index = Section::BUILT_IN
+                    .iter()
+                    .position(|section| *section == self.section)?;
+                Some(1 + Section::APPEARANCE.len() + index)
+            })
+            .or_else(|| {
+                let Section::Plugin(id) = &self.section else {
+                    return None;
+                };
+                let index = plugin_pages.iter().position(|page| page == id)?;
+                Some(first_plugin + index)
+            })
+            .or_else(|| (self.section == Section::About).then(|| first_plugin + plugin_pages.len()))
+    }
+
     /// The list of sections on the left; the open one is highlighted. The plugins' pages are
     /// indented under Plugins, as the settings tree of JetBrains IDEs, each with the plugin's icon.
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
         let store = self.plugins.read(cx);
         let plugin_pages: Vec<(Section, SharedString, Option<SharedString>)> = self
@@ -1014,6 +1048,7 @@ impl SettingsView {
                         "settings-section-{}",
                         section.key()
                     )))
+                    .flex_none()
                     .h(px(SIDEBAR_ROW_HEIGHT))
                     .px_2()
                     .when(nested && !with_icon, |row| row.pl(px(30.)))
@@ -1051,6 +1086,7 @@ impl SettingsView {
         let mut rows: Vec<AnyElement> = vec![
             div()
                 .id("settings-section-appearance")
+                .flex_none()
                 .h(px(SIDEBAR_ROW_HEIGHT))
                 .px_2()
                 .flex()
@@ -1081,29 +1117,7 @@ impl SettingsView {
                 .child(div().min_w_0().truncate().child(tr("Appearance")))
                 .into_any_element(),
         ];
-        // The selected row's place among them: the Appearance heading, its pages, the built-in
-        // sections, the plugins' pages, About.
-        let selected = Section::APPEARANCE
-            .iter()
-            .position(|section| *section == self.section)
-            .map(|index| 1 + index)
-            .or_else(|| {
-                let index = Section::BUILT_IN
-                    .iter()
-                    .position(|section| *section == self.section)?;
-                Some(1 + Section::APPEARANCE.len() + index)
-            })
-            .or_else(|| {
-                let index = plugin_pages
-                    .iter()
-                    .position(|(section, ..)| *section == self.section)?;
-                Some(1 + Section::APPEARANCE.len() + Section::BUILT_IN.len() + index)
-            })
-            .or_else(|| {
-                (self.section == Section::About).then(|| {
-                    1 + Section::APPEARANCE.len() + Section::BUILT_IN.len() + plugin_pages.len()
-                })
-            });
+        let selected = self.sidebar_row(cx);
         rows.extend(Section::APPEARANCE.into_iter().map(|section| {
             let label = SharedString::from(section.label());
             row(section, label, true, None, cx).into_any_element()
@@ -1135,7 +1149,10 @@ impl SettingsView {
                     |highlight, top| highlight.top(px(top)),
                 )
         });
+        // The rows keep their height: squeezed into a short sidebar, they left the backdrop below
+        // its row (0.6.1). They scroll instead, the backdrop with them.
         div()
+            .id("settings-sidebar")
             .flex_none()
             .relative()
             .w(px(SIDEBAR_WIDTH))
@@ -1143,6 +1160,8 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap(px(SIDEBAR_ROW_GAP))
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
             .border_r_1()
             .border_color(ui.divider)
             .children(highlight)
@@ -2555,6 +2574,16 @@ fn plain(text: impl Into<SharedString>, ui: UiColors) -> AnyElement {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui = Theme::ui(cx);
+        // The row asked for comes into view once the sidebar is laid out (the next frame, when
+        // Settings have just opened); the selection's backdrop is the sidebar's first child.
+        if let Some(row) = self.reveal {
+            if self.sidebar_scroll.bounds().size.height > px(0.) {
+                self.reveal = None;
+                self.sidebar_scroll.scroll_to_item(1 + row);
+            } else {
+                window.request_animation_frame();
+            }
+        }
         // The Plugins page scrolls its list and its details apart: it takes the whole height.
         let content = match self.section.clone() {
             Section::Theme | Section::Interface | Section::FileIcons | Section::Language => {
